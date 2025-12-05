@@ -46,8 +46,8 @@ def check_external_stop_notification(instance_name: str, instance_data: dict[str
 
 def _check_claude_alive() -> bool:
     """Check if Claude process still alive (orphan detection)"""
-    # Background instances are intentionally detached
-    if os.environ.get('HCOM_BACKGROUND') == '1':
+    # Background instances are intentionally detached (HCOM_BACKGROUND is log filename, not '1')
+    if os.environ.get('HCOM_BACKGROUND'):
         return True
     # stdin closed = Claude Code died
     return not sys.stdin.closed

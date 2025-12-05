@@ -152,7 +152,13 @@ class ManageScreen:
         # Launch status banner (if active batch not yet ready)
         if self.state.launch_batch:
             batch = self.state.launch_batch
-            banner = f"{FG_YELLOW}Launching: {batch['ready']}/{batch['expected']} ready{RESET}"
+            if self.state.launch_batch_failed and time.time() < self.state.launch_batch_failed_until:
+                # Failed state - red banner for 5s
+                banner = f"{FG_RED}Launch failed: {batch['ready']}/{batch['expected']} ready (timed out){RESET}"
+            else:
+                # Normal launching state - yellow with dots
+                dots = '.' * (1 + int(time.time()) % 3)
+                banner = f"{FG_YELLOW}Launching{dots} {batch['ready']}/{batch['expected']} ready{RESET}"
             lines.append(banner)
             instance_rows -= 1  # Reserve row for banner
 

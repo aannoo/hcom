@@ -110,12 +110,11 @@ Commands:
 
 Environment Variables:
   HCOM_TAG=name               Group tag (creates name-* instances)
-  HCOM_AGENT=type             Agent from .claude/agents/ (comma-separated for multiple)
   HCOM_TERMINAL=mode          Terminal: new|here|print|"custom {{script}}"
   HCOM_HINTS=text             Text appended to all messages received by instance
   HCOM_TIMEOUT=secs           Time until disconnected from hcom chat (default: 1800s / 30m)
   HCOM_SUBAGENT_TIMEOUT=secs  Subagent idle timeout (default: 30s)
-  HCOM_CLAUDE_ARGS=args       Claude CLI defaults (e.g., '-p --model opus "hello!"')
+  HCOM_CLAUDE_ARGS=args       Claude CLI defaults (e.g., '-p --model opus --agent reviewer')
 
   ANTHROPIC_MODEL=opus # Any env var passed through to Claude Code
 

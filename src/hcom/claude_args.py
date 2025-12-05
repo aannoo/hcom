@@ -75,9 +75,11 @@ _OPTIONAL_ALIAS_LOOKUP: Mapping[str, set[str]] = {
 # Flags that require a following value (lowercase).
 _VALUE_FLAGS = {
     "--add-dir",
+    "--agent",
     "--agents",
     "--allowed-tools",
     "--allowedtools",
+    "--betas",
     "--disallowedtools",
     "--disallowed-tools",
     "--fallback-model",
@@ -99,9 +101,11 @@ _VALUE_FLAGS = {
 
 _VALUE_FLAG_PREFIXES = {
     "--add-dir=",
+    "--agent=",
     "--agents=",
     "--allowedtools=",
     "--allowed-tools=",
+    "--betas=",
     "--disallowedtools=",
     "--disallowed-tools=",
     "--fallback-model=",
@@ -466,45 +470,6 @@ def _deduplicate_boolean_flags(tokens: Sequence[str]) -> list[str]:
         result.append(token)
 
     return result
-
-
-def merge_system_prompts(
-    user_append: str | None,
-    user_system: str | None,
-    agent_content: str | None,
-) -> Tuple[str | None, str | None]:
-    """Merge agent content with user system prompts.
-
-    Returns: (system_prompt_value, append_system_prompt_value)
-
-    Agent behavior (matches Task tool subagents):
-    - Agent content always goes in --system-prompt
-    - User's --system-prompt appends to agent: "agent\n\nuser_system"
-    - User's --append-system-prompt passes through separately
-
-    No agent:
-    - User's flags pass through as-is
-    """
-    system_blocks = []
-
-    # Agent content first (if present)
-    if agent_content:
-        system_blocks.append(agent_content)
-
-    # User's system prompt second (if present)
-    if user_system:
-        system_blocks.append(user_system)
-
-    system_value = "\n\n".join(system_blocks) if system_blocks else None
-    append_value = user_append
-
-    return system_value, append_value
-
-
-def extract_system_prompt_args(tokens: Sequence[str]) -> Tuple[list[str], str | None, str | None]:
-    """Public helper mirroring legacy behaviour."""
-    spec = _parse_tokens(tokens, "cli")
-    return list(spec.clean_tokens), spec.user_append, spec.user_system
 
 
 def add_background_defaults(spec: ClaudeArgsSpec) -> ClaudeArgsSpec:

@@ -42,8 +42,6 @@ from ..api import (
     dict_to_hcom_config, HcomConfigError,
     # Commands
     cmd_launch, cmd_start, cmd_stop, cmd_reset, cmd_send,
-    # Utilities
-    list_available_agents,
 )
 
 # Import screens
@@ -146,10 +144,6 @@ class HcomTUI:
             elif 'tag' in line_lower:
                 if 'HCOM_TAG' not in self.state.validation_errors:
                     self.state.validation_errors['HCOM_TAG'] = line
-            elif 'agent' in line_lower and 'subagent' not in line_lower:
-                # Agent can have multiple errors - store first one
-                if 'HCOM_AGENT' not in self.state.validation_errors:
-                    self.state.validation_errors['HCOM_AGENT'] = line
             elif 'claude_args' in line_lower:
                 if 'HCOM_CLAUDE_ARGS' not in self.state.validation_errors:
                     self.state.validation_errors['HCOM_CLAUDE_ARGS'] = line
@@ -341,13 +335,32 @@ class HcomTUI:
 
         # Load launch status (for banner) - aggregates all pending batches
         try:
-            from ..core.db import get_launch_status
+            from ..core.db import get_launch_status, parse_iso_timestamp, LAUNCH_TIMEOUT_SECONDS
+            from datetime import datetime, timezone
+            import time as time_module
+
+            # Clear failed banner after 5s timeout
+            if self.state.launch_batch_failed and time_module.time() >= self.state.launch_batch_failed_until:
+                self.state.launch_batch = None
+                self.state.launch_batch_failed = False
+
             batch = get_launch_status()  # No launcher filter - show all pending
-            # Only show if not complete (get_launch_status handles recency)
+            # Only show if not complete AND recent (timeout for failed launches)
             if batch and batch['ready'] < batch['expected']:
-                self.state.launch_batch = batch
+                ts = parse_iso_timestamp(batch.get('timestamp', ''))
+                cutoff = datetime.now(timezone.utc).timestamp() - LAUNCH_TIMEOUT_SECONDS
+                if ts and ts.timestamp() > cutoff:
+                    self.state.launch_batch = batch
+                    self.state.launch_batch_failed = False
+                else:
+                    # Batch timed out - show red banner for 5s
+                    if self.state.launch_batch and not self.state.launch_batch_failed:
+                        self.state.launch_batch_failed = True
+                        self.state.launch_batch_failed_until = time_module.time() + 5.0
+                    self.state.launch_batch = batch  # Keep batch for red banner
             else:
                 self.state.launch_batch = None
+                self.state.launch_batch_failed = False
         except Exception:
             self.state.launch_batch = None
 
@@ -410,7 +423,7 @@ class HcomTUI:
             self.state.config_edit['HCOM_CLAUDE_ARGS'] = spec.to_env_string()
 
             # Write config.env
-            # Note: HCOM_TAG and HCOM_AGENT are already saved directly when edited in UI
+            # Note: HCOM_TAG is already saved directly when edited in UI
             self.save_config_to_file()
         except Exception as e:
             # Don't crash on save failure, but log to stderr
@@ -488,7 +501,6 @@ class HcomTUI:
             'subagent_timeout': 'HCOM_SUBAGENT_TIMEOUT',
             'terminal': 'HCOM_TERMINAL',
             'tag': 'HCOM_TAG',
-            'agent': 'HCOM_AGENT',
             'claude_args': 'HCOM_CLAUDE_ARGS',
             'hints': 'HCOM_HINTS',
         }

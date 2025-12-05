@@ -10,7 +10,7 @@ Real-time communication layer for Claude Code via hooks.
 ## Start
 
 ```bash
-pip install hcom && hcom 1 'whats hcom?'
+pip install hcom && hcom 2
 ```
 
 
@@ -18,12 +18,12 @@ pip install hcom && hcom 1 'whats hcom?'
 
 ```
 ┌──────────┐  hcom send "hi"  ┌────────────────┐
-│ Claude A │─────────────────►│ Claude B (idle)│──► wakes instantly, sees "hi"
-└──────────┘        │         └────────────────┘ 
+│ Claude A │─────────────────►│ Claude B (idle)│──► wakes instantly:
+└──────────┘        │         └────────────────┘           sees "hi"
 - interactive       │
 - headless          │         ┌──────────────────┐
-- subagent          └────────►│Claude C (working)│──► on tool completion; sees "hi"
-- claude code web             └──────────────────┘ 
+- subagent          └────────►│Claude C (working)│──► after current tool:
+- external tools              └──────────────────┘              sees "hi"
 ```
 
 - Any Claude can join (`hcom start`) or leave (`hcom stop`) at runtime.
@@ -85,17 +85,6 @@ hcom 1 claude -p 'monitor [x] and send message via hcom if [y]'
 
 </details>
 
-<details>
-<summary><strong>Agent Types</strong> — launch .claude/agents/ in terminals</summary>
-
-Load agent configurations from `.claude/agents/` directory. Each agent gets its own interactive terminal with the specified system prompt and settings.
-
-```bash
-HCOM_AGENT=reviewer hcom 1           # Load single agent
-HCOM_AGENT=coder,tester hcom 1       # Multiple agents (launches 2 instances)
-```
-
-</details>
 
 <details>
 <summary><strong>Subagent Communication</strong></summary>
@@ -174,11 +163,12 @@ hcom stop all                        # Disconnect all instances
 ```json
 {
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then pip install -q --no-cache-dir --root-user-action=ignore -e \"$CLAUDE_PROJECT_DIR\"; [ -n \"$HF_TOKEN\" ] && hcom relay hf; hcom sessionstart; fi"}]}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then pip install -q --no-cache-dir --root-user-action=ignore hcom; [ -n \"$HF_TOKEN\" ] && hcom relay hf; hcom sessionstart; fi"}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom userpromptsubmit; fi"}]}],
     "PreToolUse": [{"matcher": "Bash|Task", "hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom pre; fi"}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom post; fi", "timeout": 86400}]}],
     "Stop": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom poll; fi", "timeout": 86400}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom subagent-start; fi"}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom subagent-stop; fi", "timeout": 86400}]}],
     "Notification": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom notify; fi"}]}],
     "SessionEnd": [{"hooks": [{"type": "command", "command": "if [ \"$CLAUDE_CODE_REMOTE\" = \"true\" ]; then hcom sessionend; fi"}]}]
@@ -187,8 +177,10 @@ hcom stop all                        # Disconnect all instances
 }
 ```
 
-**2. Set `HF_TOKEN`** in Claude Code Web environment settings.
-Get a write token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+**2. Configure environment** in Claude Code Web settings:
+- Set `HF_TOKEN` - get a write token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+- Set network access to **Full** (relay needs huggingface.co, not in default allowlist)
+
 A private HuggingFace Space is auto-created on first session.
 
 **3. In Claude Code Web**, prompt: `run hcom start`
@@ -288,10 +280,9 @@ Settings in `~/.hcom/config.env` or environment variables.
 | `HCOM_TIMEOUT` | 1800 | Instance idle timeout (seconds) |
 | `HCOM_SUBAGENT_TIMEOUT` | 30 | Subagent idle timeout (seconds) |
 | `HCOM_TAG` | — | Group tag (creates tag-* instances) |
-| `HCOM_AGENT` | — | Agent type from .claude/agents/ |
 | `HCOM_TERMINAL` | new | Terminal mode: new\|here\|print\|custom |
 | `HCOM_HINTS` | — | Text appended to all received messages |
-| `HCOM_CLAUDE_ARGS` | — | Default Claude CLI arguments |
+| `HCOM_CLAUDE_ARGS` | — | Default Claude CLI arguments (e.g., `--agent reviewer`) |
 
 **Precedence**: env var > config.env > defaults
 
@@ -370,12 +361,11 @@ Commands:
 
 Environment Variables:
   HCOM_TAG=name               Group tag (creates name-* instances)
-  HCOM_AGENT=type             Agent from .claude/agents/ (comma-separated for multiple)
   HCOM_TERMINAL=mode          Terminal: new|here|print|"custom {script}"
   HCOM_HINTS=text             Text appended to all messages received by instance
   HCOM_TIMEOUT=secs           Time until disconnected from hcom chat (default: 1800s / 30m)
   HCOM_SUBAGENT_TIMEOUT=secs  Subagent idle timeout (default: 30s)
-  HCOM_CLAUDE_ARGS=args       Claude CLI defaults (e.g., '-p --model opus "hello!"')
+  HCOM_CLAUDE_ARGS=args       Claude CLI defaults (e.g., '-p --model opus --agent reviewer')
 
   ANTHROPIC_MODEL=opus # Any env var passed through to Claude Code
 

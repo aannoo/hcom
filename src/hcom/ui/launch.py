@@ -193,7 +193,7 @@ class LaunchScreen:
             default = CONFIG_DEFAULTS.get(f.key, '')
             if not f.value:  # Empty
                 # Fields where empty reverts to default at runtime
-                if f.key in ('HCOM_TERMINAL', 'HCOM_HINTS', 'HCOM_TAG', 'HCOM_AGENT', 'HCOM_TIMEOUT', 'HCOM_SUBAGENT_TIMEOUT'):
+                if f.key in ('HCOM_TERMINAL', 'HCOM_HINTS', 'HCOM_TAG', 'HCOM_TIMEOUT', 'HCOM_SUBAGENT_TIMEOUT'):
                     return False  # Empty → uses default → NOT modified
                 # Fields where empty stays empty (different from default if default is non-empty)
                 # HCOM_CLAUDE_ARGS: empty → "" (not default "'say hi...'") → IS modified
@@ -231,7 +231,7 @@ class LaunchScreen:
                     preview_text = ", ".join(previews)
                     lines.append(f"    {DIM}{FG_GRAY}{truncate_ansi(preview_text, width - 4)}{RESET}")
             else:
-                lines.append(f"    {DIM}{FG_GRAY}agent, tag, hints, timeout, terminal{RESET}")
+                lines.append(f"    {DIM}{FG_GRAY}tag, hints, timeout, terminal{RESET}")
 
         # HCOM fields
         result = self.render_section_fields(
@@ -382,10 +382,6 @@ class LaunchScreen:
                 editor_color = FG_CYAN
                 field_name = "Tag"
                 help_text = "identifier to create groups with @-mention"
-            elif field_key == 'HCOM_AGENT':
-                editor_color = FG_CYAN
-                field_name = "Agent"
-                help_text = "agent from .claude/agents • comma-separated for multiple"
             elif field_key.startswith('HCOM_'):
                 # Other HCOM fields
                 editor_color = FG_CYAN
@@ -704,10 +700,6 @@ class LaunchScreen:
 
             # Environment variables (read from config_fields - source of truth)
             env_parts = []
-            agent = self.state.config_edit.get('HCOM_AGENT', '')
-            if agent:
-                agent_display = agent if len(agent) <= 15 else agent[:12] + "..."
-                env_parts.append(f"HCOM_AGENT={agent_display}")
             tag = self.state.config_edit.get('HCOM_TAG', '')
             if tag:
                 tag_display = tag if len(tag) <= 15 else tag[:12] + "..."
@@ -1085,10 +1077,6 @@ class LaunchScreen:
         # Set env vars if specified (read from config_fields - source of truth)
         env_backup = {}
         try:
-            agent = self.state.config_edit.get('HCOM_AGENT', '')
-            if agent:
-                env_backup['HCOM_AGENT'] = os.environ.get('HCOM_AGENT')
-                os.environ['HCOM_AGENT'] = agent
             tag = self.state.config_edit.get('HCOM_TAG', '')
             if tag:
                 env_backup['HCOM_TAG'] = os.environ.get('HCOM_TAG')

@@ -10,7 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
-__version__ = "0.6.6"
+__version__ = "0.6.7"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
@@ -60,7 +60,6 @@ def is_termux() -> bool:
 # Capture group must start with alphanumeric (prevents @-test, @_test, @123)
 # Includes : for remote instance names (e.g., @alice:BOXE)
 MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w:-]*)')
-AGENT_NAME_PATTERN = re.compile(r'^[a-z-]+$')
 
 # Sender constants
 SENDER = 'bigboss'  # CLI sender identity
@@ -180,8 +179,7 @@ DEFAULT_CONFIG_HEADER = [
     "#   HCOM_TERMINAL - Terminal mode: \"new\", \"here\", or custom command with {script}",
     "#   HCOM_HINTS - Text appended to all messages received by instances",
     "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
-    "#   HCOM_AGENT - Claude code subagent from .claude/agents/, comma-separated for multiple",
-    "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet')",
+    "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet --agent reviewer')",
     "#   HCOM_RELAY - Cross-device relay server URL (optional)",
     "#   HCOM_RELAY_TOKEN - Auth token for relay server (optional)",
     "#   HCOM_RELAY_ENABLED - Enable/disable relay sync (default: 1 if URL set)",
@@ -191,7 +189,6 @@ DEFAULT_CONFIG_HEADER = [
 ]
 
 DEFAULT_CONFIG_DEFAULTS = [
-    'HCOM_AGENT=',
     'HCOM_TAG=',
     'HCOM_HINTS=',
     'HCOM_TIMEOUT=1800',
@@ -393,8 +390,6 @@ from .claude_args import (
     ClaudeArgsSpec,
     resolve_claude_args,
     merge_claude_args,
-    merge_system_prompts,
-    extract_system_prompt_args,
     validate_conflicts,
     add_background_defaults,
 )
@@ -406,8 +401,6 @@ __all__ = [
     'ClaudeArgsSpec',
     'resolve_claude_args',
     'merge_claude_args',
-    'merge_system_prompts',
-    'extract_system_prompt_args',
     'validate_conflicts',
     'add_background_defaults',
 ]

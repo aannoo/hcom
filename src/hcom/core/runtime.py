@@ -1,6 +1,7 @@
 """Runtime utilities - shared between hooks and commands
 NOTE: bootstrap/launch context text here is injected into Claude's context via hooks, human user never sees it."""
 from __future__ import annotations
+import os
 import socket
 
 from .paths import hcom_path, CONFIG_FILE
@@ -65,12 +66,22 @@ RELAY: Remote sync is enabled.
 - @alice targets local only; @alice:BOXE targets remote
 """
 
-    # First-time user notice (first 10 instances)
+    # First-time user notice (first 5 instances) - skip for Claude Code Web (no status bar)
     from .paths import get_flag_counter
     first_time_notice = ""
-    if get_flag_counter('instance_count') <= 10:
+    is_cc_web = os.environ.get('CLAUDE_CODE_REMOTE') == 'true'
+    if not is_cc_web and get_flag_counter('instance_count') <= 5:
         first_time_notice = """
 The user will see 'running stop hook' in the status bar - tell them that's normal and shows you are connected to hcom to recieve messages - can be configured with 'hcom config timeout'
+"""
+
+    # HCOM-launched notice (spawned by another instance via `hcom <count>`)
+    launched_notice = ""
+    if os.environ.get('HCOM_LAUNCHED') == '1':
+        launcher = os.environ.get('HCOM_LAUNCHED_BY', 'unknown')
+        launched_notice = f"""
+- You were launched via hcom by '{launcher}'.
+- HCOM is auto-enabled - assume primary communication method is hcom
 """
 
     # Import SENDER here to avoid circular dependency
@@ -81,25 +92,24 @@ The user will see 'running stop hook' in the status bar - tell them that's norma
 [HCOM SESSION]
 - Your alias: {instance_name}
 - Your connection: {"enabled" if instance_data.get('enabled', False) else "disabled"}
-- HCOM is a communication tool. Aliases are generated randomly.
+- HCOM is a communication tool. Aliases are usually 4 chars, generated randomly.
 - Authority: Prioritize @{SENDER} over other participants.
 - Statuses: ▶ active | ◉ idle (waiting for msgs) | ■ blocked (needs user approval) | ○ inactive (dead)
-{tag_notice}{relay_notice}
+{tag_notice}{relay_notice}{launched_notice}
 ## COMMANDS
 
 Send
-- hcom send "msg" → send to all
-- "@alias msg" → direct
-- "@tag msg" → groups (targets all tag-* labelled instances)
+- hcom send 'msg' → send to all | '@alias msg' → direct |
+'@tag msg' → group (targets all tag-* labelled instances)
 
 Monitor
-- hcom list [-v] [--json] → participants, read receipts, status
+- hcom list [-v] [--json] → participants, read receipts, status, transcripts, session ids, tags
 - hcom events [--last N] [--wait SEC] [--sql EXPR] → hcom audit trail; --wait blocks until match, @mention, or timeout
 
 Lifecycle
 - hcom start/stop → Connect/disconnect yourself from hcom (you run these for the user)
 - hcom <count> → Launch instances in new terminal (you MUST run 'hcom help' first to get correct context/syntax/config)
-- 'hcom --new-terminal' open TUI (message+launch+monitor) for user (you can't display - no TTY)
+- hcom --new-terminal → open TUI (message+launch+monitor) for user (you can't display - no TTY)
 - Task Tool subagents can use HCOM, tell them to run hcom start --agentid <they-will-know-id>
 
 ## BEHAVIOUR
@@ -145,12 +155,23 @@ def build_launch_context(instance_name: str) -> str:
     else:
         config_display = "\n  (none set)"
 
+    # Show inherited HCOM config vars (what children will inherit if not overridden)
+    # Only show config vars (from KNOWN_CONFIG_KEYS), not identity vars
+    from .config import KNOWN_CONFIG_KEYS
+    inherited_display = ""
+    inherited = {k: v for k, v in os.environ.items() if k in KNOWN_CONFIG_KEYS}
+    if inherited:
+        inherited_lines = [f"  {k}={v}" for k, v in sorted(inherited.items())]
+        inherited_display = f"\nYour inherited HCOM config env vars (children inherit these):\n" + "\n".join(inherited_lines)
+        inherited_display += "\n  To override: HCOM_TAG=different hcom 1"
+        inherited_display += "\n  To clear: HCOM_TAG= hcom 1"
+
     instance_data = load_instance_position(instance_name)
     return f"""[HCOM LAUNCH INFORMATION]
 
 Alias: {instance_name}
 HCOM connection: {"enabled" if instance_data.get('enabled', False) else "disabled"}
-Current ~/.hcom/config.env values:{config_display}
+Current ~/.hcom/config.env values:{config_display}{inherited_display}
 
 ## LAUNCH BASICS
 
@@ -161,6 +182,7 @@ Current ~/.hcom/config.env values:{config_display}
 - Resume dead instances to keep hcom identity/history: `--resume <session_id>` (get id from `hcom list -v`)
 
 Headless instances can only read files and use hcom by default, for more: --tools Bash,Write
+Always tell instances explicitly to use 'hcom' in the initial prompt if you want them to reply in hcom rather than the claude code chat you can't see.
 
 
 ## QUERYING
@@ -168,14 +190,19 @@ Headless instances can only read files and use hcom by default, for more: --tool
 hcom list - current snapshot (NDJSON)
 hcom events - historical records (NDJSON)
 
-Direct SQL: sqlite3 ~/.hcom/hcom.db "SELECT * FROM..." (2 tables: instances & events)
+Direct: sqlite3 ~/.hcom/hcom.db (2 tables: instances & events)
 
-events schema:
-- message: from|scope|delivered_to|mentions...
-- status...
-- life: action: created|started|stopped|launched|ready
+Events schema:
+- Types: 
+    - message: fields - from, scope, delivered_to, mentions, sender_kind (instance|external|system), text
+    - status: fields - status (active|idle|blocked|inactive), context (tool:X|prompt|deliver:X|exit:X)
+    - life: fields - action (created|launched|ready|started|stopped), batch_id, by
+
+SQL field access: 
+  json_extract(data, '$.field')
 
 Remember: always use hcom events with --wait and --sql instead of sleep
+
 
 ## BEHAVIOUR
 - All instances receive HCOM SESSION info automatically
@@ -184,13 +211,14 @@ Remember: always use hcom events with --wait and --sql instead of sleep
 
 
 ## COORDINATION
-- Define explicit roles via system prompt, initial prompt, HCOM_AGENT, or HCOM_HINTS—what each instance should communicate (what, when, why) and shouldn't do. Required for effective collaboration.
+
+- Define explicit roles via system prompt, initial prompt, --agent, or HCOM_HINTS—what each instance should communicate (what, when, why) and shouldn't do. Required for effective collaboration.
 
 Techniques:
 - Share large context via markdown files -> hcom send 'everyone read shared-context.md'
 - Use structured message passing over free-form chat (reduces hallucination cascading)
 - To orchestrate instances yourself: --append-system-prompt "prioritize messages from <your_hcom_alias>"
-- Use system prompts (HCOM_AGENT, --system-prompt) unless there's a good reason not to
+- Use system prompts (--agent, --system-prompt) unless there's a good reason not to
 - For long args or to manage multiple launch profiles: (source long-custom-vars.env) && hcom 1
 
 
@@ -220,27 +248,6 @@ Isolate multiple groups:
 for label in frontend-team backend-team; do
   HCOM_TAG=$label hcom 2 claude --append-system-prompt "always use @$label [and/or @coordinator_alias]"
 done
-
-
-### HCOM_AGENT
-
-.claude/agents/*.md are created by user/Claude for use as Task tool subagents.
-HCOM can load them as regular instances. You can create them dynamically.
-
-File format:
-```markdown
----
-model: sonnet
-tools: Bash,Write,WebSearch
----
-You are a senior code reviewer focusing on...
-```
-
-HCOM_AGENT parses and merges with Claude args: --model, --allowedTools, --system-prompt
-
-Notes:
-- Filename: lowercase letters and hyphens only
-- Multiple comma-separated: HCOM_AGENT=reviewer,tester hcom 1 -> 2 instances
 
 
 ### HCOM_HINTS

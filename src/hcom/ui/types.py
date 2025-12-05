@@ -104,6 +104,8 @@ class UIState:
 
     # Launch batch tracking (for status banner)
     launch_batch: Optional[dict] = None
+    launch_batch_failed: bool = False        # Batch timed out without all ready
+    launch_batch_failed_until: float = 0.0   # When to clear failed banner
 
     # EVENTS filtering
     event_filter: str = ""                 # Current filter query (empty = inactive)

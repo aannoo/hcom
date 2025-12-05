@@ -45,9 +45,6 @@ from .commands.lifecycle import (
 )
 from .commands.messaging import cmd_send
 
-# Terminal utilities
-from .terminal import list_available_agents
-
 # Shared utilities and constants
 from .shared import (
     ClaudeArgsSpec,
@@ -84,8 +81,6 @@ __all__ = [
     'cmd_send',
     'cmd_reset',
     'cmd_events',
-    # Terminal
-    'list_available_agents',
     # Shared
     'ClaudeArgsSpec',
     'resolve_claude_args',

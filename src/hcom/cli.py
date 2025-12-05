@@ -97,10 +97,8 @@ if sys.version_info < (3, 10):
 # ANSI codes in shared.py (imported above)
 
 # ==================== Error Handling Strategy ====================
-# Hooks: Must never raise exceptions (breaks hcom). Functions return True/False.
 # CLI: Can raise exceptions for user feedback. Check return values.
 # Critical I/O: atomic_write
-# Pattern: Try/except/return False in hooks, raise in CLI operations.
 
 # ==================== CLI Errors ====================
 # CLIError and get_help_text moved to commands/utils.py
@@ -110,13 +108,9 @@ if sys.version_info < (3, 10):
 
 # ==================== Config Defaults ====================
 # Config precedence: env var > ~/.hcom/config.env > defaults
-# All config via HcomConfig dataclass (timeout, terminal, prompt, hints, tag, agent)
+# All config via HcomConfig dataclass (timeout, terminal, hints, tag, claude_args)
 
 # Hook configuration now in hooks/settings.py
-
-# ==================== Instance File Management ====================
-
-# list_available_agents moved to terminal.py
 
 # ==================== Configuration System ====================
 # Config classes and functions now in core/config.py
@@ -194,7 +188,7 @@ def _build_hcom_env_value() -> str:
 # ==================== Hook Management ====================
 # get_claude_settings_path, load_settings_json, _remove_hcom_hooks_from_settings moved to hooks/settings.py
 
-# build_env_string, has_claude_arg, build_claude_command moved to terminal.py
+# build_env_string, build_claude_command moved to terminal.py
 # create_bash_script, find_bash_on_windows moved to terminal.py
 # get_macos_terminal_argv, get_windows_terminal_argv, get_linux_terminal_argv moved to terminal.py
 # windows_hidden_popen, _parse_terminal_command, launch_terminal moved to terminal.py

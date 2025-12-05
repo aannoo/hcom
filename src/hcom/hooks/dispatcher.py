@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any
 import sys
+import os
 import json
 import re
 
@@ -68,7 +69,15 @@ def _handle_hook_impl(hook_type: str) -> None:
 
     hook_data = json.load(sys.stdin)
     tool_name = hook_data.get('tool_name', '')
-    session_id = hook_data.get('session_id')
+
+    # Get real session_id from CLAUDE_ENV_FILE path (workaround for CC fork bug)
+    # CC passes wrong session_id in hook_data for --fork-session scenarios
+    from .parent import get_real_session_id
+    env_file = os.environ.get('CLAUDE_ENV_FILE')
+    session_id = get_real_session_id(hook_data, env_file)
+
+    # Store corrected session_id back into hook_data for downstream functions
+    hook_data['session_id'] = session_id
 
     if not ensure_hcom_directories():
         log_hook_error('handle_hook', Exception('Failed to create directories'))

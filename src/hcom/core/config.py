@@ -11,10 +11,8 @@ from typing import Any
 
 from .paths import hcom_path, atomic_write, CONFIG_FILE
 from ..shared import (
-    __version__,
     parse_env_file, parse_env_value, format_env_value,
     DEFAULT_CONFIG_HEADER, DEFAULT_CONFIG_DEFAULTS,
-    AGENT_NAME_PATTERN,
 )
 
 # ==================== Config Constants ====================
@@ -70,7 +68,6 @@ class HcomConfig:
     terminal: str = 'new'
     hints: str = ''
     tag: str = ''
-    agent: str = ''
     claude_args: str = ''
     relay: str = ''
     relay_token: str = ''
@@ -133,19 +130,6 @@ class HcomConfig:
         elif self.tag and not re.match(r'^[a-zA-Z0-9-]+$', self.tag):
             set_error('tag', "tag can only contain letters, numbers, and hyphens")
 
-        # Validate agent
-        if not isinstance(self.agent, str):
-            set_error('agent', f"agent must be a string, got {type(self.agent).__name__}")
-        elif self.agent:  # Non-empty
-            for agent_name in self.agent.split(','):
-                agent_name = agent_name.strip()
-                if agent_name and not AGENT_NAME_PATTERN.match(agent_name):
-                    set_error(
-                        'agent',
-                        f"agent '{agent_name}' must match pattern ^[a-z-]+$ "
-                        f"(lowercase letters and hyphens only)"
-                    )
-
         # Validate claude_args (must be valid shell-quoted string)
         if not isinstance(self.claude_args, str):
             set_error('claude_args', f"claude_args must be a string, got {type(self.claude_args).__name__}")
@@ -207,7 +191,7 @@ class HcomConfig:
             try:
                 data['timeout'] = int(timeout_str)
             except (ValueError, TypeError):
-                pass  # Use default
+                print(f"Warning: HCOM_TIMEOUT='{timeout_str}' is not a valid integer, using default", file=sys.stderr)
 
         # Load subagent_timeout (requires int conversion)
         subagent_timeout_str = get_var('HCOM_SUBAGENT_TIMEOUT')
@@ -215,7 +199,7 @@ class HcomConfig:
             try:
                 data['subagent_timeout'] = int(subagent_timeout_str)
             except (ValueError, TypeError):
-                pass  # Use default
+                print(f"Warning: HCOM_SUBAGENT_TIMEOUT='{subagent_timeout_str}' is not a valid integer, using default", file=sys.stderr)
 
         # Load string values
         terminal = get_var('HCOM_TERMINAL')
@@ -227,9 +211,6 @@ class HcomConfig:
         tag = get_var('HCOM_TAG')
         if tag is not None:  # Allow empty string for tag (valid value)
             data['tag'] = tag
-        agent = get_var('HCOM_AGENT')
-        if agent is not None:  # Allow empty string for agent (valid value)
-            data['agent'] = agent
         claude_args = get_var('HCOM_CLAUDE_ARGS')
         if claude_args is not None:  # Allow empty string for claude_args (valid value)
             data['claude_args'] = claude_args
@@ -269,7 +250,6 @@ def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
         'HCOM_TERMINAL': config.terminal,
         'HCOM_HINTS': config.hints,
         'HCOM_TAG': config.tag,
-        'HCOM_AGENT': config.agent,
         'HCOM_CLAUDE_ARGS': config.claude_args,
         'HCOM_RELAY': config.relay,
         'HCOM_RELAY_TOKEN': config.relay_token,
@@ -320,8 +300,6 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
         kwargs['hints'] = data['HCOM_HINTS']
     if 'HCOM_TAG' in data:
         kwargs['tag'] = data['HCOM_TAG']
-    if 'HCOM_AGENT' in data:
-        kwargs['agent'] = data['HCOM_AGENT']
     if 'HCOM_CLAUDE_ARGS' in data:
         kwargs['claude_args'] = data['HCOM_CLAUDE_ARGS']
     if 'HCOM_RELAY' in data:
@@ -446,12 +424,9 @@ def get_config() -> HcomConfig:
         try:
             _config_cache = HcomConfig.load()
         except ValueError:
-            # Config validation failed
             if is_hook_context:
-                # In hooks, use defaults silently (don't break vanilla Claude Code)
                 _config_cache = HcomConfig()
             else:
-                # In commands, re-raise to show user the error
                 raise
 
     return _config_cache

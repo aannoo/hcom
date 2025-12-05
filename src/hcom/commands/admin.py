@@ -69,7 +69,8 @@ def _cmd_events_launch(argv: list[str]) -> int:
             return 1
 
     # Output JSON
-    status = "ready" if status_data['ready'] >= status_data['expected'] else "timeout"
+    is_timeout = status_data['ready'] < status_data['expected']
+    status = "timeout" if is_timeout else "ready"
     result = {
         "status": status,
         "expected": status_data['expected'],
@@ -84,8 +85,11 @@ def _cmd_events_launch(argv: list[str]) -> int:
     else:
         result["batch_id"] = status_data.get('batch_id')
 
-    if status == "timeout":
-        result["hint"] = "Timeout - launch probably failed. Check: hcom list, hcom events, hcom --help, claude --help"
+    if is_timeout:
+        result["timed_out"] = True
+        # Identify which batch(es) failed
+        batch_info = result.get('batch_id') or (result.get('batches', ['?'])[0] if result.get('batches') else '?')
+        result["hint"] = f"Launch failed: {status_data['ready']}/{status_data['expected']} ready after 30s (batch: {batch_info}). Check ~/.hcom/.tmp/logs/background_*.log or hcom list -v"
     print(json.dumps(result))
 
     return 0 if status == "ready" else 1
@@ -335,6 +339,8 @@ def cmd_list(argv: list[str]) -> int:
                 "read_receipts": read_receipts
             }
         }
+        if verbose_output and identity.session_id:
+            self_payload["_self"]["session_id"] = identity.session_id
         # Only include connection status for actual instances
         if show_connection:
             self_payload["_self"]["hcom_connected"] = current_enabled
@@ -760,13 +766,12 @@ def _relay_toggle(enable: bool) -> int:
     reload_config()  # Invalidate cache so push/pull see new relay_enabled value
 
     if enable:
-        print("Relay: enabled")
-        # Do an immediate sync
-        from ..relay import push, pull
-        push(force=True)
-        pull()
+        print("Relay enabled\n")
+        return _relay_status()
     else:
         print("Relay: disabled")
+        print(f"URL still configured: {config.relay}")
+        print("\nRun 'hcom relay on' to reconnect")
 
     return 0
 
@@ -777,7 +782,7 @@ def _relay_status() -> int:
     from ..core.device import get_device_short_id
     from ..core.config import get_config
     from ..core.db import kv_get, get_last_event_id
-    from ..relay import push
+    from ..relay import push, pull
 
     config = get_config()
 
@@ -792,8 +797,16 @@ def _relay_status() -> int:
         print("\nRun: hcom relay on")
         return 0
 
+    exit_code = 0
+
     # Push first (heartbeat - so this device shows as active)
     push(force=True)
+
+    # Pull to catch up immediately
+    _, pull_err = pull()
+    if pull_err:
+        print(f"Pull failed: {pull_err}", file=sys.stderr)
+        exit_code = 1
 
     # Ping relay to check if online
     relay_online = False
@@ -857,7 +870,7 @@ def _relay_status() -> int:
     except Exception:
         print("\nNo other active devices")
 
-    return 0
+    return exit_code
 
 
 def _format_time(timestamp: float) -> str:

@@ -26,7 +26,6 @@ FG_CUSTOM_ENV = '\033[38;5;141m'  # Light purple for Custom Env section
 
 # Parse config defaults from shared.py
 from ..shared import DEFAULT_CONFIG_DEFAULTS
-from ..api import list_available_agents
 
 CONFIG_DEFAULTS = {}
 for line in DEFAULT_CONFIG_DEFAULTS:
@@ -64,11 +63,6 @@ CONFIG_FIELD_OVERRIDES = {
         'type': 'text',
         'allowed_chars': r'^[a-zA-Z0-9-]*$',
         'hint': 'letters/numbers/hyphens only',
-    },
-    'HCOM_AGENT': {
-        'type': 'cycle',
-        'options': lambda: list_available_agents(),
-        'hint': '←→ cycle options',
     },
     'HCOM_RELAY': {
         'type': 'text',

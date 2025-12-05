@@ -231,7 +231,8 @@ def is_safe_hcom_command(command: str) -> bool:
 
     # Remove quoted strings to check for operators/redirects/parens outside quotes
     # This prevents "message with && inside" or "SQL with ()" from being treated as unsafe
-    cmd_no_quotes = re.sub(r'''(['"])(?:(?=(\\?))\2.)*?\1''', '', cmd)
+    # DOTALL makes . match newlines so multiline quoted strings are properly stripped
+    cmd_no_quotes = re.sub(r'''(['"])(?:(?=(\\?))\2.)*?\1''', '', cmd, flags=re.DOTALL)
 
     # Block command substitution parens (only outside quotes - inside quotes they're inert)
     if any(c in cmd_no_quotes for c in ['(', ')']):

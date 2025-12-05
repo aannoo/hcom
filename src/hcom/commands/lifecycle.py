@@ -4,7 +4,6 @@ import sys
 import time
 import random
 import uuid
-import json
 from pathlib import Path
 from .utils import CLIError, format_error, is_interactive, resolve_identity
 from ..shared import FG_YELLOW, RESET, IS_WINDOWS
@@ -27,7 +26,7 @@ from ..hooks.utils import disable_instance
 def cmd_launch(argv: list[str]) -> int:
     """Launch Claude instances: hcom [N] [claude] [args]"""
     # Import from terminal module
-    from ..terminal import build_claude_command, launch_terminal, resolve_agent
+    from ..terminal import build_claude_command, launch_terminal
 
     try:
         # Parse arguments: hcom [N] [claude] [args]
@@ -60,10 +59,6 @@ def cmd_launch(argv: list[str]) -> int:
         if tag and '|' in tag:
             raise CLIError('Tag cannot contain "|" characters.')
 
-        # Get agents from config (comma-separated)
-        agent_env = get_config().agent
-        agents = [a.strip() for a in agent_env.split(',') if a.strip()] if agent_env else ['']
-
         # Phase 1: Parse and merge Claude args (env + CLI with CLI precedence)
         env_spec = resolve_claude_args(None, get_config().claude_args)
         cli_spec = resolve_claude_args(forwarded if forwarded else None, None)
@@ -93,14 +88,11 @@ def cmd_launch(argv: list[str]) -> int:
 
         terminal_mode = get_config().terminal
 
-        # Calculate total instances to launch
-        total_instances = count * len(agents)
-
         # Fail fast for here mode with multiple instances
-        if terminal_mode == 'here' and total_instances > 1:
+        if terminal_mode == 'here' and count > 1:
             print(format_error(
-                f"'here' mode cannot launch {total_instances} instances (it's one terminal window)",
-                "Use 'hcom 1' for one generic instance"
+                f"'here' mode cannot launch {count} instances (it's one terminal window)",
+                "Use 'hcom 1' for one instance"
             ), file=sys.stderr)
             return 1
 
@@ -122,79 +114,52 @@ def cmd_launch(argv: list[str]) -> int:
 
         launched = 0
 
-        # Generate batch ID for notification correlation
-        batch_id = str(uuid.uuid4())
+        # Generate batch ID for notification correlation (8 chars - first UUID segment)
+        batch_id = str(uuid.uuid4()).split('-')[0]
 
-        # Launch count instances of each agent
-        for agent in agents:
-            for _ in range(count):
-                instance_type = agent
-                instance_env = base_env.copy()
+        # Build claude command once (all args passed through to claude CLI)
+        claude_cmd = build_claude_command(claude_args)
 
-                # Generate unique launch token for Windows identity
-                launch_token = str(uuid.uuid4())
-                instance_env['HCOM_LAUNCH_TOKEN'] = launch_token
+        # Launch count instances
+        for _ in range(count):
+            instance_env = base_env.copy()
 
-                # Mark all hcom-launched instances with event ID
-                instance_env['HCOM_LAUNCHED'] = '1'
+            # Generate unique launch token for Windows identity
+            launch_token = str(uuid.uuid4())
+            instance_env['HCOM_LAUNCH_TOKEN'] = launch_token
 
-                # Capture launch event ID for consistent message history start
-                from ..core.db import get_last_event_id
-                instance_env['HCOM_LAUNCH_EVENT_ID'] = str(get_last_event_id())
+            # Mark all hcom-launched instances with event ID
+            instance_env['HCOM_LAUNCHED'] = '1'
 
-                # Track who launched this instance (use the one we already resolved)
-                instance_env['HCOM_LAUNCHED_BY'] = launcher
+            # Capture launch event ID for consistent message history start
+            from ..core.db import get_last_event_id
+            instance_env['HCOM_LAUNCH_EVENT_ID'] = str(get_last_event_id())
 
-                # Track batch for notification correlation
-                instance_env['HCOM_LAUNCH_BATCH_ID'] = batch_id
+            # Track who launched this instance (use the one we already resolved)
+            instance_env['HCOM_LAUNCHED_BY'] = launcher
 
-                # Mark background instances via environment with log filename
+            # Track batch for notification correlation
+            instance_env['HCOM_LAUNCH_BATCH_ID'] = batch_id
+
+            # Mark background instances via environment with log filename
+            if background:
+                # Generate unique log filename
+                log_filename = f'background_{int(time.time())}_{random.randint(1000, 9999)}.log'
+                instance_env['HCOM_BACKGROUND'] = log_filename
+
+            try:
                 if background:
-                    # Generate unique log filename
-                    log_filename = f'background_{int(time.time())}_{random.randint(1000, 9999)}.log'
-                    instance_env['HCOM_BACKGROUND'] = log_filename
-
-                # Build claude command
-                if not instance_type:
-                    # No agent - no agent content
-                    claude_cmd, _ = build_claude_command(
-                        agent_content=None,
-                        claude_args=claude_args
-                    )
+                    log_file = launch_terminal(claude_cmd, instance_env, cwd=os.getcwd(), background=True)
+                    if log_file:
+                        print(f"Headless instance launched, log: {log_file}")
+                        launched += 1
                 else:
-                    # Agent instance
-                    try:
-                        agent_content, agent_config = resolve_agent(instance_type)
-                        # Prepend agent instance awareness to system prompt
-                        agent_prefix = f"You are an instance of {instance_type}. Do not start a subagent with {instance_type} unless explicitly asked.\n\n"
-                        agent_content = agent_prefix + agent_content
-                        # Use agent's model and tools if specified and not overridden in claude_args
-                        agent_model = agent_config.get('model')
-                        agent_tools = agent_config.get('tools')
-                        claude_cmd, _ = build_claude_command(
-                            agent_content=agent_content,
-                            claude_args=claude_args,
-                            model=agent_model,
-                            tools=agent_tools
-                        )
-                        # Agent temp files live under ~/.hcom/scripts/ for unified housekeeping cleanup
-                    except (FileNotFoundError, ValueError) as e:
-                        print(str(e), file=sys.stderr)
-                        continue
+                    if launch_terminal(claude_cmd, instance_env, cwd=os.getcwd()):
+                        launched += 1
+            except Exception as e:
+                print(format_error(f"Failed to launch terminal: {e}"), file=sys.stderr)
 
-                try:
-                    if background:
-                        log_file = launch_terminal(claude_cmd, instance_env, cwd=os.getcwd(), background=True)
-                        if log_file:
-                            print(f"Headless instance launched, log: {log_file}")
-                            launched += 1
-                    else:
-                        if launch_terminal(claude_cmd, instance_env, cwd=os.getcwd()):
-                            launched += 1
-                except Exception as e:
-                    print(format_error(f"Failed to launch terminal: {e}"), file=sys.stderr)
-
-        requested = total_instances
+        requested = count
         failed = requested - launched
 
         if launched == 0:
@@ -207,7 +172,8 @@ def cmd_launch(argv: list[str]) -> int:
         else:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
-        print(f"Wait until instance(s) are ready: hcom events launch")
+        print(f"Batch id: {batch_id}")
+        print(f"Check status of all launches + wait and notify when they're ready: hcom events launch")
 
         # Log launch event
         if launched > 0:
@@ -219,7 +185,6 @@ def cmd_launch(argv: list[str]) -> int:
                     'by': launcher,
                     'batch_id': batch_id,
                     'count_requested': count,
-                    'agents': agents,
                     'launched': launched,
                     'failed': failed,
                     'background': background,

@@ -472,6 +472,8 @@ def iter_instances(enabled_only: bool = False):
 
 # ==================== Launch Batch Queries ====================
 
+LAUNCH_TIMEOUT_SECONDS = 30  # Timeout for batch to become ready
+
 def get_launch_status(launcher: str | None = None) -> dict | None:
     """Get aggregated launch status across all pending/recent batches.
 
@@ -534,8 +536,8 @@ def get_launch_status(launcher: str | None = None) -> dict | None:
     # Use provided launcher or get from first batch
     effective_launcher = launcher or batches[0]['launcher']
 
-    # Cutoff for "recent" - 60s
-    cutoff = datetime.now(timezone.utc).timestamp() - 60
+    # Cutoff for "recent" - successful launch should be ready by then
+    cutoff = datetime.now(timezone.utc).timestamp() - LAUNCH_TIMEOUT_SECONDS
 
     # Priority 1: pending batches (incomplete AND recent - timeout stuck launches)
     pending = []
@@ -651,6 +653,7 @@ __all__ = [
     # Instances (high-level queries)
     'iter_instances',
     # Launch batch
+    'LAUNCH_TIMEOUT_SECONDS',
     'get_launch_status',
     'get_launch_batch',
     # KV store

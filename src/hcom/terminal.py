@@ -1,153 +1,23 @@
 #!/usr/bin/env python3
-"""Terminal launching and agent management for HCOM"""
+"""Terminal launching for HCOM"""
 from __future__ import annotations
 
 import os
 import sys
-import shlex
 import re
+import shlex
 import subprocess
-import tempfile
 import shutil
 import platform
 import random
 from pathlib import Path
 from typing import Any
 
-from .shared import (
-    IS_WINDOWS, CREATE_NO_WINDOW, is_wsl, is_termux,
-    AGENT_NAME_PATTERN,
-)
-from .claude_args import extract_system_prompt_args, merge_system_prompts
+from .shared import IS_WINDOWS, CREATE_NO_WINDOW, is_wsl, is_termux
 from .core.paths import hcom_path, SCRIPTS_DIR, read_file_with_retry
 from .core.config import get_config
 
-# ==================== Agent Management ====================
-
-def list_available_agents() -> list[str]:
-    """List available agent types from .claude/agents/"""
-    agents = []
-    for base_path in (Path.cwd(), Path.home()):
-        agents_dir = base_path / '.claude' / 'agents'
-        if agents_dir.exists():
-            for agent_file in agents_dir.glob('*.md'):
-                name = agent_file.stem
-                if name not in agents and AGENT_NAME_PATTERN.fullmatch(name):
-                    agents.append(name)
-    return sorted(agents)
-
-def extract_agent_config(content: str) -> dict[str, str]:
-    """Extract configuration from agent YAML frontmatter"""
-    if not content.startswith('---'):
-        return {}
-
-    # Find YAML section between --- markers
-    if (yaml_end := content.find('\n---', 3)) < 0:
-        return {}  # No closing marker
-
-    yaml_section = content[3:yaml_end]
-    config = {}
-
-    # Extract model field
-    if model_match := re.search(r'^model:\s*(.+)$', yaml_section, re.MULTILINE):
-        value = model_match.group(1).strip()
-        if value and value.lower() != 'inherit':
-            config['model'] = value
-
-    # Extract tools field
-    if tools_match := re.search(r'^tools:\s*(.+)$', yaml_section, re.MULTILINE):
-        value = tools_match.group(1).strip()
-        if value:
-            config['tools'] = value.replace(', ', ',')
-
-    return config
-
-def strip_frontmatter(content: str) -> str:
-    """Strip YAML frontmatter from agent file"""
-    if content.startswith('---'):
-        # Find the closing --- on its own line
-        lines = content.splitlines()
-        for i, line in enumerate(lines[1:], 1):
-            if line.strip() == '---':
-                return '\n'.join(lines[i+1:]).strip()
-    return content
-
-def resolve_agent(name: str) -> tuple[str, dict[str, str]]:
-    """Resolve agent file by name with validation.
-    Looks for agent files in:
-    1. .claude/agents/{name}.md (local)
-    2. ~/.claude/agents/{name}.md (global)
-    Returns tuple: (content without YAML frontmatter, config dict)
-    """
-    from .commands.utils import format_error
-
-    hint = 'Agent names must use lowercase letters and dashes only'
-    candidate = name.strip()
-    display_name = candidate or name
-
-    if not candidate or not AGENT_NAME_PATTERN.fullmatch(candidate):
-        raise FileNotFoundError(format_error(
-            f"Agent '{display_name}' not found",
-            hint
-        ))
-
-    for base_path in (Path.cwd(), Path.home()):
-        agents_dir = base_path / '.claude' / 'agents'
-        try:
-            agents_dir_resolved = agents_dir.resolve(strict=True)
-        except FileNotFoundError:
-            continue
-
-        agent_path = agents_dir / f'{candidate}.md'
-        if not agent_path.exists():
-            continue
-
-        try:
-            resolved_agent_path = agent_path.resolve(strict=True)
-        except FileNotFoundError:
-            continue
-
-        try:
-            resolved_agent_path.relative_to(agents_dir_resolved)
-        except ValueError:
-            continue
-
-        content = read_file_with_retry(
-            agent_path,
-            lambda f: f.read(),
-            default=None
-        )
-        if content is None:
-            continue
-
-        config = extract_agent_config(content)
-        stripped = strip_frontmatter(content)
-        if not stripped.strip():
-            raise ValueError(format_error(
-                f"Agent '{candidate}' has empty content",
-                'Check the agent file is a valid format and contains text'
-            ))
-        return stripped, config
-
-    available = list_available_agents()
-    if available:
-        hint = f"Available agents: {', '.join(available)}"
-    else:
-        hint = 'No agents found. Create one in .claude/agents/'
-
-    raise FileNotFoundError(format_error(
-        f"Agent '{candidate}' not found in project or user .claude/agents/ folder",
-        hint
-    ))
-
 # ==================== Claude Command Building ====================
-
-def has_claude_arg(claude_args: list[str] | None, arg_names: list[str], arg_prefixes: tuple[str, ...]) -> bool:
-    """Check if argument already exists in claude_args"""
-    return any(
-        arg in arg_names or arg.startswith(arg_prefixes)
-        for arg in (claude_args or [])
-    )
 
 def build_env_string(env_vars: dict[str, Any], format_type: str = "bash") -> str:
     """Build environment variable string for bash shells"""
@@ -164,65 +34,15 @@ def build_env_string(env_vars: dict[str, Any], format_type: str = "bash") -> str
     else:
         return ' '.join(f'{k}={shlex.quote(str(v))}' for k, v in valid_vars.items())
 
-def build_claude_command(agent_content: str | None = None, claude_args: list[str] | None = None, model: str | None = None, tools: str | None = None) -> tuple[str, str | None]:
-    """Build Claude command with proper argument handling
-    Returns tuple: (command_string, temp_file_path_or_none)
-    For agent content, writes to temp file and uses cat to read it.
-    Merges user's --system-prompt/--append-system-prompt with agent content.
-    Prompt comes from claude_args (positional tokens from HCOM_CLAUDE_ARGS).
+def build_claude_command(claude_args: list[str] | None = None) -> str:
+    """Build Claude command string from args.
+    All args (including --agent, --model, etc) are passed through to claude CLI.
     """
     cmd_parts = ['claude']
-    temp_file_path = None
-
-    # Extract user's system prompt flags
-    cleaned_args, user_append, user_system = extract_system_prompt_args(claude_args or [])
-
-    # Add model if specified and not already in cleaned_args
-    if model:
-        if not has_claude_arg(cleaned_args, ['--model'], ('--model=',)):
-            cmd_parts.extend(['--model', model])
-
-    # Add allowed tools if specified and not already in cleaned_args
-    if tools:
-        if not has_claude_arg(cleaned_args, ['--allowedTools', '--allowed-tools', '--allowedtools'],
-                              ('--allowedTools=', '--allowed-tools=', '--allowedtools=')):
-            cmd_parts.extend(['--allowedTools', tools])
-
-    # Add cleaned user args (system prompt flags removed, but positionals/prompt included)
-    if cleaned_args:
-        for arg in cleaned_args:
+    if claude_args:
+        for arg in claude_args:
             cmd_parts.append(shlex.quote(arg))
-
-    # Merge and apply system prompts (agent content + user flags)
-    system_value, append_value = merge_system_prompts(user_append, user_system, agent_content)
-
-    if system_value:
-        # Write system prompt to temp file
-        scripts_dir = hcom_path(SCRIPTS_DIR)
-        temp_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False,
-                                              prefix='hcom_system_', dir=str(scripts_dir))
-        temp_file.write(system_value)
-        temp_file.close()
-        temp_file_path = temp_file.name
-
-        cmd_parts.append('--system-prompt')
-        cmd_parts.append(f'"$(cat {shlex.quote(temp_file_path)})"')
-
-    if append_value:
-        # Write append prompt to temp file
-        scripts_dir = hcom_path(SCRIPTS_DIR)
-        append_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False,
-                                                prefix='hcom_append_', dir=str(scripts_dir))
-        append_file.write(append_value)
-        append_file.close()
-        # Track both temp files for cleanup (only return first for legacy compatibility)
-        if not temp_file_path:
-            temp_file_path = append_file.name
-
-        cmd_parts.append('--append-system-prompt')
-        cmd_parts.append(f'"$(cat {shlex.quote(append_file.name)})"')
-
-    return ' '.join(cmd_parts), temp_file_path
+    return ' '.join(cmd_parts)
 
 # ==================== Script Creation ====================
 
@@ -272,7 +92,6 @@ def create_bash_script(script_file: str, env: dict[str, Any], cwd: str | None, c
     Cleanup behavior:
     - Normal scripts: append 'rm -f' command for self-deletion
     - Background scripts: persist until `hcom reset logs` cleanup (24 hours)
-    - Agent scripts: treated like background (contain 'hcom_agent_')
     """
     with open(script_file, 'w', encoding='utf-8') as f:
         f.write('#!/bin/bash\n')
@@ -336,8 +155,8 @@ def create_bash_script(script_file: str, env: dict[str, Any], cwd: str | None, c
 
         f.write(f'{command_str}\n')
 
-        # Self-delete for normal mode (not background or agent)
-        if not background and 'hcom_agent_' not in command_str:
+        # Self-delete for normal mode (not background)
+        if not background:
             f.write(f'rm -f {shlex.quote(script_file)}\n')
 
     # Make executable on Unix
@@ -483,10 +302,14 @@ def launch_terminal(command: str, env: dict[str, str], cwd: str | None = None, b
         if shell_path:
             env_vars['SHELL'] = shell_path
 
-    # Filter CLAUDECODE to prevent identity inheritance
-    # - TUI (--new-terminal): runs as user (bigboss), not instance
-    # - New instances: get their own CLAUDECODE from Claude Code
-    env_vars.update({k: v for k, v in os.environ.items() if k != 'CLAUDECODE'})
+    # Filter instance-specific vars to prevent identity inheritance from parent Claude
+    # - CLAUDECODE: new instances get their own from Claude Code
+    # - HCOM_* not in KNOWN_CONFIG_KEYS: identity/internal vars (HCOM_LAUNCH_*, HCOM_SESSION_ID, etc.)
+    # Config vars (HCOM_TAG, etc.) are inherited - surfaced in launch context for override
+    # Shell env still overrides config.env for non-HCOM user vars (ANTHROPIC_MODEL, etc)
+    from .core.config import KNOWN_CONFIG_KEYS
+    env_vars.update({k: v for k, v in os.environ.items()
+                     if k != 'CLAUDECODE' and not (k.startswith('HCOM_') and k not in KNOWN_CONFIG_KEYS)})
     command_str = command
 
     # 1) Determine script extension
@@ -646,13 +469,7 @@ def launch_terminal(command: str, env: dict[str, str], cwd: str | None = None, b
 # ==================== Exports ====================
 
 __all__ = [
-    # Agent management
-    'list_available_agents',
-    'extract_agent_config',
-    'strip_frontmatter',
-    'resolve_agent',
     # Claude command building
-    'has_claude_arg',
     'build_env_string',
     'build_claude_command',
     # Script creation

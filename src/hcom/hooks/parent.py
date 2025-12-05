@@ -5,6 +5,7 @@ import sys
 import os
 import time
 import json
+from pathlib import Path
 
 from ..shared import HCOM_INVOCATION_PATTERN
 from ..core.instances import (
@@ -19,6 +20,38 @@ from .utils import (
     build_hcom_bootstrap_text, build_launch_context, build_hcom_command,
     disable_instance, log_hook_error, notify_instance
 )
+
+
+def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
+    """Extract real session_id from CLAUDE_ENV_FILE path, fallback to hook_data.
+
+    Claude Code has a bug where hook_data.session_id is wrong for fork scenarios
+    (--resume X --fork-session). The CLAUDE_ENV_FILE path contains the correct
+    session_id since CC creates the directory with Q0() (current WQ.sessionId).
+
+    Note: hook_data.transcript_path also has the wrong session_id in fork scenarios
+    (both use the same buggy OLD value). Only CLAUDE_ENV_FILE path is reliable.
+
+    Path structure: ~/.claude/session-env/{session_id}/hook-N.sh
+    """
+    from .utils import log_hook_error
+
+    hook_session_id = hook_data.get('session_id', '')
+
+    if env_file:
+        try:
+            parts = Path(env_file).parts
+            if 'session-env' in parts:
+                idx = parts.index('session-env')
+                if idx + 1 < len(parts):
+                    candidate = parts[idx + 1]
+                    # Sanity check: looks like UUID (36 chars, 4 hyphens)
+                    if len(candidate) == 36 and candidate.count('-') == 4:
+                        return candidate
+        except Exception as e:
+            log_hook_error('get_real_session_id:parse_error', e)
+
+    return hook_session_id
 
 
 def handle_stop_pending(hook_type: str, hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any]) -> None:
@@ -53,6 +86,9 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
     # NOTE: CLAUDE_ENV_FILE only works on Unix (Claude Code doesn't source it on Windows).
     # Windows vanilla instances must use MAPID fallback for identity resolution.
     # Windows HCOM-launched instances get HCOM_LAUNCH_TOKEN via launch env.
+    #
+    # Note: session_id is already corrected by dispatcher via get_real_session_id()
+    # to work around CC fork bug where hook_data.session_id is wrong
     session_id = hook_data.get('session_id')
     env_file = os.environ.get('CLAUDE_ENV_FILE')
 
@@ -60,9 +96,8 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
         try:
             with open(env_file, 'a', newline='\n') as f:
                 f.write(f'\nexport HCOM_SESSION_ID={session_id}\n')
-        except Exception:
-            # Fail silently - hook safety
-            pass
+        except Exception as e:
+            log_hook_error('sessionstart:env_file_write', e)
 
     # Store MAPID → session_id mapping for Windows bash command identity resolution
     from ..shared import MAPID
@@ -75,9 +110,8 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
                 (MAPID, session_id, time.time())
             )
             conn.commit()
-        except Exception:
-            # Fail silently - hook safety
-            pass
+        except Exception as e:
+            log_hook_error('sessionstart:mapid_write', e)
 
     # Create instance for HCOM-launched (explicit opt-in via launch)
     if os.environ.get('HCOM_LAUNCHED') == '1' and session_id:
