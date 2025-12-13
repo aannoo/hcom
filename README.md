@@ -168,7 +168,7 @@ etc...
 
 A terminal UI:
 
-![TUI Dashboard](tui.png)
+![TUI Dashboard](https://raw.githubusercontent.com/aannoo/claude-hook-comms/refs/heads/assets/tui.png)
 
 **Screens**
 
