@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """Codex CLI argument parsing and validation.
 
-Similar to claude_args.py but for OpenAI Codex CLI.
-Handles subcommands (exec, resume, review) and their flags.
+Parses Codex CLI arguments with support for:
+- Subcommands (exec, resume, fork, review, mcp, sandbox, etc.)
+- Flag aliases (-m/--model, -c/--config, etc.)
+- Case-sensitive flags (-C/--cd vs -c/--config)
+- Repeatable flags (-c can appear multiple times)
+- Boolean flags (--json, --full-auto, etc.)
 
-Key concepts:
-- is_exec: True when subcommand is 'exec'. Used to REJECT such launches
-  (Codex exec/headless mode is not supported in hcom).
-- is_json: True when --json flag present = JSONL streaming OUTPUT FORMAT
+Key Semantic Flags:
+    is_exec: True when subcommand is 'exec' or 'e'.
+        hcom rejects exec mode - interactive mode works.
+    is_json: True when --json flag present (JSONL output format).
 
-Note: Codex exec (headless) mode is not supported in hcom. Use claude headless instead.
+Sandbox Considerations:
+    Codex runs in a sandboxed environment by default. The preprocessing
+    module handles --add-dir ~/.hcom to allow hcom DB writes.
+
+Usage:
+    >>> spec = resolve_codex_args(['--model', 'gpt-4'], None)
+    >>> spec.get_flag_value('--model')
+    'gpt-4'
 """
 
 from __future__ import annotations
@@ -17,15 +28,30 @@ from __future__ import annotations
 import difflib
 import shlex
 from dataclasses import dataclass
-from typing import Iterable, Literal, Mapping, Sequence, Tuple
+from typing import Final, Literal, Mapping, Sequence, TypeAlias
 
-Subcommand = Literal["exec", "resume", "fork", "review", None]
+from ..args_common import (
+    BaseArgsSpec,
+    SourceType,
+    TokenList,
+    TokenTuple,
+    FlagValuesDict,
+    extract_flag_names_from_tokens as _extract_flag_names_from_tokens,
+    extract_flag_name_from_token as _extract_flag_name_from_token,
+    deduplicate_boolean_flags as _deduplicate_boolean_flags_base,
+    toggle_flag as _toggle_flag,
+)
+
+# Type aliases (Codex-specific)
+Subcommand: TypeAlias = Literal["exec", "resume", "fork", "review", None]
+
+# ==================== Subcommand Classification ====================
 
 # Subcommands that indicate exec mode (not supported in hcom)
-_EXEC_SUBCOMMANDS = {"exec", "e"}  # e is alias for exec
+_EXEC_SUBCOMMANDS: Final[frozenset[str]] = frozenset({"exec", "e"})  # e is alias for exec
 
 # All known subcommands (from codex --help)
-_SUBCOMMANDS = {
+_SUBCOMMANDS: Final[frozenset[str]] = frozenset({
     "exec",
     "e",  # e is alias for exec
     "resume",
@@ -44,11 +70,13 @@ _SUBCOMMANDS = {
     "cloud",
     "features",
     "help",
-}
+})
+
+# ==================== Flag Classification ====================
 
 # Flag aliases: map short forms to canonical long forms
 # Keys and values are lowercase
-_FLAG_ALIASES: Mapping[str, str] = {
+_FLAG_ALIASES: Final[Mapping[str, str]] = {
     "-m": "--model",
     "-c": "--config",
     "-i": "--image",
@@ -61,11 +89,11 @@ _FLAG_ALIASES: Mapping[str, str] = {
 
 # Canonical forms for case-sensitive flags
 # -C is --cd (uppercase C), -c is --config (lowercase c)
-_CASE_SENSITIVE_FLAGS = {"-C": "--cd", "-c": "--config"}
+_CASE_SENSITIVE_FLAGS: Final[Mapping[str, str]] = {"-C": "--cd", "-c": "--config"}
 
 # Boolean flags (no value required)
 # Note: Use lowercase for short flags since matching uses token.lower()
-_BOOLEAN_FLAGS = {
+_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset({
     # Global
     "--oss",
     "--full-auto",
@@ -84,10 +112,10 @@ _BOOLEAN_FLAGS = {
     "--all",
     # Review-specific
     "--uncommitted",
-}
+})
 
 # Flags that require a following value (lowercase for matching, except case-sensitive ones)
-_VALUE_FLAGS = {
+_VALUE_FLAGS: Final[frozenset[str]] = frozenset({
     # Global (short and long forms)
     "-c",
     "--config",
@@ -115,13 +143,13 @@ _VALUE_FLAGS = {
     "--base",
     "--commit",
     "--title",
-}
+})
 
 # Case-sensitive value flags (must match exactly)
-_CASE_SENSITIVE_VALUE_FLAGS = {"-C", "-c"}
+_CASE_SENSITIVE_VALUE_FLAGS: Final[frozenset[str]] = frozenset({"-C", "-c"})
 
 # Flags with = syntax prefixes (lowercase for matching)
-_VALUE_FLAG_PREFIXES = {
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset({
     "-c=",
     "--config=",
     "--enable=",
@@ -146,10 +174,10 @@ _VALUE_FLAG_PREFIXES = {
     "--base=",
     "--commit=",
     "--title=",
-}
+})
 
 # Used for friendly "did you mean" suggestions when user typos a flag.
-_KNOWN_CODEX_OPTIONS = sorted(
+_KNOWN_CODEX_OPTIONS: Final[list[str]] = sorted(
     {
         *_BOOLEAN_FLAGS,
         *_VALUE_FLAGS,
@@ -161,10 +189,10 @@ _KNOWN_CODEX_OPTIONS = sorted(
 )
 
 # Case-sensitive prefixes
-_CASE_SENSITIVE_PREFIXES = {"-C=", "-c="}
+_CASE_SENSITIVE_PREFIXES: Final[frozenset[str]] = frozenset({"-C=", "-c="})
 
 # Repeatable flags (can appear multiple times)
-_REPEATABLE_FLAGS = {
+_REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset({
     "-c",
     "--config",
     "--enable",
@@ -172,53 +200,23 @@ _REPEATABLE_FLAGS = {
     "-i",
     "--image",
     "--add-dir",
-}
+})
 
 
 @dataclass(frozen=True)
-class CodexArgsSpec:
+class CodexArgsSpec(BaseArgsSpec):
     """Normalized representation of Codex CLI arguments.
 
+    Inherits common fields and methods from BaseArgsSpec.
     Key fields for launch logic:
     - is_exec: True = exec subcommand detected. Used to REJECT such launches
       (Codex exec/headless mode is not supported in hcom).
     - is_json: True = JSONL output format (--json flag)
     """
 
-    source: Literal["cli", "env", "none"]
-    raw_tokens: Tuple[str, ...]
-    clean_tokens: Tuple[str, ...]
-    subcommand: Subcommand
-    positional_tokens: Tuple[str, ...]
-    positional_indexes: Tuple[int, ...]
-    is_json: bool  # --json flag: JSONL output format
-    is_exec: bool  # exec subcommand: detected for rejection (not supported in hcom)
-    flag_values: Mapping[str, str | list[str]]  # Single or list for repeatable
-    errors: Tuple[str, ...] = ()
-
-    def has_flag(
-        self,
-        names: Iterable[str] | None = None,
-        prefixes: Iterable[str] | None = None,
-    ) -> bool:
-        """Check for user-provided flags (only scans before -- separator)."""
-        name_set = {n.lower() for n in (names or ())}
-        prefix_tuple = tuple(p.lower() for p in (prefixes or ()))
-
-        # Only scan tokens before --
-        try:
-            dash_idx = self.clean_tokens.index("--")
-            tokens_to_scan = self.clean_tokens[:dash_idx]
-        except ValueError:
-            tokens_to_scan = self.clean_tokens
-
-        for token in tokens_to_scan:
-            lower = token.lower()
-            if lower in name_set:
-                return True
-            if any(lower.startswith(prefix) for prefix in prefix_tuple):
-                return True
-        return False
+    subcommand: Subcommand = None
+    is_json: bool = False  # --json flag: JSONL output format
+    is_exec: bool = False  # exec subcommand: detected for rejection (not supported in hcom)
 
     def get_flag_value(self, flag_name: str) -> str | list[str] | None:
         """Get value of a flag.
@@ -277,17 +275,25 @@ class CodexArgsSpec:
 
         return last_value
 
-    def rebuild_tokens(self, include_subcommand: bool = True) -> list[str]:
-        """Return token list suitable for invoking Codex."""
-        tokens: list[str] = []
+    def rebuild_tokens(
+        self,
+        include_positionals: bool = True,
+        *,
+        include_subcommand: bool = True,
+    ) -> TokenList:
+        """Return token list suitable for invoking Codex.
+
+        Overrides base class to prepend subcommand if present.
+
+        Args:
+            include_positionals: Include positional arguments (inherited from base)
+            include_subcommand: Include subcommand prefix (Codex-specific)
+        """
+        tokens: TokenList = []
         if include_subcommand and self.subcommand:
             tokens.append(self.subcommand)
-        tokens.extend(self.clean_tokens)
+        tokens.extend(super().rebuild_tokens(include_positionals))
         return tokens
-
-    def to_env_string(self) -> str:
-        """Render tokens into a shell-safe env string."""
-        return shlex.join(self.rebuild_tokens())
 
     def update(
         self,
@@ -334,9 +340,6 @@ class CodexArgsSpec:
         combined.extend(tokens)
 
         return _parse_tokens(combined, self.source)
-
-    def has_errors(self) -> bool:
-        return bool(self.errors)
 
 
 def resolve_codex_args(
@@ -491,22 +494,22 @@ def validate_conflicts(spec: CodexArgsSpec) -> list[str]:
 
 def _parse_tokens(
     tokens: Sequence[str],
-    source: Literal["cli", "env", "none"],
+    source: SourceType,
     initial_errors: Sequence[str] | None = None,
 ) -> CodexArgsSpec:
-    errors = list(initial_errors or [])
-    clean: list[str] = []
-    positional: list[str] = []
+    errors: list[str] = list(initial_errors or [])
+    clean: TokenList = []
+    positional: TokenList = []
     positional_indexes: list[int] = []
-    flag_values: dict[str, str | list[str]] = {}
+    flag_values: FlagValuesDict = {}
 
     subcommand: Subcommand = None
-    is_json = False
+    is_json: bool = False
     pending_flag: str | None = None
-    after_double_dash = False
+    after_double_dash: bool = False
 
-    i = 0
-    raw_tokens = tuple(tokens)
+    i: int = 0
+    raw_tokens: TokenTuple = tuple(tokens)
 
     # Check for subcommand as first token
     if tokens and tokens[0].lower() in _SUBCOMMANDS:
@@ -672,59 +675,12 @@ def _looks_like_flag(token_lower: str) -> bool:
     return False
 
 
-def _extract_flag_names_from_tokens(tokens: Sequence[str]) -> set[str]:
-    """Extract normalized flag names from token list."""
-    flag_names = set()
-    for token in tokens:
-        flag_name = _extract_flag_name_from_token(token)
-        if flag_name:
-            flag_names.add(flag_name)
-    return flag_names
-
-
-def _extract_flag_name_from_token(token: str) -> str | None:
-    """Extract flag name from a token."""
-    token_lower = token.lower()
-
-    if not token_lower.startswith("-"):
-        return None
-
-    if "=" in token_lower:
-        return token_lower.split("=")[0]
-
-    return token_lower
-
-
-def _deduplicate_boolean_flags(tokens: Sequence[str]) -> list[str]:
+def _deduplicate_boolean_flags(tokens: Sequence[str]) -> TokenList:
     """Remove duplicate boolean flags, keeping first occurrence."""
-    seen_flags: set[str] = set()
-    result = []
-
-    for token in tokens:
-        token_lower = token.lower()
-        if token_lower in _BOOLEAN_FLAGS:
-            if token_lower in seen_flags:
-                continue
-            seen_flags.add(token_lower)
-        result.append(token)
-
-    return result
+    return _deduplicate_boolean_flags_base(tokens, _BOOLEAN_FLAGS)
 
 
-def _toggle_flag(tokens: Sequence[str], flag: str, desired: bool) -> list[str]:
-    """Toggle a boolean flag."""
-    tokens_list = list(tokens)
-    flag_lower = flag.lower()
-
-    # Remove existing occurrences
-    filtered = [t for t in tokens_list if t.lower() != flag_lower]
-
-    if desired:
-        return [flag] + filtered
-    return filtered
-
-
-def _set_prompt(tokens: Sequence[str], value: str, positional_indexes: Sequence[int] = ()) -> list[str]:
+def _set_prompt(tokens: Sequence[str], value: str, positional_indexes: Sequence[int] = ()) -> TokenList:
     """Set or replace positional prompt.
 
     Args:
@@ -732,7 +688,7 @@ def _set_prompt(tokens: Sequence[str], value: str, positional_indexes: Sequence[
         value: New prompt value
         positional_indexes: Indexes of actual positional tokens in the list
     """
-    tokens_list = list(tokens)
+    tokens_list: TokenList = list(tokens)
     if positional_indexes:
         # Replace first positional
         tokens_list[positional_indexes[0]] = value
@@ -742,7 +698,7 @@ def _set_prompt(tokens: Sequence[str], value: str, positional_indexes: Sequence[
     return tokens_list
 
 
-def _remove_positional(tokens: Sequence[str], positional_indexes: Sequence[int] = ()) -> list[str]:
+def _remove_positional(tokens: Sequence[str], positional_indexes: Sequence[int] = ()) -> TokenList:
     """Remove first positional argument.
 
     Args:
@@ -752,5 +708,9 @@ def _remove_positional(tokens: Sequence[str], positional_indexes: Sequence[int] 
     if not positional_indexes:
         return list(tokens)  # Nothing to remove
     # Remove first positional
-    idx = positional_indexes[0]
+    idx: int = positional_indexes[0]
     return list(tokens[:idx]) + list(tokens[idx + 1 :])
+
+
+# ==================== Codex Args Preprocessing ====================
+# Re-export from preprocessing.py (canonical location) for backwards compatibility

@@ -263,10 +263,12 @@ IDENTITY_ALLOWLIST = frozenset(
         "relay",  # Works without identity
         "archive",  # Query-only, no identity needed
         "events",  # Query-only mode works without identity
+        "transcript",  # Query-only (search, timeline, @name all work without identity)
         "config",  # View/edit config, no identity needed
         "list",  # Query-only, no identity needed
         "shim",  # System setup, no identity needed
         "hooks",  # Hook management, no identity needed
+        "bundle",  # Query-only without identity
     }
 )
 
@@ -397,6 +399,7 @@ from .commands import (
     cmd_status,  # noqa: F401 (used dynamically via globals())
     cmd_shim,  # noqa: F401 (used dynamically via globals())
     cmd_hooks,  # noqa: F401 (used dynamically via globals())
+    cmd_bundle,  # noqa: F401 (used dynamically via globals())
     CLIError,
     format_error,
 )
@@ -441,6 +444,7 @@ COMMANDS = (
     "events",
     "send",
     "listen",
+    "bundle",
     "stop",
     "start",
     "kill",
@@ -555,9 +559,10 @@ def _maybe_deliver_pending_messages(
     if argv and "--json" in argv:
         return
 
+    from .shared import HcomError
+
     try:
         from .core.identity import resolve_identity
-        from .shared import HcomError
 
         identity = ctx.identity if ctx else None
         if identity is None:
@@ -1060,36 +1065,6 @@ def main(argv: list[str] | None = None) -> int | None:
                     return 1
         except (ValueError, HcomError):
             pass  # Can't resolve identity - not relevant
-
-    # Codex bootstrap gate: require `hcom listen` before allowing other commands.
-    # Codex doesn't have Claude-style hooks to reliably inject bootstrap early, so we
-    # enforce a simple first-step handshake: `listen` marks name_announced=true.
-    if cmd and not explicit_name and not is_launch_cmd:
-        try:
-            from .core.identity import resolve_identity
-            from .core.tool_utils import build_hcom_command
-
-            identity = ctx.identity if ctx else None
-            if identity is None:
-                identity = resolve_identity()
-            if (
-                identity.kind == "instance"
-                and identity.instance_data
-                and identity.instance_data.get("tool") == "codex"
-                and not identity.instance_data.get("name_announced", False)
-            ):
-                if cmd not in ("listen", "codex-notify"):
-                    hcom_cmd = build_hcom_command()
-                    print(
-                        format_error(
-                            f"Codex instance not initialized - you must run '{hcom_cmd} listen' first",
-                            f"Use: {hcom_cmd} listen",
-                        ),
-                        file=sys.stderr,
-                    )
-                    return 1
-        except Exception:
-            pass
 
     # Route to commands
     try:

@@ -32,6 +32,7 @@ SAFE_HCOM_COMMANDS = [
     "config",
     "transcript",
     "archive",
+    "bundle",
     "status",
     "--version",
     "-v",
@@ -292,42 +293,25 @@ def stop_instance(
     if tool == "claude":
         notify_instance(instance_name)
 
-    # Log stopped event with snapshot for transcript access
-    try:
-        log_event(
-            "life",
-            instance_name,
-            {
-                "action": "stopped",
-                "by": initiated_by,
-                "reason": reason,
-                "snapshot": {
-                    "transcript_path": instance_data.get("transcript_path", ""),
-                    "session_id": instance_data.get("session_id", ""),
-                    "tool": tool,
-                    "directory": instance_data.get("directory", ""),
-                    "parent_name": instance_data.get("parent_name", ""),
-                    "tag": instance_data.get("tag", ""),
-                    "wait_timeout": instance_data.get("wait_timeout"),
-                    "subagent_timeout": instance_data.get("subagent_timeout"),
-                    "hints": instance_data.get("hints", ""),
-                    "pid": instance_data.get("pid"),
-                    "created_at": instance_data.get("created_at"),
-                    "background": instance_data.get("background", 0),
-                    "agent_id": instance_data.get("agent_id", ""),
-                    "launch_args": instance_data.get("launch_args", ""),
-                    "origin_device_id": instance_data.get("origin_device_id", ""),
-                    "background_log_file": instance_data.get("background_log_file", ""),
-                },
-            },
-        )
-        from ..relay import push
-
-        push()
-    except Exception as e:
-        from .log import log_error
-
-        log_error("core", "db.error", e, op="stop_instance")
+    # Prepare snapshot before delete (for forensics/transcript access)
+    snapshot = {
+        "transcript_path": instance_data.get("transcript_path", ""),
+        "session_id": instance_data.get("session_id", ""),
+        "tool": tool,
+        "directory": instance_data.get("directory", ""),
+        "parent_name": instance_data.get("parent_name", ""),
+        "tag": instance_data.get("tag", ""),
+        "wait_timeout": instance_data.get("wait_timeout"),
+        "subagent_timeout": instance_data.get("subagent_timeout"),
+        "hints": instance_data.get("hints", ""),
+        "pid": instance_data.get("pid"),
+        "created_at": instance_data.get("created_at"),
+        "background": instance_data.get("background", 0),
+        "agent_id": instance_data.get("agent_id", ""),
+        "launch_args": instance_data.get("launch_args", ""),
+        "origin_device_id": instance_data.get("origin_device_id", ""),
+        "background_log_file": instance_data.get("background_log_file", ""),
+    }
 
     # Cleanup bindings and stop subagents
     session_id = instance_data.get("session_id")
@@ -346,7 +330,24 @@ def stop_instance(
     except Exception:
         pass
 
-    delete_instance(instance_name)
+    # Delete first, then log - prevents duplicate stopped events on race conditions
+    if not delete_instance(instance_name):
+        return
+
+    # Log stopped event only after successful delete
+    try:
+        log_event(
+            "life",
+            instance_name,
+            {"action": "stopped", "by": initiated_by, "reason": reason, "snapshot": snapshot},
+        )
+        from ..relay import push
+
+        push()
+    except Exception as e:
+        from .log import log_error
+
+        log_error("core", "db.error", e, op="stop_instance")
 
 
 def create_orphaned_pty_identity(

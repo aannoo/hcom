@@ -5,12 +5,13 @@ Usage:
     wrapper.run()  # Blocks until child exits
 
 Inject text from another process:
-    echo 'your message' | nc localhost <PORT>
+    printf 'your message\r' | nc localhost <PORT>
 
 Note: This module requires Unix-only APIs (ptyprocess, termios) and is not available on Windows.
 """
 
 import sys
+import re
 
 # Platform guard - PTY requires Unix-only APIs
 if sys.platform == "win32":
@@ -32,7 +33,8 @@ import struct
 import fcntl
 import time
 import atexit
-from typing import Callable, cast
+from pathlib import Path
+from typing import Any, Callable, cast
 
 import ptyprocess
 import pyte
@@ -57,9 +59,7 @@ class ScreenStabilityTracker:
         self._last_change: float = time.monotonic()
         self._lock = threading.Lock()
 
-    def check_dirty(
-        self, screen: pyte.Screen, instance_name: str = ""
-    ) -> set[int] | None:
+    def check_dirty(self, screen: pyte.Screen, instance_name: str = "") -> set[int] | None:
         """Check and clear screen.dirty, updating last_change if dirty.
 
         Returns:
@@ -85,9 +85,7 @@ class ScreenStabilityTracker:
         if snapshot:
             from ..core.log import log_info
 
-            log_info(
-                "pty", "stability.dirty", instance=instance_name, lines=len(snapshot)
-            )
+            log_info("pty", "stability.dirty", instance=instance_name, lines=len(snapshot))
         return snapshot if snapshot else None
 
     def is_stable(self, seconds: float | None = None, instance_name: str = "") -> bool:
@@ -126,52 +124,86 @@ class PTYWrapper:
     OSC9_APPROVAL = b"\x1b]9;Approval requested"  # exec or MCP elicitation
     OSC9_EDIT = b"\x1b]9;Codex wants to edit"  # file edits
 
+    # Filter out terminal title escape sequences (OSC 0/1/2) from child output
+    # Claude Code sets these dynamically based on conversation - we override with our own
+    _TITLE_ESCAPE_RE = re.compile(rb"\x1b\][012];[^\x07]*\x07")
+
     def __init__(
         self,
         command: list[str],
         instance_name: str | None = None,
+        tool: str | None = None,
         port: int = 0,
         on_output: Callable[[bytes], None] | None = None,
         on_input: Callable[[bytes], None] | None = None,
         user_activity_cooldown: float = 0.5,
         ready_pattern: bytes | None = None,
+        on_ready: Callable[[int], None] | None = None,
     ):
         """Initialize PTY wrapper.
 
         Args:
             command: Command to run (e.g., ['gemini'])
             instance_name: Optional instance name for logging
+            tool: Tool identifier ("claude", "gemini", "codex") for prompt parsing
             port: TCP port for injection (0 = auto-assign)
             on_output: Optional callback called with each output chunk: on_output(data: bytes)
             on_input: Optional callback called with each stdin chunk: on_input(data: bytes)
             user_activity_cooldown: Seconds after last keystroke before safe to inject (default 0.5)
             ready_pattern: Bytes pattern to detect ready state in output (e.g., b'? for shortcuts')
+            on_ready: Optional callback called when PTY is ready: on_ready(actual_port: int)
         """
         self.command = command
         self.instance_name = instance_name
+        self.tool = tool
         self.port = port  # 0 = auto-assign
         self.on_output = on_output  # Callback for output monitoring
         self.on_input = on_input  # Callback for input monitoring
         self.user_activity_cooldown = user_activity_cooldown
         self.ready_pattern = ready_pattern
+        self._on_ready_callback = on_ready  # Callback when PTY is ready
+
+        # Debug mode (enabled via HCOM_PTY_DEBUG env var)
+        self._debug_enabled = os.environ.get("HCOM_PTY_DEBUG") == "1"
+        self._debug_counter = 0
+        self._debug_file = None
+        self._debug_last_periodic_dump = 0.0
+        if self._debug_enabled:
+            # Try to use hcom logs dir first, fallback to temp
+            try:
+                hcom_dir = os.environ.get("HCOM_DIR", str(Path.home() / ".hcom"))
+                debug_dir = Path(hcom_dir) / ".tmp" / "logs" / "pty_debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                debug_path = debug_dir / f"{instance_name or 'unknown'}_{os.getpid()}.log"
+            except Exception:
+                import tempfile
+
+                debug_path = (
+                    Path(tempfile.gettempdir()) / f"hcom_pty_debug_{instance_name or 'unknown'}_{os.getpid()}.log"
+                )
+
+            try:
+                self._debug_file = open(debug_path, "w")
+                # Can't call _debug_log yet (it's defined later), write directly
+                self._debug_file.write(f"PTY Debug log started for {instance_name}\n")
+                self._debug_file.write(f"Debug file: {debug_path}\n")
+                self._debug_file.write("Will dump screen state every 5 seconds\n")
+                self._debug_file.flush()
+            except Exception as e:
+                print(f"Failed to open debug file: {e}", file=sys.stderr)
+                self._debug_enabled = False
 
         self._ptyproc: ptyprocess.PtyProcess | None = None
         self.pid: int | None = None
-        self.orig_termios = None
+        self.orig_termios: list[Any] | None = None
         self.running = False
         self.server_socket: socket.socket | None = None
         self.actual_port: int | None = None
         self.last_user_input: float = 0.0  # Timestamp of last stdin activity
-        self._last_idle_time: float = (
-            0.0  # Timestamp when status last became "listening"
-        )
+        self._last_idle_time: float = 0.0  # Timestamp when status last became "listening"
         self._output_buffer: bytes = b""  # Rolling buffer for pattern detection
-        self._waiting_approval: bool = (
-            False  # True when OSC9 approval notification detected
-        )
-        self._last_output_time: float = (
-            time.monotonic()
-        )  # Track when last output received
+        self._waiting_approval: bool = False  # True when OSC9 approval notification detected
+        self._last_output_time: float = time.monotonic()  # Track when last output received
         self._resize_timer: threading.Timer | None = None  # Debounce resize signals
 
         # Decode ready pattern once for screen scanning
@@ -188,9 +220,7 @@ class PTYWrapper:
         # pyte terminal emulation for screen tracking
         rows, cols = self.get_terminal_size()
         self._screen = pyte.Screen(cols, rows)
-        self._stream = pyte.ByteStream(
-            self._screen
-        )  # ByteStream handles incremental UTF-8
+        self._stream = pyte.ByteStream(self._screen)  # ByteStream handles incremental UTF-8
 
         # Snapshot-based stability tracking
         self._stability_tracker = ScreenStabilityTracker(stability_seconds=1.0)
@@ -348,15 +378,15 @@ class PTYWrapper:
             except Exception:
                 text = data.decode("latin-1")
 
-            text = text.rstrip("\r\n")
+            # Preserve explicit CRs; strip only a single trailing LF from nc/echo
+            if text.endswith("\n"):
+                text = text[:-1]
             if text:
                 os.write(self._ptyproc.fd, text.encode("utf-8", "surrogateescape"))
-                time.sleep(0.1)  # Wait for terminal to process before Enter
-            os.write(self._ptyproc.fd, b"\r")  # Send Enter
 
     def _render_line_from_buffer(self, row_idx: int) -> str:
         """Render single line from buffer without building full display."""
-        row_data = self._screen.buffer.get(row_idx, {})
+        row_data: dict[int, Any] = self._screen.buffer.get(row_idx, {})
         # Build line with proper column ordering
         line = [" "] * self._screen.columns
         for col, char in row_data.items():
@@ -414,16 +444,11 @@ class PTYWrapper:
             pass  # Don't break on malformed sequences
 
         # Check dirty rows and invalidate caches
-        dirty_rows = self._stability_tracker.check_dirty(
-            self._screen, self.instance_name or ""
-        )
+        dirty_rows = self._stability_tracker.check_dirty(self._screen, self.instance_name or "")
         self._invalidate_caches_for_dirty(dirty_rows)
 
         # Detect OSC9 approval notifications
-        if (
-            self.OSC9_APPROVAL in self._output_buffer
-            or self.OSC9_EDIT in self._output_buffer
-        ):
+        if self.OSC9_APPROVAL in self._output_buffer or self.OSC9_EDIT in self._output_buffer:
             self._waiting_approval = True
 
     def _handle_pty_output(self) -> bool:
@@ -434,8 +459,10 @@ class PTYWrapper:
             data = os.read(self._ptyproc.fd, 1024)
             if not data:
                 return False
-            os.write(sys.stdout.fileno(), data)
-            self._update_output_buffer(data)
+            # Strip terminal title sequences from child (Claude sets these dynamically)
+            filtered = self._TITLE_ESCAPE_RE.sub(b"", data)
+            os.write(sys.stdout.fileno(), filtered)
+            self._update_output_buffer(data)  # Keep original for pattern detection
             if self.on_output:
                 try:
                     self.on_output(data)
@@ -495,18 +522,26 @@ class PTYWrapper:
 
         # Register injection server
         if self.server_socket:
-            self._sel.register(
-                self.server_socket, selectors.EVENT_READ, "inject_accept"
-            )
+            self._sel.register(self.server_socket, selectors.EVENT_READ, "inject_accept")
 
         # Register wake pipe
         self._sel.register(self._wake_r, selectors.EVENT_READ, "wake")
 
+        # Use shorter timeout when debug enabled for periodic screen dumps
+        select_timeout = 5.0 if self._debug_enabled else None
+
         while self.running and self._ptyproc and self._ptyproc.isalive():
             try:
-                events = self._sel.select(timeout=None)  # Block indefinitely
+                events = self._sel.select(timeout=select_timeout)
             except (ValueError, OSError):
                 break
+
+            # Periodic screen dump when debug enabled (on timeout with no events)
+            if self._debug_enabled and not events:
+                if time.time() - self._debug_last_periodic_dump >= 5.0:
+                    self._debug_dump_screen("Periodic dump (io_loop)")
+                    self._debug_last_periodic_dump = time.time()
+                continue
 
             for key, _ in events:
                 if key.data == "wake":
@@ -575,10 +610,7 @@ class PTYWrapper:
 
     def _log_prompt_check(self, result: bool, reason: str, **extra) -> None:
         """Log prompt check result only on state change (debounce)."""
-        if (
-            result == self._last_prompt_check_result
-            and reason == self._last_prompt_check_reason
-        ):
+        if result == self._last_prompt_check_result and reason == self._last_prompt_check_reason:
             return  # Same state, don't log
         self._last_prompt_check_result = result
         self._last_prompt_check_reason = reason
@@ -592,6 +624,112 @@ class PTYWrapper:
             reason=reason,
             **extra,
         )
+
+    def _get_claude_input_text(self) -> tuple[str | None, str]:
+        """Extract Claude input box text and reason.
+
+        Returns:
+            (text, reason)
+            - text: "" if placeholder/empty, user text if present, None if prompt not found
+            - reason: "empty", "placeholder", "llm_suggestion", "has_text",
+                      "no_prompt_found", or "display_error"
+        """
+        try:
+            display = self._screen.display
+        except (IndexError, KeyError, RuntimeError):
+            return None, "display_error"
+
+        for row_idx, row in enumerate(display):
+            # Find ❯ at start of line
+            col = 0
+            while col < len(row) and row[col] == " ":
+                col += 1
+            if col >= len(row) or row[col] != "❯":
+                continue
+
+            # Check borders above and below (always present in Claude's UI)
+            if row_idx == 0 or "─" not in display[row_idx - 1]:
+                continue  # Skip rows without border above
+            if row_idx + 1 >= len(display) or "─" not in display[row_idx + 1]:
+                continue  # Skip rows without border below
+
+            # Find input area start (after ❯ and space - there's a nbsp \xa0 after ❯)
+            input_start_col = col + 1
+            while input_start_col < len(row) and row[input_start_col] in " \xa0":
+                input_start_col += 1
+
+            text_after_prompt = row[input_start_col:].rstrip()
+            if not text_after_prompt:
+                return "", "empty"
+            if text_after_prompt.startswith('Try "'):
+                return "", "placeholder"
+            if "↵" in text_after_prompt:
+                return "", "llm_suggestion"
+            return text_after_prompt, "has_text"
+
+        return None, "no_prompt_found"
+
+    def get_input_box_text(self) -> str | None:
+        """Extract text currently in input box.
+
+        Returns:
+            str: Text in input box (empty string if placeholder visible)
+            None: Input box not found (in menu, not at prompt)
+
+        Note:
+            Requires self.tool to be set to a supported tool. If unset, this logs
+            and returns None to avoid unreliable heuristics.
+        """
+        tool = (self.tool or "").lower()
+        if tool == "claude":
+            text, _reason = self._get_claude_input_text()
+            return text
+        if tool == "gemini":
+            return self._get_gemini_input_text()
+        if tool == "codex":
+            return self._get_codex_input_text()
+
+        from ..core.log import log_error
+
+        log_error(
+            "pty",
+            "prompt.detect",
+            "tool not set; refusing prompt detection",
+            instance=self.instance_name or "",
+        )
+        return None
+
+    def _get_gemini_input_text(self) -> str | None:
+        """Extract Gemini input text or None if prompt not found."""
+        if self.is_ready():
+            return ""
+        try:
+            display = self._screen.display
+        except (IndexError, KeyError, RuntimeError):
+            return None
+
+        for row_idx in range(len(display) - 1):
+            if "╭" in display[row_idx] and "│ >" in display[row_idx + 1]:
+                row = display[row_idx + 1]
+                if "│ >" in row and "│" in row:
+                    text = row.split("│ >", 1)[1].split("│", 1)[0].strip()
+                    return text
+        return None
+
+    def _get_codex_input_text(self) -> str | None:
+        """Extract Codex input text or None if prompt not found."""
+        if self.is_ready():
+            return ""
+        try:
+            display = self._screen.display
+        except (IndexError, KeyError, RuntimeError):
+            return None
+
+        for row in display[-10:]:
+            stripped = row.lstrip()
+            if stripped.startswith("› "):
+                return stripped.split("› ", 1)[1].rstrip()
+        return None
 
     def is_prompt_empty(self) -> bool:
         """Check if Claude's input box is visible and has no user text.
@@ -615,101 +753,19 @@ class PTYWrapper:
             True if prompt visible with placeholder/empty (safe to inject).
             False if user has typed uncommitted text (block injection).
         """
-        try:
-            display = self._screen.display
-        except (IndexError, KeyError, RuntimeError):
-            # pyte can crash on malformed screen buffer or race condition
-            self._log_prompt_check(False, "display_error")
+        text, reason = self._get_claude_input_text()
+        if text is None:
+            self._log_prompt_check(False, reason)
             return False
-
-        for row_idx, row in enumerate(display):
-            # Find ❯ at start of line
-            col = 0
-            while col < len(row) and row[col] == " ":
-                col += 1
-            if col >= len(row) or row[col] != "❯":
-                continue
-
-            # Check borders above and below (always present in Claude's UI)
-            if row_idx == 0 or "─" not in display[row_idx - 1]:
-                continue  # Skip rows without border above
-            if row_idx + 1 >= len(display) or "─" not in display[row_idx + 1]:
-                continue  # Skip rows without border below
-
-            # Found valid prompt row
-            # Note: Grey prompt check removed - redundant with require_idle gate
-            # (hooks set DB status) and caused false positives in Ghostty
-
-            # Find input area start (after ❯ and space - there's a nbsp \xa0 after ❯)
-            input_start_col = col + 1
-            while input_start_col < len(row) and row[input_start_col] in " \xa0":
-                input_start_col += 1
-
-            # Get text after prompt
-            text_after_prompt = row[input_start_col:].rstrip()
-
-            # Completely empty input = definitely safe
-            if not text_after_prompt:
-                self._log_prompt_check(True, "empty")
-                return True
-
-            # STATIC PLACEHOLDER: always starts with 'Try "'
-            # e.g., 'Try "fix lint errors"', 'Try "refactor lifecycle.py"'
-            if text_after_prompt.startswith('Try "'):
-                self._log_prompt_check(True, "placeholder")
-                return True
-
-            # LLM SUGGESTION: always ends with '↵ send'
-            # The ↵ send is right-aligned and dimmed
-            if "↵" in text_after_prompt:
-                self._log_prompt_check(True, "llm_suggestion")
-                return True
-
-            # Neither pattern = user has typed text
-            self._log_prompt_check(False, "has_text", text=text_after_prompt[:40])
-            return False
-
-        # No valid prompt found
-        self._log_prompt_check(False, "no_prompt_found", screen_lines=len(display))
+        if text == "":
+            self._log_prompt_check(True, reason)
+            return True
+        self._log_prompt_check(False, "has_text", text=text[:40])
         return False
 
-    def _is_grey_color(self, fg) -> bool:
-        """Check if foreground color is grey (placeholder/processing).
-
-        Claude uses true color hex strings like "505050" for grey.
-        """
-        if fg == "default":
-            return False  # Normal text
-
-        # True color hex string (e.g., "505050")
-        if isinstance(fg, str) and len(fg) == 6:
-            try:
-                r = int(fg[0:2], 16)
-                g = int(fg[2:4], 16)
-                b = int(fg[4:6], 16)
-                # Grey = similar RGB values, darker shades only
-                # Claude's processing grey is ~505050 (80,80,80)
-                # Normal prompt in Ghostty can be 999999 (153,153,153) - not processing
-                if abs(r - g) < 40 and abs(g - b) < 40 and max(r, g, b) < 120:
-                    return True
-            except ValueError:
-                pass
-
-        # ANSI color names for grey
-        if fg in ("black", "brightblack"):
-            return True
-
-        # 256-color grey scale (232-255)
-        if isinstance(fg, int) and 232 <= fg <= 255:
-            return True
-
-        # True color tuple
-        if isinstance(fg, tuple) and len(fg) == 3:
-            r, g, b = fg
-            if abs(r - g) < 40 and abs(g - b) < 40 and max(r, g, b) < 180:
-                return True
-
-        return False
+    def get_screen_columns(self) -> int:
+        """Return current screen column count."""
+        return self._screen.columns
 
     def is_waiting_approval(self) -> bool:
         """Check if tool is waiting for user approval (detected via OSC9 notification).
@@ -738,9 +794,7 @@ class PTYWrapper:
         """
         return (time.monotonic() - self._last_output_time) >= seconds
 
-    def wait_for_ready(
-        self, pattern: bytes | None = None, timeout: float = 30.0
-    ) -> bool:
+    def wait_for_ready(self, pattern: bytes | None = None, timeout: float = 30.0) -> bool:
         """Wait for child to be ready (output contains pattern).
 
         If pattern is None, uses:
@@ -752,8 +806,19 @@ class PTYWrapper:
         start = time.time()
         stdin_fd = sys.stdin.fileno()
 
+        if self._debug_enabled:
+            self._debug_log(f"wait_for_ready: pattern={pattern!r}, timeout={timeout}")
+            self._debug_last_periodic_dump = time.time()
+
         while time.time() - start < timeout:
+            # Periodic screen dump every 5s when debug enabled
+            if self._debug_enabled and time.time() - self._debug_last_periodic_dump >= 5.0:
+                self._debug_dump_screen(f"Periodic dump (elapsed: {time.time() - start:.1f}s)")
+                self._debug_last_periodic_dump = time.time()
+
             if not self._ptyproc or not self._ptyproc.isalive():
+                if self._debug_enabled:
+                    self._debug_log("wait_for_ready: process died")
                 return False
 
             try:
@@ -773,6 +838,8 @@ class PTYWrapper:
                 if self._ptyproc.fd in rlist:
                     data = os.read(self._ptyproc.fd, 1024)
                     if not data:
+                        if self._debug_enabled:
+                            self._debug_log("wait_for_ready: EOF from child")
                         return False
                     buffer += data
                     self._update_output_buffer(data)
@@ -783,12 +850,84 @@ class PTYWrapper:
                             pass  # Don't break ready loop on callback errors
                     sys.stdout.buffer.write(data)
                     sys.stdout.flush()
+
+                    if self._debug_enabled and pattern in data:
+                        self._debug_log("wait_for_ready: PATTERN FOUND IN DATA!")
+                        self._debug_dump_screen("Pattern found in output")
+
                     if pattern in buffer:
+                        if self._debug_enabled:
+                            self._debug_log("wait_for_ready: Pattern found in buffer, invoking on_ready")
+                            self._debug_dump_screen("Before invoking on_ready")
+                        self._invoke_on_ready()
                         return True
-            except OSError:
+            except OSError as e:
+                if self._debug_enabled:
+                    self._debug_log(f"wait_for_ready: OSError {e}")
                 return False
 
-        return True  # Timeout, continue anyway
+        # Timeout, continue anyway
+        if self._debug_enabled:
+            self._debug_log(f"wait_for_ready: Timeout after {timeout}s, invoking on_ready anyway")
+            self._debug_dump_screen("Timeout in wait_for_ready")
+        self._invoke_on_ready()
+        return True
+
+    def _debug_log(self, msg: str) -> None:
+        """Log debug message to file."""
+        if self._debug_enabled and self._debug_file:
+            try:
+                self._debug_file.write(f"{msg}\n")
+                self._debug_file.flush()
+            except Exception:
+                pass
+
+    def _invoke_on_ready(self) -> None:
+        """Invoke on_ready callback if set and port is available."""
+        if self._debug_enabled:
+            self._debug_log(
+                f"_invoke_on_ready called: callback={self._on_ready_callback is not None}, port={self.actual_port}"
+            )
+        if self._on_ready_callback and self.actual_port:
+            try:
+                if self._debug_enabled:
+                    self._debug_log(f"Calling on_ready callback with port {self.actual_port}")
+                self._on_ready_callback(self.actual_port)
+                if self._debug_enabled:
+                    self._debug_log("on_ready callback completed successfully")
+            except Exception as e:
+                if self._debug_enabled:
+                    self._debug_log(f"on_ready callback raised: {e}")
+                pass  # Don't break on callback errors
+
+    def _debug_dump_screen(self, label: str = "") -> None:
+        """Dump screen state to debug log (when HCOM_PTY_DEBUG=1)."""
+        if not self._debug_enabled or not self._screen:
+            return
+
+        self._debug_counter += 1
+        self._debug_log(f"\n=== SCREEN DUMP {self._debug_counter}: {label} ===")
+        self._debug_log(f"Instance: {self.instance_name}")
+        self._debug_log(f"Ready pattern: {self.ready_pattern!r}")
+        self._debug_log(f"Actual port: {self.actual_port}")
+        self._debug_log(f"Callback set: {self._on_ready_callback is not None}")
+        self._debug_log(f"Screen size: {self._screen.lines}x{self._screen.columns}")
+        self._debug_log(f"Cursor: ({self._screen.cursor.y}, {self._screen.cursor.x})")
+
+        # Show non-empty screen lines
+        self._debug_log("Screen content (non-empty lines):")
+        for i, line in enumerate(self._screen.display):
+            if line.strip():
+                self._debug_log(f"  {i:3d}: {line}")
+
+        # Check for ready pattern in screen
+        if self.ready_pattern:
+            pattern_str = self.ready_pattern.decode("utf-8", errors="replace")
+            found = any(pattern_str in line for line in self._screen.display)
+            self._debug_log(f"Ready pattern '{pattern_str}' in screen: {found}")
+
+        self._debug_log(f"is_ready(): {self.is_ready()}")
+        self._debug_log("")
 
     def inject(self, text: str, submit: bool = True) -> bool:
         """Inject text to the PTY (called from same process).
@@ -800,7 +939,8 @@ class PTYWrapper:
         if not self._ptyproc or not self._ptyproc.isalive():
             return False
         try:
-            text = text.rstrip("\r\n")
+            if text.endswith("\n"):
+                text = text[:-1]
             if text:
                 os.write(self._ptyproc.fd, text.encode("utf-8", "surrogateescape"))
                 time.sleep(0.1)  # Wait for terminal to process before Enter

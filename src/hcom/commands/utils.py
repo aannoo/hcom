@@ -13,6 +13,56 @@ class CLIError(Exception):
     """Raised when arguments cannot be mapped to command semantics."""
 
 
+def parse_flag_value(
+    argv: list[str], flag: str, *, required: bool = True
+) -> tuple[str | None, list[str]]:
+    """Extract flag value from argv, returning (value, remaining_argv).
+
+    Args:
+        argv: Command line arguments (will not be mutated)
+        flag: Flag to look for (e.g., "--timeout")
+        required: If True, raise CLIError when flag present but value missing
+
+    Returns:
+        (value, remaining_argv): Value if flag found, None otherwise.
+        remaining_argv has the flag and value removed.
+
+    Raises:
+        CLIError: If flag present but value missing (when required=True)
+    """
+    if flag not in argv:
+        return None, argv
+
+    argv = argv.copy()
+    idx = argv.index(flag)
+    if idx + 1 >= len(argv) or argv[idx + 1].startswith("-"):
+        if required:
+            raise CLIError(f"{flag} requires a value")
+        del argv[idx]
+        return None, argv
+
+    value = argv[idx + 1]
+    del argv[idx : idx + 2]
+    return value, argv
+
+
+def parse_flag_bool(argv: list[str], flag: str) -> tuple[bool, list[str]]:
+    """Extract boolean flag from argv, returning (present, remaining_argv).
+
+    Args:
+        argv: Command line arguments (will not be mutated)
+        flag: Flag to look for (e.g., "--json")
+
+    Returns:
+        (present, remaining_argv): True if flag found, False otherwise.
+    """
+    if flag not in argv:
+        return False, argv
+    argv = argv.copy()
+    argv.remove(flag)
+    return True, argv
+
+
 # Type for help entries: static tuple or callable returning tuple
 HelpEntry = tuple[str, str] | Callable[[], tuple[str, str]]
 
@@ -41,32 +91,43 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("Query:", ""),
         ("  events", "Recent events as JSON"),
         ("  --last N", "Limit count (default: 20)"),
-        ("  --sql EXPR", "SQL WHERE filter"),
+        ("  --all", "Include archived sessions"),
         ("  --wait [SEC]", "Block until match (default: 60s)"),
+        ("  --sql EXPR", "SQL WHERE filter"),
+        ("", ""),
+        ("Filters (compose with AND):", ""),
+        ("  --agent NAME", "Match specific agent"),
+        ("  --type TYPE", "message | status | life"),
+        ("  --status VAL", "listening | active | blocked"),
+        ("  --context PATTERN", "tool:Bash | deliver:X (supports * wildcard)"),
+        ("  --file PATH", "File path (*.py for glob, file.py for contains)"),
+        ("  --cmd PATTERN", "Command (contains default, ^start, =exact)"),
+        ("  --from NAME", "Message sender"),
+        ("  --mention NAME", "Message mentions"),
+        ("  --action VAL", "created | stopped | ready"),
+        ("  --intent VAL", "request | inform | ack | error"),
+        ("  --thread NAME", "Message thread"),
+        ("  --after TIME", "Events after timestamp (ISO-8601)"),
+        ("  --before TIME", "Events before timestamp (ISO-8601)"),
+        ("  --collision", "File collision detection"),
+        ("", ""),
+        ("Shortcuts:", ""),
+        ("  --idle NAME", "--agent NAME --status listening"),
+        ("  --blocked NAME", "--agent NAME --status blocked"),
         ("", ""),
         ("Subscribe:", ""),
         ("  events sub", "List subscriptions"),
-        ('  events sub "sql"', "Push notification when event matches SQL"),
-        ("Presets (system-wide):", ""),
-        ("  events sub collision", "Alert when agents edit same file"),
-        ("  events sub created", "Any instance created"),
-        ("  events sub stopped", "Any instance stopped"),
-        ("  events sub blocked", "Any instance blocked"),
-        ("Presets (per-instance):", ""),
-        ("  events sub idle:<name>", "Instance finished (listening)"),
-        ("  events sub file_edits:<name>", "Instance edited a file"),
-        ("  events sub user_input:<name>", "User prompt or @bigboss msg"),
-        ("  events sub created:<name>", "Instance created"),
-        ("  events sub stopped:<name>", "Instance stopped"),
-        ("  events sub blocked:<name>", "Instance blocked"),
-        ("Presets (command watch):", ""),
-        ('  events sub cmd:"pattern"', "Shell commands containing pattern"),
-        ('  events sub cmd:<name>:"pattern"', "Commands from specific instance"),
-        ('  events sub cmd-starts:"pattern"', "Commands starting with pattern"),
-        ('  events sub cmd-exact:"pattern"', "Commands matching exactly"),
+        ("  events sub [filters]", "Push notification when event matches"),
         ("    --once", "Auto-remove after first match"),
         ("    --for <name>", "Subscribe for another agent"),
-        ("  events unsub <id|preset>", "Remove subscription"),
+        ("  events unsub <id>", "Remove subscription"),
+        ("", ""),
+        ("Examples:", ""),
+        ("  events --agent peso --status listening", ""),
+        ("  events --cmd git --agent peso", ""),
+        ("  events --file '*.py' --last 100", ""),
+        ("  events sub --idle peso", ""),
+        ("  events sub --cmd 'npm test' --once", ""),
         ("", ""),
         ("SQL columns (events_v view):", ""),
         ("  Base", "id, timestamp, type, instance"),
@@ -83,7 +144,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  status_context", "tool:X, deliver:X, approval, prompt, exit:X"),
         ("  life_action", "created, ready, stopped, batch_launched"),
         ("", ""),
-        ("", "Example: msg_from = 'luna' AND type = 'message'"),
+        ("", "Example SQL: msg_from = 'luna' AND type = 'message'"),
         ("", "Use <> instead of != for SQL negation"),
     ],
     "list": [
@@ -102,10 +163,34 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("send --stdin", "Read message from stdin"),
         ("  --name <name>", "Identity (agent name or UUID)"),
         ("  --from <name>", "External sender identity, alias: -b"),
+        ("  --bundle JSON", "Create bundle and attach bundle_id to message"),
+        ("  --bundle-file F", "Create bundle from JSON file and attach"),
         ("Envelope (optional):", ""),
         ("  --intent <type>", "request|inform|ack|error"),
         ("  --reply-to <id>", "Link to event (42 or 42:BOXE for remote)"),
         ("  --thread <name>", "Group related messages"),
+    ],
+    "bundle": [
+        ("bundle", "List recent bundles"),
+        ("bundle list", "List recent bundles"),
+        ("  --last N", "Limit count (default: 20)"),
+        ("  --json", "Output JSON"),
+        ("", ""),
+        ("bundle show <id>", "Show bundle by id/prefix"),
+        ("  --json", "Output JSON"),
+        ("", ""),
+        ("bundle create \"title\"", "Create bundle"),
+        ("  --description <text>", "Bundle description"),
+        ("  --events 1,2", "Comma-separated event IDs"),
+        ("  --files a.py,b.py", "Comma-separated file paths"),
+        ("  --transcript 4-15,18-22", "Transcript ranges (comma-separated)"),
+        ("  --extends <id>", "Parent bundle"),
+        ("  --bundle JSON", "Create from JSON payload"),
+        ("  --bundle-file F", "Create from JSON file"),
+        ("  --json", "Output JSON"),
+        ("", ""),
+        ("bundle chain <id>", "Show bundle lineage"),
+        ("  --json", "Output JSON"),
     ],
     "stop": [
         ("stop", "End hcom participation"),
@@ -142,7 +227,8 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("", ""),
         ("SQL filter mode:", ""),
         ("  --sql \"type='message'\"", "Custom SQL against events_v"),
-        ("  --sql idle:name", "Preset: wait for instance to go idle"),
+        ("  --idle NAME", "Wait for instance to go idle"),
+        ("  --sql EXPR", "SQL WHERE filter"),
         ("  --sql stopped:name", "Preset: wait for instance to stop"),
         ("  --sql blocked:name", "Preset: wait for instance to block"),
         ("", ""),
@@ -196,7 +282,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  HCOM_RELAY", "Relay server URL (set by 'hcom relay hf')"),
         ("  HCOM_RELAY_TOKEN", "HuggingFace token (set by 'hcom relay hf')"),
         ("  HCOM_AUTO_APPROVE", "Auto-approve safe hcom commands (1|0)"),
-        ("  HCOM_DEFAULT_SUBSCRIPTIONS", 'Default subscriptions (e.g. "collision")'),
+        ("  HCOM_AUTO_SUBSCRIBE", 'Auto-subscribe presets (e.g. "collision")'),
         ("  HCOM_NAME_EXPORT", "Export instance name to custom env var"),
         ("", ""),
         ("", "Non-HCOM_* vars in config.env pass through to Claude/Gemini/Codex"),
@@ -226,6 +312,13 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  --last N", "Limit to last N exchanges (default: 10)"),
         ("  --full", "Show full assistant responses"),
         ("  --detailed", "Show tool I/O, edits, errors"),
+        ("  --json", "JSON output"),
+        ("", ""),
+        ('transcript search "pattern"', "Search hcom-tracked transcripts (rg or grep)"),
+        ("  --live", "Only currently alive agents"),
+        ("  --all", "All transcripts (includes non-hcom sessions)"),
+        ("  --limit N", "Max results (default: 20)"),
+        ("  --agent TYPE", "Filter: claude, gemini, or codex"),
         ("  --json", "JSON output"),
     ],
     "archive": [
@@ -361,6 +454,7 @@ Usage:
 Commands:
   send         Send message to your buddies
   listen       Block and receive messages
+  bundle       Create and query bundles
   list         Show participants, status, read receipts
   start        Enable hcom participation
   stop         Disable hcom participation
@@ -385,21 +479,53 @@ Run 'hcom <command> --help' for details.
 # Known flags per command - for validation against hallucinated flags
 # Global flags accepted by all commands: identity (--name) and help (--help, -h)
 _GLOBAL_FLAGS = {"--name", "--help", "-h"}
+
+# Composable filter flags (used by events, events sub, listen)
+_FILTER_FLAGS = {
+    "--agent",
+    "--type",
+    "--status",
+    "--context",
+    "--file",
+    "--cmd",
+    "--from",
+    "--mention",
+    "--action",
+    "--after",
+    "--before",
+    "--intent",
+    "--thread",
+    "--reply-to",
+    "--idle",
+    "--blocked",
+    "--collision",
+}
+
 KNOWN_FLAGS: dict[str, set[str]] = {
     "send": _GLOBAL_FLAGS
-    | {"--intent", "--reply-to", "--thread", "--stdin", "--from", "-b"},
-    "events": _GLOBAL_FLAGS | {"--last", "--wait", "--sql"},
-    "events sub": _GLOBAL_FLAGS | {"--once", "--for"},
+    | {
+        "--intent",
+        "--reply-to",
+        "--thread",
+        "--stdin",
+        "--from",
+        "-b",
+        "--bundle",
+        "--bundle-file",
+    },
+    "events": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--last", "--wait", "--sql", "--all"},
+    "events sub": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--once", "--for"},
     "events unsub": _GLOBAL_FLAGS,
     "events launch": _GLOBAL_FLAGS,
     "list": _GLOBAL_FLAGS | {"--json", "-v", "--verbose", "--sh"},
-    "listen": _GLOBAL_FLAGS | {"--timeout", "--json", "--sql"},
+    "listen": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--timeout", "--json", "--sql"},
     "start": _GLOBAL_FLAGS | {"--as"},
     "kill": _GLOBAL_FLAGS,
     "stop": _GLOBAL_FLAGS,
     "transcript": _GLOBAL_FLAGS
     | {"--last", "--range", "--json", "--full", "--detailed"},
     "transcript timeline": _GLOBAL_FLAGS | {"--last", "--json", "--full", "--detailed"},
+    "transcript search": _GLOBAL_FLAGS | {"--limit", "--json", "--agent", "--live", "--all"},
     "config": _GLOBAL_FLAGS | {"--json", "--edit", "--reset", "-i", "--info"},
     "reset": _GLOBAL_FLAGS,
     "relay": _GLOBAL_FLAGS | {"--space", "--update"},
@@ -407,6 +533,22 @@ KNOWN_FLAGS: dict[str, set[str]] = {
     "status": _GLOBAL_FLAGS | {"--json", "--logs"},
     "run": _GLOBAL_FLAGS,
     "hooks": _GLOBAL_FLAGS,
+    "bundle": _GLOBAL_FLAGS | {"--json", "--last"},
+    "bundle list": _GLOBAL_FLAGS | {"--json", "--last"},
+    "bundle show": _GLOBAL_FLAGS | {"--json"},
+    "bundle create": _GLOBAL_FLAGS
+    | {
+        "--json",
+        "--title",
+        "--description",
+        "--events",
+        "--files",
+        "--transcript",
+        "--extends",
+        "--bundle",
+        "--bundle-file",
+    },
+    "bundle chain": _GLOBAL_FLAGS | {"--json"},
 }
 
 

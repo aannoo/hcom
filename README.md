@@ -4,14 +4,11 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> Realtime messaging + context sharing for AI coding agents
 
-**hcom connects Claude Code, Gemini CLI, and Codex** so agents can:
+**hcom connects Claude Code, Gemini CLI, and Codex through hooks and a live event bus.**
 
-- Receive messages through hooks mid-turn + when idle
-- Query and share transcript history
-- Get notifications on each other's events (edits/status/commands)
-- Spawn agents into new terminals
+When agents send messages or trigger subscribed events, hooks inject notifications into other agents - waking them from idle or delivering mid-turn.
+
 
 ![demo](https://raw.githubusercontent.com/aannoo/hcom/refs/heads/assets/screencapture-new.gif)
 
@@ -31,12 +28,13 @@ hcom gemini
 hcom codex
 ```
 
-Then talk to any agent in natural language:
+Talk to any agent in natural language:
 
->\> send a message to claude saying hi
+>\> send a message to claude
+
 
 ```bash
-hcom            # TUI: event stream, broadcast, status, config
+hcom            # TUI
 ```
 
 ---
@@ -52,21 +50,17 @@ hcom            # TUI: event stream, broadcast, status, config
 agents ──→ hooks ──→ sqlite ──→ hooks ──→ other agents
 ```
 
-Everything gets logged: messages, file edits, commands, status changes. Agents subscribe to patterns and get notified inline.
-
 ---
 
 ## Messaging
 
-Messages arrive mid-turn after tool calls, or instantly when idle.
-
-Agents can:
+Messages arrive mid-turn after tool calls, or instantly wake agents when idle.
 
 - Route to everyone
 - @mention specific agents
 - Group agents at runtime with tag prefixes
 
----
+
 
 ## Transcripts
 
@@ -79,22 +73,23 @@ hcom transcript timeline        # user prompts across all agents
 
 > \> send claude the transcript slice where I decided on the cake feature
 
----
+
 
 ## Event Subscriptions
 
-Agents get hcom messages when patterns match
+Agents subscribe to patterns and get notified via hcom messages:
 
 ```bash
-collision               # 2 agents edit the same file within 20s
-idle:<name>             # agent finishes its turn
-cmd:"<pattern>"         # shell commands matching pattern
+--collision             # 2 agents edit the same file
+--idle peso             # agent peso finishes its turn
+--cmd "git"             # shell commands containing pattern
+--agent peso --file Y    # agent peso edits file Y
 --sql "query"           # any SQL WHERE clause
 ```
 
-> \> subscribe to when claude runs "git commit" and do something
+> \> subscribe to when any agent runs "git commit" and do something
 
----
+**Collision detection runs by default** - when agents edit the same file within 20s, both get instant notifications.
 
 ## Spawn
 
@@ -123,6 +118,8 @@ Run with `hcom run <script>`
 `debate` — launches a judge/coordinator who sets up a structured debate where existing agents choose sides dynamically with shared context of transcript ranges + workspace files. Rounds, rebuttals, verdict.
 
 Create new workflows by telling agent: *"look at `hcom run docs` then make a script that does X"*
+
+---
 
 ## Tools
 
@@ -192,7 +189,7 @@ HCOM_DIR=$PWD/.hcom                # for sandbox or project local
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.11 - multi-agent communication
+hcom (hook-comms) v0.6.12 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
@@ -202,6 +199,7 @@ Usage:
 Commands:
   send         Send message to your buddies
   listen       Block and receive messages
+  bundle       Create and query bundles
   list         Show participants, status, read receipts
   start        Enable hcom participation
   stop         Disable hcom participation
@@ -232,36 +230,47 @@ Usage:
 Query:
     events                         Recent events as JSON
     --last N                       Limit count (default: 20)
-    --sql EXPR                     SQL WHERE filter
+    --all                          Include archived sessions
     --wait [SEC]                   Block until match (default: 60s)
+    --sql EXPR                     SQL WHERE filter
+
+
+Filters (compose with AND):
+    --agent NAME                   Match specific agent
+    --type TYPE                    message | status | life
+    --status VAL                   listening | active | blocked
+    --context PATTERN              tool:Bash | deliver:X (supports * wildcard)
+    --file PATH                    File path (*.py for glob, file.py for contains)
+    --cmd PATTERN                  Command (contains default, ^start, =exact)
+    --from NAME                    Message sender
+    --mention NAME                 Message mentions
+    --action VAL                   created | stopped | ready
+    --intent VAL                   request | inform | ack | error
+    --thread NAME                  Message thread
+    --after TIME                   Events after timestamp (ISO-8601)
+    --before TIME                  Events before timestamp (ISO-8601)
+    --collision                    File collision detection
+
+
+Shortcuts:
+    --idle NAME                    --agent NAME --status listening
+    --blocked NAME                 --agent NAME --status blocked
 
 
 Subscribe:
     events sub                     List subscriptions
-    events sub "sql"               Push notification when event matches SQL
-
-Presets (system-wide):
-    events sub collision           Alert when agents edit same file
-    events sub created             Any instance created
-    events sub stopped             Any instance stopped
-    events sub blocked             Any instance blocked
-
-Presets (per-instance):
-    events sub idle:<name>         Instance finished (listening)
-    events sub file_edits:<name>   Instance edited a file
-    events sub user_input:<name>   User prompt or @bigboss msg
-    events sub created:<name>      Instance created
-    events sub stopped:<name>      Instance stopped
-    events sub blocked:<name>      Instance blocked
-
-Presets (command watch):
-    events sub cmd:"pattern"       Shell commands containing pattern
-    events sub cmd:<name>:"pattern" Commands from specific instance
-    events sub cmd-starts:"pattern" Commands starting with pattern
-    events sub cmd-exact:"pattern" Commands matching exactly
+    events sub [filters]           Push notification when event matches
       --once                       Auto-remove after first match
       --for <name>                 Subscribe for another agent
-    events unsub <id|preset>       Remove subscription
+    events unsub <id>              Remove subscription
+
+
+Examples:
+    events --agent peso --status listening
+    events --cmd git --agent peso 
+    events --file '*.py' --last 100 
+    events sub --idle peso         
+    events sub --cmd 'npm test' --once 
 
 
 SQL columns (events_v view):
@@ -277,7 +286,7 @@ Field values:
     status_context                 tool:X, deliver:X, approval, prompt, exit:X
     life_action                    created, ready, stopped, batch_launched
 
-  Example: msg_from = 'luna' AND type = 'message'
+  Example SQL: msg_from = 'luna' AND type = 'message'
   Use <> instead of != for SQL negation
 
 ## list
@@ -300,11 +309,37 @@ Usage:
   hcom send --stdin               Read message from stdin
     --name <name>                  Identity (agent name or UUID)
     --from <name>                  External sender identity, alias: -b
+    --bundle JSON                  Create bundle and attach bundle_id to message
+    --bundle-file F                Create bundle from JSON file and attach
 
 Envelope (optional):
     --intent <type>                request|inform|ack|error
     --reply-to <id>                Link to event (42 or 42:BOXE for remote)
     --thread <name>                Group related messages
+
+## bundle
+
+Usage:
+  hcom bundle                     List recent bundles
+  hcom bundle list                List recent bundles
+    --last N                       Limit count (default: 20)
+    --json                         Output JSON
+
+  hcom bundle show <id>           Show bundle by id/prefix
+    --json                         Output JSON
+
+  hcom bundle create "title"      Create bundle
+    --description <text>           Bundle description
+    --events 1,2                   Comma-separated event IDs
+    --files a.py,b.py              Comma-separated file paths
+    --transcript 4-15,18-22        Transcript ranges (comma-separated)
+    --extends <id>                 Parent bundle
+    --bundle JSON                  Create from JSON payload
+    --bundle-file F                Create from JSON file
+    --json                         Output JSON
+
+  hcom bundle chain <id>          Show bundle lineage
+    --json                         Output JSON
 
 ## stop
 
@@ -345,7 +380,8 @@ Usage:
 
 SQL filter mode:
     --sql "type='message'"         Custom SQL against events_v
-    --sql idle:name                Preset: wait for instance to go idle
+    --idle NAME                    Wait for instance to go idle
+    --sql EXPR                     SQL WHERE filter
     --sql stopped:name             Preset: wait for instance to stop
     --sql blocked:name             Preset: wait for instance to block
 
@@ -404,7 +440,7 @@ Global settings:
     HCOM_RELAY                     Relay server URL (set by 'hcom relay hf')
     HCOM_RELAY_TOKEN               HuggingFace token (set by 'hcom relay hf')
     HCOM_AUTO_APPROVE              Auto-approve safe hcom commands (1|0)
-    HCOM_DEFAULT_SUBSCRIPTIONS     Default subscriptions (e.g. "collision")
+    HCOM_AUTO_SUBSCRIBE            Auto-subscribe presets (e.g. "collision")
     HCOM_NAME_EXPORT               Export instance name to custom env var
 
   Non-HCOM_* vars in config.env pass through to Claude/Gemini/Codex
@@ -436,6 +472,13 @@ Usage:
     --last N                       Limit to last N exchanges (default: 10)
     --full                         Show full assistant responses
     --detailed                     Show tool I/O, edits, errors
+    --json                         JSON output
+
+  hcom transcript search "pattern" Search hcom-tracked transcripts (rg or grep)
+    --live                         Only currently alive agents
+    --all                          All transcripts (includes non-hcom sessions)
+    --limit N                      Max results (default: 20)
+    --agent TYPE                   Filter: claude, gemini, or codex
     --json                         JSON output
 
 ## archive
@@ -761,11 +804,11 @@ Always require approval:
 
 Values: 1, true, yes, on (enabled) | 0, false, no, off, "" (disabled)
 
-## HCOM_DEFAULT_SUBSCRIPTIONS
+## HCOM_AUTO_SUBSCRIBE
 
-HCOM_DEFAULT_SUBSCRIPTIONS - Default event subscriptions for new instances
+HCOM_AUTO_SUBSCRIBE - Auto-subscribe event presets for new instances
 
-Current value: Use 'hcom config default_subscriptions' to see current value
+Current value: Use 'hcom config auto_subscribe' to see current value
 Default: collision
 
 Purpose:
@@ -773,8 +816,8 @@ Purpose:
   when an instance registers with 'hcom start'.
 
 Usage:
-  hcom config default_subscriptions "collision,created"
-  hcom config default_subscriptions ""   # No auto-subscriptions
+  hcom config auto_subscribe "collision,created"
+  hcom config auto_subscribe ""   # No auto-subscribe
 
 Available presets:
   collision    - Alert when agents edit same file (within 20s window)
@@ -901,6 +944,49 @@ Examples:
     hcom.launch(1, tool="gemini", prompt="review code")
     hcom.launch(1, resume="abc123", fork=True)
 
+## hcom.bundle()
+
+Manage bundles for context handoff and review workflows.
+
+Bundles package conversation transcript ranges, event IDs, and file paths
+into referenceable context units for handoffs between agents.
+
+Args:
+    action: One of 'list', 'show', 'create', 'chain'.
+    title: Title for new bundle.
+    description: Description for new bundle.
+    events: List of event IDs/ranges for new bundle (e.g., ["123-125", "130"]).
+    files: List of file paths for new bundle.
+    transcript: List of transcript ranges for new bundle (e.g., ["5-10", "15"]).
+    extends: Parent bundle ID for chaining related work.
+    data: Full bundle dict (alternative to separate fields).
+    bundle_id: ID for show/chain actions.
+    last: Limit for list action.
+
+Returns:
+    list (for 'list', 'chain'): List of bundle dicts.
+    dict (for 'show'): Bundle details.
+    str (for 'create'): New bundle ID.
+
+Examples:
+    # Create a bundle
+    bundle_id = hcom.bundle("create",
+        title="Code review: auth module",
+        description="Implementation complete, ready for review",
+        events=["123-125", "130"],
+        files=["auth.py", "tests/test_auth.py"],
+        transcript=["10-15"]
+    )
+
+    # List recent bundles
+    bundles = hcom.bundle("list", last=10)
+
+    # Get bundle details
+    details = hcom.bundle("show", bundle_id="abc123")
+
+    # Get bundle chain (all related bundles)
+    chain = hcom.bundle("chain", bundle_id="abc123")
+
 ## Session
 
 Identity-bound session for hcom operations.
@@ -945,6 +1031,8 @@ Send message to instances.
         intent: One of 'request', 'inform', 'ack', 'error'.
         reply_to: Event ID to reply to (required for intent='ack').
         thread: Thread name for grouping related messages.
+        bundle: Bundle dict to create and attach. If provided, creates bundle event
+            and appends bundle summary to message.
 
     Returns:
         List of instance names that received the message.
@@ -953,6 +1041,17 @@ Send message to instances.
         s.send("@nova hello")
         s.send("@worker- start task", thread="batch-1", intent="request")
         s.send("received", to="luna", intent="ack", reply_to="42")
+
+        # With bundle
+        s.send("@reviewer check this", bundle={
+            "title": "Code review",
+            "description": "Auth module complete",
+            "refs": {
+                "events": ["123-125"],
+                "files": ["auth.py"],
+                "transcript": ["10-15"]
+            }
+        })
 
 ### Session.messages
 
@@ -989,9 +1088,11 @@ Query the event stream.
     SQL fields:
         Common: id, timestamp, type, instance
         Message: msg_from, msg_text, msg_thread, msg_intent,
-                 msg_reply_to, msg_mentions, msg_delivered_to
+                 msg_reply_to, msg_mentions, msg_delivered_to, msg_bundle_id
         Status: status_val, status_context, status_detail
         Lifecycle: life_action, life_by, life_batch_id
+        Bundle: bundle_id, bundle_title, bundle_description, bundle_extends,
+                bundle_events, bundle_files, bundle_transcript, bundle_created_by
 
     Examples:
         s.events(sql="type='message'")
@@ -1054,22 +1155,26 @@ Remove an event subscription.
 
 ### Session.transcript
 
-Get conversation transcript for an instance.
+Get conversation transcript for an instance or timeline across all instances.
 
     Args:
-        target: Instance name (defaults to self).
+        agent: Instance name, or "timeline" for timeline mode (all instances).
         last: Number of recent exchanges to return.
-        full: If True, include tool calls and detailed output.
-        range: Exchange range like "5-10" (1-indexed, inclusive).
+        full: If True, include truncated tool output (use detailed for full output).
+        range: Exchange range like "5-10" (1-indexed, inclusive). Only valid for specific agent.
+        detailed: If True, include full tool calls, results, file edits, errors.
 
     Returns:
-        List of exchange dicts with keys: user, assistant
-        (and tool_calls, tool_results if full=True)
+        If agent is name: List of exchange dicts with keys: user, assistant, position, timestamp
+        If agent is "timeline": List of entry dicts with keys: instance, position,
+            user, action, timestamp, files, command
 
     Examples:
-        s.transcript()                    # own transcript
-        s.transcript("nova", last=5)       # nova's last 5
-        s.transcript("nova", range="1-10") # nova's exchanges 1-10
+        s.transcript("nova")                     # nova's transcript
+        s.transcript("nova", last=5)             # nova's last 5
+        s.transcript("nova", range="1-10")       # nova's exchanges 1-10
+        s.transcript("timeline", last=20)        # timeline across all agents
+        s.transcript("timeline", detailed=True)  # detailed timeline
 
 ### Session.stop
 
@@ -1136,7 +1241,8 @@ Subscribe to events:
   s.wait()  # block until event matches
 
 Read transcripts:
-  exchanges = s.transcript('luna', last=5, full=True)
+  exchanges = s.transcript('luna', last=5, detailed=True)    # specific agent
+  timeline = s.transcript('timeline', last=20)               # all agents (timeline)
 
 Check messages:
   for msg in s.messages():

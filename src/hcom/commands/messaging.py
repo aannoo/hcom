@@ -1,7 +1,18 @@
 """Messaging commands for HCOM"""
 
+import socket
 import sys
-from .utils import format_error, validate_message, resolve_identity, validate_flags
+import time
+
+from .utils import (
+    CLIError,
+    format_error,
+    parse_flag_bool,
+    parse_flag_value,
+    resolve_identity,
+    validate_flags,
+    validate_message,
+)
 from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER, HcomError, CommandContext
 from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
@@ -13,6 +24,50 @@ from ..core.messages import (
     format_hook_messages,
     format_messages_json,
 )
+
+
+# ==================== Shared Helpers ====================
+
+# Import centralized TCP server creation
+from ..core.runtime import create_notify_server as _create_notify_server
+
+
+def _init_heartbeat(instance_name: str, timeout: float) -> None:
+    """Initialize heartbeat fields for listen loop."""
+    from ..core.instances import update_instance_position
+
+    try:
+        update_instance_position(
+            instance_name,
+            {
+                "last_stop": int(time.time()),
+                "wait_timeout": timeout,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _update_heartbeat(instance_name: str) -> None:
+    """Update heartbeat timestamp during listen loop."""
+    from ..core.instances import update_instance_position
+
+    try:
+        update_instance_position(instance_name, {"last_stop": int(time.time())})
+    except Exception:
+        pass
+
+
+def _drain_notify_server(server: socket.socket) -> None:
+    """Accept and close all pending connections on notify server."""
+    while True:
+        try:
+            server.accept()[0].close()
+        except BlockingIOError:
+            break
+
+
+# ==================== Recipient Feedback ====================
 
 
 def get_recipient_feedback(delivered_to: list[str]) -> str:
@@ -39,7 +94,7 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
     for r_name in delivered_to:
         r_data = load_instance_position(r_name)
         if r_data:
-            status, _, _, _ = get_instance_status(r_data)
+            status, _, _, _, _ = get_instance_status(r_data)
             icon = STATUS_ICONS.get(status, STATUS_ICONS["inactive"])
             display_name = get_full_name(r_data) or r_name
         else:
@@ -67,42 +122,27 @@ def cmd_send(
 
     # Parse --from flag (external sender identity)
     # -b is alias for --from bigboss (human override)
-    import re
     from ..shared import SenderIdentity
 
-    from_name: str | None = None
-    argv = argv.copy()  # Don't mutate original
+    # Handle -b alias for --from bigboss (parse_flag_bool copies argv internally)
+    has_bigboss, argv = parse_flag_bool(argv, "-b")
+    from_name: str | None = "bigboss" if has_bigboss else None
 
-    if "-b" in argv:
-        argv = [a for a in argv if a != "-b"]
-        from_name = "bigboss"
-
-    if "--from" in argv:
-        idx = argv.index("--from")
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
-            from_name = argv[idx + 1]
-            argv = argv[:idx] + argv[idx + 2 :]
-        else:
-            print(format_error("--from requires a value"), file=sys.stderr)
-            return 1
+    # Parse --from (overrides -b if both present)
+    try:
+        from_val, argv = parse_flag_value(argv, "--from")
+        if from_val:
+            from_name = from_val
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
 
     # Validate --from name if provided
     if from_name:
-        if len(from_name) > 50:
-            print(
-                format_error(f"Sender name too long ({len(from_name)} chars, max 50)"),
-                file=sys.stderr,
-            )
-            return 1
-        # Check for dangerous/invalid characters (injection prevention + naming consistency)
-        bad_chars = re.findall(r"[|&;$`<>@]", from_name)
-        if bad_chars:
-            print(
-                format_error(
-                    f"Name contains invalid characters: {' '.join(set(bad_chars))}"
-                ),
-                file=sys.stderr,
-            )
+        from ..core.identity import validate_name_input
+
+        if error := validate_name_input(from_name, allow_at=False):
+            print(format_error(error), file=sys.stderr)
             return 1
 
     # Guard: subagents must not spoof external sender identities.
@@ -135,6 +175,7 @@ def cmd_send(
             _looks_like_uuid,
             is_valid_base_name,
             base_name_error,
+            validate_name_input,
         )
 
         explicit_name, argv = parse_name_flag(argv)
@@ -143,23 +184,9 @@ def cmd_send(
         if explicit_name:
             # Skip validation for UUIDs (agent_id format)
             if not _looks_like_uuid(explicit_name):
-                if len(explicit_name) > 50:
-                    print(
-                        format_error(
-                            f"Sender name too long ({len(explicit_name)} chars, max 50)"
-                        ),
-                        file=sys.stderr,
-                    )
-                    return 1
-                # Check for dangerous characters (injection prevention)
-                bad_chars = re.findall(r"[|&;$`<>]", explicit_name)
-                if bad_chars:
-                    print(
-                        format_error(
-                            f"Name contains invalid characters: {' '.join(set(bad_chars))}"
-                        ),
-                        file=sys.stderr,
-                    )
+                # Validate length and dangerous characters
+                if error := validate_name_input(explicit_name, allow_at=True):
+                    print(format_error(error), file=sys.stderr)
                     return 1
                 if not is_valid_base_name(explicit_name):
                     print(format_error(base_name_error(explicit_name)), file=sys.stderr)
@@ -169,67 +196,84 @@ def cmd_send(
     envelope = {}
 
     # --intent {request|inform|ack|error}
-    if "--intent" in argv:
-        idx = argv.index("--intent")
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
-            intent_val = argv[idx + 1].lower()
+    try:
+        intent_val, argv = parse_flag_value(argv, "--intent")
+        if intent_val:
             from ..core.helpers import validate_intent
 
+            intent_val = intent_val.lower()
             try:
                 validate_intent(intent_val)
             except ValueError as e:
                 print(format_error(str(e)), file=sys.stderr)
                 return 1
             envelope["intent"] = intent_val
-            argv = argv[:idx] + argv[idx + 2 :]
-        else:
-            print(
-                format_error("--intent requires a value (request|inform|ack|error)"),
-                file=sys.stderr,
-            )
-            return 1
+    except CLIError:
+        print(format_error("--intent requires a value (request|inform|ack|error)"), file=sys.stderr)
+        return 1
 
     # --reply-to <id> or <id:DEVICE>
-    if "--reply-to" in argv:
-        idx = argv.index("--reply-to")
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
-            reply_to_val = argv[idx + 1]
+    try:
+        reply_to_val, argv = parse_flag_value(argv, "--reply-to")
+        if reply_to_val:
             envelope["reply_to"] = reply_to_val
-            argv = argv[:idx] + argv[idx + 2 :]
-        else:
-            print(
-                format_error("--reply-to requires an event ID (e.g., 42 or 42:BOXE)"),
-                file=sys.stderr,
-            )
-            return 1
+    except CLIError:
+        print(format_error("--reply-to requires an event ID (e.g., 42 or 42:BOXE)"), file=sys.stderr)
+        return 1
 
     # --thread <name>
-    if "--thread" in argv:
-        idx = argv.index("--thread")
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
-            thread_val = argv[idx + 1]
+    try:
+        thread_val, argv = parse_flag_value(argv, "--thread")
+        if thread_val:
             # Validate thread name
             if len(thread_val) > 64:
-                print(
-                    format_error(
-                        f"Thread name too long ({len(thread_val)} chars, max 64)"
-                    ),
-                    file=sys.stderr,
-                )
+                print(format_error(f"Thread name too long ({len(thread_val)} chars, max 64)"), file=sys.stderr)
                 return 1
             if not all(c.isalnum() or c in "-_" for c in thread_val):
-                print(
-                    format_error(
-                        "Thread name must be alphanumeric with hyphens/underscores"
-                    ),
-                    file=sys.stderr,
-                )
+                print(format_error("Thread name must be alphanumeric with hyphens/underscores"), file=sys.stderr)
                 return 1
             envelope["thread"] = thread_val
-            argv = argv[:idx] + argv[idx + 2 :]
-        else:
-            print(format_error("--thread requires a thread name"), file=sys.stderr)
-            return 1
+    except CLIError:
+        print(format_error("--thread requires a thread name"), file=sys.stderr)
+        return 1
+
+    # Optional: bundle payload (JSON or file)
+    import json as json_mod
+    from pathlib import Path
+
+    bundle_data = None
+
+    try:
+        bundle_raw, argv = parse_flag_value(argv, "--bundle")
+        if bundle_raw:
+            try:
+                bundle_data = json_mod.loads(bundle_raw)
+            except json_mod.JSONDecodeError as e:
+                print(format_error(f"Invalid --bundle JSON: {e}"), file=sys.stderr)
+                return 1
+    except CLIError:
+        print(format_error("--bundle requires JSON value"), file=sys.stderr)
+        return 1
+
+    try:
+        bundle_file, argv = parse_flag_value(argv, "--bundle-file")
+        if bundle_file:
+            if bundle_data is not None:
+                print(format_error("--bundle and --bundle-file are mutually exclusive"), file=sys.stderr)
+                return 1
+            path = Path(bundle_file)
+            try:
+                raw = path.read_text(encoding="utf-8")
+                bundle_data = json_mod.loads(raw)
+            except OSError as e:
+                print(format_error(f"Failed to read --bundle-file: {e}"), file=sys.stderr)
+                return 1
+            except json_mod.JSONDecodeError as e:
+                print(format_error(f"Invalid --bundle-file JSON: {e}"), file=sys.stderr)
+                return 1
+    except CLIError:
+        print(format_error("--bundle-file requires a path"), file=sys.stderr)
+        return 1
 
     # Validation: ack requires reply_to
     if envelope.get("intent") == "ack" and "reply_to" not in envelope:
@@ -251,10 +295,7 @@ def cmd_send(
                 envelope["thread"] = parent_thread
 
     # Resolve message from args or stdin
-    use_stdin = False
-    if "--stdin" in argv:
-        argv = [a for a in argv if a != "--stdin"]
-        use_stdin = True
+    use_stdin, argv = parse_flag_bool(argv, "--stdin")
 
     def _read_stdin() -> str:
         try:
@@ -344,6 +385,60 @@ def cmd_send(
         except Exception:
             pass  # Best-effort - local send still works
 
+        # Create bundle event if provided
+        if bundle_data is not None:
+            from ..core.bundles import create_bundle_event, validate_bundle
+
+            try:
+                hints = validate_bundle(bundle_data)
+            except ValueError as e:
+                print(format_error(str(e)), file=sys.stderr)
+                return 1
+            if hints:
+                print("Bundle quality hints:", file=sys.stderr)
+                for h in hints:
+                    print(f"  - {h}", file=sys.stderr)
+
+            if identity.kind == "external":
+                bundle_instance = f"ext_{identity.name}"
+            elif identity.kind == "system":
+                bundle_instance = f"sys_{identity.name}"
+            else:
+                bundle_instance = identity.name
+
+            bundle_id = create_bundle_event(
+                bundle_data, instance=bundle_instance, created_by=identity.name
+            )
+            envelope["bundle_id"] = bundle_id
+            # Append bundle payload to message text
+            refs = bundle_data.get("refs", {})
+            events = refs.get("events", [])
+            files = refs.get("files", [])
+            transcript = refs.get("transcript", [])
+            extends = bundle_data.get("extends")
+
+            def _join(vals):
+                return ", ".join(str(v) for v in vals) if vals else ""
+
+            bundle_lines = [
+                f"[Bundle {bundle_id}]",
+                f"Title: {bundle_data.get('title', '')}",
+                f"Description: {bundle_data.get('description', '')}",
+                "Refs:",
+                f"  events: {_join(events)}",
+                f"  files: {_join(files)}",
+                f"  transcript: {_join(transcript)}",
+            ]
+            if extends:
+                bundle_lines.append(f"Extends: {extends}")
+
+            message = message.rstrip() + "\n\n" + "\n".join(bundle_lines)
+            # Re-validate after append to avoid oversized payloads
+            error = validate_message(message)
+            if error:
+                print(error, file=sys.stderr)
+                return 1
+
         # Send message and get delivered_to list
         try:
             delivered_to = send_message(
@@ -417,30 +512,6 @@ def cmd_send(
     return 0
 
 
-def _expand_sql_preset(sql_arg: str) -> str:
-    """Expand preset shortcut to full SQL, or return raw SQL.
-
-    Handles:
-      - System presets: 'blocked', 'collision', 'created', 'stopped'
-      - Parameterized presets: 'idle:veki', 'file_edits:luna'
-      - Raw SQL: passed through unchanged
-    """
-    from .events import PRESET_SUBSCRIPTIONS, PARAMETERIZED_PRESETS
-
-    # Check for parameterized preset (name:target)
-    if ":" in sql_arg:
-        preset_name, target = sql_arg.split(":", 1)
-        if preset_name in PARAMETERIZED_PRESETS:
-            return PARAMETERIZED_PRESETS[preset_name].format(target=target)
-
-    # Check for system-wide preset
-    if sql_arg in PRESET_SUBSCRIPTIONS:
-        return PRESET_SUBSCRIPTIONS[sql_arg]
-
-    # Treat as raw SQL
-    return sql_arg
-
-
 def _listen_with_filter(
     sql_filter: str,
     instance_name: str,
@@ -453,8 +524,6 @@ def _listen_with_filter(
     Creates a temp --once subscription, waits for match or timeout.
     Subscription auto-deletes on first match; cleanup on timeout.
     """
-    import time
-    import socket
     import select
     import json as json_mod
     from hashlib import sha256
@@ -465,7 +534,6 @@ def _listen_with_filter(
         upsert_notify_endpoint,
         delete_notify_endpoint,
     )
-    from ..core.instances import update_instance_position
     from ..relay import relay_wait, is_relay_enabled
 
     conn = get_db()
@@ -531,31 +599,13 @@ def _listen_with_filter(
     )
 
     # Setup TCP notify socket
-    notify_server = None
-    notify_port = None
-    try:
-        notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        notify_server.bind(("127.0.0.1", 0))
-        notify_server.listen(128)
-        notify_server.setblocking(False)
-        notify_port = notify_server.getsockname()[1]
+    notify_server, notify_port = _create_notify_server()
+    if notify_port:
         upsert_notify_endpoint(instance_name, "listen_filter", notify_port)
-    except Exception:
-        notify_server = None
 
     # Initialize heartbeat
     start_time = time.time()
-    try:
-        update_instance_position(
-            instance_name,
-            {
-                "last_stop": start_time,
-                "wait_timeout": timeout,
-            },
-        )
-    except Exception:
-        pass
+    _init_heartbeat(instance_name, timeout)
 
     if not json_output:
         print(
@@ -617,10 +667,7 @@ def _listen_with_filter(
                     print("[Still waiting for filter match...]", file=sys.stderr)
 
             # Update heartbeat
-            try:
-                update_instance_position(instance_name, {"last_stop": time.time()})
-            except Exception:
-                pass
+            _update_heartbeat(instance_name)
 
             # TCP select for local notifications
             remaining = timeout - (time.time() - start_time)
@@ -631,11 +678,7 @@ def _listen_with_filter(
             if notify_server:
                 readable, _, _ = select.select([notify_server], [], [], wait_time)
                 if readable:
-                    while True:
-                        try:
-                            notify_server.accept()[0].close()
-                        except BlockingIOError:
-                            break
+                    _drain_notify_server(notify_server)
             else:
                 time.sleep(wait_time)
 
@@ -667,10 +710,7 @@ def _listen_with_filter(
 
 def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     """Block and receive messages: hcom listen --name NAME [--timeout N] [--json] [--sql FILTER]"""
-    import time
-    import socket
     import select
-    from ..core.instances import update_instance_position
     from ..relay import is_relay_enabled
 
     if not ensure_hcom_directories():
@@ -715,59 +755,58 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             return 1
 
     # Parse --timeout (optional, default 24 hours - matches HCOM_TIMEOUT)
-    timeout = 86400  # 24 hours default
-    if "--timeout" in argv:
-        idx = argv.index("--timeout")
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+    timeout: int | float = 86400  # 24 hours default
+    try:
+        timeout_val, argv = parse_flag_value(argv, "--timeout")
+        if timeout_val:
             try:
-                timeout = int(argv[idx + 1])
-                argv = argv[:idx] + argv[idx + 2 :]
+                timeout = int(timeout_val)
             except ValueError:
-                print(
-                    format_error(
-                        f"--timeout must be an integer, got '{argv[idx + 1]}'"
-                    ),
-                    file=sys.stderr,
-                )
+                print(format_error(f"--timeout must be an integer, got '{timeout_val}'"), file=sys.stderr)
                 return 1
-        else:
-            print(format_error("--timeout requires a value"), file=sys.stderr)
-            return 1
+    except CLIError:
+        print(format_error("--timeout requires a value"), file=sys.stderr)
+        return 1
 
     # Parse positional timeout (e.g. hcom listen 5)
-    # Be careful not to consume flags or other positional args if we add them later
     # Only consume if it looks like an integer and we haven't set timeout via flag
-    if not any(
-        arg == "--timeout" for arg in argv
-    ):  # Should be gone if we parsed it, but check to be safe
-        # Find first positional arg that is an integer
+    if timeout_val is None:
         for i, arg in enumerate(argv):
             if not arg.startswith("-") and arg.isdigit():
                 timeout = int(arg)
-                # Remove it from argv so it doesn't confuse other things (though usually listen has no other pos args)
-                argv.pop(i)
+                argv = argv[:i] + argv[i + 1 :]
                 break
 
     # Quick check mode: timeout <= 1 means instant check (0.1s)
-    # This makes "hcom listen 1" a fast one-shot check for pending messages
     if timeout <= 1:
         timeout = 0.1
 
     # Parse --json (optional)
-    json_output = "--json" in argv
-    if json_output:
-        argv.remove("--json")
+    json_output, argv = parse_flag_bool(argv, "--json")
+
+    # PHASE 1: Expand filter shortcuts (--idle, --blocked)
+    from ..core.filters import expand_shortcuts
+    argv = expand_shortcuts(argv)
+
+    # PHASE 2: Parse composable filter flags
+    from ..core.filters import parse_event_flags, build_sql_from_flags
+    filters, argv = parse_event_flags(argv)
+
+    # PHASE 3: Validate type constraints
+    if filters:
+        from ..core.filters import validate_type_constraints
+        try:
+            validate_type_constraints(filters)
+        except ValueError as e:
+            print(format_error(str(e)), file=sys.stderr)
+            return 1
 
     # Parse --sql (optional) - SQL filter mode
-    sql_filter = None
-    if "--sql" in argv:
-        idx = argv.index("--sql")
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
-            sql_filter = argv[idx + 1]
-            argv = argv[:idx] + argv[idx + 2 :]
-        else:
-            print(format_error("--sql requires a value"), file=sys.stderr)
-            return 1
+    try:
+        sql_filter, argv = parse_flag_value(argv, "--sql")
+    except CLIError:
+        print(format_error("--sql requires a value"), file=sys.stderr)
+        return 1
 
     # Use instance_data from identity resolution (already validated by resolve_identity)
     instance_data = identity.instance_data
@@ -776,12 +815,29 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(format_error(f"hcom not started for '{instance_name}'."), file=sys.stderr)
         return 1
 
+    # PHASE 4: Combine filters and --sql (both work together, ANDed)
+    combined_sql = None
+    if filters or sql_filter:
+        sql_parts = []
+
+        # Add filter SQL
+        if filters:
+            flag_sql = build_sql_from_flags(filters)
+            if flag_sql:
+                sql_parts.append(f"({flag_sql})")
+
+        # Add manual SQL filter
+        if sql_filter:
+            sql_parts.append(f"({sql_filter})")
+
+        # Combine with AND
+        if sql_parts:
+            combined_sql = " AND ".join(sql_parts)
+
     # Branch: SQL filter mode vs message-wait mode
-    if sql_filter:
-        # Expand preset shortcuts (e.g., 'idle:veki' -> full SQL)
-        expanded_sql = _expand_sql_preset(sql_filter)
+    if combined_sql:
         return _listen_with_filter(
-            expanded_sql, instance_name, timeout, json_output, instance_data
+            combined_sql, instance_name, timeout, json_output, instance_data
         )
 
     # Standard message-wait mode below
@@ -791,31 +847,12 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     start_time = time.time()
 
     # Setup TCP notification socket for instant wake on local messages
-    notify_server = None
-    notify_port = None
-    try:
-        notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        notify_server.bind(("127.0.0.1", 0))
-        notify_server.listen(128)
-        notify_server.setblocking(False)
-        notify_port = notify_server.getsockname()[1]
-    except Exception:
-        notify_server = None
+    notify_server, notify_port = _create_notify_server()
 
-    # Initialize heartbeat fields (notify endpoint registered separately)
-    try:
-        update_instance_position(
-            instance_name,
-            {
-                "last_stop": start_time,
-                "wait_timeout": timeout,
-            },
-        )
-    except Exception as e:
-        print(f"Warning: Failed to update instance position: {e}", file=sys.stderr)
+    # Initialize heartbeat
+    _init_heartbeat(instance_name, timeout)
 
-    # Register notify endpoint without clobbering other listeners (PTY wrappers, hooks).
+    # Register notify endpoint without clobbering other listeners (PTY wrappers, hooks)
     if notify_port:
         try:
             from ..core.db import upsert_notify_endpoint
@@ -899,17 +936,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 return 0
 
             # Update heartbeat
-            try:
-                update_instance_position(
-                    instance_name,
-                    {
-                        "last_stop": time.time(),
-                    },
-                )
-            except Exception as e:
-                print(
-                    f"Warning: Failed to update instance position: {e}", file=sys.stderr
-                )
+            _update_heartbeat(instance_name)
 
             # TCP select for local notifications
             remaining = timeout - (time.time() - start_time)
@@ -925,12 +952,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             if notify_server:
                 readable, _, _ = select.select([notify_server], [], [], wait_time)
                 if readable:
-                    # Drain all pending notifications
-                    while True:
-                        try:
-                            notify_server.accept()[0].close()
-                        except BlockingIOError:
-                            break
+                    _drain_notify_server(notify_server)
             else:
                 time.sleep(wait_time)
 

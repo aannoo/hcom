@@ -21,9 +21,7 @@ from ..shared import SenderIdentity, HcomError
 
 
 # UUID pattern for agent_id detection
-_UUID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
-)
+_UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _BASE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
 
@@ -44,10 +42,36 @@ def is_valid_base_name(name: str) -> bool:
 
 def base_name_error(name: str) -> str:
     """Build a consistent error for invalid base instance names."""
-    return (
-        f"Invalid instance name '{name}'. Use base name only "
-        "(lowercase letters, numbers, underscore)."
-    )
+    return f"Invalid instance name '{name}'. Use base name only (lowercase letters, numbers, underscore)."
+
+
+# Dangerous characters for user-provided names (injection prevention + naming consistency)
+_DANGEROUS_CHARS_PATTERN = re.compile(r"[|&;$`<>]")
+_DANGEROUS_CHARS_WITH_AT_PATTERN = re.compile(r"[|&;$`<>@]")
+
+
+def validate_name_input(name: str, *, max_length: int = 50, allow_at: bool = True) -> str | None:
+    """Validate user-provided name input for length and dangerous characters.
+
+    Used for --name and --from flag validation in CLI commands.
+
+    Args:
+        name: User-provided name string
+        max_length: Maximum allowed length (default 50)
+        allow_at: If False, reject @ character (for --from validation)
+
+    Returns:
+        Error message string if invalid, None if valid.
+    """
+    if len(name) > max_length:
+        return f"Name too long ({len(name)} chars, max {max_length})"
+
+    pattern = _DANGEROUS_CHARS_PATTERN if allow_at else _DANGEROUS_CHARS_WITH_AT_PATTERN
+    bad_chars = pattern.findall(name)
+    if bad_chars:
+        return f"Name contains invalid characters: {' '.join(set(bad_chars))}"
+
+    return None
 
 
 def resolve_from_name(name: str) -> SenderIdentity:
@@ -83,9 +107,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
 
     # 2. Agent ID lookup (Claude Code sends short IDs like 'a6d9caf')
     conn = get_db()
-    row = conn.execute(
-        "SELECT name FROM instances WHERE agent_id = ?", (name,)
-    ).fetchone()
+    row = conn.execute("SELECT name FROM instances WHERE agent_id = ?", (name,)).fetchone()
     if row:
         instance_name = row["name"]
         instance_data = load_instance_position(instance_name)
@@ -132,7 +154,7 @@ def resolve_identity(
 
     # 2. Explicit session_id (internal use)
     if session_id:
-        resolved_name, data = resolve_instance_name(session_id, None)
+        resolved_name, data = resolve_instance_name(session_id)
         if not resolved_name or not data:
             raise HcomError("Instance not found for session_id")
         return SenderIdentity(
@@ -154,27 +176,27 @@ def resolve_identity(
         bound_name = resolve_process_binding(process_id)
         if not bound_name:
             raise HcomError("Session expired. Run 'hcom start' to reconnect.")
-        data = load_instance_position(bound_name)
-        if not data:
+        bound_data = load_instance_position(bound_name)
+        if not bound_data:
             raise HcomError(instance_not_found_error(bound_name))
         # Row exists = participating
         return SenderIdentity(
             kind="instance",
             name=bound_name,
-            instance_data=data,
-            session_id=data.get("session_id"),
+            instance_data=bound_data,
+            session_id=bound_data.get("session_id"),
         )
 
     # 6. No identity - provide actionable guidance
-    raise HcomError(
-        "No hcom identity. Run 'hcom start' first, then use --name <yourname> on commands."
-    )
+    raise HcomError("No hcom identity. Run 'hcom start' first, then use --name <yourname> on commands.")
 
 
 __all__ = [
+    "_looks_like_uuid",
     "base_name_error",
     "instance_not_found_error",
     "is_valid_base_name",
     "resolve_from_name",
     "resolve_identity",
+    "validate_name_input",
 ]

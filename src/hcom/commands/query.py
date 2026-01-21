@@ -5,6 +5,8 @@ import os
 import json
 import time
 from pathlib import Path
+from typing import Any
+
 from .utils import format_error
 from ..core.paths import hcom_path, ARCHIVE_DIR
 from ..core.instances import (
@@ -31,7 +33,7 @@ def _list_archives(here_filter: bool = False, limit: int = 0) -> list[dict]:
         return []
 
     cwd = os.getcwd() if here_filter else None
-    archives = []
+    archives: list[dict[str, Any]] = []
 
     for session_dir in sorted(archive_dir.glob("session-*"), reverse=True):
         if not session_dir.is_dir():
@@ -57,15 +59,11 @@ def _list_archives(here_filter: bool = False, limit: int = 0) -> list[dict]:
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
                 event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-                instance_count = conn.execute(
-                    "SELECT COUNT(*) FROM instances"
-                ).fetchone()[0]
+                instance_count = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
 
                 # Filter by directory if --here
                 if here_filter and cwd:
-                    dir_match = conn.execute(
-                        "SELECT 1 FROM instances WHERE directory = ? LIMIT 1", (cwd,)
-                    ).fetchone()
+                    dir_match = conn.execute("SELECT 1 FROM instances WHERE directory = ? LIMIT 1", (cwd,)).fetchone()
                     if not dir_match:
                         conn.close()
                         continue
@@ -117,9 +115,7 @@ def _resolve_archive(selector: str, archives: list[dict]) -> dict | None:
     return None
 
 
-def _query_archive_events(
-    archive: dict, sql_filter: str | None, last: int
-) -> list[dict]:
+def _query_archive_events(archive: dict, sql_filter: str | None, last: int) -> list[dict]:
     """Query events from archive database."""
     import sqlite3
     from ..core.db import DB_FILE
@@ -256,15 +252,13 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         for archive in archives:
             events = archive.get("events", "?")
             instances = archive.get("instances", "?")
-            print(
-                f"  {archive['index']:>2}. {archive['name']}  {events} events  {instances} agents"
-            )
+            print(f"  {archive['index']:>2}. {archive['name']}  {events} events  {instances} agents")
         return 0
 
     # Selector provided - resolve archive
     selector = clean_argv[0]
-    archive = _resolve_archive(selector, archives)
-    if not archive:
+    resolved_archive = _resolve_archive(selector, archives)
+    if not resolved_archive:
         print(format_error(f"Archive not found: {selector}"), file=sys.stderr)
         print("Run 'hcom archive' to list available archives", file=sys.stderr)
         return 1
@@ -272,7 +266,7 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Subcommand: agents
     if len(clean_argv) > 1 and clean_argv[1] == "agents":
         try:
-            instances = _query_archive_instances(archive, sql_filter)
+            instances = _query_archive_instances(resolved_archive, sql_filter)
             if json_output:
                 print(json.dumps(instances, indent=2))
             else:
@@ -294,7 +288,7 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Default: query events
     try:
-        events = _query_archive_events(archive, sql_filter, last_count)
+        events = _query_archive_events(resolved_archive, sql_filter, last_count)
         if json_output:
             print(json.dumps(events, indent=2))
         else:
@@ -303,11 +297,7 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             else:
                 for event in events:
                     eid = event["id"]
-                    ts = (
-                        event["timestamp"].split("T")[1][:8]
-                        if "T" in event["timestamp"]
-                        else event["timestamp"]
-                    )
+                    ts = event["timestamp"].split("T")[1][:8] if "T" in event["timestamp"] else event["timestamp"]
                     etype = event["type"]
                     inst = event["instance"]
                     data = event["data"]
@@ -451,9 +441,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         is_self = target_name == "self"
         if is_self and not sender_identity:
             print(
-                format_error(
-                    "Cannot use 'self' without identity. Run 'hcom start' first."
-                ),
+                format_error("Cannot use 'self' without identity. Run 'hcom start' first."),
                 file=sys.stderr,
             )
             return 1
@@ -519,14 +507,12 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Load read receipts for all contexts (bigboss, instances)
     # JSON output gets all receipts; verbose gets 3; default gets 1
     read_limit = None if json_output else (3 if verbose_output else 1)
-    read_receipts = (
-        get_read_receipts(sender_identity, limit=read_limit) if sender_identity else []
-    )
+    read_receipts = get_read_receipts(sender_identity, limit=read_limit) if sender_identity else []
 
     # Get current instance data for display
-    current_data = None
+    display_data: Any = None
     if current_name and current_name != SENDER:
-        current_data = load_instance_position(current_name)
+        display_data = load_instance_position(current_name)
 
     # Query instances (row exists = active)
     db = get_db()
@@ -540,17 +526,13 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     from ..core.messages import get_unread_counts_batch
     from ..core.instances import is_remote_instance
 
-    instances_for_unread = {
-        d["name"]: d for d in sorted_instances if not is_remote_instance(d)
-    }
+    instances_for_unread = {d["name"]: d for d in sorted_instances if not is_remote_instance(d)}
     unread_counts = get_unread_counts_batch(instances_for_unread)
 
     if json_output:
         # JSON per line - _self entry first (skip if no identity)
         if sender_identity:
-            self_payload = {
-                "_self": {"name": current_name, "read_receipts": read_receipts}
-            }
+            self_payload = {"_self": {"name": current_name, "read_receipts": read_receipts}}
             if verbose_output and sender_identity.session_id:
                 self_payload["_self"]["session_id"] = sender_identity.session_id
             print(json.dumps(self_payload))
@@ -560,7 +542,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         for data in sorted_instances:
             # Use full display name ({tag}-{name} or {name})
             full_name = get_full_name(data)
-            status, age_str, description, age_seconds = get_instance_status(data)
+            status, age_str, description, age_seconds, _ = get_instance_status(data)
 
             # Get binding status (integration tier)
             bindings = get_instance_bindings(data["name"])
@@ -573,7 +555,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-            payload = {
+            payload: dict[str, Any] = {
                 "name": full_name,
                 "status": status,
                 "status_context": data.get("status_context", ""),
@@ -600,7 +582,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     else:
         # Human-readable - show header with name and read receipts
         # Use full display name (with tag prefix if set)
-        display_name = get_full_name(current_data) if current_data else current_name
+        display_name = get_full_name(display_data) if display_data else current_name
         if display_name:
             print(f"Your name: {display_name}")
         else:
@@ -616,14 +598,10 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 if verbose_output:
                     # Verbose: show list of who has read + ratio
                     readers = ", ".join(msg["read_by"]) if msg["read_by"] else "(none)"
-                    print(
-                        f'    #{msg["id"]} {msg["age"]} "{msg["text"]}" | read by ({read_count}/{total}): {readers}'
-                    )
+                    print(f'    #{msg["id"]} {msg["age"]} "{msg["text"]}" | read by ({read_count}/{total}): {readers}')
                 else:
                     # Default: just show ratio
-                    print(
-                        f'    #{msg["id"]} {msg["age"]} "{msg["text"]}" | read by {read_count}/{total}'
-                    )
+                    print(f'    #{msg["id"]} {msg["age"]} "{msg["text"]}" | read by {read_count}/{total}')
 
         print()
 
@@ -634,23 +612,17 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         # Check if multiple directories exist (show project tag if so)
         from ..shared import get_project_tag
 
-        directories = set(
-            data.get("directory", "")
-            for data in sorted_instances
-            if data.get("directory")
-        )
+        directories = set(data.get("directory", "") for data in sorted_instances if data.get("directory"))
         show_project = len(directories) > 1
 
         for data in sorted_instances:
             # Use full display name ({tag}-{name} or {name})
             # Mask name for launching placeholders (temp name that will change during resume)
             name = "· · ·" if is_launching_placeholder(data) else get_full_name(data)
-            status, age_str, description, age_seconds = get_instance_status(data)
+            status, age_str, description, age_seconds, _ = get_instance_status(data)
             icon = get_status_icon(data, status)
             # "now" special case (listening status uses age=0)
-            age_display = (
-                age_str if age_str == "now" else (f"{age_str} ago" if age_str else "")
-            )
+            age_display = age_str if age_str == "now" else (f"{age_str} ago" if age_str else "")
             # Append "since X" for listening agents idle >= 1 minute
             if status == "listening" and description == "listening":
                 from ..shared import format_listening_since
@@ -684,13 +656,9 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             headless_badge = "[headless]" if data.get("background", False) else ""
             remote_badge = "[remote]" if is_remote_instance(data) else ""
             # Project tag badge (only when instances have different directories)
-            project_tag = (
-                get_project_tag(data.get("directory", "")) if show_project else ""
-            )
+            project_tag = get_project_tag(data.get("directory", "")) if show_project else ""
             project_badge = f"· {project_tag}" if project_tag else ""
-            badge_parts = [
-                b for b in [headless_badge, remote_badge, project_badge] if b
-            ]
+            badge_parts = [b for b in [headless_badge, remote_badge, project_badge] if b]
             badge_str = (" " + " ".join(badge_parts)) if badge_parts else ""
 
             # Unread message indicator - messages queued for delivery on next hook/idle
@@ -719,9 +687,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             name_with_badges = f"{name}{badge_str}{unread_str}"
 
             # Main status line
-            print(
-                f"{tool_prefix}{icon} {name_with_badges:30} {age_display}{desc_sep}{description}{timeout_marker}"
-            )
+            print(f"{tool_prefix}{icon} {name_with_badges:30} {age_display}{desc_sep}{description}{timeout_marker}")
 
             if verbose_output:
                 # Multi-line detailed view
@@ -736,7 +702,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     # Get device sync time from kv store
                     from ..core.db import kv_get
 
-                    sync_time = 0
+                    sync_time = 0.0
                     try:
                         ts = kv_get(f"relay_sync_time_{origin_device}")
                         if ts:
@@ -772,9 +738,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                         # Truncate long details
                         max_len = 60
                         detail_display = (
-                            status_detail[:max_len] + "..."
-                            if len(status_detail) > max_len
-                            else status_detail
+                            status_detail[:max_len] + "..." if len(status_detail) > max_len else status_detail
                         )
                         print(f"    detail:       {detail_display}")
 
@@ -787,20 +751,12 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     parent = data.get("parent_name") or "(none)"
 
                     # Format paths (shorten with ~)
-                    log_file = (
-                        shorten_path(data.get("background_log_file") or "") or "(none)"
-                    )
-                    transcript = (
-                        shorten_path(data.get("transcript_path") or "") or "(none)"
-                    )
+                    log_file = shorten_path(data.get("background_log_file") or "") or "(none)"
+                    transcript = shorten_path(data.get("transcript_path") or "") or "(none)"
 
                     # Format created_at timestamp
                     created_ts = data.get("created_at")
-                    created = (
-                        f"{format_age(time.time() - created_ts)} ago"
-                        if created_ts
-                        else "(unknown)"
-                    )
+                    created = f"{format_age(time.time() - created_ts)} ago" if created_ts else "(unknown)"
 
                     # Get subagent agentId if this is a subagent
                     agent_id = None
@@ -837,9 +793,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                         # Truncate long details
                         max_len = 60
                         detail_display = (
-                            status_detail[:max_len] + "..."
-                            if len(status_detail) > max_len
-                            else status_detail
+                            status_detail[:max_len] + "..." if len(status_detail) > max_len else status_detail
                         )
                         print(f"    detail:       {detail_display}")
 
@@ -864,12 +818,10 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             if archive_dir.exists():
                 archive_count = len(list(archive_dir.glob("session-*")))
                 if archive_count > 0:
-                    print(
-                        f"({archive_count} archived session{'s' if archive_count != 1 else ''} - run: hcom archive)"
-                    )
+                    print(f"({archive_count} archived session{'s' if archive_count != 1 else ''} - run: hcom archive)")
 
     # For adhoc instances (--name with instance), append unread messages
-    if from_value and sender_identity.kind == "instance":
+    if from_value and sender_identity and sender_identity.kind == "instance" and current_name:
         append_unread_messages(current_name, json_output=json_output)
 
     return 0
@@ -1052,11 +1004,7 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print()
 
         # Directory
-        dir_status = (
-            "ok"
-            if (hcom_exists and hcom_writable)
-            else ("exists" if hcom_exists else "missing")
-        )
+        dir_status = "ok" if (hcom_exists and hcom_writable) else ("exists" if hcom_exists else "missing")
         print(f"dir:       {hcom_dir} ({dir_status})")
         if hcom_dir_override:
             print(f"           HCOM_DIR={os.environ.get('HCOM_DIR')}")
@@ -1084,10 +1032,7 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(f"tools:     Claude {claude_sym}  Gemini {gemini_sym}  Codex {codex_sym}")
 
         # Terminal
-        if (
-            terminal_config in ("default", "custom", "print")
-            or "{script}" in terminal_config
-        ):
+        if terminal_config in ("default", "custom", "print") or "{script}" in terminal_config:
             print(f"terminal:  {terminal_config}")
         else:
             term_status = "✓" if terminal_available else "✗"
@@ -1158,8 +1103,6 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
                     level_display = "ERROR" if level == "ERROR" else "WARN "
                     instance_part = f" ({instance})" if instance else ""
-                    print(
-                        f"           {time_display} {level_display} {subsystem}.{event}{instance_part}"
-                    )
+                    print(f"           {time_display} {level_display} {subsystem}.{event}{instance_part}")
 
     return 0

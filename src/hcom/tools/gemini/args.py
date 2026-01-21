@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Gemini CLI argument parsing and validation.
 
-Similar to codex_args.py but for Google Gemini CLI.
-Handles subcommands (mcp, extensions, hooks) and their flags.
+Parses Gemini CLI arguments with support for:
+- Subcommands (mcp, extensions, hooks)
+- Flag aliases (-m/--model, -p/--prompt, etc.)
+- Boolean flags (--yolo, --debug, etc.)
+- Value flags with space or equals syntax
+- Optional value flags (--resume with optional session id)
+- Repeatable flags (--extensions can appear multiple times)
 
-Key concepts:
-- is_headless: True when prompt provided via positional or -p flag.
-  Used to REJECT headless mode (not supported in hcom).
-- is_json: True when --output-format is json or stream-json
-- is_yolo: True when --yolo or --approval-mode=yolo (auto-approve all tools)
+Key Semantic Flags:
+    is_headless: True when prompt provided via positional or -p/--prompt.
+        hcom rejects headless Gemini - interactive mode with -i flag works.
+    is_json: True when --output-format is json or stream-json.
+    is_yolo: True when --yolo or --approval-mode=yolo (auto-approve all).
 
-Note: Gemini headless mode is not supported in hcom. Use claude headless instead.
+Usage:
+    >>> spec = resolve_gemini_args(['--model', 'gemini-2.0'], None)
+    >>> spec.get_flag_value('--model')
+    'gemini-2.0'
 """
 
 from __future__ import annotations
@@ -19,29 +27,46 @@ import difflib
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Iterable, Literal, Mapping, Sequence, Tuple
+from typing import Final, Literal, Mapping, Sequence, TypeAlias
 
-Subcommand = Literal["mcp", "extensions", "hooks", None]
-OutputFormat = Literal["text", "json", "stream-json"]
-ApprovalMode = Literal["default", "auto_edit", "yolo"]
+from ..args_common import (
+    BaseArgsSpec,
+    SourceType,
+    TokenList,
+    TokenTuple,
+    FlagValuesDict,
+    extract_flag_names_from_tokens as _extract_flag_names_from_tokens,
+    extract_flag_name_from_token as _extract_flag_name_from_token,
+    deduplicate_boolean_flags as _deduplicate_boolean_flags_base,
+    toggle_flag as _toggle_flag,
+    set_value_flag as _set_value_flag,
+    remove_flag_with_value as _remove_flag_with_value,
+)
+
+# Type aliases (Gemini-specific)
+Subcommand: TypeAlias = Literal["mcp", "extensions", "hooks", None]
+OutputFormat: TypeAlias = Literal["text", "json", "stream-json"]
+ApprovalMode: TypeAlias = Literal["default", "auto_edit", "yolo"]
+
+# ==================== Flag Classification ====================
 
 # Subcommand aliases
-_SUBCOMMAND_ALIASES: Mapping[str, str] = {
+_SUBCOMMAND_ALIASES: Final[Mapping[str, str]] = {
     "extension": "extensions",
     "hook": "hooks",
 }
 
 # All known subcommands (from gemini --help)
-_SUBCOMMANDS = {
+_SUBCOMMANDS: Final[frozenset[str]] = frozenset({
     "mcp",
     "extensions",
     "extension",  # extension is alias
     "hooks",
     "hook",  # hook is alias
-}
+})
 
 # Flag aliases: map short forms to canonical long forms
-_FLAG_ALIASES: Mapping[str, str] = {
+_FLAG_ALIASES: Final[Mapping[str, str]] = {
     "-d": "--debug",
     "-m": "--model",
     "-p": "--prompt",
@@ -57,7 +82,7 @@ _FLAG_ALIASES: Mapping[str, str] = {
 }
 
 # Boolean flags (no value required)
-_BOOLEAN_FLAGS = {
+_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset({
     # Global
     "-d",
     "--debug",
@@ -74,10 +99,10 @@ _BOOLEAN_FLAGS = {
     "-h",
     "--help",
     "--experimental-acp",
-}
+})
 
 # Flags that require a following value
-_VALUE_FLAGS = {
+_VALUE_FLAGS: Final[frozenset[str]] = frozenset({
     # Global (short and long forms)
     "-m",
     "--model",
@@ -94,11 +119,11 @@ _VALUE_FLAGS = {
     "--include-directories",
     "-o",
     "--output-format",
-}
+})
 # Note: --resume/-r moved to _OPTIONAL_VALUE_FLAGS
 
 # Flags with = syntax prefixes
-_VALUE_FLAG_PREFIXES = {
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset({
     "-m=",
     "--model=",
     "-p=",
@@ -116,25 +141,25 @@ _VALUE_FLAG_PREFIXES = {
     "--include-directories=",
     "-o=",
     "--output-format=",
-}
+})
 
 # Repeatable flags (can appear multiple times)
-_REPEATABLE_FLAGS = {
+_REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset({
     "-e",
     "--extensions",
     "--include-directories",
     "--allowed-mcp-server-names",
     "--allowed-tools",
-}
+})
 
 # Optional value flags (can be used with or without a value)
 # Per gemini docs: --resume [session_id] defaults to "latest" if omitted
-_OPTIONAL_VALUE_FLAGS = {
+_OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset({
     "--resume",
     "-r",
-}
+})
 
-_KNOWN_GEMINI_FLAGS = sorted(
+_KNOWN_GEMINI_FLAGS: Final[list[str]] = sorted(
     {
         *_BOOLEAN_FLAGS,
         *_OPTIONAL_VALUE_FLAGS,
@@ -146,9 +171,10 @@ _KNOWN_GEMINI_FLAGS = sorted(
 
 
 @dataclass(frozen=True)
-class GeminiArgsSpec:
+class GeminiArgsSpec(BaseArgsSpec):
     """Normalized representation of Gemini CLI arguments.
 
+    Inherits common fields and methods from BaseArgsSpec.
     Key fields for launch logic:
     - is_headless: True = non-interactive mode detected (prompt provided).
       Used to REJECT such launches - headless Gemini not supported in hcom.
@@ -156,43 +182,12 @@ class GeminiArgsSpec:
     - is_yolo: True = auto-approve all tools (--yolo or --approval-mode=yolo)
     """
 
-    source: Literal["cli", "env", "none"]
-    raw_tokens: Tuple[str, ...]
-    clean_tokens: Tuple[str, ...]
-    subcommand: Subcommand
-    positional_tokens: Tuple[str, ...]
-    positional_indexes: Tuple[int, ...]
-    is_headless: bool  # Has prompt (positional, -p, or stdin)
-    is_json: bool  # --output-format json|stream-json
-    is_yolo: bool  # --yolo or --approval-mode=yolo
-    output_format: OutputFormat
-    approval_mode: ApprovalMode
-    flag_values: Mapping[str, str | list[str]]  # Single or list for repeatable
-    errors: Tuple[str, ...] = ()
-
-    def has_flag(
-        self,
-        names: Iterable[str] | None = None,
-        prefixes: Iterable[str] | None = None,
-    ) -> bool:
-        """Check for user-provided flags (only scans before -- separator)."""
-        name_set = {n.lower() for n in (names or ())}
-        prefix_tuple = tuple(p.lower() for p in (prefixes or ()))
-
-        # Only scan tokens before --
-        try:
-            dash_idx = self.clean_tokens.index("--")
-            tokens_to_scan = self.clean_tokens[:dash_idx]
-        except ValueError:
-            tokens_to_scan = self.clean_tokens
-
-        for token in tokens_to_scan:
-            lower = token.lower()
-            if lower in name_set:
-                return True
-            if any(lower.startswith(prefix) for prefix in prefix_tuple):
-                return True
-        return False
+    subcommand: Subcommand = None
+    is_headless: bool = False  # Has prompt (positional, -p, or stdin)
+    is_json: bool = False  # --output-format json|stream-json
+    is_yolo: bool = False  # --yolo or --approval-mode=yolo
+    output_format: OutputFormat = "text"
+    approval_mode: ApprovalMode = "default"
 
     def get_flag_value(self, flag_name: str) -> str | list[str] | None:
         """Get value of a flag.
@@ -246,17 +241,25 @@ class GeminiArgsSpec:
 
         return last_value
 
-    def rebuild_tokens(self, include_subcommand: bool = True) -> list[str]:
-        """Return token list suitable for invoking Gemini."""
-        tokens: list[str] = []
+    def rebuild_tokens(
+        self,
+        include_positionals: bool = True,
+        *,
+        include_subcommand: bool = True,
+    ) -> TokenList:
+        """Return token list suitable for invoking Gemini.
+
+        Overrides base class to prepend subcommand if present.
+
+        Args:
+            include_positionals: Include positional arguments (inherited from base)
+            include_subcommand: Include subcommand prefix (Gemini-specific)
+        """
+        tokens: TokenList = []
         if include_subcommand and self.subcommand:
             tokens.append(self.subcommand)
-        tokens.extend(self.clean_tokens)
+        tokens.extend(super().rebuild_tokens(include_positionals))
         return tokens
-
-    def to_env_string(self) -> str:
-        """Render tokens into a shell-safe env string."""
-        return shlex.join(self.rebuild_tokens())
 
     def update(
         self,
@@ -318,9 +321,6 @@ class GeminiArgsSpec:
         combined.extend(tokens)
 
         return _parse_tokens(combined, self.source)
-
-    def has_errors(self) -> bool:
-        return bool(self.errors)
 
 
 def resolve_gemini_args(
@@ -492,27 +492,27 @@ def validate_conflicts(spec: GeminiArgsSpec) -> list[str]:
 
 def _parse_tokens(
     tokens: Sequence[str],
-    source: Literal["cli", "env", "none"],
+    source: SourceType,
     initial_errors: Sequence[str] | None = None,
 ) -> GeminiArgsSpec:
-    errors = list(initial_errors or [])
-    clean: list[str] = []
-    positional: list[str] = []
+    errors: list[str] = list(initial_errors or [])
+    clean: TokenList = []
+    positional: TokenList = []
     positional_indexes: list[int] = []
-    flag_values: dict[str, str | list[str]] = {}
+    flag_values: FlagValuesDict = {}
 
     subcommand: Subcommand = None
-    is_headless = False
-    is_json = False
-    is_yolo = False
-    has_prompt_interactive = False  # Track -i/--prompt-interactive
+    is_headless: bool = False
+    is_json: bool = False
+    is_yolo: bool = False
+    has_prompt_interactive: bool = False  # Track -i/--prompt-interactive
     output_format: OutputFormat = "text"
     approval_mode: ApprovalMode = "default"
     pending_flag: str | None = None
-    after_double_dash = False
+    after_double_dash: bool = False
 
-    i = 0
-    raw_tokens = tuple(tokens)
+    i: int = 0
+    raw_tokens: TokenTuple = tuple(tokens)
 
     # Check for subcommand as first token
     if tokens and tokens[0].lower() in _SUBCOMMANDS:
@@ -777,101 +777,6 @@ def _looks_like_session_id(token: str) -> bool:
     return False
 
 
-def _extract_flag_names_from_tokens(tokens: Sequence[str]) -> set[str]:
-    """Extract normalized flag names from token list."""
-    flag_names = set()
-    for token in tokens:
-        flag_name = _extract_flag_name_from_token(token)
-        if flag_name:
-            flag_names.add(flag_name)
-    return flag_names
-
-
-def _extract_flag_name_from_token(token: str) -> str | None:
-    """Extract flag name from a token."""
-    token_lower = token.lower()
-
-    if not token_lower.startswith("-"):
-        return None
-
-    if "=" in token_lower:
-        return token_lower.split("=")[0]
-
-    return token_lower
-
-
-def _deduplicate_boolean_flags(tokens: Sequence[str]) -> list[str]:
+def _deduplicate_boolean_flags(tokens: Sequence[str]) -> TokenList:
     """Remove duplicate boolean flags, keeping first occurrence."""
-    seen_flags: set[str] = set()
-    result = []
-
-    for token in tokens:
-        token_lower = token.lower()
-        if token_lower in _BOOLEAN_FLAGS:
-            if token_lower in seen_flags:
-                continue
-            seen_flags.add(token_lower)
-        result.append(token)
-
-    return result
-
-
-def _toggle_flag(tokens: Sequence[str], flag: str, desired: bool) -> list[str]:
-    """Toggle a boolean flag."""
-    tokens_list = list(tokens)
-    flag_lower = flag.lower()
-
-    # Remove existing occurrences
-    filtered = [t for t in tokens_list if t.lower() != flag_lower]
-
-    if desired:
-        return [flag] + filtered
-    return filtered
-
-
-def _set_value_flag(tokens: Sequence[str], flag: str, value: str) -> list[str]:
-    """Set a value flag, removing any existing occurrence."""
-    tokens_list = list(tokens)
-    flag_lower = flag.lower()
-
-    # Remove existing occurrences (both --flag value and --flag=value forms)
-    result = []
-    skip_next = False
-    for i, token in enumerate(tokens_list):
-        if skip_next:
-            skip_next = False
-            continue
-        token_lower = token.lower()
-        if token_lower == flag_lower:
-            # Skip this and the next token (the value)
-            skip_next = True
-            continue
-        if token_lower.startswith(flag_lower + "="):
-            continue
-        result.append(token)
-
-    # Add the new value
-    result.extend([flag, value])
-    return result
-
-
-def _remove_flag_with_value(tokens: Sequence[str], flag: str) -> list[str]:
-    """Remove all occurrences of a flag and its value."""
-    tokens_list = list(tokens)
-    flag_lower = flag.lower()
-
-    result = []
-    skip_next = False
-    for i, token in enumerate(tokens_list):
-        if skip_next:
-            skip_next = False
-            continue
-        token_lower = token.lower()
-        if token_lower == flag_lower:
-            skip_next = True
-            continue
-        if token_lower.startswith(flag_lower + "="):
-            continue
-        result.append(token)
-
-    return result
+    return _deduplicate_boolean_flags_base(tokens, _BOOLEAN_FLAGS)

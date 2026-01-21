@@ -87,7 +87,7 @@ class HcomConfig:
     relay_token: str = ""
     relay_enabled: bool = True
     auto_approve: bool = True
-    default_subscriptions: str = "collision"
+    auto_subscribe: str = "collision"
     name_export: str = ""
 
     def __post_init__(self):
@@ -259,20 +259,20 @@ class HcomConfig:
                 f"auto_approve must be a boolean, got {type(self.auto_approve).__name__}",
             )
 
-        # Validate default_subscriptions (comma-separated preset names)
-        if not isinstance(self.default_subscriptions, str):
+        # Validate auto_subscribe (comma-separated preset names)
+        if not isinstance(self.auto_subscribe, str):
             set_error(
-                "default_subscriptions",
-                f"default_subscriptions must be a string, got {type(self.default_subscriptions).__name__}",
+                "auto_subscribe",
+                f"auto_subscribe must be a string, got {type(self.auto_subscribe).__name__}",
             )
-        elif self.default_subscriptions:
+        elif self.auto_subscribe:
             # Check each preset name is alphanumeric/underscore (no SQL injection)
-            for preset in self.default_subscriptions.split(","):
+            for preset in self.auto_subscribe.split(","):
                 preset = preset.strip()
                 if preset and not re.match(r"^[a-zA-Z0-9_]+$", preset):
                     set_error(
-                        "default_subscriptions",
-                        f"default_subscriptions preset '{preset}' contains invalid characters (alphanumeric/underscore only)",
+                        "auto_subscribe",
+                        f"auto_subscribe preset '{preset}' contains invalid characters (alphanumeric/underscore only)",
                     )
 
         return errors
@@ -385,10 +385,10 @@ class HcomConfig:
                 "",
             )
 
-        # Load default_subscriptions (comma-separated preset names)
-        default_subscriptions = get_var("HCOM_DEFAULT_SUBSCRIPTIONS")
-        if default_subscriptions is not None:  # Allow empty string (disables defaults)
-            data["default_subscriptions"] = default_subscriptions
+        # Load auto_subscribe (comma-separated preset names)
+        auto_subscribe = get_var("HCOM_AUTO_SUBSCRIBE")
+        if auto_subscribe is not None:  # Allow empty string (disables auto-subscribe)
+            data["auto_subscribe"] = auto_subscribe
 
         # Load name_export (export instance name to custom env var)
         name_export = get_var("HCOM_NAME_EXPORT")
@@ -445,7 +445,7 @@ def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
         "HCOM_RELAY_TOKEN": config.relay_token,
         "HCOM_RELAY_ENABLED": "1" if config.relay_enabled else "0",
         "HCOM_AUTO_APPROVE": "1" if config.auto_approve else "0",
-        "HCOM_DEFAULT_SUBSCRIPTIONS": config.default_subscriptions,
+        "HCOM_AUTO_SUBSCRIBE": config.auto_subscribe,
         "HCOM_NAME_EXPORT": config.name_export,
     }
 
@@ -536,8 +536,8 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
             "off",
             "",
         )
-    if "HCOM_DEFAULT_SUBSCRIPTIONS" in data:
-        kwargs["default_subscriptions"] = data["HCOM_DEFAULT_SUBSCRIPTIONS"]
+    if "HCOM_AUTO_SUBSCRIBE" in data:
+        kwargs["auto_subscribe"] = data["HCOM_AUTO_SUBSCRIBE"]
     if "HCOM_NAME_EXPORT" in data:
         kwargs["name_export"] = data["HCOM_NAME_EXPORT"]
 

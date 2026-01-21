@@ -1,6 +1,30 @@
-"""Claude Code settings management for hooks.
+"""Claude Code settings.json management for hook installation.
 
-Mirrors the patterns from tools/gemini/settings.py and tools/codex/settings.py.
+This module handles installation and removal of hcom hooks in Claude's
+~/.claude/settings.json configuration file. It mirrors patterns from
+tools/gemini/settings.py and tools/codex/settings.py.
+
+Hook Configuration:
+    CLAUDE_HOOK_CONFIGS defines all 9 hook types with their:
+    - hook_type: Claude hook event name (SessionStart, PreToolUse, etc.)
+    - matcher: Tool name filter (e.g., "Bash|Task|Write|Edit" for PreToolUse)
+    - command_suffix: hcom subcommand (sessionstart, pre, post, poll, etc.)
+    - timeout: Max hook execution time in seconds (None = default)
+
+Permissions:
+    CLAUDE_HCOM_PERMISSIONS contains safe hcom command patterns auto-approved
+    in settings.json permissions.allow. Generated from core/tool_utils.py.
+
+Detection Patterns:
+    CLAUDE_HCOM_HOOK_PATTERNS contains regex patterns to detect existing hcom
+    hooks during removal. Includes legacy patterns for backwards compatibility.
+
+Public Functions:
+    setup_claude_hooks()           - Install all hcom hooks
+    verify_claude_hooks_installed() - Check if hooks are correctly installed
+    remove_claude_hooks()          - Remove all hcom hooks
+    get_claude_settings_path()     - Get settings.json path (respects HCOM_DIR)
+    load_claude_settings()         - Load and parse settings.json
 """
 
 from __future__ import annotations
@@ -88,7 +112,21 @@ def load_claude_settings(
 
 
 def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
-    """Remove hcom hooks from Claude settings dict. Returns True if any hooks were removed."""
+    """Remove all hcom hooks from a Claude settings dictionary.
+
+    Scans all hook types in CLAUDE_HOOK_TYPES and removes any hooks whose
+    command matches CLAUDE_HCOM_HOOK_PATTERNS. Also removes HCOM from env
+    and hcom permission patterns from permissions.allow.
+
+    Args:
+        settings: Mutable settings dict to modify in-place
+
+    Returns:
+        True if any hcom hooks/env/permissions were removed, False otherwise.
+
+    Raises:
+        ValueError: If settings structure is malformed (non-dict matchers, etc.)
+    """
     removed_any = False
 
     if not isinstance(settings, dict) or "hooks" not in settings:

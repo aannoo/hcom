@@ -15,6 +15,7 @@ from .admin import (
 )
 from .shim import cmd_shim
 from .hooks_cmd import cmd_hooks
+from .bundle import cmd_bundle
 from .utils import CLIError, format_error
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "cmd_status",
     "cmd_shim",
     "cmd_hooks",
+    "cmd_bundle",
     "CLIError",
     "format_error",
 ]

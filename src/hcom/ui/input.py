@@ -1,4 +1,25 @@
-"""Keyboard input handling and text editing"""
+"""Keyboard input handling and text editing.
+
+This module provides cross-platform keyboard input for the TUI and text input
+editing functions used by both Manage and Launch screens.
+
+Key Features
+------------
+- Cross-platform keyboard input (Unix termios/tty, Windows msvcrt)
+- UTF-8 multi-byte character handling
+- Paste detection (distinguishes manual Enter from pasted newlines)
+- Special key recognition (arrows, Ctrl+*, etc.)
+
+Text Input Functions
+--------------------
+The text_input_* functions provide cursor-based text editing:
+- text_input_insert: Insert text at cursor
+- text_input_backspace: Delete character before cursor
+- text_input_move_left/right: Move cursor
+
+These functions operate on (buffer, cursor) tuples and return new
+(buffer, cursor) values without mutating the originals.
+"""
 
 from __future__ import annotations
 import os
@@ -28,9 +49,18 @@ IS_WINDOWS = os.name == "nt"
 
 
 def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
-    """Slice text to fit within visual width, accounting for wide chars and ANSI codes.
+    """Slice text to fit within visual width, handling wide chars and ANSI codes.
 
-    Returns: (chunk_text, chars_consumed)
+    Used for text wrapping in the input area.
+
+    Args:
+        text: Text to slice (may contain ANSI codes).
+        max_width: Maximum visual width in terminal columns.
+
+    Returns:
+        (chunk_text, chars_consumed) tuple where:
+        - chunk_text: Substring that fits within max_width
+        - chars_consumed: Number of characters consumed from input
     """
     visual_width = 0
     char_pos = 0
@@ -63,9 +93,38 @@ def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
 
 
 class KeyboardInput:
-    """Cross-platform keyboard input handler"""
+    """Cross-platform keyboard input handler.
+
+    Provides non-blocking keyboard input with special key recognition.
+    Use as a context manager to properly set/restore terminal settings.
+
+    Unix: Uses termios/tty for raw mode, select for non-blocking reads.
+    Windows: Uses msvcrt for direct console input.
+
+    Special Keys Returned
+    ---------------------
+    - "UP", "DOWN", "LEFT", "RIGHT": Arrow keys
+    - "ENTER": Enter key (manual press, not pasted newline)
+    - "ESC": Escape key
+    - "BACKSPACE": Backspace/Delete
+    - "SPACE": Spacebar
+    - "TAB": Tab key
+    - "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_G", "CTRL_R": Control combinations
+    - Single character: Printable characters
+    - "\\n": Pasted newline (part of multi-character paste)
+
+    Example:
+        with KeyboardInput() as kbd:
+            while True:
+                if kbd.has_input():
+                    key = kbd.get_key()
+                    if key == "CTRL_D":
+                        break
+                    print(f"Pressed: {key}")
+    """
 
     def __init__(self):
+        """Initialize keyboard handler (platform-specific setup)."""
         self.is_windows = IS_WINDOWS
         if not self.is_windows:
             import termios
@@ -77,6 +136,7 @@ class KeyboardInput:
             self.old_settings = None
 
     def __enter__(self):
+        """Enter context: set terminal to cbreak mode and hide cursor."""
         if not self.is_windows:
             try:
                 self.old_settings = self.termios.tcgetattr(self.fd)
@@ -88,13 +148,18 @@ class KeyboardInput:
         return self
 
     def __exit__(self, *args):
+        """Exit context: restore terminal settings and show cursor."""
         if not self.is_windows and self.old_settings:
             self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.old_settings)
         sys.stdout.write(SHOW_CURSOR)
         sys.stdout.flush()
 
     def has_input(self) -> bool:
-        """Check if input is available without blocking"""
+        """Check if input is available without blocking.
+
+        Returns:
+            True if there's pending input to read.
+        """
         if self.is_windows:
             import msvcrt
 
@@ -106,7 +171,16 @@ class KeyboardInput:
                 return False
 
     def get_key(self) -> Optional[str]:
-        """Read single key press, return special key name or character"""
+        """Read single key press, returning special key name or character.
+
+        Non-blocking: returns None if no input available.
+
+        Returns:
+            Special key name (e.g., "UP", "ENTER", "CTRL_D"),
+            single character for printable keys,
+            "\\n" for pasted newlines,
+            or None if no input.
+        """
         if self.is_windows:
             import msvcrt
 
@@ -215,11 +289,23 @@ class KeyboardInput:
             return ch
 
 
-# Text input helper functions (shared between MANAGE and LAUNCH)
+# ===== Text Input Helper Functions =====
+# Shared between MANAGE and LAUNCH screens for consistent text editing.
 
 
 def text_input_insert(buffer: str, cursor: int, text: str) -> tuple[str, int]:
-    """Insert text at cursor position, return (new_buffer, new_cursor)"""
+    """Insert text at cursor position.
+
+    Strips ANSI codes from pasted text to prevent display corruption.
+
+    Args:
+        buffer: Current text buffer.
+        cursor: Current cursor position (0 to len(buffer)).
+        text: Text to insert (may contain ANSI codes which are stripped).
+
+    Returns:
+        (new_buffer, new_cursor) tuple.
+    """
     # Strip ANSI codes from pasted text (prevents cursor/layout issues)
     clean_text = ANSI_RE.sub("", text)
     new_buffer = buffer[:cursor] + clean_text + buffer[cursor:]
@@ -228,7 +314,15 @@ def text_input_insert(buffer: str, cursor: int, text: str) -> tuple[str, int]:
 
 
 def text_input_backspace(buffer: str, cursor: int) -> tuple[str, int]:
-    """Delete char before cursor, return (new_buffer, new_cursor)"""
+    """Delete character before cursor.
+
+    Args:
+        buffer: Current text buffer.
+        cursor: Current cursor position.
+
+    Returns:
+        (new_buffer, new_cursor) tuple. No change if cursor is at position 0.
+    """
     if cursor > 0:
         new_buffer = buffer[: cursor - 1] + buffer[cursor:]
         new_cursor = cursor - 1
@@ -237,19 +331,45 @@ def text_input_backspace(buffer: str, cursor: int) -> tuple[str, int]:
 
 
 def text_input_move_left(cursor: int) -> int:
-    """Move cursor left, return new position"""
+    """Move cursor left one position.
+
+    Args:
+        cursor: Current cursor position.
+
+    Returns:
+        New cursor position (clamped to 0).
+    """
     return max(0, cursor - 1)
 
 
 def text_input_move_right(buffer: str, cursor: int) -> int:
-    """Move cursor right, return new position"""
+    """Move cursor right one position.
+
+    Args:
+        buffer: Current text buffer (for length check).
+        cursor: Current cursor position.
+
+    Returns:
+        New cursor position (clamped to buffer length).
+    """
     return min(len(buffer), cursor + 1)
 
 
 def calculate_text_input_rows(
     text: str, width: int, max_rows: int = MAX_INPUT_ROWS
 ) -> int:
-    """Calculate rows needed for wrapped text with literal newlines"""
+    """Calculate rows needed to display wrapped text with literal newlines.
+
+    Used for dynamic input area sizing.
+
+    Args:
+        text: Text content (may contain literal \\n characters).
+        width: Terminal width for wrapping calculation.
+        max_rows: Maximum rows to return.
+
+    Returns:
+        Number of rows needed (1 to max_rows).
+    """
     if not text:
         return 1
 
@@ -276,19 +396,25 @@ def render_text_input(
     prefix: str = "> ",
     send_state: str | None = None,
 ) -> List[str]:
-    """
-    Render text input with cursor, wrapping, and literal newlines.
+    """Render text input with cursor, wrapping, and multi-line support.
+
+    Creates a visually styled text input area with:
+    - Visible cursor (inverse video on character or trailing space)
+    - Automatic line wrapping at terminal width
+    - Literal newline handling (multi-line input)
+    - Visual feedback for send state
 
     Args:
-        buffer: Text content
-        cursor: Cursor position (0 to len(buffer))
-        width: Terminal width
-        max_rows: Maximum rows to render
-        prefix: First line prefix (e.g., "> " or "")
-        send_state: None (normal), 'sending' (dim), or 'sent' (orange prefix)
+        buffer: Text content to display.
+        cursor: Cursor position (0 to len(buffer)).
+        width: Terminal width for wrapping.
+        max_rows: Maximum rows to render.
+        prefix: Prefix for first line (e.g., "> ").
+        send_state: Visual state - None (normal), "sending" (dimmed),
+                    or "sent" (lighter color after send).
 
     Returns:
-        List of formatted lines with cursor (█)
+        List of formatted line strings ready for display.
     """
     # Determine colors based on send state
     if send_state == "sending":

@@ -325,7 +325,6 @@ def get_macos_terminal_argv() -> list[str]:
 def get_windows_terminal_argv() -> list[str]:
     """Return Windows terminal launcher as argv list."""
     from .commands.utils import format_error
-    from .shared import HcomError
 
     if not (bash_exe := find_bash_on_windows()):
         raise Exception(format_error("Git Bash not found"))
@@ -471,7 +470,6 @@ def launch_terminal(
         - run_here=True: True on success, False on failure
         - new terminal: True on success (async), False on failure
     """
-    from .shared import HcomError
     from .commands.utils import format_error
     from .core.paths import LOGS_DIR
     import time
@@ -737,7 +735,7 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
     subprocess output and render it in their TUI (blocking the screen).
     Solution: fully detach with Popen + start_new_session + DEVNULL.
     """
-    from .shared import HcomError, is_inside_ai_tool
+    from .shared import is_inside_ai_tool
     from .core.log import log_info, log_warn
 
     if platform.system() == "Windows":

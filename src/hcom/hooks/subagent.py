@@ -1,4 +1,32 @@
-"""Subagent context hook implementations"""
+"""Subagent context hooks - handles hooks during Task tool execution.
+
+When a parent Claude instance runs the Task tool, hooks continue to fire in the
+parent's process but need to handle the subagent context. This module provides:
+
+- Subagent context detection via parent's running_tasks JSON field
+- SubagentStart/SubagentStop lifecycle hooks
+- Interrupt detection (subagent dies without SubagentStop)
+- Message polling for background Task subagents
+
+Subagent Context Tracking:
+    The parent's `running_tasks` field (JSON) tracks:
+    - active: bool - True when inside Task tool execution
+    - subagents: list - Array of {agent_id, agent_type} for spawned subagents
+
+Hook Flow (Subagent):
+    1. PreToolUse Task → parent.start_task() sets active=True
+    2. SubagentStart → track_subagent() appends to subagents array
+    3. SubagentStop → subagent_stop() polls messages, clears running_tasks
+    4. PostToolUse Task → parent.end_task() delivers freeze messages
+
+Background vs Foreground:
+    - Foreground: Parent frozen while subagents are alive
+    - Background (run_in_background=True): Parent continues while subagents are alive
+
+Interrupt Handling:
+    If Task is interrupted (user submits prompt), cleanup_dead_subagents()
+    checks transcript for agent completion and marks interrupted subagents.
+"""
 
 from __future__ import annotations
 from typing import Any
@@ -54,12 +82,24 @@ def in_subagent_context(session_id_or_name: str) -> bool:
 def check_dead_subagents(
     transcript_path: str, running_tasks: dict, subagent_timeout: int | None = None
 ) -> list[str]:
-    """Return list of dead subagent agent_ids by checking multiple signals
+    """Detect dead subagents by checking multiple death signals.
 
-    Called by UserPromptSubmit to clean up stale subagents.
+    Called by UserPromptSubmit after user interrupts a Task. To clean up orphaned
+    subagents that won't receive a SubagentStop hook.
+
+    Death signals checked:
+    1. Instance deleted from DB (SubagentStop cleanup already ran)
+    2. No transcript file exists
+    3. Transcript stale (no writes for 2x timeout)
+    4. Transcript contains "[Request interrupted by user]" marker
 
     Args:
-        subagent_timeout: Parent's override timeout, or None to use global config
+        transcript_path: Parent's transcript path (subagent transcripts are siblings)
+        running_tasks: Parent's running_tasks dict with subagents array
+        subagent_timeout: Parent's override timeout, or None for global config
+
+    Returns:
+        List of dead subagent agent_ids to clean up.
     """
     from pathlib import Path
     import time

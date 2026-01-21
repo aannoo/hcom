@@ -1,7 +1,7 @@
 """Message operations - filtering, routing, and delivery"""
 
 from __future__ import annotations
-from typing import Any
+from typing import Any, Literal, TypedDict
 import re
 import sys
 
@@ -17,6 +17,146 @@ from ..shared import (
     MAX_MESSAGE_SIZE,
 )
 from .helpers import validate_scope, is_mentioned
+
+
+# ==================== Type Definitions ====================
+
+# Message scope types
+MessageScope = Literal["broadcast", "mentions"]
+MessageIntent = Literal["request", "inform", "ack", "error"]
+
+
+class MessageEnvelope(TypedDict, total=False):
+    """Optional envelope fields for messages."""
+
+    intent: MessageIntent
+    reply_to: str  # "42" or "42:BOXE" for cross-device
+    thread: str
+    bundle_id: str
+
+
+class RelayMetadata(TypedDict, total=False):
+    """Relay metadata for cross-device messages."""
+
+    id: int | str
+    short: str  # Short device ID like "BOXE"
+
+
+class MessageEventData(TypedDict, total=False):
+    """Data stored in message events."""
+
+    # Required fields
+    scope: MessageScope
+    text: str
+
+    # Sender info (stored as 'from' but using underscore here)
+    # Note: actual key is 'from' but that's a Python keyword
+
+    # Routing fields
+    sender_kind: Literal["external", "instance", "system"]
+    delivered_to: list[str]  # Base names of recipients
+    mentions: list[str]  # For scope='mentions'
+
+    # Envelope fields
+    intent: MessageIntent
+    reply_to: str
+    reply_to_local: int  # Resolved local event ID
+    thread: str
+    bundle_id: str
+
+    # Relay metadata
+    _relay: RelayMetadata
+
+
+class UnreadMessage(TypedDict):
+    """Message returned by get_unread_messages."""
+
+    timestamp: str  # ISO timestamp
+    event_id: int
+    message: str  # Text content
+
+    # Note: 'from' is a reserved keyword, so we use it dynamically
+
+
+class FormattedMessage(TypedDict, total=False):
+    """Fully formatted message with all optional fields."""
+
+    timestamp: str
+    event_id: int
+    message: str
+    delivered_to: list[str]
+    intent: MessageIntent
+    thread: str
+    bundle_id: str
+    _relay: RelayMetadata
+
+
+class ReadReceipt(TypedDict):
+    """Read receipt for a sent message."""
+
+    id: int
+    age: str  # Formatted age string like "2m" or "1h"
+    text: str  # Truncated message text
+    read_by: list[str]  # Instance names that have read
+    total_recipients: int
+
+
+class InstanceDataMinimal(TypedDict, total=False):
+    """Minimal instance data used in message routing."""
+
+    name: str
+    tag: str | None
+
+
+class InstanceData(TypedDict, total=False):
+    """Full instance data from database."""
+
+    # Primary fields
+    name: str
+    session_id: str | None
+    parent_session_id: str | None
+    parent_name: str | None
+    tag: str | None
+
+    # Status fields
+    last_event_id: int
+    status: str
+    status_time: int
+    status_context: str
+    status_detail: str
+
+    # Metadata
+    directory: str
+    created_at: float
+    transcript_path: str
+    tcp_mode: bool | int
+    wait_timeout: int
+    notify_port: int | None
+    background: bool | int
+    background_log_file: str
+
+    # Identity
+    agent_id: str | None
+    origin_device_id: str
+
+    # Tool info
+    tool: Literal["claude", "gemini", "codex", "adhoc"]
+    hints: str
+    subagent_timeout: int | None
+    launch_args: str
+    idle_since: str
+    pid: int | None
+    launch_context: str
+
+    # Announcement flags
+    name_announced: bool | int
+    launch_context_announced: bool | int
+    running_tasks: str
+
+
+# Scope computation result types
+ScopeExtra = dict[str, list[str]]  # e.g., {"mentions": ["luna", "nova"]}
+ScopeResult = tuple[MessageScope, ScopeExtra]
 
 
 def validate_message(message: str) -> str | None:
@@ -69,8 +209,8 @@ def format_recipients(delivered_to: list[str], max_show: int = 30) -> str:
 
 
 def compute_scope(
-    message: str, enabled_instances: list[dict | str]
-) -> tuple[tuple[str, dict] | None, str | None]:
+    message: str, enabled_instances: list[dict[str, Any] | str]
+) -> tuple[ScopeResult | None, str | None]:
     """Compute message scope and routing data.
 
     Args:
@@ -171,7 +311,7 @@ def compute_scope(
 
 
 def _should_deliver(
-    scope: str, extra: dict, receiver_name: str, sender_name: str
+    scope: MessageScope, extra: ScopeExtra, receiver_name: str, sender_name: str
 ) -> bool:
     """Check if message should be delivered to receiver based on scope.
 
@@ -326,7 +466,7 @@ def unescape_bash(text: str) -> str:
 
 
 def send_message(
-    identity: SenderIdentity, message: str, envelope: dict[str, str] | None = None
+    identity: SenderIdentity, message: str, envelope: MessageEnvelope | None = None
 ) -> list[str]:
     """Send a message to the database and notify all instances.
 
@@ -410,6 +550,8 @@ def send_message(
 
         if thread := envelope.get("thread"):
             data["thread"] = thread
+        if bundle_id := envelope.get("bundle_id"):
+            data["bundle_id"] = bundle_id
 
     # Log to SQLite with namespace separation
     # External senders use 'ext_{name}' prefix for clear namespace isolation
@@ -465,7 +607,7 @@ def send_system_message(sender_name: str, message: str) -> list[str]:
 
 def get_unread_messages(
     instance_name: str, update_position: bool = False
-) -> tuple[list[dict[str, str]], int]:
+) -> tuple[list[dict[str, Any]], int]:
     """Get unread messages for instance with scope-based filtering.
 
     Args:
@@ -528,6 +670,8 @@ def get_unread_messages(
                     msg["intent"] = intent
                 if thread := event_data.get("thread"):
                     msg["thread"] = thread
+                if bundle_id := event_data.get("bundle_id"):
+                    msg["bundle_id"] = bundle_id
                 if relay := event_data.get("_relay"):
                     msg["_relay"] = relay
                 messages.append(msg)
@@ -553,7 +697,7 @@ def get_unread_messages(
 
 
 def should_deliver_message(
-    event_data: dict, receiver_name: str, sender_name: str
+    event_data: dict[str, Any], receiver_name: str, sender_name: str
 ) -> bool:
     """Check if message should be delivered based on scope.
 
@@ -597,7 +741,7 @@ def should_deliver_message(
 
 def get_subagent_messages(
     parent_name: str, since_id: int = 0, limit: int = 0
-) -> tuple[list[dict[str, str]], int, dict[str, int]]:
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
     """Get messages from/to subagents of parent instance with scope-based filtering
     Args:
         parent_name: Parent instance name (e.g., 'luna')
@@ -700,7 +844,7 @@ def get_subagent_messages(
 # ==================== Message Formatting ====================
 
 
-def _build_message_prefix(msg: dict) -> str:
+def _build_message_prefix(msg: dict[str, Any]) -> str:
     """Build message prefix from envelope fields.
 
     Format: [intent:thread #id] or [intent #id] or [thread:name #id] or [new message #id]
@@ -740,7 +884,7 @@ def _build_message_prefix(msg: dict) -> str:
     return f"[{prefix}]"
 
 
-def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> str:
+def format_hook_messages(messages: list[dict[str, Any]], instance_name: str) -> str:
     """Format messages for hook feedback.
 
     Single message uses verbose format: "sender → you + N others"
@@ -750,7 +894,7 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
     """
     from .instances import get_full_name
 
-    def _others_count(msg: dict) -> int:
+    def _others_count(msg: dict[str, Any]) -> int:
         """Count other recipients (excluding self)"""
         delivered_to = msg.get("delivered_to", [])
         # Others = total recipients minus self
@@ -797,13 +941,13 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
     return reason
 
 
-def format_messages_json(messages: list[dict[str, str]], instance_name: str) -> str:
+def format_messages_json(messages: list[dict[str, Any]], instance_name: str) -> str:
     """Format messages as JSON for model injection.
 
     Used by all hook-based message delivery (Claude, Gemini) and cmd_listen.
     Structured format for clear model comprehension.
 
-    Output: <hcom>{"hcom":{"to":"name","messages":[{"id":1,"from":"sender","text":"hello","intent":"request","thread":"foo"}]}}</hcom>
+    Output: <hcom>{"hcom":{"to":"name","messages":[{"id":1,"from":"sender","text":"hello","intent":"request","thread":"foo","bundle_id":"bundle:abcd1234"}]}}</hcom>
 
     Args:
         messages: List of message dicts with keys: event_id, from, message, intent, thread
@@ -830,6 +974,8 @@ def format_messages_json(messages: list[dict[str, str]], instance_name: str) -> 
             msg_obj["intent"] = msg["intent"]
         if msg.get("thread"):
             msg_obj["thread"] = msg["thread"]
+        if msg.get("bundle_id"):
+            msg_obj["bundle_id"] = msg["bundle_id"]
         msg_list.append(msg_obj)
 
     result_obj: dict = {"hcom": {"to": instance_name, "messages": msg_list}}
@@ -849,7 +995,7 @@ def format_messages_json(messages: list[dict[str, str]], instance_name: str) -> 
 
 def get_read_receipts(
     identity: SenderIdentity, max_text_length: int = 50, limit: int | None = None
-) -> list[dict]:
+) -> list[ReadReceipt]:
     """Get read receipts for messages sent by sender.
     Args:
         identity: SenderIdentity for the sender (external or instance)
@@ -1010,7 +1156,7 @@ def get_read_receipts(
     return receipts
 
 
-def get_unread_counts_batch(instances: dict[str, dict]) -> dict[str, int]:
+def get_unread_counts_batch(instances: dict[str, dict[str, Any]]) -> dict[str, int]:
     """Get unread message count per instance efficiently.
 
     Uses a single DB query to fetch all messages since minimum waterline,
@@ -1028,7 +1174,7 @@ def get_unread_counts_batch(instances: dict[str, dict]) -> dict[str, int]:
         return {}
 
     # Extract last_event_id per instance
-    positions = {}
+    positions: dict[str, int] = {}
     for name, data in instances.items():
         positions[name] = data.get("last_event_id", 0)
 
@@ -1073,7 +1219,69 @@ def get_unread_counts_batch(instances: dict[str, dict]) -> dict[str, int]:
     return counts
 
 
+# ==================== PTY Message Preview ====================
+# Moved from pty/pty_common.py to centralize message formatting
+
+# Max length for message preview in PTY trigger
+PREVIEW_MAX_LEN = 60
+
+
+def build_message_preview(instance_name: str, max_len: int = PREVIEW_MAX_LEN) -> str:
+    """Build truncated message preview for PTY injection.
+
+    Used by Gemini and Claude PTY modes to show a preview hint in the
+    injected trigger while avoiding problematic characters.
+
+    Reuses format_hook_messages but truncates before user message content.
+    User content may contain @ chars that trigger autocomplete in some CLIs.
+    Full messages delivered via hook's additionalContext.
+    """
+    messages, _ = get_unread_messages(instance_name, update_position=False)
+    if not messages:
+        return "<hcom></hcom>"
+
+    wrapper_open = "<hcom>"
+    wrapper_close = "</hcom>"
+    wrapper_len = len(wrapper_open) + len(wrapper_close)
+    content_max = max_len - wrapper_len
+    if content_max <= 0:
+        return f"{wrapper_open}{wrapper_close}"
+
+    formatted = format_hook_messages(messages, instance_name)
+
+    # Truncate before user content (after first ": ") to avoid special chars
+    colon_pos = formatted.find(": ")
+    if colon_pos != -1:
+        envelope = formatted[:colon_pos]  # Stop before the colon
+        if len(envelope) > content_max:
+            if content_max <= 3:
+                return f"{wrapper_open}{wrapper_close}"
+            return f"{wrapper_open}{envelope[: content_max - 3]}...{wrapper_close}"
+        return f"{wrapper_open}{envelope}{wrapper_close}"
+
+    # No colon found, just truncate normally
+    if len(formatted) > content_max:
+        if content_max <= 3:
+            return f"{wrapper_open}{wrapper_close}"
+        return f"{wrapper_open}{formatted[: content_max - 3]}...{wrapper_close}"
+    return f"{wrapper_open}{formatted}{wrapper_close}"
+
+
 __all__ = [
+    # Type definitions
+    "MessageScope",
+    "MessageIntent",
+    "MessageEnvelope",
+    "RelayMetadata",
+    "MessageEventData",
+    "UnreadMessage",
+    "FormattedMessage",
+    "ReadReceipt",
+    "InstanceDataMinimal",
+    "InstanceData",
+    "ScopeExtra",
+    "ScopeResult",
+    # Functions
     "format_recipients",
     "compute_scope",
     "_should_deliver",
@@ -1086,4 +1294,7 @@ __all__ = [
     "format_messages_json",
     "get_read_receipts",
     "get_unread_counts_batch",
+    # PTY helpers
+    "build_message_preview",
+    "PREVIEW_MAX_LEN",
 ]

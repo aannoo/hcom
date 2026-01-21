@@ -9,9 +9,9 @@ import re
 import os
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-__version__ = "0.6.11"
+__version__ = "0.6.12"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"
@@ -41,6 +41,45 @@ def is_termux() -> bool:
     )
 
 
+# Default Termux node path for shebang bypass
+TERMUX_NODE_PATH = "/data/data/com.termux/files/usr/bin/node"
+
+
+def termux_shebang_bypass(command: list[str], tool: str) -> list[str]:
+    """Apply Termux shebang bypass for npm-installed CLI tools.
+
+    On Termux, npm global CLIs have shebangs like #!/usr/bin/env node
+    which fail because /usr/bin/env doesn't exist. This function
+    rewrites the command to explicitly call node with the tool path.
+
+    Args:
+        command: Original command list, e.g. ["gemini", "--arg"]
+        tool: Tool name ("gemini" or "codex")
+
+    Returns:
+        Modified command list for Termux, or original if not on Termux
+        or tool not found.
+    """
+    import shutil
+
+    if not is_termux():
+        return command
+
+    if not command or command[0] != tool:
+        return command
+
+    # Find tool path
+    tool_path = shutil.which(tool)
+    if not tool_path:
+        return command  # Let it fail naturally
+
+    # Find node path
+    node_path = shutil.which("node") or TERMUX_NODE_PATH
+
+    # Rewrite: ["gemini", ...args] -> ["node", "/path/to/gemini", ...args]
+    return [node_path, tool_path] + command[1:]
+
+
 def is_inside_ai_tool() -> bool:
     """Detect if running inside any AI CLI tool (Claude Code, Gemini CLI, Codex).
 
@@ -54,8 +93,7 @@ def is_inside_ai_tool() -> bool:
         os.environ.get("CLAUDECODE") == "1"
         or os.environ.get("HCOM_LAUNCHED") == "1"
         or os.environ.get("GEMINI_CLI") == "1"
-        or "CODEX_SANDBOX"
-        in os.environ  # Catches CODEX_SANDBOX and CODEX_SANDBOX_NETWORK_DISABLED
+        or "CODEX_SANDBOX" in os.environ  # Catches CODEX_SANDBOX and CODEX_SANDBOX_NETWORK_DISABLED
         or "CODEX_MANAGED_BY_NPM" in os.environ
         or "CODEX_MANAGED_BY_BUN" in os.environ
     )
@@ -133,7 +171,7 @@ class SenderIdentity:
 
     kind: Literal["external", "instance", "system"]
     name: str
-    instance_data: dict | None = None
+    instance_data: dict[str, Any] | None = None
     session_id: str | None = None
 
     @property
@@ -250,9 +288,7 @@ STATUS_COLORS = {
 }
 
 # STATUS_MAP for watch command (foreground color, icon)
-STATUS_MAP = {
-    status: (STATUS_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES
-}
+STATUS_MAP = {status: (STATUS_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES}
 
 # Background colors for statusline display blocks
 STATUS_BG_COLORS = {
@@ -265,9 +301,7 @@ STATUS_BG_COLORS = {
 }
 
 # Background color map for TUI statusline (background color, icon)
-STATUS_BG_MAP = {
-    status: (STATUS_BG_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES
-}
+STATUS_BG_MAP = {status: (STATUS_BG_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES}
 
 # Display order (priority-based sorting)
 STATUS_ORDER = ["active", "listening", "blocked", "error", "launching", "inactive"]
@@ -289,7 +323,7 @@ DEFAULT_CONFIG_HEADER = [
     '#   HCOM_TERMINAL - Terminal mode: "default", preset name, or custom command with {script}',
     "#   HCOM_HINTS - Text appended to all messages received by instances",
     "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
-    "#   HCOM_DEFAULT_SUBSCRIPTIONS - Comma-separated event presets: collision, created, stopped, blocked",
+    "#   HCOM_AUTO_SUBSCRIBE - Comma-separated event presets: collision, created, stopped, blocked",
     "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet --agent reviewer')",
     "#   HCOM_GEMINI_ARGS - Default Gemini args (e.g., '--model gemini-2.5-flash --yolo')",
     "#   HCOM_CODEX_ARGS - Default Codex args (e.g., '--sandbox danger-full-access')",
@@ -309,7 +343,7 @@ DEFAULT_CONFIG_DEFAULTS = [
     "HCOM_HINTS=",
     "HCOM_SUBAGENT_TIMEOUT=30",
     "HCOM_TERMINAL=default",
-    "HCOM_DEFAULT_SUBSCRIPTIONS=collision",
+    "HCOM_AUTO_SUBSCRIBE=collision",
     r'''HCOM_CLAUDE_ARGS="'say hi in hcom chat'"''',
     "HCOM_GEMINI_ARGS=",
     "HCOM_CODEX_ARGS=",
@@ -655,6 +689,8 @@ __all__ = [
     "CREATE_NO_WINDOW",
     "is_wsl",
     "is_termux",
+    "termux_shebang_bypass",
+    "TERMUX_NODE_PATH",
     "is_inside_ai_tool",
     "detect_vanilla_tool",
     # Tool arg validation override

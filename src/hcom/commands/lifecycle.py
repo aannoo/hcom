@@ -306,9 +306,9 @@ def cmd_launch(
 
         # Show results
         if failed > 0:
-            print(f"Launched {launched}/{count} Claude agent{'s' if count != 1 else ''} ({failed} failed)")
+            print(f"Started the launch process for {launched}/{count} Claude agent{'s' if count != 1 else ''} ({failed} failed)")
         else:
-            print(f"Launched {launched} Claude agent{'s' if launched != 1 else ''}")
+            print(f"Started the launch process for {launched} Claude agent{'s' if launched != 1 else ''}")
 
         print(f"Batch id: {batch_id}")
         print("To block until ready or fail, run: hcom events launch")
@@ -1573,9 +1573,9 @@ def cmd_launch_gemini(
     for h in result.get("handles", []):
         instance_name = h.get("instance_name")
         if instance_name:
-            print(f"Launched Gemini: {instance_name}")
+            print(f"Started the launch process for Gemini: {instance_name}")
 
-    print(f"\nLaunched {launched} Gemini agent{'s' if launched != 1 else ''}")
+    print(f"\nStarted the launch process for {launched} Gemini agent{'s' if launched != 1 else ''}")
     print(f"Batch id: {result['batch_id']}")
     print("To block until ready or fail, run: hcom events launch")
 
@@ -1762,9 +1762,9 @@ def cmd_launch_codex(
         name = h.get("instance_name")
         if name:
             instance_names.append(name)
-            print(f"Launched Codex: {name}")
+            print(f"Started the launch process for Codex: {name}")
 
-    print(f"\nLaunched {launched} Codex agent{'s' if launched != 1 else ''}")
+    print(f"\nStarted the launch process for {launched} Codex agent{'s' if launched != 1 else ''}")
     print(f"Batch id: {result['batch_id']}")
     print("To block until ready or fail, run: hcom events launch")
 

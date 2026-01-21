@@ -1,19 +1,52 @@
 #!/usr/bin/env python3
-"""Claude CLI argument parsing and validation"""
+"""Claude CLI argument parsing and validation.
+
+Parses Claude Code CLI arguments with full support for:
+- Flag aliases (--allowed-tools, --allowedtools, --allowedTools)
+- Boolean flags (--verbose, -p, etc.)
+- Value flags (--model opus, --model=opus)
+- Optional value flags (--resume, --resume=session-id)
+- Positional arguments (prompt text)
+- The -- separator for literal arguments
+
+The parser produces ClaudeArgsSpec which can be:
+- Queried for specific flags (has_flag, get_flag_value)
+- Modified immutably (update method)
+- Merged with other specs (merge_claude_args)
+- Serialized back to tokens (rebuild_tokens, to_env_string)
+"""
 
 from __future__ import annotations
 
 import difflib
 import shlex
 from dataclasses import dataclass
-from typing import Iterable, Literal, Mapping, Sequence, Tuple
+from typing import Final, Literal, Mapping, Sequence, TypeAlias
 
+from ..args_common import (
+    BaseArgsSpec,
+    SourceType,
+    TokenList,
+    TokenTuple,
+    extract_flag_names_from_tokens as _extract_flag_names_from_tokens,
+    extract_flag_name_from_token as _extract_flag_name_from_token,
+    deduplicate_boolean_flags as _deduplicate_boolean_flags_base,
+)
 
-CanonicalFlag = Literal["--model", "--allowedTools", "--disallowedTools"]
+# Type aliases (Claude-specific)
+CanonicalFlag: TypeAlias = Literal["--model", "--allowedTools", "--disallowedTools"]
+FlagValuesDict: TypeAlias = dict[str, str]  # Note: using str keys for compatibility with base
+
+# ==================== Flag Classification ====================
+# Flags are categorized by their behavior:
+# - Boolean flags: standalone, no value (--verbose)
+# - Value flags: require following value (--model opus)
+# - Optional value flags: value is optional (--resume, --resume=id)
+# - Canonical flags: multiple spellings map to one form (--allowedTools)
 
 # All flag keys stored in lowercase (aside from short-form switches) for comparisons;
 # values use canonical casing when recorded.
-_FLAG_ALIASES: Mapping[str, CanonicalFlag] = {
+_FLAG_ALIASES: Final[Mapping[str, CanonicalFlag]] = {
     "--model": "--model",
     "--allowedtools": "--allowedTools",
     "--allowed-tools": "--allowedTools",
@@ -21,7 +54,7 @@ _FLAG_ALIASES: Mapping[str, CanonicalFlag] = {
     "--disallowed-tools": "--disallowedTools",
 }
 
-_CANONICAL_PREFIXES: Mapping[str, CanonicalFlag] = {
+_CANONICAL_PREFIXES: Final[Mapping[str, CanonicalFlag]] = {
     "--model=": "--model",
     "--allowedtools=": "--allowedTools",
     "--allowed-tools=": "--allowedTools",
@@ -32,114 +65,124 @@ _CANONICAL_PREFIXES: Mapping[str, CanonicalFlag] = {
 # Background switches: NOT in _BOOLEAN_FLAGS to enable special handling.
 # has_flag() detects them by scanning clean_tokens directly, so they remain
 # discoverable via spec.has_flag(['-p']) or spec.has_flag(['--print']).
-_BACKGROUND_SWITCHES = {"-p", "--print"}
-_BOOLEAN_FLAGS = {
-    "--verbose",
-    "--continue",
-    "-c",
-    "--dangerously-skip-permissions",
-    "--include-partial-messages",
-    "--allow-dangerously-skip-permissions",
-    "--replay-user-messages",
-    "--mcp-debug",
-    "--fork-session",
-    "--ide",
-    "--strict-mcp-config",
-    "--no-session-persistence",
-    "--disable-slash-commands",
-    "--chrome",
-    "--no-chrome",
-    "-v",
-    "--version",
-    "-h",
-    "--help",
-}
+_BACKGROUND_SWITCHES: Final[frozenset[str]] = frozenset({"-p", "--print"})
+_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "--verbose",
+        "--continue",
+        "-c",
+        "--dangerously-skip-permissions",
+        "--include-partial-messages",
+        "--allow-dangerously-skip-permissions",
+        "--replay-user-messages",
+        "--mcp-debug",
+        "--fork-session",
+        "--ide",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--chrome",
+        "--no-chrome",
+        "-v",
+        "--version",
+        "-h",
+        "--help",
+    }
+)
 
 # Flags with optional values (lowercase).
-_OPTIONAL_VALUE_FLAGS = {
-    "--resume",
-    "-r",
-    "--debug",
-    "-d",
-}
+_OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "--resume",
+        "-r",
+        "--debug",
+        "-d",
+    }
+)
 
-_OPTIONAL_VALUE_FLAG_PREFIXES = {
-    "--resume=",
-    "-r=",
-    "--debug=",
-    "-d=",
-}
+_OPTIONAL_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
+    {
+        "--resume=",
+        "-r=",
+        "--debug=",
+        "-d=",
+    }
+)
 
-_OPTIONAL_ALIAS_GROUPS = (
+_OPTIONAL_ALIAS_GROUPS: Final[tuple[frozenset[str], ...]] = (
     frozenset({"--resume", "-r"}),
     frozenset({"--debug", "-d"}),
 )
-_OPTIONAL_ALIAS_LOOKUP: Mapping[str, set[str]] = {
+_OPTIONAL_ALIAS_LOOKUP: Final[Mapping[str, set[str]]] = {
     alias: set(group) for group in _OPTIONAL_ALIAS_GROUPS for alias in group
 }
 
 # Flags that require a following value (lowercase).
-_VALUE_FLAGS = {
-    "--add-dir",
-    "--agent",
-    "--agents",
-    "--allowed-tools",
-    "--allowedtools",
-    "--append-system-prompt",
-    "--betas",
-    "--disallowedtools",
-    "--disallowed-tools",
-    "--fallback-model",
-    "--file",
-    "--input-format",
-    "--json-schema",
-    "--max-budget-usd",
-    "--max-turns",
-    "--mcp-config",
-    "--model",
-    "--output-format",
-    "--permission-mode",
-    "--permission-prompt-tool",
-    "--plugin-dir",
-    "--session-id",
-    "--setting-sources",
-    "--settings",
-    "--system-prompt",
-    "--system-prompt-file",
-    "--tools",
-}
+_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--allowed-tools",
+        "--allowedtools",
+        "--append-system-prompt",
+        "--betas",
+        "--disallowedtools",
+        "--disallowed-tools",
+        "--fallback-model",
+        "--file",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--max-turns",
+        "--mcp-config",
+        "--model",
+        "--output-format",
+        "--permission-mode",
+        "--permission-prompt-tool",
+        "--plugin-dir",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--system-prompt",
+        "--system-prompt-file",
+        "--tools",
+    }
+)
 
-_VALUE_FLAG_PREFIXES = {
-    "--add-dir=",
-    "--agent=",
-    "--agents=",
-    "--allowedtools=",
-    "--allowed-tools=",
-    "--append-system-prompt=",
-    "--betas=",
-    "--disallowedtools=",
-    "--disallowed-tools=",
-    "--fallback-model=",
-    "--file=",
-    "--input-format=",
-    "--json-schema=",
-    "--max-budget-usd=",
-    "--max-turns=",
-    "--mcp-config=",
-    "--model=",
-    "--output-format=",
-    "--permission-mode=",
-    "--permission-prompt-tool=",
-    "--plugin-dir=",
-    "--session-id=",
-    "--setting-sources=",
-    "--settings=",
-    "--system-prompt=",
-    "--system-prompt-file=",
-    "--tools=",
-}
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
+    {
+        "--add-dir=",
+        "--agent=",
+        "--agents=",
+        "--allowedtools=",
+        "--allowed-tools=",
+        "--append-system-prompt=",
+        "--betas=",
+        "--disallowedtools=",
+        "--disallowed-tools=",
+        "--fallback-model=",
+        "--file=",
+        "--input-format=",
+        "--json-schema=",
+        "--max-budget-usd=",
+        "--max-turns=",
+        "--mcp-config=",
+        "--model=",
+        "--output-format=",
+        "--permission-mode=",
+        "--permission-prompt-tool=",
+        "--plugin-dir=",
+        "--session-id=",
+        "--setting-sources=",
+        "--settings=",
+        "--system-prompt=",
+        "--system-prompt-file=",
+        "--tools=",
+    }
+)
 
-_KNOWN_CLAUDE_FLAGS = sorted(
+_KNOWN_CLAUDE_FLAGS: Final[list[str]] = sorted(
     {
         *_BACKGROUND_SWITCHES,
         *_BOOLEAN_FLAGS,
@@ -152,54 +195,14 @@ _KNOWN_CLAUDE_FLAGS = sorted(
 
 
 @dataclass(frozen=True)
-class ClaudeArgsSpec:
-    """Normalized representation of Claude CLI arguments."""
+class ClaudeArgsSpec(BaseArgsSpec):
+    """Normalized representation of Claude CLI arguments.
 
-    source: Literal["cli", "env", "none"]
-    raw_tokens: Tuple[str, ...]
-    clean_tokens: Tuple[str, ...]
-    positional_tokens: Tuple[str, ...]
-    positional_indexes: Tuple[int, ...]
-    is_background: bool
-    flag_values: Mapping[CanonicalFlag, str]
-    errors: Tuple[str, ...] = ()
+    Inherits common fields and methods from BaseArgsSpec.
+    Adds Claude-specific field: is_background.
+    """
 
-    def has_flag(
-        self,
-        names: Iterable[str] | None = None,
-        prefixes: Iterable[str] | None = None,
-    ) -> bool:
-        """Check for user-provided flags (only scans before -- separator)."""
-        name_set = {n.lower() for n in (names or ())}
-        prefix_tuple = tuple(p.lower() for p in (prefixes or ()))
-
-        # Only scan tokens before --
-        try:
-            dash_idx = self.clean_tokens.index("--")
-            tokens_to_scan = self.clean_tokens[:dash_idx]
-        except ValueError:
-            tokens_to_scan = self.clean_tokens
-
-        for token in tokens_to_scan:
-            lower = token.lower()
-            if lower in name_set:
-                return True
-            if any(lower.startswith(prefix) for prefix in prefix_tuple):
-                return True
-        return False
-
-    def rebuild_tokens(self, include_positionals: bool = True) -> list[str]:
-        """Return token list suitable for invoking Claude."""
-        if include_positionals:
-            return list(self.clean_tokens)
-        else:
-            # Filter out positional tokens by index (not value, to avoid collisions)
-            positional_indexes_set = set(self.positional_indexes)
-            return [t for i, t in enumerate(self.clean_tokens) if i not in positional_indexes_set]
-
-    def to_env_string(self) -> str:
-        """Render tokens into a shell-safe env string."""
-        return shlex.join(self.rebuild_tokens())
+    is_background: bool = False
 
     def update(
         self,
@@ -221,9 +224,6 @@ class ClaudeArgsSpec:
                 tokens = _set_prompt(tokens, prompt)
 
         return _parse_tokens(tokens, self.source)
-
-    def has_errors(self) -> bool:
-        return bool(self.errors)
 
     def get_flag_value(self, flag_name: str) -> str | None:
         """Get value of any flag by searching clean_tokens.
@@ -323,6 +323,7 @@ def merge_claude_args(env_spec: ClaudeArgsSpec, cli_spec: ClaudeArgsSpec) -> Cla
         Merged ClaudeArgsSpec with CLI taking precedence
     """
     # Handle positionals: CLI replaces env (if present), else inherit env
+    final_positionals: TokenList
     if cli_spec.positional_tokens:
         # Check for empty string deletion marker
         if cli_spec.positional_tokens == ("",):
@@ -334,15 +335,15 @@ def merge_claude_args(env_spec: ClaudeArgsSpec, cli_spec: ClaudeArgsSpec) -> Cla
         final_positionals = list(env_spec.positional_tokens)
 
     # Extract flag names from CLI to know what to override
-    cli_flag_names = _extract_flag_names_from_tokens(cli_spec.clean_tokens)
+    cli_flag_names: set[str] = _extract_flag_names_from_tokens(cli_spec.clean_tokens)
 
     # Use index-based filtering to avoid false collisions with positional values
-    env_positional_indexes = set(env_spec.positional_indexes)
-    cli_positional_indexes = set(cli_spec.positional_indexes)
+    env_positional_indexes: set[int] = set(env_spec.positional_indexes)
+    cli_positional_indexes: set[int] = set(cli_spec.positional_indexes)
 
     # Build merged tokens: env flags (not overridden, not positionals) + CLI flags (not positionals)
-    merged_tokens = []
-    skip_next = False
+    merged_tokens: TokenList = []
+    skip_next: bool = False
 
     for i, token in enumerate(env_spec.clean_tokens):
         if skip_next:
@@ -396,63 +397,15 @@ def merge_claude_args(env_spec: ClaudeArgsSpec, cli_spec: ClaudeArgsSpec) -> Cla
     return _parse_tokens(combined_tokens, "cli")
 
 
-def _extract_flag_names_from_tokens(tokens: Sequence[str]) -> set[str]:
-    """Extract normalized flag names from token list.
-
-    Returns set of lowercase flag names (without values).
-    Examples: '--model' → '--model', '--model=opus' → '--model'
-    """
-    flag_names = set()
-    for token in tokens:
-        flag_name = _extract_flag_name_from_token(token)
-        if flag_name:
-            flag_names.add(flag_name)
-    return flag_names
-
-
-def _extract_flag_name_from_token(token: str) -> str | None:
-    """Extract flag name from a token.
-
-    Examples:
-        '--model' → '--model'
-        '--model=opus' → '--model'
-        '-p' → '-p'
-        'value' → None
-    """
-    token_lower = token.lower()
-
-    # Check if starts with - or --
-    if not token_lower.startswith("-"):
-        return None
-
-    # Extract name (before = if present)
-    if "=" in token_lower:
-        return token_lower.split("=")[0]
-
-    return token_lower
-
-
-def _deduplicate_boolean_flags(tokens: Sequence[str]) -> list[str]:
+def _deduplicate_boolean_flags(tokens: Sequence[str]) -> TokenList:
     """Remove duplicate boolean flags, keeping first occurrence.
 
     Only deduplicates known boolean flags like --verbose, -p, etc.
     Unknown flags and value flags are left as-is (Claude CLI handles them).
     """
-    seen_flags = set()
-    result = []
-
-    for token in tokens:
-        token_lower = token.lower()
-
-        # Check if this is a known boolean flag
-        if token_lower in _BOOLEAN_FLAGS or token_lower in _BACKGROUND_SWITCHES:
-            if token_lower in seen_flags:
-                continue  # Skip duplicate
-            seen_flags.add(token_lower)
-
-        result.append(token)
-
-    return result
+    # Combine boolean flags and background switches for deduplication
+    all_boolean_flags = _BOOLEAN_FLAGS | _BACKGROUND_SWITCHES
+    return _deduplicate_boolean_flags_base(tokens, all_boolean_flags)
 
 
 def add_background_defaults(spec: ClaudeArgsSpec) -> ClaudeArgsSpec:
@@ -467,12 +420,13 @@ def add_background_defaults(spec: ClaudeArgsSpec) -> ClaudeArgsSpec:
     if not spec.is_background:
         return spec
 
-    tokens = list(spec.clean_tokens)
-    modified = False
+    tokens: TokenList = list(spec.clean_tokens)
+    modified: bool = False
 
     # Find -- separator index if present
+    insert_idx: int
     try:
-        dash_idx = tokens.index("--")
+        dash_idx: int = tokens.index("--")
         insert_idx = dash_idx
     except ValueError:
         insert_idx = len(tokens)
@@ -505,13 +459,13 @@ def validate_conflicts(spec: ClaudeArgsSpec) -> list[str]:
 
     Empty list means no conflicts detected.
     """
-    warnings = []
+    warnings: list[str] = []
 
     # Count system flags in clean_tokens
-    system_flags = []
-    i = 0
+    system_flags: list[str] = []
+    i: int = 0
     while i < len(spec.clean_tokens):
-        token_lower = spec.clean_tokens[i].lower()
+        token_lower: str = spec.clean_tokens[i].lower()
         if token_lower in ("--system-prompt", "--append-system-prompt"):
             system_flags.append(token_lower)
         elif token_lower.startswith(("--system-prompt=", "--append-system-prompt=")):
@@ -521,7 +475,7 @@ def validate_conflicts(spec: ClaudeArgsSpec) -> list[str]:
     # Check for unusual system prompt combinations
     if len(system_flags) > 1:
         # Standard pattern: one --system-prompt and one --append-system-prompt (no warning)
-        is_standard_pattern = (
+        is_standard_pattern: bool = (
             len(system_flags) == 2 and "--system-prompt" in system_flags and "--append-system-prompt" in system_flags
         )
         if not is_standard_pattern:
@@ -537,24 +491,24 @@ def validate_conflicts(spec: ClaudeArgsSpec) -> list[str]:
 
 def _parse_tokens(
     tokens: Sequence[str],
-    source: Literal["cli", "env", "none"],
+    source: SourceType,
     initial_errors: Sequence[str] | None = None,
 ) -> ClaudeArgsSpec:
-    errors = list(initial_errors or [])
-    clean: list[str] = []
-    positional: list[str] = []
+    errors: list[str] = list(initial_errors or [])
+    clean: TokenList = []
+    positional: TokenList = []
     positional_indexes: list[int] = []
-    flag_values: dict[CanonicalFlag, str] = {}
+    flag_values: FlagValuesDict = {}
 
     pending_canonical: CanonicalFlag | None = None
     pending_canonical_token: str | None = None
     pending_generic_flag: str | None = None
-    after_double_dash = False
+    after_double_dash: bool = False
 
-    is_background = False
+    is_background: bool = False
 
-    i = 0
-    raw_tokens = tuple(tokens)
+    i: int = 0
+    raw_tokens: TokenTuple = tuple(tokens)
 
     while i < len(tokens):
         token = tokens[i]
@@ -721,11 +675,17 @@ def _parse_tokens(
     )
 
 
-def _split_env(env_value: str) -> list[str]:
+def _split_env(env_value: str) -> TokenList:
+    """Split shell-quoted environment variable into tokens."""
     return shlex.split(env_value)
 
 
 def _extract_canonical_prefixed(token: str, token_lower: str) -> tuple[CanonicalFlag, str] | None:
+    """Extract canonical flag and value from --flag=value syntax.
+
+    Returns (canonical_flag, value) tuple if token matches a known prefix,
+    or None if not a recognized prefixed flag.
+    """
     for prefix, canonical in _CANONICAL_PREFIXES.items():
         if token_lower.startswith(prefix):
             return canonical, token[len(prefix) :]
@@ -762,7 +722,7 @@ def _looks_like_new_flag(token_lower: str) -> bool:
     return False
 
 
-def _toggle_background(tokens: Sequence[str], positional_indexes: Tuple[int, ...], desired: bool) -> list[str]:
+def _toggle_background(tokens: Sequence[str], positional_indexes: tuple[int, ...], desired: bool) -> TokenList:
     """Toggle background flag, preserving positional arguments.
 
     Args:
@@ -773,10 +733,10 @@ def _toggle_background(tokens: Sequence[str], positional_indexes: Tuple[int, ...
     Returns:
         Modified token list with background flag toggled
     """
-    tokens_list = list(tokens)
+    tokens_list: TokenList = list(tokens)
 
     # Only filter tokens that are NOT positionals
-    filtered = []
+    filtered: TokenList = []
     for idx, token in enumerate(tokens_list):
         if idx in positional_indexes:
             # Keep positionals even if they look like flags
@@ -784,7 +744,7 @@ def _toggle_background(tokens: Sequence[str], positional_indexes: Tuple[int, ...
         elif token.lower() not in _BACKGROUND_SWITCHES:
             filtered.append(token)
 
-    has_background = len(filtered) != len(tokens_list)
+    has_background: bool = len(filtered) != len(tokens_list)
 
     if desired:
         if has_background:
@@ -793,9 +753,13 @@ def _toggle_background(tokens: Sequence[str], positional_indexes: Tuple[int, ...
     return filtered
 
 
-def _set_prompt(tokens: Sequence[str], value: str) -> list[str]:
-    tokens_list = list(tokens)
-    index = _find_first_positional_index(tokens_list)
+def _set_prompt(tokens: Sequence[str], value: str) -> TokenList:
+    """Set or replace the first positional argument (prompt text).
+
+    If a positional exists, replaces it. Otherwise appends the value.
+    """
+    tokens_list: TokenList = list(tokens)
+    index: int | None = _find_first_positional_index(tokens_list)
     if index is None:
         tokens_list.append(value)
     else:
@@ -803,22 +767,27 @@ def _set_prompt(tokens: Sequence[str], value: str) -> list[str]:
     return tokens_list
 
 
-def _remove_positional(tokens: Sequence[str]) -> list[str]:
+def _remove_positional(tokens: Sequence[str]) -> TokenList:
     """Remove first positional argument from tokens"""
-    tokens_list = list(tokens)
-    index = _find_first_positional_index(tokens_list)
+    tokens_list: TokenList = list(tokens)
+    index: int | None = _find_first_positional_index(tokens_list)
     if index is not None:
         tokens_list.pop(index)
     return tokens_list
 
 
 def _find_first_positional_index(tokens: Sequence[str]) -> int | None:
-    pending_canonical = False
-    pending_generic = False
-    after_double_dash = False
+    """Find index of first positional argument in token list.
+
+    Walks through tokens, tracking flag state to distinguish positional
+    arguments from flag values. Returns None if no positional found.
+    """
+    pending_canonical: bool = False
+    pending_generic: bool = False
+    after_double_dash: bool = False
 
     for idx, token in enumerate(tokens):
-        token_lower = token.lower()
+        token_lower: str = token.lower()
 
         if after_double_dash:
             return idx

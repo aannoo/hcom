@@ -1,13 +1,21 @@
-"""Tool-specific integrations for hcom.
+"""Tool-specific integrations for hcom multi-agent communication.
 
-Each tool has its own subpackage with hooks and settings specific to that tool.
+This package contains CLI-specific integrations for each supported AI coding tool.
+Each tool has its own subpackage handling:
+- Argument parsing and validation (args.py)
+- Hook handlers for lifecycle events (hooks.py)
+- Settings/config file management (settings.py)
 
 Structure:
     tools/
-    ├── gemini/     # Gemini CLI hooks + settings
-    └── codex/      # Codex CLI hooks + settings
+    ├── claude/     # Claude Code argument parsing (hooks in hooks/ package)
+    ├── gemini/     # Gemini CLI hooks, settings, and idle detection
+    └── codex/      # Codex CLI hooks, settings, and transcript parsing
 
-Claude Code hooks remain in hooks/ package.
+Architecture Notes:
+    - Claude Code hooks are in the root hooks/ package (historical, may consolidate)
+    - All tools share common patterns: args parsing, hook handlers, settings management
+    - Each tool has specific quirks handled in its respective subpackage
 """
 
 __all__ = ["gemini", "codex"]

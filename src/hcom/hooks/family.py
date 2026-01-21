@@ -1,7 +1,29 @@
-"""Shared hook helpers used by both parent and subagent contexts
-Not just message relay related code but anything shared
-Functions in this module are called by hooks running in both parent and subagent contexts.
-Parent-only or subagent-only logic belongs in parent.py or subagent.py respectively.
+"""Shared hook helpers used by both parent and subagent contexts.
+
+This module contains functionality needed by both parent instances and subagents:
+- Message polling loop with TCP notification support
+- Claude process health checks (orphan detection)
+- TCP server setup for instant message wake
+
+Message Delivery Paths:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ MAIN PATH (hcom claude interactive):                            │
+    │   PTY wrapper handles injection → hooks skip polling            │
+    │   HCOM_PTY_MODE=1 → Stop hook exits immediately                 │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ SECONDARY PATHS (use poll_messages loop):                       │
+    │   - Headless (hcom claude -p): HCOM_BACKGROUND set              │
+    │   - Vanilla (claude + hcom start): no PTY wrapper               │
+    │   - Subagents: SubagentStop polling                             │
+    └─────────────────────────────────────────────────────────────────┘
+
+TCP Notification:
+    Senders call notify_instance() which connects to a TCP socket to
+    instantly wake the poll_messages() select() call. This provides
+    sub-second message delivery without busy polling.
+
+Note:
+    Parent-only or subagent-only logic belongs in parent.py or subagent.py.
 """
 
 from __future__ import annotations
@@ -22,7 +44,18 @@ from ..core.log import log_error, log_info
 
 
 def _check_claude_alive() -> bool:
-    """Check if Claude process still alive (orphan detection)"""
+    """Check if the parent Claude process is still alive (orphan detection).
+
+    Prevents marking messages as read when Claude has died but the hook
+    process is still running. This avoids message loss. (not sure this is correct)
+
+    Returns:
+        True if Claude is alive (or if running headless), False if Claude died.
+
+    Detection method:
+        - Background instances: always return True (intentionally detached)
+        - Interactive instances: check if stdin is closed (Claude death signal)
+    """
     # Background instances are intentionally detached (HCOM_BACKGROUND is log filename, not '1')
     if os.environ.get("HCOM_BACKGROUND"):
         return True
@@ -31,9 +64,17 @@ def _check_claude_alive() -> bool:
 
 
 def _setup_tcp_notification(instance_name: str) -> tuple[socket.socket | None, bool]:
-    """Setup TCP server for instant wake (shared by parent and subagent)
+    """Create a TCP server socket for instant message wake notifications.
 
-    Returns (server, tcp_mode)
+    The socket binds to localhost on an ephemeral port. Senders connect to
+    this port to wake the poll_messages() select() call instantly.
+
+    Args:
+        instance_name: Instance name for error logging
+
+    Returns:
+        Tuple of (server_socket, tcp_mode_enabled).
+        If socket creation fails, returns (None, False) and falls back to polling.
     """
     try:
         notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

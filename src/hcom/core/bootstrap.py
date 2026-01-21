@@ -37,6 +37,7 @@ When sharing context/handoff with different agents use:
 - 'hcom events' - send reference to specific parts of event history - what happened
 - relevant file locations to look at
 - Be very descriptive in your messages specifically around human user actions/decisions
+- Use bundle command to package context for handoffs
 
 GOOD: '@john do comprehensive review of my code changes, details about this feature: my transcript full range 4-15 for design decisions & relevant modified files a.py, b.md also check surrounding code & [user decisions/actions/thoughts] & [detailed description of the feature]'
 BAD: '@john review these changes i made to the code: [high level overview of what changed]'
@@ -59,10 +60,6 @@ RELAY_NOTICE = """
 """
 
 LAUNCHED_NOTICE = ""
-
-# LAUNCHED_NOTICE = """
-# - You were launched by agent: '{launched_by}'
-# """
 
 HEADLESS_NOTICE = """
 - You are in headless mode. The user cannot see your chat messages, only hcom messages. Do all communication via hcom.
@@ -209,7 +206,7 @@ If you need to confirm with the user to disambiguate - share the list --json dat
 - Don't use `sleep` (blocks message reception) → use `hcom listen [timeout]` or `hcom listen --sql 'condition'` if needed.
 
 ## COMMANDS
-<count>, send, list, events, start, stop, reset, config, relay, transcript, archive, run
+<count>, send, list, events, start, stop, reset, config, relay, transcript, archive, run, bundle
 - Always run commands like this: hcom <command> --name {instance_name}
 - If unsure about a command's usage, do not guess, run hcom <command> --help first
 - Change your tag at runtime if you have been assigned a role/task or part of a group: hcom config -i self tag <tag>
@@ -231,6 +228,28 @@ Special chars:
   EOF
 names in [] are system notifications: [hcom-launcher], [hcom-events]
 
+BUNDLE (share structured context)
+  Use bundle for anything more than a simple message, especially if human user has requested.
+  BEFORE CREATING: Query your own 'hcom transcript {instance_name}' and 'hcom events' to find relevant ranges or specific entries to include.
+  CREATING: in description include info about the transcript, files, events you included. Example: 'full spec detailed in transcript 3-4, events 7,3,4 show previous agent handoffs etc.'
+  RECIEVING: bundle = more comprehensive understanding requested by user or agent. read refs and more.
+
+  Bundle JSON:
+  {{
+    "title": "Short title",
+    "description": "what happened, user decisions, current state, blockers, next steps, any other detailed info",
+    "refs": {{
+      "events": ["354-369", "371"],      ← event ids/ranges, for example: your messages, relevant status changes
+      "files": ["src/app.py", "b.md"],   ← files modified/discussed and/or related/relevant
+      "transcript": ["8-15", "22-30"]    ← conversation ranges, for example: design decisions
+    }},
+    "extends": "bundle:abcd1234"
+  }}
+  Example: hcom send "@mako review" --bundle <json> | --bundle-file /tmp/bundle.json
+
+  IMPORTANT: All refs fields (events, files, transcript) are REQUIRED and must be non-empty.
+  bundle commands: show | create | chain
+
 LISTEN (block and wait)
   listen [timeout]             Wait for messages (default: 86400s) (listen 1 to get immediate messages)
   listen --sql "filter"        Wait for event matching SQL
@@ -239,13 +258,24 @@ LISTEN (block and wait)
   Presets: same as events sub
 
 PARTICIPANTS
-  list [-v] [--json]           Show all participants, unread counts (`+N`)
+  list [-v] [--json]           Show all participants, unread counts (`+N`), (NDJSON one per line)
   Statuses: ▶ active (will read new msgs very soon)  ◉ listening (will read new msgs in <1s)  ■ blocked (needs human user approval)  ○ inactive (dead)  ◦ unknown (neutral)
   Types: [CLAUDE] [GEMINI] [CODEX] [claude] full features | [AD-HOC] [gemini] [codex] limited
 
 EVENTS
-  events [--last N]            Recent events (default: 20)
-    --sql EXPR                 Filter (e.g., "msg_from='luna'")
+  events [--last N] [--all]    Recent events (default: 20, --all includes archives)
+  Filters (compose with AND):
+    --agent NAME               Match specific agent
+    --type TYPE                message | status | life
+    --status VAL               listening | active | blocked
+    --cmd PATTERN              Command (default: contains, ^start, =exact)
+    --file PATH                File path (*.py glob, file.py contains)
+    --context PATTERN          tool:Bash | deliver:X (* wildcard supported)
+    --from NAME                Message sender
+    --mention NAME             Message mentions
+    --action VAL               created | stopped | ready
+    --collision                File collision detection
+    --sql EXPR                 Raw SQL WHERE filter (e.g., "msg_from='luna'")
   SQL fields: id/timestamp/type/instance/data, msg_from/msg_text/msg_scope/msg_sender_kind/msg_delivered_to[]/msg_mentions[]/msg_intent/msg_thread/msg_reply_to, status_val/status_context/status_detail, life_action/life_by/life_batch_id/life_reason
   Field values:
     type: message, status, life
@@ -257,15 +287,21 @@ EVENTS
 
 EVENTS SUBSCRIPTIONS (push notifications via hcom message when event matches)
   events sub                   List subscriptions (collision enabled by default)
-  events sub "sql"|preset      Preset or custom SQL subscription
-  events unsub <id|preset>     Remove subscription
-  Presets: collision, created, stopped, blocked (system-wide)
-           idle:X, file_edits:X, user_input:X, blocked:X (per-instance)
-            cmd:"pattern", cmd:X:"pattern", cmd-starts:"p", cmd-exact:"p" (shell commands)
+  events sub [filters]         Create subscription with filter flags
+    --once                     Auto-remove after first match
+    --for <name>               Subscribe for another agent
+  events unsub <id>            Remove subscription
+  Examples:
+    events sub --idle peso
+    events sub --cmd 'npm test' --once
+    events sub --agent peso --file '*.py'
 
 TRANSCRIPT (agent (claude/codex/gemini) session conversation history)
     transcript [name] [--last N] [--range N-M] [--full] [--json] [--detailed] → get parsed conversation transcript of any agent or the timeline of users interactions across all transcripts
+        default: truncated text per user/assistant response, --full for full text, --detailed for full tools, files edited, etc.
     transcript timeline → get timeline of users interactions across all transcripts
+    transcript search "pattern" [--live] [--all] [--limit N] [--agent TYPE] [--json] → search hcom-tracked transcripts (default), --live for alive agents only, --all for all transcripts
+Send transcript range as message instead of re sending text already in transcript: "read my transcript range 7 --full for analysis"
 
 CONFIG
   config                       Show all config values

@@ -97,67 +97,16 @@ def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int
     return 0 if status == "ready" else 1
 
 
-# Preset subscriptions (name -> sql) - use events_v flat fields
-# File-write tool contexts by platform:
-#   Claude: tool:Write, tool:Edit
-#   Gemini: tool:write_file, tool:replace
-#   Codex: tool:apply_patch
-_FILE_WRITE_CONTEXTS = (
-    "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch')"
-)
-
-# System-wide presets (no target parameter)
-PRESET_SUBSCRIPTIONS = {
-    # Uses 'events_v.' prefix for outer table refs (bare names don't resolve in nested subquery)
-    "collision": f"""type = 'status' AND status_context IN {_FILE_WRITE_CONTEXTS} AND EXISTS (SELECT 1 FROM events_v e WHERE e.type = 'status' AND e.status_context IN {_FILE_WRITE_CONTEXTS} AND e.status_detail = events_v.status_detail AND e.instance != events_v.instance AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 20)""",
-    # Lifecycle events for any instance
-    "created": "type = 'life' AND life_action = 'created'",
-    "stopped": "type = 'life' AND life_action = 'stopped'",
-    "blocked": "type = 'status' AND status_val = 'blocked'",
-}
-
-# Parameterized presets: {target} replaced with instance name
-# Usage: hcom events sub idle:veki, hcom events sub file_edits:nova
-# Note: LIKE patterns use ESCAPE '\\' - targets must have wildcards escaped
-PARAMETERIZED_PRESETS = {
-    # Turn ended - instance went back to listening (finished task)
-    "idle": "type = 'status' AND instance = '{target}' AND status_val = 'listening'",
-    # File edits - any file write tool across Claude/Gemini/Codex
-    "file_edits": f"type = 'status' AND instance = '{{target}}' AND status_context IN {_FILE_WRITE_CONTEXTS}",
-    # User input - bigboss messages or user prompts to instance
-    # ESCAPE '\\' ensures _ and % in names are matched literally
-    "user_input": "((type = 'message' AND msg_from = 'bigboss' AND msg_delivered_to LIKE '%{target}%' ESCAPE '\\') OR (type = 'status' AND instance = '{target}' AND status_context = 'prompt'))",
-    # Instance lifecycle
-    "created": "type = 'life' AND instance = '{target}' AND life_action = 'created'",
-    "stopped": "type = 'life' AND instance = '{target}' AND life_action = 'stopped'",
-    "blocked": "type = 'status' AND instance = '{target}' AND status_val = 'blocked'",
-}
-
-# Command presets: match on status_detail (the command text)
-# Usage:
-#   hcom events sub cmd:"git commit"           - any instance running commands containing "git commit"
-#   hcom events sub cmd:nova:"git commit"      - only instance nova
-#   hcom events sub cmd-starts:"git"           - commands starting with "git"
-#   hcom events sub cmd-exact:"git status"     - exact command match
-# Tool contexts covered:
-#   Claude: tool:Bash
-#   Gemini: tool:run_shell_command
-#   Codex:  tool:shell (via TranscriptWatcher)
-_SHELL_TOOL_CONTEXTS = "('tool:Bash', 'tool:run_shell_command', 'tool:shell')"
-
-COMMAND_PRESETS = {
-    # Contains (default) - LIKE '%pattern%' with ESCAPE for literal matching
-    "cmd": f"type = 'status' AND status_context IN {_SHELL_TOOL_CONTEXTS} AND status_detail LIKE '%{{pattern}}%' ESCAPE '\\'",
-    "cmd-starts": f"type = 'status' AND status_context IN {_SHELL_TOOL_CONTEXTS} AND status_detail LIKE '{{pattern}}%' ESCAPE '\\'",
-    "cmd-exact": f"type = 'status' AND status_context IN {_SHELL_TOOL_CONTEXTS} AND status_detail = '{{pattern}}'",
-}
-
-
 def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     """Query events from SQLite: hcom events [launch|sub|unsub] [--last N] [--wait SEC] [--sql EXPR] [--name NAME]"""
     from ..core.db import get_db, init_db, get_last_event_id
     from .utils import parse_name_flag, validate_flags
     from ..core.identity import resolve_identity
+    from ..core.filters import (
+        expand_shortcuts,
+        parse_event_flags,
+        build_sql_from_flags,
+    )
 
     init_db()  # Ensure schema exists
 
@@ -205,10 +154,21 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Use already-parsed values from above
     argv = argv_parsed
 
+    # PHASE 1: Expand shortcuts FIRST (--idle, --blocked)
+    argv = expand_shortcuts(argv)
+
+    # PHASE 2: Parse filter flags
+    try:
+        filters, argv = parse_event_flags(argv)
+    except ValueError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
     # Parse arguments
     last_n = 20  # Default: last 20 events
     wait_timeout = None
     sql_where = None
+    search_all = False  # --all: include archives
 
     i = 0
     while i < len(argv):
@@ -241,6 +201,9 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             # SQLite doesn't use backslash escaping, so strip these artifacts
             sql_where = argv[i + 1].replace("\\!", "!")
             i += 2
+        elif argv[i] == "--all":
+            search_all = True
+            i += 1
         else:
             i += 1
 
@@ -258,16 +221,26 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     db = get_db()
     filter_query = ""
 
+    # PHASE 3: Generate SQL from filter flags
+    if filters:
+        try:
+            flag_sql = build_sql_from_flags(filters)
+            if flag_sql:
+                filter_query += f" AND ({flag_sql})"
+        except ValueError as e:
+            print(format_error(f"Filter error: {e}"), file=sys.stderr)
+            return 1
+
     # Add user SQL WHERE clause directly (no validation needed)
     # Note: SQL injection is not a security concern in hcom's threat model.
     # User (or ai) owns ~/.hcom/hcom.db and can already run: sqlite3 ~/.hcom/hcom.db "anything"
     # Validation would block legitimate queries while providing no actual security.
+    # Filters and --sql are ANDed together if both provided.
     if sql_where:
         filter_query += f" AND ({sql_where})"
 
     # Wait mode: block until matching event or timeout
     if wait_timeout:
-        import socket
         import select
 
         # Check for matching events in last 10s (race condition window)
@@ -287,6 +260,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         if lookback_row:
             try:
                 event = {
+                    "id": lookback_row["id"],
                     "ts": lookback_row["timestamp"],
                     "type": lookback_row["type"],
                     "instance": lookback_row["instance"],
@@ -302,24 +276,13 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         notify_server = None
         notify_port = None
         if instance_name:
-            try:
-                notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                notify_server.bind(("127.0.0.1", 0))
-                notify_server.listen(128)
-                notify_server.setblocking(False)
-                notify_port = notify_server.getsockname()[1]
-                # Register in notify_endpoints
+            from ..core.runtime import create_notify_server
+
+            notify_server, notify_port = create_notify_server()
+            if notify_port:
                 from ..core.db import upsert_notify_endpoint
 
                 upsert_notify_endpoint(instance_name, "events_wait", notify_port)
-            except Exception:
-                if notify_server:
-                    try:
-                        notify_server.close()
-                    except Exception:
-                        pass
-                notify_server = None
 
         start_time = time.time()
         last_id: int | str = get_last_event_id()
@@ -339,6 +302,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     for row in rows:
                         try:
                             event = {
+                                "id": row["id"],
                                 "ts": row["timestamp"],
                                 "type": row["type"],
                                 "instance": row["instance"],
@@ -427,6 +391,9 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                         pass
 
     # Snapshot mode (default)
+    all_events: list[dict] = []
+
+    # Query current session
     query = "SELECT * FROM events_v WHERE 1=1"
     query += filter_query
     query += " ORDER BY id DESC"
@@ -434,25 +401,55 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     try:
         rows = db.execute(query).fetchall()
+        for row in rows:
+            try:
+                event = {
+                    "id": row["id"],
+                    "ts": row["timestamp"],
+                    "type": row["type"],
+                    "instance": row["instance"],
+                    "data": json.loads(row["data"]),
+                }
+                if search_all:
+                    event["source"] = "current"
+                all_events.append(event)
+            except (json.JSONDecodeError, TypeError) as e:
+                print(
+                    f"Warning: Skipping corrupt event ID {row['id']}: {e}",
+                    file=sys.stderr,
+                )
     except Exception as e:
         print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
         return 2
-    # Reverse to chronological order
-    for row in reversed(rows):
-        try:
-            event = {
-                "ts": row["timestamp"],
-                "type": row["type"],
-                "instance": row["instance"],
-                "data": json.loads(row["data"]),
-            }
-            print(json.dumps(event))
-        except (json.JSONDecodeError, TypeError) as e:
-            # Skip corrupt events, log to stderr
-            print(
-                f"Warning: Skipping corrupt event ID {row['id']}: {e}", file=sys.stderr
-            )
-            continue
+
+    # Query archives if --all
+    if search_all:
+        from .query import _list_archives, _query_archive_events
+
+        archives = _list_archives()
+        for archive in archives:
+            try:
+                archive_events = _query_archive_events(archive, sql_where, last_n)
+                for event in archive_events:
+                    event["ts"] = event.pop("timestamp")
+                    event["source"] = archive["name"]
+                    all_events.append(event)
+            except Exception as e:
+                # Skip archives with incompatible schema or query errors
+                print(
+                    f"Warning: Skipping archive {archive['name']}: {e}",
+                    file=sys.stderr,
+                )
+
+    # Sort by timestamp and limit
+    all_events.sort(key=lambda e: e["ts"])
+    if len(all_events) > last_n:
+        all_events = all_events[-last_n:]
+
+    # Output (JSON by default for backwards compatibility)
+    for event in all_events:
+        print(json.dumps(event))
+
     return 0
 
 
@@ -462,49 +459,155 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = False) -> int:
     """Subscribe to events or list subscriptions.
 
-    hcom events sub                  - list all subscriptions
-    hcom events sub "sql"            - custom SQL subscription
-    hcom events sub collision        - preset: file collision warnings
-    hcom events sub idle:nova        - preset: nova returns to listening
-    hcom events sub cmd:"git"        - commands containing "git" (excludes self)
-    hcom events sub cmd:nova:"git"   - only nova's commands containing "git"
-    hcom events sub cmd-starts:"py"  - commands starting with "py"
-    hcom events sub cmd-exact:"ls"   - exact command match
-    hcom events sub "sql" --once     - one-shot (auto-removed after first match)
-    hcom events sub "sql" --for X    - subscribe on behalf of instance X
+    hcom events sub                             - list all subscriptions
+    hcom events sub --collision                 - file collision warnings
+    hcom events sub --idle peso                 - peso returns to listening
+    hcom events sub --agent peso --cmd git      - peso's git commands
+    hcom events sub --cmd ^py                   - commands starting with "py"
+    hcom events sub --cmd =ls                   - exact command match
+    hcom events sub --file '*.py' --once        - one-shot (auto-removed after match)
+    hcom events sub --status blocked --for X    - subscribe on behalf of instance X
+
+    Manual SQL (for complex queries):
+    hcom events sub "type='message' AND msg_from='bigboss'"
     """
     from ..core.db import get_db, get_last_event_id, kv_set, kv_get
     from ..core.instances import load_instance_position
     from .utils import resolve_identity, validate_flags
     from hashlib import sha256
+    from ..core.filters import (
+        expand_shortcuts,
+        parse_event_flags,
+        build_sql_from_flags,
+    )
 
     # Validate flags
     if error := validate_flags("events sub", argv):
         print(format_error(error), file=sys.stderr)
         return 1
 
+    # PHASE 1: Expand shortcuts FIRST (--idle, --blocked)
+    argv = expand_shortcuts(argv)
+
+    # PHASE 2: Parse filter flags
+    try:
+        filters, argv_remaining = parse_event_flags(argv)
+    except ValueError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
     # Parse args
-    once = "--once" in argv
+    once = "--once" in argv_remaining
     target_instance = None
     i = 0
     sql_parts = []
-    while i < len(argv):
-        if argv[i] == "--once":
+    while i < len(argv_remaining):
+        if argv_remaining[i] == "--once":
             i += 1
-        elif argv[i] == "--for":
-            if i + 1 >= len(argv):
+        elif argv_remaining[i] == "--for":
+            if i + 1 >= len(argv_remaining):
                 print("Error: --for requires name", file=sys.stderr)
                 return 1
-            target_instance = argv[i + 1]
+            target_instance = argv_remaining[i + 1]
             i += 2
-        elif not argv[i].startswith("-"):
-            sql_parts.append(argv[i])
+        elif not argv_remaining[i].startswith("-"):
+            sql_parts.append(argv_remaining[i])
             i += 1
         else:
             i += 1
 
     conn = get_db()
     now = time.time()
+
+    # PHASE 3: Handle filter-based subscription (NEW)
+    if filters:
+        # Build SQL from filters
+        try:
+            sql = build_sql_from_flags(filters)
+            if not sql:
+                print("Error: No valid filters provided", file=sys.stderr)
+                return 1
+        except ValueError as e:
+            print(format_error(f"Filter error: {e}"), file=sys.stderr)
+            return 1
+
+        # Combine filter SQL with manual SQL if provided (consistency with cmd_events/cmd_listen)
+        if sql_parts:
+            manual_sql = " ".join(sql_parts).replace("\\!", "!")
+            sql = f"({sql}) AND ({manual_sql})"
+
+        # Resolve caller for subscription
+        try:
+            caller = caller_name if caller_name else resolve_identity().name
+        except Exception:
+            print(
+                format_error("Cannot create subscription without identity."),
+                file=sys.stderr,
+            )
+            print("Run 'hcom start' first, or use --name.", file=sys.stderr)
+            return 1
+
+        # COLLISION SELF-RELEVANCE: Add caller-specific filtering for collision subscriptions
+        # Only notify about collisions involving the caller (either as event instance or recent editor)
+        if 'collision' in filters:
+            from ..core.filters import FILE_WRITE_CONTEXTS, _escape_sql
+
+            caller_escaped = _escape_sql(caller)
+            self_relevance_clause = f"""(
+    events_v.instance = '{caller_escaped}'
+    OR EXISTS (
+        SELECT 1 FROM events_v e2
+        WHERE e2.type = 'status' AND e2.status_context IN {FILE_WRITE_CONTEXTS}
+        AND e2.status_detail = events_v.status_detail
+        AND e2.instance = '{caller_escaped}'
+        AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 20
+    )
+)"""
+            sql = f"({sql}) AND {self_relevance_clause}"
+
+        # Generate subscription ID from caller + filters + full SQL
+        # Include caller to scope subscription per user (prevents cross-user collisions)
+        # Include sql to account for manual SQL differences (prevents same-user logic collisions)
+        id_source = f"{caller}:{json.dumps(filters, sort_keys=True)}:{sql}"
+        filter_hash = sha256(id_source.encode()).hexdigest()[:8]
+        sub_id = f"sub-{filter_hash}"
+        sub_key = f"events_sub:{sub_id}"
+
+        # Check if already exists
+        if kv_get(sub_key):
+            if not silent:
+                print(f"Subscription {sub_id} already exists")
+            return 0
+
+        # Store subscription with JSON filters AND SQL (runtime needs both)
+        kv_set(
+            sub_key,
+            json.dumps(
+                {
+                    "id": sub_id,
+                    "caller": caller,
+                    "filters": filters,  # Store filters as JSON for display/debugging
+                    "sql": sql,  # REQUIRED: Runtime watcher uses this to match events
+                    "created": now,
+                    "last_id": get_last_event_id(),
+                    "once": once,
+                }
+            ),
+        )
+
+        if not silent:
+            print(f"Subscription {sub_id} created")
+            # Show what it matches
+            try:
+                test_count = conn.execute(
+                    f"SELECT COUNT(*) FROM events_v WHERE ({sql})"
+                ).fetchone()[0]
+                if test_count > 0:
+                    print(f"  historical matches: {test_count} events")
+            except Exception:
+                pass  # Ignore errors in test query
+
+        return 0
 
     # No args = list subscriptions
     if not sql_parts:
@@ -530,237 +633,25 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
         print(f"{'ID':<10} {'FOR':<12} {'MODE':<10} FILTER")
         for sub in subs:
             mode = "once" if sub.get("once") else "continuous"
-            sql_display = (
-                sub["sql"][:35] + "..." if len(sub["sql"]) > 35 else sub["sql"]
-            )
-            print(f"{sub['id']:<10} {sub['caller']:<12} {mode:<10} {sql_display}")
+
+            # Handle both filter-based (new) and SQL-based (old) subscriptions
+            if "filters" in sub:
+                # New filter-based subscription
+                filter_display = json.dumps(sub["filters"])
+                if len(filter_display) > 35:
+                    filter_display = filter_display[:35] + "..."
+            else:
+                # Old SQL-based subscription
+                sql_display = sub.get("sql", "")
+                filter_display = (
+                    sql_display[:35] + "..." if len(sql_display) > 35 else sql_display
+                )
+
+            print(f"{sub['id']:<10} {sub['caller']:<12} {mode:<10} {filter_display}")
 
         return 0
 
-    # Check for preset subscription (system-wide or parameterized)
-    preset_arg = sql_parts[0] if len(sql_parts) == 1 else None
-    if preset_arg:
-        # Parse preset:target syntax (e.g., idle:veki, file_edits:nova)
-        if ":" in preset_arg and not preset_arg.startswith("'"):
-            preset_name, target = preset_arg.split(":", 1)
-        else:
-            preset_name, target = preset_arg, None
-
-        # Check system-wide presets first (when no target provided)
-        if not target and preset_name in PRESET_SUBSCRIPTIONS:
-            # Resolve caller for preset key
-            try:
-                caller = caller_name if caller_name else resolve_identity().name
-            except Exception:
-                print(
-                    format_error(f"Cannot enable '{preset_name}' without identity."),
-                    file=sys.stderr,
-                )
-                print("Run 'hcom start' first, or use --name.", file=sys.stderr)
-                return 1
-
-            sub_key = f"events_sub:{preset_name}_{caller}"
-            if kv_get(sub_key):
-                if not silent:
-                    print(f"{preset_name} already enabled")
-                return 0
-
-            kv_set(
-                sub_key,
-                json.dumps(
-                    {
-                        "id": f"{preset_name}_{caller}",
-                        "caller": caller,
-                        "sql": PRESET_SUBSCRIPTIONS[preset_name],
-                        "created": now,
-                        "last_id": get_last_event_id(),
-                        "once": once,
-                    }
-                ),
-            )
-            mode_str = " (once)" if once else ""
-            if not silent:
-                print(f"{preset_name} enabled{mode_str}")
-            return 0
-
-        # Check parameterized presets (require target)
-        if preset_name in PARAMETERIZED_PRESETS:
-            if not target:
-                print(
-                    format_error(
-                        f"Preset '{preset_name}' requires target: {preset_name}:<instance>"
-                    ),
-                    file=sys.stderr,
-                )
-                print(f"Example: hcom events sub {preset_name}:veki", file=sys.stderr)
-                return 1
-
-            # Resolve caller for notifications
-            try:
-                caller = caller_name if caller_name else resolve_identity().name
-            except Exception:
-                print(
-                    format_error(f"Cannot enable '{preset_name}' without identity."),
-                    file=sys.stderr,
-                )
-                print("Run 'hcom start' first, or use --name.", file=sys.stderr)
-                return 1
-
-            # Substitute target in SQL (escape SQL quotes and LIKE wildcards)
-            # Order matters: escape backslash first, then wildcards, then quotes
-            escaped_target = (
-                target.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-                .replace("'", "''")
-            )
-            sql = PARAMETERIZED_PRESETS[preset_name].format(target=escaped_target)
-            sub_key = f"events_sub:{preset_name}_{target}_{caller}"
-            if kv_get(sub_key):
-                if not silent:
-                    print(f"{preset_name}:{target} already enabled")
-                return 0
-
-            kv_set(
-                sub_key,
-                json.dumps(
-                    {
-                        "id": f"{preset_name}_{target}_{caller}",
-                        "caller": caller,
-                        "sql": sql,
-                        "created": now,
-                        "last_id": get_last_event_id(),
-                        "once": once,
-                    }
-                ),
-            )
-            if not silent:
-                print(f"{preset_name}:{target} enabled")
-            return 0
-
-        # Check command presets (cmd, cmd-starts, cmd-exact)
-        # Syntax: cmd:"pattern" or cmd:instance:"pattern"
-        if preset_name in COMMAND_PRESETS:
-            # Resolve caller for notifications
-            try:
-                caller = caller_name if caller_name else resolve_identity().name
-            except Exception:
-                print(
-                    format_error(f"Cannot enable '{preset_name}' without identity."),
-                    file=sys.stderr,
-                )
-                print("Run 'hcom start' first, or use --name.", file=sys.stderr)
-                return 1
-
-            # Parse target which could be:
-            #   "pattern"           -> all instances, pattern search
-            #   instance:"pattern"  -> specific instance
-            if not target:
-                print(
-                    format_error(
-                        f"Preset '{preset_name}' requires pattern: {preset_name}:\"<command>\""
-                    ),
-                    file=sys.stderr,
-                )
-                print(
-                    f'Example: hcom events sub {preset_name}:"git commit"',
-                    file=sys.stderr,
-                )
-                return 1
-
-            # Check if target contains instance:pattern (look for second colon after stripping quotes)
-            instance_filter = None
-            pattern = target
-
-            # Strip surrounding quotes from pattern if present
-            if (pattern.startswith('"') and pattern.endswith('"')) or (
-                pattern.startswith("'") and pattern.endswith("'")
-            ):
-                pattern = pattern[1:-1]
-            # Check for instance:pattern format (instance name won't have quotes/spaces)
-            elif ":" in target:
-                parts = target.split(":", 1)
-                # If first part looks like instance name (no spaces, no quotes)
-                if " " not in parts[0] and not parts[0].startswith(('"', "'")):
-                    instance_filter = parts[0]
-                    pattern = parts[1]
-                    # Strip quotes from pattern
-                    if (pattern.startswith('"') and pattern.endswith('"')) or (
-                        pattern.startswith("'") and pattern.endswith("'")
-                    ):
-                        pattern = pattern[1:-1]
-
-            # Escape for SQL: quotes and LIKE wildcards (for cmd/cmd-starts)
-            # Order: backslash first, then wildcards, then quotes
-            escaped_pattern = pattern
-            if preset_name in ("cmd", "cmd-starts"):
-                # LIKE patterns need wildcard escaping (preset has ESCAPE '\\')
-                escaped_pattern = (
-                    escaped_pattern.replace("\\", "\\\\")
-                    .replace("%", "\\%")
-                    .replace("_", "\\_")
-                )
-            escaped_pattern = escaped_pattern.replace("'", "''")
-
-            # Build SQL from preset template
-            sql = COMMAND_PRESETS[preset_name].format(pattern=escaped_pattern)
-
-            # Add instance filter if specified, otherwise exclude caller (don't notify self)
-            if instance_filter:
-                escaped_instance = instance_filter.replace("'", "''")
-                sql = f"({sql}) AND instance = '{escaped_instance}'"
-            else:
-                # Global subscription: exclude caller's own commands
-                escaped_caller = caller.replace("'", "''")
-                sql = f"({sql}) AND instance != '{escaped_caller}'"
-
-            # Generate sub ID
-            pattern_hash = sha256(pattern.encode()).hexdigest()[:4]
-            sub_id = f"{preset_name}_{pattern_hash}_{caller}"
-            if instance_filter:
-                sub_id = f"{preset_name}_{instance_filter}_{pattern_hash}_{caller}"
-
-            sub_key = f"events_sub:{sub_id}"
-            if kv_get(sub_key):
-                if not silent:
-                    display = (
-                        f"{preset_name}:{pattern}"
-                        if not instance_filter
-                        else f"{preset_name}:{instance_filter}:{pattern}"
-                    )
-                    print(f"{display} already enabled")
-                return 0
-
-            kv_set(
-                sub_key,
-                json.dumps(
-                    {
-                        "id": sub_id,
-                        "caller": caller,
-                        "sql": sql,
-                        "created": now,
-                        "last_id": get_last_event_id(),
-                        "once": once,
-                    }
-                ),
-            )
-
-            if not silent:
-                display = (
-                    f"{preset_name}:{pattern}"
-                    if not instance_filter
-                    else f"{preset_name}:{instance_filter}:{pattern}"
-                )
-                print(f"{display} enabled")
-                # Show what it matches
-                test_count = conn.execute(
-                    f"SELECT COUNT(*) FROM events_v WHERE ({sql})"
-                ).fetchone()[0]
-                if test_count > 0:
-                    print(f"  historical matches: {test_count} events")
-            return 0
-
-    # Create custom subscription
+    # Create custom subscription (using composable filters)
     # Fix shell escaping: bash/zsh escape ! as \! in double quotes (history expansion)
     sql = " ".join(sql_parts).replace("\\!", "!")
 
@@ -882,7 +773,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
 def _events_unsub(argv: list[str], caller_name: str | None = None) -> int:
     """Remove subscription: hcom events unsub <id|preset|preset:target>"""
     from ..core.db import get_db, kv_set
-    from .utils import resolve_identity, validate_flags
+    from .utils import validate_flags
 
     # Validate flags
     if error := validate_flags("events unsub", argv):
@@ -895,117 +786,8 @@ def _events_unsub(argv: list[str], caller_name: str | None = None) -> int:
 
     sub_id = argv[0]
 
-    # Parse preset:target syntax (e.g., idle:veki)
-    if ":" in sub_id and not sub_id.startswith("sub-"):
-        preset_name, target = sub_id.split(":", 1)
-    else:
-        preset_name, target = sub_id, None
-
-    # Handle system-wide preset names first (when no target)
-    if not target and preset_name in PRESET_SUBSCRIPTIONS:
-        try:
-            caller = caller_name if caller_name else resolve_identity().name
-        except Exception:
-            print(
-                format_error(f"Cannot disable '{sub_id}' without identity."),
-                file=sys.stderr,
-            )
-            print("Run 'hcom start' first, or use --name.", file=sys.stderr)
-            return 1
-        key = f"events_sub:{preset_name}_{caller}"
-        conn = get_db()
-        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
-        if not row:
-            print(f"{preset_name} not enabled")
-            return 0
-        kv_set(key, None)
-        print(f"{preset_name} disabled")
-        return 0
-
-    # Handle parameterized presets (e.g., 'idle:veki' -> 'idle_veki_{caller}')
-    if preset_name in PARAMETERIZED_PRESETS:
-        if not target:
-            print(
-                format_error(
-                    f"Preset '{preset_name}' requires target: {preset_name}:<instance>"
-                ),
-                file=sys.stderr,
-            )
-            return 1
-        try:
-            caller = caller_name if caller_name else resolve_identity().name
-        except Exception:
-            print(
-                format_error(f"Cannot disable '{sub_id}' without identity."),
-                file=sys.stderr,
-            )
-            print("Run 'hcom start' first, or use --name.", file=sys.stderr)
-            return 1
-        key = f"events_sub:{preset_name}_{target}_{caller}"
-        conn = get_db()
-        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
-        if not row:
-            print(f"{preset_name}:{target} not enabled")
-            return 0
-        kv_set(key, None)
-        print(f"{preset_name}:{target} disabled")
-        return 0
-
-    # Handle command presets (cmd, cmd-starts, cmd-exact)
-    # Key format: events_sub:{preset}_{hash}_{caller} or events_sub:{preset}_{instance}_{hash}_{caller}
-    if preset_name in COMMAND_PRESETS:
-        try:
-            caller = caller_name if caller_name else resolve_identity().name
-        except Exception:
-            print(
-                format_error(f"Cannot disable '{sub_id}' without identity."),
-                file=sys.stderr,
-            )
-            print("Run 'hcom start' first, or use --name.", file=sys.stderr)
-            return 1
-
-        conn = get_db()
-        # Search for matching subscriptions (pattern in key suffix matches caller)
-        # Keys are like: events_sub:cmd_abc1_caller or events_sub:cmd_instance_abc1_caller
-        pattern_prefix = f"events_sub:{preset_name}_%_{caller}"
-        rows = conn.execute(
-            "SELECT key, value FROM kv WHERE key LIKE ?",
-            (pattern_prefix.replace("_", r"\_").replace("%", "_") + "%",),
-        ).fetchall()
-
-        # Simpler: just look for keys starting with preset_name and ending with caller
-        rows = conn.execute(
-            "SELECT key, value FROM kv WHERE key LIKE ? AND key LIKE ?",
-            (f"events_sub:{preset_name}_%", f"%_{caller}"),
-        ).fetchall()
-
-        if not rows:
-            print(f"No {preset_name} subscriptions found for {caller}")
-            print("Use 'hcom events sub' to list active subscriptions.")
-            return 0
-
-        if len(rows) == 1:
-            kv_set(rows[0]["key"], None)
-            print(f"{preset_name} subscription disabled")
-            return 0
-
-        # Multiple matches - show them and ask for specific ID
-        print(f"Multiple {preset_name} subscriptions found:")
-        for row in rows:
-            try:
-                sub = json.loads(row["value"])
-                # Extract pattern from SQL for display
-                sql = sub.get("sql", "")
-                print(f"  {sub['id']}: {sql[:50]}...")
-            except Exception:
-                print(f"  {row['key']}")
-        print("\nUse 'hcom events unsub <full-id>' to remove a specific one.")
-        return 1
-
     # Handle prefix match (allow 'a3f2' instead of 'sub-a3f2')
-    # But don't add sub- prefix for cmd preset IDs (they use cmd_*, cmd-starts_*, cmd-exact_*)
-    is_cmd_preset_id = any(sub_id.startswith(f"{p}_") for p in COMMAND_PRESETS)
-    if not sub_id.startswith("sub-") and not is_cmd_preset_id:
+    if not sub_id.startswith("sub-"):
         sub_id = f"sub-{sub_id}"
 
     key = f"events_sub:{sub_id}"

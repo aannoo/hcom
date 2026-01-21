@@ -1,4 +1,28 @@
-"""Parent instance hook implementations"""
+"""Parent instance hook implementations.
+
+This module handles hooks for top-level Claude Code instances (not subagents).
+Parent instances are created via `hcom claude` (PTY) or `hcom start` (vanilla).
+
+Hook Handlers:
+    sessionstart()      - Session lifecycle start, bind session, inject bootstrap
+    pretooluse()        - Track tool execution status
+    posttooluse()       - Message delivery, bootstrap injection, context updates
+    stop()              - Idle polling for messages (main delivery path for non-PTY)
+    userpromptsubmit()  - PTY mode message delivery, fallback bootstrap
+    notify()            - Update status to blocked (permission prompts)
+    sessionend()        - Session lifecycle end, cleanup instance
+
+Task Coordination:
+    start_task()        - Enter subagent context when Task tool starts
+    end_task()          - Deliver freeze-period messages when Task completes
+
+Key Concepts:
+    - PTY mode (HCOM_PTY_MODE=1): Stop hook skips, PTY wrapper handles injection
+    - Headless (HCOM_BACKGROUND): Background instances use Stop hook polling
+    - Vanilla (hcom start): Session binding via [HCOM:BIND:X] marker
+    - Bootstrap: Context text injected to tell Claude its hcom identity
+    - Freeze messages: Messages sent during foreground Task execution
+"""
 
 from __future__ import annotations
 from typing import Any
@@ -23,9 +47,19 @@ from ..core.tool_utils import stop_instance
 
 
 def _extract_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """Extract status detail from tool input based on tool type.
+    """Extract human-readable detail from tool input for status display.
 
-    Only handles tools in PreToolUse matcher (Bash|Task|Write|Edit).
+    Extracts the most relevant field from each tool type:
+    - Bash: the command being executed
+    - Write/Edit: the file path being modified
+    - Task: the prompt/task description
+
+    Args:
+        tool_name: Name of the tool (Bash, Write, Edit, Task, etc.)
+        tool_input: Tool input dictionary from hook_data
+
+    Returns:
+        Relevant detail string, or empty string if tool not recognized.
     """
     match tool_name:
         case "Bash":
@@ -51,6 +85,15 @@ def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
     Path structure: ~/.claude/session-env/{session_id}/hook-N.sh
     """
     hook_session_id = hook_data.get("session_id") or hook_data.get("sessionId", "")
+    transcript_path = hook_data.get("transcript_path", "")
+
+    log_info(
+        "hooks",
+        "get_real_session_id.input",
+        hook_session_id=hook_session_id,
+        env_file=env_file,
+        transcript_path=transcript_path,
+    )
 
     if env_file:
         try:
@@ -61,10 +104,22 @@ def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
                     candidate = parts[idx + 1]
                     # Sanity check: looks like UUID (36 chars, 4 hyphens)
                     if len(candidate) == 36 and candidate.count("-") == 4:
+                        log_info(
+                            "hooks",
+                            "get_real_session_id.from_env_file",
+                            candidate=candidate,
+                            hook_session_id=hook_session_id,
+                            match=candidate == hook_session_id,
+                        )
                         return candidate
         except Exception as e:
             log_error("hooks", "hook.error", e, hook="get_real_session_id")
 
+    log_info(
+        "hooks",
+        "get_real_session_id.fallback",
+        hook_session_id=hook_session_id,
+    )
     return hook_session_id
 
 
@@ -84,6 +139,16 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
     source = hook_data.get("source", "")
     process_id = os.environ.get("HCOM_PROCESS_ID")
 
+    log_info(
+        "hooks",
+        "sessionstart.entry",
+        session_id=session_id,
+        source=source,
+        process_id=process_id,
+        raw_hook_session_id=hook_data.get("session_id"),
+        transcript_path=hook_data.get("transcript_path"),
+    )
+
     # Persist session_id for bash commands (CLAUDE_ENV_FILE only available in SessionStart)
     env_file = os.environ.get("CLAUDE_ENV_FILE")
     if env_file and session_id:
@@ -99,9 +164,7 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
             from ..core.db import get_session_binding
             from ..core.instances import resolve_process_binding
 
-            instance_name = get_session_binding(session_id) or resolve_process_binding(
-                process_id
-            )
+            instance_name = get_session_binding(session_id) or resolve_process_binding(process_id)
             if instance_name:
                 if process_id:
                     # hcom-launched: inject full bootstrap (identity via HCOM_PROCESS_ID env)
@@ -155,9 +218,7 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
         # Orphaned PTY: process_id exists but no binding (e.g., after /clear)
         # Create fresh identity automatically
         if not instance_name and process_id:
-            instance_name = create_orphaned_pty_identity(
-                session_id, process_id, tool="claude"
-            )
+            instance_name = create_orphaned_pty_identity(session_id, process_id, tool="claude")
             log_info(
                 "hooks",
                 "sessionstart.orphan_created",
@@ -170,6 +231,26 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
             if instance:
                 # Use rebind_session to allow override if session was previously bound
                 rebind_session(session_id, instance_name)
+
+                # Handle --resume session_id mismatch: Claude Code gives different session_ids
+                # at SessionStart (new internal ID) vs subsequent hooks (resumed ID).
+                # Create binding for BOTH so hooks with either ID find this instance.
+                original_session_id = hook_data.get("original_session_id", "")
+                if original_session_id and original_session_id != session_id:
+                    rebind_session(original_session_id, instance_name)
+                    # Update process_binding with original session_id
+                    # (post-compaction hooks will use this ID)
+                    from ..core.db import set_process_binding
+
+                    set_process_binding(process_id, original_session_id, instance_name)
+                    log_info(
+                        "hooks",
+                        "sessionstart.resume_dual_bind",
+                        instance=instance_name,
+                        hook_session_id=session_id,
+                        original_session_id=original_session_id,
+                    )
+
                 # Capture launch context (env vars, git branch, tty)
                 from ..core.instances import capture_and_store_launch_context
 
@@ -178,9 +259,7 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
                 # Terminal title
                 try:
                     with open("/dev/tty", "w") as tty:
-                        tty.write(
-                            f"\033]1;hcom: {instance_name}\007\033]2;hcom: {instance_name}\007"
-                        )
+                        tty.write(f"\033]1;hcom: {instance_name}\007\033]2;hcom: {instance_name}\007")
                 except (OSError, IOError):
                     pass
 
@@ -239,9 +318,7 @@ def start_task(session_id: str, hook_data: dict[str, Any]) -> dict[str, Any] | N
     instance_data = load_instance_position(instance_name)
     running_tasks = parse_running_tasks(instance_data.get("running_tasks", ""))
     running_tasks["active"] = True
-    update_instance_position(
-        instance_name, {"running_tasks": json.dumps(running_tasks)}
-    )
+    update_instance_position(instance_name, {"running_tasks": json.dumps(running_tasks)})
 
     # Set status (with task prompt as detail) - row exists = participating
     instance_data = load_instance_position(instance_name)
@@ -263,9 +340,7 @@ def start_task(session_id: str, hook_data: dict[str, Any]) -> dict[str, Any] | N
     return None
 
 
-def end_task(
-    session_id: str, hook_data: dict[str, Any], interrupted: bool = False
-) -> None:
+def end_task(session_id: str, hook_data: dict[str, Any], interrupted: bool = False) -> None:
     """Task ended - deliver freeze messages (foreground only), cleanup handled by SubagentStop
 
     Args:
@@ -303,11 +378,7 @@ def _stop_tracked_subagents(instance_name: str, instance_data: dict[str, Any]) -
 
     try:
         running_tasks = json.loads(running_tasks_json)
-        subagents = (
-            running_tasks.get("subagents", [])
-            if isinstance(running_tasks, dict)
-            else []
-        )
+        subagents = running_tasks.get("subagents", []) if isinstance(running_tasks, dict) else []
     except json.JSONDecodeError:
         return
 
@@ -376,8 +447,7 @@ def _deliver_freeze_messages(instance_name: str, freeze_event_id: int) -> int:
                 subagent_msgs.append(msg)
             # Messages TO subagents via scope routing
             elif subagent_names and any(
-                should_deliver_message(event_data, name, sender_name)
-                for name in subagent_names
+                should_deliver_message(event_data, name, sender_name) for name in subagent_names
             ):
                 if msg not in subagent_msgs:  # Avoid duplicates
                     subagent_msgs.append(msg)
@@ -402,16 +472,12 @@ def _deliver_freeze_messages(instance_name: str, freeze_event_id: int) -> int:
     all_relevant.sort(key=lambda m: m["timestamp"])
 
     if all_relevant:
-        formatted = "\n".join(
-            f"{msg['from']}: {msg['message']}" for msg in all_relevant
-        )
+        formatted = "\n".join(f"{msg['from']}: {msg['message']}" for msg in all_relevant)
 
         # Format subagent list with agent_ids for correlation
         subagent_list = (
             ", ".join(
-                f"{row['name']} (agent_id: {row['agent_id']})"
-                if row["agent_id"]
-                else row["name"]
+                f"{row['name']} (agent_id: {row['agent_id']})" if row["agent_id"] else row["name"]
                 for row in subagent_rows
             )
             if subagent_rows
@@ -570,9 +636,7 @@ def posttooluse(
     sys.exit(0)
 
 
-def _inject_bootstrap_if_needed(
-    instance_name: str, instance_data: dict[str, Any]
-) -> dict[str, Any] | None:
+def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any]) -> dict[str, Any] | None:
     """Defensive fallback bootstrap injection at PostToolUse.
 
     Rarely fires - vanilla `hcom start` already prints bootstrap to stdout which
@@ -600,9 +664,7 @@ def _inject_bootstrap_if_needed(
     }
 
 
-def _get_posttooluse_messages(
-    instance_name: str, _instance_data: dict[str, Any]
-) -> dict[str, Any] | None:
+def _get_posttooluse_messages(instance_name: str, _instance_data: dict[str, Any]) -> dict[str, Any] | None:
     """Parent context: check for unread messages
     Returns hook output dict or None.
     """
@@ -653,11 +715,7 @@ def _combine_posttooluse_outputs(outputs: list[dict[str, Any]]) -> dict[str, Any
     combined_system = " + ".join(system_msgs) if system_msgs else None
 
     # Combine additionalContext with separator
-    contexts = [
-        o["hookSpecificOutput"]["additionalContext"]
-        for o in outputs
-        if "hookSpecificOutput" in o
-    ]
+    contexts = [o["hookSpecificOutput"]["additionalContext"] for o in outputs if "hookSpecificOutput" in o]
     combined_context = "\n\n---\n\n".join(contexts)
 
     result: dict[str, Any] = {
@@ -675,7 +733,7 @@ def _combine_posttooluse_outputs(outputs: list[dict[str, Any]]) -> dict[str, Any
 def userpromptsubmit(
     _hook_data: dict[str, Any],
     instance_name: str,
-    updates: dict[str, Any],
+    updates: dict[str, Any] | None,
     is_matched_resume: bool,
     instance_data: dict[str, Any],
 ) -> None:
@@ -719,15 +777,11 @@ def userpromptsubmit(
     if os.environ.get("HCOM_PTY_MODE") == "1":
         from ..shared import MAX_MESSAGES_PER_DELIVERY
 
-        messages, max_event_id = get_unread_messages(
-            instance_name, update_position=False
-        )
+        messages, max_event_id = get_unread_messages(instance_name, update_position=False)
         if messages:
             deliver_messages = messages[:MAX_MESSAGES_PER_DELIVERY]
             delivered_last_event_id = deliver_messages[-1].get("event_id", max_event_id)
-            update_instance_position(
-                instance_name, {"last_event_id": delivered_last_event_id}
-            )
+            update_instance_position(instance_name, {"last_event_id": delivered_last_event_id})
 
             # User-facing (terminal) vs model-facing (context)
             user_display = format_hook_messages(deliver_messages, instance_name)
@@ -738,14 +792,14 @@ def userpromptsubmit(
                 f"deliver:{deliver_messages[0]['from']}",
                 msg_ts=deliver_messages[-1]["timestamp"],
             )
-            output: dict[str, Any] = {
+            delivery_output: dict[str, Any] = {
                 "systemMessage": user_display,
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": model_context,
                 },
             }
-            print(json.dumps(output, ensure_ascii=False), file=sys.stdout)
+            print(json.dumps(delivery_output, ensure_ascii=False), file=sys.stdout)
             return  # Message delivery, not user prompt
 
     # Set status to active (real user prompt, not hcom injection)
@@ -755,7 +809,7 @@ def userpromptsubmit(
 def notify(
     hook_data: dict[str, Any],
     instance_name: str,
-    updates: dict[str, Any],
+    updates: dict[str, Any] | None,
     instance_data: dict[str, Any],
 ) -> None:
     """Parent Notification: update status to blocked (parent only, handler filters subagent context)"""
@@ -770,9 +824,7 @@ def notify(
     set_status(instance_name, "blocked", message)
 
 
-def sessionend(
-    hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any]
-) -> None:
+def sessionend(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any]) -> None:
     """Parent SessionEnd: set final status and stop instance"""
     reason = hook_data.get("reason", "unknown")
 

@@ -1,4 +1,28 @@
-"""Hook utility functions"""
+"""Hook utility functions and re-exports.
+
+This module provides:
+1. Hook context initialization (binding lookup, metadata extraction)
+2. Transcript-based binding fallback for vanilla instances
+3. Re-exports of commonly used functions from core modules
+
+Key Functions:
+    init_hook_context()         - Initialize instance context from hook_data
+    _try_bind_from_transcript() - Fallback binding via transcript marker
+
+Re-exports (for backward compatibility):
+    From core.instances: load_instance_position
+    From core.runtime: build_claude_env, build_hcom_bootstrap_text,
+                       notify_all_instances, notify_instance
+    From core.tool_utils: build_hcom_command, build_claude_command,
+                          stop_instance, _detect_hcom_command_type,
+                          _build_quoted_invocation
+
+Identity Resolution Flow:
+    1. Look up session_id in session_bindings table
+    2. If not found, check transcript for [HCOM:BIND:X] marker
+    3. If marker found and instance pending, create binding
+    4. Return instance_name or None (non-participant)
+"""
 
 from __future__ import annotations
 from typing import Any
@@ -33,9 +57,20 @@ IS_WINDOWS = sys.platform == "win32"
 
 
 def _try_bind_from_transcript(session_id: str, transcript_path: str) -> str | None:
-    """Check transcript for [HCOM:BIND:X] marker, create binding if found.
+    """Check transcript for [HCOM:BIND:X] marker and create session binding.
 
-    Handles vanilla instances that ran `!hcom start` (bash shortcut bypasses hooks).
+    Fallback binding mechanism for vanilla Claude instances that used the
+    `!hcom start` bash shortcut (which bypasses PostToolUse hook detection).
+
+    Args:
+        session_id: Claude session ID from hook_data
+        transcript_path: Path to Claude's JSONL transcript
+
+    Returns:
+        Instance name if binding created, None otherwise.
+
+    Optimization:
+        Skips file I/O if no pending instances exist (fast path).
     """
     log_info(
         "hooks",
@@ -116,10 +151,25 @@ def _try_bind_from_transcript(session_id: str, transcript_path: str) -> str | No
 def init_hook_context(
     hook_data: dict[str, Any], hook_type: str | None = None
 ) -> tuple[str | None, dict[str, Any], bool]:
-    """Initialize instance context by binding lookup.
+    """Initialize instance context from hook_data via session binding lookup.
 
-    Uses session_bindings table as sole gate for hook participation.
-    No binding = hooks skip (unless transcript has binding marker).
+    Primary gate for hook participation: session must be bound to an instance
+    via session_bindings table. If not bound, falls back to transcript marker.
+
+    Args:
+        hook_data: Claude hook payload containing session_id, transcript_path, etc.
+        hook_type: Hook type string (unused, kept for API compatibility)
+
+    Returns:
+        Tuple of (instance_name, updates_dict, is_matched_resume):
+        - instance_name: Resolved instance name, or None if not participating
+        - updates_dict: Metadata updates to persist (directory, transcript_path, etc.)
+        - is_matched_resume: True if session_id matches stored value (resume scenario)
+
+    Gate Logic:
+        1. Look up session_id in session_bindings → instance_name
+        2. If not found, try transcript marker fallback
+        3. If still not found → (None, {}, False) - non-participant
     """
     from ..core.db import get_session_binding, get_instance
 

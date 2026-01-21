@@ -170,15 +170,28 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
         )
 
         config = get_config()
-        if not config.default_subscriptions:
+        if not config.auto_subscribe:
             return
 
         presets = [
-            p.strip() for p in config.default_subscriptions.split(",") if p.strip()
+            p.strip() for p in config.auto_subscribe.split(",") if p.strip()
         ]
+
+        # Map old preset names to new composable filter flags
+        preset_to_flags = {
+            "collision": ["--collision"],
+            "created": ["--action", "created"],
+            "stopped": ["--action", "stopped"],
+            "blocked": ["--status", "blocked"],
+        }
+
         for preset in presets:
             try:
-                _events_sub([preset], caller_name=instance_name, silent=True)
+                flags = preset_to_flags.get(preset)
+                if not flags:
+                    # Unknown preset - skip
+                    continue
+                _events_sub(flags, caller_name=instance_name, silent=True)
             except Exception:
                 pass
     except Exception:

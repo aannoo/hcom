@@ -1,4 +1,41 @@
-"""Manage mode screen implementation"""
+"""Manage mode screen implementation.
+
+This module implements the ManageScreen class, the primary view of the TUI.
+It displays the instance list, recent messages, and message input area.
+
+Screen Layout
+-------------
+    ┌─────────────────────────────────────────┐
+    │ Instance List (scrollable)              │
+    │   ▶ luna [listening] · 2m               │
+    │   ○ nova [active] · now                 │
+    │ ─────────────────────────────────────── │
+    │ Instance Detail (when selected)         │
+    │ ─────────────────────────────────────── │
+    │ Messages (Slack-style)                  │
+    │   10:23 luna                            │
+    │         @nova ready when you are        │
+    │ ─────────────────────────────────────── │
+    │ > message input area                    │
+    │ ─────────────────────────────────────── │
+    └─────────────────────────────────────────┘
+
+Key Bindings
+------------
+- UP/DOWN: Navigate instance list
+- ENTER: Stop instance (two-step confirm) or send message if text entered
+- @: Insert @mention for selected instance
+- TAB: Switch to Launch mode
+- Ctrl+K: Stop all instances (two-step confirm)
+- Ctrl+R: Reset/archive session (two-step confirm)
+- ESC: Clear input and close detail panel
+
+Instance Display
+----------------
+Instances are shown with status icon, name, age, and description.
+Tool type prefixes shown when multiple tools are present.
+Color indicates status (green=active, cyan=listening, gray=stopped, etc).
+"""
 
 from __future__ import annotations
 import re
@@ -20,6 +57,7 @@ from .rendering import (
     AnsiTextWrapper,
     get_device_sync_color,
     separator_line,
+    suppress_output,
 )
 
 # Import input utilities
@@ -64,26 +102,30 @@ from ..core.config import get_config
 from ..commands.messaging import cmd_send
 from ..commands.lifecycle import cmd_stop
 
-import sys
-from contextlib import contextmanager
-from io import StringIO
-
-
-@contextmanager
-def _suppress_output():
-    """Capture stdout/stderr to prevent CLI output from corrupting TUI display"""
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = StringIO(), StringIO()
-    try:
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
-
 
 class ManageScreen:
-    """Manage mode: instance list + messages + input"""
+    """Manage mode screen: instance list, messages, and input.
+
+    This is the default/primary TUI screen. It displays:
+    - List of active instances with status indicators
+    - Recent message history with delivery status
+    - Message composition input area
+
+    The screen receives shared UIState and mutates it in response to
+    user input. Rendering is done by build() which returns lines.
+
+    Attributes:
+        state: Reference to shared UIState object.
+        tui: Reference to parent HcomTUI for flash notifications and commands.
+    """
 
     def __init__(self, state: UIState, tui: HcomTUI):
+        """Initialize ManageScreen.
+
+        Args:
+            state: Shared UIState object containing ManageState.
+            tui: Parent HcomTUI for flash notifications and commands.
+        """
         self.state = state  # Shared state (explicit dependency)
         self.tui = tui  # For commands only (flash, stop_all, etc)
         self._recently_stopped_row_pos = -1  # Track position of recently stopped row
@@ -99,7 +141,21 @@ class ManageScreen:
         show_tool: bool = False,
         project_tag: str = "",
     ) -> str:
-        """Render a single instance row"""
+        """Render a single instance row with status indicator and details.
+
+        Args:
+            name: Instance display name (may include tag prefix).
+            info: Instance info dict with status, data, age_text, etc.
+            display_idx: Row index for cursor highlighting.
+            name_col_width: Width allocated for name column.
+            width: Total terminal width.
+            is_remote: Whether this is a relay-synced remote instance.
+            show_tool: Whether to show tool type prefix (claude/gemini/codex).
+            project_tag: Project directory tag to show (if multiple dirs).
+
+        Returns:
+            Formatted line string with ANSI colors.
+        """
         from ..core.instances import is_launching_placeholder
 
         # Row exists = participating (no enabled field)
@@ -184,7 +240,7 @@ class ManageScreen:
         badge_visible_len = ansi_len(badges) + ansi_len(project_suffix)
 
         # Unread count - shown as left border indicator (count in detail view)
-        unread_count = self.state.unread_counts.get(name, 0)
+        unread_count = self.state.manage.unread_counts.get(name, 0)
 
         # Timeout warning for:
         # 1. Subagents (any tool) - always show, they have limited lifetime
@@ -240,9 +296,9 @@ class ManageScreen:
 
         # Left border indicators: orange for detail open, yellow for unread
         # Indicator adds 1 char width (pushes content right) - matches original detail behavior
-        is_detail_open = self.state.show_instance_detail == name
+        is_detail_open = self.state.manage.show_instance_detail == name
         has_unread = unread_count > 0
-        if display_idx == self.state.cursor:
+        if display_idx == self.state.manage.cursor:
             # Cursor row with charcoal background
             if is_detail_open:
                 border = f"{FG_ORANGE}▐{RESET}{BG_CHARCOAL} "
@@ -283,7 +339,7 @@ class ManageScreen:
         )
 
         # Apply styling based on cursor position
-        if display_idx == self.state.cursor:
+        if display_idx == self.state.manage.cursor:
             line = f"{BG_CHARCOAL}{FG_GRAY}{content}{RESET}"
             line = truncate_ansi(line, width)
             line = bg_ljust(line, width, BG_CHARCOAL)
@@ -294,7 +350,21 @@ class ManageScreen:
         return line
 
     def build(self, height: int, width: int) -> List[str]:
-        """Build manage screen layout"""
+        """Build the complete manage screen as a list of lines.
+
+        Constructs the visual layout including:
+        - Instance list (with scrolling if needed)
+        - Instance detail panel (if an instance is selected)
+        - Message history
+        - Message input area
+
+        Args:
+            height: Available height in terminal rows.
+            width: Available width in terminal columns.
+
+        Returns:
+            List of formatted line strings ready for display.
+        """
         # Use minimum height for layout calculation to maintain structure
         layout_height = max(10, height)
 
@@ -310,7 +380,7 @@ class ManageScreen:
 
         # Sort instances by creation time (newest first) - stable, no jumping
         all_instances = sorted(
-            self.state.instances.items(),
+            self.state.manage.instances.items(),
             key=lambda x: -x[1]["data"].get("created_at", 0.0),
         )
 
@@ -328,38 +398,38 @@ class ManageScreen:
         remote_count = len(remote_instances)
 
         # Get recently stopped instances (from events, last 10 min)
-        active_names = set(self.state.instances.keys())
+        active_names = set(self.state.manage.instances.keys())
         recently_stopped = get_recently_stopped(exclude_active=active_names)
 
         # Auto-expand remote section if user hasn't explicitly toggled
         # Expand if count <= 3 OR any device synced < 5min ago
-        if not self.state.show_remote_user_set and remote_count > 0:
+        if not self.state.manage.show_remote_user_set and remote_count > 0:
             recent_sync = any(
                 (time.time() - sync_time) < 300  # 5 minutes
-                for sync_time in self.state.device_sync_times.values()
+                for sync_time in self.state.manage.device_sync_times.values()
                 if sync_time
             )
-            self.state.show_remote = (remote_count <= 3) or recent_sync
+            self.state.manage.show_remote = (remote_count <= 3) or recent_sync
 
         # Restore cursor position by instance name (stable across sorts)
-        if self.state.cursor_instance_name:
+        if self.state.manage.cursor_instance_name:
             found = False
-            target_name = self.state.cursor_instance_name
-            last_cursor = self.state.cursor
+            target_name = self.state.manage.cursor_instance_name
+            last_cursor = self.state.manage.cursor
 
             # Check local instances
             for i, (name, _) in enumerate(local_instances):
                 if name == target_name:
-                    self.state.cursor = i
+                    self.state.manage.cursor = i
                     found = True
                     break
 
             # Check remote instances (if not found and expanded)
-            if not found and self.state.show_remote:
+            if not found and self.state.manage.show_remote:
                 for i, (name, _) in enumerate(remote_instances):
                     if name == target_name:
                         # Position = local_count + 1 (remote separator) + index
-                        self.state.cursor = len(local_instances) + 1 + i
+                        self.state.manage.cursor = len(local_instances) + 1 + i
                         found = True
                         break
 
@@ -369,27 +439,27 @@ class ManageScreen:
                 temp_display_count = len(local_instances)
                 if remote_count > 0:
                     temp_display_count += 1  # remote separator
-                    if self.state.show_remote:
+                    if self.state.manage.show_remote:
                         temp_display_count += remote_count
                 if recently_stopped:
                     temp_display_count += 1  # recently stopped row
 
                 # Keep cursor at same position or move up if we were at the end
                 if temp_display_count > 0:
-                    self.state.cursor = min(last_cursor, temp_display_count - 1)
+                    self.state.manage.cursor = min(last_cursor, temp_display_count - 1)
                 else:
-                    self.state.cursor = 0
+                    self.state.manage.cursor = 0
 
                 # Update cursor_instance_name to the instance now at cursor position
                 # (Will be set below in the "Update tracked instance name" section)
-                self.state.cursor_instance_name = None
+                self.state.manage.cursor_instance_name = None
                 self.sync_scroll_to_cursor()
 
         # Calculate total display items for cursor bounds (local + remote + recently_stopped)
         display_count = len(local_instances)
         if remote_count > 0:
             display_count += 1  # remote separator row
-            if self.state.show_remote:
+            if self.state.manage.show_remote:
                 display_count += remote_count
         if recently_stopped:
             display_count += 1  # recently stopped summary row
@@ -399,24 +469,24 @@ class ManageScreen:
 
         # Ensure cursor is valid
         if display_count > 0:
-            self.state.cursor = max(0, min(self.state.cursor, display_count - 1))
+            self.state.manage.cursor = max(0, min(self.state.manage.cursor, display_count - 1))
             # Update tracked instance name (None if on separator)
-            cursor = self.state.cursor
+            cursor = self.state.manage.cursor
             if cursor < len(local_instances):
-                self.state.cursor_instance_name = local_instances[cursor][0]
+                self.state.manage.cursor_instance_name = local_instances[cursor][0]
             elif remote_sep >= 0 and cursor == remote_sep:
-                self.state.cursor_instance_name = None  # Remote separator
-            elif self.state.show_remote and remote_count > 0:
+                self.state.manage.cursor_instance_name = None  # Remote separator
+            elif self.state.manage.show_remote and remote_count > 0:
                 remote_idx = cursor - remote_sep - 1
                 if remote_idx < remote_count:
-                    self.state.cursor_instance_name = remote_instances[remote_idx][0]
+                    self.state.manage.cursor_instance_name = remote_instances[remote_idx][0]
                 else:
-                    self.state.cursor_instance_name = None
+                    self.state.manage.cursor_instance_name = None
             else:
-                self.state.cursor_instance_name = None
+                self.state.manage.cursor_instance_name = None
         else:
-            self.state.cursor = 0
-            self.state.cursor_instance_name = None
+            self.state.manage.cursor = 0
+            self.state.manage.cursor_instance_name = None
 
         # Empty state - no instances (neither local nor remote)
         if len(local_instances) == 0 and remote_count == 0:
@@ -449,7 +519,7 @@ class ManageScreen:
             display_count = len(local_instances)
             if remote_count > 0:
                 display_count += 1  # remote separator row
-                if self.state.show_remote:
+                if self.state.manage.show_remote:
                     display_count += remote_count
             if recently_stopped:
                 display_count += 1  # recently stopped summary row
@@ -460,13 +530,13 @@ class ManageScreen:
 
             # Calculate visible window
             max_scroll = max(0, display_count - instance_rows)
-            self.state.instance_scroll_pos = max(
-                0, min(self.state.instance_scroll_pos, max_scroll)
+            self.state.manage.instance_scroll_pos = max(
+                0, min(self.state.manage.instance_scroll_pos, max_scroll)
             )
 
             # Calculate dynamic name column width based on actual names
             all_for_width = list(local_instances)
-            if self.state.show_remote:
+            if self.state.manage.show_remote:
                 all_for_width += remote_instances
             max_instance_name_len = max(
                 (len(name) for name, _ in all_for_width), default=0
@@ -522,7 +592,7 @@ class ManageScreen:
             name_col_width = max(20, min(name_col_width, max_name_width))
 
             # Build display rows
-            visible_start = self.state.instance_scroll_pos
+            visible_start = self.state.manage.instance_scroll_pos
             visible_end = min(visible_start + instance_rows, display_count)
 
             # If only 1 item would be hidden, show it instead of scroll indicator
@@ -553,11 +623,11 @@ class ManageScreen:
                     lines.append(line)
                 elif remote_sep >= 0 and display_idx == remote_sep:
                     # Relay separator row (no dot here - dot is in top bar)
-                    is_cursor = display_idx == self.state.cursor
-                    arrow = "▼" if self.state.show_remote else "▶"
+                    is_cursor = display_idx == self.state.manage.cursor
+                    arrow = "▼" if self.state.manage.show_remote else "▶"
 
                     # Build sync status when expanded: relay (BOXE:1m, CATA:2s) ▼
-                    if self.state.show_remote and self.state.device_sync_times:
+                    if self.state.manage.show_remote and self.state.manage.device_sync_times:
                         # Build device_id -> suffix mapping from remote instances
                         device_suffixes = {}
                         for name, info in remote_instances:
@@ -570,7 +640,7 @@ class ManageScreen:
 
                         sync_parts = []
                         for device, sync_time in sorted(
-                            self.state.device_sync_times.items()
+                            self.state.manage.device_sync_times.items()
                         ):
                             if sync_time:
                                 sync_age = time.time() - sync_time
@@ -595,7 +665,7 @@ class ManageScreen:
                     else:
                         line = f"{FG_GRAY}{sep_line}{RESET}"
                     lines.append(truncate_ansi(line, width))
-                elif self.state.show_remote and remote_count > 0:
+                elif self.state.manage.show_remote and remote_count > 0:
                     # Remote instance (only when expanded)
                     remote_idx = display_idx - remote_sep - 1
                     if 0 <= remote_idx < remote_count:
@@ -635,14 +705,14 @@ class ManageScreen:
             # Add scroll indicators if needed
             if display_count > instance_rows:
                 # If cursor will conflict with indicator, move cursor line first
-                if visible_start > 0 and self.state.cursor == visible_start:
+                if visible_start > 0 and self.state.manage.cursor == visible_start:
                     # Save cursor line (at position 0), move to position 1
                     cursor_line = lines[0] if lines else ""
                     lines[0] = lines[1] if len(lines) > 1 else ""
                     if len(lines) > 1:
                         lines[1] = cursor_line
 
-                if visible_end < display_count and self.state.cursor == visible_end - 1:
+                if visible_end < display_count and self.state.manage.cursor == visible_end - 1:
                     # Save cursor line (at position -1), move to position -2
                     cursor_line = lines[-1] if lines else ""
                     lines[-1] = lines[-2] if len(lines) > 1 else ""
@@ -671,9 +741,9 @@ class ManageScreen:
 
         # Instance detail section (if active) - render ABOVE messages
         detail_rows = 0
-        if self.state.show_instance_detail:
+        if self.state.manage.show_instance_detail:
             detail_lines = self.build_instance_detail(
-                self.state.show_instance_detail, width
+                self.state.manage.show_instance_detail, width
             )
             lines.extend(detail_lines)
             detail_rows = len(detail_lines)
@@ -685,7 +755,7 @@ class ManageScreen:
         actual_message_rows = message_rows - detail_rows
 
         # Messages - Slack-style format with sender on separate line
-        if self.state.messages and actual_message_rows > 0:
+        if self.state.manage.messages and actual_message_rows > 0:
             all_wrapped_lines = []
 
             # Get instance read positions for read receipt calculation
@@ -735,7 +805,7 @@ class ManageScreen:
                 message,
                 delivered_to,
                 event_id,
-            ) in self.state.messages:
+            ) in self.state.manage.messages:
                 # Format timestamp (convert UTC to local time)
                 dt = parse_iso_timestamp(time_str) if "T" in time_str else None
                 display_time = (
@@ -837,7 +907,7 @@ class ManageScreen:
             lines.extend(visible_lines)
         else:
             # No messages - show hint only if instances exist (empty state shows logo instead)
-            if self.state.instances:
+            if self.state.manage.instances:
                 lines.append(
                     f"{FG_GRAY}No messages yet - type to compose | @ to mention{RESET}"
                 )
@@ -875,7 +945,7 @@ class ManageScreen:
         from ..core.db import get_recently_stopped
 
         all_instances = sorted(
-            self.state.instances.items(),
+            self.state.manage.instances.items(),
             key=lambda x: -x[1]["data"].get("created_at", 0.0),
         )
 
@@ -894,14 +964,14 @@ class ManageScreen:
         remote_count = len(remote_instances)
 
         # Get recently stopped names (excluding currently active)
-        active_names = set(self.state.instances.keys())
+        active_names = set(self.state.manage.instances.keys())
         recently_stopped = get_recently_stopped(exclude_active=active_names)
 
         # Calculate display count: local + remote section + recently stopped
         display_count = len(local_instances)
         if remote_count > 0:
             display_count += 1  # remote separator
-            if self.state.show_remote:
+            if self.state.manage.show_remote:
                 display_count += remote_count
         if recently_stopped:
             display_count += 1  # recently stopped row
@@ -930,10 +1000,10 @@ class ManageScreen:
             recently_stopped_pos = len(local)
             if remote_count > 0:
                 recently_stopped_pos += 1  # remote separator
-                if self.state.show_remote:
+                if self.state.manage.show_remote:
                     recently_stopped_pos += remote_count
 
-        cursor = self.state.cursor
+        cursor = self.state.manage.cursor
 
         # Local section
         if cursor < local_end:
@@ -944,7 +1014,7 @@ class ManageScreen:
             return None, False, "remote_sep"
 
         # Remote instances (if expanded)
-        if remote_count > 0 and self.state.show_remote:
+        if remote_count > 0 and self.state.manage.show_remote:
             remote_start = remote_sep_pos + 1
             if remote_start <= cursor < remote_start + remote_count:
                 return remote[cursor - remote_start], True, "instance"
@@ -964,268 +1034,246 @@ class ManageScreen:
 
         return remote_sep
 
+    # Key handler methods for dispatch pattern
+    def _handle_nav(self, key: str, local: list, remote: list, display_count: int, recently_stopped: list):
+        """Handle UP/DOWN navigation"""
+        if key == "UP" and display_count > 0 and self.state.manage.cursor > 0:
+            self.state.manage.cursor -= 1
+        elif key == "DOWN" and display_count > 0 and self.state.manage.cursor < display_count - 1:
+            self.state.manage.cursor += 1
+        else:
+            return
+
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped)
+        self.state.manage.cursor_instance_name = inst[0] if inst else None
+        self.tui.clear_all_pending_confirmations()
+        self.state.manage.show_instance_detail = None
+        self.sync_scroll_to_cursor()
+
+    def _handle_at(self, local: list, remote: list, recently_stopped: list):
+        """Handle @ key - insert mention"""
+        self.tui.clear_all_pending_confirmations()
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped)
+        if inst:
+            name, _ = inst
+            mention = f"@{name} "
+            if mention not in self.state.manage.message_buffer:
+                self.state.manage.message_buffer, self.state.manage.message_cursor_pos = text_input_insert(
+                    self.state.manage.message_buffer, self.state.manage.message_cursor_pos, mention
+                )
+
+    def _handle_cursor_move(self, key: str):
+        """Handle LEFT/RIGHT cursor movement"""
+        self.tui.clear_all_pending_confirmations()
+        if key == "LEFT":
+            self.state.manage.message_cursor_pos = text_input_move_left(self.state.manage.message_cursor_pos)
+        else:
+            self.state.manage.message_cursor_pos = text_input_move_right(
+                self.state.manage.message_buffer, self.state.manage.message_cursor_pos
+            )
+
+    def _handle_esc(self):
+        """Handle ESC - clear everything"""
+        self.state.manage.message_buffer = ""
+        self.state.manage.message_cursor_pos = 0
+        self.state.manage.show_instance_detail = None
+        self.tui.clear_all_pending_confirmations()
+
+    def _handle_backspace(self):
+        """Handle BACKSPACE - delete character"""
+        self.tui.clear_all_pending_confirmations()
+        self.state.manage.message_buffer, self.state.manage.message_cursor_pos = text_input_backspace(
+            self.state.manage.message_buffer, self.state.manage.message_cursor_pos
+        )
+
+    def _handle_enter(self, local: list, remote: list, recently_stopped: list):
+        """Handle ENTER - send message or toggle instance"""
+        self.tui.clear_pending_confirmations_except("stop")
+
+        # Smart Enter: send message if text exists, otherwise toggle instances
+        if self.state.manage.message_buffer.strip():
+            return self._send_message()
+
+        # Get what's at cursor
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped)
+
+        # Handle special rows
+        if row_type == "remote_sep":
+            self.state.manage.show_remote = not self.state.manage.show_remote
+            self.state.manage.show_remote_user_set = True
+            return
+
+        if row_type == "recently_stopped":
+            return ("switch_events", {"view": "instances"})
+
+        if not inst:
+            return
+
+        name, info = inst
+        if is_remote:
+            return self._handle_remote_instance(name, info)
+        return self._handle_local_instance(name, info)
+
+    def _send_message(self):
+        """Send message from buffer"""
+        self.state.manage.send_state = "sending"
+        self.state.frame_dirty = True
+        self.tui.render()
+        try:
+            message = self.state.manage.message_buffer.strip()
+            result = cmd_send(["--from", "bigboss", message])
+            if result == 0:
+                self.state.manage.send_state = "sent"
+                self.state.manage.send_state_until = time.time() + 0.1
+                self.state.manage.message_buffer = ""
+                self.state.manage.message_cursor_pos = 0
+            else:
+                self.state.manage.send_state = None
+                self.tui.flash_error("Send failed")
+        except Exception as e:
+            self.state.manage.send_state = None
+            self.tui.flash_error(f"Error: {str(e)}")
+
+    def _handle_remote_instance(self, name: str, info: dict):
+        """Handle ENTER on remote instance - stop with confirmation"""
+        from ..relay import send_control
+
+        if ":" not in name:
+            self.state.manage.show_instance_detail = name
+            return
+
+        base_name, device_short = name.rsplit(":", 1)
+        status = info.get("status", "unknown")
+        color = STATUS_FG.get(status, FG_WHITE)
+
+        if (
+            self.state.confirm.pending_stop == name
+            and (time.time() - self.state.confirm.pending_stop_time) <= self.tui.CONFIRMATION_TIMEOUT
+        ):
+            if send_control("stop", base_name, device_short):
+                self.tui.flash(f"Stopped hcom for {color}{name}{RESET}")
+                self.tui.load_status()
+            else:
+                self.tui.flash_error("Failed to stop remote instance")
+            self.state.confirm.pending_stop = None
+            self.state.manage.show_instance_detail = None
+        else:
+            self.state.confirm.pending_stop = name
+            self.state.confirm.pending_stop_time = time.time()
+            self.state.manage.show_instance_detail = name
+
+    def _handle_local_instance(self, name: str, info: dict):
+        """Handle ENTER on local instance - stop with confirmation"""
+        status = info.get("status", "unknown")
+        color = STATUS_FG.get(status, FG_WHITE)
+
+        status_context = info.get("data", {}).get("status_context", "")
+        if status == "active" and status_context.startswith("deliver:"):
+            color = FG_DELIVER
+
+        if (
+            self.state.confirm.pending_stop == name
+            and (time.time() - self.state.confirm.pending_stop_time) <= self.tui.CONFIRMATION_TIMEOUT
+        ):
+            base_name = info.get("base_name", name)
+            try:
+                with suppress_output():
+                    cmd_stop([base_name])
+                self.tui.flash(f"Stopped hcom for {color}{name}{RESET}")
+                self.tui.load_status()
+            except Exception as e:
+                self.tui.flash_error(f"Error: {str(e)}")
+            finally:
+                self.state.confirm.pending_stop = None
+                self.state.manage.show_instance_detail = None
+        else:
+            self.state.confirm.pending_stop = name
+            self.state.confirm.pending_stop_time = time.time()
+            self.state.manage.show_instance_detail = name
+
+    def _handle_ctrl_k(self):
+        """Handle CTRL_K - stop all instances with confirmation"""
+        is_confirming = (
+            self.state.confirm.pending_stop_all
+            and (time.time() - self.state.confirm.pending_stop_all_time) <= self.tui.CONFIRMATION_TIMEOUT
+        )
+        self.tui.clear_pending_confirmations_except("stop_all")
+
+        if is_confirming:
+            self.tui.stop_all_instances()
+            self.state.confirm.pending_stop_all = False
+        else:
+            self.state.confirm.pending_stop_all = True
+            self.state.confirm.pending_stop_all_time = time.time()
+            self.tui.flash(
+                f"{FG_WHITE}Confirm stop all instances? (press Ctrl+K again){RESET}",
+                duration=self.tui.CONFIRMATION_FLASH_DURATION,
+                color="white",
+            )
+
+    def _handle_ctrl_r(self):
+        """Handle CTRL_R - reset with confirmation"""
+        is_confirming = (
+            self.state.confirm.pending_reset
+            and (time.time() - self.state.confirm.pending_reset_time) <= self.tui.CONFIRMATION_TIMEOUT
+        )
+        self.tui.clear_pending_confirmations_except("reset")
+
+        if is_confirming:
+            self.tui.reset_events()
+            self.state.confirm.pending_reset = False
+        else:
+            self.state.confirm.pending_reset = True
+            self.state.confirm.pending_reset_time = time.time()
+            self.tui.flash(
+                f"{FG_WHITE}Confirm clear & archive (conversation + instance list)? (press Ctrl+R again){RESET}",
+                duration=self.tui.CONFIRMATION_FLASH_DURATION,
+                color="white",
+            )
+
+    def _handle_text_input(self, key: str):
+        """Handle text input - space, newline, printable chars"""
+        self.tui.clear_all_pending_confirmations()
+        char = " " if key == "SPACE" else ("\n" if key == "\n" else key)
+        self.state.manage.message_buffer, self.state.manage.message_cursor_pos = text_input_insert(
+            self.state.manage.message_buffer, self.state.manage.message_cursor_pos, char
+        )
+
     def handle_key(self, key: str):
-        """Handle keys in Manage mode"""
-        # Build display lists
+        """Handle keyboard input in Manage mode.
+
+        Uses a dispatch pattern to route keys to appropriate handlers.
+        Updates state and may return commands for the TUI orchestrator.
+
+        Args:
+            key: Key name from KeyboardInput (e.g., "UP", "ENTER", "a").
+
+        Returns:
+            None for most keys, or a tuple like ("switch_events", {...})
+            to signal mode changes to the orchestrator.
+        """
         local, remote, display_count, recently_stopped = self._get_display_lists()
         self._get_separator_positions(local, remote)
 
-        if key == "UP":
-            if display_count > 0 and self.state.cursor > 0:
-                self.state.cursor -= 1
-                inst, is_remote, row_type = self._get_instance_at_cursor(
-                    local, remote, recently_stopped
-                )
-                self.state.cursor_instance_name = inst[0] if inst else None
-                self.tui.clear_all_pending_confirmations()
-                self.state.show_instance_detail = None
-                self.sync_scroll_to_cursor()
-        elif key == "DOWN":
-            if display_count > 0 and self.state.cursor < display_count - 1:
-                self.state.cursor += 1
-                inst, is_remote, row_type = self._get_instance_at_cursor(
-                    local, remote, recently_stopped
-                )
-                self.state.cursor_instance_name = inst[0] if inst else None
-                self.tui.clear_all_pending_confirmations()
-                self.state.show_instance_detail = None
-                self.sync_scroll_to_cursor()
+        # Dispatch table for simple key handlers
+        if key in ("UP", "DOWN"):
+            return self._handle_nav(key, local, remote, display_count, recently_stopped)
         elif key == "@":
-            self.tui.clear_all_pending_confirmations()
-            inst, is_remote, row_type = self._get_instance_at_cursor(
-                local, remote, recently_stopped
-            )
-            if inst:
-                name, _ = inst
-                mention = f"@{name} "  # Name already includes :DEVICE suffix for remote
-                if mention not in self.state.message_buffer:
-                    self.state.message_buffer, self.state.message_cursor_pos = (
-                        text_input_insert(
-                            self.state.message_buffer,
-                            self.state.message_cursor_pos,
-                            mention,
-                        )
-                    )
-        elif key == "SPACE":
-            self.tui.clear_all_pending_confirmations()
-            # Add space to message buffer at cursor position
-            self.state.message_buffer, self.state.message_cursor_pos = (
-                text_input_insert(
-                    self.state.message_buffer, self.state.message_cursor_pos, " "
-                )
-            )
-        elif key == "LEFT":
-            self.tui.clear_all_pending_confirmations()
-            # Move cursor left in message buffer
-            self.state.message_cursor_pos = text_input_move_left(
-                self.state.message_cursor_pos
-            )
-        elif key == "RIGHT":
-            self.tui.clear_all_pending_confirmations()
-            # Move cursor right in message buffer
-            self.state.message_cursor_pos = text_input_move_right(
-                self.state.message_buffer, self.state.message_cursor_pos
-            )
+            return self._handle_at(local, remote, recently_stopped)
+        elif key in ("LEFT", "RIGHT"):
+            return self._handle_cursor_move(key)
         elif key == "ESC":
-            # Clear everything: message buffer, detail view, and confirmations
-            self.state.message_buffer = ""
-            self.state.message_cursor_pos = 0
-            self.state.show_instance_detail = None
-            self.tui.clear_all_pending_confirmations()
+            return self._handle_esc()
         elif key == "BACKSPACE":
-            self.tui.clear_all_pending_confirmations()
-            # Delete character before cursor in message buffer
-            self.state.message_buffer, self.state.message_cursor_pos = (
-                text_input_backspace(
-                    self.state.message_buffer, self.state.message_cursor_pos
-                )
-            )
+            return self._handle_backspace()
         elif key == "ENTER":
-            # Clear stop all and reset confirmations (stop handled separately below)
-            self.tui.clear_pending_confirmations_except("stop")
-
-            # Smart Enter: send message if text exists, otherwise toggle instances
-            if self.state.message_buffer.strip():
-                # Send message using cmd_send for consistent validation and error handling
-                # Dim input during send (visual feedback without flash)
-                self.state.send_state = "sending"
-                self.state.frame_dirty = True
-                self.tui.render()  # Force immediate display
-                try:
-                    message = self.state.message_buffer.strip()
-                    # Pass --from bigboss for TUI (external human sender)
-                    result = cmd_send(["--from", "bigboss", message])
-                    if result == 0:
-                        # Brief bright prefix, then clear
-                        self.state.send_state = "sent"
-                        self.state.send_state_until = time.time() + 0.1
-                        # Clear message buffer and cursor
-                        self.state.message_buffer = ""
-                        self.state.message_cursor_pos = 0
-                    else:
-                        self.state.send_state = None
-                        self.tui.flash_error("Send failed")
-                except Exception as e:
-                    self.state.send_state = None
-                    self.tui.flash_error(f"Error: {str(e)}")
-            else:
-                # Get what's at cursor
-                inst, is_remote, row_type = self._get_instance_at_cursor(
-                    local, remote, recently_stopped
-                )
-
-                # Handle special rows
-                if row_type == "remote_sep":
-                    self.state.show_remote = not self.state.show_remote
-                    self.state.show_remote_user_set = True
-                    return
-
-                if row_type == "recently_stopped":
-                    # Switch to EVENTS mode with instances view
-                    return ("switch_events", {"view": "instances"})
-
-                if not inst:
-                    return
-
-                name, info = inst
-
-                # Remote instances: stop via control event (can only stop, not start)
-                if is_remote:
-                    from ..relay import send_control
-
-                    # Extract device short ID from name (format: name:DEVICE)
-                    if ":" in name:
-                        base_name, device_short = name.rsplit(":", 1)
-
-                        # Get status color for flash message
-                        status = info.get("status", "unknown")
-                        color = STATUS_FG.get(status, FG_WHITE)
-
-                        # Two-step confirmation for remote stop
-                        if (
-                            self.state.pending_stop == name
-                            and (time.time() - self.state.pending_stop_time)
-                            <= self.tui.CONFIRMATION_TIMEOUT
-                        ):
-                            # Execute remote stop (row exists = active, can only stop)
-                            if send_control("stop", base_name, device_short):
-                                self.tui.flash(f"Stopped hcom for {color}{name}{RESET}")
-                                self.tui.load_status()
-                            else:
-                                self.tui.flash_error("Failed to stop remote instance")
-                            self.state.pending_stop = None
-                            self.state.show_instance_detail = None
-                        else:
-                            # First press - request confirmation + show detail
-                            self.state.pending_stop = name
-                            self.state.pending_stop_time = time.time()
-                            self.state.show_instance_detail = name
-                    else:
-                        # Can't parse device ID, just show detail
-                        self.state.show_instance_detail = name
-                    return
-
-                # Local instance - stop with two-step confirmation (row exists = active, can only stop)
-                # Get status color for name
-                status = info.get("status", "unknown")
-                color = STATUS_FG.get(status, FG_WHITE)
-
-                # Light green coloring for message delivery (active with deliver token)
-                status_context = info.get("data", {}).get("status_context", "")
-                if status == "active" and status_context.startswith("deliver:"):
-                    color = FG_DELIVER
-
-                # Check if confirming previous stop
-                if (
-                    self.state.pending_stop == name
-                    and (time.time() - self.state.pending_stop_time)
-                    <= self.tui.CONFIRMATION_TIMEOUT
-                ):
-                    # Execute stop (confirmation received) - row exists = participating, stop deletes
-                    # Use base_name for DB operations, display name for UI
-                    base_name = info.get("base_name", name)
-                    try:
-                        # Suppress CLI output to prevent TUI corruption
-                        with _suppress_output():
-                            cmd_stop([base_name])
-                        self.tui.flash(f"Stopped hcom for {color}{name}{RESET}")
-                        self.tui.load_status()
-                    except Exception as e:
-                        self.tui.flash_error(f"Error: {str(e)}")
-                    finally:
-                        self.state.pending_stop = None
-                        self.state.show_instance_detail = None
-                else:
-                    # Show confirmation (first press) + show detail view
-                    self.state.pending_stop = name
-                    self.state.pending_stop_time = time.time()
-                    self.state.show_instance_detail = name  # Also show detail
-
+            return self._handle_enter(local, remote, recently_stopped)
         elif key == "CTRL_K":
-            # Check state before clearing
-            is_confirming = (
-                self.state.pending_stop_all
-                and (time.time() - self.state.pending_stop_all_time)
-                <= self.tui.CONFIRMATION_TIMEOUT
-            )
-            self.tui.clear_pending_confirmations_except("stop_all")
-
-            # Two-step confirmation for stop all
-            if is_confirming:
-                # Execute stop all (confirmation received)
-                self.tui.stop_all_instances()
-                self.state.pending_stop_all = False
-            else:
-                # Show confirmation (first press) - 10s duration
-                self.state.pending_stop_all = True
-                self.state.pending_stop_all_time = time.time()
-                self.tui.flash(
-                    f"{FG_WHITE}Confirm stop all instances? (press Ctrl+K again){RESET}",
-                    duration=self.tui.CONFIRMATION_FLASH_DURATION,
-                    color="white",
-                )
-
+            return self._handle_ctrl_k()
         elif key == "CTRL_R":
-            # Check state before clearing
-            is_confirming = (
-                self.state.pending_reset
-                and (time.time() - self.state.pending_reset_time)
-                <= self.tui.CONFIRMATION_TIMEOUT
-            )
-            self.tui.clear_pending_confirmations_except("reset")
-
-            # Two-step confirmation for reset
-            if is_confirming:
-                # Execute reset (confirmation received)
-                self.tui.reset_events()
-                self.state.pending_reset = False
-            else:
-                # Show confirmation (first press)
-                self.state.pending_reset = True
-                self.state.pending_reset_time = time.time()
-                self.tui.flash(
-                    f"{FG_WHITE}Confirm clear & archive (conversation + instance list)? (press Ctrl+R again){RESET}",
-                    duration=self.tui.CONFIRMATION_FLASH_DURATION,
-                    color="white",
-                )
-
-        elif key == "\n":
-            # Handle pasted newlines - insert literally
-            self.tui.clear_all_pending_confirmations()
-            self.state.message_buffer, self.state.message_cursor_pos = (
-                text_input_insert(
-                    self.state.message_buffer, self.state.message_cursor_pos, "\n"
-                )
-            )
-
-        elif key and len(key) == 1 and key.isprintable():
-            self.tui.clear_all_pending_confirmations()
-            # Insert printable characters at cursor position
-            self.state.message_buffer, self.state.message_cursor_pos = (
-                text_input_insert(
-                    self.state.message_buffer, self.state.message_cursor_pos, key
-                )
-            )
+            return self._handle_ctrl_r()
+        elif key in ("SPACE", "\n") or (key and len(key) == 1 and key.isprintable()):
+            return self._handle_text_input(key)
 
     def calculate_layout(self, height: int, width: int) -> tuple[int, int, int]:
         """Calculate instance/message/input row allocation"""
@@ -1233,7 +1281,7 @@ class ManageScreen:
         from ..core.db import get_recently_stopped
 
         # Dynamic input area based on buffer size
-        input_rows = calculate_text_input_rows(self.state.message_buffer, width)
+        input_rows = calculate_text_input_rows(self.state.manage.message_buffer, width)
         # Space budget
         separator_rows = 3  # One separator between instances and messages, one before input, one after input
         min_instance_rows = 3
@@ -1241,7 +1289,7 @@ class ManageScreen:
         available = height - input_rows - separator_rows
 
         # Calculate display count based on current collapse state
-        all_instances = list(self.state.instances.values())
+        all_instances = list(self.state.manage.instances.values())
         local_instances = [
             i for i in all_instances if not is_remote_instance(i.get("data", {}))
         ]
@@ -1253,14 +1301,14 @@ class ManageScreen:
         remote_count = len(remote_instances)
 
         # Get recently stopped for display count
-        active_names = set(self.state.instances.keys())
+        active_names = set(self.state.manage.instances.keys())
         recently_stopped = get_recently_stopped(exclude_active=active_names)
 
         # Build display count: local + remote section + recently_stopped
         display_count = local_count
         if remote_count > 0:
             display_count += 1  # remote separator
-            if self.state.show_remote:
+            if self.state.manage.show_remote:
                 display_count += remote_count
         if recently_stopped:
             display_count += 1  # recently stopped row
@@ -1280,25 +1328,25 @@ class ManageScreen:
         visible_instance_rows = instance_rows  # Full instance section is visible
 
         # Scroll up if cursor moved above visible window
-        if self.state.cursor < self.state.instance_scroll_pos:
-            self.state.instance_scroll_pos = self.state.cursor
+        if self.state.manage.cursor < self.state.manage.instance_scroll_pos:
+            self.state.manage.instance_scroll_pos = self.state.manage.cursor
         # Scroll down if cursor moved below visible window
         elif (
-            self.state.cursor >= self.state.instance_scroll_pos + visible_instance_rows
+            self.state.manage.cursor >= self.state.manage.instance_scroll_pos + visible_instance_rows
         ):
-            self.state.instance_scroll_pos = (
-                self.state.cursor - visible_instance_rows + 1
+            self.state.manage.instance_scroll_pos = (
+                self.state.manage.cursor - visible_instance_rows + 1
             )
 
     def render_wrapped_input(self, width: int, input_rows: int) -> List[str]:
         """Render message input (delegates to shared helper)"""
         return render_text_input(
-            self.state.message_buffer,
-            self.state.message_cursor_pos,
+            self.state.manage.message_buffer,
+            self.state.manage.message_cursor_pos,
             width,
             input_rows,
             prefix="> ",
-            send_state=self.state.send_state,
+            send_state=self.state.manage.send_state,
         )
 
     def build_instance_detail(self, name: str, width: int) -> List[str]:
@@ -1309,10 +1357,10 @@ class ManageScreen:
         lines = []
 
         # Get instance data
-        if name not in self.state.instances:
+        if name not in self.state.manage.instances:
             return [f"{FG_GRAY}Instance not found{RESET}"]
 
-        info = self.state.instances[name]
+        info = self.state.manage.instances[name]
         data = info["data"]
 
         # Get status color for name (same as flash message)
@@ -1329,7 +1377,7 @@ class ManageScreen:
         lines.append(truncate_ansi(header, width))
 
         # Unread message count (aligned with other fields at column 16)
-        unread_count = self.state.unread_counts.get(name, 0)
+        unread_count = self.state.manage.unread_counts.get(name, 0)
         if unread_count > 0:
             lines.append(
                 truncate_ansi(
@@ -1344,7 +1392,7 @@ class ManageScreen:
             device_short = origin_device[:8] if origin_device else "(unknown)"
 
             # Get device sync time
-            sync_time = self.state.device_sync_times.get(origin_device, 0)
+            sync_time = self.state.manage.device_sync_times.get(origin_device, 0)
             sync_str = (
                 f"{format_age(time.time() - sync_time)} ago" if sync_time else "never"
             )

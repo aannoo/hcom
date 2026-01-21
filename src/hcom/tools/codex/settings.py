@@ -1,7 +1,26 @@
 """Codex CLI hook settings management.
 
-Mirrors the patterns from tools/gemini/settings.py for consistency.
-Codex uses TOML config (~/.codex/config.toml) with a single notify hook.
+Manages ~/.codex/config.toml for hcom hook integration.
+Codex uses TOML format (not JSON like Gemini) with simpler structure.
+
+Config Structure:
+    # ~/.codex/config.toml
+    notify = ["hcom", "codex-notify"]  # Must be at root level, before [sections]
+
+    [model]
+    ...
+
+Execpolicy Rules (~/.codex/rules/hcom.rules):
+    Auto-approve safe hcom commands (list, events, send, etc.)
+    to reduce approval prompts during normal hcom usage.
+
+Key Functions:
+    setup_codex_hooks: Install notify hook and execpolicy rules
+    remove_codex_hooks: Clean removal from config and rules
+    verify_codex_hooks_installed: Check correct configuration
+
+Important: Codex only supports ONE notify command. If user has existing
+notify configuration, setup will fail with instructions to remove it first.
 """
 
 from __future__ import annotations

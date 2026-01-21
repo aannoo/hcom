@@ -1,4 +1,55 @@
-"""HCOM TUI - Interactive Menu Interface"""
+"""HCOM TUI - Interactive Menu Interface.
+
+This module provides a terminal-based user interface for managing HCOM instances,
+sending messages, and configuring launch parameters.
+
+Architecture
+------------
+The TUI follows a screen-based architecture with centralized state:
+
+    HcomTUI (tui.py)          Main orchestrator - event loop, rendering, state management
+         │
+         ├── ManageScreen     Instance list, messaging, and status display
+         │   (manage.py)
+         │
+         └── LaunchScreen     Instance creation form with expandable sections
+             (launch.py)
+
+UIState (types.py)            Centralized state object shared by all screens
+    ├── ManageState           Cursor, messages, scroll position
+    ├── LaunchState           Form values, tool selection, section expansion
+    ├── EventsState           Filter, archive mode
+    ├── ConfirmState          Two-step confirmation dialogs
+    └── RelayState            Cross-device sync status
+
+Key Modules
+-----------
+- types.py: Dataclasses for UI state (UIState, ManageState, LaunchState, etc.)
+- colors.py: ANSI escape codes for terminal colors and styling
+- rendering.py: Text formatting utilities (ANSI-aware truncation, wrapping)
+- input.py: Cross-platform keyboard handling and text input
+- manage.py: ManageScreen implementation
+- launch.py: LaunchScreen implementation
+- tui.py: Main TUI orchestrator (HcomTUI class)
+
+Public API
+----------
+run_tui(hcom_dir)
+    Entry point to start the TUI application.
+
+CONFIG_DEFAULTS
+    Dict of default configuration values (lazy-loaded).
+
+CONFIG_FIELD_OVERRIDES
+    Field metadata for TUI rendering (type, options, hints).
+
+Usage
+-----
+    from hcom.ui import run_tui
+    exit_code = run_tui(Path.home() / ".hcom")
+
+The TUI uses alternate screen mode and raw terminal input. Exit with Ctrl+D.
+"""
 
 from pathlib import Path
 from .types import Field, Mode, LaunchField, UIState
@@ -27,10 +78,7 @@ from .input import (
     render_text_input,
     IS_WINDOWS,
 )
-
-# UI-specific colors
-FG_CLAUDE_ORANGE = "\033[38;5;214m"  # Light orange for Claude section
-FG_CUSTOM_ENV = "\033[38;5;141m"  # Light purple for Custom Env section
+from .colors import FG_CLAUDE_ORANGE, FG_CUSTOM_ENV
 
 # Parse config defaults lazily to avoid circular import
 # (shared.py imports ui/colors.py, so ui/__init__.py can't import from shared at module level)
@@ -114,6 +162,11 @@ CONFIG_FIELD_OVERRIDES = {
     "HCOM_AUTO_APPROVE": {
         "type": "checkbox",
         "hint": "auto-approve safe hcom commands",
+    },
+    "HCOM_AUTO_SUBSCRIBE": {
+        "type": "multi_cycle",
+        "options": ["collision", "created", "stopped", "blocked"],
+        "hint": "←→ cycle, SPACE to add",
     },
 }
 

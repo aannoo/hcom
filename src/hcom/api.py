@@ -6,11 +6,12 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, cast
 
 # Single source of truth for error type
 from .shared import HcomError, SenderIdentity
 
-__all__ = ["HcomError", "Session", "session", "instances", "launch"]
+__all__ = ["HcomError", "Session", "session", "instances", "launch", "bundle"]
 
 
 @dataclass
@@ -82,7 +83,7 @@ class Session:
         return SenderIdentity(
             kind="instance",
             name=self._name,
-            instance_data=data,
+            instance_data=cast(dict[str, Any], data),
             session_id=data.get("session_id"),
         )
 
@@ -94,6 +95,7 @@ class Session:
         intent: str | None = None,
         reply_to: str | None = None,
         thread: str | None = None,
+        bundle: dict | None = None,
     ) -> list[str]:
         """Send message to instances.
 
@@ -103,6 +105,8 @@ class Session:
             intent: One of 'request', 'inform', 'ack', 'error'.
             reply_to: Event ID to reply to (required for intent='ack').
             thread: Thread name for grouping related messages.
+            bundle: Bundle dict to create and attach. If provided, creates bundle event
+                and appends bundle summary to message.
 
         Returns:
             List of instance names that received the message.
@@ -111,6 +115,17 @@ class Session:
             s.send("@nova hello")
             s.send("@worker- start task", thread="batch-1", intent="request")
             s.send("received", to="luna", intent="ack", reply_to="42")
+
+            # With bundle
+            s.send("@reviewer check this", bundle={
+                "title": "Code review",
+                "description": "Auth module complete",
+                "refs": {
+                    "events": ["123-125"],
+                    "files": ["auth.py"],
+                    "transcript": ["10-15"]
+                }
+            })
         """
         from .core.ops import op_send
         from .core.helpers import validate_intent
@@ -142,6 +157,53 @@ class Session:
 
         if intent == "ack" and "reply_to" not in envelope:
             raise HcomError("Intent 'ack' requires reply_to")
+
+        # Handle bundle creation and attachment
+        if bundle:
+            from .core.bundles import create_bundle_event, validate_bundle
+
+            try:
+                validate_bundle(bundle)
+            except ValueError as e:
+                raise HcomError(str(e))
+
+            # Determine instance name for bundle
+            identity = self._get_identity()
+            if identity.kind == "external":
+                bundle_instance = f"ext_{identity.name}"
+            elif identity.kind == "system":
+                bundle_instance = f"sys_{identity.name}"
+            else:
+                bundle_instance = identity.name
+
+            # Create bundle event
+            bundle_id = create_bundle_event(bundle, instance=bundle_instance, created_by=identity.name)
+            envelope["bundle_id"] = bundle_id
+
+            # Append bundle summary to message
+            refs = bundle.get("refs", {})
+            events = refs.get("events", [])
+            files = refs.get("files", [])
+            transcript_refs = refs.get("transcript", [])
+            extends = bundle.get("extends")
+
+            def _join(vals):
+                return ", ".join(str(v) for v in vals) if vals else ""
+
+            bundle_lines = [
+                f"[Bundle {bundle_id}]",
+                f"Title: {bundle.get('title', '')}",
+                f"Description: {bundle.get('description', '')}",
+                "Refs:",
+                f"  events: {_join(events)}",
+                f"  files: {_join(files)}",
+                f"  transcript: {_join(transcript_refs)}",
+            ]
+            if extends:
+                bundle_lines.append(f"Extends: {extends}")
+
+            sep = "\n\n" if message.strip() else ""
+            message = message.rstrip() + sep + "\n".join(bundle_lines)
 
         return op_send(self._get_identity(), message, envelope=envelope if envelope else None)
 
@@ -209,9 +271,11 @@ class Session:
         SQL fields:
             Common: id, timestamp, type, instance
             Message: msg_from, msg_text, msg_thread, msg_intent,
-                     msg_reply_to, msg_mentions, msg_delivered_to
+                     msg_reply_to, msg_mentions, msg_delivered_to, msg_bundle_id
             Status: status_val, status_context, status_detail
             Lifecycle: life_action, life_by, life_batch_id
+            Bundle: bundle_id, bundle_title, bundle_description, bundle_extends,
+                    bundle_events, bundle_files, bundle_transcript, bundle_created_by
 
         Examples:
             s.events(sql="type='message'")
@@ -413,33 +477,87 @@ class Session:
 
     def transcript(
         self,
-        target: str | None = None,
+        agent: str,
         *,
         last: int = 10,
         full: bool = False,
         range: str | None = None,
+        detailed: bool = False,
     ) -> list[dict]:
-        """Get conversation transcript for an instance.
+        """Get conversation transcript for an instance or timeline across all instances.
 
         Args:
-            target: Instance name (defaults to self).
+            agent: Instance name, or "timeline" for timeline mode (all instances).
             last: Number of recent exchanges to return.
-            full: If True, include tool calls and detailed output.
-            range: Exchange range like "5-10" (1-indexed, inclusive).
+            full: If True, include truncated tool output (use detailed for full output).
+            range: Exchange range like "5-10" (1-indexed, inclusive). Only valid for specific agent.
+            detailed: If True, include full tool calls, results, file edits, errors.
 
         Returns:
-            List of exchange dicts with keys: user, assistant
-            (and tool_calls, tool_results if full=True)
+            If agent is name: List of exchange dicts with keys: user, assistant, position, timestamp
+            If agent is "timeline": List of entry dicts with keys: instance, position,
+                user, action, timestamp, files, command
 
         Examples:
-            s.transcript()                    # own transcript
-            s.transcript("nova", last=5)       # nova's last 5
-            s.transcript("nova", range="1-10") # nova's exchanges 1-10
+            s.transcript("nova")                     # nova's transcript
+            s.transcript("nova", last=5)             # nova's last 5
+            s.transcript("nova", range="1-10")       # nova's exchanges 1-10
+            s.transcript("timeline", last=20)        # timeline across all agents
+            s.transcript("timeline", detailed=True)  # detailed timeline
         """
-        from .core.transcript import get_thread
+        from .core.transcript import get_thread, get_timeline
         from .core.instances import load_instance_position
+        from .core.db import get_db
         import re
 
+        # Timeline mode: agent is "timeline"
+        if agent == "timeline":
+            if range:
+                raise HcomError("range parameter not supported in timeline mode")
+
+            # Get all instances with transcripts
+            conn = get_db()
+            active = conn.execute("""
+                SELECT name, transcript_path, tool FROM instances
+                WHERE transcript_path IS NOT NULL AND transcript_path != ''
+            """).fetchall()
+
+            stopped = conn.execute("""
+                SELECT instance as name,
+                       json_extract(data, '$.snapshot.transcript_path') as transcript_path,
+                       json_extract(data, '$.snapshot.tool') as tool
+                FROM events
+                WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
+                  AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL
+            """).fetchall()
+
+            # Combine, deduping by name
+            seen = set()
+            instances = []
+            for row in active:
+                seen.add(row["name"])
+                instances.append(
+                    {
+                        "name": row["name"],
+                        "transcript_path": row["transcript_path"],
+                        "tool": row["tool"] or "claude",
+                    }
+                )
+            for row in stopped:
+                if row["name"] not in seen:
+                    seen.add(row["name"])
+                    instances.append(
+                        {
+                            "name": row["name"],
+                            "transcript_path": row["transcript_path"],
+                            "tool": row["tool"] or "claude",
+                        }
+                    )
+
+            result = get_timeline(instances, last=last, detailed=detailed or full)
+            return result.get("entries", []) if not result.get("error") else []
+
+        # Single agent mode - agent is required (not None)
         range_tuple = None
         if range:
             match = re.match(r"^(\d+)-(\d+)$", range)
@@ -450,15 +568,9 @@ class Session:
                 raise HcomError(f"Invalid range: {range}")
             range_tuple = (start, end)
 
-        if target:
-            data = load_instance_position(target)
-            if not data:
-                raise HcomError(f"Instance not found: {target}")
-        else:
-            data = load_instance_position(self._name)
-
+        data = load_instance_position(agent)
         if not data:
-            return []
+            raise HcomError(f"Instance not found: {agent}")
 
         transcript_path = data.get("transcript_path")
         if not transcript_path:
@@ -469,7 +581,7 @@ class Session:
             transcript_path,
             last=last,
             tool=tool,
-            detailed=full,
+            detailed=detailed or full,
             range_tuple=range_tuple,
         )
         return result.get("exchanges", []) if not result.get("error") else []
@@ -722,27 +834,29 @@ def launch(
     if tool == "gemini":
         from .tools.gemini.args import resolve_gemini_args, merge_gemini_args
 
-        env_spec = resolve_gemini_args(None, config.gemini_args)
-        cli_spec = resolve_gemini_args(args_list if args_list else None, None)
-        spec = (
-            merge_gemini_args(env_spec, cli_spec) if (cli_spec.clean_tokens or cli_spec.positional_tokens) else env_spec
+        gemini_env_spec = resolve_gemini_args(None, config.gemini_args)
+        gemini_cli_spec = resolve_gemini_args(args_list if args_list else None, None)
+        gemini_spec = (
+            merge_gemini_args(gemini_env_spec, gemini_cli_spec)
+            if (gemini_cli_spec.clean_tokens or gemini_cli_spec.positional_tokens)
+            else gemini_env_spec
         )
         if prompt:
-            spec = spec.update(prompt=prompt)
-        args_list = spec.rebuild_tokens()
+            gemini_spec = gemini_spec.update(prompt=prompt)
+        args_list = gemini_spec.rebuild_tokens()
     elif tool == "codex":
         from .tools.codex.args import resolve_codex_args, merge_codex_args
 
-        env_spec = resolve_codex_args(None, config.codex_args)
-        cli_spec = resolve_codex_args(args_list if args_list else None, None)
-        spec = (
-            merge_codex_args(env_spec, cli_spec)
-            if (cli_spec.clean_tokens or cli_spec.positional_tokens or cli_spec.subcommand)
-            else env_spec
+        codex_env_spec = resolve_codex_args(None, config.codex_args)
+        codex_cli_spec = resolve_codex_args(args_list if args_list else None, None)
+        codex_spec = (
+            merge_codex_args(codex_env_spec, codex_cli_spec)
+            if (codex_cli_spec.clean_tokens or codex_cli_spec.positional_tokens or codex_cli_spec.subcommand)
+            else codex_env_spec
         )
         if prompt:
-            spec = spec.update(prompt=prompt)
-        args_list = spec.rebuild_tokens()
+            codex_spec = codex_spec.update(prompt=prompt)
+        args_list = codex_spec.rebuild_tokens()
 
     return unified_launch(
         tool,
@@ -754,3 +868,207 @@ def launch(
         launcher="api",
         cwd=cwd,
     )
+
+
+def bundle(
+    action: str = "list",
+    *,
+    # Create args
+    title: str | None = None,
+    description: str | None = None,
+    events: list[str] | None = None,
+    files: list[str] | None = None,
+    transcript: list[str] | None = None,
+    extends: str | None = None,
+    data: dict | None = None,
+    # Show/Chain args
+    bundle_id: str | None = None,
+    # List args
+    last: int = 20,
+) -> list[dict] | dict | str:
+    """Manage bundles for context handoff and review workflows.
+
+    Bundles package conversation transcript ranges, event IDs, and file paths
+    into referenceable context units for handoffs between agents.
+
+    Args:
+        action: One of 'list', 'show', 'create', 'chain'.
+        title: Title for new bundle.
+        description: Description for new bundle.
+        events: List of event IDs/ranges for new bundle (e.g., ["123-125", "130"]).
+        files: List of file paths for new bundle.
+        transcript: List of transcript ranges for new bundle (e.g., ["5-10", "15"]).
+        extends: Parent bundle ID for chaining related work.
+        data: Full bundle dict (alternative to separate fields).
+        bundle_id: ID for show/chain actions.
+        last: Limit for list action.
+
+    Returns:
+        list (for 'list', 'chain'): List of bundle dicts.
+        dict (for 'show'): Bundle details.
+        str (for 'create'): New bundle ID.
+
+    Examples:
+        # Create a bundle
+        bundle_id = hcom.bundle("create",
+            title="Code review: auth module",
+            description="Implementation complete, ready for review",
+            events=["123-125", "130"],
+            files=["auth.py", "tests/test_auth.py"],
+            transcript=["10-15"]
+        )
+
+        # List recent bundles
+        bundles = hcom.bundle("list", last=10)
+
+        # Get bundle details
+        details = hcom.bundle("show", bundle_id="abc123")
+
+        # Get bundle chain (all related bundles)
+        chain = hcom.bundle("chain", bundle_id="abc123")
+    """
+    _ensure_init()
+    from .core.db import get_db
+
+    conn = get_db()
+
+    # Helper to find bundle by ID or bundle_id prefix (shared by show and chain)
+    def _get(bid):
+        if bid.isdigit():
+            return conn.execute(
+                "SELECT id, timestamp, data FROM events WHERE type = 'bundle' AND id = ?",
+                (int(bid),),
+            ).fetchone()
+        return conn.execute(
+            """
+            SELECT id, timestamp, data
+            FROM events
+            WHERE type = 'bundle'
+              AND json_extract(data, '$.bundle_id') LIKE ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (f"{bid}%",),
+        ).fetchone()
+
+    if action == "list":
+        rows = conn.execute(
+            """
+            SELECT id, timestamp,
+                   json_extract(data, '$.bundle_id') as bundle_id,
+                   json_extract(data, '$.title') as title,
+                   json_extract(data, '$.description') as description,
+                   json_extract(data, '$.created_by') as created_by,
+                   json_extract(data, '$.refs.events') as events
+            FROM events
+            WHERE type = 'bundle'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (last,),
+        ).fetchall()
+
+        bundles = []
+        for r in rows:
+            bundles.append(
+                {
+                    "id": r["id"],
+                    "timestamp": r["timestamp"],
+                    "bundle_id": r["bundle_id"],
+                    "title": r["title"],
+                    "description": r["description"],
+                    "created_by": r["created_by"],
+                    "events": json.loads(r["events"]) if r["events"] else [],
+                }
+            )
+        return bundles
+
+    if action == "show":
+        if not bundle_id:
+            raise HcomError("bundle_id required for 'show'")
+
+        row = _get(bundle_id)
+        if not row:
+            raise HcomError(f"Bundle not found: {bundle_id}")
+
+        res = json.loads(row["data"]) if row["data"] else {}
+        res["event_id"] = row["id"]
+        res["timestamp"] = row["timestamp"]
+        return res
+
+    if action == "create":
+        from .core.bundles import create_bundle_event, validate_bundle
+        from .core.identity import resolve_identity
+
+        try:
+            identity = resolve_identity()
+        except Exception:
+            raise HcomError("Cannot create bundle without identity (run hcom start)")
+
+        if data:
+            bundle_data = data
+        else:
+            if not title:
+                raise HcomError("Title required")
+            if not description:
+                raise HcomError("Description required")
+
+            bundle_data = {
+                "title": title,
+                "description": description,
+                "refs": {
+                    "events": events or [],
+                    "files": files or [],
+                    "transcript": transcript or [],
+                },
+            }
+            if extends:
+                bundle_data["extends"] = extends
+
+        try:
+            validate_bundle(bundle_data)
+        except ValueError as e:
+            raise HcomError(str(e))
+
+        # Determine instance name
+        if identity.kind == "external":
+            inst = f"ext_{identity.name}"
+        elif identity.kind == "system":
+            inst = f"sys_{identity.name}"
+        else:
+            inst = identity.name
+
+        return create_bundle_event(bundle_data, instance=inst, created_by=identity.name)
+
+    if action == "chain":
+        if not bundle_id:
+            raise HcomError("bundle_id required for 'chain'")
+
+        chain = []
+        curr = _get(bundle_id)
+        if not curr:
+            raise HcomError(f"Bundle not found: {bundle_id}")
+
+        # Track seen bundle_ids to detect cycles
+        seen = set()
+
+        while curr:
+            b_data = json.loads(curr["data"]) if curr["data"] else {}
+            curr_bundle_id = b_data.get("bundle_id")
+
+            # Cycle detection: stop if we've seen this bundle before
+            if curr_bundle_id in seen:
+                break
+            seen.add(curr_bundle_id)
+
+            b_data["event_id"] = curr["id"]
+            b_data["timestamp"] = curr["timestamp"]
+            chain.append(b_data)
+
+            parent = b_data.get("extends")
+            if not parent:
+                break
+            curr = _get(parent)
+
+        return chain
+
+    raise HcomError(f"Unknown action: {action}")

@@ -24,9 +24,11 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
     if ctx is None:
         from_value, argv = parse_name_flag(argv)
 
-    # Check for timeline subcommand
+    # Check for subcommands
     if argv and argv[0] == "timeline":
         return _cmd_transcript_timeline(argv[1:])
+    if argv and argv[0] == "search":
+        return _cmd_transcript_search(argv[1:])
 
     # Validate flags
     if error := validate_flags("transcript", argv):
@@ -83,9 +85,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
             parsed = parse_position_or_range(argv[i + 1])
             if not parsed:
                 print(
-                    format_error(
-                        "--range requires N or N-M format (e.g. --range 5 or --range 5-10)"
-                    ),
+                    format_error("--range requires N or N-M format (e.g. --range 5 or --range 5-10)"),
                     file=sys.stderr,
                 )
                 return 1
@@ -123,9 +123,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
         if not data:
             # Try prefix match
             conn = get_db()
-            row = conn.execute(
-                "SELECT name FROM instances WHERE name LIKE ? LIMIT 1", (f"{target}%",)
-            ).fetchone()
+            row = conn.execute("SELECT name FROM instances WHERE name LIKE ? LIMIT 1", (f"{target}%",)).fetchone()
             if row:
                 target = row["name"]
                 data = load_instance_position(target)
@@ -184,9 +182,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
     if not transcript_path:
         # Check if this is an adhoc instance (no transcript available)
         if tool == "adhoc":
-            print(
-                f"Error: '{instance_name}' is ad-hoc (no transcript)", file=sys.stderr
-            )
+            print(f"Error: '{instance_name}' is ad-hoc (no transcript)", file=sys.stderr)
             print("Ad-hoc agents don't have conversation transcripts", file=sys.stderr)
         else:
             print(f"Error: No transcript path for '{instance_name}'", file=sys.stderr)
@@ -328,3 +324,119 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
         print(format_timeline(timeline_data, full=full_output))
 
     return 0
+
+
+
+
+
+
+
+
+def _cmd_transcript_search(argv: list[str]) -> int:
+    """Search transcripts: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE]
+
+    Scopes:
+      (default)  hcom-tracked transcripts only (alive + stopped agents)
+      --live     only currently alive agents
+      --all      all transcripts on disk (includes non-hcom sessions)
+
+    Uses ripgrep (fast) or grep (fallback).
+    """
+    from ..core.transcript import search_transcripts
+
+    # Parse arguments
+    pattern = None
+    limit = 20
+    json_output = False
+    agent_filter = None  # claude, gemini, codex, or None for all
+    scope = "hcom"  # default: hcom-tracked only
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--json":
+            json_output = True
+        elif arg == "--live":
+            scope = "live"
+        elif arg == "--all":
+            scope = "all"
+        elif arg == "--limit" and i + 1 < len(argv):
+            try:
+                limit = int(argv[i + 1])
+                if limit <= 0:
+                    print(format_error("--limit must be positive"), file=sys.stderr)
+                    return 1
+                i += 1
+            except ValueError:
+                print(format_error("--limit requires a number"), file=sys.stderr)
+                return 1
+        elif arg == "--agent" and i + 1 < len(argv):
+            agent_filter = argv[i + 1].lower()
+            if agent_filter not in ("claude", "gemini", "codex"):
+                print(format_error("--agent must be claude, gemini, or codex"), file=sys.stderr)
+                return 1
+            i += 1
+        elif arg.startswith("-"):
+            print(format_error(f"Unknown flag: {arg}"), file=sys.stderr)
+            return 1
+        elif pattern is None:
+            pattern = arg
+        i += 1
+
+    if not pattern:
+        print(format_error("Pattern required"), file=sys.stderr)
+        print(
+            'Usage: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE]',
+            file=sys.stderr,
+        )
+        return 1
+
+    # Use core search function
+    result = search_transcripts(
+        pattern, limit=limit, agent_filter=agent_filter, scope=scope
+    )
+
+    if result.get("error"):
+        print(f"Search error: {result['error']}", file=sys.stderr)
+        return 1
+
+    results = result.get("results", [])
+    # scope might be updated by search (e.g. valid fallback) but we use input scope for label mostly
+    # Actually core search logic returns results directly.
+
+    # Output
+    if json_output:
+        # Truncate text for JSON output
+        for r in results:
+            if len(r["text"]) > 200:
+                r["text"] = r["text"][:200] + "..."
+        print(json.dumps({"count": len(results), "results": results, "scope": scope}, indent=2))
+    else:
+        if not results:
+            print(f"No matches for '{pattern}'")
+        else:
+            scope_label = {"live": " (live agents)", "hcom": " (hcom-tracked)", "all": ""}[scope]
+            print(f"Found {len(results)} matches{scope_label}:\n")
+            for r in results:
+                # Truncate path for display
+                path = r["path"]
+                if len(path) > 60:
+                    path = "..." + path[-57:]
+                # Show hcom agent name if known
+                if "hcom_name" in r:
+                    agent_str = f"{r['agent']}:{r['hcom_name']}"
+                    if r.get("hcom_session") and r["hcom_session"] != "current":
+                        agent_str += f"@{r['hcom_session']}"
+                else:
+                    agent_str = r["agent"]
+                print(f"[{agent_str}] {path}:{r['line']}")
+                # Show snippet, truncate consistently at display time
+                snippet = r["text"].replace("\n", " ")
+                if len(snippet) > 100:
+                    snippet = snippet[:100] + "..."
+                print(f"    {snippet}\n")
+
+    return 0
+
+
+

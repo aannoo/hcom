@@ -1,7 +1,7 @@
 """Admin commands for HCOM - re-exports from focused modules for backward compatibility"""
 
 # Re-export all cmd_* functions for backward compatibility
-from .events import cmd_events, PRESET_SUBSCRIPTIONS
+from .events import cmd_events
 from .query import cmd_list, cmd_archive, cmd_status
 from .relay import cmd_relay, REQUIRED_RELAY_VERSION
 from .transcript import cmd_transcript
@@ -18,7 +18,6 @@ from .config_cmd import cmd_config
 __all__ = [
     # Events
     "cmd_events",
-    "PRESET_SUBSCRIPTIONS",
     # Query
     "cmd_list",
     "cmd_archive",

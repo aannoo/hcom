@@ -278,10 +278,10 @@ Always require approval:
 Values: 1, true, yes, on (enabled) | 0, false, no, off, "" (disabled)
 """
 
-    elif key == "HCOM_DEFAULT_SUBSCRIPTIONS":
-        return """HCOM_DEFAULT_SUBSCRIPTIONS - Default event subscriptions for new instances
+    elif key == "HCOM_AUTO_SUBSCRIBE":
+        return """HCOM_AUTO_SUBSCRIBE - Auto-subscribe event presets for new instances
 
-Current value: Use 'hcom config default_subscriptions' to see current value
+Current value: Use 'hcom config auto_subscribe' to see current value
 Default: collision
 
 Purpose:
@@ -289,8 +289,8 @@ Purpose:
   when an instance registers with 'hcom start'.
 
 Usage:
-  hcom config default_subscriptions "collision,created"
-  hcom config default_subscriptions ""   # No auto-subscriptions
+  hcom config auto_subscribe "collision,created"
+  hcom config auto_subscribe ""   # No auto-subscribe
 
 Available presets:
   collision    - Alert when agents edit same file (within 20s window)

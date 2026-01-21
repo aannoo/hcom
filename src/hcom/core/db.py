@@ -15,7 +15,7 @@ from ..shared import parse_iso_timestamp
 
 # Database configuration
 DB_FILE = "hcom.db"
-SCHEMA_VERSION = 14  # Add name_announced column
+SCHEMA_VERSION = 15  # Add bundle fields to events_v
 _thread_local = threading.local()  # Per-thread connection storage
 _write_lock = threading.Lock()  # Protect concurrent writes
 
@@ -473,11 +473,21 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             json_extract(data, '$.sender_kind') as msg_sender_kind,
             json_extract(data, '$.delivered_to') as msg_delivered_to,
             json_extract(data, '$.mentions') as msg_mentions,
+            json_extract(data, '$.bundle_id') as msg_bundle_id,
             -- message envelope fields
             json_extract(data, '$.intent') as msg_intent,
             json_extract(data, '$.thread') as msg_thread,
             json_extract(data, '$.reply_to') as msg_reply_to,
             json_extract(data, '$.reply_to_local') as msg_reply_to_local,
+            -- bundle fields
+            json_extract(data, '$.bundle_id') as bundle_id,
+            json_extract(data, '$.title') as bundle_title,
+            json_extract(data, '$.description') as bundle_description,
+            json_extract(data, '$.extends') as bundle_extends,
+            json_extract(data, '$.refs.events') as bundle_events,
+            json_extract(data, '$.refs.files') as bundle_files,
+            json_extract(data, '$.refs.transcript') as bundle_transcript,
+            json_extract(data, '$.created_by') as bundle_created_by,
             -- status fields
             json_extract(data, '$.status') as status_val,
             json_extract(data, '$.context') as status_context,

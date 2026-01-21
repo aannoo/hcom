@@ -28,7 +28,6 @@ from .settings import (
     GEMINI_HOOK_CONFIGS,
     GEMINI_HOOK_TYPES,
 )
-
 __all__ = [
     # Hook handlers
     "handle_gemini_hook",

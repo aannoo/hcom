@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from .paths import hcom_path, LOGS_DIR
 
 _LOG_FILE = "hcom.log"
 _MAX_BYTES = 8_000_000  # 8MB
-_BACKUPS = 3
+_BACKUPS = int(os.environ.get("HCOM_LOG_BACKUPS", 3))
 
 
 def _ts() -> str:

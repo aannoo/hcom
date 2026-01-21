@@ -1,14 +1,28 @@
 """Gemini CLI hook handlers for hcom.
 
-Handles Gemini-specific hooks:
-- SessionStart: Identity setup, set status to idle
-- BeforeAgent: Set status to active, deliver messages
-- AfterAgent: Set status to idle (safe for PTY injection)
-- BeforeTool: Set status to active with tool name
-- AfterTool: Deliver messages after tool execution
-- PreCompress: Reset name_announced for re-bootstrap after compression
-- Notification: Set status to blocked on approval prompts
-- SessionEnd: Mark instance inactive on exit
+Hook handlers called by Gemini CLI at various lifecycle points.
+Each handler reads JSON from stdin (hook payload) and may output
+JSON to stdout (hook response with additionalContext).
+
+Hook Lifecycle:
+    SessionStart → BeforeAgent → [BeforeTool → AfterTool]* → AfterAgent → SessionEnd
+
+Hooks and Responsibilities:
+    SessionStart: Bind session to hcom identity, set terminal title
+    BeforeAgent: Inject bootstrap on first prompt, deliver pending messages
+    AfterAgent: Set status to listening (idle), notify subscribers
+    BeforeTool: Track tool execution status (tool:X context)
+    AfterTool: Deliver messages, handle vanilla instance binding
+    Notification: Track approval prompts (blocked status)
+    SessionEnd: Stop instance, log exit reason
+
+Identity Resolution:
+    - HCOM-launched: HCOM_PROCESS_ID env var → process binding → instance
+    - Vanilla: transcript search for [HCOM:BIND:name] marker after hcom start
+
+Message Delivery:
+    Messages are delivered via additionalContext in hook response JSON.
+    Gemini displays this to the model as system context.
 """
 
 import os

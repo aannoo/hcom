@@ -1,8 +1,66 @@
-"""Unified launcher for Claude, Gemini, and Codex.
+"""Unified launcher for Claude, Gemini, and Codex AI CLI tools.
 
-Goal: feature parity across API, TUI, and CLI where possible.
-Maintains existing CLI UX (hcom N, hcom N gemini, hcom N codex) while ensuring
-launch batch tracking works consistently via life events and ready events.
+This module provides a single entry point for launching all supported AI tools
+with consistent batch tracking, environment setup, and error handling.
+
+Architecture Overview
+---------------------
+The launcher supports three tools with varying launch modes:
+
+    ┌─────────────┬───────────────┬──────────────┬────────────────┐
+    │   Tool      │  Interactive  │  Background  │  PTY Required  │
+    ├─────────────┼───────────────┼──────────────┼────────────────┤
+    │ claude      │     ✓         │     ✓        │      No        │
+    │ claude-pty  │     ✓         │     ✗        │      Yes       │
+    │ gemini      │     ✓         │     ✓*       │      Yes       │
+    │ codex       │     ✓         │     ✓*       │      Yes       │
+    └─────────────┴───────────────┴──────────────┴────────────────┘
+    * Gemini/Codex background mode routes through PTY wrapper
+
+Launch Flow
+-----------
+1. Validation: tool exists, count within limits, platform checks
+2. Hook setup: verify-first pattern (read-only check, write if needed)
+3. Environment: build from config.env + caller overrides + HCOM_* vars
+4. Instance creation: pre-register with process binding for hook identity
+5. Tool launch: dispatch to tool-specific launcher (terminal/PTY)
+6. Event logging: batch_launched life event for TUI/API tracking
+
+Instance Identity Binding
+-------------------------
+Before spawning, each instance gets:
+- Unique 4-char CVCV name (e.g., "luna")
+- HCOM_PROCESS_ID env var for hook identity resolution
+- process_binding DB row mapping process_id → instance_name
+
+When hooks fire, they use HCOM_PROCESS_ID to find the instance name,
+enabling proper event attribution and message routing.
+
+Example Usage
+-------------
+    from hcom.launcher import launch
+
+    # Launch 2 Claude instances with custom args
+    result = launch("claude", 2, ["--model", "sonnet"], tag="review")
+
+    # Launch Gemini in current terminal
+    result = launch("gemini", 1, run_here=True)
+
+    # Launch Claude in background (headless)
+    result = launch("claude", 1, ["-p", "fix tests"], background=True)
+
+Return Value
+------------
+    {
+        "tool": str,              # Normalized tool name
+        "batch_id": str,          # UUID prefix for batch tracking
+        "launched": int,          # Successfully launched count
+        "failed": int,            # Failed launch count
+        "background": bool,       # Whether headless mode was used
+        "log_files": list[str],   # Background mode log file paths
+        "handles": list[dict],    # Per-instance metadata
+        "errors": list[dict],     # Error details for failed launches
+    }
 """
 
 from __future__ import annotations
@@ -16,6 +74,22 @@ LaunchTool = Literal["claude", "claude-pty", "gemini", "codex"]
 
 
 def _normalize_tool(tool: str, *, pty: bool | None) -> LaunchTool:
+    """Normalize tool name to canonical LaunchTool type.
+
+    Handles the special case where "claude" + pty=True becomes "claude-pty".
+    Claude has two launch modes: native hooks (claude) and PTY wrapper (claude-pty).
+    Gemini and Codex always use PTY.
+
+    Args:
+        tool: Raw tool name from caller ("claude", "gemini", "codex")
+        pty: If True and tool is "claude", use PTY mode instead of native hooks
+
+    Returns:
+        Canonical LaunchTool literal: "claude", "claude-pty", "gemini", or "codex"
+
+    Raises:
+        ValueError: If tool is not a recognized name
+    """
     if tool == "claude" and pty:
         return "claude-pty"
     if tool in ("claude", "claude-pty", "gemini", "codex"):
@@ -24,19 +98,29 @@ def _normalize_tool(tool: str, *, pty: bool | None) -> LaunchTool:
 
 
 def _default_max_count(tool: LaunchTool) -> int:
-    # Keep existing CLI limits for Gemini/Codex.
-    # Claude native supports 1-100; PTY mode is intentionally capped.
+    """Get maximum instance count for a tool.
+
+    Args:
+        tool: Normalized tool name
+
+    Returns:
+        Maximum allowed instance count (currently 100 for all tools)
+    """
+    # Arbitrary limit - all tools support up to 100
     match tool:
-        case "claude":
+        case "claude" | "claude-pty" | "gemini" | "codex":
             return 100
-        case "claude-pty":
-            return 20
-        case "gemini" | "codex":
-            return 10
 
 
 def _default_tag() -> str:
-    """Get configured tag from env/config.env/defaults."""
+    """Get default tag from HCOM_TAG env var or config.env file.
+
+    Tags create named groups of instances (e.g., tag="review" creates "review-luna").
+    Used for batch operations and @tag mentions in messages.
+
+    Returns:
+        Tag string if configured, empty string otherwise
+    """
     try:
         from .core.config import get_config
 
@@ -46,6 +130,17 @@ def _default_tag() -> str:
 
 
 def _resolve_launcher_name(explicit: str | None) -> str:
+    """Resolve the name of the entity initiating the launch.
+
+    Used for audit logging in life events ("launched by X").
+    Falls back to "api" if identity cannot be determined.
+
+    Args:
+        explicit: Caller-provided launcher name (takes precedence)
+
+    Returns:
+        Launcher identity for event logging
+    """
     if explicit:
         return explicit
     try:
@@ -57,7 +152,15 @@ def _resolve_launcher_name(explicit: str | None) -> str:
 
 
 def _is_inside_ai_tool() -> bool:
-    """Detect if running inside Claude Code, Gemini CLI, or Codex."""
+    """Detect if running inside Claude Code, Gemini CLI, or Codex.
+
+    Used to determine terminal launch strategy:
+    - Inside AI tool: Always launch in new window (don't hijack AI session)
+    - Outside: May run in current terminal based on other factors
+
+    Returns:
+        True if CLAUDECODE=1, GEMINI_CLI=1, or Codex env vars present
+    """
     from .shared import is_inside_ai_tool
 
     return is_inside_ai_tool()
@@ -102,10 +205,27 @@ def will_run_in_current_terminal(
 
 
 def _parse_codex_resume(args: list[str]) -> tuple[list[str], str | None, str | None]:
-    """Parse codex resume/fork command to extract session_id and subcommand.
+    """Parse codex resume/fork subcommand to extract thread ID.
 
-    Handles: codex resume <id>, codex fork <id>, codex --flags resume <id>, etc.
-    Returns: (args, session_id or None, subcommand or None)
+    Codex supports resuming or forking previous sessions:
+        codex resume <thread-id>  - Resume existing thread
+        codex fork <thread-id>    - Fork from existing thread
+        codex --flags resume <id> - Flags can appear before subcommand
+
+    Currently requires explicit thread-id (no --last or interactive picker).
+    TODO: investigate if interactive picker could work via PTY.
+
+    Args:
+        args: Codex CLI arguments list
+
+    Returns:
+        Tuple of (args, thread_id, subcommand):
+        - args: Original args (unchanged)
+        - thread_id: Thread ID if resume subcommand found, None for fork or no subcommand
+        - subcommand: "resume" or "fork" if found, None otherwise
+
+    Raises:
+        ValueError: If resume/fork used without explicit thread-id or with --last
     """
     if not args:
         return [], None, None
@@ -139,9 +259,20 @@ def _parse_codex_resume(args: list[str]) -> tuple[list[str], str | None, str | N
 
 
 def _get_system_prompt_path(tool: str) -> "Path":
-    """Get stable path for system prompt file.
+    """Get filesystem path for tool-specific system prompt file.
+
+    Gemini and Codex don't have a --system-prompt flag like Claude does.
+    Instead they read system prompts from files:
+    - Gemini: GEMINI_SYSTEM_MD env var pointing to markdown file
+    - Codex: -c developer_instructions=<content> flag
 
     Path: ~/.hcom/system-prompts/{tool}.md
+
+    Args:
+        tool: Tool name ("gemini" or "codex")
+
+    Returns:
+        Path object for the system prompt file
     """
     from .core.paths import hcom_path
 
@@ -152,10 +283,16 @@ def _get_system_prompt_path(tool: str) -> "Path":
 
 
 def _write_system_prompt_file(system_prompt: str, tool: str) -> str:
-    """Write system prompt to persistent file, return path.
+    """Write system prompt to file for Gemini/Codex (they lack --system-prompt flag).
 
     Only rewrites if content differs (avoids unnecessary disk writes).
-    Files persist across restarts - no more temp files lost on restart.
+
+    Args:
+        system_prompt: Full system prompt text
+        tool: Tool name for filename ("gemini" or "codex")
+
+    Returns:
+        Absolute path to the written file
     """
     filepath = _get_system_prompt_path(tool)
 
@@ -193,7 +330,7 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
         try:
             if setup_claude_hooks(include_permissions=include_permissions):
                 return True, None
-            return False, f"Failed to setup Claude hooks. Run: hcom hooks add claude"
+            return False, "Failed to setup Claude hooks. Run: hcom hooks add claude"
         except Exception as e:
             return False, f"Failed to setup Claude hooks: {e}. Run: hcom hooks add claude"
 
@@ -210,7 +347,10 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
         if version is not None and version < GEMINI_MIN_VERSION:
             min_str = ".".join(map(str, GEMINI_MIN_VERSION))
             cur_str = ".".join(map(str, version))
-            return False, f"Gemini CLI {cur_str} is too old (requires {min_str}+). Update: npm i -g @google/gemini-cli@latest"
+            return (
+                False,
+                f"Gemini CLI {cur_str} is too old (requires {min_str}+). Update: npm i -g @google/gemini-cli@latest",
+            )
 
         try:
             if verify_gemini_hooks_installed(check_permissions=include_permissions):
@@ -222,7 +362,7 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
         try:
             if setup_gemini_hooks(include_permissions=include_permissions):
                 return True, None
-            return False, f"Failed to setup Gemini hooks. Run: hcom hooks add gemini"
+            return False, "Failed to setup Gemini hooks. Run: hcom hooks add gemini"
         except Exception as e:
             return False, f"Failed to setup Gemini hooks: {e}. Run: hcom hooks add gemini"
 
@@ -239,7 +379,7 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
         try:
             if setup_codex_hooks(include_permissions=include_permissions):
                 return True, None
-            return False, f"Failed to setup Codex hooks. Run: hcom hooks add codex"
+            return False, "Failed to setup Codex hooks. Run: hcom hooks add codex"
         except Exception as e:
             return False, f"Failed to setup Codex hooks: {e}. Run: hcom hooks add codex"
 
@@ -252,7 +392,7 @@ def launch(
     args: list[str] | None = None,
     *,
     tag: str | None = None,
-    prompt: str | None = None,
+    prompt: str | None = None,  # Reserved for future use
     system_prompt: str | None = None,
     pty: bool | None = None,
     background: bool = False,
@@ -261,12 +401,57 @@ def launch(
     launcher: str | None = None,
     run_here: bool | None = None,
 ) -> dict[str, Any]:
-    """Launch tool instances with consistent batch tracking.
+    """Launch one or more AI tool instances with consistent tracking.
 
-    Returns a dict compatible with the existing Claude-only launcher:
-        {"batch_id", "launched", "failed", "background", "log_files"}
-    Plus additional fields:
-        {"tool", "handles"}
+    This is the unified entry point for launching Claude, Gemini, and Codex
+    instances. It handles:
+    - Validation (tool exists, count within limits, platform compatibility)
+    - Hook installation verification and auto-setup
+    - Environment configuration from config.env and caller overrides
+    - Instance pre-registration with process bindings for identity
+    - Tool-specific launch dispatch (terminal command or PTY wrapper)
+    - Batch event logging for TUI and API tracking
+
+    Args:
+        tool: Tool to launch ("claude", "gemini", "codex")
+        count: Number of instances to launch (1-100 depending on tool)
+        args: CLI arguments to pass to the tool (e.g., ["--model", "sonnet"])
+        tag: Group tag for instances (creates "{tag}-{name}" style names)
+        prompt: Reserved for future use (initial prompt injection)
+        system_prompt: Custom system prompt (Gemini: env var, Codex: -c flag)
+        pty: If True, use PTY mode for Claude instead of native hooks
+        background: If True, run headless (Claude only, spawns detached process)
+        cwd: Working directory for instances (defaults to current dir)
+        env: Additional environment variables to set
+        launcher: Name of entity initiating launch (for audit logging)
+        run_here: Override terminal decision:
+            - True: Run in current terminal (blocks)
+            - False: Launch in new terminal window
+            - None: Auto-decide based on context
+
+    Returns:
+        Dictionary with launch results:
+        - tool: Normalized tool name (e.g., "claude-pty")
+        - batch_id: UUID prefix for batch tracking
+        - launched: Number of successfully launched instances
+        - failed: Number of failed launch attempts
+        - background: Whether headless mode was used
+        - log_files: List of log file paths (background mode only)
+        - handles: List of per-instance metadata dicts
+        - errors: List of error detail dicts for failures
+
+    Raises:
+        HcomError: On validation failure, hook setup failure, or all launches failed
+
+    Example:
+        >>> result = launch("claude", 2, ["--model", "sonnet"], tag="review")
+        >>> print(f"Launched {result['launched']}/{2} instances")
+        Launched 2/2 instances
+
+    Notes:
+        - PTY modes (claude-pty, gemini, codex) require Unix (macOS/Linux)
+        - Background mode only supported for Claude currently
+        - Each instance gets a unique 4-char CVCV name (e.g., "luna")
     """
     import os
     import uuid
@@ -374,22 +559,22 @@ def launch(
         if normalized in ("claude", "claude-pty"):
             from .tools.claude.args import resolve_claude_args
 
-            spec = resolve_claude_args(args, None)
-            validation_errors = list(spec.errors or ())
+            claude_spec = resolve_claude_args(args, None)
+            validation_errors = list(claude_spec.errors or ())
         elif normalized == "gemini":
-            from .tools.gemini.args import resolve_gemini_args, validate_conflicts
+            from .tools.gemini.args import resolve_gemini_args, validate_conflicts as validate_gemini_conflicts
 
-            spec = resolve_gemini_args(args, None)
-            validation_errors = list(spec.errors or ())
+            gemini_spec = resolve_gemini_args(args, None)
+            validation_errors = list(gemini_spec.errors or ())
             # Check for headless mode rejection and other conflicts
-            validation_errors.extend(validate_conflicts(spec))
+            validation_errors.extend(validate_gemini_conflicts(gemini_spec))
         elif normalized == "codex":
-            from .tools.codex.args import resolve_codex_args, validate_conflicts
+            from .tools.codex.args import resolve_codex_args, validate_conflicts as validate_codex_conflicts
 
-            spec = resolve_codex_args(codex_args or args, None)
-            validation_errors = list(spec.errors or ())
+            codex_spec = resolve_codex_args(codex_args or args, None)
+            validation_errors = list(codex_spec.errors or ())
             # Check for exec mode rejection and other conflicts
-            validation_errors.extend(validate_conflicts(spec))
+            validation_errors.extend(validate_codex_conflicts(codex_spec))
 
         if validation_errors:
             tip = f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom validation and let {normalized.replace('-pty', '')} handle args."
@@ -450,6 +635,16 @@ def launch(
 
         tool_type = "claude" if normalized in ("claude", "claude-pty") else normalized
         try:
+            from .core.log import log_info
+
+            log_info(
+                "launcher",
+                "launcher.create_placeholder",
+                instance_name=instance_name,
+                process_id=process_id,
+                tool=tool_type,
+                args=list(args) if args else [],
+            )
             initialize_instance_in_position_file(
                 instance_name,
                 session_id=None,
@@ -457,6 +652,13 @@ def launch(
                 background=background,
             )
             set_process_binding(process_id, None, instance_name)
+            log_info(
+                "launcher",
+                "launcher.process_binding_set",
+                process_id=process_id,
+                instance_name=instance_name,
+                session_id=None,
+            )
             if effective_tag:
                 try:
                     update_instance_position(instance_name, {"tag": effective_tag})
@@ -531,7 +733,7 @@ def launch(
                             _cleanup_instance(instance_name, process_id)
 
                 case "claude-pty":
-                    from .pty.claude import launch_claude_pty
+                    from .pty.pty_handler import launch_pty
                     from .tools.claude.args import resolve_claude_args
 
                     # Strip default prompt for PTY mode (contactable via inject, doesn't need kickstart)
@@ -544,12 +746,13 @@ def launch(
                         pass
 
                     effective_run_here = will_run_in_current_terminal(count, False, run_here)
-                    name = launch_claude_pty(
+                    name = launch_pty(
+                        "claude",
                         working_dir,
                         instance_env,
                         instance_name,
+                        list(args or []),
                         tag=effective_tag,
-                        claude_args=args,
                         run_here=effective_run_here,
                     )
                     if name:
@@ -559,6 +762,8 @@ def launch(
                         _cleanup_instance(instance_name, process_id)
 
                 case "gemini":
+                    from .pty.pty_handler import launch_pty
+
                     effective_run_here = will_run_in_current_terminal(count, False, run_here)
 
                     try:
@@ -566,14 +771,13 @@ def launch(
                     except Exception:
                         pass
 
-                    from .pty.gemini import launch_gemini_pty
-
-                    name = launch_gemini_pty(
+                    name = launch_pty(
+                        "gemini",
                         working_dir,
                         instance_env,
                         instance_name,
+                        list(args or []),
                         tag=effective_tag,
-                        gemini_args=list(args or []),
                         run_here=effective_run_here,
                     )
                     if name:
@@ -583,6 +787,8 @@ def launch(
                         _cleanup_instance(instance_name, process_id)
 
                 case "codex":
+                    from .pty.pty_handler import launch_pty
+
                     # Bootstrap delivered via developer_instructions at launch - mark announced
                     try:
                         update_instance_position(instance_name, {"name_announced": True})
@@ -606,16 +812,21 @@ def launch(
                     except Exception:
                         pass
 
-                    from .pty.codex import launch_codex_pty
-
                     effective_run_here = will_run_in_current_terminal(count, False, run_here)
-                    name = launch_codex_pty(
+                    # Codex uses custom runner for transcript watcher + resume handling
+                    resume_kwargs = f"resume_thread_id={repr(codex_resume_thread_id)}" if codex_resume_thread_id else ""
+                    name = launch_pty(
+                        "codex",
                         working_dir,
                         instance_env,
                         instance_name,
-                        codex_args=effective_codex_args,
-                        resume_thread_id=codex_resume_thread_id,
+                        effective_codex_args,
+                        tag=effective_tag,
                         run_here=effective_run_here,
+                        extra_env={"HCOM_CODEX_SANDBOX_MODE": instance_env.get("HCOM_CODEX_SANDBOX_MODE", "workspace")},
+                        runner_module="hcom.pty.codex",
+                        runner_function="run_codex_with_hcom",
+                        runner_extra_kwargs=resume_kwargs,
                     )
                     if name:
                         launched += 1

@@ -1,6 +1,28 @@
 """Codex CLI hook handlers for hcom.
 
-Handles notify hook callbacks from Codex to update instance state.
+Codex has a single hook type: notify. Called via config.toml setting:
+    notify = ["hcom", "codex-notify"]
+
+The notify hook receives JSON payload as argv[2] (not stdin like Gemini):
+    {
+        "type": "agent-turn-complete",
+        "thread-id": "uuid",
+        "turn-id": "12345",
+        "cwd": "/path/to/project",
+        "input-messages": ["user prompt"],
+        "last-assistant-message": "response text"
+    }
+
+Key Functions:
+    handle_codex_hook: Entry point dispatcher (only codex-notify supported)
+    handle_notify: Process turn completion, update status to listening
+
+Identity Resolution:
+    - HCOM-launched: HCOM_PROCESS_ID env var → process binding → instance
+    - Vanilla: Search transcript for [HCOM:BIND:name] marker
+
+Note: Unlike Gemini/Claude, message delivery is NOT done in hooks.
+Codex uses PTY injection triggered by TranscriptWatcher detecting idle.
 """
 
 import os

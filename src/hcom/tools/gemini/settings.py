@@ -1,9 +1,26 @@
 """Gemini CLI hook settings management.
 
-Mirrors the robust patterns from hooks/settings.py for Claude Code.
+Manages ~/.gemini/settings.json for hcom hook integration:
+- Version detection (requires Gemini CLI v0.24.0+)
+- Hook installation/removal with atomic writes
+- Permission patterns for auto-approving safe hcom commands
+- Verification of correct hook configuration
 
-Requirements:
-- Gemini CLI v0.24.0+ (hooks.enabled setting required)
+Key Functions:
+    setup_gemini_hooks: Install all hcom hooks into settings.json
+    remove_gemini_hooks: Clean removal of hcom hooks only
+    verify_gemini_hooks_installed: Check hooks are correctly configured
+    ensure_hooks_enabled: Set hooks.enabled=true (v0.24.0+ requirement)
+
+Settings Structure (v0.24.0+):
+    {
+        "tools": {"enableHooks": true, "allowed": [...]},
+        "hooks": {
+            "enabled": true,
+            "SessionStart": [{"matcher": "*", "hooks": [...]}],
+            ...
+        }
+    }
 """
 
 from __future__ import annotations

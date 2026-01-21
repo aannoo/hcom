@@ -216,7 +216,8 @@ Subscribe to events:
   s.wait()  # block until event matches
 
 Read transcripts:
-  exchanges = s.transcript('luna', last=5, full=True)
+  exchanges = s.transcript('luna', last=5, detailed=True)    # specific agent
+  timeline = s.transcript('timeline', last=20)               # all agents (timeline)
 
 Check messages:
   for msg in s.messages():
@@ -277,7 +278,7 @@ Precedence: defaults < config.env < shell environment variables"""
         "HCOM_RELAY_TOKEN",
         "HCOM_RELAY_ENABLED",
         "HCOM_AUTO_APPROVE",
-        "HCOM_DEFAULT_SUBSCRIPTIONS",
+        "HCOM_AUTO_SUBSCRIBE",
         "HCOM_NAME_EXPORT",
     ]
 
@@ -349,7 +350,7 @@ def _generate_api_docs() -> str:
     lines = []
 
     # Module-level functions
-    for name in ["session", "instances", "launch"]:
+    for name in ["session", "instances", "launch", "bundle"]:
         func = getattr(hcom, name, None)
         if func and func.__doc__:
             lines.append(f"## hcom.{name}()\n")
