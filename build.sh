@@ -45,15 +45,13 @@ fi
 
 # --- Full build mode ---
 
-# Version sync check: all 4 version sources must match
+# Version sync check: all 3 version sources must match
 CARGO_VER=$(grep '^version' "$SCRIPT_DIR/src/native/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 PY_VER=$(grep '^__version__' "$SCRIPT_DIR/src/hcom/shared.py" | sed 's/.*"\(.*\)".*/\1/')
 TOML_VER=$(grep '^version' "$SCRIPT_DIR/pyproject.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-FALLBACK_VER=$(grep '^version' "$SCRIPT_DIR/pyproject-fallback.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null)
 MISMATCH=""
 [[ "$CARGO_VER" != "$PY_VER" ]] && MISMATCH="Cargo.toml=$CARGO_VER shared.py=$PY_VER"
 [[ "$CARGO_VER" != "$TOML_VER" ]] && MISMATCH="${MISMATCH:+$MISMATCH, }pyproject.toml=$TOML_VER"
-[[ -n "$FALLBACK_VER" && "$CARGO_VER" != "$FALLBACK_VER" ]] && MISMATCH="${MISMATCH:+$MISMATCH, }pyproject-fallback.toml=$FALLBACK_VER"
 if [[ -n "$MISMATCH" ]]; then
     echo "[build] ERROR: Version mismatch! $MISMATCH (expected $CARGO_VER)"
     echo "[build] Sync all version files before building."

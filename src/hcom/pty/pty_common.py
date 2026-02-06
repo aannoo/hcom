@@ -14,9 +14,11 @@ from ..shared import termux_shebang_bypass, TERMUX_NODE_PATH
 
 # ==================== Ready Patterns ====================
 
-# Ready patterns for PTY detection (visible when idle, hidden when user types)
+# Ready patterns for PTY detection (visible when tool TUI has loaded)
 GEMINI_READY_PATTERN = b"Type your message"
-CLAUDE_CODEX_READY_PATTERN = b"? for shortcuts"  # Both Claude and Codex use this
+CLAUDE_READY_PATTERN = b"? for shortcuts"
+CODEX_READY_PATTERN = b"\xe2\x80\xba "  # › (U+203A) prompt — always visible, unlike "? for shortcuts" which is dropped in narrow terminals
+CLAUDE_CODEX_READY_PATTERN = CLAUDE_READY_PATTERN  # Back-compat alias
 
 
 # ==================== Terminal Title ====================

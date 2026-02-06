@@ -490,8 +490,8 @@ impl Proxy {
         use std::str::FromStr;
 
         let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
-            Ok(Tool::Claude) => Duration::from_secs(5), // Start after 5s even if no ready pattern
-            _ => Duration::from_secs(60), // Other tools: wait longer for ready
+            Ok(Tool::Claude) | Ok(Tool::Codex) => Duration::from_secs(5), // Ready pattern unreliable (Claude: accept-edits, Codex: narrow terminals)
+            _ => Duration::from_secs(60), // Gemini: ready pattern always visible
         };
 
         loop {
@@ -549,6 +549,18 @@ impl Proxy {
                     // Timeout - still update delivery state for time-based checks
                     if ready_signaled {
                         self.update_delivery_state();
+                    }
+                    // Start delivery thread on timeout if startup_time exceeded
+                    // (child may produce no output after initial render, so the
+                    // child-output path at line ~621 may never run)
+                    if !delivery_started && startup_time.elapsed() > delivery_start_timeout {
+                        self.screen.dump_screen(
+                            &self.config.tool,
+                            self.inject_server.port(),
+                            "Starting delivery thread (poll timeout)",
+                        );
+                        self.start_delivery_thread()?;
+                        delivery_started = true;
                     }
                     // Check runtime debug flag toggle
                     self.screen.check_debug_flag();

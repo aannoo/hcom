@@ -363,6 +363,14 @@ def _dispatch_with_context(
                      total_ms=round(total_ms, 2), context="subagent")
             return HookResult.success()
 
+        if hook_type == HOOK_NOTIFY:
+            total_ms = (_time.perf_counter() - dispatch_start) * 1000
+            log_info("hooks", "dispatch.timing", hook=hook_type,
+                     init_ms=round(init_ms, 2), session_ms=round(session_ms, 2),
+                     subagent_check_ms=round(subagent_check_ms, 2),
+                     total_ms=round(total_ms, 2), context="subagent")
+            return HookResult.success()
+
         if hook_type in (HOOK_PRE, HOOK_POST) and tool_name == "Bash":
             tool_input = payload.tool_input
             command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""

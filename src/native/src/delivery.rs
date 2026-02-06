@@ -217,17 +217,18 @@ impl ToolConfig {
 
     /// Get config for Codex.
     ///
-    /// - `require_ready_prompt=true`: "? for shortcuts" pattern disappears when user types.
-    ///   Same as Gemini: pattern visibility = prompt is empty, no separate check needed.
+    /// - `require_ready_prompt=false`: "? for shortcuts" is dropped by Codex's responsive
+    ///   footer in narrow terminals, making it unreliable as a gate signal.
+    /// - `require_prompt_empty=true`: Uses vt100 dim attribute detection on the `›` prompt
+    ///   character (always visible) to distinguish placeholder text from user input.
     /// - `require_idle=true`: Status tracking is reliable (~5s lag from transcript watcher).
-    ///   Status correctly shows `listening` when idle, `active` when busy. TODO: look into mitigating 5s lag for active on usersubmit for human input ini changing status to active so gate is more reliable without the require output stable thing
-    /// - `require_output_stable_seconds=0`: Disabled; hooks already signal idle state.
+    ///   Status correctly shows `listening` when idle, `active` when busy.
     pub fn codex() -> Self {
         Self {
             tool: "codex".to_string(),
             require_idle: true,
-            require_ready_prompt: true,
-            require_prompt_empty: false,
+            require_ready_prompt: false,
+            require_prompt_empty: true,
             require_output_stable_seconds: 0.0,
             block_on_user_activity: true,
             block_on_approval: true,
@@ -612,6 +613,12 @@ pub fn run_delivery_loop(
                     ));
                     delivery_state = State::Pending;
                     pending_since = Some(Instant::now()); // Start tracking pending time
+                } else if notified {
+                    // Woke by notification but no pending messages — log for diagnostics
+                    log_info("native", "delivery.wake_no_pending", &format!(
+                        "Woke up (notified=true) but no pending messages for {}",
+                        current_name
+                    ));
                 }
             }
 
@@ -651,6 +658,17 @@ pub fn run_delivery_loop(
                         attempt = 0;
                         pending_since = None;
                         inject_attempt = 0;
+                        continue;
+                    }
+
+                    // Skip injection if `hcom listen` is actively polling —
+                    // it will deliver via stdout, PTY injection would race.
+                    if db.has_listen_endpoint(&current_name) {
+                        log_info("native", "delivery.skip_listen", &format!(
+                            "Skipping injection — hcom listen is active for {}", current_name
+                        ));
+                        // Stay in Pending — re-check after listen exits and cleans up
+                        std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
 
@@ -1312,9 +1330,9 @@ mod tests {
         assert!(gemini.require_ready_prompt);
         assert!(!gemini.require_prompt_empty);
 
-        // Codex: same as Gemini
-        assert!(codex.require_ready_prompt);
-        assert!(!codex.require_prompt_empty);
+        // Codex: same as Claude (ready pattern unreliable in narrow terminals)
+        assert!(!codex.require_ready_prompt);
+        assert!(codex.require_prompt_empty);
 
         // All require idle
         assert!(claude.require_idle);

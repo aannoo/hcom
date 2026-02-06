@@ -393,7 +393,13 @@ def subagent_stop(hook_data: dict[str, Any]) -> None:
     ).fetchone()
 
     if not row:
-        # No instance = subagent hasn't run hcom start yet (not opted in)
+        # No instance = subagent never ran hcom start.
+        # Still remove from parent's running_tasks to prevent stuck active state.
+        from ...core.db import get_session_binding
+
+        parent_name = get_session_binding(hook_data.get("session_id", ""))
+        if parent_name:
+            _remove_subagent_from_parent(parent_name, agent_id)
         sys.exit(0)
 
     subagent_id = row["name"]

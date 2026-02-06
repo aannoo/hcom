@@ -218,6 +218,16 @@ impl HcomDb {
         }
     }
 
+    /// Check if `hcom listen` command is actively polling for this instance.
+    /// When true, delivery loop should skip PTY injection — listen handles delivery.
+    pub fn has_listen_endpoint(&self, name: &str) -> bool {
+        self.conn.query_row(
+            "SELECT 1 FROM notify_endpoints WHERE instance = ? AND kind = 'listen'",
+            params![name],
+            |_| Ok(true),
+        ).unwrap_or(false)
+    }
+
     /// Update heartbeat timestamp and re-assert tcp_mode to prove instance is alive.
     ///
     /// Sets both last_stop (heartbeat) and tcp_mode=true atomically.

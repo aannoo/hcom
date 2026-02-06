@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hcom"
-version = "0.6.14"
+version = "0.6.15"
 description = "Realtime messaging and context sharing for AI coding agents (Claude Code, Gemini CLI, Codex)"
 readme = "README.md"
 requires-python = ">=3.11"

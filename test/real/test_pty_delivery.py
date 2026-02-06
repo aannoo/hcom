@@ -33,11 +33,11 @@ import time
 from pathlib import Path
 
 # Import ready patterns from the actual code - single source of truth
-from hcom.pty.pty_common import GEMINI_READY_PATTERN, CLAUDE_CODEX_READY_PATTERN
+from hcom.pty.pty_common import GEMINI_READY_PATTERN, CLAUDE_READY_PATTERN, CODEX_READY_PATTERN
 
 READY_PATTERNS = {
-    "claude": CLAUDE_CODEX_READY_PATTERN.decode(),
-    "codex": CLAUDE_CODEX_READY_PATTERN.decode(),
+    "claude": CLAUDE_READY_PATTERN.decode(),
+    "codex": CODEX_READY_PATTERN.decode(),
     "gemini": GEMINI_READY_PATTERN.decode(),
 }
 
@@ -75,8 +75,15 @@ FRAME_MARKERS = {
 # Expected gate block context when prompt has text (src/native/src/delivery.rs)
 GATE_BLOCK_CONTEXTS = {
     "claude": "tui:prompt-has-text",   # Claude checks prompt_empty gate
-    "codex": "tui:not-ready",          # Codex: typing hides ready pattern
+    "codex": "tui:prompt-has-text",     # Codex checks prompt_empty gate
     "gemini": "tui:not-ready",         # Gemini: typing hides ready pattern
+}
+
+# Mirror Rust ToolConfig::require_ready_prompt — only gemini gates on ready
+REQUIRE_READY = {
+    "claude": False,
+    "codex": False,
+    "gemini": True,
 }
 
 # Expected JSON fields from hcom term --json
@@ -414,27 +421,36 @@ def run_test(tool: str):
     ok(f"Instance launched: {_instance_name} (base: {_base_name}, ready in {t_ready:.1f}s)")
 
     # Wait for screen ready (term uses base name)
+    # Timeout allows for slow TUI render; check instance still alive on failure
     screen: dict = poll_until(
         lambda: get_screen(_base_name) or None,
-        "screen ready=true",
-        timeout=15,
+        "screen query returns data",
+        timeout=30,
         interval=1.0,
     )
-    if not screen.get("ready"):
+    if not screen:
+        # Check if instance is still running
+        r = hcom(f"list --json")
+        alive = _base_name in r.stdout if r.returncode == 0 else False
+        fail(f"Screen query returned empty for 30s (instance alive={alive})")
+    if REQUIRE_READY[tool] and not screen.get("ready"):
         fail(f"Screen not ready: {screen}")
 
     # ── Validate initial screen ──────────────────────────────────
     print(f"\n[Validate] Initial screen state for {tool}...")
     validate_screen_schema(screen)
     ok("Schema valid")
-    validate_ready_pattern(screen, tool)
-    ok(f"Ready pattern '{READY_PATTERNS[tool]}' consistent")
+    if REQUIRE_READY[tool]:
+        validate_ready_pattern(screen, tool)
+        ok(f"Ready pattern '{READY_PATTERNS[tool]}' consistent")
+        assert screen["ready"] is True
+    else:
+        ok(f"ready={screen.get('ready')} (not required for {tool})")
     validate_prompt_consistency(screen)
     ok(f"prompt_empty={screen['prompt_empty']} input_text={screen.get('input_text')!r}")
     validate_tool_ui_elements(screen, tool)
-    assert screen["ready"] is True
     assert screen["prompt_empty"] is True
-    log_screen(screen, f"{tool} — initial (ready, prompt empty)")
+    log_screen(screen, f"{tool} — initial (prompt empty)")
 
     # ── Phase 2: Delivery succeeds on clean prompt ───────────────
     print(f"\n[Phase 2] Testing delivery on clean prompt...")
@@ -461,14 +477,16 @@ def run_test(tool: str):
     new_event = delivery_event["id"]
     ok(f"Cursor advanced: {baseline_event} -> {new_event} (delivery in {t_delivery:.1f}s)")
 
-    # Then wait for screen to return to ready (tool finishes processing)
-    poll_until(
-        lambda: get_screen(_base_name).get("prompt_empty") is True
-                and get_screen(_base_name).get("ready") is True,
-        "screen returns to ready after delivery",
-        timeout=60,
-        interval=1.0,
-    )
+    # Then wait for screen to settle (tool finishes processing)
+    def _screen_settled_after_delivery():
+        s = get_screen(_base_name)
+        if not s or not s.get("prompt_empty"):
+            return False
+        if REQUIRE_READY[tool] and not s.get("ready"):
+            return False
+        return True
+
+    poll_until(_screen_settled_after_delivery, "screen settles after delivery", timeout=60, interval=1.0)
 
     # Validate delivery event structure
     validate_delivery_events(_base_name, baseline_event, SENDER)
@@ -476,7 +494,8 @@ def run_test(tool: str):
     # Capture and validate post-delivery screen
     screen = get_screen(_base_name)
     validate_screen_schema(screen)
-    validate_ready_pattern(screen, tool)
+    if REQUIRE_READY[tool]:
+        validate_ready_pattern(screen, tool)
     validate_prompt_consistency(screen)
     validate_tool_ui_elements(screen, tool)
     log_screen(screen, f"{tool} — post-delivery")
@@ -484,13 +503,15 @@ def run_test(tool: str):
     # ── Phase 3: Delivery blocked by uncommitted text ────────────
     print(f"\n[Phase 3] Testing delivery blocked by uncommitted text...")
 
-    poll_until(
-        lambda: get_screen(_base_name).get("prompt_empty") is True
-                and get_screen(_base_name).get("ready") is True,
-        "ready + prompt empty before inject",
-        timeout=30,
-        interval=1.0,
-    )
+    def _screen_ready_for_inject():
+        s = get_screen(_base_name)
+        if not s or not s.get("prompt_empty"):
+            return False
+        if REQUIRE_READY[tool] and not s.get("ready"):
+            return False
+        return True
+
+    poll_until(_screen_ready_for_inject, "prompt empty before inject", timeout=30, interval=1.0)
     # Extra settle time — tool may still be processing internally
     time.sleep(2)
 
@@ -566,15 +587,18 @@ def run_test(tool: str):
     ok("Sent --enter to submit uncommitted text")
 
     # Wait for tool to process and return to ready
-    poll_until(
-        lambda: get_screen(_base_name).get("ready") is True
-                and get_screen(_base_name).get("prompt_empty") is True,
-        "screen returns to ready after submitting text",
-        timeout=60,
-        interval=1.0,
-    )
+    def _screen_settled_after_submit():
+        s = get_screen(_base_name)
+        if not s or not s.get("prompt_empty"):
+            return False
+        if REQUIRE_READY[tool] and not s.get("ready"):
+            return False
+        return True
+
+    poll_until(_screen_settled_after_submit, "screen settles after submitting text", timeout=60, interval=1.0)
 
     # Wait for delivery event for the previously-blocked message
+    # (delivery thread stays in Pending with 2s retry — should fire within seconds of gate unblock)
     # (must check for deliver: context specifically — transcript watcher events don't count)
     def find_delivery_phase4():
         evs = get_events(_base_name, last=20)
@@ -592,7 +616,8 @@ def run_test(tool: str):
     # Capture final screen
     screen = get_screen(_base_name)
     validate_screen_schema(screen)
-    validate_ready_pattern(screen, tool)
+    if REQUIRE_READY[tool]:
+        validate_ready_pattern(screen, tool)
     validate_prompt_consistency(screen)
     log_screen(screen, f"{tool} — after blocked message delivered")
 

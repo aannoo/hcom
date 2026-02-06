@@ -9,6 +9,20 @@ use std::sync::Mutex;
 /// Global configuration instance, lazily initialized and resettable for tests.
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 
+/// Find python3 next to our binary (same bin/ dir in a venv or uv tool install).
+/// Falls back to bare "python3" for PATH resolution.
+fn find_sibling_python() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("python3");
+            if sibling.exists() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "python3".to_string()
+}
+
 /// Configuration loaded from HCOM_* environment variables.
 ///
 /// All environment variable access should go through this struct
@@ -81,8 +95,10 @@ impl Config {
         // HCOM_PTY_DEBUG: boolean flag (true if "1")
         let pty_debug = env::var("HCOM_PTY_DEBUG").map(|v| v == "1").unwrap_or(false);
 
-        // HCOM_PYTHON: python executable (default "python3")
-        let python = env::var("HCOM_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        // HCOM_PYTHON: python executable
+        // Default: sibling python3 next to our binary (works in venvs / uv tool installs),
+        // falls back to system "python3"
+        let python = env::var("HCOM_PYTHON").unwrap_or_else(|_| find_sibling_python());
 
         Self {
             hcom_dir,
@@ -274,12 +290,17 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_python_default_python3() {
+    fn test_python_default_finds_sibling_or_python3() {
         Config::reset();
         without_env(&["HCOM_PYTHON"], || {
             Config::init();
             let config = Config::get();
-            assert_eq!(config.python, "python3");
+            // Either a sibling python3 path or bare "python3"
+            assert!(
+                config.python == "python3" || config.python.ends_with("/python3"),
+                "expected python3 or path ending in /python3, got: {}",
+                config.python
+            );
         });
     }
 

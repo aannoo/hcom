@@ -10,7 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  # Build platform wheels with maturin (Rust binary + Python package)
   build-wheels:
     strategy:
       matrix:
@@ -41,32 +40,8 @@ jobs:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
 
-  # Pure Python fallback wheel (no Rust binary, for unsupported platforms)
-  build-fallback:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install build tools
-        run: pip install build
-
-      - name: Build pure Python wheel
-        run: |
-          cp pyproject-fallback.toml pyproject.toml
-          python -m build --wheel --outdir dist/
-
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-fallback
-          path: dist/*.whl
-
   publish:
-    needs: [build-wheels, build-fallback]
+    needs: [build-wheels]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

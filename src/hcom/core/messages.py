@@ -208,6 +208,37 @@ def format_recipients(delivered_to: list[str], max_show: int = 30) -> str:
 # ==================== Scope Computation ====================
 
 
+def _match_target(target: str, full_names: list[str], full_to_base: dict[str, str]) -> list[str]:
+    """Match a target against instance names, with base-name fallback.
+
+    Tries prefix match on full display name first ({tag}-{name}).
+    Falls back to prefix match on base name ({name} only) if no full-name match.
+    """
+    if ":" in target:
+        # Remote target - match any instance with prefix
+        return [full_to_base[fn] for fn in full_names if fn.lower().startswith(target.lower())]
+
+    # Local target - prefix match on full display name
+    matches = [
+        full_to_base[fn]
+        for fn in full_names
+        if ":" not in fn
+        and fn.lower().startswith(target.lower())
+        and (len(fn) == len(target) or fn[len(target)] != "_")
+    ]
+    if matches:
+        return matches
+
+    # Fallback: prefix match on base name (ignoring tag prefix)
+    return [
+        full_to_base[fn]
+        for fn in full_names
+        if ":" not in fn
+        and full_to_base[fn].lower().startswith(target.lower())
+        and (len(full_to_base[fn]) == len(target) or full_to_base[fn][len(target)] != "_")
+    ]
+
+
 def compute_scope(
     message: str,
     enabled_instances: list[dict[str, Any] | str],
@@ -235,7 +266,7 @@ def compute_scope(
     Target matching uses full display name ({tag}-{name} or {name}):
         - api-luna matches instance with tag='api', name='luna'
         - api- matches all instances with tag='api' (prefix match)
-        - luna matches instance with name='luna' (no tag or base name match)
+        - luna matches instance with name='luna' (no tag, or base-name fallback)
     """
     from .instances import get_full_name
 
@@ -264,20 +295,7 @@ def compute_scope(
             unmatched = []
 
             for target in explicit_targets:
-                # Same matching logic as @mentions
-                if ":" in target:
-                    # Remote target - match any instance with prefix
-                    matches = [full_to_base[fn] for fn in full_names if fn.lower().startswith(target.lower())]
-                else:
-                    # Local target - only match local instances (no : in name)
-                    # Don't match across underscore boundary (reserved for subagent hierarchy)
-                    matches = [
-                        full_to_base[fn]
-                        for fn in full_names
-                        if ":" not in fn
-                        and fn.lower().startswith(target.lower())
-                        and (len(fn) == len(target) or fn[len(target)] != "_")
-                    ]
+                matches = _match_target(target, full_names, full_to_base)
                 if matches:
                     matched_base_names.extend(matches)
                 else:
@@ -318,22 +336,7 @@ def compute_scope(
             unmatched = []
 
             for mention in mentions:
-                # Check if mention matches any ENABLED instance (prefix match on full name)
-                # If mention has no :, only match local instances (exclude :-suffixed remotes)
-                # If mention has :, allow matching remote instances
-                if ":" in mention:
-                    # Mention includes device suffix - match any instance with prefix
-                    matches = [full_to_base[fn] for fn in full_names if fn.lower().startswith(mention.lower())]
-                else:
-                    # Mention is bare name - only match local instances (no : in name)
-                    # Don't match across underscore boundary (reserved for subagent hierarchy)
-                    matches = [
-                        full_to_base[fn]
-                        for fn in full_names
-                        if ":" not in fn
-                        and fn.lower().startswith(mention.lower())
-                        and (len(fn) == len(mention) or fn[len(mention)] != "_")
-                    ]
+                matches = _match_target(mention, full_names, full_to_base)
                 if matches:
                     matched_base_names.extend(matches)
                 else:

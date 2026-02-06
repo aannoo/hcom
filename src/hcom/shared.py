@@ -11,7 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Literal
 
-__version__ = "0.6.14"
+__version__ = "0.6.15"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"

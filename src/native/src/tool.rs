@@ -16,10 +16,14 @@ pub enum Tool {
 impl Tool {
     /// Get the ready pattern bytes for this tool
     ///
-    /// Ready pattern appears when the tool is idle and waiting for user input.
+    /// Ready pattern appears when the tool's TUI has loaded. Used for delivery
+    /// thread startup detection (not gating — gate config is in delivery.rs).
     pub fn ready_pattern(&self) -> &'static [u8] {
         match self {
-            Tool::Claude | Tool::Codex => b"? for shortcuts",
+            Tool::Claude => b"? for shortcuts",
+            // Codex's responsive footer drops "? for shortcuts" in narrow terminals.
+            // Use the › prompt character instead — always visible when TUI is loaded.
+            Tool::Codex => "\u{203A} ".as_bytes(),
             Tool::Gemini => b"Type your message",
         }
     }
