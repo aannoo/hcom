@@ -13,7 +13,7 @@ use crate::log::{log_info, log_warn};
 
 use super::connection::connect_with_timeout;
 use super::protocol::{
-    build_request, try_send, DaemonError, Response,
+    build_request, parse_listen_timeout, try_send, DaemonError, Response,
     ARGV_HOOKS, BLOCKING_HOOKS, LAUNCH_TOOLS, STDIN_HOOKS,
 };
 
@@ -92,12 +92,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // listen with long timeout (>29min) bypasses daemon to avoid idle shutdown conflict
     // Daemon has 30min idle timeout; long listen would trigger it mid-request
     if cmd == "listen" {
-        let timeout = args.iter()
-            .position(|s| s == "--timeout")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| args.get(1).and_then(|s| s.parse::<u64>().ok()))
-            .unwrap_or(86400);  // default 24h
+        let timeout = parse_listen_timeout(args);
         if timeout > 29 * 60 {
             log_info("client", "run.fallback", &format!(
                 "reason=long_listen timeout={}",
@@ -162,67 +157,47 @@ pub fn run(args: &[String]) -> Result<()> {
             ));
             exec_python_fallback(args);
         }
-        Err(DaemonError::ConnectionFailed(e)) => {
+        Err(e) => {
             let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.connection_failed", &format!(
+            let log_label = match &e {
+                DaemonError::ConnectionFailed(_) => "run.connection_failed",
+                DaemonError::ReadTimeout(_) => "run.timeout",
+                DaemonError::Io { .. } => "run.io_error",
+                DaemonError::Json { .. } => "run.json_error",
+                _ => "run.error",
+            };
+            log_info("client", log_label, &format!(
                 "request_id={} total={:.1}ms err={}",
                 request_id, total_ms, e
             ));
-            // Hooks must not print to stderr (corrupts JSON output). CLI gets diagnostics.
+            // Hooks must not print to stderr (corrupts JSON output)
             if !is_hook {
-                eprintln!("[hcom] Cannot connect to daemon: {}", e);
-                eprintln!("[hcom] Check daemon log: {}", crate::paths::log_path().display());
-                eprintln!("[hcom] Try: hcom daemon restart");
-                eprintln!("[hcom] Or set HCOM_PYTHON_FALLBACK=1 to bypass");
-            }
-            std::process::exit(1);
-        }
-        Err(DaemonError::ReadTimeout(e)) => {
-            let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.timeout", &format!(
-                "request_id={} total={:.1}ms err={}",
-                request_id, total_ms, e
-            ));
-            if !is_hook {
-                eprintln!("[hcom] Daemon hung (timeout): {}", e);
-                eprintln!("[hcom] Command may have partially executed - check results before retrying");
-                eprintln!("[hcom] If recurring, check daemon log: {}", crate::paths::log_path().display());
-            }
-            std::process::exit(1);
-        }
-        Err(DaemonError::Io { source }) => {
-            let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.io_error", &format!(
-                "request_id={} total={:.1}ms err={}",
-                request_id, total_ms, source
-            ));
-            if !is_hook {
-                eprintln!("[hcom] Daemon I/O error: {}", source);
-                eprintln!("[hcom] Check daemon log: {}", crate::paths::log_path().display());
-            }
-            std::process::exit(1);
-        }
-        Err(DaemonError::Json { source }) => {
-            let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.json_error", &format!(
-                "request_id={} total={:.1}ms err={}",
-                request_id, total_ms, source
-            ));
-            if !is_hook {
-                eprintln!("[hcom] Daemon JSON error: {}", source);
-                eprintln!("[hcom] Check daemon log: {}", crate::paths::log_path().display());
-            }
-            std::process::exit(1);
-        }
-        Err(DaemonError::Other(e)) => {
-            let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.error", &format!(
-                "request_id={} total={:.1}ms err={}",
-                request_id, total_ms, e
-            ));
-            if !is_hook {
-                eprintln!("[hcom] Daemon error: {}", e);
-                eprintln!("[hcom] Check daemon log: {}", crate::paths::log_path().display());
+                let log_path = crate::paths::log_path();
+                match &e {
+                    DaemonError::ConnectionFailed(msg) => {
+                        eprintln!("[hcom] Cannot connect to daemon: {}", msg);
+                        eprintln!("[hcom] Check daemon log: {}", log_path.display());
+                        eprintln!("[hcom] Try: hcom daemon restart");
+                        eprintln!("[hcom] Or set HCOM_PYTHON_FALLBACK=1 to bypass");
+                    }
+                    DaemonError::ReadTimeout(msg) => {
+                        eprintln!("[hcom] Daemon hung (timeout): {}", msg);
+                        eprintln!("[hcom] Command may have partially executed - check results before retrying");
+                        eprintln!("[hcom] If recurring, check daemon log: {}", log_path.display());
+                    }
+                    DaemonError::Io { source } => {
+                        eprintln!("[hcom] Daemon I/O error: {}", source);
+                        eprintln!("[hcom] Check daemon log: {}", log_path.display());
+                    }
+                    DaemonError::Json { source } => {
+                        eprintln!("[hcom] Daemon JSON error: {}", source);
+                        eprintln!("[hcom] Check daemon log: {}", log_path.display());
+                    }
+                    _ => {
+                        eprintln!("[hcom] Daemon error: {}", e);
+                        eprintln!("[hcom] Check daemon log: {}", log_path.display());
+                    }
+                }
             }
             std::process::exit(1);
         }

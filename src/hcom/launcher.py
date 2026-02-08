@@ -646,6 +646,11 @@ def launch(
         instance_env["HCOM_LAUNCH_BATCH_ID"] = batch_id
         # Propagate resolved HCOM_DIR to children for root consistency
         instance_env["HCOM_DIR"] = str(hcom_path())
+        # Propagate HCOM_NOTES from caller env (daemon: thread context, CLI: os.environ)
+        from .core.thread_context import get_hcom_notes_text
+        notes = get_hcom_notes_text()
+        if notes:
+            instance_env["HCOM_NOTES"] = notes
         # Propagate dev mode env var if set (via hdev script)
         if val := os.environ.get("HCOM_DEV_ROOT"):
             instance_env["HCOM_DEV_ROOT"] = val

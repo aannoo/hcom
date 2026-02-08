@@ -37,6 +37,14 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Build full display name: "{tag}-{name}" if tag exists, else "{name}".
+fn full_display_name(db: &HcomDb, name: &str) -> String {
+    match db.get_instance_tag(name) {
+        Some(tag) => format!("{}-{}", tag, name),
+        None => name.to_string(),
+    }
+}
+
 /// Map status to icon (matches TUI/hcom list format)
 pub fn status_icon(status: &str) -> &'static str {
     match status {
@@ -350,12 +358,12 @@ pub(crate) fn evaluate_gate(
     GateResult { safe: true, reason: "ok" }
 }
 
-/// Inject text to PTY via TCP (text only, no Enter)
-/// Filters out NULL bytes and other control characters that could corrupt terminal state
+/// Inject text to PTY via TCP (text only, no Enter).
+/// Strips all C0 control chars (0x00-0x1F) except tab. This blocks ESC (0x1B),
+/// so ANSI escape sequences cannot pass through.
 fn inject_text(port: u16, text: &str) -> bool {
-    // Filter dangerous control characters (NULL, BEL, etc) but allow printable chars
     let safe_text: String = text.chars()
-        .filter(|c| *c >= ' ' || *c == '\t')  // Allow printable + tab
+        .filter(|c| *c >= ' ' || *c == '\t')  // >= 0x20 or tab; blocks ESC, NULL, BEL, etc.
         .collect();
 
     if safe_text.is_empty() {
@@ -385,7 +393,7 @@ fn inject_enter(port: u16) -> bool {
 /// Keeps retry maximum low for the first N seconds after messages become pending,
 /// then allows a higher maximum (lower overhead) if the tool stays unsafe.
 ///
-/// ## Why two phases? TODO: not sure what this is actually doing now need to look into how its used
+/// ## Why two phases?
 ///
 /// - **Warm phase (0-60s)**: Fast retries (max 2s) for transient blocks.
 ///   Most delivery blocks are brief (user types, then stops; AI finishes turn).
@@ -513,6 +521,13 @@ pub fn run_delivery_loop(
         log_info("native", "delivery.tcp_mode", &format!("Set tcp_mode=true for {}", current_name));
     }
 
+    // Set shared display name for PTY title (tag-name or just name)
+    if let Some(ref shared) = shared_name {
+        if let Ok(mut s) = shared.write() {
+            *s = full_display_name(db, &current_name);
+        }
+    }
+
     // State machine
     let mut delivery_state = State::Pending; // Start pending to check immediately
     let mut attempt: u32 = 0;
@@ -542,10 +557,10 @@ pub fn run_delivery_loop(
                     let _ = db.migrate_notify_endpoints(&current_name, &new_name);
                     // Update tcp_mode for new name
                     let _ = db.update_tcp_mode(&new_name, true);
-                    // Update shared name for main loop's title tracking
+                    // Update shared display name for main loop's title tracking
                     if let Some(ref shared) = shared_name {
                         if let Ok(mut s) = shared.write() {
-                            *s = new_name.clone();
+                            *s = full_display_name(db, &new_name);
                         }
                     }
                     current_name = new_name;
@@ -584,6 +599,16 @@ pub fn run_delivery_loop(
                 }
             }
             current_status = new_status;
+        }
+
+        // Refresh display name in case tag changed at runtime (TUI Ctrl+T, config set)
+        if let Some(ref shared) = shared_name {
+            let new_display = full_display_name(db, &current_name);
+            if let Ok(mut s) = shared.write() {
+                if *s != new_display {
+                    *s = new_display;
+                }
+            }
         }
 
         match delivery_state {
@@ -658,17 +683,6 @@ pub fn run_delivery_loop(
                         attempt = 0;
                         pending_since = None;
                         inject_attempt = 0;
-                        continue;
-                    }
-
-                    // Skip injection if `hcom listen` is actively polling —
-                    // it will deliver via stdout, PTY injection would race.
-                    if db.has_listen_endpoint(&current_name) {
-                        log_info("native", "delivery.skip_listen", &format!(
-                            "Skipping injection — hcom listen is active for {}", current_name
-                        ));
-                        // Stay in Pending — re-check after listen exits and cleans up
-                        std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
 

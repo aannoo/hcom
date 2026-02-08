@@ -23,6 +23,7 @@ pub struct Message {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceStatus {
     pub status: String,
+    pub detail: String,
     pub last_event_id: i64,
 }
 
@@ -57,13 +58,14 @@ impl HcomDb {
     /// - Err if database error occurs
     pub fn get_instance_status(&self, name: &str) -> Result<Option<InstanceStatus>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, status, status_context, last_event_id
+            "SELECT name, status, status_detail, last_event_id
              FROM instances WHERE name = ?"
         )?;
 
         match stmt.query_row(params![name], |row| {
             Ok(InstanceStatus {
                 status: row.get::<_, String>(1).unwrap_or_else(|_| "unknown".to_string()),
+                detail: row.get::<_, String>(2).unwrap_or_default(),
                 last_event_id: row.get::<_, i64>(3).unwrap_or(0),
             })
         }) {
@@ -207,25 +209,16 @@ impl HcomDb {
     }
 
     /// Check if instance status is "listening" (idle)
+    /// Check if instance is idle (safe for PTY injection).
+    ///
+    /// Returns true only when status is "listening" AND detail is not "cmd:listen".
+    /// The "cmd:listen" detail is set by `hcom listen` as its first operation,
+    /// ensuring the gate blocks before any async setup (endpoint registration, etc.).
     pub fn is_idle(&self, name: &str) -> bool {
         match self.get_instance_status(name) {
-            Ok(Some(status)) => status.status == "listening",
-            Ok(None) => false, // No instance found
-            Err(e) => {
-                eprintln!("[hcom] DB error in is_idle (get_instance_status): {}", e);
-                false // Fallback to not idle
-            }
+            Ok(Some(s)) => s.status == "listening" && s.detail != "cmd:listen",
+            _ => false,
         }
-    }
-
-    /// Check if `hcom listen` command is actively polling for this instance.
-    /// When true, delivery loop should skip PTY injection — listen handles delivery.
-    pub fn has_listen_endpoint(&self, name: &str) -> bool {
-        self.conn.query_row(
-            "SELECT 1 FROM notify_endpoints WHERE instance = ? AND kind = 'listen'",
-            params![name],
-            |_| Ok(true),
-        ).unwrap_or(false)
     }
 
     /// Update heartbeat timestamp and re-assert tcp_mode to prove instance is alive.
@@ -410,9 +403,13 @@ impl HcomDb {
     /// Args:
     ///   context: Gate context like "tui:not-ready", "tui:user-active", etc.
     ///   detail: Human-readable description like "user is typing"
+    /// Preserve status_detail when it's "cmd:listen" — gate diagnostics must not
+    /// overwrite the flag that blocks PTY injection during `hcom listen`.
     pub fn set_gate_status(&self, name: &str, context: &str, detail: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET status_context = ?, status_detail = ? WHERE name = ?",
+            "UPDATE instances SET status_context = ?,
+                status_detail = CASE WHEN status_detail = 'cmd:listen' THEN status_detail ELSE ? END
+             WHERE name = ?",
             params![context, detail, name],
         )?;
         Ok(())
@@ -435,6 +432,20 @@ impl HcomDb {
             params![context_json, name],
         )?;
         Ok(())
+    }
+
+    /// Get instance tag (for display name computation).
+    /// Returns Some(tag) if tag is non-empty, None otherwise.
+    pub fn get_instance_tag(&self, name: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT tag FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|t| !t.is_empty())
     }
 
     /// Get current status and context for gate blocking logic
@@ -767,6 +778,7 @@ mod tests {
                 name TEXT PRIMARY KEY,
                 status TEXT,
                 status_context TEXT,
+                status_detail TEXT,
                 last_event_id INTEGER,
                 transcript_path TEXT,
                 session_id TEXT,

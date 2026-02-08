@@ -38,14 +38,26 @@ const FORWARD_ENV: &[&str] = &[
     "HCOM_LAUNCHED_BY", "HCOM_LAUNCH_BATCH_ID", "HCOM_LAUNCH_EVENT_ID",
     "HCOM_LAUNCHED_PRESET",
     // Paths and config
-    "CLAUDE_ENV_FILE", "HCOM_DIR", "HCOM_GO",
+    "CLAUDE_ENV_FILE", "HCOM_DIR", "HCOM_GO", "HCOM_NOTES",
     // Tool detection
     "CLAUDECODE", "GEMINI_CLI",
     "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED",
     "CODEX_MANAGED_BY_NPM", "CODEX_MANAGED_BY_BUN",
+    "CODEX_THREAD_ID",
 ];
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Parse listen timeout from argv: "listen [N]" or "listen --timeout N".
+/// Default: 86400s (24h).
+pub(super) fn parse_listen_timeout(argv: &[String]) -> u64 {
+    argv.iter()
+        .position(|s| s == "--timeout")
+        .and_then(|i| argv.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| argv.get(1).and_then(|s| s.parse::<u64>().ok()))
+        .unwrap_or(86400)
+}
 
 // Read/write timeouts
 const WRITE_TIMEOUT_SECS: u64 = 5;
@@ -314,15 +326,7 @@ fn get_read_timeout(request: &Request) -> Duration {
         if let Some(ref argv) = request.argv {
             if let Some(cmd) = argv.first() {
                 if cmd == "listen" {
-                    // Parse listen timeout from argv: "listen [N]" or "listen --timeout N"
-                    // Default matches Python: 86400s (24h)
-                    let listen_timeout = argv.iter()
-                        .position(|s| s == "--timeout")
-                        .and_then(|i| argv.get(i + 1))
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .or_else(|| argv.get(1).and_then(|s| s.parse::<u64>().ok()))
-                        .unwrap_or(86400);
-                    return Duration::from_secs(listen_timeout + LISTEN_TIMEOUT_BUFFER_SECS);
+                    return Duration::from_secs(parse_listen_timeout(argv) + LISTEN_TIMEOUT_BUFFER_SECS);
                 }
                 if cmd == "events" {
                     // "events launch" blocks up to 60s waiting for agents to be ready

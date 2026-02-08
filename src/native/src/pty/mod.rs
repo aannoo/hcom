@@ -434,10 +434,22 @@ impl Proxy {
 
         let user_activity_cooldown_ms = 500; // 0.5s for all tools (dim detection enables this for Claude)
 
-        // Initialize shared state for terminal title (updated by delivery thread)
-        let current_name = Arc::new(RwLock::new(
-            config.instance_name.clone().unwrap_or_default()
-        ));
+        // Initialize shared state for terminal title (updated by delivery thread).
+        // Query tag from DB to show full display name (tag-name) from the start.
+        let initial_display_name = {
+            let base = config.instance_name.clone().unwrap_or_default();
+            if base.is_empty() {
+                base
+            } else if let Ok(db) = crate::db::HcomDb::open() {
+                match db.get_instance_tag(&base) {
+                    Some(tag) => format!("{}-{}", tag, base),
+                    None => base,
+                }
+            } else {
+                base
+            }
+        };
+        let current_name = Arc::new(RwLock::new(initial_display_name));
         let current_status = Arc::new(RwLock::new("listening".to_string()));
 
         Ok(Self {
@@ -484,6 +496,10 @@ impl Proxy {
         // Stateful title OSC filter — strips tool's title sequences across read boundaries
         let mut title_filter = TitleOscFilter::new();
 
+        // Title writes deferred to iterations with NO PTY output, preventing interleaving
+        // with any incomplete escape sequence (CSI, OSC, UTF-8, etc.).
+        let mut had_pty_output: bool;
+
         // For Claude in accept-edits mode, ready pattern may be hidden.
         // Start delivery after timeout if ready pattern not seen.
         use crate::tool::Tool;
@@ -495,6 +511,8 @@ impl Proxy {
         };
 
         loop {
+            had_pty_output = false;
+
             // Handle signals
             if SIGWINCH_RECEIVED.swap(false, Ordering::AcqRel) {
                 self.forward_winsize()?;
@@ -575,7 +593,7 @@ impl Proxy {
                     if !nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) }).unwrap_or(false) {
                         break;
                     }
-                    continue;
+                    // Fall through to title write — timeout means no PTY output, safe to write.
                 }
                 Ok(_) => {}
                 Err(Errno::EINTR) => {
@@ -602,12 +620,10 @@ impl Proxy {
                                 (data.to_vec(), false)
                             };
                             write_all(&stdout_fd, &filtered)?;
-                            // Track if output ended with incomplete UTF-8 sequence.
-                            // Defer title write until sequence completes to prevent corruption.
-                            // Only update when filtered has content — if the entire read was a
-                            // title OSC (filtered empty), preserve prior pending_utf8 state to
-                            // avoid resetting mid-sequence (causes ?? artifacts).
+                            // Track if we wrote any real output this iteration.
+                            // Title write deferred to iterations with no PTY output.
                             if !filtered.is_empty() {
+                                had_pty_output = true;
                                 pending_utf8 = pending_utf8_bytes(&filtered);
                             }
                             // If tool tried to set title, ensure we write ours at end-of-loop
@@ -721,12 +737,11 @@ impl Proxy {
             // Check for title changes (delivery thread updates shared Arcs)
             // Writing here ensures title OSC is serialized with PTY output, preventing interleaving
             //
-            // IMPORTANT: Only write title when no incomplete UTF-8 sequence is pending.
-            // If PTY output ended with partial multi-byte char (e.g., first 2 bytes of ─),
-            // writing our ASCII title OSC would corrupt the UTF-8 stream, causing artifacts
-            // like ────────��────────. The pending_utf8 counter tracks how many continuation
-            // bytes we're waiting for; we defer title write until it's 0.
-            if stdout_is_tty && pending_utf8 == 0 {
+            // Only write title when this iteration had NO PTY output. This prevents
+            // interleaving with any incomplete escape sequence (CSI, UTF-8, etc.).
+            // pending_utf8 catches cross-iteration incomplete UTF-8 (e.g., title-only
+            // read after a read that ended with partial multi-byte char).
+            if stdout_is_tty && !had_pty_output && pending_utf8 == 0 {
                 let (name, status) = {
                     let n = self.current_name.read().ok().map(|n| n.clone()).unwrap_or_default();
                     let s = self.current_status.read().ok().map(|s| s.clone()).unwrap_or_default();

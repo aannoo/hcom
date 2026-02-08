@@ -271,6 +271,47 @@ impl ScreenTracker {
         }
     }
 
+    /// Check if text after a prompt character is dim (placeholder styling).
+    /// Returns `Some(true)` if majority dim (placeholder), `Some(false)` if real input.
+    /// Returns `None` if the prompt glyph can't be located on the row.
+    fn is_dim_after_prompt(&self, row: u16, prompt_char: &str) -> Option<bool> {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+
+        // Find the column where prompt char is located
+        let mut prompt_col: Option<u16> = None;
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.contents() == prompt_char {
+                    prompt_col = Some(col);
+                    break;
+                }
+            }
+        }
+        let prompt_col = prompt_col?;
+
+        // Scan cells after prompt (skip prompt + space)
+        let start_col = prompt_col + 2;
+        let mut dim_count: u32 = 0;
+        let mut non_dim_count: u32 = 0;
+
+        for col in start_col..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                let contents = cell.contents();
+                if contents.is_empty() || contents.chars().all(|c| c.is_whitespace() || c == '\u{00A0}') {
+                    continue;
+                }
+                if cell.dim() {
+                    dim_count += 1;
+                } else {
+                    non_dim_count += 1;
+                }
+            }
+        }
+
+        Some(!(non_dim_count > 0 && non_dim_count > dim_count))
+    }
+
     /// Check if prompt is empty (tool-specific)
     pub fn is_prompt_empty(&self, tool: &str) -> bool {
         match self.get_input_box_text(tool) {
@@ -312,8 +353,6 @@ impl ScreenTracker {
     fn get_claude_input_text(&self) -> Option<String> {
         let lines = self.get_screen_lines();
         let num_lines = lines.len();
-        let screen = self.parser.screen();
-        let (_, cols) = screen.size();
 
         for (row_idx, line) in lines.iter().enumerate() {
             // Find ❯ at start of line (Claude's prompt character)
@@ -331,11 +370,18 @@ impl ScreenTracker {
                 continue;
             }
 
-            if row_idx + 1 >= num_lines {
-                continue;
+            // Check for ─ border below (may be 1-3 rows down for multi-line input box)
+            let mut has_border_below = false;
+            for offset in 1..=3 {
+                if row_idx + offset >= num_lines {
+                    break;
+                }
+                if lines[row_idx + offset].contains('─') {
+                    has_border_below = true;
+                    break;
+                }
             }
-            let line_below = &lines[row_idx + 1];
-            if !line_below.contains('─') {
+            if !has_border_below {
                 continue;
             }
 
@@ -348,48 +394,13 @@ impl ScreenTracker {
                 return Some(String::new());
             }
 
-            // Check if text after prompt is dim (placeholder styling)
-            // Find the column where ❯ is located
-            let row = row_idx as u16;
-            let mut prompt_col: u16 = 0;
-            for col in 0..cols {
-                if let Some(cell) = screen.cell(row, col) {
-                    if cell.contents() == "❯" {
-                        prompt_col = col;
-                        break;
-                    }
-                }
-            }
-
-            // Scan cells starting after ❯ (skip ❯ itself and the space after it)
-            // Count dim vs non-dim to handle edge cases where the first character
-            // after the prompt may not inherit the dim attribute from the terminal
-            let start_col = prompt_col + 2;
-            let mut dim_count: u32 = 0;
-            let mut non_dim_count: u32 = 0;
-
-            for col in start_col..cols {
-                if let Some(cell) = screen.cell(row, col) {
-                    let contents = cell.contents();
-                    // Skip empty cells and whitespace (including NBSP)
-                    if contents.is_empty() || contents.chars().all(|c| c.is_whitespace() || c == '\u{00A0}') {
-                        continue;
-                    }
-                    if cell.dim() {
-                        dim_count += 1;
-                    } else {
-                        non_dim_count += 1;
-                    }
-                }
-            }
-
-            // If majority of visible characters are dim, it's placeholder text.
-            // This handles the edge case where the first char after ❯ doesn't
-            // get the dim attribute due to terminal rendering quirks.
-            if non_dim_count > 0 && non_dim_count > dim_count {
-                return Some(text.to_string());
-            } else {
+            // Dim text = placeholder, not real input
+            let is_placeholder = self.is_dim_after_prompt(row_idx as u16, "❯")
+                .unwrap_or(true); // Can't find prompt cell = treat as placeholder
+            if is_placeholder {
                 return Some(String::new());
+            } else {
+                return Some(text.to_string());
             }
         }
 
@@ -481,8 +492,6 @@ impl ScreenTracker {
     /// during PTY injection.
     fn get_codex_input_text(&self) -> Option<String> {
         let lines = self.get_screen_lines();
-        let screen = self.parser.screen();
-        let (_, cols) = screen.size();
 
         // Search bottom-to-top for › prompt character
         // › (U+203A, SINGLE RIGHT-POINTING ANGLE QUOTATION MARK) = 3 bytes UTF-8 + 1 space = 4 bytes total
@@ -495,58 +504,17 @@ impl ScreenTracker {
                     return Some(String::new());
                 }
 
-                // Check if text after prompt is dim (placeholder styling)
-                // Find the column where › is located
-                let row = row_idx as u16;
-                let mut prompt_col: Option<u16> = None;
-                for col in 0..cols {
-                    if let Some(cell) = screen.cell(row, col) {
-                        if cell.contents() == "›" {
-                            prompt_col = Some(col);
-                            break;
-                        }
-                    }
-                }
-
-                let prompt_col = match prompt_col {
-                    Some(col) => col,
+                // Dim text = placeholder, not real input
+                match self.is_dim_after_prompt(row_idx as u16, "›") {
+                    Some(true) => return Some(String::new()),
+                    Some(false) => return Some(text.to_string()),
                     None => {
-                        // If we can't locate the prompt glyph, fall back to ready-pattern logic.
+                        // Can't locate prompt glyph, fall back to ready-pattern logic
                         if self.is_ready() {
                             return Some(String::new());
                         }
                         return Some(text.to_string());
                     }
-                };
-
-                // Scan cells starting after › (skip › itself and the space after it)
-                // Count dim vs non-dim to handle edge cases
-                let start_col = prompt_col + 2;
-                let mut dim_count: u32 = 0;
-                let mut non_dim_count: u32 = 0;
-
-                for col in start_col..cols {
-                    if let Some(cell) = screen.cell(row, col) {
-                        let contents = cell.contents();
-                        // Skip empty cells and whitespace
-                        if contents.is_empty()
-                            || contents.chars().all(|c| c.is_whitespace() || c == '\u{00A0}')
-                        {
-                            continue;
-                        }
-                        if cell.dim() {
-                            dim_count += 1;
-                        } else {
-                            non_dim_count += 1;
-                        }
-                    }
-                }
-
-                // If majority of visible characters are dim, it's placeholder text
-                if non_dim_count > 0 && non_dim_count > dim_count {
-                    return Some(text.to_string());
-                } else {
-                    return Some(String::new());
                 }
             }
         }
@@ -934,6 +902,25 @@ mod tests {
         t.process(&data);
         t.process("────────────────────\r\n".as_bytes());
         // Dim text should be treated as empty (placeholder)
+        assert_eq!(t.get_claude_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn claude_prompt_with_multiline_input_box_dim_placeholder() {
+        // Claude Code sometimes shows a 2-line input box with the bottom border
+        // 2 rows below the prompt (empty continuation row in between).
+        // Dim placeholder text should still be detected as empty.
+        let mut t = make_tracker(24, 52, "? for shortcuts");
+        t.process("────────────────────────────────────────────────────\r\n".as_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice("❯ ".as_bytes());
+        data.extend_from_slice(b"\x1b[2m"); // dim on
+        data.extend_from_slice(b"tell the implementation agent to fix those");
+        data.extend_from_slice(b"\x1b[0m"); // reset
+        data.extend_from_slice(b"\r\n");
+        t.process(&data);
+        t.process(b"\r\n"); // empty continuation row
+        t.process("────────────────────────────────────────────────────\r\n".as_bytes());
         assert_eq!(t.get_claude_input_text(), Some(String::new()));
     }
 
