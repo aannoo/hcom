@@ -148,10 +148,12 @@ def cmd_launch_gemini(
     if launched == 0 and failed > 0:
         return 1  # All failed, exit with error
 
+    instance_names: list[str] = []
     for h in result.get("handles", []):
-        instance_name = h.get("instance_name")
-        if instance_name:
-            print(f"Started the launch process for Gemini: {instance_name}")
+        name = h.get("instance_name")
+        if name:
+            instance_names.append(name)
+            print(f"Started the launch process for Gemini: {name}")
 
     print(f"\nStarted the launch process for {launched} Gemini agent{'s' if launched != 1 else ''}")
     print(f"Batch id: {result['batch_id']}")
@@ -180,13 +182,17 @@ def cmd_launch_gemini(
 
         return run_tui(hcom_path())
     else:
-        tips = []
-        tips.append("Instance names shown in hcom list after startup")
-        tips.append("Send message: hcom send '@<name> hello'")
-        if is_inside_ai_tool():
-            tips.append("Disconnect from hcom: hcom stop <name>")
-            tips.append("Close pane + process: hcom kill <name>")
-        print("\n" + "\n".join(f"  • {tip}" for tip in tips) + "\n")
+        from ...core.tips import print_launch_tips
+        from ...core.instances import load_instance_position
+
+        print_launch_tips(
+            launched=launched,
+            tag=get_config().tag or None,
+            instance_names=instance_names,
+            launcher_name=launcher_name,
+            launcher_participating=load_instance_position(launcher_name) is not None if launcher_name else False,
+            background=False,
+        )
 
     return 0 if failed == 0 else 1
 
@@ -372,15 +378,16 @@ def cmd_launch_codex(
 
         return run_tui(hcom_path())
     else:
-        tips = []
-        if instance_names:
-            tips.append(f"Send message: hcom send '@{instance_names[0]} hello'")
-        if launched > 0:
-            tips.append("Check status: hcom list")
-            if is_inside_ai_tool():
-                tips.append("Disconnect from hcom: hcom stop <name>")
-                tips.append("Close pane + process: hcom kill <name>")
-        if tips:
-            print("\n" + "\n".join(f"  • {tip}" for tip in tips) + "\n")
+        from ...core.tips import print_launch_tips
+        from ...core.instances import load_instance_position
+
+        print_launch_tips(
+            launched=launched,
+            tag=get_config().tag or None,
+            instance_names=instance_names,
+            launcher_name=launcher_name,
+            launcher_participating=load_instance_position(launcher_name) is not None if launcher_name else False,
+            background=False,
+        )
 
     return 0 if failed == 0 else 1

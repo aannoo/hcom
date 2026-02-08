@@ -190,43 +190,6 @@ class HcomTUI:
         self.state.flash_color = "red"
         self.state.frame_dirty = True
 
-    def parse_validation_errors(self, error_str: str):
-        """Parse ValueError message from HcomConfig into field-specific errors"""
-        self.state.launch.validation_errors.clear()
-
-        # Parse multi-line error format:
-        # "Invalid config:\n  - timeout must be...\n  - terminal cannot..."
-        for line in error_str.split("\n"):
-            line = line.strip()
-            if not line or line == "Invalid config:":
-                continue
-
-            # Remove leading "- " from error lines
-            if line.startswith("- "):
-                line = line[2:]
-
-            # Match error to field based on keywords
-            # For fields with multiple possible errors, only store first error seen
-            line_lower = line.lower()
-            if "timeout must be" in line_lower and "subagent" not in line_lower:
-                if "HCOM_TIMEOUT" not in self.state.launch.validation_errors:
-                    self.state.launch.validation_errors["HCOM_TIMEOUT"] = line
-            elif "subagent_timeout" in line_lower or "subagent timeout" in line_lower:
-                if "HCOM_SUBAGENT_TIMEOUT" not in self.state.launch.validation_errors:
-                    self.state.launch.validation_errors["HCOM_SUBAGENT_TIMEOUT"] = line
-            elif "terminal" in line_lower:
-                if "HCOM_TERMINAL" not in self.state.launch.validation_errors:
-                    self.state.launch.validation_errors["HCOM_TERMINAL"] = line
-            elif "tag" in line_lower:
-                if "HCOM_TAG" not in self.state.launch.validation_errors:
-                    self.state.launch.validation_errors["HCOM_TAG"] = line
-            elif "claude_args" in line_lower:
-                if "HCOM_CLAUDE_ARGS" not in self.state.launch.validation_errors:
-                    self.state.launch.validation_errors["HCOM_CLAUDE_ARGS"] = line
-            elif "hints" in line_lower:
-                if "HCOM_HINTS" not in self.state.launch.validation_errors:
-                    self.state.launch.validation_errors["HCOM_HINTS"] = line
-
     def clear_all_pending_confirmations(self):
         """Clear all pending confirmation states and flash if any were active"""
         had_pending = (
@@ -724,6 +687,7 @@ class HcomTUI:
             "tag": "HCOM_TAG",
             "claude_args": "HCOM_CLAUDE_ARGS",
             "hints": "HCOM_HINTS",
+            "notes": "HCOM_NOTES",
         }
 
         try:
@@ -1156,26 +1120,6 @@ class HcomTUI:
             self.show_events_native()
             # After returning from native view, go to MANAGE
             self.mode = Mode.MANAGE
-
-    def render_status_with_separator(self, highlight_tab: str = "EVENTS"):
-        """Render separator line and status bar (extracted helper)"""
-        cols, _ = get_terminal_size()
-
-        # Separator or flash line
-        flash = self.build_flash()
-        if flash:
-            flash_len = ansi_len(flash)
-            remaining = cols - flash_len - 1
-            sep = separator_line(remaining) if remaining > 0 else ""
-            print(f"{flash} {sep}")
-        else:
-            print(separator_line(cols))
-
-        # Status line
-        safe_width = cols - 2
-        status = truncate_ansi(self.build_status_bar(highlight_tab=highlight_tab), safe_width)
-        sys.stdout.write(status)
-        sys.stdout.flush()
 
     def sanitize_filter_input(self, text: str) -> str:
         """Remove dangerous chars, limit length for filter input"""

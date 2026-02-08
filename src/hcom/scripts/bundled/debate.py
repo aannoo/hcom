@@ -325,6 +325,7 @@ Positions are pre-assigned. PRO argues first in each round."""
 """
     else:
         # Dynamic - debaters pick positions
+        assert all_workers is not None, "all_workers required for dynamic mode"
         debaters_list = " ".join(f"@{w}" for w in all_workers)
         workers_sql = ", ".join(f"'{w}'" for w in all_workers)
         position_instruction = f"""

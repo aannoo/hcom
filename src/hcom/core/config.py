@@ -75,6 +75,7 @@ class HcomConfig:
     subagent_timeout: int = 30
     terminal: str = "default"
     hints: str = ""
+    notes: str = ""
     tag: str = ""
     claude_args: str = ""
     gemini_args: str = ""
@@ -318,6 +319,9 @@ class HcomConfig:
         hints = get_var("HCOM_HINTS")
         if hints is not None:  # Allow empty string for hints (valid value)
             data["hints"] = hints
+        notes = get_var("HCOM_NOTES")
+        if notes is not None:
+            data["notes"] = notes
         tag = get_var("HCOM_TAG")
         if tag is not None:  # Allow empty string for tag (valid value)
             data["tag"] = tag
@@ -423,6 +427,7 @@ def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
         "HCOM_SUBAGENT_TIMEOUT": str(config.subagent_timeout),
         "HCOM_TERMINAL": config.terminal,
         "HCOM_HINTS": config.hints,
+        "HCOM_NOTES": config.notes,
         "HCOM_TAG": config.tag,
         "HCOM_CLAUDE_ARGS": config.claude_args,
         "HCOM_GEMINI_ARGS": config.gemini_args,
@@ -480,6 +485,8 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
     # Optional fields - allow empty strings
     if "HCOM_HINTS" in data:
         kwargs["hints"] = data["HCOM_HINTS"]
+    if "HCOM_NOTES" in data:
+        kwargs["notes"] = data["HCOM_NOTES"]
     if "HCOM_TAG" in data:
         kwargs["tag"] = data["HCOM_TAG"]
     if "HCOM_CLAUDE_ARGS" in data:

@@ -11,7 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Literal
 
-__version__ = "0.6.15"
+__version__ = "0.6.16"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"
@@ -145,6 +145,7 @@ TOOL_MARKER_VARS = (
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "CODEX_MANAGED_BY_NPM",
     "CODEX_MANAGED_BY_BUN",
+    "CODEX_THREAD_ID",
 )
 
 # HCOM identity vars - set per-instance, cleared to prevent parent identity leakage
@@ -351,6 +352,7 @@ DEFAULT_CONFIG_HEADER = [
     "#   HCOM_SUBAGENT_TIMEOUT - seconds before disconnecting idle subagents (default: 30)",
     '#   HCOM_TERMINAL - Terminal mode: "default", preset name, or custom command with {script}',
     "#   HCOM_HINTS - Text appended to all messages received by instances",
+    "#   HCOM_NOTES - One-time notes appended to bootstrap (system context at startup)",
     "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
     "#   HCOM_AUTO_SUBSCRIBE - Comma-separated event presets: collision, created, stopped, blocked",
     "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet --agent reviewer')",
@@ -370,6 +372,7 @@ DEFAULT_CONFIG_HEADER = [
 DEFAULT_CONFIG_DEFAULTS = [
     "HCOM_TAG=",
     "HCOM_HINTS=",
+    "HCOM_NOTES=",
     "HCOM_SUBAGENT_TIMEOUT=30",
     "HCOM_TERMINAL=default",
     "HCOM_AUTO_SUBSCRIBE=collision",
@@ -418,14 +421,14 @@ TERMINAL_PRESETS: dict[str, dict] = {
     "kitty": {
         "binary": "kitty",
         "open": "kitty --env HCOM_PROCESS_ID={process_id} {script}",
-        "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}",
+        "close": "kitten @ close-window --match id:{pane_id}",
         "platforms": ["Darwin", "Linux"],
     },
     "kitty-window": {
         "binary": "kitty",
         "app_name": "kitty",
         "open": "kitty --env HCOM_PROCESS_ID={process_id} {script}",
-        "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}",
+        "close": "kitten @ close-window --match id:{pane_id}",
         "platforms": ["Darwin", "Linux"],
     },
     "wezterm": {
@@ -543,14 +546,14 @@ TERMINAL_PRESETS: dict[str, dict] = {
         "binary": "kitten",
         "app_name": "kitty",
         "open": "kitten @ launch --type=tab --env HCOM_PROCESS_ID={process_id} -- bash {script}",
-        "close": "kitten @ close-tab --match env:HCOM_PROCESS_ID={process_id}",
+        "close": "kitten @ close-tab --match id:{pane_id}",
         "platforms": ["Darwin", "Linux"],
     },
     "kitty-split": {
         "binary": "kitten",
         "app_name": "kitty",
         "open": "kitten @ launch --type=window --env HCOM_PROCESS_ID={process_id} -- bash {script}",
-        "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}",
+        "close": "kitten @ close-window --match id:{pane_id}",
         "platforms": ["Darwin", "Linux"],
     },
 }
@@ -602,15 +605,6 @@ def parse_iso_timestamp(iso_str: str):
     except (ValueError, AttributeError):
         return None
 
-
-def get_local_archive_timestamp() -> str:
-    """Get local timestamp for archive files (e.g. 2024-01-30_123045).
-
-    Used for user-visible filenames where local time is preferred.
-    """
-    from datetime import datetime
-
-    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 
 def format_timestamp(iso_str: str, fmt: str = "%H:%M") -> str:

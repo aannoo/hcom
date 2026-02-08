@@ -478,6 +478,7 @@ class LaunchScreen:
                 if f.key in (
                     "HCOM_TERMINAL",
                     "HCOM_HINTS",
+                    "HCOM_NOTES",
                     "HCOM_TAG",
                     "HCOM_SUBAGENT_TIMEOUT",
                 ):
@@ -521,7 +522,7 @@ class LaunchScreen:
                     preview_text = ", ".join(previews)
                     lines.append(f"    {DIM}{FG_GRAY}{truncate_ansi(preview_text, width - 4)}{RESET}")
             else:
-                lines.append(f"    {DIM}{FG_GRAY}tag, hints, timeout, terminal{RESET}")
+                lines.append(f"    {DIM}{FG_GRAY}tag, hints, context, timeout, terminal{RESET}")
 
         # HCOM fields
         result = self.render_section_fields(
@@ -690,6 +691,10 @@ class LaunchScreen:
                 editor_color = FG_CYAN
                 field_name = "Hints"
                 help_text = "text appended to all messages this instance receives"
+            elif field_key == "HCOM_NOTES":
+                editor_color = FG_CYAN
+                field_name = "Notes"
+                help_text = "one-time notes appended to bootstrap at startup"
             elif field_key == "HCOM_TAG":
                 editor_color = FG_CYAN
                 field_name = "Tag"
@@ -1183,121 +1188,6 @@ class LaunchScreen:
         elif key == "SPACE" or (key and len(key) == 1 and key.isprintable()):
             return self._handle_text_input(key)
 
-    def get_command_preview(self) -> str:
-        """Build preview using spec (matches exactly what will be launched)"""
-        try:
-            tool = self.state.launch.tool if self.state.launch.tool in self._tool_options else "claude"
-            count = self.state.launch.count if self.state.launch.count else "1"
-
-            # Get tool-specific config args
-            args_key = f"HCOM_{tool.upper()}_ARGS"
-            args_str = self.state.config_edit.get(args_key, "")
-            args = shlex.split(args_str) if args_str else []
-            parts = [f"hcom {count}", tool]
-            if args:
-                parts.append(shlex.join(args))
-
-            # Get tool-specific prompt
-            if tool == "claude":
-                tool_prompt = self.state.launch.prompt
-            elif tool == "gemini":
-                tool_prompt = self.state.launch.gemini_prompt
-            else:
-                tool_prompt = self.state.launch.codex_prompt
-
-            if tool_prompt:
-                parts.append(f"(prompt: {tool_prompt[:30]}{'...' if len(tool_prompt) > 30 else ''})")
-            else:
-                # Check if args provide initial prompt
-                has_args_prompt = False
-                if tool == "claude":
-                    claude_spec = resolve_claude_args(None, args_str if args_str else None)
-                    has_args_prompt = bool(claude_spec.positional_tokens)
-                elif tool == "gemini":
-                    gemini_spec = resolve_gemini_args(None, args_str if args_str else None)
-                    has_args_prompt = bool(gemini_spec.positional_tokens) or gemini_spec.has_flag(
-                        ["-i", "--prompt-interactive"]
-                    )
-                elif tool == "codex":
-                    codex_spec = resolve_codex_args(None, args_str if args_str else None)
-                    has_args_prompt = bool(codex_spec.positional_tokens)
-                if not has_args_prompt:
-                    parts.append(f"{FG_GRAY}(no prompt){RESET}")
-
-            if tool != "claude":
-                return " ".join(parts)
-
-            # Load spec and update with form values (same logic as do_launch)
-            claude_args_str = self.state.config_edit.get("HCOM_CLAUDE_ARGS", "")
-            spec = resolve_claude_args(None, claude_args_str if claude_args_str else None)
-
-            # Update spec with background and prompt
-            spec = spec.update(
-                background=self.state.launch.background,
-                prompt=self.state.launch.prompt,
-            )
-
-            # Build tokens, filtering out existing system prompts from clean_tokens
-            tokens = []
-            skip_next = False
-            for i, token in enumerate(spec.clean_tokens):
-                if skip_next:
-                    skip_next = False
-                    continue
-                token_lower = token.lower()
-                # Skip system prompt flags and their values
-                if token_lower in ("--system-prompt", "--append-system-prompt"):
-                    # Only skip next token if it's not another flag (it's the value)
-                    if i + 1 < len(spec.clean_tokens):
-                        next_token = spec.clean_tokens[i + 1]
-                        if not next_token.startswith("-"):
-                            skip_next = True
-                    continue
-                if token_lower.startswith(("--system-prompt=", "--append-system-prompt=")):
-                    continue
-                tokens.append(token)
-
-            # Add UI state system prompts
-            if self.state.launch.system_prompt:
-                tokens.extend(["--system-prompt", self.state.launch.system_prompt])
-            if self.state.launch.append_system_prompt:
-                tokens.extend(["--append-system-prompt", self.state.launch.append_system_prompt])
-
-            # Re-parse to get proper spec
-            spec = resolve_claude_args(tokens, None)
-
-            # Build preview
-            parts = []
-
-            # Environment variables (read from config_fields - source of truth)
-            env_parts = []
-            tag = self.state.config_edit.get("HCOM_TAG", "")
-            if tag:
-                tag_display = tag if len(tag) <= 15 else tag[:12] + "..."
-                env_parts.append(f"HCOM_TAG={tag_display}")
-            if env_parts:
-                parts.append(" ".join(env_parts))
-
-            # Base command
-            parts.append(f"hcom {count}")
-
-            # Claude args from spec (truncate long values for preview)
-            tokens = spec.rebuild_tokens()
-            if tokens:
-                preview_tokens = []
-                for token in tokens:
-                    if len(token) > 30:
-                        preview_tokens.append(f'"{token[:27]}..."')
-                    elif " " in token:
-                        preview_tokens.append(f'"{token}"')
-                    else:
-                        preview_tokens.append(token)
-                parts.append("claude " + " ".join(preview_tokens))
-
-            return " ".join(parts)
-        except Exception:
-            return "(preview unavailable - check HCOM_CLAUDE_ARGS)"
-
     def get_current_field_info(self) -> tuple[str, str, int] | None:
         """Get (field_key, field_value, cursor_pos) for currently selected field, or None"""
         if self.state.launch.current_field == LaunchField.CLAUDE_SECTION and self.state.launch.claude_cursor >= 0:
@@ -1508,9 +1398,9 @@ class LaunchScreen:
         if tool == "codex":
             # Codex: similar to Claude with system prompt and sandbox mode
             sandbox_hints = {
-                "workspace": "←→ normal codex - edits auto-approved",
-                "untrusted": "←→ read-only - edits need Y/n approval",
-                "danger-full-access": "←→ full access (needed for Codex launches)",
+                "workspace": "←→ Default - auto-approve in workspace + allow hcom",
+                "untrusted": "←→ Read only - edits need Y/n approval + allow hcom",
+                "danger-full-access": "←→ Full Access - no sandbox (may be needed for Codex to launch agents)",
                 "none": "←→ raw codex (hcom may not work)",
             }
             current_sandbox_mode = self.state.config_edit.get("HCOM_CODEX_SANDBOX_MODE", "workspace")
@@ -1634,9 +1524,9 @@ class LaunchScreen:
             value = self.state.config_edit.get(key, "")
             if key == "HCOM_CODEX_SANDBOX_MODE":
                 sandbox_hints = {
-                    "workspace": "←→ normal codex - edits auto-approved",
-                    "untrusted": "←→ read-only - edits need Y/n approval",
-                    "danger-full-access": "←→ full access (needed for Codex launches)",
+                    "workspace": "←→ Default - auto-approve in workspace + allow hcom",
+                    "untrusted": "←→ Read only - edits need Y/n approval + allow hcom",
+                    "danger-full-access": "←→ Full Access - no sandbox (may be needed for Codex to launch agents)",
                     "none": "←→ raw codex (hcom may not work)",
                 }
                 hint_val = sandbox_hints.get(value or "workspace", hint_val)

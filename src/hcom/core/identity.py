@@ -201,6 +201,29 @@ def resolve_identity(
             log_warn("identity", "resolve.process_instance_missing", process_id=process_id, bound_name=bound_name)
             raise HcomError(instance_not_found_error(bound_name))
         log_info("identity", "resolve", method="process_binding", name=bound_name, process_id=process_id)
+
+        # Opportunistic session binding for Codex (no SessionStart hook).
+        # First hcom command the Codex agent runs triggers this.
+        if not bound_data.get("session_id"):
+            from .thread_context import get_codex_thread_id
+
+            codex_thread_id = get_codex_thread_id()
+            if codex_thread_id:
+                try:
+                    from .instances import bind_session_to_process
+
+                    # bind_session_to_process handles session binding internally
+                    # and may switch to canonical instance (resume scenario)
+                    resolved = bind_session_to_process(codex_thread_id, process_id)
+                    if resolved and resolved != bound_name:
+                        bound_name = resolved
+                        bound_data = load_instance_position(bound_name) or bound_data
+                    if bound_data:
+                        bound_data["session_id"] = codex_thread_id
+                    log_info("identity", "resolve.codex_session_bind", name=bound_name, thread_id=codex_thread_id)
+                except Exception as e:
+                    log_warn("identity", "resolve.codex_session_bind_fail", error=str(e))
+
         # Row exists = participating
         return SenderIdentity(
             kind="instance",

@@ -780,7 +780,7 @@ def ensure_hooks_current() -> bool:
         config = get_config()
         include_permissions = config.auto_approve
     except Exception:
-        include_permissions = True  # Default to enabled
+        include_permissions = False
 
     # Check if hooks exist and are current
     needs_update = False

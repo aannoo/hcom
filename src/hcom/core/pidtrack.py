@@ -53,7 +53,8 @@ def _write_raw(data: dict[str, dict]) -> None:
 
 
 def record_pid(pid: int, tool: str, name: str, directory: str = "", process_id: str = "",
-               terminal_preset: str = "", pane_id: str = "") -> None:
+               terminal_preset: str = "", pane_id: str = "", terminal_id: str = "",
+               kitty_listen_on: str = "") -> None:
     """Record a launched process PID."""
     data = _read_raw()
     key = str(pid)
@@ -67,6 +68,10 @@ def record_pid(pid: int, tool: str, name: str, directory: str = "", process_id: 
             data[key]["terminal_preset"] = terminal_preset
         if pane_id and not data[key].get("pane_id"):
             data[key]["pane_id"] = pane_id
+        if terminal_id and not data[key].get("terminal_id"):
+            data[key]["terminal_id"] = terminal_id
+        if kitty_listen_on and not data[key].get("kitty_listen_on"):
+            data[key]["kitty_listen_on"] = kitty_listen_on
     else:
         entry: dict = {
             "tool": tool,
@@ -80,20 +85,14 @@ def record_pid(pid: int, tool: str, name: str, directory: str = "", process_id: 
             entry["terminal_preset"] = terminal_preset
         if pane_id:
             entry["pane_id"] = pane_id
+        if terminal_id:
+            entry["terminal_id"] = terminal_id
+        if kitty_listen_on:
+            entry["kitty_listen_on"] = kitty_listen_on
         data[key] = entry
     _write_raw(data)
     _invalidate_cache()
 
-
-def append_name(pid: int, name: str) -> None:
-    """Add an instance name association to an existing PID entry."""
-    data = _read_raw()
-    key = str(pid)
-    if key in data:
-        if name not in data[key].get("names", []):
-            data[key].setdefault("names", []).append(name)
-            _write_raw(data)
-            _invalidate_cache()
 
 
 def get_orphan_processes(active_pids: set[int] | None = None) -> list[dict]:
@@ -135,6 +134,8 @@ def get_orphan_processes(active_pids: set[int] | None = None) -> list[dict]:
             "process_id": info.get("process_id", ""),
             "terminal_preset": info.get("terminal_preset", ""),
             "pane_id": info.get("pane_id", ""),
+            "terminal_id": info.get("terminal_id", ""),
+            "kitty_listen_on": info.get("kitty_listen_on", ""),
         })
 
     _cache = result
@@ -200,6 +201,18 @@ def get_process_id_for_pid(pid: int) -> str:
     """Get HCOM process ID for a tracked PID."""
     data = _read_raw()
     return data.get(str(pid), {}).get("process_id", "")
+
+
+def get_terminal_id_for_pid(pid: int) -> str:
+    """Get captured terminal ID (stdout from open command) for a tracked PID."""
+    data = _read_raw()
+    return data.get(str(pid), {}).get("terminal_id", "")
+
+
+def get_kitty_listen_on_for_pid(pid: int) -> str:
+    """Get KITTY_LISTEN_ON socket path for a tracked PID."""
+    data = _read_raw()
+    return data.get(str(pid), {}).get("kitty_listen_on", "")
 
 
 def _invalidate_cache() -> None:

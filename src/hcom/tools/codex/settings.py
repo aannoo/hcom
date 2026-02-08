@@ -32,7 +32,6 @@ from pathlib import Path
 from ...core.tool_utils import (
     build_hcom_command,
     build_codex_rules,
-    build_hcom_hook_patterns,
 )
 from ...core.paths import atomic_write
 
@@ -47,8 +46,6 @@ CODEX_HOOK_CONFIGS = [
 # Derived from CODEX_HOOK_CONFIGS
 CODEX_HOOK_COMMANDS = [cfg[1] for cfg in CODEX_HOOK_CONFIGS]
 
-# Hook detection patterns (generated from shared builder)
-CODEX_HCOM_HOOK_PATTERNS = build_hcom_hook_patterns("codex", CODEX_HOOK_COMMANDS)
 
 # ==================== Codex Settings Access ====================
 

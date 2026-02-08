@@ -16,6 +16,7 @@ from ...shared import (
 )
 from ...core.thread_context import get_hcom_go
 from ...core.instances import (
+    get_full_name,
     load_instance_position,
     resolve_display_name,
     is_subagent_instance,
@@ -35,7 +36,7 @@ def _print_stop_preview(target: str, instances: list[dict], target_names: list[s
     """
     hcom_cmd = build_hcom_command()
     count = len(instances)
-    names = [i["name"] for i in instances]
+    names = [get_full_name(i) or i["name"] for i in instances]
 
     # Categorize instances
     headless = [i for i in instances if i.get("background")]
@@ -174,15 +175,16 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         for instance_data in instances:
             # Row exists = participating (stop all instances)
             instance_name = instance_data["name"]
+            display_name = get_full_name(instance_data) or instance_name
             stop_instance(instance_name, initiated_by=launcher, reason="stop_all")
-            stopped_names.append(instance_name)
+            stopped_names.append(display_name)
             stopped_count += 1
 
             # Track background logs
             if instance_data.get("background"):
                 log_file = instance_data.get("background_log_file", "")
                 if log_file:
-                    bg_logs.append((instance_name, log_file))
+                    bg_logs.append((display_name, log_file))
 
         if stopped_count == 0:
             print("Nothing to stop")
@@ -226,10 +228,11 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         log_info("lifecycle", "stop.tag", tag=tag, count=len(tag_matches), initiated_by=launcher)
         for inst in tag_matches:
             name = inst["name"]
+            display_name = get_full_name(inst) or name
             stop_instance(name, initiated_by=launcher, reason="tag_stop")
-            stopped_names.append(name)
+            stopped_names.append(display_name)
             if inst.get("background") and inst.get("background_log_file"):
-                bg_logs.append((name, inst["background_log_file"]))
+                bg_logs.append((display_name, inst["background_log_file"]))
 
         print(f"Stopped tag:{tag}: {', '.join(stopped_names)}")
         if bg_logs:
@@ -276,14 +279,15 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         bg_logs = []
         for inst in instances_to_stop:
             name = inst["name"]
+            display_name = get_full_name(inst) or name
             # Skip remote instances in multi-stop
             if inst.get("origin_device_id"):
-                print(f"Skipping remote instance: {name}")
+                print(f"Skipping remote instance: {display_name}")
                 continue
             stop_instance(name, initiated_by=launcher, reason="multi_stop")
-            stopped_names.append(name)
+            stopped_names.append(display_name)
             if inst.get("background") and inst.get("background_log_file"):
-                bg_logs.append((name, inst["background_log_file"]))
+                bg_logs.append((display_name, inst["background_log_file"]))
 
         if stopped_names:
             print(f"Stopped: {', '.join(stopped_names)}")
@@ -363,14 +367,15 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     reason = "external" if is_external_stop else "self"
 
     # Check if this is a subagent
+    display_name = get_full_name(position) or instance_name
     log_info("lifecycle", "stop.single", name=instance_name, reason=reason, initiated_by=launcher)
     if is_subagent_instance(position):
         stop_instance(instance_name, initiated_by=launcher, reason=reason)
-        print(f"Stopped hcom for subagent {instance_name}.")
+        print(f"Stopped hcom for subagent {display_name}.")
     else:
         # Regular parent instance
         stop_instance(instance_name, initiated_by=launcher, reason=reason)
-        print(f"Stopped hcom for {instance_name}.")
+        print(f"Stopped hcom for {display_name}.")
 
     # Show background log location if applicable
     if position.get("background"):
@@ -416,19 +421,21 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     target = args_without_flags[0]
 
-    def _kill_instance(name: str, pid: int) -> bool:
+    def _kill_instance(name: str, pid: int, display: str = "") -> bool:
         """Kill a single instance. Returns True on success."""
         from ...core.log import log_info, log_warn
         from ...terminal import KillResult, kill_process, resolve_terminal_info
 
+        show = display or name
         info = resolve_terminal_info(name, pid)
         result, pane_closed = kill_process(pid, preset_name=info.preset_name, pane_id=info.pane_id,
-                              process_id=info.process_id, kitty_listen_on=info.kitty_listen_on)
+                              process_id=info.process_id, kitty_listen_on=info.kitty_listen_on,
+                              terminal_id=info.terminal_id)
         preset_name = info.preset_name
         pane_id = info.pane_id
         if result == KillResult.PERMISSION_DENIED:
             log_warn("lifecycle", "kill.permission_denied", name=name, pid=pid)
-            print(format_error(f"Permission denied to kill process group {pid} for '{name}'"), file=sys.stderr)
+            print(format_error(f"Permission denied to kill process group {pid} for '{show}'"), file=sys.stderr)
             return False
         log_info("lifecycle", "kill", name=name, pid=pid, result=result.name, pane_closed=pane_closed)
         if pane_closed:
@@ -438,9 +445,9 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         else:
             pane_info = ""
         if result == KillResult.ALREADY_DEAD:
-            print(f"Process group {pid} not found for '{name}' (already terminated){pane_info}")
+            print(f"Process group {pid} not found for '{show}' (already terminated){pane_info}")
         else:
-            print(f"Sent SIGTERM to process group {pid} for '{name}'{pane_info}")
+            print(f"Sent SIGTERM to process group {pid} for '{show}'{pane_info}")
         stop_instance(name, initiated_by=initiator, reason="killed")
         return True
 
@@ -456,7 +463,7 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             name = data.get("name")
             pid = data.get("pid")
             if name and pid:
-                if _kill_instance(name, pid):
+                if _kill_instance(name, pid, get_full_name(data) or name):
                     killed += 1
                 else:
                     failed += 1
@@ -468,7 +475,10 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             pid = orphan["pid"]
             o_preset = orphan.get("terminal_preset", "")
             o_pane = orphan.get("pane_id", "")
-            result, pane_closed = kill_process(pid, preset_name=o_preset, pane_id=o_pane, process_id=orphan.get("process_id", ""))
+            result, pane_closed = kill_process(pid, preset_name=o_preset, pane_id=o_pane,
+                                               process_id=orphan.get("process_id", ""),
+                                               kitty_listen_on=orphan.get("kitty_listen_on", ""),
+                                               terminal_id=orphan.get("terminal_id", ""))
             if result == KillResult.PERMISSION_DENIED:
                 failed += 1
                 continue
@@ -504,14 +514,15 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         failed = 0
         for inst in tag_matches:
             name = inst.get("name")
+            show = get_full_name(inst) or name
             pid = inst.get("pid")
             if name and pid:
-                if _kill_instance(name, pid):
+                if _kill_instance(name, pid, show or name):
                     killed += 1
                 else:
                     failed += 1
             elif name:
-                print(format_error(f"Cannot kill '{name}' - no tracked process. Use 'hcom stop {name}' instead."),
+                print(format_error(f"Cannot kill '{show or name}' - no tracked process. Use 'hcom stop {name}' instead."),
                       file=sys.stderr)
                 failed += 1
         if killed == 0 and failed == 0:
@@ -527,13 +538,14 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     position = load_instance_position(target)
     if position:
         pid = position.get("pid")
+        show = get_full_name(position) or target
         if not pid:
             print(
-                format_error(f"Cannot kill '{target}' - no tracked process. Use 'hcom stop {target}' instead."),
+                format_error(f"Cannot kill '{show}' - no tracked process. Use 'hcom stop {target}' instead."),
                 file=sys.stderr,
             )
             return 1
-        return 0 if _kill_instance(target, pid) else 1
+        return 0 if _kill_instance(target, pid, show) else 1
 
     # Not an active instance — check orphan processes (stopped but still running)
     from ...core.pidtrack import get_orphan_processes, remove_pid
@@ -545,7 +557,10 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             from ...terminal import KillResult, kill_process
             o_preset = orphan.get("terminal_preset", "")
             o_pane = orphan.get("pane_id", "")
-            result, pane_closed = kill_process(pid, preset_name=o_preset, pane_id=o_pane, process_id=orphan.get("process_id", ""))
+            result, pane_closed = kill_process(pid, preset_name=o_preset, pane_id=o_pane,
+                                               process_id=orphan.get("process_id", ""),
+                                               kitty_listen_on=orphan.get("kitty_listen_on", ""),
+                                               terminal_id=orphan.get("terminal_id", ""))
             if result == KillResult.PERMISSION_DENIED:
                 print(format_error(f"Permission denied to kill process group {pid}"), file=sys.stderr)
                 return 1

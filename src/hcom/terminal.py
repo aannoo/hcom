@@ -40,13 +40,15 @@ class KillResult(enum.Enum):
 
 class TerminalInfo:
     """Terminal info resolved for an instance."""
-    __slots__ = ("preset_name", "pane_id", "process_id", "kitty_listen_on")
+    __slots__ = ("preset_name", "pane_id", "process_id", "kitty_listen_on", "terminal_id")
 
-    def __init__(self, preset_name: str = "", pane_id: str = "", process_id: str = "", kitty_listen_on: str = ""):
+    def __init__(self, preset_name: str = "", pane_id: str = "", process_id: str = "",
+                 kitty_listen_on: str = "", terminal_id: str = ""):
         self.preset_name = preset_name
         self.pane_id = pane_id
         self.process_id = process_id
         self.kitty_listen_on = kitty_listen_on
+        self.terminal_id = terminal_id
 
 
 def resolve_terminal_info(name: str, pid: int) -> TerminalInfo:
@@ -69,6 +71,7 @@ def resolve_terminal_info(name: str, pid: int) -> TerminalInfo:
                 info.preset_name = lc_data.get("terminal_preset", "")
                 info.pane_id = lc_data.get("pane_id", "")
                 info.process_id = lc_data.get("process_id", "")
+                info.terminal_id = lc_data.get("terminal_id", "")
                 # Extract KITTY_LISTEN_ON from captured env
                 lc_env = lc_data.get("env", {})
                 info.kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
@@ -77,11 +80,15 @@ def resolve_terminal_info(name: str, pid: int) -> TerminalInfo:
 
     # Fallback: pidtrack (for orphans after stop deleted the DB row)
     if not info.preset_name:
-        from .core.pidtrack import get_pane_id_for_pid, get_preset_for_pid, get_process_id_for_pid
+        from .core.pidtrack import get_pane_id_for_pid, get_preset_for_pid, get_process_id_for_pid, get_terminal_id_for_pid, get_kitty_listen_on_for_pid
         info.preset_name = get_preset_for_pid(pid) or ""
         info.pane_id = get_pane_id_for_pid(pid)
         if not info.process_id:
             info.process_id = get_process_id_for_pid(pid)
+        if not info.terminal_id:
+            info.terminal_id = get_terminal_id_for_pid(pid)
+        if not info.kitty_listen_on:
+            info.kitty_listen_on = get_kitty_listen_on_for_pid(pid)
 
     # Fallback: process_bindings table (for process_id if not in launch_context)
     if not info.process_id:
@@ -229,20 +236,46 @@ def resolve_terminal_preset(preset_name: str) -> str | None:
     return open_cmd
 
 
+def _find_kitten_binary() -> str | None:
+    """Find kitten binary — PATH first, then macOS app bundle."""
+    path_kitten = shutil.which("kitten")
+    if path_kitten:
+        return path_kitten
+    if platform.system() == "Darwin":
+        app = _find_macos_app("kitty")
+        if app:
+            full = app / "Contents" / "MacOS" / "kitten"
+            if full.exists():
+                return str(full)
+    return None
+
+
 def _find_kitty_socket() -> str:
     """Find a reachable kitty remote control socket. Returns 'unix:<path>' or ''."""
-    for sock_path in ("/tmp/kitty",):
-        if Path(sock_path).exists():
-            socket_uri = f"unix:{sock_path}"
-            try:
-                result = subprocess.run(
-                    ["kitten", "@", "--to", socket_uri, "ls"],
-                    capture_output=True, timeout=2,
-                )
-                if result.returncode == 0:
-                    return socket_uri
-            except Exception:
-                pass
+    import glob as _glob
+    import stat
+
+    kitten = _find_kitten_binary()
+    if not kitten:
+        return ""
+
+    candidates = sorted(_glob.glob("/tmp/kitty*"), reverse=True)
+    for sock_path in candidates:
+        try:
+            if not stat.S_ISSOCK(os.stat(sock_path).st_mode):
+                continue
+        except OSError:
+            continue
+        socket_uri = f"unix:{sock_path}"
+        try:
+            result = subprocess.run(
+                [kitten, "@", "--to", socket_uri, "ls"],
+                capture_output=True, timeout=2,
+            )
+            if result.returncode == 0:
+                return socket_uri
+        except Exception:
+            pass
     return ""
 
 
@@ -272,10 +305,10 @@ def detect_terminal_from_env() -> str | None:
 
 
 def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_id: str = "",
-                        kitty_listen_on: str = "") -> bool:
+                        kitty_listen_on: str = "", terminal_id: str = "") -> bool:
     """Run terminal-specific close command before SIGTERM.
 
-    Must run before SIGTERM because terminal CLIs match panes by PID, pane_id, or process_id.
+    Must run before SIGTERM because terminal CLIs match panes by PID, pane_id, process_id, or terminal_id.
     Returns True if close command ran successfully, False otherwise.
     Non-fatal: caller should always proceed with SIGTERM regardless.
     """
@@ -297,10 +330,13 @@ def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_i
         return False
     if "{process_id}" in close_cmd and not process_id:
         return False
+    if "{id}" in close_cmd and not terminal_id:
+        return False
 
     close_cmd = close_cmd.replace("{pid}", str(pid))
     close_cmd = close_cmd.replace("{pane_id}", pane_id)
     close_cmd = close_cmd.replace("{process_id}", process_id)
+    close_cmd = close_cmd.replace("{id}", terminal_id)
 
     # Resolve binary path (app bundle fallback on macOS)
     binary = preset.get("binary")
@@ -339,7 +375,7 @@ def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_i
 
 
 def kill_process(pid: int, preset_name: str = "", pane_id: str = "", process_id: str = "",
-                 kitty_listen_on: str = "") -> tuple[KillResult, bool]:
+                 kitty_listen_on: str = "", terminal_id: str = "") -> tuple[KillResult, bool]:
     """Close terminal pane (if applicable) then SIGTERM the process group.
 
     Returns (kill_result, pane_closed) tuple.
@@ -347,7 +383,7 @@ def kill_process(pid: int, preset_name: str = "", pane_id: str = "", process_id:
     pane_closed = False
     if preset_name:
         pane_closed = close_terminal_pane(pid, preset_name, pane_id=pane_id, process_id=process_id,
-                                          kitty_listen_on=kitty_listen_on)
+                                          kitty_listen_on=kitty_listen_on, terminal_id=terminal_id)
     try:
         os.killpg(pid, signal.SIGTERM)
         return KillResult.SENT, pane_closed
@@ -958,7 +994,9 @@ def launch_terminal(
         # Our argv commands - safe execution without shell
         final_argv = [arg.replace("{script}", script_file) for arg in custom_cmd]
         try:
-            return _spawn_terminal_process(final_argv, format_error)
+            success, captured_id = _spawn_terminal_process(final_argv, format_error)
+            _write_terminal_id(env, captured_id)
+            return success
         except HcomError:
             raise
         except Exception as e:
@@ -972,19 +1010,38 @@ def launch_terminal(
             return False
 
         try:
-            return _spawn_terminal_process(final_argv, format_error)
+            success, captured_id = _spawn_terminal_process(final_argv, format_error)
+            _write_terminal_id(env, captured_id)
+            return success
         except HcomError:
             raise
         except Exception as e:
             raise HcomError(format_error(f"Failed to execute terminal command: {e}"))
 
 
-def _spawn_terminal_process(argv: list[str], format_error) -> bool:
+def _write_terminal_id(env: dict[str, str], captured_id: str) -> None:
+    """Write captured terminal ID (stdout from open command) to temp file for child to read."""
+    if not captured_id:
+        return
+    process_id = env.get("HCOM_PROCESS_ID", "")
+    if not process_id:
+        return
+    ids_dir = Path(hcom_path(".tmp", "terminal_ids"))
+    ids_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (ids_dir / process_id).write_text(captured_id)
+    except OSError:
+        pass
+
+
+def _spawn_terminal_process(argv: list[str], format_error) -> tuple[bool, str]:
     """Spawn terminal process, detached when inside AI tools.
 
     When running inside Gemini/Codex/Claude, their PTY wrappers capture
     subprocess output and render it in their TUI (blocking the screen).
     Solution: fully detach with Popen + start_new_session + DEVNULL.
+
+    Returns (success, stdout_first_line) — stdout captured for {id} in close commands.
     """
     from .shared import is_inside_ai_tool
     from .core.log import log_info, log_warn
@@ -999,12 +1056,14 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
             pid=process.pid,
             platform="Windows",
         )
-        return True  # Popen is non-blocking, can't check success
+        return True, ""  # Popen is non-blocking, can't check success
 
     if is_inside_ai_tool():
         # Fully detach: don't let AI tool's PTY capture our output
         stderr_path = None
         stderr_handle = None
+        stdout_path = None
+        stdout_handle = None
         try:
             stderr_handle = tempfile.NamedTemporaryFile(
                 prefix="hcom_terminal_launch_",
@@ -1016,6 +1075,17 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
         except Exception:
             stderr_handle = None
             stderr_path = None
+        try:
+            stdout_handle = tempfile.NamedTemporaryFile(
+                prefix="hcom_terminal_stdout_",
+                suffix=".txt",
+                dir=str(hcom_path(LAUNCH_DIR)),
+                delete=False,
+            )
+            stdout_path = stdout_handle.name
+        except Exception:
+            stdout_handle = None
+            stdout_path = None
 
         popen_kwargs: dict[str, Any] = {}
         kitty_fd = _kitty_listen_fd()
@@ -1024,13 +1094,15 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
         process = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=stdout_handle or subprocess.DEVNULL,
             stderr=stderr_handle or subprocess.DEVNULL,
             start_new_session=True,
             **popen_kwargs,
         )
         if stderr_handle:
             stderr_handle.close()
+        if stdout_handle:
+            stdout_handle.close()
 
         deadline = time.time() + 0.5
         returncode = None
@@ -1039,6 +1111,8 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
             if returncode is not None:
                 break
             time.sleep(0.05)
+
+        captured_stdout = ""
         if returncode is not None:
             stderr_text = ""
             if stderr_path:
@@ -1051,6 +1125,18 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
                     Path(stderr_path).unlink()
                 except OSError:
                     pass
+            if stdout_path:
+                raw = read_file_with_retry(
+                    Path(stdout_path),
+                    lambda f: f.read()[:1000],
+                    default="",
+                )
+                lines = raw.strip().splitlines()
+                captured_stdout = lines[0] if lines else ""
+                try:
+                    Path(stdout_path).unlink()
+                except OSError:
+                    pass
             if returncode == 0:
                 log_info(
                     "terminal",
@@ -1058,8 +1144,9 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
                     terminal_cmd=" ".join(argv),
                     returncode=returncode,
                     stderr=stderr_text,
+                    captured_stdout=captured_stdout,
                 )
-                return True
+                return True, captured_stdout
 
             log_warn(
                 "terminal",
@@ -1071,8 +1158,19 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
             error_msg = f"Terminal launch failed (exit code {returncode})" + (f": {stderr_text}" if stderr_text else "")
             from .core.thread_context import get_is_codex
             if argv and argv[0] == "open" and get_is_codex():
-                error_msg += " (Codex sandbox blocks LaunchServices; use Agent full access or run outside sandbox)"
+                error_msg += " (Codex sandbox blocks LaunchServices; set permissions -> full access in codex or set HCOM_TERMINAL to kitty or tmux)"
             raise HcomError(error_msg)
+
+        # Process still running after 0.5s — read stdout so far
+        if stdout_path:
+            raw = read_file_with_retry(
+                Path(stdout_path),
+                lambda f: f.read()[:1000],
+                default="",
+            )
+            lines = raw.strip().splitlines()
+            captured_stdout = lines[0] if lines else ""
+            # Don't delete — process may still write to it; it's in LAUNCH_DIR (cleaned on reset)
 
         log_info(
             "terminal",
@@ -1080,8 +1178,9 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
             terminal_cmd=" ".join(argv),
             pid=process.pid,
             stderr_path=stderr_path or "",
+            captured_stdout=captured_stdout,
         )
-        return True  # Fire and forget
+        return True, captured_stdout  # Fire and forget
 
     # Normal case: wait for terminal launcher to complete
     popen_kwargs_normal: dict[str, Any] = {}
@@ -1095,7 +1194,9 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
             f": {stderr_text}" if stderr_text else ""
         )
         raise HcomError(error_msg)
-    return True
+    lines = (result.stdout or "").strip().splitlines()
+    captured_stdout = lines[0] if lines else ""
+    return True, captured_stdout
 
 
 # ==================== Exports ====================

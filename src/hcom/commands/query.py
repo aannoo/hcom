@@ -672,10 +672,23 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
             headless_badge = "[headless]" if data.get("background", False) else ""
             remote_badge = "[remote]" if is_remote_instance(data) else ""
+            # Managed terminal badge (tmux/kitty/wezterm)
+            terminal_badge = ""
+            lc_str = data.get("launch_context", "")
+            if lc_str:
+                try:
+                    lc = json.loads(lc_str) if isinstance(lc_str, str) else lc_str
+                    preset = lc.get("terminal_preset", "")
+                    for prefix in ("tmux", "kitty", "wezterm"):
+                        if preset.startswith(prefix):
+                            terminal_badge = f"[{prefix}]"
+                            break
+                except (json.JSONDecodeError, TypeError):
+                    pass
             # Project tag badge (only when instances have different directories)
             project_tag = get_project_tag(data.get("directory", "")) if show_project else ""
             project_badge = f"· {project_tag}" if project_tag else ""
-            badge_parts = [b for b in [headless_badge, remote_badge, project_badge] if b]
+            badge_parts = [b for b in [headless_badge, remote_badge, terminal_badge, project_badge] if b]
             badge_str = (" " + " ".join(badge_parts)) if badge_parts else ""
 
             # Unread message indicator - messages queued for delivery on next hook/idle
@@ -803,6 +816,17 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     bind_str = format_binding_status(bindings)
                     print(f"    bindings:     {bind_str}")
 
+                    # Terminal preset
+                    lc_str = data.get("launch_context", "")
+                    if lc_str:
+                        try:
+                            lc = json.loads(lc_str) if isinstance(lc_str, str) else lc_str
+                            preset = lc.get("terminal_preset", "")
+                            if preset:
+                                print(f"    terminal:     {preset}")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
                     if log_file != "(none)":
                         print(f"    headless log: {log_file}")
                     print(f"    transcript:   {transcript}")
@@ -862,7 +886,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if current_name:
         from ..core.tips import maybe_show_tip
 
-        maybe_show_tip(current_name, "list", json_output=json_output)
+        maybe_show_tip(current_name, "list:types", json_output=json_output)
 
     return 0
 

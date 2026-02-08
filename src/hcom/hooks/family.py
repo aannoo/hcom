@@ -47,7 +47,13 @@ def _check_claude_alive(is_background: bool | None = None) -> bool:
     """Check if the parent Claude process is still alive (orphan detection).
 
     Prevents marking messages as read when Claude has died but the hook
-    process is still running. This avoids message loss. (not sure this is correct)
+    process is still running. This avoids message loss.
+
+    Limitation: sys.stdin.closed is a heuristic — stdin can stay open after
+    parent exits (inherited FDs) or close for unrelated reasons (pipe breakage).
+    Worst case is a false positive keeping the hook alive slightly longer.
+
+    Pointless seems likely what this is.
 
     Args:
         is_background: If True, always return True. If None, falls back to
@@ -55,10 +61,6 @@ def _check_claude_alive(is_background: bool | None = None) -> bool:
 
     Returns:
         True if Claude is alive (or if running headless), False if Claude died.
-
-    Detection method:
-        - Background instances: always return True (intentionally detached)
-        - Interactive instances: check if stdin is closed (Claude death signal)
     """
     # Background instances are intentionally detached
     if is_background is None:

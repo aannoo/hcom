@@ -58,8 +58,12 @@ def _start_adhoc_mode(tool: str = "adhoc", post_warning: str | None = None) -> i
     instance_name = generate_unique_name()
     log_info("lifecycle", "start.adhoc", name=instance_name, tool=tool)
 
-    # Get session_id from env (set by SessionStart hook via CLAUDE_ENV_FILE)
-    session_id = os.environ.get("HCOM_CLAUDE_UNIX_SESSION_ID")
+    # Get session_id from env
+    # Claude: HCOM_CLAUDE_UNIX_SESSION_ID (SessionStart hook writes to CLAUDE_ENV_FILE)
+    # Codex: CODEX_THREAD_ID (injected by Codex into all child process envs)
+    from ...core.thread_context import get_codex_thread_id
+
+    session_id = os.environ.get("HCOM_CLAUDE_UNIX_SESSION_ID") or get_codex_thread_id()
 
     # Create instance with detected tool type (row exists = participating)
     initialize_instance_in_position_file(

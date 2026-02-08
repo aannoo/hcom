@@ -44,13 +44,6 @@ TOOL_EXTRA_ENV: dict[str, dict[str, str]] = {
     "codex": {},
 }
 
-# Whether to apply Termux shebang bypass for the tool command
-TOOL_TERMUX_BYPASS: dict[str, bool] = {
-    "claude": False,
-    "gemini": True,
-    "codex": True,
-}
-
 
 # ==================== Runner Script Generation ====================
 

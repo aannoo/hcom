@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 
@@ -118,6 +119,20 @@ def capture_context() -> dict[str, Any]:
     hcom_process_id = get_process_id() or ""
     if hcom_process_id:
         ctx["process_id"] = hcom_process_id
+
+    # Terminal ID from parent's stdout capture (for custom preset {id} in close commands)
+    process_id_val = ctx.get("process_id", "")
+    if process_id_val:
+        from .paths import hcom_path
+        id_file = Path(hcom_path(".tmp", "terminal_ids", process_id_val))
+        if id_file.exists():
+            try:
+                terminal_id = id_file.read_text().strip()
+                if terminal_id:
+                    ctx["terminal_id"] = terminal_id
+                id_file.unlink()
+            except OSError:
+                pass
 
     return ctx
 

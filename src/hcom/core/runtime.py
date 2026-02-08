@@ -32,8 +32,7 @@ from .paths import hcom_path, CONFIG_FILE
 from ..shared import parse_env_file
 from .instances import load_instance_position
 
-# Re-export from bootstrap module for backward compatibility
-from .bootstrap import build_hcom_bootstrap_text, get_bootstrap  # noqa: F401
+from .bootstrap import get_bootstrap  # noqa: F401
 
 
 def build_claude_env() -> dict[str, str]:

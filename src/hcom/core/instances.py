@@ -333,14 +333,35 @@ def capture_and_store_launch_context(instance_name: str) -> None:
     """Capture environment context and store it for the instance.
 
     Captures git branch, terminal program, tty, and relevant env vars.
-    Used at instance creation/binding across all tool types (claude/gemini/codex).
+    Preserves pane_id and terminal_id from prior context if Python can't
+    recapture them (pane_id: launcher env lacks TMUX_PANE/WEZTERM_PANE;
+    terminal_id: one-shot file deleted on first read).
 
     Args:
         instance_name: Name of instance to update.
     """
-    from .context import capture_context_json
+    import json as _json
+    from .context import capture_context
 
-    update_instance_position(instance_name, {"launch_context": capture_context_json()})
+    new_ctx = capture_context()
+
+    # Preserve fields from Rust PTY early context that Python hook can't recapture
+    # (pane_id: Python runs in launcher env lacking TMUX_PANE/WEZTERM_PANE;
+    #  terminal_id: one-shot file deleted on first read)
+    preserve_keys = ("pane_id", "terminal_id")
+    missing = [k for k in preserve_keys if not new_ctx.get(k)]
+    if missing:
+        pos = load_instance_position(instance_name)
+        if pos:
+            try:
+                old_ctx = _json.loads(pos.get("launch_context") or "{}")
+                for k in missing:
+                    if old_ctx.get(k):
+                        new_ctx[k] = old_ctx[k]
+            except (ValueError, TypeError):
+                pass
+
+    update_instance_position(instance_name, {"launch_context": _json.dumps(new_ctx, separators=(",", ":"))})
 
 
 # ==================== Instance Helper Functions ====================
@@ -1265,16 +1286,10 @@ def _allocate_name(
     Uses softmax-like sampling from top-scored names to avoid
     always consuming gold names first while maintaining quality.
 
-    Similarity check (hamming ≤ 1) is applied against alive_names only,
-    and is a soft preference — the greedy fallback ignores it to avoid
-    pool exhaustion.
+    Three tiers: (1) weighted sampling + similarity, (2) greedy + similarity,
+    (3) greedy without similarity (last resort).
 
-    Args:
-        is_taken: Callback to check if name is already used (alive + stopped)
-        alive_names: Currently alive instance names (for similarity check only)
-        attempts: Max sampling attempts before greedy fallback
-        top_window: Only sample from top N ranked names
-        temperature: Higher = flatter distribution, lower = more greedy
+    Similarity check (hamming ≤ 2) is applied against alive_names only.
     """
     rng = random.Random()
 
@@ -1285,13 +1300,17 @@ def _allocate_name(
     # Softmax-like weights (numerically stable)
     weights = [math.exp((s - max_score) / temperature) for s in scores]
 
-    # Prefer dissimilar names, but similarity is soft (greedy fallback ignores it)
     for _ in range(attempts):
         choice = rng.choices(window, weights=weights, k=1)[0].name
         if not is_taken(choice) and not _is_too_similar(choice, alive_names):
             return choice
 
-    # Fallback: greedy scan, skip similarity check to guarantee allocation
+    # Greedy with similarity check
+    for item in _NAME_POOL:
+        if not is_taken(item.name) and not _is_too_similar(item.name, alive_names):
+            return item.name
+
+    # Last resort: ignore similarity to guarantee allocation
     for item in _NAME_POOL:
         if not is_taken(item.name):
             return item.name

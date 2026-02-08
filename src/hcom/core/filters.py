@@ -52,11 +52,6 @@ LIFE_FLAGS = {"action"}
 #   Codex: tool:apply_patch
 FILE_WRITE_CONTEXTS = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch')"
 
-# File read contexts:
-#   Claude: tool:Read
-#   Gemini: tool:read_file
-#   Codex: (none tracked)
-FILE_READ_CONTEXTS = "('tool:Read', 'tool:read_file')"
 
 # All file operation contexts (for queries and formatting)
 FILE_OP_CONTEXTS = (

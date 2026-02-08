@@ -136,6 +136,10 @@ CONFIG_FIELD_OVERRIDES = {
         "type": "text",
         "hint": "text string",
     },
+    "HCOM_NOTES": {
+        "type": "text",
+        "hint": "text string",
+    },
     "HCOM_TAG": {
         "type": "text",
         "allowed_chars": r"^[a-zA-Z0-9-]*$",

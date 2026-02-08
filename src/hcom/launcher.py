@@ -523,7 +523,7 @@ def launch(
     try:
         include_permissions = get_config().auto_approve
     except Exception:
-        include_permissions = True
+        include_permissions = False
 
     hooks_ok, hooks_error = _ensure_hooks_installed(normalized, include_permissions)
     if not hooks_ok:
@@ -539,6 +539,9 @@ def launch(
     base_env.update(build_claude_env())
     if env:
         base_env.update(env)
+    # Terminal override is launch-local: resolve from current process config,
+    # but do not export to launched agent environments.
+    base_env.pop("HCOM_TERMINAL", None)
 
     if tag is not None:
         # Explicit tag (including empty string) overrides any configured/default tag.

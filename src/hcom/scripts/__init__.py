@@ -270,6 +270,7 @@ Precedence: defaults < config.env < shell environment variables"""
         "HCOM_TAG",
         "HCOM_TERMINAL",
         "HCOM_HINTS",
+        "HCOM_NOTES",
         "HCOM_SUBAGENT_TIMEOUT",
         "HCOM_CLAUDE_ARGS",
         "HCOM_GEMINI_ARGS",

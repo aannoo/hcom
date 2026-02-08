@@ -245,6 +245,8 @@ def push(force: bool = False) -> tuple[bool, str | None]:
         timeout=3,
     )
     if status == 200:
+        # KV update after POST — if process dies here, events re-push next cycle.
+        # Pull-side dedup (monotonic event ID) handles duplicates on the receiver.
         _safe_kv_set("relay_last_push", str(time.time()))
         _safe_kv_set("relay_last_push_id", str(max_id))
         _set_relay_status("ok")

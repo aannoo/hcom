@@ -344,6 +344,8 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
             proc_id = ""
             terminal_preset = ""
             pane_id = ""
+            terminal_id = ""
+            kitty_listen_on = ""
             try:
                 import json as _json
                 lc = instance_data.get("launch_context", "")
@@ -352,6 +354,9 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
                     terminal_preset = lc_data.get("terminal_preset", "")
                     pane_id = lc_data.get("pane_id", "")
                     proc_id = lc_data.get("process_id", "")
+                    terminal_id = lc_data.get("terminal_id", "")
+                    lc_env = lc_data.get("env", {})
+                    kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
             except Exception:
                 pass
             # Fallback: process_bindings table (if process_id not in launch_context)
@@ -368,7 +373,8 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
                     pass
             record_pid(pid, instance_data.get("tool", "claude"), instance_name,
                        instance_data.get("directory", ""), process_id=proc_id,
-                       terminal_preset=terminal_preset, pane_id=pane_id)
+                       terminal_preset=terminal_preset, pane_id=pane_id,
+                       terminal_id=terminal_id, kitty_listen_on=kitty_listen_on)
             log_info("stop", "pidtrack_recorded", pid=pid, instance=instance_name,
                      preset=terminal_preset, pane_id=pane_id)
         except (ProcessLookupError, PermissionError):

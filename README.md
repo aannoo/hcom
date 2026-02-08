@@ -161,7 +161,7 @@ HCOM_DIR=$PWD/.hcom                # for sandbox or project local
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.14 - multi-agent communication
+hcom (hook-comms) v0.6.16 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
@@ -503,6 +503,7 @@ Global settings:
     HCOM_TAG                       Group tag (agents become tag-*)
     HCOM_TERMINAL                  default | <preset> | "cmd {script}"
     HCOM_HINTS                     Text appended to all messages agent receives
+    HCOM_NOTES                     One-time notes appended to bootstrap
     HCOM_SUBAGENT_TIMEOUT          Subagent keep-alive seconds after task
     HCOM_CLAUDE_ARGS               Default claude args (e.g. "--model opus")
     HCOM_GEMINI_ARGS               Default gemini args
@@ -597,13 +598,15 @@ Usage:
     HCOM_TAG=api hcom 2 claude     Group tag (creates api-*)
     hcom 1 claude --agent <name>   .claude/agents/<name>.md
     hcom 1 claude --system-prompt "text" System prompt
+    HCOM_TERMINAL=tmux hcom 1 claude detached tmux launch
 
 
 Environment:
-    HCOM_TAG                       Group tag (agents become tag-*)
+    HCOM_TAG                       Group/label tag (agents become tag-*)
     HCOM_TERMINAL                  default | <preset> | "cmd {script}"
     HCOM_CLAUDE_ARGS               Default args (merged with CLI)
     HCOM_HINTS                     Appended to messages received
+    HCOM_NOTES                     One-time bootstrap notes
     HCOM_SUBAGENT_TIMEOUT          Seconds subagents are keep-alive after task
 
 
@@ -624,6 +627,7 @@ Usage:
     hcom N gemini -i "initial prompt" Initial prompt (-i flag required)
     hcom N gemini --yolo           Flags forwarded to gemini
     HCOM_TAG=api hcom 2 gemini     Group tag (creates api-*)
+    HCOM_TERMINAL=tmux hcom 1 gemini detached tmux launch
 
 
 Environment:
@@ -631,6 +635,7 @@ Environment:
     HCOM_TERMINAL                  default | <preset> | "cmd {script}"
     HCOM_GEMINI_ARGS               Default args (merged with CLI)
     HCOM_HINTS                     Appended to messages received
+    HCOM_NOTES                     One-time bootstrap notes
     HCOM_GEMINI_SYSTEM_PROMPT      Use this for system prompt
 
 
@@ -651,6 +656,7 @@ Usage:
     hcom N codex "initial prompt"  Initial prompt (positional)
     hcom codex --sandbox danger-full-access Flags forwarded to codex
     HCOM_TAG=api hcom 2 codex      Group tag (creates api-*)
+    HCOM_TERMINAL=tmux hcom 1 codex detached tmux launch
 
 
 Environment:
@@ -658,6 +664,7 @@ Environment:
     HCOM_TERMINAL                  default | <preset> | "cmd {script}"
     HCOM_CODEX_ARGS                Default args (merged with CLI)
     HCOM_HINTS                     Appended to messages received
+    HCOM_NOTES                     One-time bootstrap notes
     HCOM_CODEX_SYSTEM_PROMPT       System prompt (env var or config)
 
 
@@ -757,62 +764,41 @@ Allowed characters: letters, numbers, hyphens (a-z, A-Z, 0-9, -)
 
 ## HCOM_TERMINAL
 
-HCOM_TERMINAL - Terminal for launching new instances
+HCOM_TERMINAL — where hcom opens new agent windows
 
-Current value: Use 'hcom config terminal' to see current value
+Current: default (Terminal.app)
 
-Values:
-  default         Use platform default terminal
-  <preset>        Use a named preset (see list below)
-  <command>       Custom command with {script} placeholder
+Managed (open + close on kill):
+  kitty          auto split/tab/window
+  wezterm        auto tab/split/window
+  tmux           detached sessions
 
-Available presets:
-  default              Platform default (Terminal.app / wt / gnome-terminal)
-  Terminal.app         macOS Terminal
-  iTerm                macOS iTerm2
-  Ghostty              Fast GPU-accelerated terminal
-  kitty                Auto: split if inside, tab if reachable, else new window
-  kitty-window         Always new kitty OS window
-  wezterm              Auto: split if inside, tab if reachable, else new window
-  wezterm-window       Always new WezTerm OS window
-  alacritty            Minimal GPU-accelerated terminal
-  ttab                 Open in new tab (npm install -g ttab)
-  tmux
-  tmux-split           Split current tmux pane horizontally
-  wezterm-tab          New tab in WezTerm (requires wezterm CLI)
-  wezterm-split
-  kitty-tab            New tab in kitty (requires kitten CLI)
-  kitty-split          Split pane in kitty (requires kitten CLI)
-  custom               Custom command (see below)
+  Variants:
+    kitty: kitty-window, kitty-tab, kitty-split
+    wezterm: wezterm-window, wezterm-tab, wezterm-split
+    tmux: tmux-split
 
-------------------------------------------------------------------------
-CUSTOM TERMINAL SETUP
-------------------------------------------------------------------------
+Other (opens window only):
+  Terminal.app
+  iTerm
+  Ghostty
+  alacritty
+  ttab               npm install -g ttab
 
-To use a terminal not in the presets list, set a custom command.
-The command MUST include {script} where the launch script path goes.
+Custom command (open only):
+  hcom config terminal "my-terminal -e bash {script}"
 
-How it works:
-  1. hcom creates a bash script with the claude/gemini/codex command
-  2. Your terminal command is executed with {script} replaced by script path
-  3. The terminal runs the script, which starts the AI tool
+Custom preset with close (~/.hcom/settings.toml):
+  [terminal.myterm]
+  open = "myterm spawn -- bash {script}"
+  close = "myterm kill --id {id}"
+  binary = "myterm"
 
-Examples (what the presets are):
-  ghostty:        open -na Ghostty.app --args -e bash {script}
-  kitty:          kitty {script}
-  alacritty:      alacritty -e bash {script}
-  gnome-terminal: gnome-terminal --window -- bash {script}
-  wezterm:        wezterm start -- bash {script}
+  {id} = stdout from the open command.
+  {pid} and {process_id} also available.
 
-Testing your command:
-  1. Set the terminal: hcom config terminal "your-command {script}"
-  2. Launch a test: hcom 1 claude
-  3. If it fails, check that:
-     - The terminal binary/app exists
-     - {script} is in the right position
-
-Reset to default:
-  hcom config terminal default
+Set:    hcom config terminal kitty
+Reset:  hcom config terminal default
 
 ## HCOM_HINTS
 
@@ -835,6 +821,20 @@ Notes:
   - Hints are appended to message content, not system prompt
   - Each agent can have different hints (set via hcom config -i <name> hints)
   - Global hints apply to all new launches
+
+## HCOM_NOTES
+
+HCOM_NOTES - One-time notes appended to bootstrap
+
+  Custom text added to agent system context at startup.
+  Unlike HCOM_HINTS (per-message), this is injected once and does not repeat.
+
+Usage:
+  hcom config notes "Always check hcom list before spawning new agents"
+  hcom config notes ""                            # Clear
+  HCOM_NOTES="tips" hcom 1 claude                 # Per-launch override
+
+  Changing after launch has no effect (bootstrap already delivered).
 
 ## HCOM_SUBAGENT_TIMEOUT
 
@@ -1451,8 +1451,8 @@ pip install maturin
 maturin build --release
 ```
 
-
 </details>
+
 
 ---
 ## License

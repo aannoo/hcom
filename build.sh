@@ -29,7 +29,7 @@ copy_to_bundled() {
 }
 
 restart_daemon() {
-    if pgrep -f 'python.*hcom\.daemon' >/dev/null 2>&1; then
+    if pgrep -f 'hcom\.daemon' >/dev/null 2>&1; then
         echo "Restarting daemon..."
         hcom daemon restart 2>/dev/null || true
     fi

@@ -21,7 +21,7 @@ user_hook_names = st.text(
     alphabet="abcdefghijklmnopqrstuvwxyz-_",
     min_size=3,
     max_size=20,
-).filter(lambda x: not x.startswith("hcom"))
+).filter(lambda x: "hcom" not in x)
 
 # Random commands (non-hcom)
 user_commands = st.text(
@@ -86,7 +86,9 @@ def random_claude_settings():
             }), max_size=2) for ht in claude_hook_types[:3]
         }),
         "env": st.dictionaries(
-            st.text(alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ_", min_size=3, max_size=10),
+            st.text(alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ_", min_size=3, max_size=10).filter(
+                lambda x: not x.startswith("HCOM")
+            ),
             st.text(min_size=1, max_size=20),
             max_size=3,
         ),

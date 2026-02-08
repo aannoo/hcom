@@ -9,123 +9,229 @@ from .utils import format_error
 from ..shared import CommandContext
 
 
+# ==================== Terminal Config Helpers ====================
+
+# Managed parent presets (recommended in bare get — auto split/tab/window + close on kill)
+_MANAGED_PARENTS = ("kitty", "wezterm", "tmux")
+
+_MANAGED_VARIANTS = {
+    "kitty": ("kitty-window", "kitty-tab", "kitty-split"),
+    "wezterm": ("wezterm-window", "wezterm-tab", "wezterm-split"),
+    "tmux": ("tmux-split",),
+}
+
+_MANAGED_DESCS = {
+    "kitty": "auto split/tab/window",
+    "wezterm": "auto tab/split/window",
+    "tmux": "detached sessions",
+}
+
+
+def _resolve_default_terminal_name() -> str:
+    """Human name for what 'default' resolves to on this platform."""
+    import platform as _platform
+
+    system = _platform.system()
+    if system == "Darwin":
+        return "Terminal.app"
+    elif system == "Windows":
+        return "Windows Terminal" if shutil.which("wt") else "cmd"
+    else:
+        for name in ("gnome-terminal", "konsole", "xterm"):
+            if shutil.which(name):
+                return name
+        return "system terminal"
+
+
+def _is_managed_preset(preset_name: str) -> bool:
+    """Check if a preset has close-on-kill support."""
+    from ..core.settings import get_merged_preset
+
+    preset = get_merged_preset(preset_name) or {}
+    return bool(preset.get("close"))
+
+
+def _get_available_managed() -> list[tuple[str, str]]:
+    """Available managed parent presets on this system. Returns [(name, desc)]."""
+    from ..terminal import get_available_presets
+
+    available_names = {name for name, avail in get_available_presets() if avail}
+    return [(name, _MANAGED_DESCS[name]) for name in _MANAGED_PARENTS if name in available_names]
+
+
+def _find_kitty_binary() -> str | None:
+    """Find kitty binary — PATH first, then macOS app bundle."""
+    from ..terminal import _find_macos_app
+    import platform
+    path_kitty = shutil.which("kitty")
+    if path_kitty:
+        return path_kitty
+    if platform.system() == "Darwin":
+        app = _find_macos_app("kitty")
+        if app:
+            full = app / "Contents" / "MacOS" / "kitty"
+            if full.exists():
+                return str(full)
+    return None
+
+
+def _find_kitty_conf() -> str | None:
+    """Get kitty's config path using kitty itself."""
+    import subprocess
+    kitty = _find_kitty_binary()
+    if not kitty:
+        return None
+    try:
+        result = subprocess.run(
+            [kitty, "+runpy", "from kitty.constants import config_dir; print(config_dir)"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0:
+            return None
+    except Exception:
+        return None
+    conf_dir = result.stdout.strip()
+    if not conf_dir:
+        return None
+    conf = os.path.join(conf_dir, "kitty.conf")
+    return conf if os.path.isfile(conf) else None
+
+
+def _kitty_conf_has(conf_path: str, key: str) -> str | None:
+    """Return the value of an uncommented key in kitty.conf, or None."""
+    with open(conf_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            parts = stripped.split(None, 1)
+            if len(parts) == 2 and parts[0] == key:
+                return parts[1]
+    return None
+
+
+def _show_kitty_status(value: str) -> None:
+    """Check kitty remote control socket and show status / hint at --setup.
+
+    Runs in daemon context — no access to KITTY_WINDOW_ID/KITTY_LISTEN_ON env vars.
+    Only filesystem-based detection (_find_kitty_socket) works here.
+    """
+    from ..terminal import _find_kitty_socket
+
+    socket = _find_kitty_socket()
+
+    if socket:
+        if value == "kitty":
+            print(f"  Socket found ({socket}) → splits/tabs available")
+        return
+
+    # No socket — diagnose why
+    conf = _find_kitty_conf()
+    if not conf:
+        print("  No kitty.conf found")
+        print("  Run: hcom config terminal --setup")
+        return
+
+    has_rc = _kitty_conf_has(conf, "allow_remote_control")
+    has_listen = _kitty_conf_has(conf, "listen_on")
+
+    if has_rc in ("yes", "socket") and has_listen:
+        print("  Config OK but no socket — restart kitty")
+    elif has_rc and has_rc not in ("yes", "socket"):
+        print(f"  allow_remote_control is '{has_rc}' — needs 'yes' or 'socket'")
+        print(f"  Edit {conf} manually, then restart kitty")
+    else:
+        print("  Remote control not configured")
+        print("  Run: hcom config terminal --setup")
+
+
+def _kitty_setup() -> int:
+    """Configure kitty for remote control (splits/tabs). Returns exit code."""
+    from ..terminal import _find_kitty_socket
+
+    socket = _find_kitty_socket()
+    if socket:
+        print(f"Kitty remote control already working ({socket})")
+        return 0
+
+    conf = _find_kitty_conf()
+    if not conf:
+        print(format_error("Could not find kitty.conf"), file=sys.stderr)
+        return 1
+
+    has_rc = _kitty_conf_has(conf, "allow_remote_control")
+    has_listen = _kitty_conf_has(conf, "listen_on")
+
+    if has_rc in ("yes", "socket") and has_listen:
+        print(f"Config OK ({conf}) but no socket — restart kitty")
+        return 0
+
+    if has_rc and has_rc not in ("yes", "socket"):
+        print(format_error(f"allow_remote_control is '{has_rc}' in {conf}"), file=sys.stderr)
+        print("  Change to 'yes' or 'socket', then restart kitty", file=sys.stderr)
+        return 1
+
+    lines: list[str] = []
+    if not has_rc:
+        lines.append("allow_remote_control yes")
+    if not has_listen:
+        lines.append("listen_on unix:/tmp/kitty")
+
+    try:
+        with open(conf, "a") as f:
+            f.write("\n# Added by hcom for remote control (splits/tabs)\n")
+            for line in lines:
+                f.write(f"{line}\n")
+    except OSError as e:
+        print(format_error(f"Failed to write {conf}: {e}"), file=sys.stderr)
+        return 1
+
+    for line in lines:
+        print(f"Added to {conf}: {line}")
+    print("Restart kitty for changes to take effect")
+    return 0
+
+
+def _show_terminal_status(current_value: str) -> int:
+    """Rich terminal config status for bare 'hcom config terminal'."""
+    if not current_value:
+        current_value = "default"
+
+    managed = _get_available_managed()
+
+    if current_value == "default":
+        resolved = _resolve_default_terminal_name()
+        print(f"Terminal: default ({resolved})")
+        if managed:
+            print()
+            print("'hcom kill' stops processes but can't close terminal windows.")
+            print("For full lifecycle control (open + close on kill), set a managed terminal:")
+            print()
+            for name, desc in managed:
+                print(f"  hcom config terminal {name:<14} {desc}")
+    elif _is_managed_preset(current_value):
+        print(f"Terminal: {current_value} (managed — opens and closes panes on kill)")
+        print()
+        print("  hcom config terminal default     reset to platform default")
+    else:
+        print(f"Terminal: {current_value} (open only — kill can't close windows)")
+        if managed:
+            print()
+            print("For full lifecycle control, set a managed terminal:")
+            print()
+            for name, desc in managed:
+                print(f"  hcom config terminal {name:<14} {desc}")
+
+    print()
+    print("  hcom config terminal --info      all options")
+    return 0
+
+
 # ==================== Detailed Config Help ====================
 
 
-def _get_config_help(key: str) -> str | None:
-    """Get detailed help for a config key. Returns None if no detailed help available."""
-    from ..terminal import get_available_presets
-
-    key = key.upper()
-    if not key.startswith("HCOM_"):
-        key = f"HCOM_{key}"
-
-    if key == "HCOM_TERMINAL":
-        # Build preset list with availability
-        presets = get_available_presets()
-        preset_lines = []
-        for name, available in presets:
-            if name == "default":
-                desc = "Platform default (Terminal.app / wt / gnome-terminal)"
-            elif name == "custom":
-                desc = "Custom command (see below)"
-            elif name == "Terminal.app":
-                desc = "macOS Terminal"
-            elif name == "iTerm":
-                desc = "macOS iTerm2"
-            elif name == "Ghostty":
-                desc = "Fast GPU-accelerated terminal"
-            elif name == "kitty":
-                desc = "Auto: split if inside, tab if reachable, else new window"
-            elif name == "kitty-window":
-                desc = "Always new kitty OS window"
-            elif name == "wezterm":
-                desc = "Auto: split if inside, tab if reachable, else new window"
-            elif name == "wezterm-window":
-                desc = "Always new WezTerm OS window"
-            elif name == "alacritty":
-                desc = "Minimal GPU-accelerated terminal"
-            elif name == "ttab":
-                desc = "Open in new tab (npm install -g ttab)"
-            elif name == "tmux-split":
-                desc = "Split current tmux pane horizontally"
-            elif name == "wezterm-tab":
-                desc = "New tab in WezTerm (requires wezterm CLI)"
-            elif name == "kitty-tab":
-                desc = "New tab in kitty (requires kitten CLI)"
-            elif name == "kitty-split":
-                desc = "Split pane in kitty (requires kitten CLI)"
-            elif name == "gnome-terminal":
-                desc = "GNOME desktop default"
-            elif name == "konsole":
-                desc = "KDE desktop default"
-            elif name == "xterm":
-                desc = "Basic X11 terminal"
-            elif name == "tilix":
-                desc = "Tiling terminal for GNOME"
-            elif name == "terminator":
-                desc = "Tiling terminal emulator"
-            elif name == "Windows Terminal":
-                desc = "Windows Terminal (wt)"
-            elif name == "mintty":
-                desc = "MinTTY (Git Bash default)"
-            elif name == "wttab":
-                desc = "Windows Terminal tab utility"
-            else:
-                desc = ""
-
-            mark = "[+]" if available else "[-]"
-            if desc:
-                preset_lines.append(f"  {mark} {name:<20} {desc}")
-            else:
-                preset_lines.append(f"  {mark} {name}")
-
-        return f"""HCOM_TERMINAL - Terminal for launching new instances
-
-Current value: Use 'hcom config terminal' to see current value
-
-Values:
-  default         Use platform default terminal
-  <preset>        Use a named preset (see list below)
-  <command>       Custom command with {{script}} placeholder
-
-Available presets on this system:
-{chr(10).join(preset_lines)}
-
-[+] = installed/available, [-] = not detected
-
-------------------------------------------------------------------------
-CUSTOM TERMINAL SETUP
-------------------------------------------------------------------------
-
-To use a terminal not in the presets list, set a custom command.
-The command MUST include {{script}} where the launch script path goes.
-
-How it works:
-  1. hcom creates a bash script with the claude/gemini/codex command
-  2. Your terminal command is executed with {{script}} replaced by script path
-  3. The terminal runs the script, which starts the AI tool
-
-Examples (what the presets are):
-  ghostty:        open -na Ghostty.app --args -e bash {{script}}
-  kitty:          kitty {{script}}
-  alacritty:      alacritty -e bash {{script}}
-  gnome-terminal: gnome-terminal --window -- bash {{script}}
-  wezterm:        wezterm start -- bash {{script}}
-
-Testing your command:
-  1. Set the terminal: hcom config terminal "your-command {{script}}"
-  2. Launch a test: hcom 1 claude
-  3. If it fails, check that:
-     - The terminal binary/app exists
-     - {{script}} is in the right position
-
-Reset to default:
-  hcom config terminal default
-"""
-
-    elif key == "HCOM_TAG":
-        return """HCOM_TAG - Group tag for launched instances
+_CONFIG_HELP: dict[str, str] = {
+    "HCOM_TAG": """HCOM_TAG - Group tag for launched instances
 
 Current value: Use 'hcom config tag' to see current value
 
@@ -149,10 +255,8 @@ Addressing:
   @dev-luna    → sends to specific agent
 
 Allowed characters: letters, numbers, hyphens (a-z, A-Z, 0-9, -)
-"""
-
-    elif key == "HCOM_HINTS":
-        return """HCOM_HINTS - Text injected with all messages
+""",
+    "HCOM_HINTS": """HCOM_HINTS - Text injected with all messages
 
 Current value: Use 'hcom config hints' to see current value
 
@@ -171,10 +275,20 @@ Notes:
   - Hints are appended to message content, not system prompt
   - Each agent can have different hints (set via hcom config -i <name> hints)
   - Global hints apply to all new launches
-"""
+""",
+    "HCOM_NOTES": """HCOM_NOTES - One-time notes appended to bootstrap
 
-    elif key == "HCOM_TIMEOUT":
-        return """HCOM_TIMEOUT - Advanced: idle timeout for headless/vanilla Claude (seconds)
+  Custom text added to agent system context at startup.
+  Unlike HCOM_HINTS (per-message), this is injected once and does not repeat.
+
+Usage:
+  hcom config notes "Always check hcom list before spawning new agents"
+  hcom config notes ""                            # Clear
+  HCOM_NOTES="tips" hcom 1 claude                 # Per-launch override
+
+  Changing after launch has no effect (bootstrap already delivered).
+""",
+    "HCOM_TIMEOUT": """HCOM_TIMEOUT - Advanced: idle timeout for headless/vanilla Claude (seconds)
 
 Default: 86400 (24 hours)
 
@@ -194,10 +308,8 @@ How it works:
 Usage (if needed):
   hcom config HCOM_TIMEOUT 3600   # 1 hour
   export HCOM_TIMEOUT=3600        # via environment
-"""
-
-    elif key == "HCOM_SUBAGENT_TIMEOUT":
-        return """HCOM_SUBAGENT_TIMEOUT - Timeout for Claude subagents (seconds)
+""",
+    "HCOM_SUBAGENT_TIMEOUT": """HCOM_SUBAGENT_TIMEOUT - Timeout for Claude subagents (seconds)
 
 Current value: Use 'hcom config subagent_timeout' to see current value
 Default: 30
@@ -214,53 +326,41 @@ Notes:
   - Only applies to Claude Code's Task tool spawned agents
   - Parent agent blocks until subagent completes or times out
   - Increase for complex subagent tasks
-"""
-
-    elif key == "HCOM_CLAUDE_ARGS":
-        return """HCOM_CLAUDE_ARGS - Default args passed to claude on launch
+""",
+    "HCOM_CLAUDE_ARGS": """HCOM_CLAUDE_ARGS - Default args passed to claude on launch
 
 Example: hcom config claude_args "--model opus"
 Clear:   hcom config claude_args ""
 
 Merged with launch-time cli args (launch args win on conflict).
-"""
-
-    elif key == "HCOM_GEMINI_ARGS":
-        return """HCOM_GEMINI_ARGS - Default args passed to gemini on launch
+""",
+    "HCOM_GEMINI_ARGS": """HCOM_GEMINI_ARGS - Default args passed to gemini on launch
 
 Example: hcom config gemini_args "--model gemini-2.5-flash"
 Clear:   hcom config gemini_args ""
 
 Merged with launch-time cli args (launch args win on conflict).
-"""
-
-    elif key == "HCOM_CODEX_ARGS":
-        return """HCOM_CODEX_ARGS - Default args passed to codex on launch
+""",
+    "HCOM_CODEX_ARGS": """HCOM_CODEX_ARGS - Default args passed to codex on launch
 
 Example: hcom config codex_args "--search"
 Clear:   hcom config codex_args ""
 
 Merged with launch-time cli args (launch args win on conflict).
-"""
-
-    elif key == "HCOM_RELAY":
-        return """HCOM_RELAY - Relay server URL
+""",
+    "HCOM_RELAY": """HCOM_RELAY - Relay server URL
 
 Set automatically by 'hcom relay hf'.
 
 Custom server: implement POST /push/{device_id}, GET /poll, GET /version
 See: https://huggingface.co/spaces/aannoo/hcom-relay/blob/main/app.py
-"""
-
-    elif key == "HCOM_RELAY_TOKEN":
-        return """HCOM_RELAY_TOKEN - HuggingFace token for private Space auth
+""",
+    "HCOM_RELAY_TOKEN": """HCOM_RELAY_TOKEN - HuggingFace token for private Space auth
 Set automatically by 'hcom relay hf'
 
 Or optional authentication token for custom server.
-"""
-
-    elif key == "HCOM_AUTO_APPROVE":
-        return """HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
+""",
+    "HCOM_AUTO_APPROVE": """HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Current value: Use 'hcom config auto_approve' to see current value
 
@@ -282,10 +382,8 @@ Always require approval:
   - hcom <N> claude     (launches new instances)
 
 Values: 1, true, yes, on (enabled) | 0, false, no, off, "" (disabled)
-"""
-
-    elif key == "HCOM_AUTO_SUBSCRIBE":
-        return """HCOM_AUTO_SUBSCRIBE - Auto-subscribe event presets for new instances
+""",
+    "HCOM_AUTO_SUBSCRIBE": """HCOM_AUTO_SUBSCRIBE - Auto-subscribe event presets for new instances
 
 Current value: Use 'hcom config auto_subscribe' to see current value
 Default: collision
@@ -307,10 +405,8 @@ Available presets:
 Notes:
   - Instances can add/remove subscriptions at runtime
   - See 'hcom events --help' for subscription management
-"""
-
-    elif key == "HCOM_NAME_EXPORT":
-        return """HCOM_NAME_EXPORT - Export instance name to custom env var
+""",
+    "HCOM_NAME_EXPORT": """HCOM_NAME_EXPORT - Export instance name to custom env var
 
 Current value: Use 'hcom config name_export' to see current value
 
@@ -337,9 +433,105 @@ Notes:
   - Only affects hcom-launched instances (hcom N claude/gemini/codex)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity
+""",
+}
+
+
+def _build_terminal_help(current_value: str = "") -> str:
+    """Dynamic help for HCOM_TERMINAL (depends on installed tools).
+
+    Args:
+        current_value: Current terminal setting. Caller should pass this
+            from the freshly-loaded config snapshot, not get_config() cache.
+    """
+    from ..terminal import get_available_presets
+
+    current = current_value or "default"
+
+    # Current value display
+    if current == "default":
+        current_display = f"default ({_resolve_default_terminal_name()})"
+    elif _is_managed_preset(current):
+        current_display = f"{current} (managed)"
+    else:
+        current_display = f"{current} (open only)"
+
+    # Build managed section
+    presets_avail = {name: avail for name, avail in get_available_presets()}
+
+    managed_lines = []
+    for parent in _MANAGED_PARENTS:
+        mark = "[+]" if presets_avail.get(parent, False) else "[-]"
+        desc = _MANAGED_DESCS[parent]
+        managed_lines.append(f"  {mark} {parent:<14} {desc}")
+
+    variant_lines = []
+    for parent, variants in _MANAGED_VARIANTS.items():
+        variant_lines.append(f"    {parent}: {', '.join(variants)}")
+
+    # Build other section (platform-filtered by get_available_presets)
+    all_managed = set(_MANAGED_PARENTS)
+    for variants in _MANAGED_VARIANTS.values():
+        all_managed.update(variants)
+
+    install_hints = {
+        "ttab": "npm install -g ttab",
+        "wttab": "npm install -g wttab",
+    }
+
+    other_lines = []
+    for name, avail in get_available_presets():
+        if name in ("default", "custom") or name in all_managed:
+            continue
+        mark = "[+]" if avail else "[-]"
+        hint = install_hints.get(name, "")
+        if not avail and hint:
+            other_lines.append(f"  {mark} {name:<18} {hint}")
+        else:
+            other_lines.append(f"  {mark} {name}")
+
+    return f"""HCOM_TERMINAL — where hcom opens new agent windows
+
+Current: {current_display}
+
+Managed (open + close on kill):
+{chr(10).join(managed_lines)}
+
+  Variants:
+{chr(10).join(variant_lines)}
+
+Other (opens window only):
+{chr(10).join(other_lines)}
+
+Custom command (open only):
+  hcom config terminal "my-terminal -e bash {{script}}"
+
+Custom preset with close (~/.hcom/settings.toml):
+  [terminal.myterm]
+  open = "myterm spawn -- bash {{script}}"
+  close = "myterm kill --id {{id}}"
+  binary = "myterm"
+
+  {{id}} = stdout from the open command.
+  {{pid}} and {{process_id}} also available.
+
+Set:    hcom config terminal kitty
+Reset:  hcom config terminal default
 """
 
-    return None
+
+def _get_config_help(key: str, current_value: str = "") -> str | None:
+    """Get detailed help for a config key. Returns None if no detailed help available.
+
+    Args:
+        current_value: For HCOM_TERMINAL, the freshly-loaded current value.
+    """
+    key = key.upper()
+    if not key.startswith("HCOM_"):
+        key = f"HCOM_{key}"
+    if key == "HCOM_TERMINAL":
+        return _build_terminal_help(current_value)
+    return _CONFIG_HELP.get(key)
 
 
 def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
@@ -465,6 +657,11 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
     # Update in DB
     update_instance_position(instance_name, {db_column: db_value})  # type: ignore[misc]
 
+    # Wake PTY delivery thread so terminal title updates instantly
+    if key == "tag":
+        from ..core.runtime import notify_instance
+        notify_instance(instance_name)
+
     # Show result
     new_data = load_instance_position(instance_name)
     if json_output:
@@ -538,7 +735,15 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     json_output = "--json" in argv
     edit_mode = "--edit" in argv
     reset_mode = "--reset" in argv
-    argv = [a for a in argv if a not in ("--json", "--edit", "--reset")]
+    setup_mode = "--setup" in argv
+    argv = [a for a in argv if a not in ("--json", "--edit", "--reset", "--setup")]
+
+    # --setup: only valid with 'terminal' key
+    if setup_mode:
+        positional = [a for a in argv if not a.startswith("-")]
+        if not positional or positional[0] != "terminal":
+            print(format_error("--setup is only valid with: hcom config terminal --setup"), file=sys.stderr)
+            return 1
 
     # Parse -i <name> for instance-level config
     instance_target = None
@@ -689,7 +894,8 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         key = argv[0].upper()
         if not key.startswith("HCOM_"):
             key = f"HCOM_{key}"
-        help_text = _get_config_help(key)
+        current_val = core_dict.get(key, "") or effective_dict.get(key, "")
+        help_text = _get_config_help(key, current_val)
         if help_text:
             print(help_text)
             return 0
@@ -703,6 +909,13 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         key = argv[0].upper()
         if not key.startswith("HCOM_"):
             key = f"HCOM_{key}"
+
+        # Rich output for HCOM_TERMINAL bare get
+        if key == "HCOM_TERMINAL" and not json_output:
+            if setup_mode:
+                return _kitty_setup()
+            current = core_dict.get(key, "") or effective_dict.get(key, "")
+            return _show_terminal_status(current)
 
         if key in core_dict:
             value = core_dict[key]
@@ -758,7 +971,21 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
         # Save
         save_config_snapshot(snapshot)
-        print(f"Set {key}={value}")
+        if key == "HCOM_TERMINAL":
+            if _is_managed_preset(value):
+                print(f"Set {key}={value} (managed — kill closes panes)")
+            elif value == "default" or value == "":
+                print(f"Set {key}={value} ({_resolve_default_terminal_name()})")
+            else:
+                print(f"Set {key}={value} (open only — kill can't close windows)")
+            # Kitty: check socket / run setup
+            if value in ("kitty", "kitty-tab", "kitty-split"):
+                if setup_mode:
+                    _kitty_setup()
+                else:
+                    _show_kitty_status(value)
+        else:
+            print(f"Set {key}={value}")
 
         # Handle HCOM_AUTO_APPROVE changes - update permissions in all tools
         if key == "HCOM_AUTO_APPROVE":

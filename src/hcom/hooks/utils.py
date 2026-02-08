@@ -39,9 +39,9 @@ from ..core.log import log_info
 from ..core.instances import (
     load_instance_position,  # noqa: F401 (re-export)
 )
+from ..core.bootstrap import get_bootstrap
 from ..core.runtime import (
     build_claude_env,  # noqa: F401 (re-export)
-    build_hcom_bootstrap_text,  # noqa: F401 (re-export)
     notify_all_instances,  # noqa: F401 (re-export)
     notify_instance,  # noqa: F401 (re-export)
 )
@@ -241,7 +241,7 @@ def inject_bootstrap_once(
     if instance_data.get("name_announced", False):
         return None
 
-    bootstrap = build_hcom_bootstrap_text(instance_name, tool=tool)
+    bootstrap = get_bootstrap(instance_name, tool=tool)
     update_instance_position(instance_name, {"name_announced": True})
 
     return bootstrap

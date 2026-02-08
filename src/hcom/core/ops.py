@@ -109,6 +109,7 @@ def op_launch(
             "failed": int,
             "background": bool,
             "log_files": list[str],
+            "handles": list[dict],
         }
 
     Raises:
@@ -134,6 +135,7 @@ def op_launch(
         "failed": result["failed"],
         "background": result["background"],
         "log_files": result.get("log_files", []),
+        "handles": result.get("handles", []),
     }
 
 

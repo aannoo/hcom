@@ -26,6 +26,9 @@ def deliver_pending_messages(instance_name: str) -> tuple[list[dict[str, Any]], 
 
     deliver = messages[:MAX_MESSAGES_PER_DELIVERY]
     last_id = deliver[-1].get("event_id", max_event_id)
+    # Cursor advances before format — safe because format is stdlib string ops on
+    # data that just came from SQLite (won't throw). Rust delivery loop retries if
+    # this hook process dies before returning (does it?).
     update_instance_position(instance_name, {"last_event_id": last_id})
 
     formatted = format_messages_json(deliver, instance_name)

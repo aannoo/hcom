@@ -72,28 +72,6 @@ class HookResult:
         return cls(exit_code=exit_code, stderr=message)
 
     @classmethod
-    def stop_with_messages(cls, context: str) -> "HookResult":
-        """Create result for Stop hook when messages delivered.
-
-        Exit code 2 tells Claude Code to continue processing (message injected).
-
-        Args:
-            context: Message context to inject via hook output.
-
-        Returns:
-            HookResult with exit_code=2 and hook output for message injection.
-        """
-        output = {
-            "decision": "block",
-            "reason": context,
-        }
-        return cls(
-            exit_code=2,
-            stdout=json.dumps(output),
-            hook_output=output,
-        )
-
-    @classmethod
     def allow_with_context(cls, hook_event: str, context: str) -> "HookResult":
         """Create result that allows operation and injects additional context.
 
@@ -112,31 +90,6 @@ class HookResult:
                 "hookEventName": hook_event,
                 "additionalContext": context,
             },
-        }
-        return cls(
-            exit_code=0,
-            stdout=json.dumps(output),
-            hook_output=output,
-        )
-
-    @classmethod
-    def with_updated_input(cls, hook_event: str, updated_input: dict[str, Any]) -> "HookResult":
-        """Create result with modified tool input.
-
-        Used for PreToolUse hooks that modify input (e.g., Task tool prompt injection).
-
-        Args:
-            hook_event: Hook event name (e.g., "PreToolUse").
-            updated_input: Modified input dict for the tool.
-
-        Returns:
-            HookResult with updated input.
-        """
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": hook_event,
-                "updatedInput": updated_input,
-            }
         }
         return cls(
             exit_code=0,

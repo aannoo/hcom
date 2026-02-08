@@ -49,11 +49,9 @@ HOOK_SESSIONSTART: Final[str] = "sessionstart"
 HOOK_USERPROMPTSUBMIT: Final[str] = "userpromptsubmit"
 HOOK_PRE: Final[str] = "pre"
 HOOK_POST: Final[str] = "post"
-HOOK_POLL: Final[str] = "poll"
 HOOK_NOTIFY: Final[str] = "notify"
 HOOK_SUBAGENT_START: Final[str] = "subagent-start"
 HOOK_SUBAGENT_STOP: Final[str] = "subagent-stop"
-HOOK_SESSIONEND: Final[str] = "sessionend"
 
 
 def handle_hook(hook_type: str) -> None:

@@ -17,7 +17,7 @@ from ..shared import parse_iso_timestamp
 DB_FILE = "hcom.db"
 SCHEMA_VERSION = 15  # Add bundle fields to events_v
 _thread_local = threading.local()  # Per-thread connection storage
-_write_lock = threading.Lock()  # Protect concurrent writes
+_write_lock = threading.Lock()  # Serializes writes within this process (daemon threads). Cross-process: WAL mode + busy_timeout.
 
 # Error messages
 DB_LOCK_ERROR = "hcom: DB locked by another process. Close other hcom instances and retry."
@@ -139,7 +139,8 @@ def archive_db(reason: str = "schema") -> str | None:
         session_archive.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Checkpoint WAL before archiving (PASSIVE mode doesn't block readers)
+            # PASSIVE checkpoint: best-effort flush of WAL into main DB.
+            # Return value unchecked — WAL+SHM files are copied alongside below.
             temp_conn = sqlite3.connect(str(db_file))
             temp_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             temp_conn.close()
@@ -203,6 +204,8 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
         # Multi-process bootstrap race: another process may have created some tables but
         # not yet committed PRAGMA user_version. In that window, treating it as a
         # pre-versioned DB would cause pointless archive/reset loops.
+        # Note: actual window is tiny (~ms) since Python sqlite3 auto-commits each DDL,
+        # so version pragma is visible almost immediately after tables. 1s is very safe.
         if tables and tables.intersection(required):
             import time as _time
 
@@ -322,6 +325,12 @@ def init_db(conn: Optional[sqlite3.Connection] = None, _attempt: int = 0) -> Non
         Tables: events, notify_endpoints, process_bindings, session_bindings,
         instances, kv. Also creates events_v view for flattened JSON field access.
         """
+        # Skip if schema already at current version (all IF NOT EXISTS are no-ops,
+        # and DROP+CREATE VIEW has a race window where concurrent readers see no view)
+        current = connection.execute("PRAGMA user_version").fetchone()[0]
+        if current == SCHEMA_VERSION:
+            return
+
         # Create events table
         connection.execute("""
         CREATE TABLE IF NOT EXISTS events (
@@ -940,26 +949,6 @@ def get_last_event_id() -> int:
     result = cursor.fetchone()[0]
     return result if result is not None else 0
 
-
-def get_last_stop_event(instance_name: str) -> dict[str, Any] | None:
-    """Get the last stop event for an instance.
-
-    Returns:
-        Dict with 'stopped_by' and 'reason', or None if no stop event found
-    """
-    conn = get_db()
-    row = conn.execute(
-        """
-        SELECT json_extract(data, '$.by') as stopped_by,
-               json_extract(data, '$.reason') as reason
-        FROM events
-        WHERE instance = ? AND type = 'life'
-          AND json_extract(data, '$.action') = 'stopped'
-        ORDER BY id DESC LIMIT 1
-    """,
-        (instance_name,),
-    ).fetchone()
-    return dict(row) if row else None
 
 
 # ==================== Instance Operations ====================

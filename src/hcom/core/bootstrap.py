@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from .config import get_config
-from .thread_context import get_background_name, get_is_launched
+from .thread_context import get_background_name, get_is_launched, get_hcom_notes_text
 from .instances import load_instance_position, get_full_name
 from .paths import hcom_path
 
@@ -23,7 +23,7 @@ UNIVERSAL = """[HCOM SESSION]
 You have access to the hcom communication tool.
 - Your name: {display_name}
 - Authority: Prioritize @{SENDER} over others
-- Important: Include this marker anywhere in your first response: [hcom:{instance_name}]
+- Important: Include this marker anywhere in your first response only: [hcom:{instance_name}]
 
 You run hcom commands on behalf of the human user. The human uses natural language with you.
 
@@ -43,29 +43,30 @@ Routing:
 You MUST use `hcom <cmd> --name {instance_name}` for all hcom commands:
 
 - Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+  Example: send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
 - See who's active: list [-v] [--json]
 - Read another's conversation: transcript [name] [--range N-M] [--last N] [--full]
 - See history (filter by agent, commands ran, files touched, status, msgs, sql): events --help
-- Get notified on events: events sub --help
+- Get notified when anything in hcom happens (same filters): events sub --help
 - Handoff context: bundle prepare → send with --title
-- Spawn agents: [HCOM_TAG=label-or-group] hcom N <claude|gemini|codex>
-- Resume/fork agents, background, tmux, kitty, prompt, system, forward args: hcom N tool --help
-- Run workflows: run <script> [args]
+- Spawn agents: [HCOM_TAG=label-or-group] hcom [num] <claude|gemini|codex>
+- Resume/fork agents, background, tmux, prompt, system, forward args: hcom <claude|gemini|codex> --help
+- Run workflows: run <script> [args] [--help]
+  {scripts}
 - View agent screen, inject text/enter: term [name]
-- install status, stop, kill, set tag, set terminal, remote, etc.: --help
+- See install status, stop, kill, set tag, set terminal, remote, etc.: --help
 
 If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 ## RULES
 
-1. Always substitute `sleep [timeout]` with `hcom listen [timeout]`
-2. Task via hcom → ack immediately, do work, report via hcom
-3. Avoid chit-chat, welcomes, thanks-only messages
-4. Use --intent on sends: request (want reply), inform (FYI), ack (responding).
-5. User says "the gemini agent", "ask claude" → run `hcom list` to resolve name
+1. Task via hcom → ack immediately, do work, report via hcom
+2. No filler messages (greetings, thanks, congratulations).
+3. Use --intent on sends: request (want reply), inform (FYI), ack (responding).
+4. User says "the gemini/claude/codex agent" or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
-{active_instances}{user_scripts}
+{active_instances}
 
 This is session context, not a task for immediate action.
 """
@@ -91,15 +92,23 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples.
 DELIVERY_AUTO = """
 ## DELIVERY
 
-Messages auto-arrive via <hcom> tags — end your turn to receive them.
+Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
 
-Use hcom listen only as an alternative to sleep. If you are purely waiting for a hcom message; end your turn.
+- For hcom message waiting: end your turn (do not run `hcom listen`).
+- For hcom event/other agent progress waiting: use `hcom events sub --help` and subscribe (do not run `hcom listen`).
+- For non-hcom pause/yield, use `hcom listen` instead of `sleep`.
 """
 
 DELIVERY_CODEX_HCOM_LAUNCHED = """
 ## DELIVERY
 
-<hcom> tags = run `hcom listen 1 --name {instance_name}` IMMEDIATELY to read message.
+New message notifications instantly auto-arrive via <hcom> tags - end your turn to receive them.
+
+- For hcom message waiting: end your turn. (do not preemptively run `hcom listen`)
+- For hcom event/other agent progress waiting: use `hcom events sub --help` and subscribe.
+- For non-hcom pause/yield, use `hcom listen` instead of `sleep`
+
+IMPORTANT: <hcom> tags = run `hcom listen 1 --name {instance_name}` IMMEDIATELY to read message.
 """
 
 DELIVERY_ADHOC = """
@@ -108,21 +117,22 @@ DELIVERY_ADHOC = """
 Messages do NOT arrive automatically.
 - Check messages: `hcom listen 1`
 - Wait for messages: `hcom listen [timeout]`
+- Always substitute `sleep [timeout]` with `hcom listen [timeout]`
 
 <critical_rule>
 LISTENING REQUIREMENT:
 - After sending hcom message expecting reply → `hcom listen --timeout 60 --name {instance_name}`
-- After task via hcom → complete, report, then listen again
-- User says "stay connected" → enter listen loop
+- After receiving a task via hcom → do the work, report, then enter CONNECTED MODE
+- User says "stay connected" → enter CONNECTED MODE
 
-CONNECTED MODE:
-1. Run: `hcom listen --name {instance_name} --timeout [max]`
-2. Timeout → listen again
+CONNECTED MODE (infinite listen loop):
+1. Run: `hcom listen --name {instance_name} --timeout [large_num]`
+2. Timeout → you MUST run listen again
 3. Message received → handle it, then listen again
 4. Exit only when user says stop
 
-WRONG: hcom listen &
-RIGHT: hcom listen --timeout [sec]
+WRONG: hcom listen & (background)
+RIGHT: hcom listen --timeout [sec] (blocking)
 </critical_rule>
 
 You are now registered with hcom.
@@ -148,9 +158,12 @@ You're participating in the hcom multi-agent network.
 - Your name: {subagent_name}
 - Your parent: {parent_name}
 - Use "--name {subagent_name}" for all hcom commands
-- Announce once to parent via hcom: "Cool! I'm connected to hcom as {subagent_name}"
+- Announce to parent once: send @{parent_name} --intent inform -- "Connected as {subagent_name}"
 
-Messages arrive automatically via <hcom> tags. End your turn to receive the next message.
+Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
+
+- For hcom message waiting: end your turn (do not run `hcom listen`).
+- For non-hcom pause/yield, use `hcom listen` instead of `sleep`.
 
 Response rules:
 - From {SENDER} or intent=request → always respond
@@ -160,7 +173,8 @@ Response rules:
 hcom message → respond via hcom send
 
 Commands:
-  {hcom_cmd} send @name --name {subagent_name} [--intent request\\|inform\\|ack] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+  {hcom_cmd} send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+  Example: {hcom_cmd} send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
   {hcom_cmd} list --name {subagent_name}
   {hcom_cmd} events --name {subagent_name}
   {hcom_cmd} <cmd> --help --name {subagent_name}
@@ -168,8 +182,6 @@ Commands:
 Rules:
 - Task via hcom → ack, work, report
 - Authority: @{SENDER} > others
-- Never use `sleep` → use `hcom listen [timeout]`
-- Avoid chit-chat, welcomes, thanks-only messages
 - Use --intent on sends: request (want reply), inform (FYI), ack (responding)
 """
 
@@ -180,14 +192,18 @@ Rules:
 
 
 def _get_active_instances(exclude_name: str) -> str:
-    """Get concise list of active instances."""
+    """Get concise list of active instances, grouped by tool."""
     from .db import iter_instances
 
     now = time.time()
     cutoff = now - 60
 
-    active = []
+    # Collect names grouped by tool, preserving insertion order
+    by_tool: dict[str, list[str]] = {}
+    count = 0
     for inst in iter_instances():
+        if count >= 8:
+            break
         name = inst.get("name", "")
         if name == exclude_name:
             continue
@@ -202,30 +218,42 @@ def _get_active_instances(exclude_name: str) -> str:
         tool = inst.get("tool", "claude")
 
         if status in ("active", "listening") or status_time >= cutoff:
-            marker = "▶" if status == "active" else "◉" if status == "listening" else "○"
-            active.append(f"{name} [{tool}] {marker}")
+            by_tool.setdefault(tool, []).append(get_full_name(inst) or name)
+            count += 1
 
-    if not active:
+    if not by_tool:
         return ""
 
-    return "\nActive (snapshot): " + ", ".join(active[:8]) + "\n"
+    # Format: "claude: a, b | codex: c"
+    parts = []
+    for tool, names in by_tool.items():
+        parts.append(f"{tool}: " + ", ".join(names))
+    return "\nActive (snapshot): " + " | ".join(parts)
 
 
-def _get_user_scripts() -> str:
-    """Get user scripts list."""
-    scripts_dir = hcom_path("scripts")
-    if not scripts_dir.exists():
+def _get_scripts() -> str:
+    """Get combined list of bundled + user scripts."""
+    from importlib.resources import files as pkg_files
+
+    names: set[str] = set()
+
+    # Bundled scripts
+    bundled = pkg_files("hcom.scripts.bundled")
+    for item in bundled.iterdir():
+        if item.name.endswith(".py") and not item.name.startswith("_"):
+            names.add(item.name.removesuffix(".py"))
+
+    # User scripts
+    user_dir = hcom_path("scripts")
+    if user_dir.exists():
+        for f in user_dir.iterdir():
+            if f.suffix in (".py", ".sh") and not f.name.startswith("_"):
+                names.add(f.stem)
+
+    if not names:
         return ""
 
-    scripts = []
-    for f in scripts_dir.iterdir():
-        if f.suffix == ".py" and not f.name.startswith("_"):
-            scripts.append(f.stem)
-
-    if not scripts:
-        return ""
-
-    return "User scripts: " + ", ".join(sorted(scripts)) + "\n"
+    return "Scripts: " + ", ".join(sorted(names))
 
 
 # =============================================================================
@@ -256,7 +284,8 @@ def build_context(instance_name: str, tool: str, headless: bool) -> dict[str, An
     ctx["is_launched"] = get_is_launched()
     ctx["SENDER"] = SENDER
     ctx["active_instances"] = _get_active_instances(instance_name)
-    ctx["user_scripts"] = _get_user_scripts()
+    ctx["scripts"] = _get_scripts()
+    ctx["notes"] = get_hcom_notes_text()
 
     return ctx
 
@@ -302,20 +331,11 @@ def get_bootstrap(
         parts.append(UVX_CMD_NOTICE)
 
     # Tool-specific delivery
-    if tool == "claude":
-        # Claude: auto delivery (PTY + hooks or Stop hook polling)
-        parts.append(DELIVERY_AUTO)
-    elif tool == "gemini" and ctx["is_launched"]:
-        # Gemini launched: auto delivery (PTY + BeforeAgent hook)
+    if tool == "claude" or (tool == "gemini" and ctx["is_launched"]):
         parts.append(DELIVERY_AUTO)
     elif tool == "codex" and ctx["is_launched"]:
-        # Codex launched: notification only, must fetch
         parts.append(DELIVERY_CODEX_HCOM_LAUNCHED)
-    elif tool in ("gemini", "codex") and not ctx["is_launched"]:
-        # Vanilla gemini/codex: manual poll
-        parts.append(DELIVERY_ADHOC)
-    elif tool == "adhoc":
-        # Adhoc: manual poll
+    else:
         parts.append(DELIVERY_ADHOC)
 
     # Claude subagent info
@@ -323,8 +343,12 @@ def get_bootstrap(
         parts.append(CLAUDE_ONLY)
 
     # Join and substitute
-    result = "\n".join(parts)
+    result = "\n\n".join(p.strip("\n") for p in parts)
     result = result.format(**ctx)
+
+    # User notes (appended after format to avoid brace issues in user text)
+    if ctx["notes"]:
+        result += f"\n\n## NOTES\n\n{ctx['notes']}\n"
 
     # Rewrite hcom references if using alternate command
     if ctx["hcom_cmd"] != "hcom":
@@ -360,14 +384,4 @@ def get_subagent_bootstrap(subagent_name: str, parent_name: str) -> str:
     return "<hcom>\n" + result + "\n</hcom>"
 
 
-# Backwards compatibility
-def build_hcom_bootstrap_text(instance_name: str, tool: str | None = None) -> str:
-    """Legacy wrapper - use get_bootstrap() instead."""
-    return get_bootstrap(
-        instance_name,
-        tool=tool or "claude",
-        headless=bool(get_background_name()),
-    )
-
-
-__all__ = ["get_bootstrap", "get_subagent_bootstrap", "build_hcom_bootstrap_text"]
+__all__ = ["get_bootstrap", "get_subagent_bootstrap"]

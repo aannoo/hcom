@@ -1,6 +1,6 @@
 [package]
 name = "hcom"
-version = "0.6.15"
+version = "0.6.16"
 edition = "2024"
 authors = ["hcom"]
 description = "High-performance PTY wrapper and daemon client for hcom"

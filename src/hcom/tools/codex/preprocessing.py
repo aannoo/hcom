@@ -4,14 +4,14 @@ Transforms Codex CLI arguments before launch to enable hcom functionality
 within Codex's sandboxed environment.
 
 Preprocessing Steps:
-    1. Sandbox flags: --sandbox workspace-write (or per mode)
+    1. Sandbox flags: --full-auto (or per mode)
     2. DB access: --add-dir ~/.hcom (allows hcom writes from sandbox)
     3. Bootstrap: -c developer_instructions=<bootstrap text>
 
-Sandbox Modes:
-    workspace: Auto-approve edits in workspace (default for hcom)
-    untrusted: All edits need Y/n approval, but hcom still works
-    danger-full-access: No sandbox restrictions
+Sandbox Modes (aligned with Codex TUI presets):
+    workspace: "Default" — --full-auto (workspace-write + on-request approvals)
+    untrusted: Workspace writes, approval before untrusted commands
+    danger-full-access: "Full Access" — --dangerously-bypass-approvals-and-sandbox
     none: Raw codex, user's own settings (hcom may not work)
 
 Key Functions:
@@ -30,18 +30,21 @@ from __future__ import annotations
 def get_sandbox_flags(mode: str) -> list[str]:
     """Get sandbox flags for the given mode.
 
-    Modes:
-    - workspace: Normal codex - edits auto-approved in workspace (default)
-    - untrusted: Read-only - all edits need Y/n approval, but hcom works
-    - danger-full-access: Full access (no sandbox restrictions)
+    Modes map to Codex TUI presets:
+    - workspace: "Default" — --full-auto (workspace-write + on-request approvals)
+    - untrusted: Workspace writes but approval before running untrusted commands
+    - danger-full-access: "Full Access" — --dangerously-bypass-approvals-and-sandbox
     - none: No flags - raw codex folder trust (hcom may not work)
     """
+    # Seatbelt blocks Unix sockets by default, breaking tmux/kitty terminal launches.
+    # network_access=true adds (allow system-socket) to the seatbelt profile.
+    net = ["-c", "sandbox_workspace_write.network_access=true"]
     return {
-        "workspace": ["--sandbox", "workspace-write"],
-        "untrusted": ["--sandbox", "workspace-write", "-a", "untrusted"],
-        "danger-full-access": ["--sandbox", "danger-full-access"],
+        "workspace": ["--full-auto"] + net,
+        "untrusted": ["--sandbox", "workspace-write", "-a", "untrusted"] + net,
+        "danger-full-access": ["--dangerously-bypass-approvals-and-sandbox"],
         "none": [],
-    }.get(mode, ["--sandbox", "workspace-write"])  # default to workspace
+    }.get(mode, ["--full-auto"] + net)  # default to workspace
 
 
 def ensure_hcom_writable(tokens: list[str]) -> list[str]:
@@ -62,7 +65,7 @@ def ensure_hcom_writable(tokens: list[str]) -> list[str]:
     # If no sandbox flags, assume mode="none" - skip --add-dir
     # User takes responsibility for hcom DB access
     has_sandbox = spec.has_flag(
-        ["--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox"],
+        ["--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox", "--full-auto"],
         ["--sandbox=", "-s="],
     )
     if not has_sandbox:

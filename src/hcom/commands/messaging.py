@@ -68,6 +68,28 @@ def _drain_notify_server(server: socket.socket) -> None:
             break
 
 
+def _extract_targets_strict(pre_sep: list[str], reject_reason: str) -> tuple[list[str], int | None]:
+    """Extract @targets from pre_sep, rejecting any non-@ args.
+
+    Returns (targets, None) on success, ([], 1) on error (printed to stderr).
+    """
+    targets = []
+    for arg in pre_sep:
+        if arg.startswith("@"):
+            t = arg[1:]
+            if not t:
+                print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
+                return [], 1
+            targets.append(t)
+        else:
+            hint = ""
+            if arg.isalpha() and len(arg) <= 20:
+                hint = f"\nDid you mean @{arg}? Targets require @"
+            print(format_error(reject_reason + hint), file=sys.stderr)
+            return [], 1
+    return targets, None
+
+
 # ==================== Recipient Feedback ====================
 
 
@@ -304,24 +326,14 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
     if has_separator:
         # Has -- separator: extract @targets from pre_sep, message is everything after --
-        for arg in pre_sep:
-            if arg.startswith("@"):
-                target = arg[1:]  # Strip @ prefix
-                if not target:
-                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
-                    return 1
-                explicit_targets.append(target)
-            else:
-                # Non-@ arg before -- that isn't a flag
-                print(
-                    format_error(
-                        f"Unexpected argument before --: '{arg}'\n"
-                        "Put flags first, then @targets, then -- message.\n"
-                        "Example: hcom send --intent request @luna -- hello"
-                    ),
-                    file=sys.stderr,
-                )
-                return 1
+        explicit_targets, err = _extract_targets_strict(
+            pre_sep,
+            "Unexpected argument before --.\n"
+            "Put flags first, then @targets, then -- message.\n"
+            "Example: hcom send --intent request @luna -- hello",
+        )
+        if err:
+            return err
 
         if message_parts:
             message = " ".join(message_parts)
@@ -331,40 +343,18 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             return 1
 
     elif use_stdin:
-        # Explicit --stdin flag - extract @targets from pre_sep
-        for arg in pre_sep:
-            if arg.startswith("@"):
-                target = arg[1:]
-                if not target:
-                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
-                    return 1
-                explicit_targets.append(target)
-            else:
-                print(
-                    format_error("--stdin cannot be combined with message arguments"),
-                    file=sys.stderr,
-                )
-                return 1
+        explicit_targets, err = _extract_targets_strict(pre_sep, "--stdin cannot be combined with message arguments")
+        if err:
+            return err
         message = _read_stdin()
         if not message:
             print(format_error("No input received on stdin"), file=sys.stderr)
             return 1
 
     elif file_path:
-        # --file <path> - extract @targets from pre_sep, read message from file
-        for arg in pre_sep:
-            if arg.startswith("@"):
-                target = arg[1:]
-                if not target:
-                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
-                    return 1
-                explicit_targets.append(target)
-            else:
-                print(
-                    format_error("--file cannot be combined with message arguments"),
-                    file=sys.stderr,
-                )
-                return 1
+        explicit_targets, err = _extract_targets_strict(pre_sep, "--file cannot be combined with message arguments")
+        if err:
+            return err
         from pathlib import Path
         from ..core.thread_context import get_cwd
 
@@ -383,22 +373,11 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             return 1
 
     elif base64_val:
-        # --base64 <encoded> - extract @targets from pre_sep, decode message
         import base64 as b64
 
-        for arg in pre_sep:
-            if arg.startswith("@"):
-                target = arg[1:]
-                if not target:
-                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
-                    return 1
-                explicit_targets.append(target)
-            else:
-                print(
-                    format_error("--base64 cannot be combined with message arguments"),
-                    file=sys.stderr,
-                )
-                return 1
+        explicit_targets, err = _extract_targets_strict(pre_sep, "--base64 cannot be combined with message arguments")
+        if err:
+            return err
         try:
             message = b64.b64decode(base64_val).decode("utf-8")
         except Exception:
@@ -1015,16 +994,14 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         return _listen_with_filter(combined_sql, instance_name, timeout, json_output, instance_data)
 
     # Standard message-wait mode below
-    # Mark instance as listening when entering listen loop
-    set_status(instance_name, "listening", "ready")
+    # Mark as cmd:listen FIRST — blocks delivery gate before any async setup.
+    # Uses detail (not context) to avoid affecting TUI status display.
+    set_status(instance_name, "listening", "ready", detail="cmd:listen")
 
     start_time = time.time()
 
     # Setup TCP notification socket for instant wake on local messages
     notify_server, notify_port = _create_notify_server()
-
-    # Initialize heartbeat
-    _init_heartbeat(instance_name, timeout)
 
     # Register notify endpoint without clobbering other listeners (PTY wrappers, hooks)
     if notify_port:
@@ -1034,6 +1011,9 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             upsert_notify_endpoint(instance_name, "listen", int(notify_port))
         except Exception:
             pass
+
+    # Initialize heartbeat
+    _init_heartbeat(instance_name, timeout)
 
     # Check if already disconnected before starting polling (row deleted = stopped)
     current_instance = load_instance_position(instance_name)

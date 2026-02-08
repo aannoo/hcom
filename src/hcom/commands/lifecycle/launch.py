@@ -141,6 +141,7 @@ Config (override: VAR=val {hcom_cmd} ...):
   HCOM_TAG={fmt("HCOM_TAG")}
   HCOM_TERMINAL={fmt("HCOM_TERMINAL") or "default"}
   HCOM_HINTS={fmt("HCOM_HINTS") or "(none)"}
+  HCOM_NOTES={fmt("HCOM_NOTES") or "(none)"}
   {claude_env_vars}{gemini_env_vars}{codex_env_vars}
 
 Args:
@@ -299,6 +300,7 @@ def cmd_launch(
         launched = result["launched"]
         failed = result["failed"]
         batch_id = result["batch_id"]
+        instance_names = [h["instance_name"] for h in result.get("handles", []) if h.get("instance_name")]
 
         # Print background log files
         for log_file in result.get("log_files", []):
@@ -313,7 +315,7 @@ def cmd_launch(
             print(f"Started the launch process for {launched} Claude agent{'s' if launched != 1 else ''}")
 
         print(f"Batch id: {batch_id}")
-        print("To block until ready or fail, run: hcom events launch")
+        print("To block until ready or fail (30s timeout), run: hcom events launch")
 
         # Auto-launch TUI if:
         # - Not print mode, not background, not auto-watch disabled, all launched, interactive terminal
@@ -343,29 +345,16 @@ def cmd_launch(
 
             return run_tui(hcom_path())
         else:
-            tips = []
-            if tag:
-                tips.append(f"Send to {tag} team: hcom send '@{tag}- message'")
+            from ...core.tips import print_launch_tips
 
-            if launched > 0:
-                if is_inside_ai_tool():
-                    if launcher_participating:
-                        tips.append(
-                            f"You'll be automatically notified when all {launched} instances are launched & ready"
-                        )
-                    else:
-                        tips.append("Run 'hcom start' to receive automatic notifications/messages from instances")
-                    if tag:
-                        tips.append(f"Disconnect from hcom: hcom stop tag:{tag}")
-                        tips.append(f"Close pane + process: hcom kill tag:{tag}")
-                    else:
-                        tips.append("Disconnect from hcom: hcom stop <name>")
-                        tips.append("Close pane + process: hcom kill <name>")
-                else:
-                    tips.append("Check status: hcom list")
-
-            if tips:
-                print("\n" + "\n".join(f"  • {tip}" for tip in tips) + "\n")
+            print_launch_tips(
+                launched=launched,
+                tag=tag,
+                instance_names=instance_names,
+                launcher_name=launcher if launcher != "user" else None,
+                launcher_participating=launcher_participating,
+                background=background,
+            )
 
             return 0
 

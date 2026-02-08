@@ -45,10 +45,10 @@ from ...core.config import get_config
 
 from ...core.db import get_db, get_events_since
 
-from ...hooks.utils import build_hcom_bootstrap_text, notify_instance
+from ...core.bootstrap import get_bootstrap
+from ...hooks.utils import notify_instance
 from ...hooks.family import extract_tool_detail
 from ...core.log import log_error, log_info
-from ...core.tool_utils import stop_instance
 
 
 def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
@@ -158,7 +158,7 @@ def handle_sessionstart(
             if instance_name:
                 if process_id:
                     # hcom-launched: inject full bootstrap (identity via HCOM_PROCESS_ID env)
-                    bootstrap = build_hcom_bootstrap_text(instance_name)
+                    bootstrap = get_bootstrap(instance_name)
                 else:
                     # Vanilla: need to rebind session first, then bootstrap injects via posttooluse
                     bootstrap = (
@@ -267,7 +267,7 @@ def handle_sessionstart(
                 # - Resume: name_announced=True → inject anyway (context may be lost)
                 # SessionStart only fires once per session start, so no duplicate risk
                 is_resume = instance.get("name_announced", False)
-                bootstrap = build_hcom_bootstrap_text(instance_name)
+                bootstrap = get_bootstrap(instance_name)
                 result_output = {
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
@@ -373,36 +373,6 @@ def end_task(session_id: str, hook_data: dict[str, Any], interrupted: bool = Fal
     last_event_id = _deliver_freeze_messages(instance_name, freeze_event_id)
     update_instance_position(instance_name, {"last_event_id": last_event_id})
 
-
-def _stop_tracked_subagents(instance_name: str, instance_data: dict[str, Any]) -> None:
-    """Stop subagents in running_tasks with exit:interrupted"""
-    running_tasks_json = instance_data.get("running_tasks", "")
-    if not running_tasks_json:
-        return
-
-    try:
-        running_tasks = json.loads(running_tasks_json)
-        subagents = running_tasks.get("subagents", []) if isinstance(running_tasks, dict) else []
-    except json.JSONDecodeError:
-        return
-
-    if not subagents:
-        return
-
-    conn = get_db()
-    agent_id_map = {
-        r["agent_id"]: r["name"]
-        for r in conn.execute(
-            "SELECT name, agent_id FROM instances WHERE parent_name = ?",
-            (instance_name,),
-        ).fetchall()
-        if r["agent_id"]
-    }
-
-    for entry in subagents:
-        if (aid := entry.get("agent_id")) and (name := agent_id_map.get(aid)):
-            set_status(name, "inactive", "exit:interrupted")
-            stop_instance(name, initiated_by="system", reason="interrupted")
 
 
 def _deliver_freeze_messages(instance_name: str, freeze_event_id: int) -> int:
@@ -542,10 +512,6 @@ def handle_pretooluse(
     update_tool_status(instance_name, "claude", tool_name, tool_input)
     return HookResult.success()
 
-
-def update_status(instance_name: str, tool_name: str) -> None:
-    """Update parent status (direct call, no checks)"""
-    set_status(instance_name, "active", f"tool:{tool_name}")
 
 
 def handle_stop(

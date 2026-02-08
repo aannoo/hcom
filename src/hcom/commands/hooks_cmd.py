@@ -74,7 +74,7 @@ def cmd_hooks_add(argv: list[str]) -> int:
         config = get_config()
         include_permissions = config.auto_approve
     except Exception:
-        include_permissions = True
+        include_permissions = False
 
     # Determine which tools to install
     if not argv:

@@ -53,6 +53,10 @@ _ctx_is_claude: ContextVar[bool | None] = ContextVar("hcom_is_claude", default=N
 _ctx_is_gemini: ContextVar[bool | None] = ContextVar("hcom_is_gemini", default=None)
 _ctx_is_codex: ContextVar[bool | None] = ContextVar("hcom_is_codex", default=None)
 _ctx_hcom_go: ContextVar[bool | None] = ContextVar("hcom_hcom_go", default=None)
+# Codex thread ID (session equivalent) - None = not in context (use os.environ fallback)
+_ctx_codex_thread_id: ContextVar[str | None] = ContextVar("hcom_codex_thread_id", default=None)
+# Per-instance HCOM_NOTES (bootstrap user notes)
+_ctx_notes: ContextVar[str | None] = ContextVar("hcom_notes", default=None)
 # Daemon mode marker - True when running inside daemon's with_context()
 _ctx_in_daemon: ContextVar[bool] = ContextVar("hcom_in_daemon", default=False)
 
@@ -275,6 +279,7 @@ def get_is_codex() -> bool:
         or "CODEX_SANDBOX_NETWORK_DISABLED" in os.environ
         or "CODEX_MANAGED_BY_NPM" in os.environ
         or "CODEX_MANAGED_BY_BUN" in os.environ
+        or "CODEX_THREAD_ID" in os.environ
     )
 
 
@@ -290,6 +295,32 @@ def get_hcom_go() -> bool:
     if val is not None:
         return val
     return os.environ.get("HCOM_GO") == "1"
+
+
+def get_codex_thread_id() -> str | None:
+    """Get Codex thread ID (session equivalent).
+
+    In daemon mode, uses context. In CLI mode, falls back to os.environ.
+
+    Returns:
+        Thread ID string or None if not in Codex.
+    """
+    val = _ctx_codex_thread_id.get()
+    if val is not None:
+        return val
+    return os.environ.get("CODEX_THREAD_ID") or None
+
+
+def get_hcom_notes_text() -> str:
+    """Get HCOM_NOTES - per-instance bootstrap user notes.
+
+    Returns:
+        Notes string if set, empty string otherwise.
+    """
+    val = _ctx_notes.get()
+    if val is not None:
+        return val
+    return os.environ.get("HCOM_NOTES") or ""
 
 
 def is_in_daemon_mode() -> bool:
@@ -355,6 +386,8 @@ def with_context(ctx: "HcomContext"):
     tokens.append(_ctx_is_gemini.set(ctx.is_gemini))
     tokens.append(_ctx_is_codex.set(ctx.is_codex))
     tokens.append(_ctx_hcom_go.set(ctx.hcom_go))
+    tokens.append(_ctx_codex_thread_id.set(ctx.codex_thread_id))
+    tokens.append(_ctx_notes.set(ctx.notes))
 
     # Mark that we're in daemon mode
     tokens.append(_ctx_in_daemon.set(True))
@@ -387,6 +420,8 @@ __all__ = [
     "get_is_gemini",
     "get_is_codex",
     "get_hcom_go",
+    "get_codex_thread_id",
+    "get_hcom_notes_text",
     # Daemon mode
     "is_in_daemon_mode",
     # Context manager

@@ -65,11 +65,14 @@ class HcomContext:
     is_gemini: bool = False
     is_codex: bool = False
     hcom_go: bool = False
+    # Codex thread ID (session equivalent) - available in all Codex child processes
+    codex_thread_id: str | None = None
     # Launch context - who launched this instance and batch tracking
     launched_by: str | None = None
     launch_batch_id: str | None = None
     launch_event_id: str | None = None
     launched_preset: str | None = None
+    notes: str = ""
 
     @classmethod
     def from_env(
@@ -102,6 +105,7 @@ class HcomContext:
             or "CODEX_SANDBOX_NETWORK_DISABLED" in env
             or "CODEX_MANAGED_BY_NPM" in env
             or "CODEX_MANAGED_BY_BUN" in env
+            or "CODEX_THREAD_ID" in env
         )
         hcom_go = env.get("HCOM_GO") == "1"
 
@@ -138,10 +142,12 @@ class HcomContext:
             is_gemini=is_gemini,
             is_codex=is_codex,
             hcom_go=hcom_go,
+            codex_thread_id=env.get("CODEX_THREAD_ID") or None,
             launched_by=env.get("HCOM_LAUNCHED_BY") or None,
             launch_batch_id=env.get("HCOM_LAUNCH_BATCH_ID") or None,
             launch_event_id=env.get("HCOM_LAUNCH_EVENT_ID") or None,
             launched_preset=env.get("HCOM_LAUNCHED_PRESET") or None,
+            notes=env.get("HCOM_NOTES") or "",
         )
 
     @classmethod
@@ -177,9 +183,11 @@ class HcomContext:
             is_gemini=self.is_gemini,
             is_codex=self.is_codex,
             hcom_go=self.hcom_go,
+            codex_thread_id=self.codex_thread_id,
             launched_by=self.launched_by,
             launch_batch_id=self.launch_batch_id,
             launch_event_id=self.launch_event_id,
+            notes=self.notes,
         )
 
     # === Derived Properties ===

@@ -130,7 +130,6 @@ class ManageScreen:
         """
         self.state = state  # Shared state (explicit dependency)
         self.tui = tui  # For commands only (flash, stop_all, etc)
-        self._recently_stopped_row_pos = -1  # Track position of recently stopped row
 
     def _render_instance_row(
         self,
@@ -226,7 +225,6 @@ class ManageScreen:
         badges = ""
         if is_background:
             badges += " [headless]"
-
         # Project tag (shown when instances have different directories)
         project_suffix = ""
         if project_tag:
@@ -572,20 +570,6 @@ class ManageScreen:
             while len(lines) < instance_rows:
                 lines.append("")
             return
-
-        # Calculate total display items: local → orphans → stopped → relay → remote
-        display_count = len(local_instances)
-        orphan_start_pos = display_count
-        display_count += len(orphan_processes)
-        if recently_stopped:
-            display_count += 1  # recently stopped summary row
-        recently_stopped_pos = display_count - 1 if recently_stopped else -1
-        self._recently_stopped_row_pos = recently_stopped_pos
-        remote_sep = display_count if remote_count > 0 else -1
-        if remote_count > 0:
-            display_count += 1  # remote separator row
-            if self.state.manage.show_remote:
-                display_count += remote_count
 
         # Calculate visible window
         max_scroll = max(0, display_count - instance_rows)
@@ -1348,6 +1332,10 @@ class ManageScreen:
         self.tui.load_status()
         self.tui.flash(f"Tag {'set to ' + new_tag if new_tag else 'removed'}")
 
+        # Wake PTY delivery thread so terminal title updates instantly
+        from ..core.runtime import notify_instance
+        notify_instance(target)
+
     def _handle_tag_cancel(self):
         """Cancel tag editing and restore original buffer and cursor"""
         self.state.manage.message_buffer = self.state.manage.tag_edit_original_buffer
@@ -1611,6 +1599,18 @@ class ManageScreen:
             bindings = get_instance_bindings(base_name)
             bind_str = format_binding_status(bindings)
             lines.append(truncate_ansi(f"  bindings:    {bind_str}", width))
+
+            # Terminal preset (tmux/kitty/wezterm/etc)
+            lc_str = data.get("launch_context", "")
+            if lc_str:
+                try:
+                    import json as _json
+                    lc = _json.loads(lc_str) if isinstance(lc_str, str) else lc_str
+                    preset = lc.get("terminal_preset", "")
+                    if preset:
+                        lines.append(truncate_ansi(f"  terminal:    {preset}", width))
+                except (ValueError, TypeError):
+                    pass
 
             if log_file:
                 lines.append(truncate_ansi(f"  log:         {log_file}", width))

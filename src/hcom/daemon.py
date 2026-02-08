@@ -384,7 +384,7 @@ class DaemonHandler(socketserver.StreamRequestHandler):
         with _active_lock:
             _active_requests += 1
 
-        request_id: str | None = None
+        request_id = ""
         try:
             # Set socket timeout for this connection
             self.connection.settimeout(self.timeout)
@@ -480,10 +480,12 @@ def dispatch_request(req: dict, request_id: str) -> dict:
     """Route request to handler using typed context objects."""
     from .core.hcom_context import HcomContext
     from .core.hook_payload import HookPayload
+    from .core.config import reload_config
     from .core.paths import clear_path_cache
 
-    # Clear path cache - HCOM_DIR from request affects all paths
+    # Re-read config.env and paths each request so config set takes effect without daemon restart
     clear_path_cache()
+    reload_config()
 
     # Build typed context from request
     env = req.get("env", {})
