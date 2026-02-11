@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from .utils import format_error, validate_flags, parse_flag_value, parse_flag_bool, parse_last_flag, CLIError
+from .utils import format_error, validate_flags, parse_flag_value, parse_flag_bool, parse_last_flag, get_command_help, CLIError
 from ..shared import CommandContext, format_age, parse_iso_timestamp
 from ..core.bundles import parse_csv_list, get_bundle_instance_name
 from ..core.detail_levels import is_full_output_detail
@@ -720,6 +720,7 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     if subcmd not in {"list", "show", "create", "chain", "prepare", "preview", "cat"}:
         print(format_error(f"Unknown bundle subcommand: {subcmd}"), file=sys.stderr)
+        print(get_command_help("bundle"), file=sys.stderr)
         return 1
 
     # Validate flags

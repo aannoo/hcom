@@ -68,8 +68,9 @@ _SUBCOMMANDS: Final[frozenset[str]] = frozenset(
         "logout",
         "completion",
         "sandbox",
-        "debug",  # debug is alias for sandbox
+        "debug",  # debugging tools (separate from sandbox)
         "apply",
+        "app",
         "a",  # a is alias for apply
         "cloud",
         "features",

@@ -44,8 +44,8 @@ impl HcomDb {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
-        // Enable WAL mode for concurrent access
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        // Enable WAL mode for concurrent access + foreign keys for CASCADE
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
 
         Ok(Self { conn })
     }
@@ -573,7 +573,7 @@ impl HcomDb {
         let mut stmt = self.conn.prepare(
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
-                    agent_id, launch_args, origin_device_id, background_log_file
+                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id
              FROM instances WHERE name = ?"
         )?;
 
@@ -595,6 +595,7 @@ impl HcomDb {
                 "launch_args": row.get::<_, String>(13).unwrap_or_default(),
                 "origin_device_id": row.get::<_, String>(14).unwrap_or_default(),
                 "background_log_file": row.get::<_, String>(15).unwrap_or_default(),
+                "last_event_id": row.get::<_, i64>(16).unwrap_or(0),
             }))
         }) {
             Ok(snapshot) => Ok(Some(snapshot)),

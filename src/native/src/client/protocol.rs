@@ -33,7 +33,7 @@ pub const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "f", "r"];
 /// Environment variables to forward to daemon
 const FORWARD_ENV: &[&str] = &[
     // Identity and mode
-    "HCOM_PROCESS_ID", "HCOM_LAUNCHED", "HCOM_PTY_MODE", "HCOM_BACKGROUND",
+    "HCOM_PROCESS_ID", "HCOM_LAUNCHED", "HCOM_PTY_MODE", "HCOM_BACKGROUND", "HCOM_IS_FORK",
     // Launch context
     "HCOM_LAUNCHED_BY", "HCOM_LAUNCH_BATCH_ID", "HCOM_LAUNCH_EVENT_ID",
     "HCOM_LAUNCHED_PRESET",

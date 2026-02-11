@@ -319,10 +319,12 @@ def posttooluse(
         update_instance_position(subagent_name, {"last_event_id": delivered_last_event_id})
 
         formatted = format_messages_json(deliver_messages, subagent_name)
+        from ...core.instances import get_display_name
+
         set_status(
             subagent_name,
             "active",
-            f"deliver:{deliver_messages[0]['from']}",
+            f"deliver:{get_display_name(deliver_messages[0]['from'])}",
             msg_ts=deliver_messages[-1]["timestamp"],
         )
         outputs.append(

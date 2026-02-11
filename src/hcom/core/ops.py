@@ -218,6 +218,36 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
         pass
 
 
+def load_stopped_snapshot(name: str) -> dict | None:
+    """Load instance snapshot from most recent stopped life event.
+
+    Used by both CLI resume and API launch(resume=name).
+    """
+    import json
+    from .db import get_db
+
+    row = get_db().execute(
+        "SELECT json_extract(data, '$.snapshot') FROM events"
+        " WHERE type='life' AND instance=? AND json_extract(data, '$.action')='stopped'"
+        " ORDER BY id DESC LIMIT 1",
+        (name,),
+    ).fetchone()
+    if row and row[0]:
+        return json.loads(row[0])
+    return None
+
+
+def resume_system_prompt(name: str, *, fork: bool) -> str:
+    """System prompt injected when resuming or forking an instance."""
+    if fork:
+        return (
+            f"YOU ARE A FORK of agent '{name}'. "
+            f"You have the same session history but are a NEW agent. "
+            f"Run hcom start to get your own identity."
+        )
+    return f"YOUR SESSION HAS BEEN RESUMED! You are still '{name}'."
+
+
 __all__ = [
     "op_send",
     "op_stop",
@@ -225,4 +255,6 @@ __all__ = [
     "op_launch",
     "auto_subscribe_defaults",
     "cleanup_instance_subscriptions",
+    "load_stopped_snapshot",
+    "resume_system_prompt",
 ]

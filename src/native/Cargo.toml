@@ -1,9 +1,9 @@
 [package]
 name = "hcom"
-version = "0.6.17"
+version = "0.6.18"
 edition = "2024"
 authors = ["hcom"]
-description = "High-performance PTY wrapper and daemon client for hcom"
+description = "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
 license = "MIT"
 rust-version = "1.85"
 

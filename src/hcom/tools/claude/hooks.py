@@ -51,30 +51,35 @@ from ...hooks.family import extract_tool_detail
 from ...core.log import log_error, log_info
 
 
-def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
-    """Extract real session_id from CLAUDE_ENV_FILE path, fallback to hook_data.
+def get_real_session_id(hook_data: dict[str, Any], env_file: str | None, *, is_fork: bool = False) -> str:
+    """Get the correct session_id, handling Claude Code's fork bug.
 
-    Claude Code has a bug where hook_data.session_id is wrong for fork scenarios
-    (--resume X --fork-session). The CLAUDE_ENV_FILE path contains the correct
-    session_id since CC creates the directory with Q0() (current WQ.sessionId).
+    Claude Code has a bug where hook_data.session_id is wrong for --fork-session:
+    it reports the parent's old session_id instead of the fork's new one.
+    The CLAUDE_ENV_FILE path always has the correct ID (CC creates the directory
+    with Q0() / current WQ.sessionId).
 
-    Note: hook_data.transcript_path also has the wrong session_id in fork scenarios
-    (both use the same buggy OLD value). Only CLAUDE_ENV_FILE path is reliable.
+    For non-fork scenarios (fresh launch, resume), hook_data.session_id is correct.
+    Using CLAUDE_ENV_FILE in those cases is wrong — during resume, CC creates a new
+    startup UUID for the env_file path that doesn't match the resumable session_id.
+
+    Only applies env_file extraction when is_fork=True (set by launcher for
+    --fork-session launches, forwarded via HcomContext).
 
     Path structure: ~/.claude/session-env/{session_id}/hook-N.sh
     """
     hook_session_id = hook_data.get("session_id") or hook_data.get("sessionId", "")
-    transcript_path = hook_data.get("transcript_path", "")
 
     log_info(
         "hooks",
         "get_real_session_id.input",
         hook_session_id=hook_session_id,
         env_file=env_file,
-        transcript_path=transcript_path,
+        is_fork=is_fork,
     )
 
-    if env_file:
+    # Only use env_file extraction for fork (where hook_data has the wrong/parent ID)
+    if env_file and is_fork:
         try:
             parts = Path(env_file).parts
             if "session-env" in parts:
@@ -88,17 +93,11 @@ def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
                             "get_real_session_id.from_env_file",
                             candidate=candidate,
                             hook_session_id=hook_session_id,
-                            match=candidate == hook_session_id,
                         )
                         return candidate
         except Exception as e:
             log_error("hooks", "hook.error", e, hook="get_real_session_id")
 
-    log_info(
-        "hooks",
-        "get_real_session_id.fallback",
-        hook_session_id=hook_session_id,
-    )
     return hook_session_id
 
 
@@ -221,34 +220,6 @@ def handle_sessionstart(
             if instance:
                 # Use rebind_session to allow override if session was previously bound
                 rebind_session(session_id, instance_name)
-
-                # Handle --resume session_id mismatch: Claude Code gives different session_ids
-                # at SessionStart (new internal ID) vs subsequent hooks (resumed ID).
-                # Create binding for BOTH so hooks with either ID find this instance.
-                # Skip if original_session_id belongs to another instance (fork scenario).
-                original_session_id = payload.raw.get("original_session_id", "")
-                if original_session_id and original_session_id != session_id:
-                    from ...core.db import get_session_binding, set_process_binding
-
-                    existing_owner = get_session_binding(original_session_id)
-                    if not existing_owner or existing_owner == instance_name:
-                        rebind_session(original_session_id, instance_name)
-                        set_process_binding(process_id, original_session_id, instance_name)
-                        log_info(
-                            "hooks",
-                            "sessionstart.resume_dual_bind",
-                            instance=instance_name,
-                            hook_session_id=session_id,
-                            original_session_id=original_session_id,
-                        )
-                    else:
-                        log_info(
-                            "hooks",
-                            "sessionstart.fork_skip_dualbind",
-                            instance=instance_name,
-                            original_owner=existing_owner,
-                            original_session_id=original_session_id,
-                        )
 
                 # Capture launch context (env vars, git branch, tty)
                 from ...core.instances import capture_and_store_launch_context
@@ -798,10 +769,12 @@ def handle_userpromptsubmit(
             # User-facing (terminal) vs model-facing (context)
             user_display = format_hook_messages(deliver_messages, instance_name)
             model_context = format_messages_json(deliver_messages, instance_name)
+            from ...core.instances import get_display_name
+
             set_status(
                 instance_name,
                 "active",
-                f"deliver:{deliver_messages[0]['from']}",
+                f"deliver:{get_display_name(deliver_messages[0]['from'])}",
                 msg_ts=deliver_messages[-1]["timestamp"],
             )
             delivery_output: dict[str, Any] = {

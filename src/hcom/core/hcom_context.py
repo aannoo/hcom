@@ -65,6 +65,7 @@ class HcomContext:
     is_gemini: bool = False
     is_codex: bool = False
     hcom_go: bool = False
+    is_fork: bool = False  # HCOM_IS_FORK=1 (--fork-session launch)
     # Codex thread ID (session equivalent) - available in all Codex child processes
     codex_thread_id: str | None = None
     # Launch context - who launched this instance and batch tracking
@@ -108,6 +109,7 @@ class HcomContext:
             or "CODEX_THREAD_ID" in env
         )
         hcom_go = env.get("HCOM_GO") == "1"
+        is_fork = env.get("HCOM_IS_FORK") == "1"
 
         # Determine tool type from markers
         tool: ToolType = "adhoc"
@@ -142,6 +144,7 @@ class HcomContext:
             is_gemini=is_gemini,
             is_codex=is_codex,
             hcom_go=hcom_go,
+            is_fork=is_fork,
             codex_thread_id=env.get("CODEX_THREAD_ID") or None,
             launched_by=env.get("HCOM_LAUNCHED_BY") or None,
             launch_batch_id=env.get("HCOM_LAUNCH_BATCH_ID") or None,
@@ -183,6 +186,7 @@ class HcomContext:
             is_gemini=self.is_gemini,
             is_codex=self.is_codex,
             hcom_go=self.hcom_go,
+            is_fork=self.is_fork,
             codex_thread_id=self.codex_thread_id,
             launched_by=self.launched_by,
             launch_batch_id=self.launch_batch_id,

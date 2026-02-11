@@ -269,20 +269,17 @@ def _dispatch_with_context(
     get_db()
     init_ms = (_time.perf_counter() - init_start) * 1000
 
-    # Resolve session_id FIRST (get_real_session_id handles fork/resume scenarios)
+    # Resolve session_id FIRST (get_real_session_id handles fork bug)
     # Must happen before SessionStart to ensure correct binding
     session_start = _time.perf_counter()
     hook_data = payload.raw.copy()
-    original_session_id = payload.session_id or ""
-    session_id = get_real_session_id(hook_data, ctx.claude_env_file)
+    session_id = get_real_session_id(hook_data, ctx.claude_env_file, is_fork=ctx.is_fork)
     hook_data["session_id"] = session_id
-    hook_data["original_session_id"] = original_session_id
     session_ms = (_time.perf_counter() - session_start) * 1000
 
     # Update payload with corrected session_id (HookPayload is mutable)
     payload.session_id = session_id
     payload.raw["session_id"] = session_id
-    payload.raw["original_session_id"] = original_session_id
 
     # SessionStart is special - no instance resolution needed
     if hook_type == HOOK_SESSIONSTART:

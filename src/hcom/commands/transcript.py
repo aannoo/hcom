@@ -3,7 +3,7 @@
 import sys
 import json
 import re
-from .utils import format_error, parse_flag_bool, parse_last_flag, CLIError
+from .utils import format_error, parse_flag_bool, parse_last_flag, get_command_help, CLIError
 from ..shared import CommandContext
 
 
@@ -254,6 +254,7 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
             return 1
         elif arg.startswith("-"):
             print(format_error(f"Unknown flag '{arg}'"), file=sys.stderr)
+            print(get_command_help("transcript"), file=sys.stderr)
             return 1
 
     # Get all instances with transcript paths (active + stopped from snapshots)
@@ -366,6 +367,7 @@ def _cmd_transcript_search(argv: list[str]) -> int:
             i += 1
         elif arg.startswith("-"):
             print(format_error(f"Unknown flag: {arg}"), file=sys.stderr)
+            print(get_command_help("transcript"), file=sys.stderr)
             return 1
         elif pattern is None:
             pattern = arg

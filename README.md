@@ -1,12 +1,14 @@
 # hcom
 
 [![PyPI](https://img.shields.io/pypi/v/hcom)](https://pypi.org/project/hcom/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-hcom connects Claude Code, Gemini CLI, and Codex. When one agent runs a command, edits a file, or sends a message, others find out in real-time through hooks, across terminals or across devices.
+AI agents running in separate terminals are isolated from each other. Context doesn't transfer, decisions get repeated, file edits collide.
 
-![demo](https://raw.githubusercontent.com/aannoo/hcom/refs/heads/assets/screencapture-new.gif)
+hcom connects them. When one agent edits a file, runs a command, or sends a message, the others find out immediately.
+
+![demo](https://raw.githubusercontent.com/aannoo/hcom/refs/heads/assets/screencapture-new-new.gif)
 
 ---
 
@@ -24,7 +26,7 @@ hcom gemini
 hcom codex
 ```
 
-Tell agent in natural language:
+Prompt:
 
 > send a message to claude
 
@@ -36,91 +38,105 @@ hcom
 
 ---
 
+## What you can do
 
-## Query and send
+Tell any agent:
 
-Agents have structured access to each other's transcripts, live terminal screens, command history, file edits, and event logs. You describe what you want, the agent runs hcom commands.
+> when codex goes idle, send it the next task, and get claude to review the previous
 
-> send gemini the API decisions from claude's plan
+> watch gemini's file edits, review each and send feedback if any bugs
 
-**Messages arrive mid-turn (injected after tool calls) or wake idle agents immediately.**
+> fork yourself to investigate the bug and report back
 
----
+> find which agent worked on terminal_id code, resume them and ask why it sucks
 
-## Event subscriptions
+Messages arrive mid-turn or wake idle agents immediately.
 
-```text
-agents → hooks → sqlite → hooks → other agents
-```
+Collision detection is on by default. If 2 agents edit the same file within 20s, both get notified.
 
-Hooks capture agent activity into sqlite. Other hooks and PTY push matching events back into agent context. Agents subscribe to what they care about and get notified inline.
+Agents get unique names. You can also refer to them by tool, terminal, branch, cwd, or set custom: *"tag yourself reviewer"*.
 
-> when any agent runs git commit do something good
+<details><summary>What agents can do</summary>
 
-**Collision detection is on by default. If 2 agents edit the same file within 20s, both get notified.**
+* Message each other (with intents, threads, broadcast, @mentions)
 
----
+* Read each other's transcripts (with ranges and detail levels)
 
-## Spawn
+* View other's terminal screens and inject text / enter for permission approval
 
-Agents can launch other agents into new terminal windows, tabs, or panes.
+* Query event history (file edits, commands, status, lifecycle events)
 
-```bash
-hcom 3 codex              # open 3 codex instances
-hcom f <name>             # fork agent
-```
+* Subscribe and react to each other's event activity
 
-> spawn gemini to write tests for this feature then kill it
+* Spawn, fork, resume other agents into new terminal windows/panes/tabs. and kill them.
 
-Use any terminal emulator. See `hcom config terminal --info`
+* Build bundles of context (files, transcript, events) for handoffs
 
-Kitty and wezterm work well (agents can auto open and close panes). tmux works in the background.
+</details>
 
----
+
+
 
 ## Workflow scripts
 
-Bundled scripts that combine launching, messaging, and subscriptions:
+Included examples of multi-agent setups built with the Python API.
 
-**`clone`** -- fork the current agent into a new terminal with a task. Result comes back via hcom message.
+**`hcom run confess`** - agent (or background clone) writes an honesty self-eval, a spawned calibrator reads the target's transcript independently, judge compares both reports, sends back a verdict via hcom message.
 
-**`watcher`** -- background reviewer that subscribes to an agent's work, reviews the diff every turn boundary, and sends 'lgtm' or flags issues back via hcom.
+**`hcom run debate`** - judge spawns then sets up a debate with existing agents - coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
 
-**`confess`** -- honesty self-evaluation based on OpenAI's confessions paper. The target agent writes a confession report, a calibrator generates an independent report from transcript only, a judge compares and returns a verdict. `--fork` runs in the background.
+**`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, answers other agents on demand.
 
-**`debate`** -- a judge sets up a structured debate where agents choose sides with shared context of transcript ranges and workspace files. Rounds, rebuttals, verdict.
+Create your own by prompting:
 
-Run with `hcom run <script>`. Create new workflows by telling agent: *"read `hcom run docs` then make a script that does X"*
+> "read `hcom run docs` then make a script that does X"
+
 
 ---
 
 ## Tools
 
-| Agents | When messages arrive | Why |
-|------|----------------------|-------|
-| **Claude Code** (including subagents) | idle + mid-turn | *many hooks* |
-| **Gemini CLI** (v0.26.0+) | idle + mid-turn | *many hooks* |
-| **Codex** | idle + `hcom listen` | *1 hook* |
-| **Any AI tool that can run shell commands** | manual (`hcom start`, `hcom listen`) | *no hooks* |
+**Claude Code, Gemini CLI, Codex** — automatic message delivery, transcript/terminal screen etc.
 
-### Connect from inside any session
+**Any AI tool that can run shell commands** - send and receive messages. Tell it "run `hcom start`"
 
-> run this command: `hcom start`
 
-### Ping from any process
+<details><summary>Ping from any process</summary>
+
 
 ```bash
 hcom send <message> --from bot-name
 ```
+</details>
 
-#### Claude Code headless
+<details><summary>Claude Code headless</summary>
+
+Detached background process that stays alive. Manage via TUI.
 
 ```bash
-hcom claude -p 'do task'    # detached background (manage via TUI)
+hcom claude -p 'say hi in hcom'
 ```
-#### Claude Code subagents
+</details>
+
+<details><summary>Claude Code subagents</summary>
+
+Run `hcom claude`. Then inside, prompt:
 
 > run 2x task tool and get them to talk to each other in hcom
+
+</details>
+
+---
+
+## Terminal
+
+Spawning works with any terminal emulator. Run `hcom config terminal --info` to set up.
+
+Closing/killing works with kitty, wezterm (auto open/close panes), and tmux (background).
+
+```bash
+hcom config terminal kitty    # set
+```
 
 ---
 
@@ -161,7 +177,7 @@ HCOM_DIR=$PWD/.hcom                # for sandbox or project local
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.16 - multi-agent communication
+hcom (hook-comms) v0.6.18 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
@@ -369,6 +385,7 @@ Usage:
     --last-transcript N            Transcript entries to suggest (default: 20)
     --last-events N                Events to scan per category (default: 30)
     --json                         Output JSON
+    --compact                      Hide how-to section
   Shows suggested transcript ranges, relevant events, files
   Outputs ready-to-use bundle create command
   TIP: Skip 'bundle create' — use bundle flags directly in 'hcom send'
@@ -490,6 +507,8 @@ Usage:
     --edit                         Open config in $EDITOR
     --reset                        Reset config to defaults
 
+  hcom config terminal --setup    Configure kitty remote control
+
 
 Per-agent runtime config:
   hcom config -i <name>           Show agent config
@@ -591,7 +610,7 @@ Usage:
 Usage:
   hcom [N] claude [args...]       Launch N Claude agents (default N=1)
 
-    hcom claude                    Opens new terminal
+    hcom claude                    Runs in current terminal
     hcom N claude (N>1)            Opens new terminal windows
     hcom N claude "initial prompt" Initial prompt (positional)
     hcom 3 claude -p "prompt"      3 headless in background
@@ -622,7 +641,7 @@ Resume / Fork:
 Usage:
   hcom [N] gemini [args...]       Launch N Gemini agents (default N=1)
 
-    hcom gemini                    Opens new terminal
+    hcom gemini                    Runs in current terminal
     hcom N gemini (N>1)            Opens new terminal windows
     hcom N gemini -i "initial prompt" Initial prompt (-i flag required)
     hcom N gemini --yolo           Flags forwarded to gemini
@@ -651,7 +670,7 @@ Resume:
 Usage:
   hcom [N] codex [args...]        Launch N Codex agents (default N=1)
 
-    hcom codex                     Opens new terminal
+    hcom codex                     Runs in current terminal
     hcom N codex (N>1)             Opens new terminal windows
     hcom N codex "initial prompt"  Initial prompt (positional)
     hcom codex --sandbox danger-full-access Flags forwarded to codex
@@ -1050,8 +1069,12 @@ Args:
     system_prompt: System prompt override (single mode).
     background: If True, run headless (single mode).
     claude_args: Additional Claude CLI args (single mode).
-    resume: Session ID to resume from (single mode).
+    resume: Instance name or session ID to resume from (single mode).
+        If an instance name (e.g., "luna"), loads snapshot automatically:
+        sets tool, tag, cwd, background, system_prompt, and restores
+        message delivery cursor. If a raw session ID, passes through as-is.
     fork: If True with resume, fork instead of continue (single mode).
+        Fork creates a new instance from the same session history.
     tool_args: Additional tool-specific args (single mode).
     cwd: Working directory (single mode).
     wait: If True (default), block until all instances are ready or timeout.
@@ -1209,27 +1232,41 @@ Get messages for this instance.
 
 Query the event stream.
 
+    Filter kwargs mirror CLI flags (--agent, --file, --after, etc.).
+    Same composition: different filters AND together, multiple values OR.
+    Raw sql is ANDed with structured filters when both provided.
+
     Args:
-        sql: SQL WHERE clause filter (e.g., "msg_from='nova'").
+        sql: Raw SQL WHERE clause (ANDed with structured filters).
         params: Parameters for SQL placeholders (?).
         last: Maximum events to return.
+        agent: Instance name(s).
+        type: Event type (message, status, life).
+        file: File path pattern(s) — glob (*.py) or contains match.
+        after: ISO-8601 timestamp lower bound.
+        before: ISO-8601 timestamp upper bound.
+        status: Status value (listening, active, blocked).
+        context: Status context pattern (tool:Bash, deliver:*).
+        action: Life action (created, ready, stopped).
+        sender: Message sender name (maps to --from).
+        intent: Message intent (request, inform, ack).
+        thread: Message thread name.
 
     Returns:
         List of dicts with keys: ts, type, instance, data
 
-    SQL fields:
+    SQL fields (for raw sql= queries against events_v):
         Common: id, timestamp, type, instance
         Message: msg_from, msg_text, msg_thread, msg_intent,
                  msg_reply_to, msg_mentions, msg_delivered_to, msg_bundle_id
         Status: status_val, status_context, status_detail
         Lifecycle: life_action, life_by, life_batch_id
-        Bundle: bundle_id, bundle_title, bundle_description, bundle_extends,
-                bundle_events, bundle_files, bundle_transcript, bundle_created_by
 
     Examples:
-        s.events(sql="type='message'")
-        s.events(sql="msg_from=?", params=["nova"])
-        s.events(sql="msg_thread='task-1'", last=50)
+        s.events(file="src/core/*", after="2026-01-01T00:00:00")
+        s.events(agent="nova", type="message")
+        s.events(sender="luna", intent="request", last=50)
+        s.events(sql="msg_from=?", params=["nova"])  # raw SQL still works
 
 ### Session.wait
 
@@ -1402,6 +1439,7 @@ View bundled script sources as working examples:
   hcom run confess --source      # Honesty self-evaluation based on OpenAI's confessions paper. (3 agents)
   hcom run debate --source       # PRO/CON debaters (fresh or existing agents) + judge evaluate a topic in shared hcom thread. (2+ agents)
   hcom run ensemble --source     # Ensemble Refinement - multiple agents implement, see each other's work, refine iterativly with a judge. (3-6 agents)
+  hcom run fatcow --source       # Fat cow - a fat agent that deeply reads a module and answers questions on demand.
   hcom run glue --source         # Background glue that watches transcript timeline and connects dots across agents. (1 agent)
   hcom run watcher --source      # Background code reviewer that subscribes to activity, sends review back via hcom (1 agent)
 
@@ -1419,6 +1457,7 @@ View workflow script sources:
   hcom run confess --source
   hcom run debate --source
   hcom run ensemble --source
+  hcom run fatcow --source
   hcom run glue --source
   hcom run watcher --source
 ```

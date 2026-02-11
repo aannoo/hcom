@@ -416,23 +416,31 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Get target instance name
     args_without_flags = [a for a in argv if not a.startswith("--")]
     if not args_without_flags:
-        print(format_error("Usage: hcom kill <name> | hcom kill all"), file=sys.stderr)
+        print(format_error("Usage: hcom kill <name> | hcom kill tag:<name> | hcom kill all"), file=sys.stderr)
         return 1
 
     target = args_without_flags[0]
 
-    def _kill_instance(name: str, pid: int, display: str = "") -> bool:
+    def _kill_instance(name: str, pid: int, display: str = "", background: bool = False) -> bool:
         """Kill a single instance. Returns True on success."""
         from ...core.log import log_info, log_warn
         from ...terminal import KillResult, kill_process, resolve_terminal_info
 
         show = display or name
-        info = resolve_terminal_info(name, pid)
-        result, pane_closed = kill_process(pid, preset_name=info.preset_name, pane_id=info.pane_id,
-                              process_id=info.process_id, kitty_listen_on=info.kitty_listen_on,
-                              terminal_id=info.terminal_id)
-        preset_name = info.preset_name
-        pane_id = info.pane_id
+        # Headless instances have no terminal pane — skip pane close entirely
+        if background:
+            result, pane_closed = kill_process(pid)
+        else:
+            info = resolve_terminal_info(name, pid)
+            result, pane_closed = kill_process(pid, preset_name=info.preset_name, pane_id=info.pane_id,
+                                  process_id=info.process_id, kitty_listen_on=info.kitty_listen_on,
+                                  terminal_id=info.terminal_id)
+        if background:
+            preset_name = ""
+            pane_id = ""
+        else:
+            preset_name = info.preset_name
+            pane_id = info.pane_id
         if result == KillResult.PERMISSION_DENIED:
             log_warn("lifecycle", "kill.permission_denied", name=name, pid=pid)
             print(format_error(f"Permission denied to kill process group {pid} for '{show}'"), file=sys.stderr)
@@ -463,7 +471,7 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             name = data.get("name")
             pid = data.get("pid")
             if name and pid:
-                if _kill_instance(name, pid, get_full_name(data) or name):
+                if _kill_instance(name, pid, get_full_name(data) or name, background=bool(data.get("background"))):
                     killed += 1
                 else:
                     failed += 1
@@ -517,7 +525,7 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             show = get_full_name(inst) or name
             pid = inst.get("pid")
             if name and pid:
-                if _kill_instance(name, pid, show or name):
+                if _kill_instance(name, pid, show or name, background=bool(inst.get("background"))):
                     killed += 1
                 else:
                     failed += 1
@@ -545,7 +553,7 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        return 0 if _kill_instance(target, pid, show) else 1
+        return 0 if _kill_instance(target, pid, show, background=bool(position.get("background"))) else 1
 
     # Not an active instance — check orphan processes (stopped but still running)
     from ...core.pidtrack import get_orphan_processes, remove_pid

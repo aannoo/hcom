@@ -28,7 +28,6 @@ Message Delivery:
 from __future__ import annotations
 
 import json
-import os
 import sys
 from typing import TYPE_CHECKING
 
@@ -605,7 +604,9 @@ def handle_gemini_hook(hook_name: str) -> None:
     from ...core.paths import ensure_hcom_directories
 
     # Check vanilla skip condition
-    if os.environ.get("HCOM_LAUNCHED") != "1" and hook_name == "gemini-beforeagent":
+    from ...core.thread_context import get_is_launched
+
+    if not get_is_launched() and hook_name == "gemini-beforeagent":
         return
 
     if not ensure_hcom_directories():

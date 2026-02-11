@@ -108,13 +108,98 @@ def _get_auth_headers() -> dict[str, str]:
 
 _last_http_error: str = ""
 
+# *.hf.space proxy fallback state
+# None = untested, True = use fallback, False = fallback probe failed
+_hf_space_fallback: bool | None = None
+_hf_space_fallback_lock = threading.Lock()
+
+
+def _has_https_proxy() -> bool:
+    """Check if an HTTPS proxy is configured."""
+    return bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"))
+
+
+def _rewrite_hf_space_url(url: str) -> tuple[str, str | None]:
+    """Rewrite *.hf.space URL for proxy compatibility.
+
+    Returns (rewritten_url, original_host) or (url, None) if no rewrite needed.
+
+    Workaround: *.hf.space TLS hangs through some HTTP CONNECT proxies because
+    HF Spaces run on direct EC2/ALB (not CloudFront). Routing through huggingface.co
+    with the original Host header works when the proxy does TLS termination and
+    re-resolves destinations based on Host (e.g. Envoy dynamic_forward_proxy).
+    This is fragile and proxy-specific — it won't work on passthrough proxies.
+    """
+    import re
+    m = re.match(r'https://([^/]+\.hf\.space)(/.*)$', url)
+    if not m:
+        return url, None
+    host = m.group(1)
+    path = m.group(2)
+    return f"https://huggingface.co{path}", host
+
 
 def _http(method: str, url: str, data: bytes | None = None, timeout: int = 5) -> tuple[int, bytes]:
-    """HTTP request. On connection failure, sets _last_http_error with reason."""
+    """HTTP request. On connection failure, sets _last_http_error with reason.
+
+    For *.hf.space URLs behind a proxy: on first timeout, tries Host-header
+    fallback through huggingface.co. Caches result so subsequent calls don't
+    pay the timeout penalty. If cached fallback fails, retries direct once
+    to self-heal when proxy/env changes.
+    """
+    global _last_http_error, _hf_space_fallback
+
+    is_hf_space = ".hf.space" in url
+    has_proxy = is_hf_space and _has_https_proxy()
+
+    # If we already know fallback works, use it — but retry direct on failure
+    if has_proxy and _hf_space_fallback is True:
+        rewritten_url, host_header = _rewrite_hf_space_url(url)
+        status, body = _http_raw(method, rewritten_url, data=data, timeout=timeout, host_override=host_header)
+        if status == 200:
+            return status, body
+        # Fallback failed — maybe env changed (proxy removed, NO_PROXY set).
+        # Retry direct once to self-heal.
+        direct_status, direct_body = _http_raw(method, url, data=data, timeout=timeout)
+        if direct_status > 0:
+            _hf_space_fallback = None  # Reset — direct works now
+            return direct_status, direct_body
+        return status, body  # Return the fallback result (better error than timeout)
+
+    # Normal request
+    status, body = _http_raw(method, url, data=data, timeout=timeout)
+
+    # On timeout for *.hf.space through a proxy, try fallback
+    if status == 0 and has_proxy and "timed out" in _last_http_error:
+        with _hf_space_fallback_lock:
+            if _hf_space_fallback is True:
+                # Another thread already confirmed fallback works
+                rewritten_url, host_header = _rewrite_hf_space_url(url)
+                return _http_raw(method, rewritten_url, data=data, timeout=timeout, host_override=host_header)
+            if _hf_space_fallback is None:
+                rewritten_url, host_header = _rewrite_hf_space_url(url)
+                if host_header:
+                    log_info("relay", "relay.hf_fallback", msg="trying Host-header fallback")
+                    fb_status, fb_body = _http_raw(method, rewritten_url, data=data, timeout=timeout, host_override=host_header)
+                    if fb_status == 200:
+                        _hf_space_fallback = True
+                        log_info("relay", "relay.hf_fallback", msg="fallback works, using for future requests")
+                        return fb_status, fb_body
+                    else:
+                        _hf_space_fallback = False
+                        _last_http_error = "timed out (*.hf.space unreachable through proxy — add *.hf.space to NO_PROXY or proxy allowlist)"
+
+    return status, body
+
+
+def _http_raw(method: str, url: str, data: bytes | None = None, timeout: int = 5, host_override: str | None = None) -> tuple[int, bytes]:
+    """Low-level HTTP request."""
     global _last_http_error
     req = urllib.request.Request(url, data=data, method=method)
     for k, v in _get_auth_headers().items():
         req.add_header(k, v)
+    if host_override:
+        req.add_header("Host", host_override)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             _last_http_error = ""
@@ -124,7 +209,6 @@ def _http(method: str, url: str, data: bytes | None = None, timeout: int = 5) ->
         return (e.code, b"")
     except (urllib.error.URLError, socket.timeout) as e:
         reason = str(getattr(e, "reason", e))
-        # Condense SSL errors for display
         if "CERTIFICATE_VERIFY_FAILED" in reason:
             _last_http_error = "SSL certificate error"
         elif "timed out" in reason.lower():

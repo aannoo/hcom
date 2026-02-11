@@ -592,17 +592,18 @@ def _maybe_deliver_pending_messages(argv: list[str] | None = None, *, ctx: Comma
         # Update status to show delivery
         # Codex: active (notify hook will set idle when done)
         # Adhoc: inactive (no hooks - just records "this happened")
-        from .core.instances import set_status
+        from .core.instances import set_status, get_display_name
 
         msg_ts = messages[-1].get("timestamp", "")
+        sender_display = get_display_name(messages[0]["from"])
         tool = identity.instance_data.get("tool")
         if tool == "codex":
-            set_status(instance_name, "active", f"deliver:{messages[0]['from']}", msg_ts=msg_ts)
+            set_status(instance_name, "active", f"deliver:{sender_display}", msg_ts=msg_ts)
         else:
             set_status(
                 instance_name,
                 "inactive",
-                f"deliver:{messages[0]['from']}",
+                f"deliver:{sender_display}",
                 msg_ts=msg_ts,
             )
     except Exception as e:
@@ -1022,6 +1023,7 @@ def main(argv: list[str] | None = None) -> int | None:
             from .core.thread_context import get_cwd
 
             env = build_claude_env()
+            env["HCOM_DIR"] = str(hcom_path())
             hcom_cmd = build_hcom_command()
             success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
             _maybe_deliver_pending_messages(ctx=ctx)
@@ -1048,6 +1050,7 @@ def main(argv: list[str] | None = None) -> int | None:
                 from .core.thread_context import get_cwd
 
                 env = build_claude_env()
+                env["HCOM_DIR"] = str(hcom_path())
                 hcom_cmd = build_hcom_command()
                 success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
                 _maybe_deliver_pending_messages(ctx=ctx)

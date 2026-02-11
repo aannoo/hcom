@@ -232,10 +232,12 @@ def poll_messages(
                     update_instance_position(instance_id, {"last_event_id": delivered_last_event_id})
 
                     formatted = format_messages_json(deliver_messages, instance_id)
+                    from ..core.instances import get_display_name
+
                     set_status(
                         instance_id,
                         "active",
-                        f"deliver:{deliver_messages[0]['from']}",
+                        f"deliver:{get_display_name(deliver_messages[0]['from'])}",
                         msg_ts=deliver_messages[-1]["timestamp"],
                     )
 

@@ -633,6 +633,38 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         directories = set(data.get("directory", "") for data in sorted_instances if data.get("directory"))
         show_project = len(directories) > 1
 
+        # Check if multiple terminal types exist (show terminal badge only when different)
+        terminal_types: set[str] = set()
+        for d in sorted_instances:
+            lc_str = d.get("launch_context", "")
+            if lc_str:
+                try:
+                    lc = json.loads(lc_str) if isinstance(lc_str, str) else lc_str
+                    preset = lc.get("terminal_preset", "")
+                    for pfx in ("tmux", "kitty", "wezterm"):
+                        if preset.startswith(pfx):
+                            terminal_types.add(pfx)
+                            break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        show_terminal = len(terminal_types) > 1
+
+        # Compute name column width from actual names
+        from ..core.instances import is_remote_instance
+
+        max_name_len = 0
+        for d in sorted_instances:
+            n = len(get_full_name(d))
+            if d.get("background", False):
+                n += 11  # " [headless]"
+            if is_remote_instance(d):
+                n += 9  # " [remote]"
+            uc = unread_counts.get(d["name"], 0)
+            if uc > 0:
+                n += len(f" +{uc}")
+            max_name_len = max(max_name_len, n)
+        name_col_width = max(max_name_len + 2, 14)
+
         for data in sorted_instances:
             # Use full display name ({tag}-{name} or {name})
             name = get_full_name(data)
@@ -665,33 +697,13 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     tool_display = tool.lower() + "*"  # claude* - no binding
                 else:
                     tool_display = "ad-hoc"  # ad-hoc tool type
-                tool_prefix = f"[{tool_display:7}] "
+                tool_prefix = f"[{tool_display}]".ljust(10)
 
-            # Add badges
-            from ..core.instances import is_remote_instance
+            # Core badges (stay with name — these are important identity info)
+            headless_badge = " [headless]" if data.get("background", False) else ""
+            remote_badge = " [remote]" if is_remote_instance(data) else ""
 
-            headless_badge = "[headless]" if data.get("background", False) else ""
-            remote_badge = "[remote]" if is_remote_instance(data) else ""
-            # Managed terminal badge (tmux/kitty/wezterm)
-            terminal_badge = ""
-            lc_str = data.get("launch_context", "")
-            if lc_str:
-                try:
-                    lc = json.loads(lc_str) if isinstance(lc_str, str) else lc_str
-                    preset = lc.get("terminal_preset", "")
-                    for prefix in ("tmux", "kitty", "wezterm"):
-                        if preset.startswith(prefix):
-                            terminal_badge = f"[{prefix}]"
-                            break
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            # Project tag badge (only when instances have different directories)
-            project_tag = get_project_tag(data.get("directory", "")) if show_project else ""
-            project_badge = f"· {project_tag}" if project_tag else ""
-            badge_parts = [b for b in [headless_badge, remote_badge, terminal_badge, project_badge] if b]
-            badge_str = (" " + " ".join(badge_parts)) if badge_parts else ""
-
-            # Unread message indicator - messages queued for delivery on next hook/idle
+            # Unread message indicator
             unread = unread_counts.get(data["name"], 0)
             unread_str = f" +{unread}" if unread > 0 else ""
 
@@ -716,10 +728,32 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 if 0 < time_remaining < 10:
                     timeout_marker = f" ⏱ {int(time_remaining)}s"
 
-            name_with_badges = f"{name}{badge_str}{unread_str}"
+            # Metadata suffix (terminal + project — only when they differ across agents)
+            meta_parts: list[str] = []
+            if show_terminal:
+                lc_str = data.get("launch_context", "")
+                if lc_str:
+                    try:
+                        lc = json.loads(lc_str) if isinstance(lc_str, str) else lc_str
+                        preset = lc.get("terminal_preset", "")
+                        for pfx in ("tmux", "kitty", "wezterm"):
+                            if preset.startswith(pfx):
+                                meta_parts.append(f"[{pfx}]")
+                                break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            if show_project:
+                project_tag = get_project_tag(data.get("directory", ""))
+                if project_tag:
+                    meta_parts.append(project_tag)
+            meta_suffix = ("  " + " · ".join(meta_parts)) if meta_parts else ""
+
+            # Build line: {tool}{icon} {name+badges}  {status}{meta}
+            name_part = f"{name}{headless_badge}{remote_badge}{unread_str}"
+            status_text = f"{age_display}{desc_sep}{description}{timeout_marker}"
 
             # Main status line
-            print(f"{tool_prefix}{icon} {name_with_badges:30} {age_display}{desc_sep}{description}{timeout_marker}")
+            print(f"{tool_prefix}{icon} {name_part:<{name_col_width}}{status_text}{meta_suffix}")
 
             if verbose_output:
                 # Multi-line detailed view
@@ -848,14 +882,17 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         active_pids: set[int] = {data["pid"] for data in sorted_instances if data.get("pid")}
         orphans = get_orphan_processes(active_pids=active_pids)
         if orphans:
-            print("\nRunning processes (stopped):")
+            print("\nOrphan processes:")
             for o in orphans:
-                names = ", ".join(o.get("names", []))
-                names_str = f" ({names})" if names else ""
+                names = o.get("names", [])
+                name_str = ", ".join(names) if names else f"pid:{o['pid']}"
                 age = format_age(time.time() - o["launched_at"]) if o.get("launched_at") else ""
-                age_str = f" · {age}" if age else ""
-                print(f"  ◌ pid:{o['pid']}{names_str} · {o['tool']}{age_str}")
-            print("  → hcom kill <name>")
+                age_part = f" · {age}" if age else ""
+                print(f"  ◌ {name_str} · {o['tool']}{age_part}")
+            if len(orphans) == 1 and orphans[0].get("names"):
+                print(f"  → hcom kill {orphans[0]['names'][0]}")
+            else:
+                print("  → hcom kill <name>")
 
         # Show recently stopped summary (last 10 minutes)
         from ..core.db import get_recently_stopped, RECENTLY_STOPPED_MINUTES

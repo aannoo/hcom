@@ -16,7 +16,7 @@ import re
 
 from .thread_context import get_process_id
 from .db import get_db
-from .instances import load_instance_position, resolve_instance_name
+from .instances import load_instance_position, resolve_instance_name, resolve_display_name
 from ..shared import SenderIdentity, HcomError
 
 
@@ -93,7 +93,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
     3. Error if not found (no external fallback)
 
     Args:
-        name: The value from --name flag (base name only, no tag/device suffix)
+        name: The value from --name flag (base name or tag-name like 'team-luna')
 
     Returns:
         SenderIdentity with kind='instance'
@@ -103,9 +103,14 @@ def resolve_from_name(name: str) -> SenderIdentity:
     """
     from .log import log_info, log_warn
 
-    # Reject invalid base names (tag/device suffixes are not allowed here)
+    # Reject invalid base names, but allow tag-name format (e.g. "team-luna")
     if not _looks_like_uuid(name) and not is_valid_base_name(name):
-        raise HcomError(base_name_error(name))
+        # Try tag-name resolution before rejecting
+        resolved = resolve_display_name(name)
+        if resolved:
+            name = resolved
+        else:
+            raise HcomError(base_name_error(name))
 
     # 1. Instance name lookup (exact match)
     data = load_instance_position(name)

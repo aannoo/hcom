@@ -315,7 +315,7 @@ The shim works by:
     elif subcommand == "status":
         return cmd_shim_status(sub_argv)
     else:
-        raise CLIError(f"Unknown shim subcommand: {subcommand}\nRun 'hcom shim --help' for usage")
+        raise CLIError(f"Unknown shim subcommand: {subcommand}\nValid: install, uninstall, status")
 
 
 __all__ = ["cmd_shim"]

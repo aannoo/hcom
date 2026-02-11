@@ -87,11 +87,10 @@ def _relay_toggle(enable: bool) -> int:
 
 def _relay_status() -> int:
     """Show relay status and configuration"""
-    import urllib.request
     from ..core.device import get_device_short_id
     from ..core.config import get_config
     from ..core.db import kv_get
-    from ..relay import push, pull
+    from ..relay import push, pull, _http
 
     config = get_config()
 
@@ -120,15 +119,14 @@ def _relay_status() -> int:
     # Ping relay to check if online
     relay_online = False
     relay_version = None
-    headers = {"Authorization": f"Bearer {config.relay_token}"} if config.relay_token else {}
-    try:
-        url = config.relay.rstrip("/") + "/version"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as r:
-            relay_version = json.loads(r.read()).get("v")
+    url = config.relay.rstrip("/") + "/version"
+    status, content = _http("GET", url, timeout=5)
+    if status == 200 and content:
+        try:
+            relay_version = json.loads(content).get("v")
             relay_online = True
-    except Exception:
-        pass
+        except json.JSONDecodeError:
+            pass
 
     # Version warning first (if outdated)
     if relay_version is not None and relay_version != REQUIRED_RELAY_VERSION:
@@ -162,22 +160,23 @@ def _relay_status() -> int:
     print(f"Last push: {_format_time(last_push)}" if last_push else "Last push: never")
 
     # Live remote devices from server
-    try:
-        devices_url = config.relay.rstrip("/") + "/devices"
-        req = urllib.request.Request(devices_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as r:
-            remote_devices = json.loads(r.read())
+    devices_url = config.relay.rstrip("/") + "/devices"
+    dev_status, dev_content = _http("GET", devices_url, timeout=5)
+    if dev_status == 200 and dev_content:
+        try:
+            remote_devices = json.loads(dev_content)
+            my_short_id = get_device_short_id()
+            active = [d for d in remote_devices if d.get("age", 9999) < 300 and d.get("short_id") != my_short_id]
 
-        my_short_id = get_device_short_id()
-        active = [d for d in remote_devices if d.get("age", 9999) < 300 and d.get("short_id") != my_short_id]
-
-        if active:
-            print("\nActive devices:")
-            for d in active:
-                print(f"  {d['short_id']}: {d['instances']} agents ({format_age(d['age'])} ago)")
-        else:
+            if active:
+                print("\nActive devices:")
+                for d in active:
+                    print(f"  {d['short_id']}: {d['instances']} agents ({format_age(d['age'])} ago)")
+            else:
+                print("\nNo other active devices")
+        except json.JSONDecodeError:
             print("\nNo other active devices")
-    except Exception:
+    else:
         print("\nNo other active devices")
 
     return exit_code
@@ -192,31 +191,26 @@ def _format_time(timestamp: float) -> str:
 
 def _check_relay_version() -> tuple[bool, str | None]:
     """Check if relay version matches required version."""
-    import urllib.request
     from ..core.config import get_config
+    from ..relay import _http
 
     config = get_config()
     if not config.relay:
         return (False, None)
 
-    try:
-        url = config.relay.rstrip("/") + "/version"
-        headers = {"Authorization": f"Bearer {config.relay_token}"} if config.relay_token else {}
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as r:
-            relay_version = json.loads(r.read()).get("v", 0)
-
-        if relay_version != REQUIRED_RELAY_VERSION:
-            return (
-                True,
-                f"Relay v{relay_version}, need v{REQUIRED_RELAY_VERSION}. Run: hcom relay hf --update",
-            )
-        return (False, None)
-    except Exception:
-        return (
-            False,
-            None,
-        )  # Fail silently (relay might not have /version yet (it will, this is shit))
+    url = config.relay.rstrip("/") + "/version"
+    status, content = _http("GET", url, timeout=5)
+    if status == 200 and content:
+        try:
+            relay_version = json.loads(content).get("v", 0)
+            if relay_version != REQUIRED_RELAY_VERSION:
+                return (
+                    True,
+                    f"Relay v{relay_version}, need v{REQUIRED_RELAY_VERSION}. Run: hcom relay hf --update",
+                )
+        except json.JSONDecodeError:
+            pass
+    return (False, None)
 
 
 def _relay_pull() -> int:

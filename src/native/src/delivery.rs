@@ -613,12 +613,31 @@ pub fn run_delivery_loop(
 
         match delivery_state {
             State::Idle => {
+                // Capture wall clock before wait to detect system sleep
+                let wall_before = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
                 // Wait for notification or timeout
                 let notified = notify.wait(idle_wait);
 
                 if !running.load(Ordering::Acquire) {
                     log_info("native", "delivery.shutdown", "Running flag cleared, exiting loop");
                     break;
+                }
+
+                // Detect sleep/wake: wall clock jumped more than expected for idle_wait
+                let wall_after = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let wall_elapsed = wall_after.saturating_sub(wall_before);
+                if wall_elapsed > 45 {
+                    log_info("native", "delivery.sleep_wake", &format!(
+                        "System sleep detected for {}: wall clock jumped {}s during 30s poll",
+                        current_name, wall_elapsed
+                    ));
                 }
 
                 // Update heartbeat to prove we're alive (also re-asserts tcp_mode=true)
@@ -1091,15 +1110,14 @@ pub fn run_delivery_loop(
         // 3. Delete notify endpoints
         let _ = db.delete_notify_endpoints(&current_name);
 
-        // 4. Delete instance row
-        let deleted = db.delete_instance(&current_name).unwrap_or(false);
-
-        // 5. Log life event only after successful delete (matches Python)
-        if deleted {
-            if let Err(e) = db.log_life_event(&current_name, "stopped", "pty", exit_reason, snapshot) {
-                log_warn("native", "delivery.life_event_fail", &format!("Failed to log life event: {}", e));
-            }
+        // 4. Log life event BEFORE delete — if log fails, row stays (stale cleanup catches it).
+        //    Previous order (delete first) lost snapshots when log_life_event hit DB lock.
+        if let Err(e) = db.log_life_event(&current_name, "stopped", "pty", exit_reason, snapshot) {
+            log_warn("native", "delivery.life_event_fail", &format!("Failed to log life event: {}", e));
         }
+
+        // 5. Delete instance row
+        let _ = db.delete_instance(&current_name);
     } else {
         log_info("native", "delivery.cleanup_skipped", &format!(
             "Skipping instance cleanup for {} — name reassigned to new process", current_name

@@ -629,9 +629,18 @@ def send_message(
         routing_instance = identity.name
 
     try:
-        log_event(event_type="message", instance=routing_instance, data=data)
+        event_id = log_event(event_type="message", instance=routing_instance, data=data)
     except Exception as e:
         raise HcomError(f"Failed to write message to database: {e}")
+
+    # Auto-create request-watch subscriptions for targeted request messages
+    if (
+        envelope
+        and envelope.get("intent") == "request"
+        and identity.kind == "instance"
+        and scope == "mentions"
+    ):
+        _create_request_watches(identity.name, event_id, delivered_to)
 
     # Push to relay server (notify daemon if running, else inline push)
     try:
@@ -666,6 +675,51 @@ def send_system_message(sender_name: str, message: str) -> list[str]:
     """
     identity = SenderIdentity(kind="system", name=sender_name, instance_data=None)
     return send_message(identity, message)
+
+
+def _create_request_watches(sender: str, request_event_id: int, recipients: list[str]) -> None:
+    """Create request-watch subscriptions for each recipient.
+
+    Watches for recipients going idle (listening) or stopping without responding.
+    Auto-removes on first match (once=True). Cancelled by _cancel_request_watches_by_flow()
+    in db.py when the recipient sends a targeted message back to the sender.
+    """
+    import json
+    import time
+
+    from .db import kv_set, get_last_event_id
+
+    last_id = get_last_event_id()
+    now = time.time()
+
+    for recipient in recipients:
+        sub_id = f"reqwatch-{request_event_id}-{recipient}"
+        sub_key = f"events_sub:{sub_id}"
+
+        sql = (
+            "(type='status' AND instance=? AND status_val='listening') "
+            "OR (type='life' AND instance=? AND life_action='stopped')"
+        )
+
+        kv_set(
+            sub_key,
+            json.dumps(
+                {
+                    "id": sub_id,
+                    "caller": sender,
+                    "sql": sql,
+                    "params": [recipient, recipient],
+                    "filters": {
+                        "request_watch": True,
+                        "request_id": request_event_id,
+                        "target": recipient,
+                    },
+                    "created": now,
+                    "last_id": last_id,
+                    "once": True,
+                }
+            ),
+        )
 
 
 def get_unread_messages(instance_name: str, update_position: bool = False) -> tuple[list[dict[str, Any]], int]:
@@ -947,7 +1001,7 @@ def format_hook_messages(messages: list[dict[str, Any]], instance_name: str) -> 
 
     Format includes envelope info: [intent:thread #id] sender → recipient: text
     """
-    from .instances import get_full_name
+    from .instances import get_full_name, get_display_name
 
     def _others_count(msg: dict[str, Any]) -> int:
         """Count other recipients (excluding self)"""
@@ -960,13 +1014,15 @@ def format_hook_messages(messages: list[dict[str, Any]], instance_name: str) -> 
         sender_data = load_instance_position(sender_base_name)
         return get_full_name(sender_data) or sender_base_name
 
+    recipient_display = get_display_name(instance_name)
+
     if len(messages) == 1:
         msg = messages[0]
         others = _others_count(msg)
         if others > 0:
-            recipient = f"{instance_name} (+{others} other{'s' if others > 1 else ''})"
+            recipient = f"{recipient_display} (+{others} other{'s' if others > 1 else ''})"
         else:
-            recipient = instance_name
+            recipient = recipient_display
         prefix = _build_message_prefix(msg)
         sender_display = _get_sender_display_name(msg["from"])
         reason = f"{prefix} {sender_display} → {recipient}: {msg['message']}"
@@ -975,9 +1031,9 @@ def format_hook_messages(messages: list[dict[str, Any]], instance_name: str) -> 
         for msg in messages:
             others = _others_count(msg)
             if others > 0:
-                recipient = f"{instance_name} (+{others})"
+                recipient = f"{recipient_display} (+{others})"
             else:
-                recipient = instance_name
+                recipient = recipient_display
             prefix = _build_message_prefix(msg)
             sender_display = _get_sender_display_name(msg["from"])
             parts.append(f"{prefix} {sender_display} → {recipient}: {msg['message']}")

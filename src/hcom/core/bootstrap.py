@@ -50,7 +50,8 @@ You MUST use `hcom <cmd> --name {instance_name}` for all hcom commands:
 - Get notified when anything in hcom happens (same filters): events sub --help
 - Handoff context: bundle prepare → send with --title
 - Spawn agents: [HCOM_TAG=label-or-group] hcom [num] <claude|gemini|codex>
-- Resume/fork agents, background, tmux, prompt, system, forward args: hcom <claude|gemini|codex> --help
+  Example: `HCOM_TAG=reviewer hcom 1 claude` -> automatic <hcom> notify when ready -> send task to agent via hcom message
+  Resume/fork agents, background, tmux, set prompt, system, forward args: hcom <claude|gemini|codex> --help
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen, inject text/enter: term [name]
@@ -92,23 +93,30 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples.
 DELIVERY_AUTO = """
 ## DELIVERY
 
-Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
+Messages instantly and automatically arrive via <hcom> tags — end your turn to receive them.
 
-- For hcom message waiting: end your turn (do not run `hcom listen`).
-- For hcom event/other agent progress waiting: use `hcom events sub --help` and subscribe (do not run `hcom listen`).
-- For non-hcom pause/yield, use `hcom listen` instead of `sleep`.
+## WAITING RULES
+
+1. Never use `sleep [sec]` instead use `hcom listen [sec]`
+2. Only use `hcom listen` when you are waiting for something not related to hcom
+- Waiting for hcom message → end your turn                                                                                                  
+- Waiting for agent progress → `hcom events sub`                                                                                                   
 """
 
 DELIVERY_CODEX_HCOM_LAUNCHED = """
 ## DELIVERY
 
 New message notifications instantly auto-arrive via <hcom> tags - end your turn to receive them.
+IMPORTANT: <hcom> tags = run `hcom listen 1 --name {instance_name}` IMMEDIATELY to read message.
+
+## WAITING RULES
+
+Never use `sleep`
 
 - For hcom message waiting: end your turn. (do not preemptively run `hcom listen`)
 - For hcom event/other agent progress waiting: use `hcom events sub --help` and subscribe.
 - For non-hcom pause/yield, use `hcom listen` instead of `sleep`
 
-IMPORTANT: <hcom> tags = run `hcom listen 1 --name {instance_name}` IMMEDIATELY to read message.
 """
 
 DELIVERY_ADHOC = """

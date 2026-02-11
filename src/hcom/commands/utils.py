@@ -266,6 +266,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  --last-transcript N", "Transcript entries to suggest (default: 20)"),
         ("  --last-events N", "Events to scan per category (default: 30)"),
         ("  --json", "Output JSON"),
+        ("  --compact", "Hide how-to section"),
         ("", "Shows suggested transcript ranges, relevant events, files"),
         ("", "Outputs ready-to-use bundle create command"),
         ("", "TIP: Skip 'bundle create' — use bundle flags directly in 'hcom send'"),
@@ -374,6 +375,8 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  --json", "JSON output"),
         ("  --edit", "Open config in $EDITOR"),
         ("  --reset", "Reset config to defaults"),
+        ("", ""),
+        ("config terminal --setup", "Configure kitty remote control"),
         ("", ""),
         ("Per-agent runtime config:", ""),
         ("config -i <name>", "Show agent config"),
@@ -577,6 +580,10 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
 def get_command_help(name: str) -> str:
     """Get formatted help for a single command."""
     if name not in COMMAND_HELP:
+        # Try parent command (e.g. "events sub" -> "events")
+        parent = name.rsplit(" ", 1)[0]
+        if parent != name and parent in COMMAND_HELP:
+            return get_command_help(parent)
         return f"Usage: hcom {name}"
     lines = ["Usage:"]
     for entry in COMMAND_HELP[name]:
@@ -675,7 +682,7 @@ KNOWN_FLAGS: dict[str, set[str]] = {
     "events": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--last", "--wait", "--sql", "--all", "--full"},
     "events sub": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--once", "--for"},
     "events unsub": _GLOBAL_FLAGS,
-    "events launch": _GLOBAL_FLAGS,
+    "events launch": _GLOBAL_FLAGS | {"--timeout"},
     "list": _GLOBAL_FLAGS | {"--json", "-v", "--verbose", "--sh", "--stopped", "--all"},
     "listen": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--timeout", "--json", "--sql"},
     "start": _GLOBAL_FLAGS | {"--as"},

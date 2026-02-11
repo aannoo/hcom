@@ -322,10 +322,11 @@ class ManageScreen:
         tool = orphan.get("tool", "unknown")
         launched_at = orphan.get("launched_at", 0)
 
-        # Format: "  ◌ pid:12345 (luna, nova) · claude · 16m"
-        names_str = f" ({', '.join(names)})" if names else ""
+        # Format: "  ◌ luna, nova (pid:12345) · claude · 16m"
+        name_str = ", ".join(names) if names else f"pid:{pid}"
+        pid_suffix = f" (pid:{pid})" if names else ""
         age_str = format_age(time.time() - launched_at) if launched_at else ""
-        content = f" ◌ pid:{pid}{names_str} · {tool}"
+        content = f" ◌ {name_str}{pid_suffix} · {tool}"
         if age_str:
             content += f" · {age_str}"
 

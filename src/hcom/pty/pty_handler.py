@@ -52,38 +52,35 @@ def create_runner_script(
     tool: str,
     cwd: str,
     instance_name: str,
-    process_id: str,
-    tag: str,
+    env: dict[str, str],
     tool_args: list[str],
     *,
     run_here: bool = False,
-    extra_env: dict[str, str] | None = None,
-    runner_module: str | None = None,
-    runner_function: str | None = None,
-    runner_extra_kwargs: str = "",
 ) -> str:
     """Create a bash script that runs a tool with hcom native PTY integration.
+
+    The env dict should be the full instance_env from launcher.py, with
+    HCOM_INSTANCE_NAME and tool-specific vars (TOOL_EXTRA_ENV) already added
+    by the caller (launch_pty). This script exports all vars from env, so it
+    is the single source of truth for what the Rust PTY binary sees.
+
+    Note: the outer bash script (created by launch_terminal → create_bash_script)
+    also exports instance_env. This intentional redundancy means the runner
+    script overrides with identical values — see create_bash_script comment.
 
     Args:
         tool: Tool identifier ("claude", "gemini", "codex")
         cwd: Working directory
-        instance_name: HCOM instance name
-        process_id: HCOM process ID
-        tag: Instance tag prefix
+        instance_name: HCOM instance name (for script filename/comment only)
+        env: Full instance environment variables dict
         tool_args: Arguments to pass to tool command
         run_here: If True, script is for current terminal (no exec bash at end)
-        extra_env: Additional environment variables
-        runner_module: Ignored (legacy compatibility)
-        runner_function: Ignored (legacy compatibility)
-        runner_extra_kwargs: Ignored (legacy compatibility)
 
     Returns:
         Path to created script file
     """
-    # Ignore legacy Python PTY parameters
-    del runner_module, runner_function, runner_extra_kwargs
-
     from ..core.paths import hcom_path, LAUNCH_DIR
+    from ..terminal import build_env_string
 
     native_bin = _require_native_binary()
     script_file = str(hcom_path(LAUNCH_DIR, f"{tool}_{instance_name}_{random.randint(1000, 9999)}.sh"))
@@ -93,36 +90,7 @@ def create_runner_script(
     # The .command wrapper handles exec bash -l after this script exits.
     use_exec = not run_here
 
-    # Export HCOM_DIR if set
-    hcom_dir = os.environ.get("HCOM_DIR", "")
-    hcom_dir_export = f'export HCOM_DIR="{hcom_dir}"' if hcom_dir else "# HCOM_DIR not set"
-
-    # Build env exports
-    # HCOM_INSTANCE_NAME is a hint for delivery thread startup - the authoritative
-    # name comes from process binding lookup (allows for name changes during session)
-    env_exports = [
-        f'export HCOM_PROCESS_ID="{process_id}"',
-        f'export HCOM_TAG="{tag}"',
-        f'export HCOM_INSTANCE_NAME="{instance_name}"',
-        "export HCOM_LAUNCHED=1",
-        hcom_dir_export,
-    ]
-    if os.environ.get("HCOM_VIA_SHIM"):
-        env_exports.append("export HCOM_VIA_SHIM=1")
-    if os.environ.get("HCOM_PTY_DEBUG"):
-        env_exports.append("export HCOM_PTY_DEBUG=1")
-
-    # Add tool-specific env
-    tool_env = TOOL_EXTRA_ENV.get(tool, {})
-    for key, value in tool_env.items():
-        env_exports.append(f'export {key}="{value}"')
-
-    # Add caller-provided extra env
-    if extra_env:
-        for key, value in extra_env.items():
-            env_exports.append(f'export {key}="{value}"')
-
-    env_block = "\n".join(env_exports)
+    env_block = build_env_string(env, "bash_export")
 
     # Build tool args for command line
     tool_args_str = " ".join(shlex.quote(arg) for arg in tool_args)
@@ -172,39 +140,29 @@ unset {' '.join(HCOM_IDENTITY_VARS)}
 def launch_pty(
     tool: str,
     cwd: str,
-    env: dict,
+    env: dict[str, str],
     instance_name: str,
     tool_args: list[str],
     *,
-    tag: str = "",
     run_here: bool = False,
-    extra_env: dict[str, str] | None = None,
-    runner_module: str | None = None,
-    runner_function: str | None = None,
-    runner_extra_kwargs: str = "",
 ) -> str | None:
     """Launch a tool in a terminal via native PTY wrapper.
 
     Args:
         tool: Tool identifier ("claude", "gemini", "codex")
         cwd: Working directory
-        env: Environment variables dict
+        env: Full instance_env dict from launcher (config.env + instance vars).
+             Will be augmented with HCOM_INSTANCE_NAME and tool-specific vars.
         instance_name: HCOM instance name
         tool_args: Arguments to pass to tool command
-        tag: Instance tag prefix (optional)
         run_here: If True, run in current terminal (blocking)
-        extra_env: Additional environment variables
-        runner_module: Ignored (legacy compatibility)
-        runner_function: Ignored (legacy compatibility)
-        runner_extra_kwargs: Ignored (legacy compatibility)
 
     Returns:
         instance_name on success, None on failure
     """
     from ..terminal import launch_terminal
 
-    process_id = env.get("HCOM_PROCESS_ID")
-    if not process_id:
+    if not env.get("HCOM_PROCESS_ID"):
         log_error(
             "pty",
             "pty.exit",
@@ -214,25 +172,20 @@ def launch_pty(
         )
         return None
 
-    # Forward launch context vars from env dict (not os.environ — that would
-    # leak grandparent values in nested launches)
-    merged_extra_env = dict(extra_env) if extra_env else {}
-    for var in ("HCOM_LAUNCHED_BY", "HCOM_LAUNCH_BATCH_ID", "HCOM_LAUNCH_EVENT_ID", "HCOM_LAUNCHED_PRESET"):
-        if val := env.get(var):
-            merged_extra_env.setdefault(var, val)
+    # Add PTY-specific vars to env. HCOM_INSTANCE_NAME is a hint for the Rust
+    # delivery thread startup — the authoritative name comes from process
+    # binding lookup (allows for name changes during session).
+    runner_env = env.copy()
+    runner_env["HCOM_INSTANCE_NAME"] = instance_name
+    runner_env.update(TOOL_EXTRA_ENV.get(tool, {}))
 
     script_file = create_runner_script(
         tool,
         cwd,
         instance_name,
-        process_id,
-        tag,
+        runner_env,
         tool_args,
         run_here=run_here,
-        extra_env=merged_extra_env,
-        runner_module=runner_module,
-        runner_function=runner_function,
-        runner_extra_kwargs=runner_extra_kwargs,
     )
 
     success = launch_terminal(f"bash {shlex.quote(script_file)}", env, cwd=cwd, run_here=run_here)

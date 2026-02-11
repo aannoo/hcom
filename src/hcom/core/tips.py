@@ -15,7 +15,7 @@ TIPS = {
         " | [AD-HOC] [gemini] [codex] limited"
     ),
     # Send-side (shown after send with --intent)
-    "send:intent:request": "[tip] intent=request: You signaled you expect a response.",
+    "send:intent:request": "[tip] intent=request: You signaled you expect a response. You'll be auto-notified if they end their turn or stop without responding. Safe to move on.",
     "send:intent:inform": "[tip] intent=inform: You signaled no response needed.",
     "send:intent:ack": "[tip] intent=ack: You acknowledged receipt. Recipient won't respond.",
     # Recv-side (appended to message on first receipt of each type)

@@ -315,7 +315,7 @@ def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_i
     from .core.log import log_info, log_warn
     from .core.settings import get_merged_preset
 
-    log_info("terminal", "close_pane_attempt", preset=preset_name, pane_id=pane_id, process_id=process_id, pid=pid)
+    log_info("terminal", "close_pane_attempt", preset=preset_name, pane_id=pane_id, process_id=process_id, pid=pid, terminal_id=terminal_id)
 
     preset = get_merged_preset(preset_name)
     if not preset:
@@ -326,8 +326,12 @@ def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_i
         return False
 
     # Skip if command needs a placeholder we don't have
+    # Fall back to terminal_id (captured from launch stdout) if pane_id is missing
     if "{pane_id}" in close_cmd and not pane_id:
-        return False
+        if terminal_id:
+            pane_id = terminal_id
+        else:
+            return False
     if "{process_id}" in close_cmd and not process_id:
         return False
     if "{id}" in close_cmd and not terminal_id:
@@ -486,8 +490,10 @@ def create_bash_script(
             tool_name = "Gemini"
         elif "codex" in cmd_lower:
             tool_name = "Codex"
-        else:
+        elif "claude" in cmd_lower:
             tool_name = "Claude Code"
+        else:
+            tool_name = "hcom"
 
     with open(script_file, "w", encoding="utf-8") as f:
         f.write("#!/bin/bash\n")
@@ -516,6 +522,10 @@ def create_bash_script(
             # Always add hcom's own directory so 'hcom' is findable
             _add_path(shutil.which("hcom"))
 
+            # Add python3 so Rust binary's find_sibling_python() fallback works
+            # (new terminal windows may lack pyenv/venv in PATH)
+            _add_path(shutil.which("python3"))
+
             # Detect tool from command and add its path
             cmd_stripped = command_str.lstrip()
             tool_cmd = cmd_stripped.split()[0] if cmd_stripped else ""
@@ -531,7 +541,12 @@ def create_bash_script(
             if paths_to_add:
                 f.write(f'export PATH="{":".join(paths_to_add)}:$PATH"\n')
 
-            # Write environment variables
+            # Write environment variables.
+            # For PTY paths, the inner runner script (create_runner_script) also exports
+            # env vars — mostly overlapping but the runner adds HCOM_INSTANCE_NAME and
+            # TOOL_EXTRA_ENV (e.g. HCOM_PTY_MODE). The runner script's exports are
+            # authoritative for the Rust binary; this outer script provides the base.
+            # If you change env handling here, check create_runner_script too.
             f.write(build_env_string(env, "bash_export") + "\n")
 
             if cwd:
@@ -710,6 +725,29 @@ def _parse_terminal_command(template: str, script_file: str, process_id: str = "
         )
 
     return replaced
+
+
+# Terminal context vars that should not leak to other terminal apps.
+# KITTY_WINDOW_ID/WEZTERM_PANE identify specific panes — stale values cause targeting errors
+# (e.g. "window_id is not a recognized location" when Terminal.app inherits kitty context).
+# KITTY_LISTEN_ON is kept: kitten @ needs it for fd-based sockets (pass_fds only opens the fd,
+# kitten still reads KITTY_LISTEN_ON to know which fd to use).
+_TERMINAL_CONTEXT_VARS = {"KITTY_WINDOW_ID", "WEZTERM_PANE"}
+
+
+def _get_launcher_env() -> dict[str, str]:
+    """Build clean env for terminal launcher subprocesses.
+
+    Strips AI tool markers, hcom identity vars, and terminal context vars
+    from the caller's env. Critical for `open -a Terminal` (macOS) which
+    propagates caller env to the singleton Terminal.app process, contaminating
+    every future window.
+
+    Uses blocklist (not allowlist) to preserve the user's full env — we can't
+    predict what vars launcher commands need (DBUS_SESSION_BUS_ADDRESS, SystemRoot, etc).
+    """
+    strip = set(TOOL_MARKER_VARS) | set(HCOM_IDENTITY_VARS) | _TERMINAL_CONTEXT_VARS
+    return {k: v for k, v in os.environ.items() if k not in strip}
 
 
 def launch_terminal(
@@ -1048,7 +1086,7 @@ def _spawn_terminal_process(argv: list[str], format_error) -> tuple[bool, str]:
 
     if platform.system() == "Windows":
         # Windows needs non-blocking for parallel launches
-        process = subprocess.Popen(argv)
+        process = subprocess.Popen(argv, env=_get_launcher_env())
         log_info(
             "terminal",
             "launch.detached",
@@ -1088,11 +1126,13 @@ def _spawn_terminal_process(argv: list[str], format_error) -> tuple[bool, str]:
             stdout_path = None
 
         popen_kwargs: dict[str, Any] = {}
+        launcher_env = _get_launcher_env()
         kitty_fd = _kitty_listen_fd()
         if kitty_fd is not None and any("kitten" in a for a in argv):
             popen_kwargs["pass_fds"] = (kitty_fd,)
         process = subprocess.Popen(
             argv,
+            env=launcher_env,
             stdin=subprocess.DEVNULL,
             stdout=stdout_handle or subprocess.DEVNULL,
             stderr=stderr_handle or subprocess.DEVNULL,
@@ -1183,11 +1223,12 @@ def _spawn_terminal_process(argv: list[str], format_error) -> tuple[bool, str]:
         return True, captured_stdout  # Fire and forget
 
     # Normal case: wait for terminal launcher to complete
+    launcher_env = _get_launcher_env()
     popen_kwargs_normal: dict[str, Any] = {}
     kitty_fd_normal = _kitty_listen_fd()
     if kitty_fd_normal is not None and any("kitten" in a for a in argv):
         popen_kwargs_normal["pass_fds"] = (kitty_fd_normal,)
-    result = subprocess.run(argv, capture_output=True, text=True, **popen_kwargs_normal)
+    result = subprocess.run(argv, env=launcher_env, capture_output=True, text=True, **popen_kwargs_normal)
     if result.returncode != 0:
         stderr_text = (result.stderr or "").strip()
         error_msg = f"Terminal launch failed (exit code {result.returncode})" + (

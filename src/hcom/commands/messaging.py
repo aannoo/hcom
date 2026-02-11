@@ -200,8 +200,6 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
         from .utils import parse_name_flag
         from ..core.identity import (
             _looks_like_uuid,
-            is_valid_base_name,
-            base_name_error,
             validate_name_input,
         )
 
@@ -211,9 +209,6 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             if not _looks_like_uuid(explicit_name):
                 if error := validate_name_input(explicit_name, allow_at=True):
                     print(format_error(error), file=sys.stderr)
-                    return 1
-                if not is_valid_base_name(explicit_name):
-                    print(format_error(base_name_error(explicit_name)), file=sys.stderr)
                     return 1
 
     # --stdin flag
@@ -487,7 +482,11 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
         elif ctx and ctx.identity:
             identity = ctx.identity
         elif explicit_name:
-            identity = resolve_identity(name=explicit_name)
+            try:
+                identity = resolve_identity(name=explicit_name)
+            except HcomError as e:
+                print(format_error(str(e)), file=sys.stderr)
+                return 1
         else:
             identity = resolve_identity()
 
@@ -1024,8 +1023,10 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         return 0
 
     if not json_output:
+        from ..core.instances import get_display_name
+
         print(
-            f"[Listening for messages to {instance_name}. Timeout: {timeout}s]",
+            f"[Listening for messages to {get_display_name(instance_name)}. Timeout: {timeout}s]",
             file=sys.stderr,
         )
 
@@ -1060,10 +1061,12 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     set_status(instance_name, "inactive", "message received")
                 elif instance_data.get("tool") == "codex":
                     msg_ts = messages[-1].get("timestamp", "")
+                    from ..core.instances import get_display_name
+
                     set_status(
                         instance_name,
                         "active",
-                        f"deliver:{messages[0]['from']}",
+                        f"deliver:{get_display_name(messages[0]['from'])}",
                         msg_ts=msg_ts,
                     )
                 else:
@@ -1121,6 +1124,14 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             print("\n[Interrupted]", file=sys.stderr)
         return 130
     finally:
+        # Clear cmd:listen detail if still set (timeout/interrupt paths don't clear it).
+        # This unblocks the PTY delivery gate which treats cmd:listen as non-idle.
+        try:
+            current = load_instance_position(instance_name)
+            if current and current.get("status_detail") == "cmd:listen":
+                set_status(instance_name, "listening", "ready")
+        except Exception:
+            pass
         # Clean up notify endpoint so future sends don't hit stale port
         try:
             from ..core.db import delete_notify_endpoint

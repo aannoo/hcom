@@ -70,6 +70,19 @@ def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int
 
     init_db()
 
+    # Parse --timeout flag
+    timeout = 30  # default
+    if "--timeout" in argv:
+        idx = argv.index("--timeout")
+        argv = argv[:idx] + argv[idx + 1:]
+        if idx < len(argv) and not argv[idx].startswith("-"):
+            try:
+                timeout = int(argv[idx])
+                argv = argv[:idx] + argv[idx + 1:]
+            except ValueError:
+                print(format_error(f"--timeout must be an integer, got '{argv[idx]}'"), file=sys.stderr)
+                return 1
+
     # Parse batch_id arg (for specific batch lookup)
     batch_id = argv[0] if argv and not argv[0].startswith("--") else None
 
@@ -83,7 +96,7 @@ def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int
         except Exception:
             pass
 
-    result = wait_for_launch(launcher=launcher, batch_id=batch_id)
+    result = wait_for_launch(launcher=launcher, batch_id=batch_id, timeout=timeout)
     print(json.dumps(result))
 
     return 0 if result.get("status") == "ready" else 1

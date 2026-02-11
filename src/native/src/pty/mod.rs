@@ -290,6 +290,45 @@ fn build_early_launch_context() -> String {
         }
     }
 
+    // Read terminal_id from temp file written by parent's launch stdout capture.
+    // This is the ID returned by `kitten @ launch` (or similar) and serves as
+    // fallback for pane_id when the terminal env var isn't available.
+    //
+    // Race condition: parent writes this file after `kitten @ launch` returns
+    // (~500ms after child starts), but we run within ~10-100ms of spawn.
+    // Retry with backoff only when pane_id not already captured from env vars
+    // (tmux/wezterm set env vars directly, no file needed).
+    if let Some(process_id) = ctx.get("process_id").and_then(|v| v.as_str()) {
+        let id_file = crate::paths::hcom_dir().join(".tmp").join("terminal_ids").join(process_id);
+        let needs_id = !ctx.contains_key("pane_id");
+        let max_attempts: usize = if needs_id { 10 } else { 1 };
+        let mut terminal_id_value = String::new();
+
+        for attempt in 0..max_attempts {
+            match std::fs::read_to_string(&id_file) {
+                Ok(contents) => {
+                    let trimmed = contents.trim().to_string();
+                    if !trimmed.is_empty() {
+                        terminal_id_value = trimmed;
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            if attempt + 1 < max_attempts {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        if !terminal_id_value.is_empty() {
+            ctx.insert("terminal_id".into(), Value::String(terminal_id_value.clone()));
+            if !ctx.contains_key("pane_id") {
+                ctx.insert("pane_id".into(), Value::String(terminal_id_value));
+            }
+        }
+        let _ = std::fs::remove_file(&id_file);
+    }
+
     Value::Object(ctx).to_string()
 }
 

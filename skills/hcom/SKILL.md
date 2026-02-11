@@ -5,11 +5,11 @@ description: |
 
 ---
 
-# hcom — realtime messaging + context sharing for AI coding agents
+# hcom — Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals
 
 ## What is hcom?
 
-Local message bus + event log. Agents message each other, share transcripts, get notified on events, and spawn new agents. Messages arive when agents are active and idle.
+Local message bus + event log. Agents message each other, share transcripts, get notified on events, and spawn new agents. Messages arrive when agents are active and idle.
 
 ```
 pip install hcom
@@ -141,7 +141,7 @@ hcom hooks add                   # Installs to project dir
 ### Fresh Start
 
 ```bash
-hcom reset all # arhive db, reset config, remove hooks, stop all agents
+hcom reset all # archive db, reset config, remove hooks, stop all agents
 pip uninstall hcom && pip install hcom
 # Restart AI tool
 ```
@@ -153,7 +153,7 @@ pip uninstall hcom && pip install hcom
 | Tool | Message Delivery | Notes |
 |------|------------------|-------|
 | Claude Code | idle + mid-turn | Full hooks, subagents work |
-| Gemini CLI (v0.24.0+) | idle + mid-turn | Full hooks |
+| Gemini CLI (v0.26.0+) | idle + mid-turn | Full hooks |
 | Codex | idle + `hcom listen` | 1 hook |
 | Any AI tool | manual | Ad-hoc mode via `hcom start` |
 

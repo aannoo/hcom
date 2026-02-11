@@ -264,34 +264,94 @@ class Session:
             )
         return result
 
-    def events(self, *, sql: str | None = None, params: list | None = None, last: int = 20) -> list[dict]:
+    def events(
+        self,
+        *,
+        sql: str | None = None,
+        params: list | None = None,
+        last: int = 20,
+        # Structured filters (same semantics as CLI flags)
+        agent: str | list[str] | None = None,
+        type: str | None = None,
+        file: str | list[str] | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        status: str | None = None,
+        context: str | None = None,
+        action: str | None = None,
+        # Message filters
+        sender: str | None = None,
+        intent: str | None = None,
+        thread: str | None = None,
+    ) -> list[dict]:
         """Query the event stream.
 
+        Filter kwargs mirror CLI flags (--agent, --file, --after, etc.).
+        Same composition: different filters AND together, multiple values OR.
+        Raw sql is ANDed with structured filters when both provided.
+
         Args:
-            sql: SQL WHERE clause filter (e.g., "msg_from='nova'").
+            sql: Raw SQL WHERE clause (ANDed with structured filters).
             params: Parameters for SQL placeholders (?).
             last: Maximum events to return.
+            agent: Instance name(s).
+            type: Event type (message, status, life).
+            file: File path pattern(s) — glob (*.py) or contains match.
+            after: ISO-8601 timestamp lower bound.
+            before: ISO-8601 timestamp upper bound.
+            status: Status value (listening, active, blocked).
+            context: Status context pattern (tool:Bash, deliver:*).
+            action: Life action (created, ready, stopped).
+            sender: Message sender name (maps to --from).
+            intent: Message intent (request, inform, ack).
+            thread: Message thread name.
 
         Returns:
             List of dicts with keys: ts, type, instance, data
 
-        SQL fields:
+        SQL fields (for raw sql= queries against events_v):
             Common: id, timestamp, type, instance
             Message: msg_from, msg_text, msg_thread, msg_intent,
                      msg_reply_to, msg_mentions, msg_delivered_to, msg_bundle_id
             Status: status_val, status_context, status_detail
             Lifecycle: life_action, life_by, life_batch_id
-            Bundle: bundle_id, bundle_title, bundle_description, bundle_extends,
-                    bundle_events, bundle_files, bundle_transcript, bundle_created_by
 
         Examples:
-            s.events(sql="type='message'")
-            s.events(sql="msg_from=?", params=["nova"])
-            s.events(sql="msg_thread='task-1'", last=50)
+            s.events(file="src/core/*", after="2026-01-01T00:00:00")
+            s.events(agent="nova", type="message")
+            s.events(sender="luna", intent="request", last=50)
+            s.events(sql="msg_from=?", params=["nova"])  # raw SQL still works
         """
         from .core.db import get_db
+        from .core.filters import build_sql_from_flags
+
+        # Build structured filter dict
+        filters: dict[str, list] = {}
+        for key, val in [
+            ("instance", agent), ("type", type), ("file", file),
+            ("after", after), ("before", before), ("status", status),
+            ("context", context), ("action", action), ("from", sender),
+            ("intent", intent), ("thread", thread),
+        ]:
+            if val is not None:
+                filters[key] = val if isinstance(val, list) else [val]
+
+        # Normalize tag-prefixed instance names (e.g., "review-luna" → "luna")
+        if "instance" in filters:
+            from .core.instances import resolve_display_name
+
+            filters["instance"] = [
+                resolve_display_name(n) or n for n in filters["instance"]
+            ]
+
+        try:
+            structured_sql = build_sql_from_flags(filters) if filters else ""
+        except ValueError as e:
+            raise HcomError(str(e))
 
         query = "SELECT * FROM events_v WHERE 1=1"
+        if structured_sql:
+            query += f" AND {structured_sql}"
         if sql:
             query += f" AND ({sql})"
         query += f" ORDER BY id DESC LIMIT {last}"
@@ -667,11 +727,15 @@ def instances(name: str | None = None) -> list[dict] | dict:
         nova = hcom.instances(name="nova")
     """
     from .core.db import iter_instances
-    from .core.instances import load_instance_position, get_full_name
+    from .core.instances import load_instance_position, get_full_name, resolve_display_name
 
     _ensure_init()
 
     if name:
+        # Resolve tag-prefixed names (e.g., "fatcow-luna" → "luna")
+        resolved = resolve_display_name(name)
+        if resolved:
+            name = resolved
         data = load_instance_position(name)
         if not data:
             raise HcomError(f"Instance not found: {name}")
@@ -738,8 +802,12 @@ def launch(
         system_prompt: System prompt override (single mode).
         background: If True, run headless (single mode).
         claude_args: Additional Claude CLI args (single mode).
-        resume: Session ID to resume from (single mode).
+        resume: Instance name or session ID to resume from (single mode).
+            If an instance name (e.g., "luna"), loads snapshot automatically:
+            sets tool, tag, cwd, background, system_prompt, and restores
+            message delivery cursor. If a raw session ID, passes through as-is.
         fork: If True with resume, fork instead of continue (single mode).
+            Fork creates a new instance from the same session history.
         tool_args: Additional tool-specific args (single mode).
         cwd: Working directory (single mode).
         wait: If True (default), block until all instances are ready or timeout.
@@ -843,6 +911,78 @@ def _launch_group(
     return out
 
 
+def _resolve_resume_target(resume_val: str, *, fork: bool) -> dict | None:
+    """If resume_val is an instance name (with or without tag prefix), resolve to snapshot data.
+
+    Returns None if not an instance name (treated as raw session_id by caller).
+    """
+    from .core.instances import load_instance_position, resolve_display_name
+    from .core.ops import load_stopped_snapshot, resume_system_prompt
+
+    # Normalize tag-prefixed names (e.g., "fatcow-luna" → "luna")
+    resolved_name = resolve_display_name(resume_val)
+    name = resolved_name if resolved_name else resume_val
+
+    # Try as active instance (fork allows active, resume does not)
+    active = load_instance_position(name)
+    if active:
+        if not fork:
+            raise HcomError(f"'{resume_val}' is still active — stop it first, or pass a raw session_id")
+        session_id = active.get("session_id")
+        if not session_id:
+            raise HcomError(f"'{resume_val}' has no session_id")
+        tool = active.get("tool", "claude")
+        if tool not in ("claude", "codex"):
+            raise HcomError(f"Fork not supported for {tool}")
+        return {
+            "name": name,
+            "session_id": session_id,
+            "tool": tool,
+            "tag": active.get("tag"),
+            "directory": active.get("directory"),
+            "background": bool(active.get("background")),
+            "last_event_id": active.get("last_event_id"),
+            "system_prompt": resume_system_prompt(name, fork=True),
+        }
+
+    # Try as stopped instance
+    snapshot = load_stopped_snapshot(name)
+    if not snapshot:
+        return None  # Not an instance name — treat as raw session_id
+
+    session_id = snapshot.get("session_id")
+    if not session_id:
+        raise HcomError(f"'{resume_val}' has no session_id")
+
+    tool = snapshot.get("tool", "claude")
+    if fork and tool not in ("claude", "codex"):
+        raise HcomError(f"Fork not supported for {tool}")
+
+    return {
+        "name": name,
+        "session_id": session_id,
+        "tool": tool,
+        "tag": snapshot.get("tag"),
+        "directory": snapshot.get("directory"),
+        "background": bool(snapshot.get("background")),
+        "last_event_id": snapshot.get("last_event_id"),
+        "system_prompt": resume_system_prompt(name, fork=fork),
+    }
+
+
+def _restore_resume_cursor(resolved: dict | None, fork: bool, result: dict) -> None:
+    """Restore last_event_id cursor after instance-name resume (not fork).
+
+    This ensures messages sent while the instance was stopped get delivered.
+    """
+    if not resolved or fork or result.get("launched", 0) == 0:
+        return
+    cursor = resolved.get("last_event_id")
+    if cursor is not None:
+        from .core.instances import update_instance_position
+        update_instance_position(resolved["name"], {"last_event_id": cursor})
+
+
 def _launch_single(
     count: int = 1,
     *,
@@ -868,6 +1008,26 @@ def _launch_single(
 
     _ensure_init()
     config = get_config()
+
+    # Resolve instance-name-based resume: if resume is an instance name (active or
+    # stopped), load its snapshot and fill in tool/tag/cwd/background/system_prompt/name.
+    # If it's a raw session_id, _resolve_resume_target returns None and we proceed as before.
+    _resolved = None
+    if resume:
+        _resolved = _resolve_resume_target(resume, fork=fork)
+        if _resolved:
+            resume = _resolved["session_id"]
+            tool = _resolved["tool"]
+            if tag is None:
+                tag = _resolved.get("tag")
+            if cwd is None:
+                cwd = _resolved.get("directory")
+            if not background and _resolved.get("background"):
+                background = True
+            if system_prompt is None:
+                system_prompt = _resolved["system_prompt"]
+            if name is None and not fork:
+                name = _resolved["name"]
 
     if tool in ("claude", "claude-pty"):
         from .tools.claude.args import (
@@ -943,6 +1103,7 @@ def _launch_single(
             result["launch_status"] = wait_for_launch(
                 batch_id=result["batch_id"], timeout=timeout
             )
+        _restore_resume_cursor(_resolved, fork, result)
         return result
 
     if tool not in ("gemini", "codex"):
@@ -1007,6 +1168,7 @@ def _launch_single(
         result["launch_status"] = wait_for_launch(
             batch_id=result["batch_id"], timeout=timeout
         )
+    _restore_resume_cursor(_resolved, fork, result)
     return result
 
 

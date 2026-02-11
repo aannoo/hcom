@@ -651,11 +651,23 @@ def launch(
         notes = get_hcom_notes_text()
         if notes:
             instance_env["HCOM_NOTES"] = notes
+        # Propagate shim marker so child's runner script exports it
+        # (previously create_runner_script read os.environ directly)
+        if os.environ.get("HCOM_VIA_SHIM"):
+            instance_env["HCOM_VIA_SHIM"] = "1"
+        # Propagate debug flag for Rust PTY binary
+        if os.environ.get("HCOM_PTY_DEBUG"):
+            instance_env["HCOM_PTY_DEBUG"] = "1"
         # Propagate dev mode env var if set (via hdev script)
         if val := os.environ.get("HCOM_DEV_ROOT"):
             instance_env["HCOM_DEV_ROOT"] = val
         process_id = str(uuid.uuid4())
         instance_env["HCOM_PROCESS_ID"] = process_id
+        # Signal fork mode so get_real_session_id() uses CLAUDE_ENV_FILE (needed for CC
+        # fork bug where hook_data.session_id is wrong). Without this, resume sessions
+        # get their correct hook_data session_id overridden by a non-resumable env_file ID.
+        if normalized in ("claude", "claude-pty") and args and "--fork-session" in args:
+            instance_env["HCOM_IS_FORK"] = "1"
         # Pass resolved terminal preset so child can record it in launch_context
         _terminal_cfg = get_config().terminal
         if _terminal_cfg and _terminal_cfg not in ("default", "here", "print") and "{script}" not in _terminal_cfg:
@@ -796,7 +808,6 @@ def launch(
                         instance_env,
                         instance_name,
                         list(args or []),
-                        tag=effective_tag,
                         run_here=effective_run_here,
                     )
                     if pty_result:
@@ -821,7 +832,6 @@ def launch(
                         instance_env,
                         instance_name,
                         list(args or []),
-                        tag=effective_tag,
                         run_here=effective_run_here,
                     )
                     if pty_result:
@@ -879,15 +889,14 @@ def launch(
                         except Exception:
                             pass  # Non-fatal, continue with launch
 
+                    instance_env["HCOM_CODEX_SANDBOX_MODE"] = sandbox_mode
                     pty_result = launch_pty(
                         "codex",
                         working_dir,
                         instance_env,
                         effective_instance_name,
                         effective_codex_args,
-                        tag=effective_tag,
                         run_here=effective_run_here,
-                        extra_env={"HCOM_CODEX_SANDBOX_MODE": sandbox_mode},
                     )
                     if pty_result:
                         launched += 1

@@ -221,6 +221,20 @@ def _handle_rebind_session(rebind_target: str, current_identity: str | None) -> 
     # Preserve last_event_id so reclaimed instance resumes from where it left off
     target_data = get_instance(rebind_target)
     last_event_id = target_data.get("last_event_id") if target_data else None
+    # Fallback: read cursor from stopped snapshot if instance row was already deleted
+    if last_event_id is None:
+        from .resume import _load_stopped_snapshot
+
+        stopped = _load_stopped_snapshot(rebind_target)
+        if stopped:
+            last_event_id = stopped.get("last_event_id")
+    # Final fallback: if both row and snapshot are gone (e.g., stop_instance failed
+    # to log snapshot due to DB lock), use current max to avoid re-delivering old messages.
+    # Without this, initialize_instance_in_position_file uses stale HCOM_LAUNCH_EVENT_ID.
+    if last_event_id is None:
+        from ...core.db import get_last_event_id as _get_last_event_id
+
+        last_event_id = _get_last_event_id()
     if target_data and not target_data.get("origin_device_id"):
         delete_instance(rebind_target)
 
@@ -247,7 +261,7 @@ def _handle_rebind_session(rebind_target: str, current_identity: str | None) -> 
     recover_orphan_pid(rebind_target, process_id)
 
     # 4. Restore cursor position (resume from where old instance left off)
-    if last_event_id:
+    if last_event_id is not None:
         update_instance_position(rebind_target, {"last_event_id": last_event_id})
 
     # 5. Create bindings

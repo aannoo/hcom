@@ -410,6 +410,7 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
         "launch_args": instance_data.get("launch_args", ""),
         "origin_device_id": instance_data.get("origin_device_id", ""),
         "background_log_file": instance_data.get("background_log_file", ""),
+        "last_event_id": instance_data.get("last_event_id", 0),
     }
 
     # Cleanup bindings and stop subagents
@@ -436,31 +437,35 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
         from .log import log_warn as _log_warn
         _log_warn("stop", "cleanup.subscriptions_error", instance=instance_name, error=str(_e))
 
-    # Delete first, then log - prevents duplicate stopped events on race conditions
-    if not delete_instance(instance_name):
-        return
-
-    # Notify AFTER delete - so listeners wake and see row is gone
-    if notify_ports:
-        from .runtime import _send_notify_to_ports
-
-        _send_notify_to_ports(notify_ports)
-
-    # Log stopped event only after successful delete
+    # Log snapshot BEFORE delete — if log fails, row stays (stale cleanup catches it).
+    # Previous order (delete first) lost snapshots when log_event hit "database is locked".
     try:
         log_event(
             "life",
             instance_name,
             {"action": "stopped", "by": initiated_by, "reason": reason, "snapshot": snapshot},
         )
-        from ..relay import notify_relay, push
-
-        if not notify_relay():
-            push()
     except Exception as e:
         from .log import log_error
 
         log_error("core", "db.error", e, op="stop_instance")
+
+    if not delete_instance(instance_name):
+        return
+
+    # Notify AFTER delete — listeners need row gone to detect stop
+    if notify_ports:
+        from .runtime import _send_notify_to_ports
+
+        _send_notify_to_ports(notify_ports)
+
+    try:
+        from ..relay import notify_relay, push
+
+        if not notify_relay():
+            push()
+    except Exception:
+        pass
 
 
 def create_orphaned_pty_identity(session_id: str, process_id: str, tool: str = "claude") -> str | None:

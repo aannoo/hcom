@@ -45,9 +45,9 @@ from ..args_common import (
 )
 
 # Type aliases (Gemini-specific)
-Subcommand: TypeAlias = Literal["mcp", "extensions", "hooks", None]
+Subcommand: TypeAlias = Literal["mcp", "extensions", "hooks", "skills", None]
 OutputFormat: TypeAlias = Literal["text", "json", "stream-json"]
-ApprovalMode: TypeAlias = Literal["default", "auto_edit", "yolo"]
+ApprovalMode: TypeAlias = Literal["default", "auto_edit", "yolo", "plan"]
 
 # ==================== Flag Classification ====================
 
@@ -55,6 +55,7 @@ ApprovalMode: TypeAlias = Literal["default", "auto_edit", "yolo"]
 _SUBCOMMAND_ALIASES: Final[Mapping[str, str]] = {
     "extension": "extensions",
     "hook": "hooks",
+    "skill": "skills",
 }
 
 # All known subcommands (from gemini --help)
@@ -65,6 +66,8 @@ _SUBCOMMANDS: Final[frozenset[str]] = frozenset(
         "extension",  # extension is alias
         "hooks",
         "hook",  # hook is alias
+        "skills",
+        "skill",  # skill is alias
     }
 )
 
@@ -103,6 +106,8 @@ _BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
         "-h",
         "--help",
         "--experimental-acp",
+        "--raw-output",
+        "--accept-raw-output-risk",
     }
 )
 
@@ -471,9 +476,9 @@ def validate_conflicts(spec: GeminiArgsSpec) -> list[str]:
     if (
         approval_value
         and isinstance(approval_value, str)
-        and approval_value.lower() not in ("default", "auto_edit", "yolo")
+        and approval_value.lower() not in ("default", "auto_edit", "yolo", "plan")
     ):
-        warnings.append(f"ERROR: invalid --approval-mode value '{approval_value}' (must be: default, auto_edit, yolo)")
+        warnings.append(f"ERROR: invalid --approval-mode value '{approval_value}' (must be: default, auto_edit, yolo, plan)")
 
     # Validate --output-format enum values
     output_value = spec.get_flag_value("--output-format")
@@ -513,7 +518,7 @@ def _parse_tokens(
         # Normalize aliases
         if subcommand_str in _SUBCOMMAND_ALIASES:
             subcommand_str = _SUBCOMMAND_ALIASES[subcommand_str]
-        if subcommand_str in ("mcp", "extensions", "hooks"):
+        if subcommand_str in ("mcp", "extensions", "hooks", "skills"):
             subcommand = subcommand_str  # type: ignore
         i = 1
 
@@ -559,7 +564,7 @@ def _parse_tokens(
                     if token.lower() == "yolo":
                         is_yolo = True
                         approval_mode = "yolo"
-                    elif token.lower() in ("default", "auto_edit"):
+                    elif token.lower() in ("default", "auto_edit", "plan"):
                         approval_mode = token.lower()  # type: ignore
 
                 clean.append(token)
@@ -651,7 +656,7 @@ def _parse_tokens(
                 if value.lower() == "yolo":
                     is_yolo = True
                     approval_mode = "yolo"
-                elif value.lower() in ("default", "auto_edit"):
+                elif value.lower() in ("default", "auto_edit", "plan"):
                     approval_mode = value.lower()  # type: ignore
 
             i += 1

@@ -1301,6 +1301,13 @@ def _format_sub_notification(
 
     Note: @mentions in quoted text are escaped to prevent routing to unintended recipients.
     """
+    # Request-watch: custom format for idle/stopped notifications
+    if filters and filters.get("request_watch"):
+        request_id = filters.get("request_id", "?")
+        target = filters.get("target", instance)
+        action = "went idle" if event_type == "status" else "stopped"
+        return f"[sub:{sub_id}] #{event_id} {target} {action} without responding to your request #{request_id}"
+
     # Preset-specific prefixes based on subscription filters
     prefix = ""
     if filters and "collision" in filters:
@@ -1337,6 +1344,37 @@ def _format_sub_notification(
     return prefix + " | ".join(parts)
 
 
+def _cancel_request_watches_by_flow(
+    sender: str, delivered_to: list[str], reply_to_id: int | None = None
+) -> None:
+    """Cancel request-watch subs when the watched target messages the requester.
+
+    Called from _check_event_subscriptions() on targeted message events.
+    If B (sender/target) sends a message to A (caller/requester in delivered_to),
+    cancel A's watch on B.
+
+    When reply_to_id is set, only cancel the watch for that specific request.
+    When None (non-reply message), cancel all watches for the A↔B pair.
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:reqwatch-%'"
+        ).fetchall()
+    except Exception:
+        return
+    for row in rows:
+        try:
+            sub = json.loads(row["value"])
+            filters = sub.get("filters", {})
+            if filters.get("target") == sender and sub.get("caller") in delivered_to:
+                if reply_to_id is not None and filters.get("request_id") != reply_to_id:
+                    continue
+                kv_set(row["key"], None)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+
 def _check_event_subscriptions(
     event_id: int, event_type: str, instance: str, data: dict[str, Any], timestamp: str
 ) -> None:
@@ -1355,6 +1393,14 @@ def _check_event_subscriptions(
         sender_kind = data.get("sender_kind", "")
         if sender == "[hcom-events]" or sender_kind == "system":
             return
+
+    # Request-watch cancellation: targeted message from watched target to requester
+    if event_type == "message" and data.get("scope") == "mentions":
+        msg_sender = data.get("from", "")
+        msg_delivered_to = data.get("delivered_to", [])
+        if msg_sender and msg_delivered_to:
+            reply_to_id = data.get("reply_to_local")
+            _cancel_request_watches_by_flow(msg_sender, msg_delivered_to, reply_to_id)
 
     conn = get_db()
     try:
@@ -1391,6 +1437,22 @@ def _check_event_subscriptions(
                     continue
                 if not match:
                     continue
+
+            # Request-watch delivery gate: don't fire if target hasn't received the request yet
+            sub_filters = sub.get("filters", {})
+            if sub_filters.get("request_watch"):
+                request_id = sub_filters.get("request_id")
+                target = sub_filters.get("target")
+                if request_id and target:
+                    target_row = conn.execute(
+                        "SELECT last_event_id FROM instances WHERE name = ?", (target,)
+                    ).fetchone()
+                    waterline = (target_row["last_event_id"] or 0) if target_row else 0
+                    if waterline < request_id:
+                        # Not delivered yet — advance cursor, skip notification
+                        sub["last_id"] = event_id
+                        kv_set(row["key"], json.dumps(sub))
+                        continue
 
             # Match - send notification
             caller = sub.get("caller", "")

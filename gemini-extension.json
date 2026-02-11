@@ -1,5 +1,5 @@
 {
   "name": "hcom",
   "version": "1.0.0",
-  "description": "Multi-agent communication for AI CLI tools"
+  "description": "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
 }

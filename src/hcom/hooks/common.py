@@ -31,11 +31,13 @@ def deliver_pending_messages(instance_name: str) -> tuple[list[dict[str, Any]], 
     # this hook process dies before returning (does it?).
     update_instance_position(instance_name, {"last_event_id": last_id})
 
+    from ..core.instances import get_display_name
+
     formatted = format_messages_json(deliver, instance_name)
     set_status(
         instance_name,
         "active",
-        f"deliver:{deliver[0]['from']}",
+        f"deliver:{get_display_name(deliver[0]['from'])}",
         msg_ts=deliver[-1].get("timestamp", ""),
     )
     return deliver, formatted

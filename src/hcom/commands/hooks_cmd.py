@@ -232,7 +232,8 @@ After adding, restart the tool to activate hooks.""")
     elif subcommand in ("remove", "uninstall"):
         return cmd_hooks_remove(sub_argv)
     else:
-        raise CLIError(f"Unknown hooks subcommand: {subcommand}\nRun 'hcom hooks --help' for usage")
+        from .utils import get_command_help
+        raise CLIError(f"Unknown hooks subcommand: {subcommand}\n{get_command_help('hooks')}")
 
 
 __all__ = ["cmd_hooks"]

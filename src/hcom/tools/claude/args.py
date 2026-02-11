@@ -69,6 +69,7 @@ _CANONICAL_PREFIXES: Final[Mapping[str, CanonicalFlag]] = {
 # has_flag() detects them by scanning clean_tokens directly, so they remain
 # discoverable via spec.has_flag(['-p']) or spec.has_flag(['--print']).
 _BACKGROUND_SWITCHES: Final[frozenset[str]] = frozenset({"-p", "--print"})
+_FORK_SWITCHES: Final[frozenset[str]] = frozenset({"--fork-session"})
 _BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
     {
         "--verbose",
@@ -79,7 +80,7 @@ _BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
         "--allow-dangerously-skip-permissions",
         "--replay-user-messages",
         "--mcp-debug",
-        "--fork-session",
+        # --fork-session handled by _FORK_SWITCHES (sets is_fork)
         "--ide",
         "--strict-mcp-config",
         "--no-session-persistence",
@@ -104,6 +105,7 @@ _OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
         "--debug",
         "-d",
         "--teleport",
+        "--from-pr",
     }
 )
 
@@ -114,6 +116,7 @@ _OPTIONAL_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
         "--debug=",
         "-d=",
         "--teleport=",
+        "--from-pr=",
     }
 )
 
@@ -157,6 +160,7 @@ _VALUE_FLAGS: Final[frozenset[str]] = frozenset(
         "--settings",
         "--system-prompt",
         "--system-prompt-file",
+        "--teammate-mode",
         "--tools",
     }
 )
@@ -192,6 +196,7 @@ _VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
         "--settings=",
         "--system-prompt=",
         "--system-prompt-file=",
+        "--teammate-mode=",
         "--tools=",
     }
 )
@@ -213,10 +218,11 @@ class ClaudeArgsSpec(BaseArgsSpec):
     """Normalized representation of Claude CLI arguments.
 
     Inherits common fields and methods from BaseArgsSpec.
-    Adds Claude-specific field: is_background.
+    Adds Claude-specific fields: is_background, is_fork.
     """
 
     is_background: bool = False
+    is_fork: bool = False
 
     def update(
         self,
@@ -422,7 +428,7 @@ def _deduplicate_boolean_flags(tokens: Sequence[str]) -> TokenList:
     Unknown flags and value flags are left as-is (Claude CLI handles them).
     """
     # Combine boolean flags and background switches for deduplication
-    all_boolean_flags = _BOOLEAN_FLAGS | _BACKGROUND_SWITCHES
+    all_boolean_flags = _BOOLEAN_FLAGS | _BACKGROUND_SWITCHES | _FORK_SWITCHES
     return _deduplicate_boolean_flags_base(tokens, all_boolean_flags)
 
 
@@ -535,6 +541,7 @@ def _parse_tokens(
     after_double_dash: bool = False
 
     is_background: bool = False
+    is_fork: bool = False
 
     i: int = 0
     raw_tokens: TokenTuple = tuple(tokens)
@@ -596,6 +603,12 @@ def _parse_tokens(
 
         if token_lower in _BACKGROUND_SWITCHES:
             is_background = True
+            clean.append(token)
+            i += 1
+            continue
+
+        if token_lower in _FORK_SWITCHES:
+            is_fork = True
             clean.append(token)
             i += 1
             continue
@@ -699,6 +712,7 @@ def _parse_tokens(
         positional_tokens=tuple(positional),
         positional_indexes=tuple(positional_indexes),
         is_background=is_background,
+        is_fork=is_fork,
         flag_values=dict(flag_values),
         errors=tuple(errors),
     )
@@ -740,7 +754,7 @@ def _looks_like_new_flag(token_lower: str) -> bool:
         flag_aliases=_FLAG_ALIASES,
         optional_value_flag_prefixes=_OPTIONAL_VALUE_FLAG_PREFIXES,
         canonical_prefixes=_CANONICAL_PREFIXES,
-        extra_flags=_BACKGROUND_SWITCHES,
+        extra_flags=_BACKGROUND_SWITCHES | _FORK_SWITCHES,
     )
 
 

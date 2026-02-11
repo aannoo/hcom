@@ -49,6 +49,10 @@ CLEANUP_STALE_THRESHOLD = 3600  # seconds (1 hour)
 # How long any inactive instances can exist before cleanup
 CLEANUP_INACTIVE_THRESHOLD = 43200  # seconds (12 hours)
 
+# Grace period after system sleep/wake before resuming stale cleanup
+# Allows delivery threads to write fresh heartbeats after wake
+WAKE_GRACE_PERIOD = 60  # seconds (2x heartbeat interval)
+
 
 # ==================== Delivery & PTY ====================
 # User activity cooldown: don't inject messages if user typed within this window
@@ -86,6 +90,7 @@ __all__ = [
     "CLEANUP_PLACEHOLDER_THRESHOLD",
     "CLEANUP_STALE_THRESHOLD",
     "CLEANUP_INACTIVE_THRESHOLD",
+    "WAKE_GRACE_PERIOD",
     # Delivery
     "USER_ACTIVITY_COOLDOWN",
     "INITIAL_RETRY_DELAY",

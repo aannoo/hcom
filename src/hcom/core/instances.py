@@ -85,7 +85,38 @@ from .timeouts import (
     CLEANUP_STALE_THRESHOLD,
     CLEANUP_INACTIVE_THRESHOLD,
     PROCESS_REGISTRATION_TIMEOUT,
+    WAKE_GRACE_PERIOD,
 )
+
+
+# ==================== Sleep/Wake Detection ====================
+# Tracks wall-clock vs monotonic-clock drift to detect system sleep.
+# On macOS, time.monotonic() does NOT advance during sleep, but time.time() does.
+# A large drift means the system just woke — skip stale cleanup to let heartbeats resume.
+_last_drift_check_mono: float = 0.0
+_last_drift_check_wall: float = 0.0
+_wake_grace_until: float = 0.0  # monotonic deadline for grace period
+
+
+def _is_in_wake_grace() -> bool:
+    """Detect sleep/wake via wall-vs-monotonic drift, return whether grace period is active.
+
+    Called from both get_instance_status() and cleanup_stale_instances() so
+    whichever runs first after wake will detect the drift and grant grace.
+    """
+    global _last_drift_check_mono, _last_drift_check_wall, _wake_grace_until
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    if _last_drift_check_mono > 0:
+        drift = (now_wall - _last_drift_check_wall) - (now_mono - _last_drift_check_mono)
+        if drift > 30:
+            from .log import log_info
+
+            log_info("cleanup", "sleep_wake_detected", drift=f"{drift:.0f}s", grace=f"{WAKE_GRACE_PERIOD}s")
+            _wake_grace_until = now_mono + WAKE_GRACE_PERIOD
+    _last_drift_check_mono = now_mono
+    _last_drift_check_wall = now_wall
+    return now_mono < _wake_grace_until
 
 
 # ==================== Type Definitions ====================
@@ -512,6 +543,10 @@ def cleanup_stale_instances(
     # Cleanup orphaned DB rows (notify_endpoints, process_bindings for deleted instances)
     _cleanup_orphaned_db_rows()
 
+    # During wake grace period: skip stale cleanup to let heartbeats resume
+    if _is_in_wake_grace():
+        return 0
+
     deleted = 0
 
     for data in iter_instances():
@@ -579,6 +614,7 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
     status = pos_data.get("status", "inactive")
     status_time = pos_data.get("status_time", 0)
     status_context = pos_data.get("status_context", "")
+    wake_grace = _is_in_wake_grace()
 
     # Launching: instance created but session not yet bound / status not yet updated
     # This is the window between launcher creating instance and first hook firing
@@ -649,9 +685,12 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
 
             threshold = HEARTBEAT_THRESHOLD_TCP if (has_tcp_listener or is_remote) else HEARTBEAT_THRESHOLD_NO_TCP
             if heartbeat_age > threshold:
-                status = "inactive"
-                status_context = "stale:listening"
-                age = heartbeat_age
+                if wake_grace:
+                    age = 0  # Wake grace: heartbeat will refresh soon
+                else:
+                    status = "inactive"
+                    status_context = "stale:listening"
+                    age = heartbeat_age
             else:
                 # Heartbeat within threshold - age=0 shows "now" in TUI
                 age = 0
@@ -674,6 +713,8 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
             last_stop = pos_data.get("last_stop", 0)
             if last_stop and (now - last_stop) < HEARTBEAT_THRESHOLD_TCP:
                 pass  # Heartbeat fresh — process alive, skip stale
+            elif wake_grace:
+                pass  # Wake grace: heartbeat will refresh soon
             else:
                 prev_status = status  # Capture before changing
                 status = "inactive"
@@ -931,7 +972,9 @@ def set_status(
                                     (batch_id,),
                                 ).fetchall()
 
-                                instances_list = ", ".join(row["instance"] for row in ready_instances)
+                                instances_list = ", ".join(
+                                    get_display_name(row["instance"]) for row in ready_instances
+                                )
 
                                 send_system_message(
                                     "[hcom-launcher]",
@@ -1368,6 +1411,11 @@ def get_full_name(instance_data: InstanceData | dict[str, Any] | None) -> str:
     # Cache on dict (safe - update functions use explicit field dicts)
     instance_data["_full_name"] = full_name
     return full_name
+
+
+def get_display_name(base_name: str) -> str:
+    """Get full display name (tag-name) for a base name. Returns base_name if not found."""
+    return get_full_name(load_instance_position(base_name)) or base_name
 
 
 def generate_unique_name(max_retries: int = 200) -> str:
@@ -1992,6 +2040,7 @@ __all__ = [
     "parse_running_tasks",
     # Identity management
     "get_full_name",
+    "get_display_name",
     "generate_unique_name",
     "resolve_display_name",
     "resolve_instance_name",

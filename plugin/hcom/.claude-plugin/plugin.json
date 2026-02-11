@@ -1,7 +1,7 @@
 {
   "name": "hcom",
   "version": "1.0.0",
-  "description": "Real-time messaging and context sharing for AI coding agents (Claude Code, Gemini CLI, Codex)",
+  "description": "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals",
   "author": {
     "name": "aannoo"
   },
