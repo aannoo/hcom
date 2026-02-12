@@ -42,7 +42,7 @@ hcom
 
 Tell any agent:
 
-> when codex goes idle, send it the next task, and get claude to review the previous
+> when codex goes idle send it the next task
 
 > watch gemini's file edits, review each and send feedback if any bugs
 
@@ -130,26 +130,12 @@ Run `hcom claude`. Then inside, prompt:
 
 ## Terminal
 
-Spawning works with any terminal emulator. Run `hcom config terminal --info` to set up.
+Spawning works with any terminal emulator. Run `hcom config terminal --info` to set up a custom one.
 
 Closing/killing works with kitty, wezterm (auto open/close panes), and tmux (background).
 
 ```bash
 hcom config terminal kitty    # set
-```
-
----
-
-## Cross-device
-
-Connect agents across machines through a private HuggingFace Space (free):
-
-```bash
-# local
-hcom relay hf <HF_TOKEN>
-
-# remote/cloud
-pip install hcom && hcom relay hf <HF_TOKEN> && hcom start -h
 ```
 
 ---
