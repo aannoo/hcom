@@ -15,7 +15,15 @@ test/public/unit/test_transcript.py.
 import glob
 import os
 import random
+import time
 from pathlib import Path
+
+
+def _seeded_rng(test_name: str) -> random.Random:
+    """Create a seeded RNG and print the seed for reproducibility."""
+    seed = int(time.time() * 1000) % (2**32)
+    print(f"\n[{test_name}] random seed: {seed}")
+    return random.Random(seed)
 
 from hcom.core.transcript import (
     parse_claude_thread,
@@ -115,7 +123,8 @@ class TestRealTranscriptParsing:
         self.all_paths = get_transcript_paths()
         if len(self.all_paths) < 10:
             raise RuntimeError(f"Need at least 10 Claude transcripts, found {len(self.all_paths)}")
-        self.sample = random.sample(self.all_paths, min(50, len(self.all_paths)))
+        rng = _seeded_rng("TestRealTranscriptParsing")
+        self.sample = rng.sample(self.all_paths, min(50, len(self.all_paths)))
 
     def test_no_crashes_on_any_transcript(self):
         """Parser must not crash on any real transcript."""
@@ -161,7 +170,8 @@ class TestRealTranscriptStatistics:
         """Parser should succeed (no errors) on most transcripts."""
         assert self.all_paths, "Need Claude transcripts for testing"
 
-        sample = random.sample(self.all_paths, min(200, len(self.all_paths)))
+        rng = _seeded_rng("test_parse_success_rate")
+        sample = rng.sample(self.all_paths, min(200, len(self.all_paths)))
 
         errors = 0
         for path in sample:
@@ -177,8 +187,9 @@ class TestRealTranscriptStatistics:
         agent = [p for p in self.all_paths if "agent-" in p.name]
         session = [p for p in self.all_paths if "agent-" not in p.name]
 
-        agent_sample = random.sample(agent, min(20, len(agent)))
-        session_sample = random.sample(session, min(20, len(session)))
+        rng = _seeded_rng("test_agent_vs_session_transcripts")
+        agent_sample = rng.sample(agent, min(20, len(agent)))
+        session_sample = rng.sample(session, min(20, len(session)))
 
         for path in agent_sample + session_sample:
             result = parse_claude_thread(str(path))
@@ -186,34 +197,35 @@ class TestRealTranscriptStatistics:
 
 
 class TestSubagentTranscripts:
-    """Tests for subagent transcript parsing (agent-*.jsonl)."""
+    """Tests for subagent transcript parsing (agent-*.jsonl).
+
+    Note: Agent transcripts typically have isSidechain=True on all entries,
+    which are classified as 'system' and filtered out. This means 0 exchanges
+    is expected. These tests verify the parser doesn't crash, not that it
+    finds exchanges.
+    """
 
     def test_subagent_transcripts_parse(self):
-        """Subagent transcripts should parse despite isSidechain=true."""
+        """Parser should not crash on agent transcripts (0 exchanges expected)."""
         agent_paths = get_agent_transcripts()
         assert len(agent_paths) >= 5, f"Need at least 5 agent transcripts, found {len(agent_paths)}"
 
         sample_size = min(200, len(agent_paths))
-        rng = random.Random(0)
+        rng = _seeded_rng("test_subagent_transcripts_parse")
         sample = rng.sample(agent_paths, sample_size)
 
-        found_exchanges = 0
         for path in sample:
             result = parse_claude_thread(str(path))
             assert result["error"] is None, f"Failed on {path}"
-            if result["exchanges"]:
-                found_exchanges += 1
-
-        if found_exchanges == 0:
-            import warnings
-            warnings.warn(f"No exchanges found in sampled agent transcripts ({sample_size} checked)")
+        # Note: 0 exchanges is expected since agent transcripts have isSidechain=True
 
     def test_subagent_detailed_parse(self):
-        """Detailed parser should also work on subagent transcripts."""
+        """Detailed parser should not crash on agent transcripts."""
         agent_paths = get_agent_transcripts()
         assert len(agent_paths) >= 5, f"Need at least 5 agent transcripts, found {len(agent_paths)}"
 
-        sample = random.sample(agent_paths, min(5, len(agent_paths)))
+        rng = _seeded_rng("test_subagent_detailed_parse")
+        sample = rng.sample(agent_paths, min(5, len(agent_paths)))
 
         for path in sample:
             result = parse_claude_thread_detailed(str(path), last=3)
@@ -227,6 +239,7 @@ class TestRealTranscriptEdgeCases:
     def test_sidechain_messages_skipped(self):
         """Sidechain messages should not appear in exchanges."""
         paths = get_transcript_paths(500)
+        tested_count = 0
 
         for path in paths:
             try:
@@ -237,13 +250,18 @@ class TestRealTranscriptEdgeCases:
 
                 result = parse_claude_thread(str(path))
                 assert result["error"] is None
-                break
+                tested_count += 1
+                if tested_count >= 5:  # Test multiple files, not just one
+                    break
             except (OSError, AssertionError):
                 continue
+
+        assert tested_count > 0, "No transcripts with isSidechain found - test did not verify anything"
 
     def test_compact_summary_skipped(self):
         """isCompactSummary messages should be skipped."""
         paths = get_transcript_paths(500)
+        tested_count = 0
 
         for path in paths:
             try:
@@ -254,13 +272,18 @@ class TestRealTranscriptEdgeCases:
 
                 result = parse_claude_thread(str(path))
                 assert result["error"] is None
-                break
+                tested_count += 1
+                if tested_count >= 5:
+                    break
             except (OSError, AssertionError):
                 continue
+
+        assert tested_count > 0, "No transcripts with isCompactSummary found - test did not verify anything"
 
     def test_thinking_blocks_not_in_output(self):
         """Thinking blocks should not leak into action summaries."""
         paths = get_transcript_paths(200)
+        tested_count = 0
 
         for path in paths:
             try:
@@ -272,9 +295,13 @@ class TestRealTranscriptEdgeCases:
                 result = parse_claude_thread(str(path))
                 for ex in result["exchanges"]:
                     assert "signature" not in ex["action"].lower()
-                break
+                tested_count += 1
+                if tested_count >= 5:
+                    break
             except (OSError, AssertionError):
                 continue
+
+        assert tested_count > 0, "No transcripts with thinking blocks found - test did not verify anything"
 
 
 class TestRealWorldScenarios:
@@ -334,7 +361,8 @@ class TestDetailedParserRealTranscripts:
     def setup_method(self):
         all_paths = get_transcript_paths()
         assert len(all_paths) >= 10, f"Need at least 10 Claude transcripts, found {len(all_paths)}"
-        self.sample = random.sample(all_paths, min(30, len(all_paths)))
+        rng = _seeded_rng("TestDetailedParserRealTranscripts")
+        self.sample = rng.sample(all_paths, min(30, len(all_paths)))
 
     def test_no_crashes(self):
         """Detailed parser must not crash on real transcripts."""
@@ -368,7 +396,8 @@ class TestRealGeminiTranscripts:
     def setup_method(self):
         paths = get_gemini_transcript_paths()
         assert len(paths) >= 5, f"Need at least 5 Gemini transcripts, found {len(paths)}"
-        self.sample = random.sample(paths, min(30, len(paths)))
+        rng = _seeded_rng("TestRealGeminiTranscripts")
+        self.sample = rng.sample(paths, min(30, len(paths)))
 
     def test_no_crashes(self):
         """Parser must not crash on any real Gemini transcript."""
@@ -441,7 +470,8 @@ class TestRealCodexTranscripts:
     def setup_method(self):
         paths = get_codex_transcript_paths()
         assert len(paths) >= 5, f"Need at least 5 Codex transcripts, found {len(paths)}"
-        self.sample = random.sample(paths, min(30, len(paths)))
+        rng = _seeded_rng("TestRealCodexTranscripts")
+        self.sample = rng.sample(paths, min(30, len(paths)))
 
     def test_no_crashes(self):
         """Parser must not crash on any real Codex transcript."""
@@ -514,12 +544,13 @@ class TestRealTranscriptsCrossToolStatistics:
     def test_parse_success_rate_all_tools(self):
         """Parser should succeed on most transcripts for all tools."""
         all_paths = get_all_transcript_paths(max_per_tool=50)
+        rng = _seeded_rng("test_parse_success_rate_all_tools")
 
         for tool, paths in all_paths.items():
             if len(paths) < 10:
                 continue
 
-            sample = random.sample(paths, min(30, len(paths)))
+            sample = rng.sample(paths, min(30, len(paths)))
             errors = 0
 
             for path in sample:
@@ -533,13 +564,14 @@ class TestRealTranscriptsCrossToolStatistics:
     def test_detailed_mode_finds_tools_all_tools(self):
         """Detailed mode should find tools in at least some transcripts for each tool."""
         all_paths = get_all_transcript_paths(max_per_tool=100)
+        rng = _seeded_rng("test_detailed_mode_finds_tools_all_tools")
 
         for tool, paths in all_paths.items():
             if len(paths) < 10:
                 continue
 
             found_tools = False
-            sample = random.sample(paths, min(50, len(paths)))
+            sample = rng.sample(paths, min(50, len(paths)))
 
             for path in sample:
                 result = get_thread(str(path), tool=tool, detailed=True)

@@ -6,8 +6,10 @@ Raises HcomError on failure, returns meaningful data on success.
 
 from __future__ import annotations
 
+import sqlite3
+
 from .messages import MessageEnvelope
-from ..shared import HcomError, SenderIdentity
+from ..shared import HcomError, SenderIdentity, ST_BLOCKED
 
 
 def op_send(identity: SenderIdentity, message: str, envelope: MessageEnvelope | None = None) -> list[str]:
@@ -81,63 +83,6 @@ def op_start(instance_name: str, initiated_by: str | None = None, reason: str = 
     # Row exists = already participating, nothing to do
 
 
-def op_launch(
-    count: int,
-    claude_args: list[str],
-    *,
-    launcher: str,
-    tag: str | None = None,
-    background: bool = False,
-    cwd: str | None = None,
-    pty: bool = False,
-) -> dict:
-    """Launch Claude instances.
-
-    Args:
-        count: Number of instances to launch (1-100)
-        claude_args: Claude CLI arguments (already parsed/merged)
-        launcher: Name of launching instance (for logging)
-        tag: HCOM_TAG value
-        background: Headless mode
-        cwd: Working directory for instances
-        pty: Use PTY mode instead of native hooks
-
-    Returns:
-        {
-            "batch_id": str,
-            "launched": int,
-            "failed": int,
-            "background": bool,
-            "log_files": list[str],
-            "handles": list[dict],
-        }
-
-    Raises:
-        HcomError: If validation fails or no instances launched
-    """
-    from ..launcher import launch as unified_launch
-
-    result = unified_launch(
-        "claude",
-        count,
-        claude_args,
-        tag=tag,
-        background=background,
-        cwd=cwd,
-        launcher=launcher,
-        pty=pty,
-    )
-
-    # Preserve existing return shape for callers.
-    return {
-        "batch_id": result["batch_id"],
-        "launched": result["launched"],
-        "failed": result["failed"],
-        "background": result["background"],
-        "log_files": result.get("log_files", []),
-        "handles": result.get("handles", []),
-    }
-
 
 def cleanup_instance_subscriptions(instance_name: str) -> int:
     """Remove all event subscriptions owned by an instance.
@@ -168,7 +113,7 @@ def cleanup_instance_subscriptions(instance_name: str) -> int:
                     deleted += 1
             except (json.JSONDecodeError, TypeError):
                 pass
-    except Exception:
+    except (json.JSONDecodeError, TypeError, sqlite3.Error):
         pass
 
     return deleted
@@ -202,7 +147,7 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
             "collision": ["--collision"],
             "created": ["--action", "created"],
             "stopped": ["--action", "stopped"],
-            "blocked": ["--status", "blocked"],
+            ST_BLOCKED: ["--status", ST_BLOCKED],
         }
 
         for preset in presets:
@@ -252,7 +197,6 @@ __all__ = [
     "op_send",
     "op_stop",
     "op_start",
-    "op_launch",
     "auto_subscribe_defaults",
     "cleanup_instance_subscriptions",
     "load_stopped_snapshot",

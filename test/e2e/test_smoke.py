@@ -73,16 +73,20 @@ def run_hcom(*argv: str, env: Mapping[str, str], stdin: Any | None = None) -> Co
 
 
 def write_config(hcom_dir: Path) -> None:
-    content = "\n".join(
-        [
-            "HCOM_TIMEOUT=5",
-            "HCOM_SUBAGENT_TIMEOUT=5",
-            "HCOM_TERMINAL=print",
-            "HCOM_HINTS=Smoke hints",
-            'HCOM_CLAUDE_ARGS="Smoke test prompt"',
-        ]
-    )
-    (hcom_dir / "config.env").write_text(content, encoding="utf-8")
+    import tomli_w
+    data = {
+        "terminal": {"active": "print"},
+        "launch": {
+            "tag": "", "hints": "Smoke hints", "notes": "",
+            "subagent_timeout": 5, "auto_subscribe": "collision",
+            "claude": {"args": "Smoke test prompt"},
+            "gemini": {"args": "", "system_prompt": ""},
+            "codex": {"args": "", "sandbox_mode": "workspace", "system_prompt": ""},
+        },
+        "relay": {"url": "", "id": "", "token": "", "enabled": True},
+        "preferences": {"timeout": 5, "auto_approve": True, "name_export": ""},
+    }
+    (hcom_dir / "config.toml").write_text(tomli_w.dumps(data), encoding="utf-8")
 
 
 def _parse_single_json(text: str) -> dict[str, Any]:
@@ -495,7 +499,7 @@ def run_headless_smoke() -> None:
                 "HCOM_LAUNCHED": "1",
                 "HCOM_PROCESS_ID": process_id,
                 "HOME": str(home_dir),
-                # Override any inherited config env vars — config.env has these
+                # Override any inherited config env vars — config.toml has these
                 # but env vars take precedence, so clear them
                 "HCOM_TIMEOUT": "5",
                 "HCOM_SUBAGENT_TIMEOUT": "5",

@@ -28,11 +28,13 @@ Codex uses PTY injection triggered by TranscriptWatcher detecting idle.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from typing import TYPE_CHECKING
 
 from ...core.log import log_error, log_info
 from ...core.transcript import derive_codex_transcript_path
+from ...shared import ST_LISTENING
 
 if TYPE_CHECKING:
     from ...core.hcom_context import HcomContext
@@ -168,15 +170,6 @@ def handle_notify(
         if not instance:
             return HookResult.success()
 
-    # Pull remote events (rate-limited)
-    try:
-        from ...relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception:
-        pass
-
     instance_name = instance["name"]
     thread_id = payload.thread_id
     transcript_path = payload.transcript_path or derive_codex_transcript_path(thread_id)
@@ -209,7 +202,7 @@ def handle_notify(
             if transcript_path:
                 updates["transcript_path"] = transcript_path
             update_instance_position(instance_name, updates)
-        except Exception as e:
+        except (sqlite3.Error, KeyError) as e:
             log_error("hooks", "hook.error", e, hook="codex-notify", op="update_instance")
 
     # Update instance status (row exists = participating)
@@ -226,11 +219,11 @@ def handle_notify(
         from datetime import datetime, timezone
 
         idle_since = datetime.now(timezone.utc).isoformat()
-        set_status(instance_name, "listening", "")
+        set_status(instance_name, ST_LISTENING, "")
         update_instance_position(instance_name, {"idle_since": idle_since})
 
         notify_instance(instance_name)
-    except Exception as e:
+    except (sqlite3.Error, KeyError) as e:
         log_error("hooks", "hook.error", e, hook="codex-notify", op="update_status")
 
     return HookResult.success()

@@ -7,6 +7,7 @@ replaces the 3 separate agent-specific parsers.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -359,7 +360,7 @@ def get_exchanges(
 
     try:
         index = TranscriptIndex.build(str(path), agent)
-    except Exception as e:
+    except (json.JSONDecodeError, OSError, AttributeError, TypeError) as e:
         err_msg = f"Invalid JSON: {e}" if "json" in str(e).lower() else f"Error reading file: {e}"
         return {"exchanges": [], "total": 0, "error": err_msg}
 

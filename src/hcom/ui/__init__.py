@@ -82,25 +82,15 @@ from .input import (
 from .colors import FG_CLAUDE_ORANGE, FG_CUSTOM_ENV
 
 # Parse config defaults lazily to avoid circular import
-# (shared.py imports ui/colors.py, so ui/__init__.py can't import from shared at module level)
 _CONFIG_DEFAULTS_CACHE: dict[str, str] | None = None
 
 
 def _get_config_defaults() -> dict[str, str]:
-    """Lazy-load config defaults from shared."""
+    """Lazy-load config defaults from TOML schema."""
     global _CONFIG_DEFAULTS_CACHE
     if _CONFIG_DEFAULTS_CACHE is None:
-        from ..shared import DEFAULT_CONFIG_DEFAULTS
-
-        _CONFIG_DEFAULTS_CACHE = {}
-        for line in DEFAULT_CONFIG_DEFAULTS:
-            if "=" in line:
-                key, value = line.split("=", 1)
-                value = value.strip()
-                # Remove only outer layer of quotes
-                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-                    value = value[1:-1]
-                _CONFIG_DEFAULTS_CACHE[key.strip()] = value
+        from ..core.config import _get_default_known_values
+        _CONFIG_DEFAULTS_CACHE = dict(_get_default_known_values())
     return _CONFIG_DEFAULTS_CACHE
 
 
@@ -147,11 +137,15 @@ CONFIG_FIELD_OVERRIDES = {
     },
     "HCOM_RELAY": {
         "type": "text",
-        "hint": "relay server URL",
+        "hint": "MQTT broker URL (empty = public brokers)",
+    },
+    "HCOM_RELAY_ID": {
+        "type": "text",
+        "hint": "shared UUID for relay group",
     },
     "HCOM_RELAY_TOKEN": {
         "type": "text",
-        "hint": "auth token for relay",
+        "hint": "auth token for custom broker",
     },
     "HCOM_CODEX_SANDBOX_MODE": {
         "type": "cycle",

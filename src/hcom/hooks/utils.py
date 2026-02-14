@@ -9,14 +9,6 @@ Key Functions:
     init_hook_context()         - Initialize instance context from hook_data
     _try_bind_from_transcript() - Fallback binding via transcript marker
 
-Re-exports (for backward compatibility):
-    From core.instances: load_instance_position
-    From core.runtime: build_claude_env, build_hcom_bootstrap_text,
-                       notify_all_instances, notify_instance
-    From core.tool_utils: build_hcom_command, build_claude_command,
-                          stop_instance, _detect_hcom_command_type,
-                          _build_quoted_invocation
-
 Identity Resolution Flow:
     1. Look up session_id in session_bindings table
     2. If not found, check transcript for [hcom:X] marker
@@ -32,28 +24,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..core.hcom_context import HcomContext
 import sys
-import socket  # noqa: F401 (re-export)
 
 from ..core.paths import hcom_path, LOGS_DIR
 from ..core.log import log_info
-from ..core.instances import (
-    load_instance_position,  # noqa: F401 (re-export)
-)
 from ..core.bootstrap import get_bootstrap
-from ..core.runtime import (
-    build_claude_env,  # noqa: F401 (re-export)
-    notify_all_instances,  # noqa: F401 (re-export)
-    notify_instance,  # noqa: F401 (re-export)
-)
-
-# Re-export from core.tool_utils
-from ..core.tool_utils import (
-    build_hcom_command,  # noqa: F401 (re-export)
-    build_claude_command,  # noqa: F401 (re-export)
-    stop_instance,  # noqa: F401 (re-export)
-    _detect_hcom_command_type,  # noqa: F401 (re-export)
-    _build_quoted_invocation,  # noqa: F401 (re-export)
-)
 
 # Platform detection
 IS_WINDOWS = sys.platform == "win32"

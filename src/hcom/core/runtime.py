@@ -4,9 +4,9 @@ This module provides shared infrastructure used by both hooks and CLI commands:
 
 Environment Building
 --------------------
-build_claude_env() loads config.env as environment variable defaults that get
-layered under shell environment (shell vars take precedence). This enables
-configuration via both file and environment.
+build_claude_env() merges HCOM settings (from config.toml via HcomConfig) with
+passthrough env vars (from env file). The caller layers the current shell
+environment on top, so env vars > config.toml > defaults.
 
 TCP Notifications
 -----------------
@@ -27,35 +27,43 @@ hooks - the human user never sees it directly.
 
 from __future__ import annotations
 import socket
+import sqlite3
 
-from .paths import hcom_path, CONFIG_FILE
-from ..shared import parse_env_file
+from .paths import hcom_path, ENV_FILE
 from .instances import load_instance_position
 
 from .bootstrap import get_bootstrap  # noqa: F401
 
 
 def build_claude_env() -> dict[str, str]:
-    """Load config.env as environment variable defaults.
+    """Build environment dict for launched agents.
 
-    Reads ~/.hcom/config.env and returns all HCOM_* and other configured
-    variables as a dict. The caller (typically launch_terminal) layers the
-    current shell environment on top, so env vars > config.env > defaults.
+    Merges two sources:
+    - HCOM_* settings from config.toml (via get_config → hcom_config_to_dict)
+    - Passthrough env vars from env file (ANTHROPIC_MODEL, etc.)
+
+    The caller (typically launch_terminal) layers the current shell environment
+    on top, so env vars > config.toml/env > defaults.
 
     Returns:
         Dict of environment variable names to string values.
-        Blank values in config.env are skipped.
+        Blank values are skipped.
     """
-    env = {}
+    from .config import get_config, hcom_config_to_dict, load_env_extras
 
-    # Read all vars from config file as defaults
-    config_path = hcom_path(CONFIG_FILE)
-    if config_path.exists():
-        file_config = parse_env_file(config_path)
-        for key, value in file_config.items():
-            if value == "":
-                continue  # Skip blank values
-            env[key] = str(value)
+    env: dict[str, str] = {}
+
+    # 1. HCOM_* settings from config.toml
+    config = get_config()
+    for key, value in hcom_config_to_dict(config).items():
+        if value:
+            env[key] = value
+
+    # 2. Passthrough vars from env file
+    env_path = hcom_path(ENV_FILE)
+    for key, value in load_env_extras(env_path).items():
+        if value:
+            env[key] = value
 
     return env
 
@@ -76,7 +84,7 @@ def create_notify_server() -> tuple[socket.socket | None, int | None]:
         server.listen(128)
         server.setblocking(False)
         return server, server.getsockname()[1]
-    except Exception:
+    except OSError:
         return None, None
 
 
@@ -102,7 +110,7 @@ def notify_instance(instance_name: str, timeout: float = 0.05) -> None:
         from .db import list_notify_ports
 
         ports.extend(list_notify_ports(instance_name))
-    except Exception:
+    except sqlite3.Error:
         pass
 
     if not ports:
@@ -122,11 +130,11 @@ def notify_instance(instance_name: str, timeout: float = 0.05) -> None:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
                 sock.send(b"\n")
-        except Exception:
+        except OSError:
             # Best effort prune: if a port is dead, remove from notify_endpoints.
             try:
                 delete_notify_endpoint(instance_name, port=port)
-            except Exception:
+            except sqlite3.Error:
                 pass
 
 
@@ -151,7 +159,7 @@ def _send_notify_to_ports(ports: list[int], timeout: float = 0.05) -> None:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
                 sock.send(b"\n")
-        except Exception:
+        except OSError:
             pass  # Best effort - no pruning since row is already deleted
 
 
@@ -185,7 +193,7 @@ def notify_all_instances(timeout: float = 0.05) -> None:
         for row in rows:
             try:
                 k = (row["name"], int(row["port"]))
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 continue
             if k in seen:
                 continue
@@ -196,12 +204,12 @@ def notify_all_instances(timeout: float = 0.05) -> None:
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
                     sock.send(b"\n")
-            except Exception:
+            except OSError:
                 # Best-effort prune for notify_endpoints rows.
                 try:
                     delete_notify_endpoint(name, port=port)
-                except Exception:
+                except sqlite3.Error:
                     pass
 
-    except Exception:
+    except (sqlite3.Error, OSError):
         return

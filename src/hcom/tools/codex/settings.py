@@ -124,7 +124,7 @@ def setup_codex_execpolicy() -> bool:
 
         rules_dir.mkdir(parents=True, exist_ok=True)
         return atomic_write(rules_file, rule_content)
-    except Exception as e:
+    except OSError as e:
         print(f"WARN: Failed to setup Codex execpolicy: {e}", file=sys.stderr)
         return False
 
@@ -136,7 +136,7 @@ def _remove_codex_execpolicy_from_path(rules_dir: Path) -> bool:
         if rules_file.exists():
             rules_file.unlink()
         return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -263,7 +263,7 @@ def setup_codex_hooks(include_permissions: bool = True) -> bool:
             remove_codex_execpolicy()
 
         return True
-    except Exception as e:
+    except OSError as e:
         print(f"ERROR: Failed to setup Codex hooks: {e}", file=sys.stderr)
         return False
 
@@ -295,7 +295,7 @@ def _verify_codex_hooks_at(config_path: Path, check_permissions: bool = True) ->
                 return False
 
         return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -343,7 +343,7 @@ def _remove_codex_hooks_from_path(config_path: Path) -> bool:
 
         # Write back atomically
         return atomic_write(config_path, "\n".join(new_lines))
-    except Exception:
+    except OSError:
         return False
 
 

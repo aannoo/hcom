@@ -37,6 +37,141 @@ use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop,
 use crate::log::{log_info, log_error, log_warn};
 use crate::notify::NotifyServer;
 
+/// Tracks what type of incomplete escape sequence is pending on stdout.
+/// Used to defer title writes until the sequence completes across read boundaries.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PendingEscape {
+    None,
+    /// Incomplete CSI (ESC [) — complete when final byte (0x40-0x7E) appears
+    Csi,
+    /// Incomplete string sequence (OSC 3+, DCS, PM, APC) — complete when BEL (0x07)
+    /// or ST (ESC \) appears. Title OSCs (0/1/2) are stripped by TitleOscFilter.
+    StringSeq,
+}
+
+/// Check if it's safe to write title OSC to stdout.
+///
+/// Three guards prevent corruption from interleaving with tool output:
+/// 1. `had_pty_output` — no PTY data this poll iteration (same-iteration guard)
+/// 2. `pending_utf8` — no incomplete UTF-8 multi-byte sequence (cross-iteration)
+/// 3. `pending_escape` — no incomplete CSI/OSC escape sequence on stdout
+///    (cross-iteration guard for escape sequences, which are all-ASCII
+///    and invisible to pending_utf8)
+#[inline]
+fn title_write_safe(had_pty_output: bool, pending_utf8: u8, pending_escape: PendingEscape) -> bool {
+    !had_pty_output && pending_utf8 == 0 && pending_escape == PendingEscape::None
+}
+
+/// Check if data ends inside an incomplete escape sequence.
+///
+/// Scans backwards for the last ESC (0x1b) and checks whether the escape
+/// sequence that starts there has a valid terminator. Returns the type of
+/// pending escape for cross-chunk continuation tracking. Handles:
+/// - CSI (`ESC [` ... final byte 0x40-0x7E)
+/// - OSC (`ESC ]` ... BEL or ST)
+/// - DCS/PM/APC (`ESC P`/`ESC ^`/`ESC _` ... ST)
+///
+/// Note: The TitleOscFilter eats ESC bytes it's tracking (SawEsc state),
+/// so those never appear in the filtered output. This function only sees
+/// ESC bytes that the filter passed through (non-title sequences).
+#[inline]
+fn has_pending_escape(data: &[u8]) -> PendingEscape {
+    if data.is_empty() {
+        return PendingEscape::None;
+    }
+
+    // Scan backwards for the last ESC
+    let mut esc_pos = None;
+    for i in (0..data.len()).rev() {
+        if data[i] == 0x1b {
+            esc_pos = Some(i);
+            break;
+        }
+    }
+
+    let esc_pos = match esc_pos {
+        Some(pos) => pos,
+        None => return PendingEscape::None,
+    };
+
+    let after = &data[esc_pos + 1..];
+    if after.is_empty() {
+        // ESC at end — TitleOscFilter should have eaten this, but be safe
+        return PendingEscape::Csi;
+    }
+
+    match after[0] {
+        b'[' => {
+            // CSI: complete when a final byte (0x40-0x7E) appears after params
+            for &b in &after[1..] {
+                if (0x40..=0x7E).contains(&b) {
+                    return PendingEscape::None;
+                }
+            }
+            PendingEscape::Csi
+        }
+        b']' => {
+            // OSC: complete when BEL (0x07) or ST (ESC \) appears
+            // TitleOscFilter strips OSC 0/1/2; this catches OSC 8+ (hyperlinks etc.)
+            let content = &after[1..];
+            let mut i = 0;
+            while i < content.len() {
+                if content[i] == 0x07 {
+                    return PendingEscape::None;
+                }
+                if content[i] == 0x1b && i + 1 < content.len() && content[i + 1] == b'\\' {
+                    return PendingEscape::None;
+                }
+                i += 1;
+            }
+            PendingEscape::StringSeq
+        }
+        b'P' | b'^' | b'_' => {
+            // DCS / PM / APC: terminated by ST (ESC \)
+            let content = &after[1..];
+            let mut i = 0;
+            while i < content.len() {
+                if content[i] == 0x1b && i + 1 < content.len() && content[i + 1] == b'\\' {
+                    return PendingEscape::None;
+                }
+                i += 1;
+            }
+            PendingEscape::StringSeq
+        }
+        _ => {
+            // Simple 2-byte escape (ESC + letter) — always complete
+            PendingEscape::None
+        }
+    }
+}
+
+/// Resolve pending escape state when a continuation chunk has no ESC byte.
+///
+/// When the previous read left an incomplete escape and the current chunk
+/// has no new ESC, check whether a type-appropriate terminator appears:
+/// - CSI: any byte in 0x40-0x7E (the final byte)
+/// - StringSeq: BEL (0x07) — ST (ESC \) requires ESC, handled by caller
+#[inline]
+fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape {
+    match pending {
+        PendingEscape::None => PendingEscape::None,
+        PendingEscape::Csi => {
+            if data.iter().any(|&b| (0x40..=0x7E).contains(&b)) {
+                PendingEscape::None
+            } else {
+                PendingEscape::Csi
+            }
+        }
+        PendingEscape::StringSeq => {
+            if data.contains(&0x07) {
+                PendingEscape::None
+            } else {
+                PendingEscape::StringSeq
+            }
+        }
+    }
+}
+
 /// Check if buffer ends with an incomplete UTF-8 multi-byte sequence.
 /// Returns the number of continuation bytes still expected (0-3).
 ///
@@ -532,6 +667,10 @@ impl Proxy {
         // would corrupt the UTF-8 stream. We defer until sequence completes or timeout.
         let mut pending_utf8: u8 = 0;
 
+        // Track incomplete escape sequences across reads to defer title writes.
+        // Typed by escape kind so continuation chunks check the correct terminator.
+        let mut pending_escape = PendingEscape::None;
+
         // Stateful title OSC filter — strips tool's title sequences across read boundaries
         let mut title_filter = TitleOscFilter::new();
 
@@ -664,6 +803,14 @@ impl Proxy {
                             if !filtered.is_empty() {
                                 had_pty_output = true;
                                 pending_utf8 = pending_utf8_bytes(&filtered);
+                                // Track escape state across reads. If chunk has ESC,
+                                // scan from the new ESC. If no ESC, check if the
+                                // continuation resolves a previously pending escape.
+                                pending_escape = if filtered.iter().any(|&b| b == 0x1b) {
+                                    has_pending_escape(&filtered)
+                                } else {
+                                    resolve_pending_escape(pending_escape, &filtered)
+                                };
                             }
                             // If tool tried to set title, ensure we write ours at end-of-loop
                             if had_title {
@@ -780,7 +927,7 @@ impl Proxy {
             // interleaving with any incomplete escape sequence (CSI, UTF-8, etc.).
             // pending_utf8 catches cross-iteration incomplete UTF-8 (e.g., title-only
             // read after a read that ended with partial multi-byte char).
-            if stdout_is_tty && !had_pty_output && pending_utf8 == 0 {
+            if stdout_is_tty && title_write_safe(had_pty_output, pending_utf8, pending_escape) {
                 let (name, status) = {
                     let n = self.current_name.read().ok().map(|n| n.clone()).unwrap_or_default();
                     let s = self.current_status.read().ok().map(|s| s.clone()).unwrap_or_default();
@@ -923,7 +1070,6 @@ impl Proxy {
         if let Ok(mut state) = self.delivery_state.write() {
             state.ready = self.screen.is_ready();
             state.approval = self.screen.is_waiting_approval();
-            state.output_stable_1s = self.screen.is_output_stable(1000);
             state.prompt_empty = self.screen.is_prompt_empty(&self.config.tool);
             state.input_text = self.screen.get_input_box_text(&self.config.tool);
             state.last_output = self.screen.last_output_instant();
@@ -1340,5 +1486,181 @@ mod tests {
         }
         data.push(0xE2); // Start of next ─
         assert_eq!(pending_utf8_bytes(&data), 2);
+    }
+
+    // ---- title_write_safe tests ----
+
+    use super::{PendingEscape, title_write_safe, has_pending_escape, resolve_pending_escape};
+
+    #[test]
+    fn test_title_write_blocked_by_pty_output() {
+        assert!(!title_write_safe(true, 0, PendingEscape::None));
+    }
+
+    #[test]
+    fn test_title_write_blocked_by_pending_utf8() {
+        assert!(!title_write_safe(false, 1, PendingEscape::None));
+    }
+
+    #[test]
+    fn test_title_write_blocked_by_pending_csi() {
+        assert!(!title_write_safe(false, 0, PendingEscape::Csi));
+    }
+
+    #[test]
+    fn test_title_write_blocked_by_pending_string_seq() {
+        assert!(!title_write_safe(false, 0, PendingEscape::StringSeq));
+    }
+
+    #[test]
+    fn test_title_write_safe_when_all_clear() {
+        assert!(title_write_safe(false, 0, PendingEscape::None));
+    }
+
+    #[test]
+    fn test_title_write_blocked_by_multiple_conditions() {
+        assert!(!title_write_safe(true, 2, PendingEscape::Csi));
+    }
+
+    // ---- has_pending_escape tests ----
+
+    #[test]
+    fn test_pending_escape_empty() {
+        assert_eq!(has_pending_escape(&[]), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_plain_text() {
+        assert_eq!(has_pending_escape(b"Hello world"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_csi() {
+        assert_eq!(has_pending_escape(b"\x1b[38;2;100m"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_incomplete_csi() {
+        assert_eq!(has_pending_escape(b"\x1b[38;2;"), PendingEscape::Csi);
+    }
+
+    #[test]
+    fn test_pending_escape_bare_esc() {
+        assert_eq!(has_pending_escape(b"text\x1b"), PendingEscape::Csi);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_osc_bel() {
+        assert_eq!(has_pending_escape(b"\x1b]8;id=link;https://example.com\x07"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_incomplete_osc() {
+        assert_eq!(has_pending_escape(b"\x1b]8;id=link;https://example.com"), PendingEscape::StringSeq);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_osc_st() {
+        assert_eq!(has_pending_escape(b"\x1b]8;id=link;https://example.com\x1b\\"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_simple_two_byte() {
+        assert_eq!(has_pending_escape(b"\x1bM"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_after_complete_sequence() {
+        assert_eq!(has_pending_escape(b"\x1b[38;2;100mhello"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_incomplete_dcs() {
+        assert_eq!(has_pending_escape(b"\x1bPsome data"), PendingEscape::StringSeq);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_dcs() {
+        assert_eq!(has_pending_escape(b"\x1bPsome data\x1b\\"), PendingEscape::None);
+    }
+
+    // ---- resolve_pending_escape (cross-chunk) tests ----
+
+    #[test]
+    fn test_resolve_csi_continuation_no_final() {
+        // CSI params without final byte — stays pending
+        assert_eq!(resolve_pending_escape(PendingEscape::Csi, b"100;50;"), PendingEscape::Csi);
+    }
+
+    #[test]
+    fn test_resolve_csi_continuation_with_final() {
+        // CSI terminated by 'm' (0x6D)
+        assert_eq!(resolve_pending_escape(PendingEscape::Csi, b"200m"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_resolve_csi_continuation_final_mid_chunk() {
+        // Final byte followed by normal text
+        assert_eq!(resolve_pending_escape(PendingEscape::Csi, b"200mHello world"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_resolve_string_seq_continuation_no_terminator() {
+        // OSC URL continuation without BEL — stays pending
+        assert_eq!(resolve_pending_escape(PendingEscape::StringSeq, b"ample.com/path"), PendingEscape::StringSeq);
+    }
+
+    #[test]
+    fn test_resolve_string_seq_continuation_with_bel() {
+        // OSC terminated by BEL
+        assert_eq!(resolve_pending_escape(PendingEscape::StringSeq, b"url\x07rest"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_resolve_none_stays_none() {
+        assert_eq!(resolve_pending_escape(PendingEscape::None, b"any data"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_resolve_string_seq_letters_dont_clear() {
+        // Letters in OSC content (e.g., URL) must NOT clear StringSeq —
+        // only BEL or ST terminates. (Letters would falsely clear CSI.)
+        assert_eq!(resolve_pending_escape(PendingEscape::StringSeq, b"https://example"), PendingEscape::StringSeq);
+    }
+
+    #[test]
+    fn test_three_way_csi_split() {
+        // Simulate the exact 3-way split bug: ESC[38;2; | 100;50; | 200m
+        let chunk1 = b"\x1b[38;2;";
+        let chunk2 = b"100;50;";
+        let chunk3 = b"200m";
+
+        let state = has_pending_escape(chunk1);
+        assert_eq!(state, PendingEscape::Csi);
+
+        // Chunk 2 has no ESC — use resolve
+        let state = resolve_pending_escape(state, chunk2);
+        assert_eq!(state, PendingEscape::Csi, "must stay pending through middle chunk");
+
+        // Chunk 3 has no ESC — use resolve, 'm' terminates
+        let state = resolve_pending_escape(state, chunk3);
+        assert_eq!(state, PendingEscape::None);
+    }
+
+    #[test]
+    fn test_three_way_osc_split() {
+        // OSC 8 hyperlink split: ESC]8;id=x; | https://long.url | .com/path BEL
+        let chunk1 = b"\x1b]8;id=x;";
+        let chunk2 = b"https://long.url";
+        let chunk3 = b".com/path\x07";
+
+        let state = has_pending_escape(chunk1);
+        assert_eq!(state, PendingEscape::StringSeq);
+
+        let state = resolve_pending_escape(state, chunk2);
+        assert_eq!(state, PendingEscape::StringSeq, "URL letters must not terminate OSC");
+
+        let state = resolve_pending_escape(state, chunk3);
+        assert_eq!(state, PendingEscape::None);
     }
 }

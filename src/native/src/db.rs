@@ -208,8 +208,8 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Check if instance status is "listening" (idle)
     /// Check if instance is idle (safe for PTY injection).
+    /// Status values defined in src/hcom/shared.py ST_* constants.
     ///
     /// Returns true only when status is "listening" AND detail is not "cmd:listen".
     /// The "cmd:listen" detail is set by `hcom listen` as its first operation,
@@ -654,6 +654,31 @@ impl HcomDb {
             params![name],
         )?;
         Ok(())
+    }
+
+    /// Remove all event subscriptions owned by an instance.
+    ///
+    /// Subscriptions are stored as kv entries with key 'events_sub:sub-{hash}'
+    /// and a JSON value containing a "caller" field.
+    pub fn cleanup_subscriptions(&self, name: &str) -> Result<u32> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'"
+        )?;
+        let rows: Vec<(String, String)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        let mut deleted = 0u32;
+        for (key, value) in &rows {
+            // Parse JSON and check caller field
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(value) {
+                if obj.get("caller").and_then(|c| c.as_str()) == Some(name) {
+                    self.conn.execute("DELETE FROM kv WHERE key = ?", params![key])?;
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Log a status event to the events table

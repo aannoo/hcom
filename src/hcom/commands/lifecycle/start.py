@@ -18,12 +18,14 @@ from ...shared import (
     detect_vanilla_tool,
     detect_current_tool,
     CommandContext,
+    ST_ACTIVE,
+    ST_LISTENING,
+    ST_INACTIVE,
 )
 from ...core.thread_context import get_process_id, get_is_launched, get_cwd
 from ...core.instances import (
     load_instance_position,
     update_instance_position,
-    SKIP_HISTORY,
     parse_running_tasks,
 )
 from .launch import _verify_hooks_for_tool
@@ -85,7 +87,7 @@ def _start_adhoc_mode(tool: str = "adhoc", post_warning: str | None = None) -> i
     log_event("life", instance_name, {"action": "started", "by": "cli", "reason": "adhoc"})
 
     # Set initial status context
-    set_status(instance_name, "listening", "registered")
+    set_status(instance_name, ST_LISTENING, "registered")
 
     # Print binding marker for notify hook to capture session_id
     # Format: [hcom:<name>] - specific enough to avoid false matches
@@ -151,7 +153,7 @@ def _start_orphaned_hcom_launched() -> int:
 
     log_event("life", instance_name, {"action": "started", "by": "cli", "reason": "restart"})
 
-    set_status(instance_name, "listening", "registered")
+    set_status(instance_name, ST_LISTENING, "registered")
 
     print(f"[hcom:{instance_name}]")
 
@@ -287,6 +289,14 @@ def _handle_rebind_session(rebind_target: str, current_identity: str | None) -> 
 
     # Mark as announced so hooks don't duplicate
     update_instance_position(rebind_target, {"name_announced": True})
+
+    # Push rebound instance to relay (hooks will set_status shortly, but clear stale state now)
+    try:
+        from ...relay import trigger_push
+
+        trigger_push()
+    except Exception:
+        pass
 
     return 0
 
@@ -444,7 +454,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         if existing:
             # Already created - reuse existing name (row exists = participating)
             subagent_name = existing["name"]
-            set_status(subagent_name, "active", "start")
+            set_status(subagent_name, ST_ACTIVE, "start")
             print(f"hcom already started for {subagent_name}")
             return 0
 
@@ -468,7 +478,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         import time
         from ...core.db import get_last_event_id
 
-        initial_event_id = get_last_event_id() if SKIP_HISTORY else 0
+        initial_event_id = get_last_event_id()
         parent_tag = parent_data.get("tag") if parent_data else None
 
         try:
@@ -488,7 +498,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     initial_event_id,
                     str(get_cwd()),
                     0,
-                    "active",
+                    ST_ACTIVE,
                 ),
             )
             conn.commit()
@@ -512,7 +522,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                         initial_event_id,
                         str(get_cwd()),
                         0,
-                        "active",
+                        ST_ACTIVE,
                     ),
                 )
                 conn.commit()
@@ -529,19 +539,10 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         capture_and_store_launch_context(subagent_name)
 
         # Set active status
-        set_status(subagent_name, "active", "tool:start")
+        set_status(subagent_name, ST_ACTIVE, "tool:start")
 
         from ...core.log import log_info as _log_info
         _log_info("lifecycle", "start.subagent", name=subagent_name, parent=parent_name, agent_id=agent_id, agent_type=agent_type)
-
-        # Push subagent creation to relay
-        try:
-            from ...relay import notify_relay, push
-
-            if not notify_relay():
-                push()
-        except Exception:
-            pass
 
         # Print subagent bootstrap
         from ...core.bootstrap import get_subagent_bootstrap
@@ -680,7 +681,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if not has_session_binding(instance_name) and is_inside_ai_tool():
         # AI tool context: row exists but no session binding (inactive from previous session)
         # Suggest --as to rebind this session to the instance
-        status = existing_data.get("status", "inactive")
+        status = existing_data.get("status", ST_INACTIVE)
         from ...core.tool_utils import build_hcom_command
 
         hcom_cmd = build_hcom_command()

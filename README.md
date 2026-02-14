@@ -38,6 +38,24 @@ hcom
 
 ---
 
+## How it works
+
+Messages arrive mid-turn or wake idle agents immediately.
+
+```text
+agents → hooks → sqlite → hooks → other agents
+```
+
+Hooks capture agent activity into sqlite. Other hooks and PTY push matching events back into agent context. 
+
+Agents get unique names. You can also refer to them by tool, terminal, branch, cwd, or set custom: *"tag yourself reviewer"*.
+
+Collision detection is on by default. If 2 agents edit the same file within 20s, both get notified.
+
+
+---
+
+
 ## What you can do
 
 Tell any agent:
@@ -50,36 +68,27 @@ Tell any agent:
 
 > find which agent worked on terminal_id code, resume them and ask why it sucks
 
-Messages arrive mid-turn or wake idle agents immediately.
-
-Collision detection is on by default. If 2 agents edit the same file within 20s, both get notified.
-
-Agents get unique names. You can also refer to them by tool, terminal, branch, cwd, or set custom: *"tag yourself reviewer"*.
 
 <details><summary>What agents can do</summary>
 
-* Message each other (with intents, threads, broadcast, @mentions)
-
-* Read each other's transcripts (with ranges and detail levels)
-
-* View other's terminal screens and inject text / enter for permission approval
-
-* Query event history (file edits, commands, status, lifecycle events)
-
-* Subscribe and react to each other's event activity
-
-* Spawn, fork, resume other agents into new terminal windows/panes/tabs. and kill them.
-
-* Build bundles of context (files, transcript, events) for handoffs
+| | |
+|---|---|
+| Message each other (intents, threads, broadcast, @mentions) | `hcom send` |
+| Read each other's transcripts (ranges and detail levels) | `hcom transcript` |
+| View terminal screens, inject text/enter for approvals | `hcom term` |
+| Query event history (file edits, commands, status, lifecycle) | `hcom events` |
+| Subscribe and react to each other's activity | `hcom events sub` |
+| Spawn, fork, resume, kill agents in new terminal panes | `hcom N claude\|gemini\|codex`, `hcom kill`, `hcom r`, `hcom f` |
+| Build context bundles (files, transcript, events) for handoffs | `hcom bundle` |
 
 </details>
 
 
+---
 
+## Multi-agent workflows
 
-## Workflow scripts
-
-Included examples of multi-agent setups built with the Python API.
+Included examples of scripts with the Python API.
 
 **`hcom run confess`** - agent (or background clone) writes an honesty self-eval, a spawned calibrator reads the target's transcript independently, judge compares both reports, sends back a verdict via hcom message.
 
@@ -96,18 +105,11 @@ Create your own by prompting:
 
 ## Tools
 
-**Claude Code, Gemini CLI, Codex** — automatic message delivery, transcript/terminal screen etc.
+**Claude Code, Gemini CLI, Codex** — messages are delivered automatically, events are tracked.
 
-**Any AI tool that can run shell commands** - send and receive messages. Tell it "run `hcom start`"
+**Any AI tool that can run shell commands** - send and receive messages manually. Tell agent "run `hcom start`"
 
-
-<details><summary>Ping from any process</summary>
-
-
-```bash
-hcom send <message> --from bot-name
-```
-</details>
+**Any process** - fire and forget: `hcom send <message> --from botname`
 
 <details><summary>Claude Code headless</summary>
 
@@ -140,17 +142,43 @@ hcom config terminal kitty    # set
 
 ---
 
+## Cross-device
+
+Connect agents across machines via MQTT relay:
+
+```bash
+# get token
+hcom relay new
+
+# on each device
+hcom relay connect <token>
+```
+
+### Cloud
+
+1. Allow network access
+2. Paste into AI tool:
+
+```
+run this and connect: pip install hcom && hcom relay connect <token> && hcom start -h
+```
+
+---
+
 ## What gets installed
 
 Hooks go into `~/` (or `HCOM_DIR`) on launch or `hcom start`. If you aren't using hcom, the hooks do nothing.
 
 ```bash
 hcom hooks remove                  # safely remove only hcom hooks
-hcom status                        # install status
 ```
 
 ```bash
 HCOM_DIR=$PWD/.hcom                # for sandbox or project local
+```
+
+```bash
+hcom status                        # diagnostics
 ```
 
 ---
@@ -163,7 +191,7 @@ HCOM_DIR=$PWD/.hcom                # for sandbox or project local
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.18 - multi-agent communication
+hcom (hook-comms) v0.6.19 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
@@ -485,62 +513,51 @@ Sandbox / local mode:
 ## config
 
 Usage:
-  hcom config                     Show all config values
-  hcom config <key>               Get single value
-  hcom config <key> <value>       Set value
-  hcom config <key> --info        Detailed help for a setting (presets, examples)
-    --json                         JSON output
-    --edit                         Open config in $EDITOR
-    --reset                        Reset config to defaults
-
-  hcom config terminal --setup    Configure kitty remote control
+  hcom config                     Show effective config (with sources)
+  hcom config <key>               Get one key
+  hcom config <key> <value>       Set one key
+  hcom config <key> --info        Detailed help for a key
+    --json / --edit / --reset      
 
 
-Per-agent runtime config:
-  hcom config -i <name>           Show agent config
-  hcom config -i <name> <key>     Get value
-  hcom config -i <name> <key> <val> Set value
-    -i self                        Current agent
-    keys: tag, timeout, hints, subagent_timeout 
+Per-agent:
+  hcom config -i <name|self> [key] [val] tag, timeout, hints, subagent_timeout
 
 
-Global settings:
-    HCOM_TAG                       Group tag (agents become tag-*)
-    HCOM_TERMINAL                  default | <preset> | "cmd {script}"
-    HCOM_HINTS                     Text appended to all messages agent receives
-    HCOM_NOTES                     One-time notes appended to bootstrap
-    HCOM_SUBAGENT_TIMEOUT          Subagent keep-alive seconds after task
-    HCOM_CLAUDE_ARGS               Default claude args (e.g. "--model opus")
-    HCOM_GEMINI_ARGS               Default gemini args
-    HCOM_CODEX_ARGS                Default codex args
-    HCOM_RELAY                     Relay server URL (set by 'hcom relay hf')
-    HCOM_RELAY_TOKEN               HuggingFace token (set by 'hcom relay hf')
-    HCOM_AUTO_APPROVE              Auto-approve safe hcom commands (1|0)
-    HCOM_AUTO_SUBSCRIBE            Auto-subscribe presets (e.g. "collision")
-    HCOM_NAME_EXPORT               Export agent name to custom env var
+Keys:
+    tag                            Group/label (agents become tag-*)
+    terminal                       Where new agent windows open
+    hints                          Text appended to all messages agent receives
+    notes                          Notes appended to agent bootstrap
+    subagent_timeout               Subagent keep-alive seconds after task
+    claude_args / gemini_args / codex_args 
+    auto_approve                   Auto-approve safe hcom commands
+    auto_subscribe                 Event auto-subscribe presets
+    name_export                    Export agent name to custom env var
+  hcom config <key> --info for details
 
-  Non-HCOM_* vars in config.env pass through to claude/gemini/codex
-  e.g. ANTHROPIC_MODEL=opus
-
-
-Precedence: HCOM defaults < config.env < shell env vars
-  Each resolves independently
-
-  HCOM_DIR: per project/sandbox — must be set in shell (see 'hcom reset --help')
+  Precedence: defaults < config.toml < env vars
+  Files: /Users/anno/.hcom/config.toml, /Users/anno/.hcom/env
+  HCOM_DIR: isolate per project (see 'hcom reset --help')
 
 ## relay
 
 Usage:
-  hcom relay                      Show relay status
-  hcom relay on                   Enable cross-device communication
-  hcom relay off                  Disable cross-device communication
-  hcom relay pull                 Force sync now
-  hcom relay hf [token]           Setup HuggingFace Space relay
-    --update                       Update existing Space
+  hcom relay                      Show status and token
+  hcom relay new                  Create new relay group
+  hcom relay connect <token>      Join relay group
+  hcom relay on / off             Enable/disable sync
 
-  Finds or duplicates a private, free HF Space to your account.
-  Provide HF_TOKEN or run 'huggingface-cli login' first.
-  Remote agents appear with :SUFFIX (e.g. luna:BOXE).
+
+Setup:
+  1. 'relay new' to get token
+  2. 'relay connect <token>' on each device
+
+
+Custom broker:
+  hcom relay new --broker mqtts://host:port --password <broker-auth-secret> 
+  hcom relay connect <token> --password <secret> 
+
 
 ## transcript
 
@@ -559,6 +576,7 @@ Usage:
     --all                          All transcripts (includes non-hcom sessions)
     --limit N                      Max results (default: 20)
     --agent TYPE                   Filter: claude | gemini | codex
+    --exclude-self                 Exclude the searching agent's own transcript
     --json                         JSON output
 
   Tip: Reference ranges in messages instead of copying:
@@ -730,7 +748,7 @@ JSON fields: lines[], size[rows,cols], cursor[row,col],
 ```
 # Config Settings Reference
 
-Config is stored in ~/.hcom/config.env (or $HCOM_DIR/config.env).
+Config is stored in ~/.hcom/config.toml (or $HCOM_DIR/config.toml).
 
 Commands:
   hcom config                 Show all values
@@ -738,7 +756,7 @@ Commands:
   hcom config <key> --info    Detailed help for a setting
   hcom config --edit          Open in $EDITOR
 
-Precedence: defaults < config.env < shell environment variables
+Precedence: defaults < config.toml < shell environment variables
 
 ## HCOM_TAG
 
@@ -793,8 +811,8 @@ Other (opens window only):
 Custom command (open only):
   hcom config terminal "my-terminal -e bash {script}"
 
-Custom preset with close (~/.hcom/settings.toml):
-  [terminal.myterm]
+Custom preset with close (~/.hcom/config.toml):
+  [terminal.presets.myterm]
   open = "myterm spawn -- bash {script}"
   close = "myterm kill --id {id}"
   binary = "myterm"
@@ -890,19 +908,19 @@ Merged with launch-time cli args (launch args win on conflict).
 
 ## HCOM_RELAY
 
-HCOM_RELAY - Relay server URL
+HCOM_RELAY - MQTT broker URL
 
-Set automatically by 'hcom relay hf'.
+Empty = use public brokers (broker.emqx.io, broker.hivemq.com, test.mosquitto.org).
+Set automatically by 'hcom relay new' (pins first working broker).
 
-Custom server: implement POST /push/{device_id}, GET /poll, GET /version
-See: https://huggingface.co/spaces/aannoo/hcom-relay/blob/main/app.py
+Private broker: hcom relay new --broker mqtts://host:port
 
 ## HCOM_RELAY_TOKEN
 
-HCOM_RELAY_TOKEN - HuggingFace token for private Space auth
-Set automatically by 'hcom relay hf'
+HCOM_RELAY_TOKEN - Auth token for MQTT broker
 
-Or optional authentication token for custom server.
+Optional. Set via 'hcom relay new --password <secret>' or directly here.
+Only needed if your broker requires authentication.
 
 ## HCOM_AUTO_APPROVE
 

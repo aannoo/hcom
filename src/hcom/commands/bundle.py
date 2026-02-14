@@ -436,7 +436,7 @@ def _bundle_prepare(argv: list[str], *, ctx: CommandContext | None = None, json_
                     transcript_range = f"{first_pos}-{last_pos}"
             elif thread and thread.get("error"):
                 transcript_text = f"Error reading transcript: {thread['error']}"
-        except Exception as e:
+        except (OSError, ValueError) as e:
             transcript_text = f"Error reading transcript: {e}"
 
     # --- GET ACTUAL EVENTS BY CATEGORY ---
@@ -592,7 +592,7 @@ def _bundle_cat(argv: list[str], *, conn: Any) -> int:
                     print(f"{file_path} ({lines} lines, {size_str}, modified {modified_str})")
                 else:
                     print(f"{file_path} (not found)")
-            except Exception as e:
+            except OSError as e:
                 print(f"{file_path} (error: {e})")
         print()
 
@@ -646,7 +646,7 @@ def _bundle_cat(argv: list[str], *, conn: Any) -> int:
                     else:
                         error = thread.get("error", "Unknown error") if thread else "Failed to read transcript"
                         print(f"Error: {error}")
-                except Exception as e:
+                except (OSError, ValueError) as e:
                     print(f"Error reading transcript: {e}")
 
                 print()
@@ -897,7 +897,7 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             except json.JSONDecodeError as e:
                 print(format_error(f"Invalid --bundle-file JSON: {e}"), file=sys.stderr)
                 return 1
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         # Flag not present
         pass
 
@@ -987,10 +987,9 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     bundle_id = create_bundle_event(bundle, instance=bundle_instance, created_by=identity.name)
     try:
-        from ..relay import notify_relay, push
+        from ..relay import trigger_push
 
-        if not notify_relay():
-            push()
+        trigger_push()
     except Exception:
         pass
     result = {"bundle_id": bundle_id}

@@ -49,7 +49,7 @@ Storage
 Field values are stored in different places:
 - LaunchState attributes: prompt, system_prompt, etc.
 - config_edit dict: HCOM_* config values
-- Both are persisted to config.env on mode switch or exit
+- Both are persisted to config.toml on mode switch or exit
 """
 
 from __future__ import annotations
@@ -101,11 +101,12 @@ from .colors import (
 
 # Import non-color constants from shared
 from ..shared import (
-    DEFAULT_CONFIG_DEFAULTS,
     RELEASED_TOOLS,
     RELEASED_BACKGROUND,
+    HcomError,
     IS_WINDOWS,
 )
+from ..core.config import KNOWN_CONFIG_KEYS as _KNOWN_CONFIG_KEYS
 from ..ui import (
     CONFIG_DEFAULTS,
     CONFIG_FIELD_OVERRIDES,
@@ -117,7 +118,7 @@ from ..tools.claude.args import resolve_claude_args
 from ..tools.codex.args import resolve_codex_args
 from ..tools.gemini.args import resolve_gemini_args
 from ..launcher import launch as unified_launch
-from ..commands.admin import reset_config
+from ..commands.reset import reset_config
 
 # PTY-only tools that don't work on Windows
 _PTY_ONLY_TOOLS = {"gemini", "codex"}
@@ -1099,7 +1100,7 @@ class LaunchScreen:
                     self.tui.flash("Config reset to defaults")
                 else:
                     self.tui.flash_error("Failed to reset config")
-            except Exception as e:
+            except (ValueError, AttributeError) as e:
                 self.tui.flash_error(f"Reset failed: {str(e)}")
             finally:
                 self.state.confirm.pending_reset = False
@@ -1492,24 +1493,23 @@ class LaunchScreen:
 
     def build_hcom_fields(self) -> List[Field]:
         """Build HCOM section fields - always show all expected HCOM vars"""
-        # Extract expected keys from DEFAULT_CONFIG_DEFAULTS (excluding tool-specific vars)
+        # Extract expected keys from KNOWN_CONFIG_KEYS (excluding tool-specific vars)
         # Tool args and system prompts are shown in the tool-specific section, not here
         # Tool-specific vars shown in tool section, hidden vars not shown at all
-        tool_specific_prefixes = (
-            "HCOM_CLAUDE_ARGS=",
-            "HCOM_GEMINI_ARGS=",
-            "HCOM_CODEX_ARGS=",
-            "HCOM_GEMINI_SYSTEM_PROMPT=",
-            "HCOM_CODEX_SYSTEM_PROMPT=",
-        )
+        tool_specific_keys = {
+            "HCOM_CLAUDE_ARGS",
+            "HCOM_GEMINI_ARGS",
+            "HCOM_CODEX_ARGS",
+            "HCOM_GEMINI_SYSTEM_PROMPT",
+            "HCOM_CODEX_SYSTEM_PROMPT",
+        }
         # HCOM_TIMEOUT: only for headless/vanilla claude, hidden from TUI
         hidden_keys = {"HCOM_TIMEOUT"}
         expected_keys = [
-            line.split("=")[0]
-            for line in DEFAULT_CONFIG_DEFAULTS
-            if line.startswith("HCOM_")
-            and not any(line.startswith(p) for p in tool_specific_prefixes)
-            and line.split("=")[0] not in hidden_keys
+            key for key in _KNOWN_CONFIG_KEYS
+            if key.startswith("HCOM_")
+            and key not in tool_specific_keys
+            and key not in hidden_keys
         ]
 
         fields = []
@@ -1978,6 +1978,7 @@ class LaunchScreen:
                     background=background,
                     pty=use_pty,
                     run_here=False,  # TUI: always launch in new terminal
+                    skip_validation=True,
                 )
             elif tool == "codex":
                 # Codex: uses HCOM_CODEX_ARGS from config (checkbox updates field directly)
@@ -2004,6 +2005,7 @@ class LaunchScreen:
                     system_prompt=self.state.launch.codex_system_prompt or None,
                     background=headless,
                     run_here=False,  # TUI: always launch in new terminal
+                    skip_validation=True,
                 )
             else:
                 # Gemini: uses HCOM_GEMINI_ARGS from config, prompt injected via PTY or headless.
@@ -2028,6 +2030,7 @@ class LaunchScreen:
                     system_prompt=self.state.launch.gemini_system_prompt or None,
                     background=headless,
                     run_here=False,  # TUI: always launch in new terminal
+                    skip_validation=True,
                 )
 
             if result and result.get("launched", 0) > 0:
@@ -2044,8 +2047,8 @@ class LaunchScreen:
                 else:
                     self.tui.flash_error("Launch failed - check instances")
 
-        except Exception as e:
-            # cmd_launch raises CLIError for validation failures
+        except HcomError as e:
+            # launcher raises HcomError for validation failures
             self.tui.flash_error(str(e))
         finally:
             pass

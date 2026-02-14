@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from pathlib import Path
 
 from ...core.log import log_error
+from ...shared import ST_ACTIVE
 
 # Regex to extract file paths from apply_patch input
 APPLY_PATCH_FILE_RE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+?)(?:\n|$)")
@@ -217,28 +219,38 @@ class TranscriptWatcher:
                         if detail:
                             updates["status_detail"] = detail
                         update_instance_position(self.instance_name, updates)
-            except Exception:
+                        # Wake delivery thread for terminal title update
+                        from ...core.runtime import notify_instance
+
+                        notify_instance(self.instance_name)
+                        try:
+                            from ...relay import trigger_push
+
+                            trigger_push()
+                        except Exception:
+                            pass
+            except (ValueError, TypeError):
                 pass  # Don't fail on timestamp parse errors
 
     def _log_file_edit(self, filepath: str, timestamp: str) -> None:
         """Log a file edit status event for collision detection."""
         try:
-            self._log_status_retroactive("active", "tool:apply_patch", filepath, timestamp)
-        except Exception as e:
+            self._log_status_retroactive(ST_ACTIVE, "tool:apply_patch", filepath, timestamp)
+        except (sqlite3.Error, OSError, KeyError) as e:
             log_error("pty", "pty.exit", e, instance=self.instance_name, tool="codex")
 
     def _log_shell_command(self, command: str, timestamp: str) -> None:
         """Log a shell command status event for command subscriptions."""
         try:
-            self._log_status_retroactive("active", "tool:shell", command, timestamp)
-        except Exception as e:
+            self._log_status_retroactive(ST_ACTIVE, "tool:shell", command, timestamp)
+        except (sqlite3.Error, OSError, KeyError) as e:
             log_error("pty", "pty.exit", e, instance=self.instance_name, tool="codex")
 
     def _log_user_prompt(self, timestamp: str) -> None:
         """Log user prompt status event (active:prompt)."""
         try:
-            self._log_status_retroactive("active", "prompt", "", timestamp)
-        except Exception as e:
+            self._log_status_retroactive(ST_ACTIVE, "prompt", "", timestamp)
+        except (sqlite3.Error, OSError, KeyError) as e:
             log_error("pty", "pty.exit", e, instance=self.instance_name, tool="codex")
 
 
@@ -264,7 +276,7 @@ def run_transcript_watcher_thread(
                 if bound_name and bound_name != instance_name:
                     instance_name = bound_name
                     watcher.instance_name = bound_name
-            except Exception:
+            except sqlite3.Error:
                 pass
 
         # Get transcript path from instance DB (may be set by notify hook)
@@ -274,7 +286,7 @@ def run_transcript_watcher_thread(
             inst = get_instance(instance_name)
             if inst and inst.get("transcript_path"):
                 watcher.set_transcript_path(inst["transcript_path"])
-        except Exception:
+        except (sqlite3.Error, KeyError):
             pass
 
         # Sync any new edits

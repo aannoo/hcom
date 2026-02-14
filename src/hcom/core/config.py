@@ -7,46 +7,382 @@ import sys
 import re
 import shlex
 import threading
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from .paths import hcom_path, atomic_write, CONFIG_FILE
-from ..shared import (
-    parse_env_file,
-    parse_env_value,
-    format_env_value,
-    DEFAULT_CONFIG_HEADER,
-    DEFAULT_CONFIG_DEFAULTS,
-)
+from .paths import hcom_path, atomic_write, CONFIG_FILE, CONFIG_TOML, ENV_FILE
+from ..shared import parse_env_value, format_env_value
 
-# ==================== Config Constants ====================
 
-# Parse header defaults (ANTHROPIC_MODEL, CLAUDE_CODE_SUBAGENT_MODEL, etc.)
-_HEADER_COMMENT_LINES: list[str] = []
-_HEADER_DEFAULT_EXTRAS: dict[str, str] = {}
-_header_data_started = False
-for _line in DEFAULT_CONFIG_HEADER:
-    stripped = _line.strip()
-    if not _header_data_started and (not stripped or stripped.startswith("#")):
-        _HEADER_COMMENT_LINES.append(_line)
-        continue
-    if not _header_data_started:
-        _header_data_started = True
-    if _header_data_started and "=" in _line:
-        key, _, value = _line.partition("=")
-        _HEADER_DEFAULT_EXTRAS[key.strip()] = parse_env_value(value)
+# ==================== TOML Schema ====================
 
-# Parse known HCOM_* config keys and defaults
-KNOWN_CONFIG_KEYS: list[str] = []
+TOML_HEADER = """\
+# hcom configuration
+# Help: hcom config --help
+# Docs: hcom run docs
+"""
+
+# Canonical TOML structure with built-in defaults
+DEFAULT_TOML: dict[str, Any] = {
+    "terminal": {"active": "default"},
+    "relay": {"url": "", "id": "", "token": "", "enabled": True},
+    "launch": {
+        "tag": "",
+        "hints": "",
+        "notes": "",
+        "subagent_timeout": 30,
+        "auto_subscribe": "collision",
+        "claude": {"args": ""},
+        "gemini": {"args": "", "system_prompt": ""},
+        "codex": {"args": "", "sandbox_mode": "workspace", "system_prompt": ""},
+    },
+    "preferences": {"timeout": 86400, "auto_approve": True, "name_export": ""},
+}
+
+# Bidirectional mapping: HcomConfig field name <-> TOML dotted path
+TOML_KEY_MAP: dict[str, str] = {
+    "terminal": "terminal.active",
+    "tag": "launch.tag",
+    "hints": "launch.hints",
+    "notes": "launch.notes",
+    "subagent_timeout": "launch.subagent_timeout",
+    "auto_subscribe": "launch.auto_subscribe",
+    "claude_args": "launch.claude.args",
+    "gemini_args": "launch.gemini.args",
+    "gemini_system_prompt": "launch.gemini.system_prompt",
+    "codex_args": "launch.codex.args",
+    "codex_sandbox_mode": "launch.codex.sandbox_mode",
+    "codex_system_prompt": "launch.codex.system_prompt",
+    "relay": "relay.url",
+    "relay_id": "relay.id",
+    "relay_token": "relay.token",
+    "relay_enabled": "relay.enabled",
+    "timeout": "preferences.timeout",
+    "auto_approve": "preferences.auto_approve",
+    "name_export": "preferences.name_export",
+}
+
+# Mapping: HcomConfig field name -> HCOM_* env var key
+_FIELD_TO_ENV: dict[str, str] = {
+    "timeout": "HCOM_TIMEOUT",
+    "subagent_timeout": "HCOM_SUBAGENT_TIMEOUT",
+    "terminal": "HCOM_TERMINAL",
+    "hints": "HCOM_HINTS",
+    "notes": "HCOM_NOTES",
+    "tag": "HCOM_TAG",
+    "claude_args": "HCOM_CLAUDE_ARGS",
+    "gemini_args": "HCOM_GEMINI_ARGS",
+    "codex_args": "HCOM_CODEX_ARGS",
+    "codex_sandbox_mode": "HCOM_CODEX_SANDBOX_MODE",
+    "gemini_system_prompt": "HCOM_GEMINI_SYSTEM_PROMPT",
+    "codex_system_prompt": "HCOM_CODEX_SYSTEM_PROMPT",
+    "relay": "HCOM_RELAY",
+    "relay_id": "HCOM_RELAY_ID",
+    "relay_token": "HCOM_RELAY_TOKEN",
+    "relay_enabled": "HCOM_RELAY_ENABLED",
+    "auto_approve": "HCOM_AUTO_APPROVE",
+    "auto_subscribe": "HCOM_AUTO_SUBSCRIBE",
+    "name_export": "HCOM_NAME_EXPORT",
+}
+_ENV_TO_FIELD = {v: k for k, v in _FIELD_TO_ENV.items()}
+
+# Relay fields — file-only, no env var override
+_RELAY_FIELDS = {"relay", "relay_id", "relay_token", "relay_enabled"}
+
+# Derive KNOWN_CONFIG_KEYS and DEFAULT_KNOWN_VALUES for backward compat
+# (config_cmd.py display loop iterates KNOWN_CONFIG_KEYS)
+KNOWN_CONFIG_KEYS: list[str] = list(_FIELD_TO_ENV.values())
 DEFAULT_KNOWN_VALUES: dict[str, str] = {}
-for _entry in DEFAULT_CONFIG_DEFAULTS:
-    if "=" not in _entry:
-        continue
-    key, _, value = _entry.partition("=")
-    key = key.strip()
-    KNOWN_CONFIG_KEYS.append(key)
-    DEFAULT_KNOWN_VALUES[key] = parse_env_value(value)
+_default_config_obj = None  # Lazy — avoid constructing HcomConfig at import time
+
+
+def _get_default_known_values() -> dict[str, str]:
+    """Lazily build DEFAULT_KNOWN_VALUES from HcomConfig defaults."""
+    global DEFAULT_KNOWN_VALUES, _default_config_obj
+    if not DEFAULT_KNOWN_VALUES:
+        # Build from dataclass defaults directly
+        _defaults = {f.name: f.default for f in fields(HcomConfig)}
+        for field_name, env_key in _FIELD_TO_ENV.items():
+            val = _defaults.get(field_name, "")
+            if isinstance(val, bool):
+                DEFAULT_KNOWN_VALUES[env_key] = "1" if val else "0"
+            else:
+                DEFAULT_KNOWN_VALUES[env_key] = str(val)
+    return DEFAULT_KNOWN_VALUES
+
+
+# ==================== TOML I/O ====================
+
+_TERMINAL_DANGEROUS_CHARS = ["`", "$", ";", "|", "&", "\n", "\r"]
+
+
+def _get_nested(data: dict, dotted_path: str) -> Any:
+    """Get value from nested dict using dotted path. Returns None if missing."""
+    parts = dotted_path.split(".")
+    current = data
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _set_nested(data: dict, dotted_path: str, value: Any) -> None:
+    """Set value in nested dict using dotted path, creating intermediates."""
+    parts = dotted_path.split(".")
+    current = data
+    for part in parts[:-1]:
+        if part not in current or not isinstance(current[part], dict):
+            current[part] = {}
+        current = current[part]
+    current[parts[-1]] = value
+
+
+def load_toml_config(path: Path) -> dict[str, Any]:
+    """Read config.toml and return flat dict of HcomConfig field names -> values.
+
+    Includes terminal dangerous-char validation (rejects unsafe terminal values).
+    """
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        print(f"Warning: Failed to parse {path.name}: {exc} — using defaults", file=sys.stderr)
+        return {}
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError):
+        return {}
+
+    result: dict[str, Any] = {}
+    for field_name, toml_path in TOML_KEY_MAP.items():
+        val = _get_nested(raw, toml_path)
+        if val is not None:
+            result[field_name] = val
+
+    # Terminal dangerous-char validation
+    terminal_val = result.get("terminal")
+    if isinstance(terminal_val, str) and any(c in terminal_val for c in _TERMINAL_DANGEROUS_CHARS):
+        print(
+            f"Warning: Unsafe characters in terminal.active "
+            f"({', '.join(repr(c) for c in _TERMINAL_DANGEROUS_CHARS if c in terminal_val)}), "
+            f"ignoring custom terminal command",
+            file=sys.stderr,
+        )
+        del result["terminal"]
+
+    return result
+
+
+def _config_to_toml_dict(config: HcomConfig) -> dict[str, Any]:
+    """Convert HcomConfig to nested TOML-ready dict."""
+    import copy
+    toml_data = copy.deepcopy(DEFAULT_TOML)
+    for field_name, toml_path in TOML_KEY_MAP.items():
+        value = getattr(config, field_name)
+        _set_nested(toml_data, toml_path, value)
+    return toml_data
+
+
+def save_toml_config(config: HcomConfig, presets: dict[str, dict] | None = None) -> None:
+    """Write config.toml from HcomConfig. Optionally includes terminal presets."""
+    toml_data = _config_to_toml_dict(config)
+
+    # Merge terminal presets if provided
+    if presets:
+        toml_data.setdefault("terminal", {})["presets"] = presets
+
+    import tomli_w
+    content = TOML_HEADER + "\n" + tomli_w.dumps(toml_data)
+    toml_path = hcom_path(CONFIG_TOML, ensure_parent=True)
+    atomic_write(toml_path, content)
+
+    # Invalidate settings cache (presets may have changed)
+    from .settings import invalidate_settings_cache
+    invalidate_settings_cache()
+
+
+def _load_toml_presets(path: Path) -> dict[str, dict]:
+    """Load terminal presets from config.toml [terminal.presets.*] section."""
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError, ValueError):
+        return {}
+    terminal = raw.get("terminal", {})
+    if not isinstance(terminal, dict):
+        return {}
+    presets = terminal.get("presets", {})
+    return presets if isinstance(presets, dict) else {}
+
+
+# ==================== Env File I/O ====================
+
+ENV_HEADER = "# Env vars passed through to agents (e.g. ANTHROPIC_MODEL=...)\n"
+DEFAULT_ENV_VARS = ["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "GEMINI_MODEL"]
+
+
+def load_env_extras(path: Path) -> dict[str, str]:
+    """Load non-HCOM env vars from env file."""
+    if not path.exists():
+        return {}
+    result: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                # Ignore any HCOM_* keys that ended up in env file
+                if key and not key.startswith("HCOM_"):
+                    result[key] = parse_env_value(value)
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError):
+        pass
+    return result
+
+
+def _save_env_file(extras: dict[str, str]) -> None:
+    """Write env passthrough file (non-HCOM vars only)."""
+    env_path = hcom_path(ENV_FILE, ensure_parent=True)
+    lines = [ENV_HEADER]
+    # Always include default env var placeholders
+    all_keys = dict.fromkeys(DEFAULT_ENV_VARS)
+    all_keys.update(extras)
+    for key in all_keys:
+        if key.startswith("HCOM_"):
+            continue
+        value = extras.get(key, "")
+        formatted = format_env_value(value)
+        lines.append(f"{key}={formatted}" if formatted else f"{key}=")
+    content = "\n".join(lines) + "\n"
+    atomic_write(env_path, content)
+
+
+# ==================== Migration ====================
+
+
+def _migrate_config_env_to_toml() -> bool:
+    """Migrate config.env + settings.toml → config.toml + env.
+
+    Returns True if migration succeeded (or was unnecessary), False on failure.
+    Atomic: old files deleted only after both new files written successfully.
+    """
+    config_env_path = hcom_path(CONFIG_FILE)
+    if not config_env_path.exists():
+        return True  # Nothing to migrate
+
+    toml_path = hcom_path(CONFIG_TOML)
+    if toml_path.exists():
+        return True  # Already migrated
+
+    try:
+        # 1. Parse config.env — raw key=value only, NO validation.
+        # parse_env_file() validates terminal against presets from config.toml,
+        # but config.toml doesn't exist yet during migration.
+        file_config: dict[str, str] = {}
+        for line in config_env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key:
+                    file_config[key] = parse_env_value(value.strip())
+
+        # 2. Split HCOM_* vs non-HCOM
+        hcom_values: dict[str, str] = {}
+        env_extras: dict[str, str] = {}
+        for key, value in file_config.items():
+            if key.startswith("HCOM_"):
+                hcom_values[key] = value
+            else:
+                env_extras[key] = value
+
+        # 3. Normalize compat values
+        if hcom_values.get("HCOM_CODEX_SANDBOX_MODE") == "full-auto":
+            hcom_values["HCOM_CODEX_SANDBOX_MODE"] = "danger-full-access"
+        # Clear old default kickstart prompt
+        claude_args = hcom_values.get("HCOM_CLAUDE_ARGS", "")
+        if claude_args.strip().strip("'\"") == "say hi in hcom chat":
+            hcom_values["HCOM_CLAUDE_ARGS"] = ""
+
+        # 4. Build TOML data from HCOM_* values
+        import copy
+        toml_data = copy.deepcopy(DEFAULT_TOML)
+        for env_key, value in hcom_values.items():
+            field_name = _ENV_TO_FIELD.get(env_key)
+            if field_name and field_name in TOML_KEY_MAP:
+                toml_path_str = TOML_KEY_MAP[field_name]
+                # Convert types for TOML
+                default_val = _get_nested(DEFAULT_TOML, toml_path_str)
+                typed_val: bool | int | str
+                if isinstance(default_val, bool):
+                    typed_val = value not in ("0", "false", "False", "no", "off", "")
+                elif isinstance(default_val, int):
+                    try:
+                        typed_val = int(value)
+                    except (ValueError, TypeError):
+                        typed_val = value  # Let validation catch it
+                else:
+                    typed_val = value
+                _set_nested(toml_data, toml_path_str, typed_val)
+
+        # 5. Merge terminal presets from settings.toml
+        settings_path = hcom_path("settings.toml")
+        if settings_path.exists():
+            try:
+                settings_data = tomllib.loads(settings_path.read_text(encoding="utf-8"))
+                terminal_presets = settings_data.get("terminal", {})
+                if isinstance(terminal_presets, dict) and terminal_presets:
+                    toml_data.setdefault("terminal", {})["presets"] = terminal_presets
+            except Exception:
+                pass
+
+        # 6. Atomic write config.toml
+        import tomli_w
+        toml_content = TOML_HEADER + "\n" + tomli_w.dumps(toml_data)
+        toml_dest = hcom_path(CONFIG_TOML, ensure_parent=True)
+        if not atomic_write(toml_dest, toml_content):
+            return False
+
+        # 7. Atomic write env file (non-HCOM vars only, skip empty)
+        env_lines = [ENV_HEADER]
+        all_env_keys = dict.fromkeys(DEFAULT_ENV_VARS)
+        all_env_keys.update(env_extras)
+        for key in all_env_keys:
+            if key.startswith("HCOM_"):
+                continue
+            value = env_extras.get(key, "")
+            formatted = format_env_value(value)
+            env_lines.append(f"{key}={formatted}" if formatted else f"{key}=")
+        env_content = "\n".join(env_lines) + "\n"
+        env_dest = hcom_path(ENV_FILE, ensure_parent=True)
+        if not atomic_write(env_dest, env_content):
+            # Rollback: remove config.toml since env write failed
+            try:
+                toml_dest.unlink()
+            except Exception:
+                pass
+            return False
+
+        # 8. Delete old files only after both writes succeed
+        try:
+            config_env_path.unlink()
+        except Exception:
+            pass
+        try:
+            if settings_path.exists():
+                settings_path.unlink()
+        except Exception:
+            pass
+
+        return True
+
+    except Exception as exc:
+        from .log import log_warn
+        log_warn("config", "migration_failed", f"Failed to migrate config.env to config.toml: {exc}")
+        return False
 
 
 # ==================== Config Error ====================
@@ -69,7 +405,7 @@ class HcomConfigError(ValueError):
 
 @dataclass
 class HcomConfig:
-    """HCOM configuration with validation. Load priority: env → file → defaults"""
+    """HCOM configuration with validation. Load priority: env → config.toml → defaults"""
 
     timeout: int = 86400  # Idle timeout - 24hr since last activity (CC hook max)
     subagent_timeout: int = 30
@@ -84,6 +420,7 @@ class HcomConfig:
     gemini_system_prompt: str = ""
     codex_system_prompt: str = ""
     relay: str = ""
+    relay_id: str = ""
     relay_token: str = ""
     relay_enabled: bool = True
     auto_approve: bool = True
@@ -228,9 +565,13 @@ class HcomConfig:
                 f"codex_sandbox_mode must be one of {valid_sandbox_modes}, got '{self.codex_sandbox_mode}'",
             )
 
-        # Validate relay (optional string - URL)
+        # Validate relay (optional string - MQTT broker URL)
         if not isinstance(self.relay, str):
             set_error("relay", f"relay must be a string, got {type(self.relay).__name__}")
+
+        # Validate relay_id (optional string - UUID for topic namespacing)
+        if not isinstance(self.relay_id, str):
+            set_error("relay_id", f"relay_id must be a string, got {type(self.relay_id).__name__}")
 
         # Validate relay_token (optional string)
         if not isinstance(self.relay_token, str):
@@ -273,137 +614,102 @@ class HcomConfig:
 
     @classmethod
     def load(cls) -> "HcomConfig":
-        """Load config with precedence: env var → file → defaults"""
-        # Ensure config file exists
-        config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
-        if not config_path.exists():
-            _write_default_config(config_path)
+        """Load config with precedence: env var → config.toml → defaults"""
+        toml_path = hcom_path(CONFIG_TOML, ensure_parent=True)
 
-        # Parse config file once
-        file_config = parse_env_file(config_path) if config_path.exists() else {}
+        if not toml_path.exists():
+            # Try migration from config.env
+            config_env_path = hcom_path(CONFIG_FILE)
+            if config_env_path.exists():
+                _migrate_config_env_to_toml()
+            # If still missing (migration failed or no old file), write defaults
+            if not toml_path.exists():
+                _write_default_config()
 
-        def get_var(key: str) -> str | None:
-            """Get variable with precedence: env → file"""
-            if key in os.environ:
-                return os.environ[key]
-            if key in file_config:
-                return file_config[key]
+        # Parse config.toml
+        file_config = load_toml_config(toml_path) if toml_path.exists() else {}
+
+        def get_var(field: str) -> Any | None:
+            """Get variable with precedence: env → file. Returns None if not set."""
+            env_key = _FIELD_TO_ENV.get(field)
+            # Relay fields are file-only (no env override)
+            if env_key and field not in _RELAY_FIELDS and env_key in os.environ:
+                return os.environ[env_key]
+            if field in file_config:
+                return file_config[field]
             return None
 
         data: dict[str, Any] = {}
 
-        # Load timeout (requires int conversion)
-        timeout_str = get_var("HCOM_TIMEOUT")
-        if timeout_str is not None and timeout_str != "":
-            try:
-                data["timeout"] = int(timeout_str)
-            except (ValueError, TypeError):
-                from .log import log_warn
-                log_warn("config", "invalid_timeout",
-                        f"HCOM_TIMEOUT='{timeout_str}' is not a valid integer, using default")
+        # Load integer fields
+        for int_field in ("timeout", "subagent_timeout"):
+            val = get_var(int_field)
+            if val is not None:
+                if isinstance(val, int) and not isinstance(val, bool):
+                    data[int_field] = val
+                elif isinstance(val, str) and val != "":
+                    try:
+                        data[int_field] = int(val)
+                    except (ValueError, TypeError):
+                        from .log import log_warn
+                        env_key = _FIELD_TO_ENV[int_field]
+                        log_warn("config", f"invalid_{int_field}",
+                                f"{env_key}='{val}' is not a valid integer, using default")
 
-        # Load subagent_timeout (requires int conversion)
-        subagent_timeout_str = get_var("HCOM_SUBAGENT_TIMEOUT")
-        if subagent_timeout_str is not None and subagent_timeout_str != "":
-            try:
-                data["subagent_timeout"] = int(subagent_timeout_str)
-            except (ValueError, TypeError):
-                from .log import log_warn
-                log_warn("config", "invalid_subagent_timeout",
-                        f"HCOM_SUBAGENT_TIMEOUT='{subagent_timeout_str}' is not a valid integer, using default")
+        # Load string fields
+        for str_field in (
+            "terminal", "hints", "notes", "tag",
+            "claude_args", "gemini_args", "codex_args",
+            "codex_sandbox_mode", "gemini_system_prompt", "codex_system_prompt",
+            "auto_subscribe", "name_export",
+        ):
+            val = get_var(str_field)
+            if val is not None:
+                str_val = str(val)
+                # terminal and codex_sandbox_mode: skip empty (use default)
+                if str_field in ("terminal", "codex_sandbox_mode") and str_val == "":
+                    continue
+                # Normalize legacy sandbox mode value
+                if str_field == "codex_sandbox_mode" and str_val == "full-auto":
+                    str_val = "danger-full-access"
+                data[str_field] = str_val
 
-        # Load string values
-        terminal = get_var("HCOM_TERMINAL")
-        if terminal is not None and terminal != "":  # Empty → uses default
-            data["terminal"] = terminal
-        hints = get_var("HCOM_HINTS")
-        if hints is not None:  # Allow empty string for hints (valid value)
-            data["hints"] = hints
-        notes = get_var("HCOM_NOTES")
-        if notes is not None:
-            data["notes"] = notes
-        tag = get_var("HCOM_TAG")
-        if tag is not None:  # Allow empty string for tag (valid value)
-            data["tag"] = tag
-        claude_args = get_var("HCOM_CLAUDE_ARGS")
-        if claude_args is not None:  # Allow empty string for claude_args (valid value)
-            data["claude_args"] = claude_args
-        gemini_args = get_var("HCOM_GEMINI_ARGS")
-        if gemini_args is not None:  # Allow empty string for gemini_args (valid value)
-            data["gemini_args"] = gemini_args
-        codex_args = get_var("HCOM_CODEX_ARGS")
-        if codex_args is not None:  # Allow empty string for codex_args (valid value)
-            data["codex_args"] = codex_args
-        codex_sandbox_mode = get_var("HCOM_CODEX_SANDBOX_MODE")
-        if codex_sandbox_mode is not None and codex_sandbox_mode != "":
-            if codex_sandbox_mode == "full-auto":
-                codex_sandbox_mode = "danger-full-access"
-            data["codex_sandbox_mode"] = codex_sandbox_mode
-        gemini_system_prompt = get_var("HCOM_GEMINI_SYSTEM_PROMPT")
-        if gemini_system_prompt is not None:
-            data["gemini_system_prompt"] = gemini_system_prompt
-        codex_system_prompt = get_var("HCOM_CODEX_SYSTEM_PROMPT")
-        if codex_system_prompt is not None:
-            data["codex_system_prompt"] = codex_system_prompt
+        # Load boolean fields
+        for bool_field in ("relay_enabled", "auto_approve"):
+            val = get_var(bool_field)
+            if val is not None:
+                if isinstance(val, bool):
+                    data[bool_field] = val
+                elif isinstance(val, str):
+                    data[bool_field] = val not in ("0", "false", "False", "no", "off", "")
 
-        # Load relay string values
-        relay = get_var("HCOM_RELAY")
-        if relay is not None:  # Allow empty string for relay (valid value - means disabled)
-            data["relay"] = relay
-        relay_token = get_var("HCOM_RELAY_TOKEN")
-        if relay_token is not None:  # Allow empty string for token (valid value)
-            data["relay_token"] = relay_token
-
-        # Load relay_enabled (boolean - "0" or "1", default True)
-        relay_enabled_str = get_var("HCOM_RELAY_ENABLED")
-        if relay_enabled_str is not None:
-            data["relay_enabled"] = relay_enabled_str not in (
-                "0",
-                "false",
-                "False",
-                "no",
-                "off",
-                "",
-            )
-
-        # Load auto_approve (boolean - "0" or "1", default True)
-        auto_approve_str = get_var("HCOM_AUTO_APPROVE")
-        if auto_approve_str is not None:
-            data["auto_approve"] = auto_approve_str not in (
-                "0",
-                "false",
-                "False",
-                "no",
-                "off",
-                "",
-            )
-
-        # Load auto_subscribe (comma-separated preset names)
-        auto_subscribe = get_var("HCOM_AUTO_SUBSCRIBE")
-        if auto_subscribe is not None:  # Allow empty string (disables auto-subscribe)
-            data["auto_subscribe"] = auto_subscribe
-
-        # Load name_export (export instance name to custom env var)
-        name_export = get_var("HCOM_NAME_EXPORT")
-        if name_export is not None:  # Allow empty string (disables export)
-            data["name_export"] = name_export
+        # Load relay string fields (file-only, already handled by get_var)
+        for relay_field in ("relay", "relay_id", "relay_token"):
+            val = get_var(relay_field)
+            if val is not None:
+                data[relay_field] = str(val)
 
         return cls(**data)  # Validation happens in __post_init__
 
 
 def get_config_sources() -> dict[str, str]:
-    """Get source of each config value: 'env', 'file', or 'default'."""
-    config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
-    file_config = parse_env_file(config_path) if config_path.exists() else {}
+    """Get source of each config value: 'env', 'toml', or 'default'."""
+    toml_path = hcom_path(CONFIG_TOML, ensure_parent=True)
+    file_config = load_toml_config(toml_path) if toml_path.exists() else {}
 
     sources = {}
-    for key in KNOWN_CONFIG_KEYS:
-        if key in os.environ:
-            sources[key] = "env"
-        elif key in file_config:
-            sources[key] = "file"
+    for env_key in KNOWN_CONFIG_KEYS:
+        field = _ENV_TO_FIELD.get(env_key)
+        if not field:
+            sources[env_key] = "default"
+            continue
+        # Relay fields are file-only
+        if field not in _RELAY_FIELDS and env_key in os.environ:
+            sources[env_key] = "env"
+        elif field in file_config:
+            sources[env_key] = "toml"
         else:
-            sources[key] = "default"
+            sources[env_key] = "default"
     return sources
 
 
@@ -436,6 +742,7 @@ def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
         "HCOM_GEMINI_SYSTEM_PROMPT": config.gemini_system_prompt,
         "HCOM_CODEX_SYSTEM_PROMPT": config.codex_system_prompt,
         "HCOM_RELAY": config.relay,
+        "HCOM_RELAY_ID": config.relay_id,
         "HCOM_RELAY_TOKEN": config.relay_token,
         "HCOM_RELAY_ENABLED": "1" if config.relay_enabled else "0",
         "HCOM_AUTO_APPROVE": "1" if config.auto_approve else "0",
@@ -458,7 +765,6 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
             except ValueError:
                 errors["timeout"] = f"timeout must be an integer, got '{timeout_raw}'"
         else:
-            # Explicit empty string is an error (can't be blank)
             errors["timeout"] = "timeout cannot be empty (must be 1-86400 seconds)"
 
     subagent_raw = data.get("HCOM_SUBAGENT_TIMEOUT")
@@ -470,7 +776,6 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
             except ValueError:
                 errors["subagent_timeout"] = f"subagent_timeout must be an integer, got '{subagent_raw}'"
         else:
-            # Explicit empty string is an error (can't be blank)
             errors["subagent_timeout"] = "subagent_timeout cannot be empty (must be positive integer)"
 
     terminal_val = data.get("HCOM_TERMINAL")
@@ -479,7 +784,6 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
         if stripped:
             kwargs["terminal"] = stripped
         else:
-            # Explicit empty string is an error (can't be blank)
             errors["terminal"] = "terminal cannot be empty (must be: default, preset name, or custom command)"
 
     # Optional fields - allow empty strings
@@ -496,16 +800,16 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
     if "HCOM_CODEX_ARGS" in data:
         kwargs["codex_args"] = data["HCOM_CODEX_ARGS"]
     if "HCOM_CODEX_SANDBOX_MODE" in data:
-        codex_sandbox_mode = data["HCOM_CODEX_SANDBOX_MODE"]
-        if codex_sandbox_mode == "full-auto":
-            codex_sandbox_mode = "danger-full-access"
-        kwargs["codex_sandbox_mode"] = codex_sandbox_mode
+        val = data["HCOM_CODEX_SANDBOX_MODE"]
+        kwargs["codex_sandbox_mode"] = "danger-full-access" if val == "full-auto" else val
     if "HCOM_GEMINI_SYSTEM_PROMPT" in data:
         kwargs["gemini_system_prompt"] = data["HCOM_GEMINI_SYSTEM_PROMPT"]
     if "HCOM_CODEX_SYSTEM_PROMPT" in data:
         kwargs["codex_system_prompt"] = data["HCOM_CODEX_SYSTEM_PROMPT"]
     if "HCOM_RELAY" in data:
         kwargs["relay"] = data["HCOM_RELAY"]
+    if "HCOM_RELAY_ID" in data:
+        kwargs["relay_id"] = data["HCOM_RELAY_ID"]
     if "HCOM_RELAY_TOKEN" in data:
         kwargs["relay_token"] = data["HCOM_RELAY_TOKEN"]
     if "HCOM_RELAY_ENABLED" in data:
@@ -540,30 +844,41 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
 
 
 def load_config_snapshot() -> ConfigSnapshot:
-    """Load config.env into structured snapshot (file contents only)."""
-    config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
-    if not config_path.exists():
-        _write_default_config(config_path)
+    """Load config.toml + env into structured snapshot (file contents only, no env overrides)."""
+    toml_path = hcom_path(CONFIG_TOML, ensure_parent=True)
+    if not toml_path.exists():
+        # Try migration, then write defaults
+        config_env_path = hcom_path(CONFIG_FILE)
+        if config_env_path.exists():
+            _migrate_config_env_to_toml()
+        if not toml_path.exists():
+            _write_default_config()
 
-    file_values = parse_env_file(config_path)
+    # Load TOML config values
+    file_config = load_toml_config(toml_path) if toml_path.exists() else {}
 
-    extras: dict[str, str] = {k: v for k, v in _HEADER_DEFAULT_EXTRAS.items()}
+    # Build raw_core dict (HCOM_* keys) from TOML values
+    defaults = _get_default_known_values()
     raw_core: dict[str, str] = {}
-
-    for key in KNOWN_CONFIG_KEYS:
-        if key in file_values:
-            raw_core[key] = file_values.pop(key)
+    for env_key in KNOWN_CONFIG_KEYS:
+        field = _ENV_TO_FIELD.get(env_key)
+        if field and field in file_config:
+            val = file_config[field]
+            if isinstance(val, bool):
+                raw_core[env_key] = "1" if val else "0"
+            else:
+                raw_core[env_key] = str(val)
         else:
-            raw_core[key] = DEFAULT_KNOWN_VALUES.get(key, "")
+            raw_core[env_key] = defaults.get(env_key, "")
 
-    for key, value in file_values.items():
-        extras[key] = value
+    # Load env extras (non-HCOM passthrough vars)
+    env_path = hcom_path(ENV_FILE)
+    extras = load_env_extras(env_path)
 
     try:
         core = dict_to_hcom_config(raw_core)
     except HcomConfigError as exc:
         core = HcomConfig()
-        # Keep raw values so the UI can surface issues; log once for CLI users.
         if exc.errors:
             print(exc, file=sys.stderr)
 
@@ -577,38 +892,15 @@ def load_config_snapshot() -> ConfigSnapshot:
 
 
 def save_config_snapshot(snapshot: ConfigSnapshot) -> None:
-    """Write snapshot to config.env in canonical form."""
-    config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
+    """Write snapshot: core → config.toml, extras → env file."""
+    # Load existing presets to preserve them
+    toml_path = hcom_path(CONFIG_TOML, ensure_parent=True)
+    existing_presets = _load_toml_presets(toml_path) if toml_path.exists() else {}
 
-    lines: list[str] = list(_HEADER_COMMENT_LINES)
-    if lines and lines[-1] != "":
-        lines.append("")
+    save_toml_config(snapshot.core, presets=existing_presets or None)
 
-    core_values = hcom_config_to_dict(snapshot.core)
-    for entry in DEFAULT_CONFIG_DEFAULTS:
-        key, _, _ = entry.partition("=")
-        key = key.strip()
-        value = core_values.get(key, "")
-        formatted = format_env_value(value)
-        if formatted:
-            lines.append(f"{key}={formatted}")
-        else:
-            lines.append(f"{key}=")
-
-    extras = {**_HEADER_DEFAULT_EXTRAS, **snapshot.extras}
-    for key in KNOWN_CONFIG_KEYS:
-        extras.pop(key, None)
-
-    if extras:
-        if lines and lines[-1] != "":
-            lines.append("")
-        for key in sorted(extras.keys()):
-            value = extras[key]
-            formatted = format_env_value(value)
-            lines.append(f"{key}={formatted}" if formatted else f"{key}=")
-
-    content = "\n".join(lines) + "\n"
-    atomic_write(config_path, content)
+    # Write env extras
+    _save_env_file(snapshot.extras)
 
 
 def save_config(core: HcomConfig, extras: dict[str, str]) -> None:
@@ -620,13 +912,15 @@ def save_config(core: HcomConfig, extras: dict[str, str]) -> None:
 # ==================== Config File Writing ====================
 
 
-def _write_default_config(config_path: Path) -> None:
-    """Write default config file with documentation"""
+def _write_default_config() -> None:
+    """Write default config.toml + env file."""
     try:
-        content = "\n".join(DEFAULT_CONFIG_HEADER) + "\n" + "\n".join(DEFAULT_CONFIG_DEFAULTS) + "\n"
-        atomic_write(config_path, content)
-    except Exception:
-        pass
+        save_toml_config(HcomConfig())
+        # Write env file with placeholders
+        _save_env_file({})
+    except Exception as exc:
+        from .log import log_warn
+        log_warn("config", "default_config_write_failed", str(exc))
 
 
 # ==================== Global Config Cache ====================
@@ -677,4 +971,7 @@ def reload_config() -> HcomConfig:
     global _config_cache
     with _config_cache_lock:
         _config_cache = None
+    # Also clear settings/preset cache so new presets are picked up
+    from .settings import invalidate_settings_cache
+    invalidate_settings_cache()
     return get_config()

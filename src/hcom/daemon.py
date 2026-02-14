@@ -22,6 +22,7 @@ import os
 import signal
 import socket
 import socketserver
+import sqlite3
 import threading
 import time
 import traceback
@@ -264,21 +265,55 @@ def _log_error(event: str, error: Exception | str, msg: str = "", **fields) -> N
     log_error("daemon", event, error, msg, **fields)
 
 
+def _mqtt_reason(rc: object) -> str:
+    """Translate MQTT reason code to human-readable string.
+
+    Handles both int (paho v1) and ReasonCode object (paho v2).
+    """
+    # paho-mqtt v2 passes ReasonCode object - convert to int for dict lookup
+    rc_int = getattr(rc, "value", rc)
+    if not isinstance(rc_int, int):
+        return f"unknown ({rc})"
+    reasons = {
+        1: "unsupported protocol version",
+        2: "invalid client ID",
+        3: "server unavailable",
+        4: "bad username or password",
+        5: "not authorized",
+        128: "unspecified error",
+        132: "bad authentication method",
+        133: "topic name invalid",
+        135: "not authorized",
+        137: "server busy",
+        138: "banned",
+        140: "bad authentication method",
+        144: "topic filter invalid",
+        149: "packet too large",
+        153: "quota exceeded",
+        160: "connection rate exceeded",
+    }
+    return reasons.get(rc_int, f"unknown ({rc})")
+
+
 class RelayManager:
-    """Background relay worker (pull + push threads) for daemon."""
+    """Background MQTT relay worker for daemon.
+
+    Single paho-mqtt Client with loop_start() handles both receiving (on_message)
+    and publishing (push via client.publish()). A TCP notify server lets CLI
+    processes wake the push loop.
+    """
 
     def __init__(self, shutdown_event: threading.Event) -> None:
         self.shutdown_event = shutdown_event
         self.push_event = threading.Event()
         self.notify_server: socket.socket | None = None
-        self.pull_thread: threading.Thread | None = None
         self.push_thread: threading.Thread | None = None
+        self.mqtt_client: Any = None
 
     def start(self) -> None:
         self._setup_notify_server()
-        self.pull_thread = threading.Thread(target=self._pull_loop, daemon=True)
+        self._connect_mqtt()
         self.push_thread = threading.Thread(target=self._push_loop, daemon=True)
-        self.pull_thread.start()
         self.push_thread.start()
 
     def stop(self) -> None:
@@ -295,9 +330,191 @@ class RelayManager:
             except Exception:
                 pass
             self.notify_server = None
+        # Graceful MQTT disconnect: publish empty retained to own topic, then disconnect
+        if self.mqtt_client:
+            try:
+                from .relay import _get_relay_id, _state_topic
+                from .core.device import get_device_uuid
+
+                relay_id = _get_relay_id()
+                if relay_id:
+                    topic = _state_topic(relay_id, get_device_uuid())
+                    result = self.mqtt_client.publish(topic, b"", qos=1, retain=True)
+                    result.wait_for_publish(timeout=5)
+            except Exception:
+                pass
+            try:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+            except Exception:
+                pass
+            self.mqtt_client = None
         self.push_event.set()
 
+    def reconnect(self) -> None:
+        """Tear down MQTT client so push loop reconnects with fresh config."""
+        if self.mqtt_client:
+            try:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+            except Exception:
+                pass
+            self.mqtt_client = None
+        from .core.config import reload_config
+        reload_config()
+        # Push loop will see mqtt_client is None and call _connect_mqtt()
+        self.push_event.set()
+
+    def _connect_mqtt(self) -> None:
+        """Create and connect the MQTT client."""
+        from .relay import (
+            is_relay_enabled, _get_relay_id, _get_broker_address, _use_tls,
+            _state_topic, _wildcard_topic, _mark_as_relay_worker,
+            _set_relay_status, handle_mqtt_message,
+        )
+        from .core.device import get_device_uuid
+
+        if not is_relay_enabled():
+            return
+
+        relay_id = _get_relay_id()
+        if not relay_id:
+            return
+
+        try:
+            import paho.mqtt.client as mqtt
+            from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
+        except ImportError:
+            _log_error("relay.mqtt", "paho-mqtt not installed", "relay disabled")
+            return
+
+        device_uuid = get_device_uuid()
+        client_id = f"hcom-{device_uuid[:8]}"
+
+        # Try MQTT v5 first (needed for message_expiry_interval)
+        client = mqtt.Client(
+            CallbackAPIVersion.VERSION2,
+            client_id=client_id,
+            protocol=MQTTProtocolVersion.MQTTv5,
+        )
+
+        # Set LWT: empty retained payload on our state topic (clears state on ungraceful disconnect)
+        will_topic = _state_topic(relay_id, device_uuid)
+        client.will_set(will_topic, payload=b"", qos=1, retain=True)
+
+        # Callbacks
+        connected_event = threading.Event()
+
+        def on_connect(client, userdata, flags, reason_code, properties=None):
+            _mark_as_relay_worker()  # Mark paho's loop thread as relay worker
+            if reason_code != 0:
+                msg = f"connect refused: {_mqtt_reason(reason_code)}"
+                _set_relay_status("error", msg)
+                _log_error("relay.mqtt", msg)
+                connected_event.set()  # Unblock wait, but connection failed
+                return
+            client.subscribe(_wildcard_topic(relay_id), qos=1)
+            _set_relay_status("ok")
+            _log_info("relay.mqtt", "connected to broker")
+            connected_event.set()  # Unblock wait
+
+        def on_disconnect(client, userdata, flags, reason_code, properties=None):
+            # Paho's reconnect_delay_set(1, 60) handles auto-reconnect with backoff.
+            # No broker re-pinning — token must stay stable across devices.
+            _log_warn("relay.mqtt", f"on_disconnect: reason={_mqtt_reason(reason_code)}")
+            if reason_code != 0:
+                _set_relay_status("error", f"disconnected: {_mqtt_reason(reason_code)}")
+
+        def on_message(client, userdata, msg):
+            try:
+                handle_mqtt_message(msg.topic, msg.payload, relay_id)
+            except Exception as e:
+                _log_error("relay.on_message", e, f"topic={msg.topic}")
+
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        client.on_message = on_message
+
+        # Limit paho's internal queue to prevent unbounded memory during outages
+        client.max_queued_messages_set(100)
+        client.max_inflight_messages_set(20)
+        # Auto-reconnect with backoff
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+
+        # Determine broker
+        broker_addr = _get_broker_address()
+        if not broker_addr:
+            # No broker pinned — try fallback list
+            broker_addr = self._find_working_broker()
+            if not broker_addr:
+                _set_relay_status("error", "all brokers unreachable")
+                return
+
+        host, port = broker_addr
+
+        # TLS (auto-negotiates highest version)
+        if _use_tls(port):
+            client.tls_set()
+
+        # Auth (optional, for custom brokers)
+        from .core.config import get_config
+        config = get_config()
+        if config.relay_token:
+            client.username_pw_set(username="hcom", password=config.relay_token)
+
+        try:
+            client.connect(host, port, keepalive=60)
+            client.loop_start()
+            # Wait for CONNACK before returning - prevents push_loop race
+            if not connected_event.wait(timeout=5.0):
+                _log_warn("relay.mqtt", f"connect timeout: {host}:{port}")
+                _set_relay_status("error", "connect timeout")
+                try:
+                    client.loop_stop()
+                    client.disconnect()
+                except Exception:
+                    pass
+                return
+            # Check if on_connect reported failure
+            if not client.is_connected():
+                try:
+                    client.loop_stop()
+                    client.disconnect()
+                except Exception:
+                    pass
+                return
+            self.mqtt_client = client
+        except Exception as e:
+            _log_error("relay.mqtt", e, f"connect failed: {host}:{port}")
+            _set_relay_status("error", f"connect failed: {e}")
+
+    def _find_working_broker(self) -> tuple[str, int] | None:
+        """Try each public broker, pin the first that works. Returns (host, port) or None."""
+        from .relay import DEFAULT_BROKERS
+
+        for host, port in DEFAULT_BROKERS:
+            try:
+                # Brief test connection
+                import ssl as _ssl
+                test_sock = socket.create_connection((host, port), timeout=5)
+                ctx = _ssl.create_default_context()
+                test_sock = ctx.wrap_socket(test_sock, server_hostname=host)
+                test_sock.close()
+
+                # Pin this broker to config
+                from .core.config import load_config_snapshot, save_config_snapshot
+                snapshot = load_config_snapshot()
+                snapshot.core.relay = f"mqtts://{host}:{port}"
+                save_config_snapshot(snapshot)
+                _log_info("relay.mqtt", f"pinned broker: {host}:{port}")
+                return host, port
+            except Exception:
+                continue
+
+        return None
+
     def _setup_notify_server(self) -> None:
+        """TCP server for CLI→daemon push wake notifications."""
         try:
             from .core.db import kv_set
 
@@ -308,11 +525,12 @@ class RelayManager:
             self.notify_server.setblocking(False)
             relay_port = self.notify_server.getsockname()[1]
             kv_set("relay_daemon_port", str(relay_port))
-        except Exception as e:
+        except OSError as e:
             _log_error("relay.notify_server", e, "Failed to setup relay notification server")
             self.notify_server = None
 
     def _check_notify_server(self) -> None:
+        """Accept pending TCP notifications (non-blocking) and trigger push."""
         if not self.notify_server:
             return
         while True:
@@ -325,43 +543,98 @@ class RelayManager:
             except Exception:
                 break
 
-    def _pull_loop(self) -> None:
-        from .relay import is_relay_enabled, pull, push, _mark_as_relay_worker
+    def _wait_for_notify_or_timeout(self, timeout: float) -> bool:
+        """Wait for notify socket activity, push_event, or timeout.
 
-        _mark_as_relay_worker()
-        consecutive_failures = 0
+        Uses select() on the notify socket so we wake immediately when
+        a client connects (e.g. hcom send triggers notify_relay()).
+        Returns True if woken by notify/event, False on timeout.
+        """
+        import select as _select
+
+        deadline = time.time() + timeout
         while not self.shutdown_event.is_set():
-            if not is_relay_enabled():
-                consecutive_failures = 0
-                self.shutdown_event.wait(5.0)
-                continue
-            try:
-                push()
-                pull(timeout=25)
-                consecutive_failures = 0
-            except Exception as e:
-                consecutive_failures += 1
-                backoff = min(2 ** consecutive_failures, 30)
-                _log_error("relay.pull_loop", e, "Error in relay pull loop")
-                self.shutdown_event.wait(backoff)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            if self.push_event.is_set():
+                return True
+            # select() on notify socket — wakes on incoming TCP connection
+            wait_fds = [self.notify_server] if self.notify_server else []
+            ready, _, _ = _select.select(wait_fds, [], [], min(remaining, 1.0))
+            if ready:
+                self._check_notify_server()
+                return True
+        return False
 
     def _push_loop(self) -> None:
+        """Push state to MQTT when notified or periodically.
+
+        Drains backlog in a loop with a 10s time budget per wake cycle.
+        Re-queues push_event if budget exhausted with events remaining.
+        """
         from .relay import is_relay_enabled, push, _mark_as_relay_worker
 
         _mark_as_relay_worker()
+        _retry_backoff = 10.0  # seconds between reconnect attempts
         while not self.shutdown_event.is_set():
             if not is_relay_enabled():
                 self.push_event.clear()
                 self.shutdown_event.wait(1.0)
                 continue
+            if not self.mqtt_client:
+                # Initial connect failed or client lost — retry
+                _log_info("relay.push_loop", f"connecting (backoff={_retry_backoff:.0f}s)")
+                self._connect_mqtt()
+                if not self.mqtt_client:
+                    self.shutdown_event.wait(_retry_backoff)
+                    _retry_backoff = min(_retry_backoff * 2, 120.0)
+                    continue
+                _retry_backoff = 10.0  # reset on success
+                self.push_event.set()  # Drain backlog on fresh connect
             self._check_notify_server()
-            if not self.push_event.wait(timeout=0.1):
-                continue
+            # Wait for notify socket or periodic heartbeat (30s fallback)
+            if not self.push_event.is_set():
+                self._wait_for_notify_or_timeout(30.0)
             self.push_event.clear()
-            try:
-                push(force=True)
-            except Exception as e:
-                _log_error("relay.push_loop", e, "Error in relay push loop")
+            # Detect stale connection (e.g. after system sleep) — paho may not
+            # fire on_disconnect if the socket died silently.  Tear down so the
+            # next iteration rebuilds from scratch.
+            if self.mqtt_client and not self.mqtt_client.is_connected():
+                _log_warn("relay.push_loop", "is_connected()=False — forcing reconnect")
+                try:
+                    self.mqtt_client.loop_stop()
+                    self.mqtt_client.disconnect()
+                except Exception:
+                    pass
+                self.mqtt_client = None
+                continue
+            # Drain: push batches until empty, error, shutdown, or 10s budget
+            deadline = time.time() + 10.0
+            while not self.shutdown_event.is_set():
+                try:
+                    success, err, has_more = push(mqtt_client=self.mqtt_client)
+                    if not success:
+                        # Connection error — paho's is_connected() can lag behind
+                        # reality (e.g. after system sleep where TCP socket died
+                        # silently).  Force teardown so next iteration reconnects.
+                        if err and ("not connected" in err.lower() or "not currently" in err.lower()):
+                            _log_warn("relay.push_loop", f"publish failed ({err}) — forcing reconnect")
+                            try:
+                                self.mqtt_client.loop_stop()
+                                self.mqtt_client.disconnect()
+                            except Exception:
+                                pass
+                            self.mqtt_client = None
+                        break
+                    if not has_more:
+                        break
+                    if time.time() > deadline:
+                        self.push_event.set()  # Re-queue — more to drain
+                        break
+                except (OSError, sqlite3.Error) as e:
+                    _log_error("relay.push_loop", e, "Error in relay push loop")
+                    break
 
 
 class DaemonHandler(socketserver.StreamRequestHandler):
@@ -483,7 +756,7 @@ def dispatch_request(req: dict, request_id: str) -> dict:
     from .core.config import reload_config
     from .core.paths import clear_path_cache
 
-    # Re-read config.env and paths each request so config set takes effect without daemon restart
+    # Re-read config and paths each request so config set takes effect without daemon restart
     clear_path_cache()
     reload_config()
 
@@ -599,6 +872,17 @@ def handle_cli_request(
     from .cli import main_with_context
     from .core.hook_result import HookResult
 
+    # Snapshot relay config before relay commands so we can detect changes
+    relay_config_before = None
+    is_relay_cmd = len(argv) >= 1 and argv[0] == "relay"
+    if is_relay_cmd and _relay_manager:
+        try:
+            from .core.config import get_config
+            cfg = get_config()
+            relay_config_before = (cfg.relay_id, cfg.relay, cfg.relay_enabled)
+        except Exception:
+            pass
+
     # Set up thread-local capture buffers (stdin, stdout, stderr)
     stdout_capture = CaptureBuffer(is_tty=stdout_is_tty)
     stderr_capture = CaptureBuffer(is_tty=False)
@@ -608,6 +892,16 @@ def handle_cli_request(
 
     try:
         result = main_with_context(argv, ctx)
+        # Hot-reload relay if config changed (e.g. after relay new/connect/off)
+        if relay_config_before is not None and _relay_manager:
+            try:
+                from .core.config import get_config
+                cfg = get_config()
+                relay_config_after = (cfg.relay_id, cfg.relay, cfg.relay_enabled)
+                if relay_config_after != relay_config_before:
+                    _relay_manager.reconnect()
+            except Exception:
+                pass
         # Build HookResult from thread-local captured output
         return HookResult(
             exit_code=result.exit_code,
@@ -697,7 +991,7 @@ def _acquire_pidfile_lock(pid_path: Path, socket_path: Path):
         return _try_lock()
     except BlockingIOError:
         pass
-    except Exception as e:
+    except OSError as e:
         _log_error("daemon.lock_failed", e)
         return None
 
@@ -730,7 +1024,7 @@ def _acquire_pidfile_lock(pid_path: Path, socket_path: Path):
 
     try:
         return _try_lock()
-    except Exception as e:
+    except OSError as e:
         _log_error("daemon.lock_failed", f"Zombie recovery failed: {e}")
         return None
 

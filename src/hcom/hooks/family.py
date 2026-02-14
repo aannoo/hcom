@@ -28,12 +28,13 @@ Note:
 
 from __future__ import annotations
 from typing import Any
+import sqlite3
 import sys
 import time
 import socket
 
 from ..core.thread_context import get_background_name
-from ..shared import MAX_MESSAGES_PER_DELIVERY
+from ..shared import MAX_MESSAGES_PER_DELIVERY, ST_ACTIVE, ST_LISTENING
 from ..core.instances import (
     load_instance_position,
     update_instance_position,
@@ -92,7 +93,7 @@ def _setup_tcp_notification(instance_name: str) -> tuple[socket.socket | None, b
         notify_server.setblocking(False)
 
         return (notify_server, True)
-    except Exception as e:
+    except OSError as e:
         log_error("hooks", "hook.error", e, hook="tcp_notification", instance=instance_name)
         return (None, False)
 
@@ -143,7 +144,7 @@ def poll_messages(
         if notify_server:
             try:
                 notify_port = notify_server.getsockname()[1]
-            except Exception:
+            except OSError:
                 # getsockname failed - close socket and fall back to polling
                 try:
                     notify_server.close()
@@ -159,7 +160,7 @@ def poll_messages(
                 from ..core.db import upsert_notify_endpoint
 
                 upsert_notify_endpoint(instance_id, "hook", int(notify_port))
-            except Exception as e:
+            except sqlite3.Error as e:
                 log_error(
                     "hooks",
                     "hook.error",
@@ -184,7 +185,7 @@ def poll_messages(
             tcp_mode=tcp_mode,
             has_notify_port=bool(notify_port),
         )
-        set_status(instance_id, "listening")
+        set_status(instance_id, ST_LISTENING)
         # Verify status was set
         verify_data = load_instance_position(instance_id)
         log_info(
@@ -236,7 +237,7 @@ def poll_messages(
 
                     set_status(
                         instance_id,
-                        "active",
+                        ST_ACTIVE,
                         f"deliver:{get_display_name(deliver_messages[0]['from'])}",
                         msg_ts=deliver_messages[-1]["timestamp"],
                     )

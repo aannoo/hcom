@@ -33,7 +33,7 @@ messages.py
     envelope fields (intent/thread/reply_to), and format helpers.
 
 config.py
-    Configuration with validation. Loads from env vars → config.env → defaults.
+    Configuration with validation. Loads from env vars → config.toml → defaults.
     HcomConfig dataclass with comprehensive validation.
 
 bootstrap.py

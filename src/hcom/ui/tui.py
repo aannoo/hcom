@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Optional
 
@@ -76,10 +77,10 @@ from .colors import (
 
 # Import non-color constants from shared
 from ..shared import (
-    DEFAULT_CONFIG_HEADER,
     STATUS_ORDER,
     STATUS_BG_MAP,
     STATUS_FG,
+    HcomError,
     format_timestamp,
     get_status_counts,
     parse_iso_timestamp,
@@ -88,7 +89,7 @@ from ..tools.claude import resolve_claude_args
 from ..tools.gemini.args import resolve_gemini_args
 from ..tools.codex.args import resolve_codex_args
 from ..core.instances import get_instance_status
-from ..core.paths import hcom_path, ensure_hcom_directories
+from ..core.paths import hcom_path, ensure_hcom_directories, CONFIG_TOML, ENV_FILE
 from ..core.config import (
     reload_config,
     load_config_snapshot,
@@ -97,7 +98,7 @@ from ..core.config import (
     HcomConfigError,
 )
 from ..commands.lifecycle import cmd_stop
-from ..commands.admin import cmd_reset
+from ..commands.reset import cmd_reset
 
 # Import screens
 from .manage import ManageScreen
@@ -155,6 +156,7 @@ class HcomTUI:
         self.last_status_update = 0.0
         self.last_config_check = 0.0
         self.first_render = True
+        self.relay_text_until = 0.0  # Show "connected" text briefly on startup
 
         # Screen instances (pass state + self)
         self.manage_screen = ManageScreen(self.state, self)
@@ -241,7 +243,7 @@ class HcomTUI:
                     self.flash("Nothing to stop")
             else:
                 self.flash_error("Failed to stop")
-        except Exception as e:
+        except (HcomError, OSError) as e:
             self.flash_error(f"Error: {str(e)}")
 
     def reset_events(self):
@@ -260,13 +262,14 @@ class HcomTUI:
                 self.state.manage.messages = []
                 self.state.events.last_event_id = 0
                 self.state.manage.device_sync_times = {}  # Clear cached sync times
+                self.state.manage.device_short_ids = {}
                 # Reload to clear instance list from display
                 self.load_status()
                 archive_path = str(hcom_path("archive")) + "/"
                 self.flash(f"Logs and instance list archived to {archive_path}", duration=10.0)
             else:
                 self.flash_error("Failed to reset events")
-        except Exception as e:
+        except (HcomError, OSError) as e:
             self.flash_error(f"Error: {str(e)}")
 
     def run(self) -> int:
@@ -291,7 +294,7 @@ class HcomTUI:
         # Initialize
         ensure_hcom_directories()
 
-        # Load saved states (config.env first, then launch state reads from it)
+        # Load saved states (config.toml first, then launch state reads from it)
         self.load_config_from_file()
         self.load_launch_state()
 
@@ -454,39 +457,39 @@ class HcomTUI:
         else:
             self.state.archive_count = 0
 
-        # Load device sync times for remote instance pulse coloring
+        # Load device sync times and short IDs for remote device display
         try:
-            from ..core.db import get_db, kv_get
+            from ..relay import get_remote_devices
 
-            conn = get_db()
-            # Get unique remote device IDs
-            rows = conn.execute(
-                "SELECT DISTINCT origin_device_id FROM instances WHERE origin_device_id IS NOT NULL AND origin_device_id != ''"
-            ).fetchall()
             device_times = {}
-            for row in rows:
-                device_id = row["origin_device_id"]
-                ts = kv_get(f"relay_sync_time_{device_id}")
-                if ts:
-                    device_times[device_id] = float(ts)
+            device_short_ids = {}
+            for device_id, info in get_remote_devices().items():
+                if info["sync_time"]:
+                    device_times[device_id] = info["sync_time"]
+                device_short_ids[device_id] = info["short_id"]
             self.state.manage.device_sync_times = device_times
+            self.state.manage.device_short_ids = device_short_ids
         except Exception:
-            pass  # Keep existing sync times if query fails
+            pass  # Keep existing data if query fails
 
         # Load relay status for status bar indicator
         try:
             from ..relay import get_relay_status
 
             status = get_relay_status()
+            prev_status = self.state.relay.status
             self.state.relay.configured = status["configured"]
             self.state.relay.enabled = status["enabled"]
             self.state.relay.status = status["status"]
             self.state.relay.error = status["error"]
-        except Exception:
+            # Show "connected" text briefly on startup or when status transitions to ok
+            if status["status"] == "ok" and prev_status != "ok":
+                self.relay_text_until = time.time() + 5.0
+        except (OSError, sqlite3.Error):
             pass
 
     def save_launch_state(self):
-        """Save launch form values to config.env via args parsers.
+        """Save launch form values to config.toml via args parsers.
 
         IMPORTANT: All config_edit updates are done first, then a single
         save_config_to_file() call at the end. This avoids the reload loop where
@@ -559,11 +562,11 @@ class HcomTUI:
         self.state.config_edit["HCOM_GEMINI_SYSTEM_PROMPT"] = self.state.launch.gemini_system_prompt
         self.state.config_edit["HCOM_CODEX_SYSTEM_PROMPT"] = self.state.launch.codex_system_prompt
 
-        # Phase 2: Single write to config.env (triggers load_launch_state() AFTER all values are set)
+        # Phase 2: Single write to config.toml (triggers load_launch_state() AFTER all values are set)
         self.save_config_to_file()
 
     def load_launch_state(self):
-        """Load launch form values from config.env via tool args parsers"""
+        """Load launch form values from config.toml via tool args parsers"""
         # Validate Claude args from HCOM_CLAUDE_ARGS
         try:
             claude_args_str = self.state.config_edit.get("HCOM_CLAUDE_ARGS", "")
@@ -644,8 +647,8 @@ class HcomTUI:
         )
 
     def load_config_from_file(self, *, raise_on_error: bool = False):
-        """Load all vars from config.env into editable dict"""
-        config_path = hcom_path("config.env")
+        """Load all vars from config.toml + env into editable dict"""
+        config_path = hcom_path(CONFIG_TOML)
         try:
             snapshot = load_config_snapshot()
             combined: dict[str, str] = {}
@@ -653,30 +656,25 @@ class HcomTUI:
             combined.update(snapshot.extras)
             self.state.config_edit = combined
             self.state.launch.validation_errors.clear()
-            # Track mtime for external change detection
+            # Track mtime for external change detection (both config.toml and env)
             try:
                 self.state.config_mtime = config_path.stat().st_mtime
             except FileNotFoundError:
                 self.state.config_mtime = 0.0
+            try:
+                self.state.env_mtime = hcom_path(ENV_FILE).stat().st_mtime
+            except FileNotFoundError:
+                self.state.env_mtime = 0.0
             LaunchScreen.invalidate_defaults_cache()  # Clear cached defaults
-        except Exception as e:
+        except (OSError, tomllib.TOMLDecodeError) as e:
             if raise_on_error:
                 raise
-            sys.stderr.write(f"Warning: Failed to load config.env (using defaults): {e}\n")
+            sys.stderr.write(f"Warning: Failed to load config.toml (using defaults): {e}\n")
             self.state.config_edit = dict(CONFIG_DEFAULTS)
-            for line in DEFAULT_CONFIG_HEADER:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    key = key.strip()
-                    raw = value.strip()
-                    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
-                        raw = raw[1:-1]
-                    self.state.config_edit.setdefault(key, raw)
             self.state.config_mtime = 0.0
 
     def save_config_to_file(self):
-        """Write current config edits back to ~/.hcom/config.env using canonical writer."""
+        """Write current config edits back to config.toml + env using canonical writer."""
         known_values = {key: self.state.config_edit.get(key, "") for key in CONFIG_DEFAULTS.keys()}
         extras = {key: value for key, value in self.state.config_edit.items() if key not in CONFIG_DEFAULTS}
 
@@ -700,7 +698,7 @@ class HcomTUI:
             first_error = next(iter(self.state.launch.validation_errors.values()), "Invalid config")
             self.flash_error(first_error)
             return
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
             self.flash_error(f"Validation error: {exc}")
             return
 
@@ -715,18 +713,23 @@ class HcomTUI:
             reload_config()
             # Update relay status in UI state
             self.load_status()
-        except Exception as exc:
+        except OSError as exc:
             self.flash_error(f"Save failed: {exc}")
 
     def check_external_config_changes(self):
-        """Reload config.env if changed on disk, preserving active edits."""
-        config_path = hcom_path("config.env")
+        """Reload config if changed on disk (config.toml or env), preserving active edits."""
+        config_path = hcom_path(CONFIG_TOML)
+        env_path = hcom_path(ENV_FILE)
         try:
-            mtime = config_path.stat().st_mtime
+            config_mtime = config_path.stat().st_mtime
         except FileNotFoundError:
-            return
+            config_mtime = 0.0
+        try:
+            env_mtime = env_path.stat().st_mtime
+        except FileNotFoundError:
+            env_mtime = 0.0
 
-        if mtime <= self.state.config_mtime:
+        if config_mtime <= self.state.config_mtime and env_mtime <= self.state.env_mtime:
             return  # No change
 
         # Save what's currently being edited
@@ -742,14 +745,18 @@ class HcomTUI:
             reload_config()  # Refresh runtime cache
             LaunchScreen.invalidate_defaults_cache()  # Clear cached defaults
         except Exception as exc:
-            self.flash_error(f"Failed to reload config.env: {exc}")
+            self.flash_error(f"Failed to reload config.toml: {exc}")
             return
 
-        # Update mtime
+        # Update mtimes
         try:
             self.state.config_mtime = config_path.stat().st_mtime
         except FileNotFoundError:
             self.state.config_mtime = 0.0
+        try:
+            self.state.env_mtime = env_path.stat().st_mtime
+        except FileNotFoundError:
+            self.state.env_mtime = 0.0
 
         self.state.frame_dirty = True
 
@@ -766,7 +773,7 @@ class HcomTUI:
 
     def resolve_editor_command(self) -> tuple[list[str] | None, str | None]:
         """Resolve preferred editor command and display label for config edits."""
-        config_path = hcom_path("config.env")
+        config_path = hcom_path(CONFIG_TOML)
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
         pretty_names = {
             "code": "VS Code",
@@ -801,7 +808,7 @@ class HcomTUI:
         return None, None
 
     def open_config_in_editor(self):
-        """Open config.env in the resolved editor."""
+        """Open config.toml in the resolved editor."""
         cmd, label = self.resolve_editor_command()
         if not cmd:
             self.flash_error("No external editor found")
@@ -812,7 +819,7 @@ class HcomTUI:
 
         try:
             subprocess.Popen(cmd)
-            self.flash(f"Opening config.env in {label or 'VS Code'}...")
+            self.flash(f"Opening config.toml in {label or 'VS Code'}...")
         except Exception as exc:
             self.flash_error(f"Failed to launch {label or 'editor'}: {exc}")
 
@@ -997,14 +1004,18 @@ class HcomTUI:
             if self.state.relay.status == "error":
                 icon = f"{FG_RED}⇄{RESET}"
                 err = self.state.relay.error
-                relay_indicator = f" {icon} {err}" if err else f" {icon}"
+                relay_indicator = f"  {icon} {err}" if err else f"  {icon}"
             elif self.state.relay.status == "ok":
                 icon = f"{FG_GREEN}⇄{RESET}"
-                relay_indicator = f" {icon}"
+                # Show "relay connected" text briefly after connect
+                if time.time() < self.relay_text_until:
+                    relay_indicator = f"  {icon} {FG_GREEN}relay connected{RESET}"
+                else:
+                    relay_indicator = f"  {icon}"
             else:
                 # Never connected yet
                 icon = f"{FG_GRAY}⇄{RESET}"
-                relay_indicator = f" {icon}"
+                relay_indicator = f"  {icon}"
 
         return f"{BOLD}hcom{RESET} {tab_display}{relay_indicator}{path_indicator}"
 

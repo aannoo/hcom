@@ -12,15 +12,6 @@ from __future__ import annotations
 from ..shared import termux_shebang_bypass, TERMUX_NODE_PATH
 
 
-# ==================== Ready Patterns ====================
-
-# Ready patterns for PTY detection (visible when tool TUI has loaded)
-GEMINI_READY_PATTERN = b"Type your message"
-CLAUDE_READY_PATTERN = b"? for shortcuts"
-CODEX_READY_PATTERN = b"\xe2\x80\xba "  # › (U+203A) prompt — always visible, unlike "? for shortcuts" which is dropped in narrow terminals
-CLAUDE_CODEX_READY_PATTERN = CLAUDE_READY_PATTERN  # Back-compat alias
-
-
 # ==================== Terminal Title ====================
 
 
@@ -57,9 +48,6 @@ __all__ = [
     "TERMUX_NODE_PATH",
     # Terminal title
     "set_terminal_title",
-    # Magic strings
-    "GEMINI_READY_PATTERN",
-    "CLAUDE_CODEX_READY_PATTERN",
     # Message preview
     "PREVIEW_MAX_LEN",
     "build_message_preview",

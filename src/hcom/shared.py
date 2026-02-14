@@ -9,9 +9,9 @@ import re
 import os
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
-__version__ = "0.6.18"
+__version__ = "0.6.19"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"
@@ -289,19 +289,28 @@ BOX_H = "─"
 # Status values stored directly in instance files (no event mapping)
 # Row exists = participating (no separate enabled field)
 
+# Status name constants — use these instead of raw strings.
+# Rust delivery.rs and db.rs also use these values (see source-of-truth comments there).
+ST_ACTIVE: Final = "active"
+ST_LISTENING: Final = "listening"
+ST_BLOCKED: Final = "blocked"
+ST_INACTIVE: Final = "inactive"
+ST_LAUNCHING: Final = "launching"
+ST_ERROR: Final = "error"
+
 # Valid status values
-# 'listening' is special: heartbeat-proven current (refreshed every ~30s)
+# ST_LISTENING is special: heartbeat-proven current (refreshed every ~30s)
 # Other statuses are event-based (show time since last update)
-STATUS_VALUES = ["active", "listening", "blocked", "launching", "error", "inactive"]
+STATUS_VALUES = [ST_ACTIVE, ST_LISTENING, ST_BLOCKED, ST_LAUNCHING, ST_ERROR, ST_INACTIVE]
 
 # Status icons
 STATUS_ICONS = {
-    "active": "▶",
-    "listening": "◉",
-    "blocked": "■",
-    "launching": "◎",
-    "error": "✗",
-    "inactive": "○",
+    ST_ACTIVE: "▶",
+    ST_LISTENING: "◉",
+    ST_BLOCKED: "■",
+    ST_LAUNCHING: "◎",
+    ST_ERROR: "✗",
+    ST_INACTIVE: "○",
 }
 
 # Adhoc instance icon (neutral - not claiming alive or dead)
@@ -309,12 +318,12 @@ ADHOC_ICON = "◦"
 
 # Status colors (foreground)
 STATUS_COLORS = {
-    "active": FG_GREEN,
-    "listening": FG_BLUE,
-    "blocked": FG_RED,
-    "launching": FG_YELLOW,
-    "error": FG_RED,
-    "inactive": FG_GRAY,
+    ST_ACTIVE: FG_GREEN,
+    ST_LISTENING: FG_BLUE,
+    ST_BLOCKED: FG_RED,
+    ST_LAUNCHING: FG_YELLOW,
+    ST_ERROR: FG_RED,
+    ST_INACTIVE: FG_GRAY,
 }
 
 # STATUS_MAP for watch command (foreground color, icon)
@@ -322,72 +331,22 @@ STATUS_MAP = {status: (STATUS_COLORS[status], STATUS_ICONS[status]) for status i
 
 # Background colors for statusline display blocks
 STATUS_BG_COLORS = {
-    "active": BG_GREEN,
-    "listening": BG_BLUE,
-    "blocked": BG_RED,
-    "launching": BG_YELLOW,
-    "error": BG_RED,
-    "inactive": BG_GRAY,
+    ST_ACTIVE: BG_GREEN,
+    ST_LISTENING: BG_BLUE,
+    ST_BLOCKED: BG_RED,
+    ST_LAUNCHING: BG_YELLOW,
+    ST_ERROR: BG_RED,
+    ST_INACTIVE: BG_GRAY,
 }
 
 # Background color map for TUI statusline (background color, icon)
 STATUS_BG_MAP = {status: (STATUS_BG_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES}
 
 # Display order (priority-based sorting)
-STATUS_ORDER = ["active", "listening", "blocked", "error", "launching", "inactive"]
+STATUS_ORDER = [ST_ACTIVE, ST_LISTENING, ST_BLOCKED, ST_ERROR, ST_LAUNCHING, ST_INACTIVE]
 
 # TUI-specific (alias for STATUS_COLORS)
 STATUS_FG = STATUS_COLORS
-
-# ===== Default Config =====
-DEFAULT_CONFIG_HEADER = [
-    "# HCOM Configuration",
-    "#",
-    "# All HCOM_* settings (and any env var ie. Claude Code settings)",
-    "# can be set here or via environment variables.",
-    "# Environment variables and cli args override config file values.",
-    "# Put each value on separate lines without comments.",
-    "#",
-    "# HCOM settings:",
-    "#   HCOM_SUBAGENT_TIMEOUT - seconds before disconnecting idle subagents (default: 30)",
-    '#   HCOM_TERMINAL - Terminal mode: "default", preset name, or custom command with {script}',
-    "#   HCOM_HINTS - Text appended to all messages received by instances",
-    "#   HCOM_NOTES - One-time notes appended to bootstrap (system context at startup)",
-    "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
-    "#   HCOM_AUTO_SUBSCRIBE - Comma-separated event presets: collision, created, stopped, blocked",
-    "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet --agent reviewer')",
-    "#   HCOM_GEMINI_ARGS - Default Gemini args (e.g., '--model gemini-2.5-flash --yolo')",
-    "#   HCOM_CODEX_ARGS - Default Codex args (e.g., '--sandbox danger-full-access')",
-    "#   HCOM_RELAY - Cross-device relay server URL (optional)",
-    "#   HCOM_RELAY_TOKEN - Auth token for relay server (optional)",
-    "#   HCOM_RELAY_ENABLED - Enable/disable relay sync (default: 1 if URL set)",
-    "#   HCOM_AUTO_APPROVE - Auto-approve safe hcom commands (default: 1)",
-    "#   HCOM_NAME_EXPORT - Export instance name to this env var in launched instances",
-    "#",
-    "ANTHROPIC_MODEL=",
-    "CLAUDE_CODE_SUBAGENT_MODEL=",
-    "GEMINI_MODEL=",
-]
-
-DEFAULT_CONFIG_DEFAULTS = [
-    "HCOM_TAG=",
-    "HCOM_HINTS=",
-    "HCOM_NOTES=",
-    "HCOM_SUBAGENT_TIMEOUT=30",
-    "HCOM_TERMINAL=default",
-    "HCOM_AUTO_SUBSCRIBE=collision",
-    r'''HCOM_CLAUDE_ARGS="'say hi in hcom chat'"''',
-    "HCOM_GEMINI_ARGS=",
-    "HCOM_CODEX_ARGS=",
-    "HCOM_CODEX_SANDBOX_MODE=workspace",
-    "HCOM_GEMINI_SYSTEM_PROMPT=",
-    "HCOM_CODEX_SYSTEM_PROMPT=",
-    "HCOM_RELAY=",
-    "HCOM_RELAY_TOKEN=",
-    "HCOM_RELAY_ENABLED=1",
-    "HCOM_AUTO_APPROVE=1",
-    "HCOM_NAME_EXPORT=",
-]
 
 # ===== Terminal Presets =====
 # Each preset: {binary, open, close, platforms}
@@ -838,6 +797,13 @@ __all__ = [
     "HIDE_CURSOR",
     "SHOW_CURSOR",
     "BOX_H",
+    # Status name constants
+    "ST_ACTIVE",
+    "ST_LISTENING",
+    "ST_BLOCKED",
+    "ST_INACTIVE",
+    "ST_LAUNCHING",
+    "ST_ERROR",
     # Status configuration
     "STATUS_VALUES",
     "STATUS_ICONS",
@@ -849,8 +815,6 @@ __all__ = [
     "STATUS_ORDER",
     "STATUS_FG",
     # Config defaults
-    "DEFAULT_CONFIG_HEADER",
-    "DEFAULT_CONFIG_DEFAULTS",
     # Terminal presets
     "TERMINAL_PRESETS",
     # Utility functions

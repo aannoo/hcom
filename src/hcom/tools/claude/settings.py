@@ -317,7 +317,7 @@ def setup_claude_hooks(include_permissions: bool = True) -> bool:
     # Write settings atomically
     try:
         atomic_write(settings_path, json.dumps(settings, indent=2))
-    except Exception as e:
+    except OSError as e:
         raise Exception(f"Cannot write settings: {e}")
 
     # Quick verification
@@ -387,7 +387,7 @@ def _verify_claude_hooks_at(settings_path: Path, check_permissions: bool = True)
                     return False
 
         return True
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return False
 
 
@@ -425,7 +425,7 @@ def _remove_claude_hooks_from_path(settings_path: Path) -> bool:
 
         # Write atomically
         return atomic_write(settings_path, json.dumps(settings, indent=2))
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return False
 
 

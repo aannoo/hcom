@@ -6,7 +6,9 @@ interactive subagents, headless persistence, and real-time communication via hoo
 """
 
 import os
+import sqlite3
 import sys
+from collections.abc import Callable
 
 # ==================== Shim Detection (argv[0]) ====================
 # If invoked as 'claude', 'gemini', or 'codex' (via symlink), rewrite argv.
@@ -249,43 +251,14 @@ from .shared import (
     is_inside_ai_tool,
     HcomError,
     CommandContext,
+    ST_ACTIVE,
+    ST_INACTIVE,
 )
 
 # ==================== Identity Gating ====================
-# Commands that don't require identity
-IDENTITY_ALLOWLIST = frozenset(
-    {
-        "start",  # Creates identity
-        "help",  # No identity needed
-        "reset",  # Admin command
-        "stop",  # Admin command (stop all/name works without identity, self-stop validated in cmd)
-        "kill",  # Admin command (kill by name/all, uses identity only for logging)
-        "run",  # Scripts handle their own identity requirements
-        "status",  # Diagnostic command
-        "relay",  # Works without identity
-        "archive",  # Query-only, no identity needed
-        "events",  # Query-only mode works without identity
-        "transcript",  # Query-only (search, timeline, @name all work without identity)
-        "config",  # View/edit config, no identity needed
-        "list",  # Query-only, no identity needed
-        "shim",  # System setup, no identity needed
-        "hooks",  # Hook management, no identity needed
-        "bundle",  # Query-only without identity
-        "daemon",  # Daemon management, no identity needed
-        "term",  # PTY admin (screen query, inject, debug toggle)
-    }
-)
-
-# Flags that bypass identity requirement
-IDENTITY_BYPASS_FLAGS = frozenset(
-    {
-        "--help",
-        "-h",
-        "--version",
-        "-v",
-        "--new-terminal",  # TUI launch in new terminal (same as bare 'hcom')
-    }
-)
+# Commands that require a registered identity (all others work without one).
+# Inverted from an allowlist so new commands default to no-identity-required.
+REQUIRE_IDENTITY = frozenset({"send", "listen"})
 
 
 def _extract_name_flag(argv: list[str]) -> tuple[list[str], str | None]:
@@ -386,25 +359,25 @@ from .core.runtime import build_claude_env
 # Import command implementations
 from .commands import (
     cmd_launch,
-    cmd_stop,  # noqa: F401 (used dynamically via globals())
-    cmd_start,  # noqa: F401 (used dynamically via globals())
-    cmd_kill,  # noqa: F401 (used dynamically via globals())
-    cmd_daemon,  # noqa: F401 (used dynamically via globals())
-    cmd_send,  # noqa: F401 (used dynamically via globals())
-    cmd_listen,  # noqa: F401 (used dynamically via globals())
-    cmd_events,  # noqa: F401 (used dynamically via globals())
-    cmd_reset,  # noqa: F401 (used dynamically via globals())
+    cmd_stop,
+    cmd_start,
+    cmd_kill,
+    cmd_daemon,
+    cmd_send,
+    cmd_listen,
+    cmd_events,
+    cmd_reset,
     cmd_help,
-    cmd_list,  # noqa: F401 (used dynamically via globals())
-    cmd_relay,  # noqa: F401 (used dynamically via globals())
-    cmd_config,  # noqa: F401 (used dynamically via globals())
-    cmd_transcript,  # noqa: F401 (used dynamically via globals())
-    cmd_archive,  # noqa: F401 (used dynamically via globals())
-    cmd_status,  # noqa: F401 (used dynamically via globals())
-    cmd_shim,  # noqa: F401 (used dynamically via globals())
-    cmd_hooks,  # noqa: F401 (used dynamically via globals())
-    cmd_bundle,  # noqa: F401 (used dynamically via globals())
-    cmd_term,  # noqa: F401 (used dynamically via globals())
+    cmd_list,
+    cmd_relay,
+    cmd_config,
+    cmd_transcript,
+    cmd_archive,
+    cmd_status,
+    cmd_shim,
+    cmd_hooks,
+    cmd_bundle,
+    cmd_term,
     CLIError,
     format_error,
 )
@@ -442,28 +415,30 @@ def _build_ctx_for_command(cmd: str | None, *, explicit_name: str | None) -> Com
     return CommandContext(explicit_name=explicit_name, identity=identity)
 
 
-# Commands that support --help (maps to cmd_* functions)
-COMMANDS = (
-    "events",
-    "send",
-    "listen",
-    "bundle",
-    "stop",
-    "start",
-    "kill",
-    "daemon",
-    "reset",
-    "list",
-    "config",
-    "relay",
-    "transcript",
-    "archive",
-    "run",
-    "status",
-    "shim",
-    "hooks",
-    "term",
-)
+# Command dispatch table — maps command name to handler function.
+# cmd_run is defined inline above; all others come from .commands.
+_COMMAND_HANDLERS: dict[str, Callable[..., int]] = {
+    "events": cmd_events,
+    "send": cmd_send,
+    "listen": cmd_listen,
+    "bundle": cmd_bundle,
+    "stop": cmd_stop,
+    "start": cmd_start,
+    "kill": cmd_kill,
+    "daemon": cmd_daemon,
+    "reset": cmd_reset,
+    "list": cmd_list,
+    "config": cmd_config,
+    "relay": cmd_relay,
+    "transcript": cmd_transcript,
+    "archive": cmd_archive,
+    "run": cmd_run,
+    "status": cmd_status,
+    "shim": cmd_shim,
+    "hooks": cmd_hooks,
+    "term": cmd_term,
+}
+COMMANDS = tuple(_COMMAND_HANDLERS)
 
 # Commands that should NOT trigger status update (handled internally or lifecycle)
 _STATUS_SKIP_COMMANDS = frozenset({"listen", "start", "stop", "kill", "reset", "status"})
@@ -511,10 +486,10 @@ def _set_hookless_command_status(cmd_name: str, *, ctx: CommandContext | None = 
 
         if tool == "adhoc":
             # No hooks - can only claim "this event happened"
-            set_status(identity.name, "inactive", f"tool:{cmd_name}")
+            set_status(identity.name, ST_INACTIVE, f"tool:{cmd_name}")
         else:
             # Has hooks - will reset to idle when turn ends
-            set_status(identity.name, "active", f"tool:{cmd_name}")
+            set_status(identity.name, ST_ACTIVE, f"tool:{cmd_name}")
 
     except Exception:
         pass  # Best effort - don't break commands
@@ -528,16 +503,9 @@ def _run_command(name: str, argv: list[str], *, ctx: CommandContext | None = Non
         from .commands.utils import get_command_help
 
         print(get_command_help(name))
-        _maybe_deliver_pending_messages(argv, ctx=ctx)
         return 0
     _set_hookless_command_status(name, ctx=ctx)
-    if name == "run":
-        result = cmd_run(argv, ctx=ctx)
-    else:
-        func_name = f"cmd_{name.replace('-', '_')}"
-        result = globals()[func_name](argv, ctx=ctx)
-    _maybe_deliver_pending_messages(argv, ctx=ctx)
-    return result
+    return _COMMAND_HANDLERS[name](argv, ctx=ctx)
 
 
 def _maybe_deliver_pending_messages(argv: list[str] | None = None, *, ctx: CommandContext | None = None) -> None:
@@ -598,15 +566,15 @@ def _maybe_deliver_pending_messages(argv: list[str] | None = None, *, ctx: Comma
         sender_display = get_display_name(messages[0]["from"])
         tool = identity.instance_data.get("tool")
         if tool == "codex":
-            set_status(instance_name, "active", f"deliver:{sender_display}", msg_ts=msg_ts)
+            set_status(instance_name, ST_ACTIVE, f"deliver:{sender_display}", msg_ts=msg_ts)
         else:
             set_status(
                 instance_name,
-                "inactive",
+                ST_INACTIVE,
                 f"deliver:{sender_display}",
                 msg_ts=msg_ts,
             )
-    except Exception as e:
+    except (OSError, KeyError, sqlite3.Error) as e:
         from .core.log import log_error
 
         log_error("cli", "deliver.fail", e, instance=instance_name)
@@ -633,7 +601,7 @@ if sys.version_info < (3, 10):
 # ==================== Logging ====================
 
 # ==================== Config Defaults ====================
-# Config precedence: env var > ~/.hcom/config.env > defaults
+# Config precedence: env var > ~/.hcom/config.toml > defaults
 # All config via HcomConfig dataclass (timeout, terminal, hints, tag, claude_args)
 
 # Hook configuration now in hooks/settings.py
@@ -812,7 +780,7 @@ def ensure_hooks_current() -> bool:
             print(f"Warning: Could not verify/update hooks: {e}", file=sys.stderr)
             print(f"Check {settings_path}", file=sys.stderr)
 
-    # Gemini/Codex hooks are setup at launch time (cmd_launch_gemini/cmd_launch_codex)
+    # Gemini/Codex hooks are setup at launch time (cmd_launch_tool)
     # But we do self-healing to ensure hooks.enabled = true (required for v0.24.0+)
     try:
         from .tools.gemini.settings import ensure_hooks_enabled
@@ -822,6 +790,106 @@ def ensure_hooks_current() -> bool:
         pass  # Non-critical, gemini may not be installed
 
     return True
+
+
+def _dispatch(cmd: str | None, argv: list[str], ctx: CommandContext | None) -> int:
+    """Route command and return exit code. Delivery handled by caller."""
+    try:
+        # Normalize shorthands: hcom gemini → hcom 1 gemini, hcom codex → hcom 1 codex
+        from .shared import RELEASED_TOOLS
+
+        if cmd in ("gemini", "codex") and cmd in RELEASED_TOOLS:
+            argv = ["1"] + argv
+            cmd = "1"  # Now it's a numeric launch
+
+        # Handle --new-terminal flag: force launch TUI in new terminal window
+        if cmd == "--new-terminal":
+            from .core.tool_utils import build_hcom_command
+            from .core.thread_context import get_cwd
+
+            env = build_claude_env()
+            env["HCOM_DIR"] = str(hcom_path())
+            hcom_cmd = build_hcom_command()
+            success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
+            return 0 if success else 1
+
+        if not cmd:
+            # TTY detection: launch TUI if interactive, otherwise launch in new terminal
+            # If inside AI tool (Gemini/Claude), force new terminal to avoid hijacking the session
+            from .commands.utils import is_interactive
+            if is_interactive() and not is_inside_ai_tool():
+                # Check for updates and prompt before TUI launch
+                latest, update_cmd = get_update_info()
+                if latest and update_cmd:
+                    if _prompt_and_install_update(latest, update_cmd):
+                        return 0  # Updated - user should restart
+
+                # Interactive terminal - run TUI directly
+                from .ui import run_tui
+
+                return run_tui(hcom_path())
+            else:
+                # No TTY (pipe, redirect, etc) - launch in new terminal window
+                from .core.tool_utils import build_hcom_command
+                from .core.thread_context import get_cwd
+
+                env = build_claude_env()
+                env["HCOM_DIR"] = str(hcom_path())
+                hcom_cmd = build_hcom_command()
+                success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
+                return 0 if success else 1
+        elif cmd in ("help", "--help", "-h"):
+            return cmd_help()
+        elif cmd in ("--version", "-v"):
+            print(f"hcom {__version__}")
+            return 0
+        elif cmd in COMMANDS:
+            return _run_command(cmd, _get_command_args(argv, cmd), ctx=ctx)
+        elif cmd.isdigit():
+            # Launch instances: hcom [N] [tool] [args]
+            cmd_args = _get_command_args(argv, cmd)
+            next_cmd = _find_command(cmd_args)
+            launcher_name = ctx.identity.name if (ctx and ctx.identity and ctx.identity.kind == "instance") else None
+
+            # Determine tool from next arg after count
+            tool_name = next_cmd if next_cmd in RELEASED_TOOLS else "claude"
+
+            if "--help" in argv or "-h" in argv:
+                from .commands.utils import get_command_help
+
+                print(get_command_help(tool_name))
+                return 0
+            from .commands.lifecycle import cmd_launch_tool
+
+            return cmd_launch_tool(tool_name, _strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
+        elif cmd == "r":
+            # Resume shortcut: hcom r NAME
+            from .commands.lifecycle import cmd_resume
+
+            return cmd_resume(_get_command_args(argv, cmd), ctx=ctx)
+        elif cmd == "f":
+            # Fork shortcut: hcom f NAME
+            from .commands.lifecycle import cmd_fork
+
+            return cmd_fork(_get_command_args(argv, cmd), ctx=ctx)
+        elif cmd == "claude":
+            # hcom claude [args]
+            if "--help" in argv or "-h" in argv:
+                from .commands.utils import get_command_help
+
+                print(get_command_help("claude"))
+                return 0
+            launcher_name = ctx.identity.name if (ctx and ctx.identity and ctx.identity.kind == "instance") else None
+            return cmd_launch(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
+        else:
+            print(
+                format_error(f"Unknown command: {cmd}", "Run 'hcom --help' for usage"),
+                file=sys.stderr,
+            )
+            return 1
+    except (CLIError, ValueError, RuntimeError, HcomError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 # ==================== Main Entry Point ====================
@@ -897,11 +965,8 @@ def main(argv: list[str] | None = None) -> int | None:
     else:
         ctx = CommandContext(explicit_name=None, identity=None)
 
-    # Launch commands: numeric (hcom 1) or tool names (hcom gemini, hcom codex, hcom claude) - always allowed
-    is_launch_cmd = cmd and (cmd.isdigit() or cmd in ("gemini", "codex", "claude", "r", "f"))
-
-    # Gate: require identity unless allowlisted, bypass flag, or explicit identity provided
-    if cmd and not is_launch_cmd and cmd not in IDENTITY_ALLOWLIST and cmd not in IDENTITY_BYPASS_FLAGS:
+    # Gate: require identity for send/listen (all other commands work without one)
+    if cmd in REQUIRE_IDENTITY:
         # Check if send external sender flags present (send command uses these)
         has_from = cmd == "send" and (("-b" in argv) or ("--from" in argv)) if argv else False
         if not explicit_name and not has_from:
@@ -970,17 +1035,10 @@ def main(argv: list[str] | None = None) -> int | None:
                     print(f"Usage: {hcom_cmd} start", file=sys.stderr)
                 return 1
 
-    # Subagent context: require explicit --name for all commands
+    # Subagent context: require explicit --name for identity-requiring commands
     # Both subagents (--name <uuid>) and parent (--name parent) must identify
-    # Skip for version/help flags and allowlisted commands - they don't need identity
     from .core.thread_context import get_is_claude as _get_is_claude
-    if (
-        cmd
-        and not explicit_name
-        and cmd not in IDENTITY_ALLOWLIST
-        and cmd not in ("-v", "--version", "-h", "--help")
-        and _get_is_claude()
-    ):
+    if cmd in REQUIRE_IDENTITY and not explicit_name and _get_is_claude():
         try:
             from .core.identity import resolve_identity
             from .tools.claude.subagent import in_subagent_context, cleanup_dead_subagents
@@ -1008,142 +1066,10 @@ def main(argv: list[str] | None = None) -> int | None:
         except (ValueError, HcomError):
             pass  # Can't resolve identity - not relevant
 
-    # Route to commands
-    try:
-        # Normalize shorthands: hcom gemini → hcom 1 gemini, hcom codex → hcom 1 codex
-        from .shared import RELEASED_TOOLS
-
-        if cmd in ("gemini", "codex") and cmd in RELEASED_TOOLS:
-            argv = ["1"] + argv
-            cmd = "1"  # Now it's a numeric launch
-
-        # Handle --new-terminal flag: force launch TUI in new terminal window
-        if cmd == "--new-terminal":
-            from .core.tool_utils import build_hcom_command
-            from .core.thread_context import get_cwd
-
-            env = build_claude_env()
-            env["HCOM_DIR"] = str(hcom_path())
-            hcom_cmd = build_hcom_command()
-            success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
-            _maybe_deliver_pending_messages(ctx=ctx)
-            return 0 if success else 1
-
-        if not cmd:
-            # TTY detection: launch TUI if interactive, otherwise launch in new terminal
-            # If inside AI tool (Gemini/Claude), force new terminal to avoid hijacking the session
-            from .commands.utils import is_interactive
-            if is_interactive() and not is_inside_ai_tool():
-                # Check for updates and prompt before TUI launch
-                latest, update_cmd = get_update_info()
-                if latest and update_cmd:
-                    if _prompt_and_install_update(latest, update_cmd):
-                        return 0  # Updated - user should restart
-
-                # Interactive terminal - run TUI directly
-                from .ui import run_tui
-
-                return run_tui(hcom_path())
-            else:
-                # No TTY (pipe, redirect, etc) - launch in new terminal window
-                from .core.tool_utils import build_hcom_command
-                from .core.thread_context import get_cwd
-
-                env = build_claude_env()
-                env["HCOM_DIR"] = str(hcom_path())
-                hcom_cmd = build_hcom_command()
-                success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
-                _maybe_deliver_pending_messages(ctx=ctx)
-                return 0 if success else 1
-        elif cmd in ("help", "--help", "-h"):
-            result = cmd_help()
-            _maybe_deliver_pending_messages(ctx=ctx)
-            return result
-        elif cmd in ("--version", "-v"):
-            print(f"hcom {__version__}")
-            _maybe_deliver_pending_messages(ctx=ctx)
-            return 0
-        elif cmd in COMMANDS:
-            return _run_command(cmd, _get_command_args(argv, cmd), ctx=ctx)
-        elif cmd.isdigit():
-            # Launch instances: hcom [N] [tool] [args]
-            # Check for gemini/codex after the number
-            cmd_args = _get_command_args(argv, cmd)
-            next_cmd = _find_command(cmd_args)
-            launcher_name = ctx.identity.name if (ctx and ctx.identity and ctx.identity.kind == "instance") else None
-
-            if next_cmd == "gemini" and "gemini" in RELEASED_TOOLS:
-                if "--help" in argv or "-h" in argv:
-                    from .commands.utils import get_command_help
-
-                    print(get_command_help("gemini"))
-                    _maybe_deliver_pending_messages(ctx=ctx)
-                    return 0
-                from .commands.lifecycle import cmd_launch_gemini
-
-                result = cmd_launch_gemini(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
-                _maybe_deliver_pending_messages(ctx=ctx)
-                return result
-            elif next_cmd == "codex" and "codex" in RELEASED_TOOLS:
-                if "--help" in argv or "-h" in argv:
-                    from .commands.utils import get_command_help
-
-                    print(get_command_help("codex"))
-                    _maybe_deliver_pending_messages(ctx=ctx)
-                    return 0
-                from .commands.lifecycle import cmd_launch_codex
-
-                result = cmd_launch_codex(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
-                _maybe_deliver_pending_messages(ctx=ctx)
-                return result
-            else:
-                # Default: Claude launch
-                if "--help" in argv or "-h" in argv:
-                    from .commands.utils import get_command_help
-
-                    print(get_command_help("claude"))
-                    _maybe_deliver_pending_messages(ctx=ctx)
-                    return 0
-                result = cmd_launch(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
-                _maybe_deliver_pending_messages(ctx=ctx)
-                return result
-        elif cmd == "r":
-            # Resume shortcut: hcom r NAME
-            from .commands.lifecycle import cmd_resume
-
-            cmd_args = _get_command_args(argv, cmd)
-            result = cmd_resume(cmd_args, ctx=ctx)
-            _maybe_deliver_pending_messages(ctx=ctx)
-            return result
-        elif cmd == "f":
-            # Fork shortcut: hcom f NAME
-            from .commands.lifecycle import cmd_fork
-
-            cmd_args = _get_command_args(argv, cmd)
-            result = cmd_fork(cmd_args, ctx=ctx)
-            _maybe_deliver_pending_messages(ctx=ctx)
-            return result
-        elif cmd == "claude":
-            # hcom claude [args]
-            if "--help" in argv or "-h" in argv:
-                from .commands.utils import get_command_help
-
-                print(get_command_help("claude"))
-                _maybe_deliver_pending_messages(ctx=ctx)
-                return 0
-            launcher_name = ctx.identity.name if (ctx and ctx.identity and ctx.identity.kind == "instance") else None
-            result = cmd_launch(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
-            _maybe_deliver_pending_messages(ctx=ctx)
-            return result
-        else:
-            print(
-                format_error(f"Unknown command: {cmd}", "Run 'hcom --help' for usage"),
-                file=sys.stderr,
-            )
-            return 1
-    except (CLIError, ValueError, RuntimeError, HcomError) as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    # Route to commands, then deliver pending messages (codex/adhoc) once
+    result = _dispatch(cmd, argv, ctx)
+    _maybe_deliver_pending_messages(argv, ctx=ctx)
+    return result
 
 
 # ==================== Exports for UI Module ====================

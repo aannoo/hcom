@@ -13,6 +13,7 @@ from .config import get_config
 from .thread_context import get_background_name, get_is_launched, get_hcom_notes_text
 from .instances import load_instance_position, get_full_name
 from .paths import hcom_path
+from ..shared import ST_ACTIVE, ST_LISTENING
 
 
 # =============================================================================
@@ -225,7 +226,7 @@ def _get_active_instances(exclude_name: str) -> str:
                 status_time = 0
         tool = inst.get("tool", "claude")
 
-        if status in ("active", "listening") or status_time >= cutoff:
+        if status in (ST_ACTIVE, ST_LISTENING) or status_time >= cutoff:
             by_tool.setdefault(tool, []).append(get_full_name(inst) or name)
             count += 1
 

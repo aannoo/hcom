@@ -21,7 +21,7 @@ Launch Flow
 -----------
 1. Validation: tool exists, count within limits, platform checks
 2. Hook setup: verify-first pattern (read-only check, write if needed)
-3. Environment: build from config.env + caller overrides + HCOM_* vars
+3. Environment: build from config.toml + env passthrough + caller overrides
 4. Instance creation: pre-register with process binding for hook identity
 5. Tool launch: dispatch to tool-specific launcher (terminal/PTY)
 6. Event logging: batch_launched life event for TUI/API tracking
@@ -113,7 +113,7 @@ def _default_max_count(tool: LaunchTool) -> int:
 
 
 def _default_tag() -> str:
-    """Get default tag from HCOM_TAG env var or config.env file.
+    """Get default tag from HCOM_TAG env var or config.toml file.
 
     Tags create named groups of instances (e.g., tag="review" creates "review-luna").
     Used for batch operations and @tag mentions in messages.
@@ -407,6 +407,7 @@ def launch(
     run_here: bool | None = None,
     batch_id: str | None = None,
     name: str | None = None,
+    skip_validation: bool = False,
 ) -> dict[str, Any]:
     """Launch one or more AI tool instances with consistent tracking.
 
@@ -414,7 +415,7 @@ def launch(
     instances. It handles:
     - Validation (tool exists, count within limits, platform compatibility)
     - Hook installation verification and auto-setup
-    - Environment configuration from config.env and caller overrides
+    - Environment configuration from config.toml and caller overrides
     - Instance pre-registration with process bindings for identity
     - Tool-specific launch dispatch (terminal command or PTY wrapper)
     - Batch event logging for TUI and API tracking
@@ -438,6 +439,8 @@ def launch(
         name: Explicit instance name to use instead of auto-generating.
             Used for resume (reuse stopped instance's name). If provided,
             count must be 1 and name must not be in use by an active instance.
+        skip_validation: If True, skip tool arg validation (caller already validated).
+            Falls back to HCOM_SKIP_TOOL_ARGS_VALIDATION env var if False.
 
     Returns:
         Dictionary with launch results:
@@ -481,7 +484,8 @@ def launch(
 
     normalized = _normalize_tool(tool, pty=pty)
     args = args or []
-    skip_validation = skip_tool_args_validation()
+    if not skip_validation:
+        skip_validation = skip_tool_args_validation()
 
     # Check release gates (safety net - UI should filter these)
     base_tool = normalized.replace("-pty", "")
@@ -534,7 +538,7 @@ def launch(
     launcher_name = _resolve_launcher_name(launcher)
     batch_id = batch_id or str(uuid.uuid4()).split("-")[0]
 
-    # Build base environment from config.env defaults (+ user overrides via caller-provided env).
+    # Build base environment from config.toml defaults (+ user overrides via caller-provided env).
     base_env: dict[str, str] = {}
     base_env.update(build_claude_env())
     if env:
@@ -548,7 +552,7 @@ def launch(
         effective_tag = tag
         base_env["HCOM_TAG"] = tag
     else:
-        # Preserve any pre-configured HCOM_TAG from config.env or caller-provided env.
+        # Preserve any pre-configured HCOM_TAG from config.toml or caller-provided env.
         if "HCOM_TAG" in base_env:
             effective_tag = base_env["HCOM_TAG"]
         else:
@@ -947,12 +951,11 @@ def launch(
     except Exception:
         pass
 
-    # Push launch event to relay (notify daemon if running, else inline push)
+    # Push launch event to relay
     try:
-        from .relay import notify_relay, push
+        from .relay import trigger_push
 
-        if not notify_relay():
-            push()
+        trigger_push()
     except Exception:
         pass
 

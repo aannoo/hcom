@@ -1,4 +1,4 @@
-"""Launch Claude instances."""
+"""Launch AI tool instances (Claude, Gemini, Codex)."""
 
 import os
 import sys
@@ -6,7 +6,6 @@ import time
 
 from ..utils import (
     CLIError,
-    format_error,
     is_interactive,
     resolve_identity,
 )
@@ -16,6 +15,8 @@ from ...shared import (
     IS_WINDOWS,
     is_inside_ai_tool,
     CommandContext,
+    skip_tool_args_validation,
+    HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV,
 )
 from ...core.thread_context import get_hcom_go, get_cwd
 from ...core.config import get_config
@@ -165,202 +166,267 @@ Initial Prompt Tip:
 """)
 
 
+def cmd_launch_tool(
+    tool: str,
+    argv: list[str],
+    *,
+    launcher_name: str | None = None,
+    ctx: "CommandContext | None" = None,
+) -> int:
+    """Launch AI tool instances: hcom [N] [claude|gemini|codex] [args]
+
+    Unified entry point for all tool launch commands (CLI path).
+
+    Args:
+        tool: Tool name ("claude", "gemini", "codex")
+        argv: Command line arguments (identity flags already stripped)
+        launcher_name: Explicit launcher identity from --name flag
+        ctx: Command context with explicit_name if --name was provided
+
+    Raises:
+        CLIError: On argument validation failure.
+        HcomError: On hook setup failure or launch failure.
+    """
+    from ...launcher import launch as unified_launch, will_run_in_current_terminal
+
+    config = get_config()
+
+    # --- Platform check (gemini/codex require PTY = Unix only) ---
+    if tool in ("gemini", "codex") and IS_WINDOWS:
+        tool_name = "Gemini" if tool == "gemini" else "Codex"
+        raise CLIError(
+            f"{tool_name} CLI integration requires PTY (pseudo-terminal) which is not available on Windows.\n"
+            "Use 'hcom N claude' for Claude Code on Windows (hooks-based, no PTY required)."
+        )
+
+    # --- Parse count and skip tool keyword ---
+    count = 1
+    if argv and argv[0].isdigit():
+        count = int(argv[0])
+        if count <= 0:
+            raise CLIError("Count must be positive.")
+        max_count = 100 if tool == "claude" else 10
+        if count > max_count:
+            raise CLIError(f"Too many agents requested (max {max_count}).")
+        argv = argv[1:]
+
+    if argv and argv[0] == tool:
+        argv = argv[1:]
+
+    # --- Extract --no-auto-watch flag ---
+    no_auto_watch = "--no-auto-watch" in argv
+    if no_auto_watch:
+        argv = [arg for arg in argv if arg != "--no-auto-watch"]
+
+    forwarded = argv
+
+    # --- Tool-specific arg parsing (env + CLI merge) ---
+    background = False
+    tool_args: list[str] = []
+    system_prompt: str | None = None
+
+    match tool:
+        case "claude":
+            from ...tools.claude.args import (
+                resolve_claude_args,
+                merge_claude_args,
+                add_background_defaults,
+                validate_conflicts,
+            )
+
+            env_spec = resolve_claude_args(None, config.claude_args)
+            cli_spec = resolve_claude_args(forwarded if forwarded else None, None)
+
+            if cli_spec.clean_tokens or cli_spec.positional_tokens:
+                spec = merge_claude_args(env_spec, cli_spec)
+            else:
+                spec = env_spec
+
+            if spec.has_errors() and not skip_tool_args_validation():
+                raise CLIError(
+                    "\n".join([
+                        *spec.errors,
+                        f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom validation and let claude handle args.",
+                    ])
+                )
+
+            # Warnings (claude-only)
+            for warning in validate_conflicts(spec):
+                print(f"{FG_YELLOW}Warning:{RESET} {warning}", file=sys.stderr)
+
+            spec = add_background_defaults(spec)
+            background = spec.is_background
+            tool_args = spec.rebuild_tokens()
+
+        case "gemini":
+            from ...tools.gemini.args import resolve_gemini_args, merge_gemini_args
+
+            g_env = resolve_gemini_args(None, config.gemini_args)
+            g_cli = resolve_gemini_args(forwarded if forwarded else None, None)
+            g_spec = merge_gemini_args(g_env, g_cli) if (g_cli.clean_tokens or g_cli.positional_tokens) else g_env
+
+            if g_spec.has_errors() and not skip_tool_args_validation():
+                raise CLIError(
+                    "\n".join([
+                        *g_spec.errors,
+                        f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom validation and let gemini handle args.",
+                    ])
+                )
+
+            # Reject headless mode
+            if g_spec.positional_tokens or g_spec.has_flag(["-p", "--prompt"], ("-p=", "--prompt=")):
+                headless_type = "positional query" if g_spec.positional_tokens else "-p/--prompt flag"
+                raise CLIError(
+                    f"Gemini headless mode not supported in hcom (attempted: {headless_type}).\n"
+                    "  • For interactive: hcom N gemini\n"
+                    '  • For interactive with initial prompt: hcom N gemini -i "prompt"\n'
+                    '  • For headless: hcom N claude -p "task"'
+                )
+
+            tool_args = g_spec.rebuild_tokens()
+            system_prompt = config.gemini_system_prompt or None
+
+        case "codex":
+            from ...tools.codex.args import resolve_codex_args, merge_codex_args
+
+            x_env = resolve_codex_args(None, config.codex_args)
+            x_cli = resolve_codex_args(forwarded if forwarded else None, None)
+            x_spec = (
+                merge_codex_args(x_env, x_cli)
+                if (x_cli.clean_tokens or x_cli.positional_tokens or x_cli.subcommand)
+                else x_env
+            )
+
+            if x_spec.has_errors() and not skip_tool_args_validation():
+                raise CLIError(
+                    "\n".join([
+                        *x_spec.errors,
+                        f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom validation and let codex handle args.",
+                    ])
+                )
+
+            # Handle resume/fork subcommand
+            if x_spec.subcommand in ("resume", "fork"):
+                if not x_spec.positional_tokens:
+                    raise CLIError(f"'codex {x_spec.subcommand}' requires explicit thread-id (interactive picker not supported)")
+                if x_spec.has_flag(["--last"]):
+                    raise CLIError(f"'codex {x_spec.subcommand} --last' not supported - use explicit thread-id")
+
+            # Reject exec mode
+            if x_spec.is_exec:
+                raise CLIError("'codex exec' is not supported. Use interactive codex or headless claude.")
+
+            include_subcommand = x_spec.subcommand in ("resume", "fork", "review")
+            tool_args = x_spec.rebuild_tokens(include_subcommand=include_subcommand)
+            system_prompt = config.codex_system_prompt or None
+
+        case _:
+            raise CLIError(f"Unknown tool: {tool}")
+
+    # --- HCOM_GO confirmation gate ---
+    has_args = forwarded and len(forwarded) > 0
+    if is_inside_ai_tool() and not get_hcom_go() and (has_args or count > 5):
+        _print_launch_preview(tool, count, background, forwarded)
+        return 0
+
+    # --- Resolve launcher identity ---
+    if launcher_name:
+        launcher = launcher_name
+    else:
+        try:
+            launcher = resolve_identity().name
+        except Exception:
+            launcher = "user"
+    launcher_data = load_instance_position(launcher)
+    launcher_participating = launcher_data is not None
+
+    # --- PTY and terminal decisions ---
+    use_pty = tool != "claude" or (not background and not IS_WINDOWS)
+    ran_here = will_run_in_current_terminal(count, background)
+    tag = config.tag
+
+    # --- Launch ---
+    result = unified_launch(
+        tool,
+        count,
+        tool_args,
+        tag=tag,
+        background=background,
+        cwd=str(get_cwd()),
+        launcher=launcher,
+        pty=use_pty,
+        system_prompt=system_prompt,
+        skip_validation=True,
+    )
+
+    # --- Surface errors ---
+    for err in result.get("errors", []):
+        print(f"Error: {err.get('error', 'Unknown error')}", file=sys.stderr)
+
+    launched = result["launched"]
+    failed = result["failed"]
+    batch_id = result["batch_id"]
+    instance_names = [h["instance_name"] for h in result.get("handles", []) if h.get("instance_name")]
+
+    # Print background log files (claude headless)
+    for log_file in result.get("log_files", []):
+        print(f"Headless launched, log: {log_file}")
+
+    if launched == 0 and failed > 0:
+        return 1
+
+    # --- Print summary ---
+    tool_label = tool.capitalize()
+    if failed > 0:
+        print(f"Started the launch process for {launched}/{count} {tool_label} agent{'s' if count != 1 else ''} ({failed} failed)")
+    else:
+        print(f"Started the launch process for {launched} {tool_label} agent{'s' if launched != 1 else ''}")
+    print(f"Batch id: {batch_id}")
+    print("To block until ready or fail (30s timeout), run: hcom events launch")
+
+    # --- Auto-TUI or tips ---
+    terminal_mode = config.terminal
+    explicit_name_provided = ctx and ctx.explicit_name
+
+    if (
+        terminal_mode != "print"
+        and failed == 0
+        and is_interactive()
+        and not background
+        and not no_auto_watch
+        and not ran_here
+        and not is_inside_ai_tool()
+        and not explicit_name_provided
+    ):
+        if tag:
+            print(f"\n  • Send to {tag} team: hcom send '@{tag}- message'")
+
+        print("\nOpening hcom UI...")
+        time.sleep(2)
+
+        from ...ui import run_tui
+
+        return run_tui(hcom_path())
+    else:
+        from ...core.tips import print_launch_tips
+
+        print_launch_tips(
+            launched=launched,
+            tag=tag,
+            instance_names=instance_names,
+            launcher_name=launcher if launcher != "user" else None,
+            launcher_participating=launcher_participating,
+            background=background,
+        )
+
+    return 0 if failed == 0 else 1
+
+
 def cmd_launch(
     argv: list[str],
     *,
     launcher_name: str | None = None,
     ctx: "CommandContext | None" = None,
 ) -> int:
-    """Launch Claude instances: hcom [N] [claude] [args]
-
-    Args:
-        argv: Command line arguments (identity flags already stripped)
-        launcher_name: Explicit launcher identity from --name flag (CLI layer parsed this)
-        ctx: Command context with explicit_name if --name was provided
-
-    Raises:
-        HcomError: On hook setup failure or launch failure.
-    """
-    from ...core.ops import op_launch
-    from ...shared import (
-        HcomError,
-        skip_tool_args_validation,
-        HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV,
-    )
-
-    # Hook setup moved to launcher.launch() - single source of truth
-
-    try:
-        # Parse arguments: hcom [N] [claude] [args]
-        # Note: Identity flags (--name) already stripped by CLI layer
-        count = 1
-
-        # Extract count if first arg is digit
-        if argv and argv[0].isdigit():
-            count = int(argv[0])
-            if count <= 0:
-                raise CLIError("Count must be positive.")
-            if count > 100:
-                raise CLIError("Too many agents requested (max 100).")
-            argv = argv[1:]
-
-        # Skip 'claude' keyword if present
-        if argv and argv[0] == "claude":
-            argv = argv[1:]
-
-        # Forward all remaining args to claude CLI
-        forwarded = argv
-
-        # Check for --no-auto-watch flag (used by TUI to prevent opening another watch window)
-        no_auto_watch = "--no-auto-watch" in forwarded
-        if no_auto_watch:
-            forwarded = [arg for arg in forwarded if arg != "--no-auto-watch"]
-
-        # Get tag from config
-        tag = get_config().tag
-
-        # Lazy import to avoid ~3ms overhead on CLI startup
-        from ...tools.claude.args import (
-            resolve_claude_args,
-            merge_claude_args,
-            add_background_defaults,
-            validate_conflicts,
-        )
-
-        # Phase 1: Parse and merge Claude args (env + CLI with CLI precedence)
-        env_spec = resolve_claude_args(None, get_config().claude_args)
-        cli_spec = resolve_claude_args(forwarded if forwarded else None, None)
-
-        # Merge: CLI overrides env on per-flag basis, inherits env if CLI has no args
-        if cli_spec.clean_tokens or cli_spec.positional_tokens:
-            spec = merge_claude_args(env_spec, cli_spec)
-        else:
-            spec = env_spec
-
-        # Validate parsed args
-        if spec.has_errors() and not skip_tool_args_validation():
-            raise CLIError(
-                "\n".join(
-                    [
-                        *spec.errors,
-                        f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom validation and let claude handle args.",
-                    ]
-                )
-            )
-
-        # Check for conflicts (warnings only, not errors)
-        warnings = validate_conflicts(spec)
-        for warning in warnings:
-            print(f"{FG_YELLOW}Warning:{RESET} {warning}", file=sys.stderr)
-
-        # Add HCOM background mode enhancements
-        spec = add_background_defaults(spec)
-
-        # Extract values from spec
-        background = spec.is_background
-
-        # Launch confirmation gate: inside AI tools, require HCOM_GO=1
-        # Show preview if: has args OR count > 5
-        has_args = forwarded and len(forwarded) > 0
-        if is_inside_ai_tool() and not get_hcom_go() and (has_args or count > 5):
-            _print_launch_preview("claude", count, background, forwarded)
-            return 0
-        claude_args = spec.rebuild_tokens()
-
-        # Resolve launcher identity: use explicit --name if provided, else auto-resolve
-        if launcher_name:
-            launcher = launcher_name
-        else:
-            try:
-                launcher = resolve_identity().name
-            except HcomError:
-                launcher = "user"
-        launcher_data = load_instance_position(launcher)
-        launcher_participating = launcher_data is not None  # Row exists = participating
-
-        # PTY mode: use PTY wrapper for interactive Claude (not headless, not Windows)
-        use_pty = not background and not IS_WINDOWS
-
-        # Determine if instance will run in current terminal (blocking mode)
-        from ...launcher import will_run_in_current_terminal
-
-        ran_here = will_run_in_current_terminal(count, background)
-
-        # Call op_launch
-        result = op_launch(
-            count,
-            claude_args,
-            launcher=launcher,
-            tag=tag,
-            background=background,
-            cwd=str(get_cwd()),
-            pty=use_pty,
-        )
-
-        launched = result["launched"]
-        failed = result["failed"]
-        batch_id = result["batch_id"]
-        instance_names = [h["instance_name"] for h in result.get("handles", []) if h.get("instance_name")]
-
-        # Print background log files
-        for log_file in result.get("log_files", []):
-            print(f"Headless launched, log: {log_file}")
-
-        # Show results
-        if failed > 0:
-            print(
-                f"Started the launch process for {launched}/{count} Claude agent{'s' if count != 1 else ''} ({failed} failed)"
-            )
-        else:
-            print(f"Started the launch process for {launched} Claude agent{'s' if launched != 1 else ''}")
-
-        print(f"Batch id: {batch_id}")
-        print("To block until ready or fail (30s timeout), run: hcom events launch")
-
-        # Auto-launch TUI if:
-        # - Not print mode, not background, not auto-watch disabled, all launched, interactive terminal
-        # - Did NOT run in current terminal (ran_here=True means single instance already finished)
-        # - NOT inside AI tool (would hijack the session)
-        # - NOT ad-hoc launch with --name (external script doesn't want TUI)
-        terminal_mode = get_config().terminal
-        explicit_name_provided = ctx and ctx.explicit_name
-
-        if (
-            terminal_mode != "print"
-            and failed == 0
-            and is_interactive()
-            and not background
-            and not no_auto_watch
-            and not ran_here
-            and not is_inside_ai_tool()
-            and not explicit_name_provided
-        ):
-            if tag:
-                print(f"\n  • Send to {tag} team: hcom send '@{tag}- message'")
-
-            print("\nOpening hcom UI...")
-            time.sleep(2)
-
-            from ...ui import run_tui
-
-            return run_tui(hcom_path())
-        else:
-            from ...core.tips import print_launch_tips
-
-            print_launch_tips(
-                launched=launched,
-                tag=tag,
-                instance_names=instance_names,
-                launcher_name=launcher if launcher != "user" else None,
-                launcher_participating=launcher_participating,
-                background=background,
-            )
-
-            return 0
-
-    except (CLIError, HcomError) as e:
-        print(format_error(str(e)), file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(format_error(str(e)), file=sys.stderr)
-        return 1
+    """Launch Claude instances. Alias for cmd_launch_tool("claude", ...)."""
+    return cmd_launch_tool("claude", argv, launcher_name=launcher_name, ctx=ctx)

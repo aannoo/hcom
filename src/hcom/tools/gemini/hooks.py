@@ -28,10 +28,12 @@ Message Delivery:
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from typing import TYPE_CHECKING
 
 from ...core.log import log_error, log_info
+from ...shared import ST_ACTIVE, ST_BLOCKED, ST_LISTENING
 
 if TYPE_CHECKING:
     from ...core.hcom_context import HcomContext
@@ -150,7 +152,7 @@ def _bind_vanilla_instance(
             update_instance_position(instance_name, updates)
         log_info("hooks", "gemini.bind.success", instance=instance_name, session_id=payload.session_id)
         return instance_name
-    except Exception as e:
+    except (sqlite3.Error, KeyError) as e:
         log_error("hooks", "hook.error", e, hook="gemini-aftertool", op="bind_vanilla")
         return instance_name
 
@@ -235,7 +237,7 @@ def handle_sessionstart(
     if transcript_path:
         updates["transcript_path"] = transcript_path
     update_instance_position(instance_name, updates)
-    set_status(instance_name, "listening", "start")
+    set_status(instance_name, ST_LISTENING, "start")
 
     from ...pty.pty_common import set_terminal_title
 
@@ -245,14 +247,6 @@ def handle_sessionstart(
     # Reason: Gemini doesn't display SessionStart hook output after /clear
     # BeforeAgent output always works, so it handles all bootstrap injection
     # SessionStart just does identity binding, BeforeAgent does bootstrap
-    # Pull remote events
-    try:
-        from ...relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception:
-        pass
     return HookResult.success()
 
 
@@ -313,15 +307,6 @@ def handle_beforeagent(
     if bootstrap := inject_bootstrap_once(instance_name, instance, tool="gemini"):
         outputs.append(bootstrap)
 
-    # Pull remote events (rate-limited)
-    try:
-        from ...relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception:
-        pass
-
     # Deliver pending messages
     from ...hooks.common import deliver_pending_messages
 
@@ -330,7 +315,7 @@ def handle_beforeagent(
         outputs.append(formatted)
     else:
         # Real user prompt (not hcom injection)
-        set_status(instance_name, "active", "prompt")
+        set_status(instance_name, ST_ACTIVE, "prompt")
 
     if outputs:
         combined = "\n\n---\n\n".join(outputs)
@@ -362,7 +347,7 @@ def handle_afteragent(
     from ...core.runtime import notify_instance
 
     instance_name = instance["name"]
-    set_status(instance_name, "listening", "")
+    set_status(instance_name, ST_LISTENING, "")
     notify_instance(instance_name)
 
     return HookResult.success()
@@ -476,7 +461,7 @@ def handle_notification(
 
     notification_type = payload.notification_type or "unknown"
     if notification_type == "ToolPermission":
-        set_status(instance["name"], "blocked", "approval")
+        set_status(instance["name"], ST_BLOCKED, "approval")
 
     return HookResult.success()
 
@@ -509,7 +494,7 @@ def handle_sessionend(
 
     try:
         finalize_session(instance["name"], reason)
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         log_error("hooks", "hook.error", e, hook="gemini-sessionend")
 
     return HookResult.success()
@@ -618,7 +603,7 @@ def handle_gemini_hook(hook_name: str) -> None:
     # Read stdin ONCE at dispatch entry
     try:
         stdin_json = json.load(sys.stdin)
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         stdin_json = {}
 
     # Build payload from stdin

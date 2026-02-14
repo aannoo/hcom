@@ -69,7 +69,7 @@ class LaunchField(Enum):
     CLAUDE_SECTION = 3  # Tool-specific config section
     HCOM_SECTION = 4  # HCOM config section
     CUSTOM_ENV_SECTION = 5  # Custom environment variables
-    OPEN_EDITOR = 6  # Open config.env in editor
+    OPEN_EDITOR = 6  # Open config.toml in editor
 
 
 # ===== Nested State Dataclasses =====
@@ -115,6 +115,7 @@ class ManageState:
     show_stopped_user_set: bool = False
     show_remote_user_set: bool = False
     device_sync_times: dict = field(default_factory=dict)
+    device_short_ids: dict = field(default_factory=dict)  # {device_id: short_id}
     send_state: Optional[str] = None  # None, 'sending', 'sent'
     send_state_until: float = 0.0
     unread_counts: dict = field(default_factory=dict)
@@ -297,7 +298,8 @@ class UIState:
         confirm: State for two-step confirmation dialogs.
         relay: State for cross-device relay sync.
         config_edit: Dict of config values being edited (key -> value).
-        config_mtime: Last modification time of config.env file.
+        config_mtime: Last modification time of config.toml file.
+        env_mtime: Last modification time of env passthrough file.
         frame_dirty: Whether screen needs re-render (optimization).
         flash_message: Current flash notification text (or None).
         flash_until: Timestamp when flash should disappear.
@@ -316,6 +318,7 @@ class UIState:
     # Shared config state
     config_edit: dict = field(default_factory=dict)
     config_mtime: float = 0.0
+    env_mtime: float = 0.0
 
     # Rendering
     frame_dirty: bool = True

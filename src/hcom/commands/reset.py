@@ -1,5 +1,6 @@
 """Reset commands for HCOM"""
 
+import sqlite3
 import sys
 import time
 import shutil
@@ -82,63 +83,40 @@ def clear() -> int:
             print("Started fresh HCOM conversation")
         return 0
 
-    except Exception as e:
+    except (OSError, sqlite3.Error) as e:
         print(format_error(f"Failed to archive: {e}"), file=sys.stderr)
         return 1
 
 
-def remove_global_hooks() -> bool:
-    """Remove HCOM hooks from all supported tool configs (global and HCOM_DIR-local)."""
-
-    success = True
-
-    # Remove Claude hooks
-    try:
-        from ..tools.claude.settings import remove_claude_hooks
-
-        if not remove_claude_hooks():
-            success = False
-    except Exception:
-        pass  # Claude module might not be available
-
-    # Remove Gemini hooks
-    try:
-        from ..tools.gemini.settings import remove_gemini_hooks
-
-        if not remove_gemini_hooks():
-            success = False
-    except Exception:
-        pass  # Gemini module might not be available
-
-    # Remove Codex hooks
-    try:
-        from ..tools.codex.settings import remove_codex_hooks
-
-        if not remove_codex_hooks():
-            success = False
-    except Exception:
-        pass  # Codex module might not be available
-
-    return success
-
 
 def reset_config() -> int:
     """Archive and reset config to defaults. Returns exit code."""
-    from ..core.paths import CONFIG_FILE
+    from ..core.paths import CONFIG_TOML, ENV_FILE
 
-    config_path = hcom_path(CONFIG_FILE)
-    if config_path.exists():
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_config_dir = hcom_path(ARCHIVE_DIR, "config")
+    archived = False
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_config_dir = hcom_path(ARCHIVE_DIR, "config")
+
+    toml_path = hcom_path(CONFIG_TOML)
+    if toml_path.exists():
         archive_config_dir.mkdir(parents=True, exist_ok=True)
-        archive_path = archive_config_dir / f"config.env.{timestamp}"
-        shutil.copy2(config_path, archive_path)
-        config_path.unlink()
-        print(f"Config archived to archive/config/config.env.{timestamp}")
-        return 0
-    else:
+        shutil.copy2(toml_path, archive_config_dir / f"config.toml.{timestamp}")
+        toml_path.unlink()
+        print(f"Config archived to archive/config/config.toml.{timestamp}")
+        archived = True
+
+    env_path = hcom_path(ENV_FILE)
+    if env_path.exists():
+        archive_config_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(env_path, archive_config_dir / f"env.{timestamp}")
+        env_path.unlink()
+        if not archived:
+            print(f"Env archived to archive/config/env.{timestamp}")
+        archived = True
+
+    if not archived:
         print("No config file to reset")
-        return 0
+    return 0
 
 
 def _print_reset_preview(target: str | None) -> None:
@@ -196,7 +174,7 @@ Actions:
   2. Archive database to ~/.hcom/archive/session-<timestamp>/
   3. Delete database (hcom.db)
   4. Remove hooks from Claude/Gemini/Codex configs
-  5. Archive and delete config.env
+  5. Archive and delete config.toml + env
   6. Clear device identity (new UUID on next relay)
 
 Set HCOM_GO=1 and run again to proceed:
@@ -291,21 +269,11 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Push reset event to relay server
     try:
-        from ..relay import notify_relay, push
+        from ..relay import trigger_push
 
-        if not notify_relay():
-            push(force=True)
+        trigger_push()
     except Exception:
         pass  # Best effort
-
-    # Pull fresh state from other devices
-    try:
-        from ..relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception as e:
-        print(f"Warning: Failed to pull remote state: {e}", file=sys.stderr)
 
     # all: also remove hooks, reset config, clear device identity
     if target == "all":

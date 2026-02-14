@@ -55,6 +55,7 @@ Architecture Notes
 from __future__ import annotations
 import math
 import random
+import sqlite3
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -74,7 +75,7 @@ from .thread_context import (
     get_launch_event_id,
     get_cwd,
 )
-from ..shared import format_age
+from ..shared import format_age, ST_ACTIVE, ST_LISTENING, ST_BLOCKED, ST_INACTIVE, ST_LAUNCHING
 from .timeouts import (
     LAUNCH_PLACEHOLDER_TIMEOUT,
     HEARTBEAT_THRESHOLD_TCP,
@@ -181,9 +182,6 @@ class InstanceData(TypedDict, total=False):
     subagent_timeout: int
     hints: str
 
-    # Notifications
-    notify_port: int | None
-
     # Device/relay info
     origin_device_id: str
     pid: int | None
@@ -192,7 +190,6 @@ class InstanceData(TypedDict, total=False):
 
     # Announcement tracking
     name_announced: int  # SQLite stores as int (0/1)
-    launch_context_announced: int  # SQLite stores as int (0/1)
 
     # Runtime state
     running_tasks: str  # JSON string
@@ -227,8 +224,6 @@ class InstanceStatus(NamedTuple):
 # Type variable for instance data dicts (can be partial)
 InstanceDataT = TypeVar("InstanceDataT", bound=dict[str, Any])
 
-# Configuration
-SKIP_HISTORY = True  # New instances start at current log position (skip old messages)
 # UNKNOWN_HEARTBEAT_AGE imported from core.timeouts
 
 
@@ -347,7 +342,6 @@ def update_instance_position(instance_name: str, update_fields: InstanceData | d
             "tcp_mode",
             "background",
             "name_announced",
-            "launch_context_announced",
         ]:
             if bool_field in update_copy:
                 val = update_copy[bool_field]
@@ -447,7 +441,7 @@ def is_launching_placeholder(pos_data: InstanceData | dict[str, Any]) -> bool:
     return (
         not pos_data.get("session_id")
         and pos_data.get("status_context") == "new"
-        and pos_data.get("status", "inactive") in ("inactive", "pending")
+        and pos_data.get("status", ST_INACTIVE) in (ST_INACTIVE, "pending")
     )
 
 
@@ -513,6 +507,49 @@ def _cleanup_orphaned_db_rows() -> None:
         log_warn("cleanup", "orphaned_db_cleanup_fail", error=str(e))
 
 
+_REMOTE_DEVICE_STALE_THRESHOLD = 90  # seconds without push before deleting remote instances
+
+
+def _cleanup_stale_remote_instances() -> None:
+    """Delete remote instance rows whose device hasn't pushed in >90s.
+
+    Backstop for missed LWT — if a device disappears without the broker
+    delivering its Last Will, its instance rows would otherwise stay forever
+    (since remote instances skip local heartbeat-based stale detection).
+    """
+    try:
+        from .db import get_db, kv_prefix
+
+        conn = get_db()
+        now = time.time()
+
+        # Find all distinct remote device IDs in instances table
+        rows = conn.execute(
+            "SELECT DISTINCT origin_device_id FROM instances "
+            "WHERE origin_device_id IS NOT NULL AND origin_device_id != ''"
+        ).fetchall()
+        if not rows:
+            return
+
+        sync_map = kv_prefix("relay_sync_time_")
+        for row in rows:
+            device_id = row["origin_device_id"]
+            sync_val = sync_map.get(f"relay_sync_time_{device_id}")
+            sync_time = float(sync_val) if sync_val else 0.0
+            if sync_time and (now - sync_time) <= _REMOTE_DEVICE_STALE_THRESHOLD:
+                continue
+            # Device is stale or has no sync time — clean up its instances
+            conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
+            conn.commit()
+            from ..relay import _clear_short_id
+            _clear_short_id(device_id)
+            from .log import log_info
+            log_info("cleanup", "remote_device_stale", device=device_id[:8])
+    except sqlite3.Error as e:
+        from .log import log_warn
+        log_warn("cleanup", "remote_stale_cleanup_fail", error=str(e))
+
+
 def cleanup_stale_instances(
     max_stale_seconds: int = CLEANUP_STALE_THRESHOLD,
     max_inactive_seconds: int = CLEANUP_INACTIVE_THRESHOLD,
@@ -543,9 +580,12 @@ def cleanup_stale_instances(
     # Cleanup orphaned DB rows (notify_endpoints, process_bindings for deleted instances)
     _cleanup_orphaned_db_rows()
 
-    # During wake grace period: skip stale cleanup to let heartbeats resume
+    # During wake grace period: skip all stale cleanup to let heartbeats/syncs resume
     if _is_in_wake_grace():
         return 0
+
+    # Cleanup remote instances whose device hasn't pushed in >90s (missed LWT backstop)
+    _cleanup_stale_remote_instances()
 
     deleted = 0
 
@@ -553,7 +593,7 @@ def cleanup_stale_instances(
         instance_status = get_instance_status(data)
 
         # Only target inactive instances
-        if instance_status.status != "inactive":
+        if instance_status.status != ST_INACTIVE:
             continue
 
         name = data.get("name")
@@ -611,22 +651,22 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
         Status is activity state (what instance is doing): 'active', 'listening', 'inactive'.
         Row exists = participating (all instances in DB are active participants).
     """
-    status = pos_data.get("status", "inactive")
+    status = pos_data.get("status", ST_INACTIVE)
     status_time = pos_data.get("status_time", 0)
     status_context = pos_data.get("status_context", "")
     wake_grace = _is_in_wake_grace()
 
     # Launching: instance created but session not yet bound / status not yet updated
     # This is the window between launcher creating instance and first hook firing
-    if status_context == "new" and status in ("inactive", "pending"):
+    if status_context == "new" and status in (ST_INACTIVE, "pending"):
         created_at = pos_data.get("created_at", 0)
         age = time.time() - created_at if created_at else 0
         if age < LAUNCH_PLACEHOLDER_TIMEOUT:
-            return InstanceStatus("launching", format_age(int(age)) if age else "", "launching", int(age), "new")
+            return InstanceStatus(ST_LAUNCHING, format_age(int(age)) if age else "", "launching", int(age), "new")
         else:
             # Timeout without hooks firing = launch probably failed
             return InstanceStatus(
-                "inactive",
+                ST_INACTIVE,
                 format_age(int(age)),
                 "launch probably failed — check logs or hcom list -v",
                 int(age),
@@ -652,23 +692,20 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
     # Heartbeat timeout check: instance was listening but heartbeat died
     # This detects terminated instances (closed window/crashed) that were listening
     # 'listening' is special: heartbeat-proven current (refreshed every ~30s)
-    if status == "listening":
+    if status == ST_LISTENING:
         last_stop = pos_data.get("last_stop", 0)
         is_remote = bool(pos_data.get("origin_device_id"))
 
-        # Remote instances: skip heartbeat check if no last_stop (can't verify remote heartbeat)
-        # Local instances: missing last_stop = stale (use status_time as fallback)
-        if not last_stop and is_remote:
-            pass  # Trust synced status for remote instances
+        # Remote instances: trust synced status — heartbeat is managed by relay push, not local
+        if is_remote:
+            age = 0
         else:
             heartbeat_age = (
                 now - last_stop if last_stop else (now - status_time if status_time else UNKNOWN_HEARTBEAT_AGE)
             )
             tcp_mode = pos_data.get("tcp_mode", False)
-            # Remote instances use 40s threshold (sync interval).
-            # Local instances use:
-            # - HEARTBEAT_THRESHOLD_TCP when there is an active TCP notify endpoint (pty, listen, hooks)
-            # - HEARTBEAT_THRESHOLD_NO_TCP otherwise (no TCP listener means rapid stale detection)
+            # HEARTBEAT_THRESHOLD_TCP when there is an active TCP notify endpoint (pty, listen, hooks)
+            # HEARTBEAT_THRESHOLD_NO_TCP otherwise (no TCP listener means rapid stale detection)
             has_tcp_listener = bool(tcp_mode)
             if not has_tcp_listener:
                 try:
@@ -683,12 +720,12 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
                 except Exception:
                     has_tcp_listener = bool(tcp_mode)
 
-            threshold = HEARTBEAT_THRESHOLD_TCP if (has_tcp_listener or is_remote) else HEARTBEAT_THRESHOLD_NO_TCP
+            threshold = HEARTBEAT_THRESHOLD_TCP if has_tcp_listener else HEARTBEAT_THRESHOLD_NO_TCP
             if heartbeat_age > threshold:
                 if wake_grace:
                     age = 0  # Wake grace: heartbeat will refresh soon
                 else:
-                    status = "inactive"
+                    status = ST_INACTIVE
                     status_context = "stale:listening"
                     age = heartbeat_age
             else:
@@ -696,7 +733,7 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
                 age = 0
     # Activity timeout check: no status updates for extended period
     # This detects terminated instances that were active/blocked/etc when closed
-    elif status not in ["inactive"]:
+    elif status not in [ST_INACTIVE]:
         status_age = now - status_time if status_time else 0
 
         # Fallback to created_at for instances that never updated status (e.g. active: new)
@@ -707,26 +744,29 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
                 status_age = now - int(created_at)
 
         if status_age > STATUS_ACTIVITY_TIMEOUT:
-            # PTY instances have a Rust delivery thread that updates last_stop every ~30s
-            # regardless of Python-level status. If heartbeat is fresh, process is alive —
-            # don't mark stale just because no hook fired (e.g. long tool call, blocked prompt).
-            last_stop = pos_data.get("last_stop", 0)
-            if last_stop and (now - last_stop) < HEARTBEAT_THRESHOLD_TCP:
-                pass  # Heartbeat fresh — process alive, skip stale
-            elif wake_grace:
-                pass  # Wake grace: heartbeat will refresh soon
-            else:
-                prev_status = status  # Capture before changing
-                status = "inactive"
-                status_context = f"stale:{prev_status}"
-                age = status_age
+            # Remote instances: trust synced status — relay manages lifecycle
+            is_remote = bool(pos_data.get("origin_device_id"))
+            if not is_remote:
+                # PTY instances have a Rust delivery thread that updates last_stop every ~30s
+                # regardless of Python-level status. If heartbeat is fresh, process is alive —
+                # don't mark stale just because no hook fired (e.g. long tool call, blocked prompt).
+                last_stop = pos_data.get("last_stop", 0)
+                if last_stop and (now - last_stop) < HEARTBEAT_THRESHOLD_TCP:
+                    pass  # Heartbeat fresh — process alive, skip stale
+                elif wake_grace:
+                    pass  # Wake grace: heartbeat will refresh soon
+                else:
+                    prev_status = status  # Capture before changing
+                    status = ST_INACTIVE
+                    status_context = f"stale:{prev_status}"
+                    age = status_age
 
     # Build description from status and context
     description = get_status_description(status, status_context)
 
     # Adhoc instances: strip "inactive: " prefix (we don't claim dead, just show last event)
     tool = pos_data.get("tool", "claude")
-    if tool == "adhoc" and status == "inactive":
+    if tool == "adhoc" and status == ST_INACTIVE:
         if description.startswith("inactive: "):
             description = description[10:]
         elif description == "inactive":
@@ -758,7 +798,7 @@ def get_status_description(status: str, context: str = "") -> str:
     - unknown - unknown state
     - Empty string - simple idle (no context needed)
     """
-    if status == "active":
+    if status == ST_ACTIVE:
         if context.startswith("deliver:"):
             sender = context[8:]  # "deliver:luna" → "luna"
             return f"active: msg from {sender}"
@@ -771,7 +811,7 @@ def get_status_description(status: str, context: str = "") -> str:
         elif context == "resuming":
             return "resuming..."
         return f"active: {context}" if context else "active"
-    elif status == "listening":
+    elif status == ST_LISTENING:
         if context == "tui:not-ready":
             return "listening: blocked"
         elif context == "tui:not-idle":
@@ -790,11 +830,11 @@ def get_status_description(status: str, context: str = "") -> str:
             return "listening: suspended"
         # Don't show 'ready' or other normal contexts
         return "listening"
-    elif status == "blocked":
+    elif status == ST_BLOCKED:
         if context == "pty:approval":
             return "blocked: approval pending"
         return f"blocked: {context}" if context else "blocked: permission needed"
-    elif status == "inactive":
+    elif status == ST_INACTIVE:
         if context.startswith("stale:"):
             return "inactive: stale"
         elif context.startswith("exit:"):
@@ -822,19 +862,19 @@ def get_status_icon(pos_data: InstanceData | dict[str, Any], status: StatusType 
     from ..shared import STATUS_ICONS, ADHOC_ICON
 
     # Resolve status from pos_data if not provided
-    resolved_status: str = status if status is not None else (pos_data.get("status") or "inactive")
+    resolved_status: str = status if status is not None else (pos_data.get("status") or ST_INACTIVE)
     tool = pos_data.get("tool", "claude")
 
     # Launching: flash between ◎ and ○ (2Hz)
-    if resolved_status == "launching":
+    if resolved_status == ST_LAUNCHING:
         return "◎○"[int(time.time() * 2) % 2]
 
     # Adhoc: only 2 states - listening (normal ◉) or neutral (◦)
     # Neutral when not actively listening (we can't verify if alive)
-    if tool == "adhoc" and resolved_status != "listening":
+    if tool == "adhoc" and resolved_status != ST_LISTENING:
         return ADHOC_ICON
 
-    return STATUS_ICONS.get(resolved_status, STATUS_ICONS["inactive"])
+    return STATUS_ICONS.get(resolved_status, STATUS_ICONS[ST_INACTIVE])
 
 
 def set_status(
@@ -876,7 +916,7 @@ def set_status(
         "status_detail": detail,
     }
     # Set last_stop heartbeat when entering listening state (for staleness detection)
-    if status == "listening":
+    if status == ST_LISTENING:
         updates["last_stop"] = int(time.time())
 
     # Check if status actually changed (for notify optimization)
@@ -996,11 +1036,9 @@ def set_status(
             data["msg_ts"] = msg_ts
         log_event(event_type="status", instance=instance_name, data=data)
         # Push to relay so remote devices see current state
-        if status in ("listening", "inactive"):
-            from ..relay import notify_relay, push
+        from ..relay import trigger_push
 
-            if not notify_relay():
-                push(force=status == "inactive")
+        trigger_push()
     except Exception as e:
         from .log import log_error
 
@@ -1672,7 +1710,7 @@ def bind_session_to_process(
             else:
                 # Real instance being abandoned due to session switch.
                 # Mark inactive and remove session binding (process no longer serves it)
-                set_status(placeholder_name, "inactive", "exit:session_switch")
+                set_status(placeholder_name, ST_INACTIVE, "exit:session_switch")
                 delete_session_bindings_for_instance(placeholder_name)
 
         # Apply resume updates to canonical instance
@@ -1777,13 +1815,13 @@ def initialize_instance_in_position_file(
             if background:
                 updates["background"] = int(background)
 
-            # Fix last_event_id for new instances (SKIP_HISTORY fix)
+            # Fix last_event_id for new instances
             # Only set if:
             # 1. last_event_id is 0 (never received messages)
             # 2. AND session_id is not set (true placeholder, not a resumed instance)
             # This prevents accidentally skipping messages for resumed instances
             is_true_placeholder = not existing.get("session_id")
-            if SKIP_HISTORY and existing.get("last_event_id", 0) == 0 and is_true_placeholder:
+            if existing.get("last_event_id", 0) == 0 and is_true_placeholder:
                 current_max = get_last_event_id()
                 # Validate launch event ID isn't stale (higher than max = DB was reset)
                 launch_event_id_str = get_launch_event_id()
@@ -1818,22 +1856,20 @@ def initialize_instance_in_position_file(
 
             return True
 
-        # Determine starting event ID: skip history or read from beginning
-        initial_event_id = 0
-        if SKIP_HISTORY:
-            current_max = get_last_event_id()
-            # Use launch event ID if valid (for hcom-launched instances)
-            # Validate it's not stale (higher than current max = DB was reset)
-            launch_event_id_str = get_launch_event_id()
-            if launch_event_id_str:
-                launch_event_id = int(launch_event_id_str)
-                if launch_event_id <= current_max:
-                    initial_event_id = launch_event_id
-                else:
-                    # Stale env var from before DB reset - use current max
-                    initial_event_id = current_max
+        # New instances start at current log position (skip old messages)
+        current_max = get_last_event_id()
+        # Use launch event ID if valid (for hcom-launched instances)
+        # Validate it's not stale (higher than current max = DB was reset)
+        launch_event_id_str = get_launch_event_id()
+        if launch_event_id_str:
+            launch_event_id = int(launch_event_id_str)
+            if launch_event_id <= current_max:
+                initial_event_id = launch_event_id
             else:
+                # Stale env var from before DB reset - use current max
                 initial_event_id = current_max
+        else:
+            initial_event_id = current_max
 
         data = {
             "name": instance_name,
@@ -1845,7 +1881,7 @@ def initialize_instance_in_position_file(
             "transcript_path": "",
             "name_announced": 0,
             "tag": None,
-            "status": "inactive",  # New instances start inactive until first hook/PTY fires
+            "status": ST_INACTIVE,  # New instances start inactive until first hook/PTY fires
             "status_time": int(time.time()),
             # status_context="new" triggers ready event on first status update (see set_status)
             "status_context": "new",

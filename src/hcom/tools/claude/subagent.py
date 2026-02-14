@@ -34,6 +34,7 @@ import sys
 import json
 
 from ...core.config import get_config
+from ...shared import ST_ACTIVE, ST_INACTIVE
 from ...core.instances import (
     load_instance_position,
     update_instance_position,
@@ -181,7 +182,7 @@ def cleanup_dead_subagents(session_id: str, transcript_path: str) -> None:
         if row:
             from ...core.tool_utils import stop_instance
 
-            set_status(row["name"], "inactive", "exit:interrupted")
+            set_status(row["name"], ST_INACTIVE, "exit:interrupted")
             stop_instance(row["name"], initiated_by="system", reason="interrupted")
 
 
@@ -295,18 +296,6 @@ def posttooluse(
 
     # Row exists = participating, proceed with message delivery
 
-    # Pull remote events (rate-limited)
-    try:
-        from ...relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception as e:
-        # Best-effort sync - log for debugging
-        from ...core.log import log_error
-
-        log_error("relay", "relay.error", e, hook="subagent_posttooluse")
-
     outputs = []
 
     # Message delivery (like parent PostToolUse)
@@ -323,7 +312,7 @@ def posttooluse(
 
         set_status(
             subagent_name,
-            "active",
+            ST_ACTIVE,
             f"deliver:{get_display_name(deliver_messages[0]['from'])}",
             msg_ts=deliver_messages[-1]["timestamp"],
         )
@@ -438,7 +427,7 @@ def subagent_stop(hook_data: dict[str, Any]) -> None:
         from ...core.tool_utils import stop_instance
 
         reason = "timeout" if timed_out else "task_completed"
-        set_status(subagent_id, "inactive", f"exit:{reason}")
+        set_status(subagent_id, ST_INACTIVE, f"exit:{reason}")
         if parent_name:
             _remove_subagent_from_parent(parent_name, agent_id)
         stop_instance(subagent_id, initiated_by="subagent", reason=reason)

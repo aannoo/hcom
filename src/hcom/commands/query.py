@@ -1,5 +1,6 @@
 """Query commands for HCOM - list and archive operations"""
 
+import sqlite3
 import sys
 import os
 import json
@@ -15,7 +16,16 @@ from ..core.instances import (
     get_full_name,
     resolve_display_name,
 )
-from ..shared import format_age, shorten_path, HcomError, CommandContext
+from ..shared import (
+    format_age,
+    shorten_path,
+    HcomError,
+    CommandContext,
+    ST_ACTIVE,
+    ST_LISTENING,
+    ST_BLOCKED,
+    ST_INACTIVE,
+)
 
 
 def _list_archives(here_filter: bool = False, limit: int = 0) -> list[dict]:
@@ -152,7 +162,7 @@ def _query_archive_events(archive: dict, sql_filter: str | None, last: int) -> l
             )
         conn.close()
         return list(reversed(events))  # Show oldest first
-    except Exception as e:
+    except sqlite3.Error as e:
         conn.close()
         raise e
 
@@ -176,7 +186,7 @@ def _query_archive_instances(archive: dict, sql_filter: str | None) -> list[dict
         instances = [dict(row) for row in rows]
         conn.close()
         return instances
-    except Exception as e:
+    except sqlite3.Error as e:
         conn.close()
         raise e
 
@@ -280,7 +290,7 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                         transcript = shorten_path(inst.get("transcript_path", ""))
                         print(f"{name:<8} {status:<8} {directory:<40} {transcript}")
             return 0
-        except Exception as e:
+        except (sqlite3.Error, ValueError) as e:
             print(format_error(f"Query failed: {e}"), file=sys.stderr)
             return 1
 
@@ -321,7 +331,7 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     else:
                         print(f"#{eid} {ts} {etype:<8} {inst:<8}")
         return 0
-    except Exception as e:
+    except (sqlite3.Error, ValueError) as e:
         print(format_error(f"Query failed: {e}"), file=sys.stderr)
         return 1
 
@@ -368,15 +378,6 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Clean up stale launching placeholders (>2min) and stale instances (>1hr)
     cleanup_stale_placeholders()
     cleanup_stale_instances()
-
-    # Pull remote state for fresh instance list
-    try:
-        from ..relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception:
-        pass
 
     # Validate flags before parsing
     if error := validate_flags("list", argv):
@@ -673,7 +674,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             # "now" special case (listening status uses age=0)
             age_display = age_str if age_str == "now" else (f"{age_str} ago" if age_str else "")
             # Append "since X" for listening agents idle >= 1 minute
-            if status == "listening" and description == "listening":
+            if status == ST_LISTENING and description == "listening":
                 from ..shared import format_listening_since
 
                 description += format_listening_since(data.get("status_time", 0))
@@ -710,7 +711,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             # Timeout marker for subagents about to expire
             timeout_marker = ""
             is_subagent = bool(data.get("parent_session_id"))
-            if status == "listening" and is_subagent:
+            if status == ST_LISTENING and is_subagent:
                 from ..core.config import get_config
                 from ..core.instances import load_instance_position
 
@@ -1020,10 +1021,10 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Instance status counts
     instance_counts = {
-        "active": 0,
-        "listening": 0,
-        "blocked": 0,
-        "inactive": 0,
+        ST_ACTIVE: 0,
+        ST_LISTENING: 0,
+        ST_BLOCKED: 0,
+        ST_INACTIVE: 0,
         "total": 0,
     }
     try:
@@ -1149,10 +1150,10 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print()
 
         # Instances
-        active = instance_counts.get("active", 0)
-        listening = instance_counts.get("listening", 0)
-        blocked = instance_counts.get("blocked", 0)
-        inactive = instance_counts.get("inactive", 0)
+        active = instance_counts.get(ST_ACTIVE, 0)
+        listening = instance_counts.get(ST_LISTENING, 0)
+        blocked = instance_counts.get(ST_BLOCKED, 0)
+        inactive = instance_counts.get(ST_INACTIVE, 0)
         parts = []
         if active:
             parts.append(f"{active} active")

@@ -1,5 +1,6 @@
 """Messaging commands for HCOM"""
 
+import binascii
 import socket
 import sys
 import time
@@ -13,7 +14,7 @@ from .utils import (
     validate_flags,
     validate_message,
 )
-from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER, HcomError, CommandContext
+from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER, HcomError, CommandContext, ST_ACTIVE, ST_INACTIVE, ST_LISTENING
 from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
 from ..core.instances import load_instance_position, set_status, get_instance_status
@@ -118,7 +119,7 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
         r_data = load_instance_position(r_name)
         if r_data:
             status, _, _, _, _ = get_instance_status(r_data)
-            icon = STATUS_ICONS.get(status, STATUS_ICONS["inactive"])
+            icon = STATUS_ICONS.get(status, STATUS_ICONS[ST_INACTIVE])
             display_name = get_full_name(r_data) or r_name
         else:
             icon = ADHOC_ICON  # Unknown recipient - neutral (not claiming dead)
@@ -375,7 +376,7 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             return err
         try:
             message = b64.b64decode(base64_val).decode("utf-8")
-        except Exception:
+        except (ValueError, binascii.Error):
             print(format_error("Invalid base64 encoding"), file=sys.stderr)
             return 1
         if not message:
@@ -503,15 +504,6 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
         # Status set by _set_hookless_command_status in cli.py for subagent/codex/adhoc
 
-        # Pull remote state to ensure delivered_to includes cross-device instances
-        try:
-            from ..relay import is_relay_handled_by_daemon, pull
-
-            if not is_relay_handled_by_daemon():
-                pull()  # relay.py logs errors internally
-        except Exception:
-            pass  # Best-effort - local send still works
-
         # Create bundle event if provided
         if bundle_data is not None:
             from ..core.bundles import create_bundle_event, validate_bundle
@@ -530,10 +522,9 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
             bundle_id = create_bundle_event(bundle_data, instance=bundle_instance, created_by=identity.name)
             try:
-                from ..relay import notify_relay, push
+                from ..relay import trigger_push
 
-                if not notify_relay():
-                    push()
+                trigger_push()
             except Exception:
                 pass
             envelope["bundle_id"] = bundle_id
@@ -733,7 +724,7 @@ def _listen_with_filter(
 
     # Mark instance as listening BEFORE capturing last_id
     # This ensures our own status event is excluded from the subscription
-    set_status(instance_name, "listening", f"filter:{sub_id}")
+    set_status(instance_name, ST_LISTENING, f"filter:{sub_id}")
 
     kv_set(
         sub_key,
@@ -803,7 +794,7 @@ def _listen_with_filter(
                             )
                         else:
                             print(f"\n{msg.get('message', '')}")
-                        set_status(instance_name, "active", "filter matched")
+                        set_status(instance_name, ST_ACTIVE, "filter matched")
                         return 0
 
                 # Other messages received - exit to let agent process them
@@ -816,7 +807,7 @@ def _listen_with_filter(
                     else:
                         formatted = format_hook_messages(real_messages, instance_name)
                         print(f"\n{formatted}")
-                    set_status(instance_name, "active", "message received")
+                    set_status(instance_name, ST_ACTIVE, "message received")
                     return 0
 
             # Update heartbeat
@@ -839,7 +830,7 @@ def _listen_with_filter(
         if not json_output:
             print(f"\n[Timeout: no match after {timeout}s]", file=sys.stderr)
         if instance_data.get("tool") == "adhoc":
-            set_status(instance_name, "inactive", "exit:timeout")
+            set_status(instance_name, ST_INACTIVE, "exit:timeout")
         return 0
 
     except KeyboardInterrupt:
@@ -995,7 +986,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Standard message-wait mode below
     # Mark as cmd:listen FIRST — blocks delivery gate before any async setup.
     # Uses detail (not context) to avoid affecting TUI status display.
-    set_status(instance_name, "listening", "ready", detail="cmd:listen")
+    set_status(instance_name, ST_LISTENING, "ready", detail="cmd:listen")
 
     start_time = time.time()
 
@@ -1058,19 +1049,19 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 # Codex: set active:deliver (matches Gemini pattern - notify hook sets idle)
                 # Others: set active (they have hooks to track state)
                 if instance_data.get("tool") == "adhoc":
-                    set_status(instance_name, "inactive", "message received")
+                    set_status(instance_name, ST_INACTIVE, "message received")
                 elif instance_data.get("tool") == "codex":
                     msg_ts = messages[-1].get("timestamp", "")
                     from ..core.instances import get_display_name
 
                     set_status(
                         instance_name,
-                        "active",
+                        ST_ACTIVE,
                         f"deliver:{get_display_name(messages[0]['from'])}",
                         msg_ts=msg_ts,
                     )
                 else:
-                    set_status(instance_name, "active", "finished listening")
+                    set_status(instance_name, ST_ACTIVE, "finished listening")
 
                 if json_output:
                     import json
@@ -1114,7 +1105,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         # Timeout
         # Only set inactive for adhoc instances - others have their own lifecycle
         if instance_data.get("tool") == "adhoc":
-            set_status(instance_name, "inactive", "exit:timeout")
+            set_status(instance_name, ST_INACTIVE, "exit:timeout")
         if not json_output:
             print(f"\n[Timeout: no messages after {timeout}s]", file=sys.stderr)
         # Timeout is normal for listen (especially for external tools)
@@ -1129,7 +1120,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         try:
             current = load_instance_position(instance_name)
             if current and current.get("status_detail") == "cmd:listen":
-                set_status(instance_name, "listening", "ready")
+                set_status(instance_name, ST_LISTENING, "ready")
         except Exception:
             pass
         # Clean up notify endpoint so future sends don't hit stale port

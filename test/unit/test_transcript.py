@@ -129,7 +129,8 @@ class TestExtractFilesFromContent:
     def test_string_content_returns_empty(self):
         assert extract_files_from_content("hello") == []
 
-    def test_limit_to_ten(self):
+    def test_no_file_limit(self):
+        """Bug fix #7: Removed internal [:10] cap - callers cap as needed."""
         content = [
             {"type": "tool_use", "input": {"file_path": f"/path/{i}.py"}}
             for i in range(15)

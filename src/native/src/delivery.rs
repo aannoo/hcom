@@ -3,7 +3,7 @@
 //! Ported from Python push_delivery.py - notify-driven delivery with:
 //! - Gate checks (idle, ready, prompt empty, output stable, user activity, approval)
 //! - Three-phase verification (text render -> text clear -> cursor advance)
-//! - Bounded retry with backoff
+//! - Fixed 1s retry poll (TCP notify handles fast path)
 //!
 //! ## Design Goals
 //!
@@ -45,7 +45,8 @@ fn full_display_name(db: &HcomDb, name: &str) -> String {
     }
 }
 
-/// Map status to icon (matches TUI/hcom list format)
+/// Map status to icon (matches TUI/hcom list format).
+/// Source of truth for status values: src/hcom/shared.py ST_* constants.
 pub fn status_icon(status: &str) -> &'static str {
     match status {
         "listening" => "◉",
@@ -163,7 +164,6 @@ fn build_codex_inject_with_hint(db: &HcomDb, name: &str) -> String {
 /// 5. `require_prompt_empty` - Check if prompt has no user text.
 ///    Claude-specific: Uses VT100 dim attribute detection to distinguish placeholder text
 ///    (dim) from user input (not dim). Implemented in screen.rs get_claude_input_text(). 
-/// 6. `require_output_stable_seconds` - Screen unchanged for N seconds. Disabled for all tools since hooks already signal idle state reliably.
 #[derive(Clone)]
 pub struct ToolConfig {
     /// Tool name (claude, gemini, codex)
@@ -174,8 +174,6 @@ pub struct ToolConfig {
     pub require_ready_prompt: bool,
     /// Require prompt to be empty (no user text)
     pub require_prompt_empty: bool,
-    /// Seconds of output stability required
-    pub require_output_stable_seconds: f64,
     /// Block if user is actively typing
     pub block_on_user_activity: bool,
     /// Block if approval prompt detected
@@ -188,14 +186,12 @@ impl ToolConfig {
     /// - `require_ready_prompt=false`: Status bar ("? for shortcuts") hides in accept-edits mode.
     /// - `require_prompt_empty=true`: Uses vt100 dim attribute detection to distinguish
     ///   placeholder text from user input. Placeholder (dim) = safe, user text (not dim) = block.
-    /// - `require_output_stable_seconds=0`: Disabled; hooks already signal idle state.
     pub fn claude() -> Self {
         Self {
             tool: "claude".to_string(),
             require_idle: true,
             require_ready_prompt: false,
             require_prompt_empty: true,
-            require_output_stable_seconds: 0.0,
             block_on_user_activity: true,
             block_on_approval: true,
         }
@@ -205,7 +201,6 @@ impl ToolConfig {
     ///
     /// - `require_ready_prompt=true`: "Type your message" placeholder disappears instantly when
     ///   user types. Pattern visibility indicates 100% empty prompt. (but could be processing or idle)
-    /// - `require_output_stable_seconds=0`: Disabled; hooks already signal idle state.
     ///
     /// Note: Previously used DebouncedIdleChecker (0.4s debounce) because AfterAgent fired
     /// multiple times per turn during tool loops. However, Gemini CLI commit 15c9f88da
@@ -217,7 +212,6 @@ impl ToolConfig {
             require_idle: true,
             require_ready_prompt: true,
             require_prompt_empty: false,
-            require_output_stable_seconds: 0.0,  // Disabled: hooks already signal idle state
             block_on_user_activity: true,
             block_on_approval: true,
         }
@@ -237,7 +231,6 @@ impl ToolConfig {
             require_idle: true,
             require_ready_prompt: false,
             require_prompt_empty: true,
-            require_output_stable_seconds: 0.0,
             block_on_user_activity: true,
             block_on_approval: true,
         }
@@ -275,7 +268,6 @@ pub struct DeliveryState {
 pub struct ScreenState {
     pub ready: bool,
     pub approval: bool,
-    pub output_stable_1s: bool,
     pub prompt_empty: bool,
     pub input_text: Option<String>,
     pub last_user_input: Instant,
@@ -290,7 +282,6 @@ impl Default for ScreenState {
         Self {
             ready: false,
             approval: false,
-            output_stable_1s: false,
             prompt_empty: false,
             input_text: None,
             last_user_input: Instant::now(),
@@ -350,10 +341,6 @@ pub(crate) fn evaluate_gate(
     if config.require_prompt_empty && !screen.prompt_empty {
         return GateResult { safe: false, reason: "prompt_has_text" };
     }
-    // Check output stability (skip if <= 0, which disables the check)
-    if config.require_output_stable_seconds > 0.0 && !screen.output_stable_1s {
-        return GateResult { safe: false, reason: "output_unstable" };
-    }
 
     GateResult { safe: true, reason: "ok" }
 }
@@ -388,61 +375,10 @@ fn inject_enter(port: u16) -> bool {
     }
 }
 
-/// Two-phase retry policy with warm and cold phases.
-///
-/// Keeps retry maximum low for the first N seconds after messages become pending,
-/// then allows a higher maximum (lower overhead) if the tool stays unsafe.
-///
-/// ## Why two phases?
-///
-/// - **Warm phase (0-60s)**: Fast retries (max 2s) for transient blocks.
-///   Most delivery blocks are brief (user types, then stops; AI finishes turn).
-///   Fast retries ensure messages arrive quickly once the block clears.
-///
-/// - **Cold phase (60s+)**: Slow retries (max 5s) for persistent blocks.
-///   If the tool is genuinely unavailable (user walked away, long AI task),
-///   slower retries reduce CPU usage and log spam without losing messages.
-pub(crate) struct TwoPhaseRetryPolicy {
-    /// Initial delay before first retry (seconds)
-    initial: f64,
-    /// Exponential backoff multiplier
-    multiplier: f64,
-    /// Maximum delay during warm phase (seconds)
-    warm_maximum: f64,
-    /// Duration of warm phase (seconds)
-    warm_seconds: f64,
-    /// Maximum delay during cold phase (seconds)
-    cold_maximum: f64,
-}
-
-impl TwoPhaseRetryPolicy {
-    pub(crate) fn default_policy() -> Self {
-        Self {
-            initial: 0.25,
-            multiplier: 2.0,
-            warm_maximum: 2.0,
-            warm_seconds: 60.0,
-            cold_maximum: 5.0,
-        }
-    }
-
-    pub(crate) fn delay(&self, attempt: u32, pending_for: Option<Duration>) -> Duration {
-        if attempt == 0 {
-            return Duration::ZERO;
-        }
-        // Cap exponent to prevent overflow (2^10 = 1024 is already way past max)
-        let exp = (attempt - 1).min(10) as i32;
-        let d = self.initial * self.multiplier.powi(exp);
-
-        // Use cold maximum after warm_seconds of pending
-        let max_delay = match pending_for {
-            Some(dur) if dur.as_secs_f64() >= self.warm_seconds => self.cold_maximum,
-            _ => self.warm_maximum,
-        };
-
-        Duration::from_secs_f64(d.min(max_delay))
-    }
-}
+/// Fixed retry delay between gate-blocked delivery attempts.
+/// TCP notify handles the fast path (instant wake on status change);
+/// this is the fallback polling interval for missed notifications.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Delivery loop states
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -475,7 +411,6 @@ pub fn run_delivery_loop(
     shared_name: Option<Arc<std::sync::RwLock<String>>>,
     shared_status: Option<Arc<std::sync::RwLock<String>>>,
 ) {
-    let retry = TwoPhaseRetryPolicy::default_policy();
     let idle_wait = Duration::from_secs(30);
 
     // Phase timeouts
@@ -536,8 +471,6 @@ pub fn run_delivery_loop(
     let mut injected_text = String::new();
     let mut phase_started_at = Instant::now();
     let mut cursor_before: i64 = 0;
-    let mut pending_since: Option<Instant> = Some(Instant::now()); // Track for two-phase retry
-
     // Gate block tracking for TUI status updates
     let mut block_since: Option<Instant> = None;
     let mut last_block_context: String = String::new();
@@ -656,7 +589,6 @@ pub fn run_delivery_loop(
                         notified, current_name
                     ));
                     delivery_state = State::Pending;
-                    pending_since = Some(Instant::now()); // Start tracking pending time
                 } else if notified {
                     // Woke by notification but no pending messages — log for diagnostics
                     log_info("native", "delivery.wake_no_pending", &format!(
@@ -674,7 +606,6 @@ pub fn run_delivery_loop(
                     ));
                     delivery_state = State::Idle;
                     attempt = 0;
-                    pending_since = None; // Clear pending tracking
                     continue;
                 }
 
@@ -700,7 +631,6 @@ pub fn run_delivery_loop(
                     if !db.has_pending(&current_name) {
                         delivery_state = State::Idle;
                         attempt = 0;
-                        pending_since = None;
                         inject_attempt = 0;
                         continue;
                     }
@@ -756,9 +686,9 @@ pub fn run_delivery_loop(
                     if attempt == 0 || attempt % 5 == 0 {
                         let screen = state.screen.read().unwrap();
                         log_info("native", "delivery.gate_blocked", &format!(
-                            "Gate blocked: {} (attempt={}, ready={}, approval={}, stable={}, user_active={})",
+                            "Gate blocked: {} (attempt={}, ready={}, approval={}, user_active={})",
                             gate.reason, attempt,
-                            screen.ready, screen.approval, screen.output_stable_1s,
+                            screen.ready, screen.approval,
                             state.is_user_active()
                         ));
                     }
@@ -864,13 +794,11 @@ pub fn run_delivery_loop(
                     attempt += 1;
                 }
 
-                // Wait before retry (two-phase: warm 2s for 60s, then cold 5s)
-                let pending_for = pending_since.map(|t| t.elapsed());
-                let delay = retry.delay(attempt, pending_for);
-                if !delay.is_zero() {
-                    let notified = notify.wait(delay);
+                // Fixed 1s poll — TCP notify handles the fast path
+                if attempt > 0 {
+                    let notified = notify.wait(RETRY_DELAY);
                     if notified {
-                        attempt = 0; // Reset on notification
+                        attempt = 0;
                     }
                 }
             }
@@ -1008,11 +936,9 @@ pub fn run_delivery_loop(
                     if db.has_pending(&current_name) {
                         log_info("native", "delivery.more_pending", "More messages pending, continuing");
                         delivery_state = State::Pending;
-                        pending_since = Some(Instant::now()); // Reset pending timer for new batch
                     } else {
                         log_info("native", "delivery.complete", "All messages delivered, going idle");
                         delivery_state = State::Idle;
-                        pending_since = None;
                     }
                     attempt = 0;
                     inject_attempt = 0;
@@ -1050,7 +976,6 @@ pub fn run_delivery_loop(
                             "Messages gone despite cursor not advancing - delivery successful"
                         );
                         delivery_state = State::Idle;
-                        pending_since = None;
                         attempt = 0;
                         inject_attempt = 0;
                         continue;
@@ -1107,8 +1032,9 @@ pub fn run_delivery_loop(
         };
         let _ = db.set_status(&current_name, "inactive", exit_context);
 
-        // 3. Delete notify endpoints
+        // 3. Delete notify endpoints and event subscriptions
         let _ = db.delete_notify_endpoints(&current_name);
+        let _ = db.cleanup_subscriptions(&current_name);
 
         // 4. Log life event BEFORE delete — if log fails, row stays (stale cleanup catches it).
         //    Previous order (delete first) lost snapshots when log_life_event hit DB lock.
@@ -1148,7 +1074,6 @@ mod tests {
         ScreenState {
             ready: true,
             approval: false,
-            output_stable_1s: true,
             prompt_empty: true,
             input_text: None,
             last_user_input: Instant::now() - Duration::from_secs(10),
@@ -1244,27 +1169,6 @@ mod tests {
     }
 
     #[test]
-    fn gate_output_unstable_only_when_configured() {
-        // All tools have require_output_stable_seconds=0, so this gate never fires
-        let config = ToolConfig::claude();
-        let mut screen = safe_screen();
-        screen.output_stable_1s = false;
-        let state = make_state(screen, 500);
-        let result = evaluate_gate(&config, &state, true);
-        assert!(result.safe); // 0s stable requirement = always passes
-
-        // But if we made a config that requires it:
-        let mut strict = ToolConfig::claude();
-        strict.require_output_stable_seconds = 1.0;
-        let mut screen2 = safe_screen();
-        screen2.output_stable_1s = false;
-        let state2 = make_state(screen2, 500);
-        let result2 = evaluate_gate(&strict, &state2, true);
-        assert!(!result2.safe);
-        assert_eq!(result2.reason, "output_unstable");
-    }
-
-    #[test]
     fn gate_fail_fast_order() {
         // When multiple gates fail, first one wins
         let config = ToolConfig::gemini();
@@ -1275,50 +1179,6 @@ mod tests {
         // not idle + approval + not ready → not_idle wins
         let result = evaluate_gate(&config, &state, false);
         assert_eq!(result.reason, "not_idle");
-    }
-
-    // ---- TwoPhaseRetryPolicy tests ----
-
-    #[test]
-    fn retry_attempt_zero_is_instant() {
-        let policy = TwoPhaseRetryPolicy::default_policy();
-        assert_eq!(policy.delay(0, None), Duration::ZERO);
-    }
-
-    #[test]
-    fn retry_warm_phase_exponential() {
-        let policy = TwoPhaseRetryPolicy::default_policy();
-        let d1 = policy.delay(1, None).as_secs_f64();
-        let d2 = policy.delay(2, None).as_secs_f64();
-        let d3 = policy.delay(3, None).as_secs_f64();
-        let d4 = policy.delay(4, None).as_secs_f64();
-        assert!((d1 - 0.25).abs() < 0.01);
-        assert!((d2 - 0.50).abs() < 0.01);
-        assert!((d3 - 1.00).abs() < 0.01);
-        assert!((d4 - 2.00).abs() < 0.01); // capped at warm_maximum
-    }
-
-    #[test]
-    fn retry_warm_caps_at_2s() {
-        let policy = TwoPhaseRetryPolicy::default_policy();
-        let d10 = policy.delay(10, None).as_secs_f64();
-        assert!((d10 - 2.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn retry_cold_phase_caps_at_5s() {
-        let policy = TwoPhaseRetryPolicy::default_policy();
-        let pending_long = Some(Duration::from_secs(120));
-        let d10 = policy.delay(10, pending_long).as_secs_f64();
-        assert!((d10 - 5.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn retry_high_attempt_no_overflow() {
-        let policy = TwoPhaseRetryPolicy::default_policy();
-        // Should not panic with very high attempt values
-        let d = policy.delay(1000, None);
-        assert!(d.as_secs_f64() <= 2.0 + 0.01);
     }
 
     // ---- Lookup functions ----

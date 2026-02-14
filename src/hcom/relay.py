@@ -1,17 +1,13 @@
-"""Cross-device relay - state-embedded events
+"""Cross-device relay via MQTT pub/sub.
 
-Custom server implementation:
-  Required endpoints:
-    POST /push/{device_id}  — receive JSON: {"state": {...}, "events": [...]}
-    GET /poll?since=&timeout=  — long-poll, return {"devices": {...}, "ts": float}
-    GET /version  — return {"v": 1}
-    GET /devices  — return list of active devices
+Topic layout:
+  {relay_id}/{device_uuid}  — retained state per device
+  {relay_id}/control        — non-retained control events (kill, etc.)
 
-  Reference: https://huggingface.co/spaces/aannoo/hcom-relay/blob/main/app.py
-
-  Configure with:
-    hcom config relay https://your-server.example.com
-    hcom config relay_token <token>  # optional auth
+Configure with:
+  hcom relay new                           — create new relay group
+  hcom relay connect <token>               — join existing relay
+  hcom relay new --broker mqtts://host:port  — private broker
 """
 
 from __future__ import annotations
@@ -20,8 +16,6 @@ import os
 import sqlite3
 import threading
 import time
-import urllib.request
-import urllib.error
 import socket
 from typing import Any
 
@@ -31,9 +25,16 @@ from .core.config import get_config
 from .core.log import log_info, log_warn, log_error
 from .shared import parse_iso_timestamp
 
-_poll_ts: float = 0
-_poll_ts_lock = threading.Lock()
 _relay_worker_flag = threading.local()
+
+# ==================== MQTT Broker Defaults ====================
+
+# Public brokers (TLS). Tried in order during initial setup; first success gets pinned.
+DEFAULT_BROKERS = [
+    ("broker.emqx.io", 8883),
+    ("broker.hivemq.com", 8883),
+    ("test.mosquitto.org", 8886),
+]
 
 
 def _safe_kv_get(key: str, default: str | None = None) -> str | None:
@@ -48,6 +49,18 @@ def _safe_kv_set(key: str, value: str | None) -> None:
     """kv_set that won't crash on DB errors."""
     try:
         kv_set(key, value)
+    except Exception:
+        pass
+
+
+def _clear_short_id(device_id: str) -> None:
+    """Remove relay_short_* mapping for a device (reverse lookup by value)."""
+    try:
+        from .core.db import kv_prefix
+        for key, val in kv_prefix("relay_short_").items():
+            if val == device_id:
+                _safe_kv_set(key, None)
+                break
     except Exception:
         pass
 
@@ -72,150 +85,66 @@ def _set_relay_status(status: str, error: str | None = None) -> None:
     pid = str(os.getpid())
     owner = _safe_kv_get("relay_status_owner")
     if status == "ok":
-        # Success: claim ownership
         _safe_kv_set("relay_status_owner", pid)
         _safe_kv_set("relay_status", "ok")
         _safe_kv_set("relay_last_error", None)
     else:
-        # Error: only write if we're the owner (the process that last succeeded)
         if owner == pid or not daemon_active:
             _safe_kv_set("relay_status", status)
             _safe_kv_set("relay_last_error", error)
 
 
-def _get_relay_url() -> str | None:
-    """Get relay URL from config (returns None if disabled)."""
-    config = get_config()
-    if not config.relay_enabled:
-        return None
-    url = config.relay
-    return url.rstrip("/") if url and url.startswith("http") else None
-
-
 def is_relay_enabled() -> bool:
-    """Check if relay is configured AND enabled."""
+    """Check if relay is configured AND enabled. Requires relay_id to be set."""
     config = get_config()
-    return bool(config.relay and config.relay_enabled)
+    return bool(config.relay_id and config.relay_enabled)
 
 
-def _get_auth_headers() -> dict[str, str]:
-    """Get auth headers."""
-    headers = {"Content-Type": "application/json"}
-    if token := get_config().relay_token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+def _get_broker_address() -> tuple[str, int] | None:
+    """Get MQTT broker (host, port) from config. Returns None if relay not configured."""
+    config = get_config()
+    if not config.relay_id or not config.relay_enabled:
+        return None
+    url = config.relay.strip()
+    if url:
+        # Parse mqtts://host:port or mqtt://host:port
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or url
+        port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
+        return (host, port)
+    return None  # No broker pinned yet — daemon will try fallback list
 
 
-_last_http_error: str = ""
-
-# *.hf.space proxy fallback state
-# None = untested, True = use fallback, False = fallback probe failed
-_hf_space_fallback: bool | None = None
-_hf_space_fallback_lock = threading.Lock()
+def _get_relay_id() -> str | None:
+    """Get relay_id from config."""
+    config = get_config()
+    return config.relay_id if config.relay_id else None
 
 
-def _has_https_proxy() -> bool:
-    """Check if an HTTPS proxy is configured."""
-    return bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"))
+def _use_tls(broker_port: int) -> bool:
+    """Determine if TLS should be used for this broker."""
+    config = get_config()
+    url = config.relay.strip()
+    if url:
+        return not url.startswith("mqtt://")  # mqtts:// or unknown → TLS
+    # Public brokers: ports 8883/8886 use TLS
+    return broker_port in (8883, 8886)
 
 
-def _rewrite_hf_space_url(url: str) -> tuple[str, str | None]:
-    """Rewrite *.hf.space URL for proxy compatibility.
-
-    Returns (rewritten_url, original_host) or (url, None) if no rewrite needed.
-
-    Workaround: *.hf.space TLS hangs through some HTTP CONNECT proxies because
-    HF Spaces run on direct EC2/ALB (not CloudFront). Routing through huggingface.co
-    with the original Host header works when the proxy does TLS termination and
-    re-resolves destinations based on Host (e.g. Envoy dynamic_forward_proxy).
-    This is fragile and proxy-specific — it won't work on passthrough proxies.
-    """
-    import re
-    m = re.match(r'https://([^/]+\.hf\.space)(/.*)$', url)
-    if not m:
-        return url, None
-    host = m.group(1)
-    path = m.group(2)
-    return f"https://huggingface.co{path}", host
+def _state_topic(relay_id: str, device_uuid: str) -> str:
+    """Topic for device state: {relay_id}/{device_uuid}"""
+    return f"{relay_id}/{device_uuid}"
 
 
-def _http(method: str, url: str, data: bytes | None = None, timeout: int = 5) -> tuple[int, bytes]:
-    """HTTP request. On connection failure, sets _last_http_error with reason.
-
-    For *.hf.space URLs behind a proxy: on first timeout, tries Host-header
-    fallback through huggingface.co. Caches result so subsequent calls don't
-    pay the timeout penalty. If cached fallback fails, retries direct once
-    to self-heal when proxy/env changes.
-    """
-    global _last_http_error, _hf_space_fallback
-
-    is_hf_space = ".hf.space" in url
-    has_proxy = is_hf_space and _has_https_proxy()
-
-    # If we already know fallback works, use it — but retry direct on failure
-    if has_proxy and _hf_space_fallback is True:
-        rewritten_url, host_header = _rewrite_hf_space_url(url)
-        status, body = _http_raw(method, rewritten_url, data=data, timeout=timeout, host_override=host_header)
-        if status == 200:
-            return status, body
-        # Fallback failed — maybe env changed (proxy removed, NO_PROXY set).
-        # Retry direct once to self-heal.
-        direct_status, direct_body = _http_raw(method, url, data=data, timeout=timeout)
-        if direct_status > 0:
-            _hf_space_fallback = None  # Reset — direct works now
-            return direct_status, direct_body
-        return status, body  # Return the fallback result (better error than timeout)
-
-    # Normal request
-    status, body = _http_raw(method, url, data=data, timeout=timeout)
-
-    # On timeout for *.hf.space through a proxy, try fallback
-    if status == 0 and has_proxy and "timed out" in _last_http_error:
-        with _hf_space_fallback_lock:
-            if _hf_space_fallback is True:
-                # Another thread already confirmed fallback works
-                rewritten_url, host_header = _rewrite_hf_space_url(url)
-                return _http_raw(method, rewritten_url, data=data, timeout=timeout, host_override=host_header)
-            if _hf_space_fallback is None:
-                rewritten_url, host_header = _rewrite_hf_space_url(url)
-                if host_header:
-                    log_info("relay", "relay.hf_fallback", msg="trying Host-header fallback")
-                    fb_status, fb_body = _http_raw(method, rewritten_url, data=data, timeout=timeout, host_override=host_header)
-                    if fb_status == 200:
-                        _hf_space_fallback = True
-                        log_info("relay", "relay.hf_fallback", msg="fallback works, using for future requests")
-                        return fb_status, fb_body
-                    else:
-                        _hf_space_fallback = False
-                        _last_http_error = "timed out (*.hf.space unreachable through proxy — add *.hf.space to NO_PROXY or proxy allowlist)"
-
-    return status, body
+def _control_topic(relay_id: str) -> str:
+    """Topic for control events: {relay_id}/control"""
+    return f"{relay_id}/control"
 
 
-def _http_raw(method: str, url: str, data: bytes | None = None, timeout: int = 5, host_override: str | None = None) -> tuple[int, bytes]:
-    """Low-level HTTP request."""
-    global _last_http_error
-    req = urllib.request.Request(url, data=data, method=method)
-    for k, v in _get_auth_headers().items():
-        req.add_header(k, v)
-    if host_override:
-        req.add_header("Host", host_override)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            _last_http_error = ""
-            return (resp.status, resp.read())
-    except urllib.error.HTTPError as e:
-        _last_http_error = ""
-        return (e.code, b"")
-    except (urllib.error.URLError, socket.timeout) as e:
-        reason = str(getattr(e, "reason", e))
-        if "CERTIFICATE_VERIFY_FAILED" in reason:
-            _last_http_error = "SSL certificate error"
-        elif "timed out" in reason.lower():
-            _last_http_error = "timed out"
-        else:
-            _last_http_error = "network unreachable"
-        return (0, b"")
+def _wildcard_topic(relay_id: str) -> str:
+    """Wildcard subscription: {relay_id}/+ (matches all device + control topics)"""
+    return f"{relay_id}/+"
 
 
 # ==================== State ====================
@@ -225,7 +154,9 @@ def build_state() -> dict[str, Any]:
     """Build current instance state snapshot."""
     conn = get_db()
     rows = conn.execute("""
-        SELECT name, status, status_context, status_time, parent_name, session_id, parent_session_id, agent_id, directory, transcript_path, wait_timeout, last_stop, tcp_mode
+        SELECT name, status, status_context, status_detail, status_time, parent_name, session_id,
+            parent_session_id, agent_id, directory, transcript_path, wait_timeout, last_stop,
+            tcp_mode, tag, tool, background
         FROM instances WHERE COALESCE(origin_device_id, '') = ''
     """).fetchall()
 
@@ -248,6 +179,10 @@ def build_state() -> dict[str, Any]:
             "wait_timeout": row["wait_timeout"] or 86400,
             "last_stop": row["last_stop"] or 0,
             "tcp_mode": bool(row["tcp_mode"]),
+            "tag": row["tag"] or None,
+            "tool": row["tool"] or "claude",
+            "background": bool(row["background"]),
+            "detail": row["status_detail"] or "",
         }
 
     # Get reset timestamp (local only - exclude imported events)
@@ -275,26 +210,14 @@ def build_state() -> dict[str, Any]:
 # ==================== Push ====================
 
 
-def push(force: bool = False) -> tuple[bool, str | None]:
-    """Push state and new events to server.
+def build_push_payload() -> tuple[dict[str, Any], list[dict], int, bool]:
+    """Build the state + events payload for publishing.
 
-    Returns:
-        (success, error_message) - error_message is None on success
+    Returns (state, events, max_event_id, has_more).
+    Fetches 101 rows, sends first 100 — has_more=True if 101st exists.
     """
-    url = _get_relay_url()
-    if not url:
-        return (False, None)  # Not configured, not an error
-
-    # Rate limit
-    if not force:
-        last = float(_safe_kv_get("relay_last_push") or 0)
-        if time.time() - last < 1.0:
-            return (True, None)
-
-    device_id = get_device_uuid()
     state = build_state()
 
-    # Get new events since last push (exclude imported events - they have _relay marker)
     last_push_id = int(_safe_kv_get("relay_last_push_id") or 0)
     conn = get_db()
     rows = conn.execute(
@@ -303,17 +226,20 @@ def push(force: bool = False) -> tuple[bool, str | None]:
         WHERE id > ? AND instance NOT LIKE '%:%'
         AND instance != '_device'
         AND json_extract(data, '$._relay') IS NULL
-        ORDER BY id LIMIT 100
+        ORDER BY id LIMIT 101
     """,
         (last_push_id,),
     ).fetchall()
 
+    has_more = len(rows) > 100
+    send_rows = rows[:100]
+
     events = []
     max_id = last_push_id
-    for row in rows:
+    for row in send_rows:
         events.append(
             {
-                "id": row["id"],  # Monotonic event ID for dedup on pull
+                "id": row["id"],
                 "ts": row["timestamp"],
                 "type": row["type"],
                 "instance": row["instance"],
@@ -322,86 +248,130 @@ def push(force: bool = False) -> tuple[bool, str | None]:
         )
         max_id = max(max_id, row["id"])
 
-    status, content = _http(
-        "POST",
-        f"{url}/push/{device_id}",
-        data=json.dumps({"state": state, "events": events}).encode(),
-        timeout=3,
-    )
-    if status == 200:
-        # KV update after POST — if process dies here, events re-push next cycle.
-        # Pull-side dedup (monotonic event ID) handles duplicates on the receiver.
+    return state, events, max_id, has_more
+
+
+def push(mqtt_client: Any = None, **_kw: Any) -> tuple[bool, str | None, bool]:
+    """Push state and new events via MQTT.
+
+    Args:
+        mqtt_client: paho.mqtt.client.Client instance (from daemon). If None, not connected.
+
+    Returns:
+        (success, error_message, has_more) - has_more=True if more events remain to push
+    """
+    if not is_relay_enabled():
+        return (False, None, False)
+
+    if mqtt_client is None:
+        return (False, None, False)  # No MQTT client — daemon handles publishing
+
+    if not mqtt_client.is_connected():
+        return (False, None, False)  # Disconnected — paho auto-reconnect will retry
+
+    relay_id = _get_relay_id()
+    if not relay_id:
+        return (False, None, False)
+
+    # Don't queue into paho's internal buffer while disconnected
+    if not mqtt_client.is_connected():
+        return (False, "not connected", False)
+
+    device_id = get_device_uuid()
+    state, events, max_id, has_more = build_push_payload()
+
+    payload = json.dumps({"state": state, "events": events}).encode()
+    topic = _state_topic(relay_id, device_id)
+
+    try:
+        # Publish with retain=True so new subscribers get latest state.
+        # QoS 1 (at-least-once) — pull-side dedup handles duplicates.
+        t0 = time.time()
+        result = mqtt_client.publish(topic, payload, qos=1, retain=True)
+        result.wait_for_publish(timeout=5)
+        publish_ms = int((time.time() - t0) * 1000)
+
+        if not result.is_published():
+            _set_relay_status("error", "publish not confirmed")
+            return (False, "publish not confirmed", False)
+
         _safe_kv_set("relay_last_push", str(time.time()))
         _safe_kv_set("relay_last_push_id", str(max_id))
         _set_relay_status("ok")
-        log_info("relay", "relay.push", events=len(events))
-        return (True, None)
-    elif status == 0:
-        error = _last_http_error or "network unreachable"
+        log_info("relay", "relay.push", events=len(events), publish_ms=publish_ms,
+                 payload_bytes=len(payload))
+        return (True, None, has_more)
+    except Exception as e:
+        # Don't advance cursor — events will be retried on next push
+        error = str(e) or "mqtt publish failed"
         _set_relay_status("error", error)
-        log_warn("relay", "relay.network", error)  # Transient - WARN appropriate
-        return (False, error)
-    else:
-        error = f"server returned {status}"
-        _set_relay_status("error", error)
-        log_warn("relay", "relay.network", error)  # Transient - WARN appropriate
-        return (False, error)
+        log_warn("relay", "relay.network", error)
+        return (False, error, False)
 
 
 # ==================== Pull ====================
 
 
-def pull(timeout: int = 0) -> tuple[dict[str, Any], str | None]:
-    """Pull remote devices. timeout=0 for immediate, >0 for long-poll.
+def handle_mqtt_message(topic: str, payload: bytes, relay_id: str) -> None:
+    """Process an incoming MQTT message (called from daemon's on_message).
 
-    Returns:
-        (result_dict, error_message) - error_message is None on success
+    Routes by topic suffix:
+      {relay_id}/control → _handle_control_events
+      {relay_id}/{device_uuid} → _apply_remote_devices
     """
-    global _poll_ts
+    prefix = relay_id + "/"
+    if not topic.startswith(prefix):
+        return  # Not our relay group — ignore (safety on shared public brokers)
 
-    url = _get_relay_url()
-    if not url:
-        return ({"devices": {}}, None)  # Not configured
+    suffix = topic[len(prefix):]
 
-    with _poll_ts_lock:
-        since = _poll_ts
+    if not payload:
+        # Empty payload = device disconnected (LWT or graceful cleanup).
+        if suffix and suffix != "control":
+            device_id = suffix
+            try:
+                conn = get_db()
+                with _write_lock:
+                    conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
+                    conn.commit()
+                _safe_kv_set(f"relay_sync_time_{device_id}", None)
+                _clear_short_id(device_id)
+                log_info("relay", "relay.device_gone", device=device_id[:8])
+            except Exception:
+                pass
+        return
 
-    status, content = _http(
-        "GET",
-        f"{url}/poll?since={since}&timeout={timeout}",
-        timeout=timeout + 5 if timeout else 5,
-    )
-    if status == 200 and content:
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError as e:
-            error = f"invalid json: {e}"
-            _set_relay_status("error", error)
-            log_error("relay", "relay.error", e, msg="pull: invalid json")
-            return ({"devices": {}}, error)
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log_warn("relay", "relay.bad_payload", error=str(e))
+        return
+    own_device = get_device_uuid()
 
-        with _poll_ts_lock:
-            new_ts = result.get("ts", _poll_ts)
-            if new_ts > _poll_ts:
-                _poll_ts = new_ts
-        _set_relay_status("ok")
+    if suffix == "control":
+        # Control event — process directly
+        own_short_id = get_device_short_id()
+        events = data.get("events", [data] if data.get("type") == "control" else [])
+        source_device = data.get("from_device", "unknown")
+        if source_device != own_device:
+            _handle_control_events(events, own_short_id, source_device)
+        return
 
-        devices = result.get("devices", {})
-        if devices:
-            own_device = get_device_uuid()
-            _apply_remote_devices(devices, own_device)
+    # State message from a device
+    device_id = suffix
+    if device_id == own_device:
+        return  # Ignore own messages
 
-        return (result, None)
-    elif status == 0:
-        error = _last_http_error or "network unreachable"
-        _set_relay_status("error", error)
-        log_warn("relay", "relay.network", error)
-        return ({"devices": {}}, error)
-    else:
-        error = f"server returned {status}"
-        _set_relay_status("error", error)
-        log_warn("relay", "relay.network", error)
-        return ({"devices": {}}, error)
+    t0 = time.time()
+    devices = {device_id: data}
+    _apply_remote_devices(devices, own_device)
+    apply_ms = int((time.time() - t0) * 1000)
+    n_events = len(data.get("events", []))
+    n_instances = len(data.get("state", {}).get("instances", {}))
+    short_id = data.get("state", {}).get("short_id", device_id[:4].upper())
+    log_info("relay", "relay.recv", device=short_id, events=n_events,
+             instances=n_instances, apply_ms=apply_ms,
+             payload_bytes=len(payload))
 
 
 def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
@@ -491,24 +461,28 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     conn.execute(
                         """
                         INSERT INTO instances (
-                            name, origin_device_id, status, status_context, status_time,
+                            name, origin_device_id, status, status_context, status_detail, status_time,
                             parent_name, directory, transcript_path, created_at,
-                            session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode,
+                            tag, tool, background
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(name) DO UPDATE SET
                             status = excluded.status,
-                            status_context = excluded.status_context, status_time = excluded.status_time,
+                            status_context = excluded.status_context, status_detail = excluded.status_detail,
+                            status_time = excluded.status_time,
                             parent_name = excluded.parent_name,
                             directory = excluded.directory, transcript_path = excluded.transcript_path,
                             session_id = excluded.session_id, parent_session_id = excluded.parent_session_id,
                             agent_id = excluded.agent_id, wait_timeout = excluded.wait_timeout,
-                            last_stop = excluded.last_stop, tcp_mode = excluded.tcp_mode
+                            last_stop = excluded.last_stop, tcp_mode = excluded.tcp_mode,
+                            tag = excluded.tag, tool = excluded.tool, background = excluded.background
                     """,
                         (
                             namespaced,
                             device_id,
                             inst.get("status", "unknown"),
                             inst.get("context", ""),
+                            inst.get("detail", ""),
                             inst.get("status_time", 0),
                             parent_namespaced,
                             inst.get("directory"),
@@ -520,13 +494,16 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                             inst.get("wait_timeout", 86400),
                             inst.get("last_stop", 0),
                             inst.get("tcp_mode", False),
+                            inst.get("tag"),
+                            inst.get("tool", "claude"),
+                            inst.get("background", False),
                         ),
                     )
                     conn.commit()
             except sqlite3.Error as e:
                 try:
                     conn.rollback()
-                except Exception:
+                except sqlite3.Error:
                     pass
                 log_error("relay", "relay.error", e, op="instance_upsert", instance=namespaced)
 
@@ -634,6 +611,13 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             )
             max_event_id = max(max_event_id, event_id)
 
+            # Log relay latency for message events
+            if event.get("type") == "message" and event_ts > 0:
+                latency_ms = int((time.time() - event_ts) * 1000)
+                log_info("relay", "relay.msg_recv", device=short_id,
+                         remote_id=event_id, latency_ms=latency_ms,
+                         **{"from": data.get("from", "?")})
+
         if max_event_id > last_event_id:
             _safe_kv_set(f"relay_events_{device_id}", str(max_event_id))
 
@@ -660,37 +644,105 @@ def _parse_ts(ts) -> float:
 # ==================== Remote Control ====================
 
 
-def send_control(action: str, target: str, device_short_id: str) -> bool:
-    """Send control command to remote device."""
-    url = _get_relay_url()
-    if not url:
+def _create_ephemeral_client() -> Any:
+    """Create a short-lived MQTT client for one-shot publishes (CLI callers).
+
+    Connects to the pinned broker, starts loop, waits for CONNACK.
+    Returns connected client or None on failure.
+    """
+    try:
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
+    except ImportError:
+        return None
+
+    broker = _get_broker_address()
+    if not broker:
+        return None
+    host, port = broker
+
+    client = mqtt.Client(
+        CallbackAPIVersion.VERSION2,
+        protocol=MQTTProtocolVersion.MQTTv5,
+    )
+    if _use_tls(port):
+        client.tls_set()
+
+    config = get_config()
+    if config.relay_token:
+        client.username_pw_set(username="hcom", password=config.relay_token)
+
+    connected = threading.Event()
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            connected.set()
+
+    client.on_connect = on_connect
+
+    try:
+        client.connect(host, port, keepalive=30)
+        client.loop_start()
+        if not connected.wait(timeout=5):
+            client.loop_stop()
+            client.disconnect()
+            return None
+        return client
+    except Exception:
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
+        return None
+
+
+def send_control(action: str, target: str, device_short_id: str, mqtt_client: Any = None) -> bool:
+    """Send control command to remote device via MQTT.
+
+    Args:
+        mqtt_client: paho.mqtt.client.Client instance (from daemon).
+            If None, creates an ephemeral client (for CLI callers like start/stop).
+    """
+    if not is_relay_enabled():
+        return False
+
+    relay_id = _get_relay_id()
+    if not relay_id:
         return False
 
     device_id = get_device_uuid()
     short_id = get_device_short_id()
 
-    control_event = {
-        "ts": time.time(),
-        "type": "control",
-        "instance": "_control",
-        "data": {
-            "action": action,
-            "target": target,
-            "target_device": device_short_id,
-            "from": f"_:{short_id}",
-            "from_device": device_id,
-        },
+    control_payload = {
+        "from_device": device_id,
+        "events": [{
+            "ts": time.time(),
+            "type": "control",
+            "instance": "_control",
+            "data": {
+                "action": action,
+                "target": target,
+                "target_device": device_short_id,
+                "from": f"_:{short_id}",
+                "from_device": device_id,
+            },
+        }],
     }
 
-    # Push immediately with control event
-    state = build_state()
-    status, _ = _http(
-        "POST",
-        f"{url}/push/{device_id}",
-        data=json.dumps({"state": state, "events": [control_event]}).encode(),
-        timeout=3,
-    )
-    if status == 200:
+    topic = _control_topic(relay_id)
+
+    # Create ephemeral client if no daemon client provided
+    ephemeral = False
+    if mqtt_client is None:
+        mqtt_client = _create_ephemeral_client()
+        if mqtt_client is None:
+            return False
+        ephemeral = True
+
+    try:
+        result = mqtt_client.publish(topic, json.dumps(control_payload).encode(), qos=1, retain=False)
+        result.wait_for_publish(timeout=5)
         log_info(
             "relay",
             "relay.control",
@@ -698,11 +750,16 @@ def send_control(action: str, target: str, device_short_id: str) -> bool:
             target=f"{target}:{device_short_id}",
         )
         return True
-    elif status == 0:
-        log_warn("relay", "relay.network", f"control: {_last_http_error or 'network unreachable'}")
-    else:
-        log_warn("relay", "relay.network", f"control: status={status}")
-    return False
+    except Exception as e:
+        log_warn("relay", "relay.network", f"control: {e}")
+        return False
+    finally:
+        if ephemeral:
+            try:
+                mqtt_client.loop_stop()
+                mqtt_client.disconnect()
+            except Exception:
+                pass
 
 
 def _handle_control_events(events: list[dict], own_short_id: str, source_device: str) -> None:
@@ -799,7 +856,7 @@ def is_relay_handled_by_daemon() -> bool:
             if fail_count >= 3:
                 _safe_kv_set("relay_daemon_port", None)
                 _safe_kv_set("relay_daemon_fail_count", None)
-        except Exception:
+        except (sqlite3.Error, ValueError, TypeError):
             pass
         return False
     finally:
@@ -836,59 +893,152 @@ def notify_relay() -> bool:
     return notify_relay_daemon()
 
 
+def trigger_push() -> None:
+    """Notify daemon to push; fall back to direct push if daemon isn't running."""
+    if not notify_relay_daemon():
+        push()
+
+
+def clear_retained_state() -> bool:
+    """Publish empty retained message to clear this device's state from broker.
+
+    Used by 'relay off' so remote devices stop seeing stale instances.
+    Creates an ephemeral MQTT client if daemon isn't available.
+    """
+    if not is_relay_enabled():
+        return False
+    relay_id = _get_relay_id()
+    if not relay_id:
+        return False
+    device_id = get_device_uuid()
+    topic = _state_topic(relay_id, device_id)
+
+    client = _create_ephemeral_client()
+    if not client:
+        return False
+    try:
+        result = client.publish(topic, b"", qos=1, retain=True)
+        result.wait_for_publish(timeout=5)
+        return result.is_published()
+    except Exception:
+        return False
+    finally:
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
+
+
 # ==================== Wait Helper ====================
 
 
 def relay_wait(timeout: float = 25.0) -> bool:
-    """Drop-in replacement for sync_wait(). Returns True if new data imported.
+    """Wait for relay data. Returns True if new data arrived in DB.
 
-    Used by cmd_events --wait and cmd_listen.
+    Used by cmd_events --wait, cmd_listen, and relay poll.
+    With MQTT, the daemon's on_message writes to DB in real-time.
+    We poll DB for new remote events (instances with : in name).
     """
-    # If daemon is polling, just sleep to preserve timing behavior
-    if is_relay_handled_by_daemon():
-        time.sleep(min(timeout, 1.0))
+    try:
+        conn = get_db()
+        before = conn.execute(
+            "SELECT MAX(id) FROM events WHERE instance LIKE '%:%'"
+        ).fetchone()[0] or 0
+    except Exception:
+        before = 0
+
+    time.sleep(min(timeout, 1.0))
+
+    try:
+        conn = get_db()
+        after = conn.execute(
+            "SELECT MAX(id) FROM events WHERE instance LIKE '%:%'"
+        ).fetchone()[0] or 0
+        return after > before
+    except Exception:
         return False
-
-    # Push first (rate-limited internally)
-    push()
-
-    # Pull with long-poll
-    result, _ = pull(timeout=int(min(timeout, 25)))
-
-    return bool(result.get("devices"))
 
 
 def get_relay_status() -> dict[str, Any]:
     """Get relay status for TUI display.
 
     Returns dict with:
-        configured: bool - relay URL is set
+        configured: bool - relay_id is set
         enabled: bool - relay is enabled (config flag)
         status: 'ok' | 'error' | None - last operation result
         error: str | None - last error message
         last_push: float - timestamp of last successful push
+        broker: str | None - current broker URL
     """
     config = get_config()
     return {
-        "configured": bool(config.relay),
+        "configured": bool(config.relay_id),
         "enabled": config.relay_enabled,
         "status": _safe_kv_get("relay_status"),
         "error": _safe_kv_get("relay_last_error"),
         "last_push": float(_safe_kv_get("relay_last_push") or 0),
+        "broker": config.relay or None,
     }
+
+
+def get_remote_devices(max_age: float = 90.0) -> dict[str, dict]:
+    """Get remote devices with recent sync activity.
+
+    Derives device list from relay_short_{short_id} → device_id mapping in KV,
+    filtered by relay_sync_time freshness.  Excludes own device and stale entries.
+
+    Args:
+        max_age: Maximum seconds since last sync to consider a device alive.
+                 0 = return all known devices regardless of staleness.
+    """
+    from .core.db import kv_prefix
+    from .core.device import get_device_uuid
+
+    own = get_device_uuid()
+    now = time.time()
+
+    # relay_short_{short_id} → device_id  (invert to device_id → short_id)
+    short_map = kv_prefix("relay_short_")
+    device_to_short: dict[str, str] = {}
+    for key, device_id in short_map.items():
+        if device_id == own:
+            continue
+        short_id = key.removeprefix("relay_short_")
+        device_to_short[device_id] = short_id
+
+    if not device_to_short:
+        return {}
+
+    # Look up sync times, filter by staleness
+    sync_map = kv_prefix("relay_sync_time_")
+    result = {}
+    for device_id, short_id in device_to_short.items():
+        sync_val = sync_map.get(f"relay_sync_time_{device_id}")
+        sync_time = float(sync_val) if sync_val else 0.0
+        if max_age > 0 and (not sync_time or (now - sync_time) > max_age):
+            continue
+        result[device_id] = {"short_id": short_id, "sync_time": sync_time}
+
+    return result
 
 
 # ==================== Public API ====================
 
 __all__ = [
     "push",
-    "pull",
+    "build_push_payload",
+    "handle_mqtt_message",
     "relay_wait",
     "build_state",
     "send_control",
+    "clear_retained_state",
     "get_relay_status",
+    "get_remote_devices",
     "is_relay_enabled",
     "is_relay_handled_by_daemon",
     "notify_relay_daemon",
     "notify_relay",
+    "trigger_push",
+    "DEFAULT_BROKERS",
 ]

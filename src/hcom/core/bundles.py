@@ -101,7 +101,7 @@ def parse_inline_bundle_flags(argv: list[str]) -> tuple[dict | None, list[str]]:
     except CLIError as e:
         # Convert CLIError to ValueError for consistent error handling
         raise ValueError(str(e))
-    except Exception as e:
+    except ValueError as e:
         raise ValueError(f"Error parsing bundle flags: {e}")
 
     # Parse CSV lists

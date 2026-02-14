@@ -4,7 +4,7 @@ import sys
 import json
 import re
 from .utils import format_error, parse_flag_bool, parse_last_flag, get_command_help, CLIError
-from ..shared import CommandContext
+from ..shared import CommandContext, HcomError
 
 
 def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int:
@@ -165,7 +165,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
                 transcript_path = data.get("transcript_path", "")
             else:
                 raise ValueError("Not an instance")
-        except Exception:
+        except (ValueError, KeyError, HcomError):
             # Cannot resolve self - require @instance
             from .utils import get_command_help
 
@@ -322,12 +322,14 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
 
 
 def _cmd_transcript_search(argv: list[str]) -> int:
-    """Search transcripts: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE]
+    """Search transcripts: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE] [--exclude-self]
 
     Scopes:
       (default)  hcom-tracked transcripts only (alive + stopped agents)
       --live     only currently alive agents
       --all      all transcripts on disk (includes non-hcom sessions)
+
+    --exclude-self  Exclude the searching agent's own transcript from results.
 
     Uses ripgrep (fast) or grep (fallback).
     """
@@ -339,6 +341,7 @@ def _cmd_transcript_search(argv: list[str]) -> int:
     json_output = False
     agent_filter = None  # claude, gemini, codex, or None for all
     scope = "hcom"  # default: hcom-tracked only
+    exclude_self = False
 
     i = 0
     while i < len(argv):
@@ -349,6 +352,8 @@ def _cmd_transcript_search(argv: list[str]) -> int:
             scope = "live"
         elif arg == "--all":
             scope = "all"
+        elif arg == "--exclude-self":
+            exclude_self = True
         elif arg == "--limit" and i + 1 < len(argv):
             try:
                 limit = int(argv[i + 1])
@@ -376,13 +381,24 @@ def _cmd_transcript_search(argv: list[str]) -> int:
     if not pattern:
         print(format_error("Pattern required"), file=sys.stderr)
         print(
-            'Usage: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE]',
+            'Usage: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE] [--exclude-self]',
             file=sys.stderr,
         )
         return 1
 
+    # Resolve self name for --exclude-self
+    self_name = None
+    if exclude_self:
+        try:
+            from ..core.identity import resolve_identity
+            identity = resolve_identity()
+            if identity.kind == "instance":
+                self_name = identity.name
+        except Exception:
+            pass
+
     # Use core search function
-    result = search_transcripts(pattern, limit=limit, agent_filter=agent_filter, scope=scope)
+    result = search_transcripts(pattern, limit=limit, agent_filter=agent_filter, scope=scope, exclude_self=self_name)
 
     if result.get("error"):
         print(f"Search error: {result['error']}", file=sys.stderr)
@@ -404,7 +420,10 @@ def _cmd_transcript_search(argv: list[str]) -> int:
             print(f"No matches for '{pattern}'")
         else:
             scope_label = {"live": " (live agents)", "hcom": " (hcom-tracked)", "all": ""}[scope]
-            print(f"Found {len(results)} matches{scope_label}:\n")
+            if result.get("limit_hit"):
+                print(f"Showing {len(results)} matches (limit {limit}){scope_label}:\n")
+            else:
+                print(f"Found {len(results)} matches{scope_label}:\n")
             for r in results:
                 # Truncate path for display
                 path = r["path"]

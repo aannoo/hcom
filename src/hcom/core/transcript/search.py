@@ -238,6 +238,7 @@ def search_transcripts(
     limit: int = 20,
     agent_filter: str | None = None,
     scope: str = "hcom",
+    exclude_self: str | None = None,
 ) -> dict[str, Any]:
     """Search transcripts using two-phase ripgrep/grep.
 
@@ -251,9 +252,11 @@ def search_transcripts(
         limit: Max results to return.
         agent_filter: 'claude', 'gemini', 'codex', or None.
         scope: 'live' (alive only), 'hcom' (all tracked), or 'all' (all on disk).
+        exclude_self: hcom name to exclude from results (filters after correlation).
 
     Returns:
-        Dict with 'results' (list), 'count' (int), and 'scope' (str).
+        Dict with 'results' (list), 'count' (int), 'scope' (str),
+        and 'limit_hit' (bool) indicating if results were truncated.
         Each result has: path, line, agent, text, hcom_name (opt), hcom_session (opt).
     """
     # Build search paths
@@ -314,10 +317,21 @@ def search_transcripts(
         if not matching_files:
             return {"results": [], "count": 0, "scope": scope}
 
+        # Resolve exclude_self to transcript path for early filtering
+        exclude_path: str | None = None
+        if exclude_self:
+            path_to_hcom = _correlate_paths_to_hcom(set(matching_files))
+            for tp, info in path_to_hcom.items():
+                if info["name"] == exclude_self:
+                    exclude_path = tp
+                    break
+
         # Filter by agent type and get mtimes
         files_with_mtime: list[tuple[str, float]] = []
         for f in matching_files:
             if not f:
+                continue
+            if exclude_path and f == exclude_path:
                 continue
             agent = _agent_from_path(f)
             if agent_filter and agent != agent_filter:
@@ -395,9 +409,11 @@ def search_transcripts(
                     )
 
     except subprocess.TimeoutExpired:
-        return {"results": results, "count": len(results), "scope": scope, "error": "Search timed out"}
+        return {"results": results, "count": len(results), "scope": scope, "limit_hit": False, "error": "Search timed out"}
     except Exception as e:
-        return {"results": [], "count": 0, "scope": scope, "error": f"Search failed: {e}"}
+        return {"results": [], "count": 0, "scope": scope, "limit_hit": False, "error": f"Search failed: {e}"}
+
+    limit_hit = len(results) >= limit
 
     if results:
         unique_paths = set(r["path"] for r in results)
@@ -408,4 +424,4 @@ def search_transcripts(
                 r["hcom_name"] = info["name"]
                 r["hcom_session"] = info["session"]
 
-    return {"results": results, "count": len(results), "scope": scope}
+    return {"results": results, "count": len(results), "scope": scope, "limit_hit": limit_hit}

@@ -1,11 +1,12 @@
 """Events commands for HCOM"""
 
+import sqlite3
 import sys
 import json
 import time
 from datetime import datetime
 from .utils import format_error, parse_flag_bool, parse_last_flag, CLIError
-from ..shared import CommandContext
+from ..shared import CommandContext, HcomError
 
 
 def streamline_event(event: dict, filters: dict | None = None) -> dict:
@@ -135,7 +136,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             if identity.kind == "instance":
                 instance_name = identity.name
                 caller_name = identity.name
-        except Exception as e:
+        except (HcomError, ValueError, sqlite3.Error) as e:
             print(format_error(f"Cannot resolve '{from_value}': {e}"), file=sys.stderr)
             return 1
 
@@ -206,16 +207,6 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(format_error(str(e)), file=sys.stderr)
         return 1
 
-    # Pull remote events for fresh data (skip if --wait mode, which has its own polling)
-    if wait_timeout is None:
-        try:
-            from ..relay import is_relay_handled_by_daemon, pull
-
-            if not is_relay_handled_by_daemon():
-                pull()
-        except Exception:
-            pass
-
     # Build base query for filters
     db = get_db()
     filter_query = ""
@@ -250,7 +241,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
         try:
             lookback_row = db.execute(lookback_query, [lookback_timestamp]).fetchone()
-        except Exception as e:
+        except sqlite3.Error as e:
             print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
             return 2
 
@@ -291,7 +282,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
                 try:
                     rows = db.execute(query, [last_id]).fetchall()
-                except Exception as e:
+                except sqlite3.Error as e:
                     print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
                     return 2
 
@@ -411,7 +402,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     f"Warning: Skipping corrupt event ID {row['id']}: {e}",
                     file=sys.stderr,
                 )
-    except Exception as e:
+    except sqlite3.Error as e:
         print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
         return 2
 
@@ -427,7 +418,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     event["ts"] = event.pop("timestamp")
                     event["source"] = archive["name"]
                     all_events.append(event)
-            except Exception as e:
+            except sqlite3.Error as e:
                 # Skip archives with incompatible schema or query errors
                 print(
                     f"Warning: Skipping archive {archive['name']}: {e}",

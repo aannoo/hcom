@@ -23,7 +23,7 @@ import argparse
 import os
 import sys
 
-from hcom.api import launch
+from hcom.api import launch, HcomError
 
 
 FATCOW_SYSTEM_PROMPT_LIVE = """You are a fat cow - a dedicated codebase oracle.
@@ -319,7 +319,7 @@ def ask_fatcow(fatcow_name: str, question: str, *, caller: str | None, timeout: 
             claude_args='--allowedTools "Bash(hcom stop:*)"' if is_claude else None,
             wait=True,
         )
-    except Exception as e:
+    except (HcomError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 

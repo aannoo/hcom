@@ -69,7 +69,7 @@ def get_gemini_version() -> tuple[int, int, int] | None:
             patch = parts[2].split("-")[0]
             return (int(parts[0]), int(parts[1]), int(patch))
         return None
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 
@@ -137,7 +137,7 @@ def ensure_hooks_enabled() -> bool:
         _set_hooks_enabled(settings)
 
         return atomic_write(settings_path, json.dumps(settings, indent=2))
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return False
 
 
@@ -475,7 +475,7 @@ def _verify_gemini_hooks_at(settings_path: Path, check_permissions: bool = True)
                     return False
 
         return True
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return False
 
 
@@ -510,7 +510,7 @@ def _remove_gemini_hooks_from_path(settings_path: Path) -> bool:
 
         # Write atomically
         return atomic_write(settings_path, json.dumps(settings, indent=2))
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return False
 
 

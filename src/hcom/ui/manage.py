@@ -39,6 +39,8 @@ Color indicates status (green=active, cyan=listening, gray=stopped, etc).
 
 from __future__ import annotations
 import re
+import sqlite3
+import subprocess
 import time
 from typing import List, TYPE_CHECKING
 
@@ -93,9 +95,12 @@ from .colors import (
 # Import non-color constants from shared
 from ..shared import (
     STATUS_FG,
+    HcomError,
     format_age,
     shorten_path,
     parse_iso_timestamp,
+    ST_ACTIVE,
+    ST_LISTENING,
 )
 from ..core.instances import get_status_icon
 
@@ -199,20 +204,20 @@ class ManageScreen:
 
         # Light green coloring for message delivery (active with deliver token)
         status_context = info.get("data", {}).get("status_context", "")
-        if status == "active" and status_context.startswith("deliver:"):
+        if status == ST_ACTIVE and status_context.startswith("deliver:"):
             color = FG_DELIVER
 
         display_text = info.get("description", "")
 
         # Append "since X" for listening agents idle >= 1 minute
-        if status == "listening" and display_text == "listening":
+        if status == ST_LISTENING and display_text == "listening":
             from ..shared import format_listening_since
 
             status_time = info.get("data", {}).get("status_time", 0)
             display_text += format_listening_since(status_time)
 
         # Gold background for tui:* blocking status (gate blocked for 2+ seconds)
-        if status == "listening" and status_context.startswith("tui:") and display_text:
+        if status == ST_LISTENING and status_context.startswith("tui:") and display_text:
             display_text = f"{BG_GOLD}{FG_BLACK} {display_text} {RESET}"
 
         age_text = info.get("age_text", "")
@@ -245,7 +250,7 @@ class ManageScreen:
         is_subagent = bool(data.get("parent_session_id"))
 
         # Subagents always show timeout warning (regardless of tool/binding)
-        if status == "listening" and is_subagent:
+        if status == ST_LISTENING and is_subagent:
             # Use parent's subagent_timeout if set, else global config
             parent_name = data.get("parent_name")
             timeout = None
@@ -261,7 +266,7 @@ class ManageScreen:
             if 0 < remaining < 10:
                 timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
         # Non-subagent Claude instances: show countdown for short timeouts (<1hr)
-        elif status == "listening" and tool == "claude":
+        elif status == ST_LISTENING and tool == "claude":
             is_hooks_only = bindings["hooks_bound"] and not bindings["process_bound"]
             is_headless = data.get("background", False)
             if is_hooks_only or is_headless:
@@ -457,9 +462,12 @@ class ManageScreen:
         active_pids = {i.get("data", {}).get("pid") for _, i in all_instances if i.get("data", {}).get("pid")}
         orphan_processes = get_orphan_processes(active_pids=active_pids)
 
+        # Show relay separator if there are remote instances OR connected remote devices
+        has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
+
         # Auto-expand remote section if user hasn't explicitly toggled
         # Expand if count <= 3 OR any device synced < 5min ago
-        if not self.state.manage.show_remote_user_set and remote_count > 0:
+        if not self.state.manage.show_remote_user_set and has_remote:
             recent_sync = any(
                 (time.time() - sync_time) < 300  # 5 minutes
                 for sync_time in self.state.manage.device_sync_times.values()
@@ -497,7 +505,7 @@ class ManageScreen:
                 temp_display_count += len(orphan_processes)
                 if recently_stopped:
                     temp_display_count += 1  # recently stopped row
-                if remote_count > 0:
+                if has_remote:
                     temp_display_count += 1  # remote separator
                     if self.state.manage.show_remote:
                         temp_display_count += remote_count
@@ -521,8 +529,8 @@ class ManageScreen:
         if recently_stopped:
             display_count += 1  # recently stopped summary row
         recently_stopped_pos = display_count - 1 if recently_stopped else -1
-        remote_sep = display_count if remote_count > 0 else -1
-        if remote_count > 0:
+        remote_sep = display_count if has_remote else -1
+        if has_remote:
             display_count += 1  # remote separator row
             if self.state.manage.show_remote:
                 display_count += remote_count
@@ -548,8 +556,8 @@ class ManageScreen:
             self.state.manage.cursor = 0
             self.state.manage.cursor_instance_name = None
 
-        # Empty state - no instances and no orphan processes
-        if len(local_instances) == 0 and remote_count == 0 and not orphan_processes:
+        # Empty state - no instances, no remote devices, and no orphan processes
+        if len(local_instances) == 0 and not has_remote and not orphan_processes:
             lines.append("")
             lines.append(f"{FG_ORANGE}  ╦ ╦╔═╗╔═╗╔╦╗{RESET}")
             lines.append(f"{FG_ORANGE}  ╠═╣║  ║ ║║║║{RESET}")
@@ -678,6 +686,7 @@ class ManageScreen:
 
                 # Build sync status when expanded: relay (BOXE:1m, CATA:2s) ▼
                 if self.state.manage.show_remote and self.state.manage.device_sync_times:
+                    # Map device_id → short_id from instance names (has agents)
                     device_suffixes = {}
                     for name, info in remote_instances:
                         origin_device = info.get("data", {}).get("origin_device_id", "")
@@ -689,7 +698,7 @@ class ManageScreen:
                     for device, sync_time in sorted(self.state.manage.device_sync_times.items()):
                         if sync_time:
                             sync_age = time.time() - sync_time
-                            suffix = device_suffixes.get(device, device[:4].upper())
+                            suffix = device_suffixes.get(device) or self.state.manage.device_short_ids.get(device) or device[:4].upper()
                             color = get_device_sync_color(sync_age)
                             sync_parts.append(f"{color}{suffix}:{format_age(sync_age)}{FG_GRAY}")
 
@@ -801,7 +810,7 @@ class ManageScreen:
                     ).fetchone()
                     if row and row["msg_ts"]:
                         remote_msg_ts[full_name] = row["msg_ts"]
-            except Exception:
+            except (OSError, sqlite3.Error):
                 pass  # No read receipts if DB query fails
 
             for (
@@ -941,11 +950,12 @@ class ManageScreen:
         orphan_processes = get_orphan_processes(active_pids=active_pids)
 
         # Calculate display count: local → orphans → stopped → relay → remote
+        has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
         display_count = len(local_instances)
         display_count += len(orphan_processes)
         if recently_stopped:
             display_count += 1  # recently stopped row
-        if remote_count > 0:
+        if has_remote:
             display_count += 1  # remote separator
             if self.state.manage.show_remote:
                 display_count += remote_count
@@ -974,7 +984,8 @@ class ManageScreen:
         recently_stopped_pos = orphan_end if recently_stopped else -1
         pos_after_stopped = orphan_end + (1 if recently_stopped else 0)
 
-        remote_sep_pos = pos_after_stopped if remote_count > 0 else -1
+        has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
+        remote_sep_pos = pos_after_stopped if has_remote else -1
 
         cursor = self.state.manage.cursor
 
@@ -991,11 +1002,11 @@ class ManageScreen:
             return None, False, "recently_stopped"
 
         # Remote separator
-        if remote_count > 0 and cursor == remote_sep_pos:
+        if has_remote and cursor == remote_sep_pos:
             return None, False, "remote_sep"
 
         # Remote instances (if expanded)
-        if remote_count > 0 and self.state.manage.show_remote:
+        if has_remote and self.state.manage.show_remote:
             remote_start = remote_sep_pos + 1
             if remote_start <= cursor < remote_start + remote_count:
                 return remote[cursor - remote_start], True, "instance"
@@ -1005,9 +1016,10 @@ class ManageScreen:
     def _get_separator_positions(self, local, remote, recently_stopped=None, orphan_processes=None):
         """Calculate separator position for remote section"""
         remote_count = len(remote)
+        has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
         orphans = orphan_processes or []
         pos = len(local) + len(orphans) + (1 if recently_stopped else 0)
-        remote_sep = pos if remote_count > 0 else -1
+        remote_sep = pos if has_remote else -1
         return remote_sep
 
     # Key handler methods for dispatch pattern
@@ -1120,7 +1132,7 @@ class ManageScreen:
             else:
                 self.state.manage.send_state = None
                 self.tui.flash_error("Send failed")
-        except Exception as e:
+        except (HcomError, sqlite3.Error) as e:
             self.state.manage.send_state = None
             self.tui.flash_error(f"Error: {str(e)}")
 
@@ -1158,7 +1170,7 @@ class ManageScreen:
         color = STATUS_FG.get(status, FG_WHITE)
 
         status_context = info.get("data", {}).get("status_context", "")
-        if status == "active" and status_context.startswith("deliver:"):
+        if status == ST_ACTIVE and status_context.startswith("deliver:"):
             color = FG_DELIVER
 
         if (
@@ -1171,7 +1183,7 @@ class ManageScreen:
                     cmd_stop([base_name])
                 self.tui.flash(f"Stopped hcom for {color}{name}{RESET}")
                 self.tui.load_status()
-            except Exception as e:
+            except (HcomError, OSError) as e:
                 self.tui.flash_error(f"Error: {str(e)}")
             finally:
                 self.state.confirm.pending_stop = None
@@ -1275,7 +1287,7 @@ class ManageScreen:
                 self.tui.load_status()
             else:
                 self.tui.flash_error("Fork failed")
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             self.tui.flash_error(f"Fork error: {str(e)}")
 
     def _handle_tag_start(self, local: list, remote: list, recently_stopped: list, orphan_processes: list | None = None):
@@ -1435,8 +1447,9 @@ class ManageScreen:
         orphan_count = len(get_orphan_processes(active_pids=active_pids))
 
         # Build display count: local + remote section + orphans + recently_stopped
+        has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
         display_count = local_count
-        if remote_count > 0:
+        if has_remote:
             display_count += 1  # remote separator
             if self.state.manage.show_remote:
                 display_count += remote_count
@@ -1497,7 +1510,7 @@ class ManageScreen:
 
         # Light green coloring for message delivery (active with deliver token)
         status_context = data.get("status_context", "")
-        if status == "active" and status_context.startswith("deliver:"):
+        if status == ST_ACTIVE and status_context.startswith("deliver:"):
             color = FG_DELIVER
 
         # Header: bold colored name (badges already shown in instance list)

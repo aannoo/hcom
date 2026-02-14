@@ -101,59 +101,6 @@ class ReadReceipt(TypedDict):
     total_recipients: int
 
 
-class InstanceDataMinimal(TypedDict, total=False):
-    """Minimal instance data used in message routing."""
-
-    name: str
-    tag: str | None
-
-
-class InstanceData(TypedDict, total=False):
-    """Full instance data from database."""
-
-    # Primary fields
-    name: str
-    session_id: str | None
-    parent_session_id: str | None
-    parent_name: str | None
-    tag: str | None
-
-    # Status fields
-    last_event_id: int
-    status: str
-    status_time: int
-    status_context: str
-    status_detail: str
-
-    # Metadata
-    directory: str
-    created_at: float
-    transcript_path: str
-    tcp_mode: bool | int
-    wait_timeout: int
-    notify_port: int | None
-    background: bool | int
-    background_log_file: str
-
-    # Identity
-    agent_id: str | None
-    origin_device_id: str
-
-    # Tool info
-    tool: Literal["claude", "gemini", "codex", "adhoc"]
-    hints: str
-    subagent_timeout: int | None
-    launch_args: str
-    idle_since: str
-    pid: int | None
-    launch_context: str
-
-    # Announcement flags
-    name_announced: bool | int
-    launch_context_announced: bool | int
-    running_tasks: str
-
-
 # Scope computation result types
 ScopeExtra = dict[str, list[str]]  # e.g., {"mentions": ["luna", "nova"]}
 ScopeResult = tuple[MessageScope, ScopeExtra]
@@ -213,7 +160,15 @@ def _match_target(target: str, full_names: list[str], full_to_base: dict[str, st
 
     Tries prefix match on full display name first ({tag}-{name}).
     Falls back to prefix match on base name ({name} only) if no full-name match.
+
+    Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
     """
+    # bigboss is device-agnostic - strip any remote suffix
+    if target.lower().startswith("bigboss:"):
+        if "bigboss" in full_names or "bigboss" in full_to_base.values():
+            return ["bigboss"]
+        return []
+
     if ":" in target:
         # Remote target - match any instance with prefix
         return [full_to_base[fn] for fn in full_names if fn.lower().startswith(target.lower())]
@@ -371,30 +326,6 @@ def compute_scope(
     # No @mentions → broadcast to everyone
     return ("broadcast", {}), None
 
-
-def _should_deliver(scope: MessageScope, extra: ScopeExtra, receiver_name: str, sender_name: str) -> bool:
-    """Check if message should be delivered to receiver based on scope.
-
-    Args:
-        scope: Message scope ('broadcast', 'mentions')
-        extra: Extra scope data (mentions list for 'mentions' scope)
-        receiver_name: Instance to check delivery for
-        sender_name: Sender name (excluded from delivery)
-
-    Returns:
-        True if receiver should get the message
-    """
-    if receiver_name == sender_name:
-        return False
-
-    validate_scope(scope)
-
-    if scope == "broadcast":
-        return True
-    if scope == "mentions":
-        return receiver_name in extra.get("mentions", [])
-
-    return False
 
 
 # ==================== Core Message Operations ====================
@@ -571,9 +502,11 @@ def send_message(
     scope, extra = scope_result
 
     # Compute delivered_to: base names of participating instances in scope
-    # Use base name for delivery check since that's what's stored in mentions
+    # Build scope dict for should_deliver_message (cross-device stripping is a no-op for local names)
+    scope_data: dict[str, Any] = {"scope": scope, **extra}
     delivered_to = [
-        inst["name"] for inst in participating_instances if _should_deliver(scope, extra, inst["name"], identity.name)
+        inst["name"] for inst in participating_instances
+        if should_deliver_message(scope_data, inst["name"], identity.name)
     ]
 
     # Build event data
@@ -644,11 +577,9 @@ def send_message(
 
     # Push to relay server (notify daemon if running, else inline push)
     try:
-        from ..relay import notify_relay, push
+        from ..relay import trigger_push
 
-        if not notify_relay():
-            # Daemon not running - do inline push
-            push(force=True)
+        trigger_push()
     except Exception:
         pass  # Best effort
 
@@ -849,7 +780,7 @@ def should_deliver_message(event_data: dict[str, Any], receiver_name: str, sende
 
 
 # Note: determine_message_recipients() removed - obsolete after scope refactor
-# Use compute_scope() + _should_deliver() directly instead (see send_message() or get_recipient_feedback())
+# Use compute_scope() + should_deliver_message() directly instead (see send_message())
 
 
 def get_subagent_messages(
@@ -1352,14 +1283,11 @@ __all__ = [
     "UnreadMessage",
     "FormattedMessage",
     "ReadReceipt",
-    "InstanceDataMinimal",
-    "InstanceData",
     "ScopeExtra",
     "ScopeResult",
     # Functions
     "format_recipients",
     "compute_scope",
-    "_should_deliver",
     "unescape_bash",
     "send_message",
     "get_unread_messages",

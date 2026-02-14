@@ -75,7 +75,7 @@ def test_broadcast_delivers_to_all_participants(ws):
 
 
 def test_mentions_deliver_only_to_target(ws):
-    # Expect non-target poll to time out quickly (timeout is 1s in config.env).
+    # Expect non-target poll to time out quickly (timeout is 1s in config.toml).
     s1 = f"hermetic-a-{uuid4()}"
     s2 = f"hermetic-b-{uuid4()}"
     a = "alpha"

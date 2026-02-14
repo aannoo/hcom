@@ -20,6 +20,8 @@ Example usage:
 
 from typing import Any
 
+from ..shared import ST_LISTENING, ST_BLOCKED
+
 
 # Mapping of CLI flags to internal filter keys
 FLAG_MAP = {
@@ -430,10 +432,10 @@ def expand_shortcuts(argv: list[str]) -> list[str]:
 
     while i < len(argv):
         if argv[i] == "--idle" and i + 1 < len(argv):
-            expanded.extend(["--agent", argv[i + 1], "--status", "listening"])
+            expanded.extend(["--agent", argv[i + 1], "--status", ST_LISTENING])
             i += 2
         elif argv[i] == "--blocked" and i + 1 < len(argv):
-            expanded.extend(["--agent", argv[i + 1], "--status", "blocked"])
+            expanded.extend(["--agent", argv[i + 1], "--status", ST_BLOCKED])
             i += 2
         else:
             # Pass through (including --collision)

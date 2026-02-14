@@ -189,13 +189,13 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
     """
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-    except Exception:
+    except sqlite3.Error:
         version = 0
 
     # Check what tables exist
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    except Exception:
+    except sqlite3.Error:
         tables = set()
 
     required = {"events", "instances", "kv", "notify_endpoints", "session_bindings"}
@@ -284,7 +284,7 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
     # If these are missing, we must treat it as an incompatible schema and reset.
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(instances)").fetchall()}
-    except Exception:
+    except sqlite3.Error:
         cols = set()
     if "tool" not in cols:
         import sys
@@ -401,11 +401,11 @@ def init_db(conn: Optional[sqlite3.Connection] = None, _attempt: int = 0) -> Non
             transcript_path TEXT DEFAULT '',
             tcp_mode INTEGER DEFAULT 0,
             wait_timeout INTEGER DEFAULT 86400,
-            notify_port INTEGER,
+            notify_port INTEGER,  -- DEAD: replaced by notify_endpoints table. Remove on next schema bump.
             background INTEGER DEFAULT 0,
             background_log_file TEXT DEFAULT '',
             name_announced INTEGER DEFAULT 0,
-            launch_context_announced INTEGER DEFAULT 0,
+            launch_context_announced INTEGER DEFAULT 0,  -- DEAD: never read or written. Remove on next schema bump.
             agent_id TEXT UNIQUE,
             running_tasks TEXT DEFAULT '',
             origin_device_id TEXT DEFAULT '',
@@ -1276,6 +1276,13 @@ def kv_set(key: str, value: str | None) -> None:
         conn.commit()
 
 
+def kv_prefix(prefix: str) -> dict[str, str]:
+    """Get all kv entries whose key starts with prefix. Returns {key: value}."""
+    conn = get_db()
+    rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE ?", (prefix + "%",)).fetchall()
+    return {row["key"]: row["value"] for row in rows if row["value"] is not None}
+
+
 # ==================== Event Subscriptions ====================
 
 
@@ -1361,7 +1368,7 @@ def _cancel_request_watches_by_flow(
         rows = conn.execute(
             "SELECT key, value FROM kv WHERE key LIKE 'events_sub:reqwatch-%'"
         ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return
     for row in rows:
         try:
@@ -1405,7 +1412,7 @@ def _check_event_subscriptions(
     conn = get_db()
     try:
         rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'").fetchall()
-    except Exception as e:
+    except sqlite3.Error as e:
         _log_sub_error("*", "query failed", e)
         return
 
@@ -1432,7 +1439,7 @@ def _check_event_subscriptions(
                         f"SELECT 1 FROM events_v WHERE id = ? AND ({sql})",
                         [event_id] + params,
                     ).fetchone()
-                except Exception as e:
+                except sqlite3.Error as e:
                     _log_sub_error(sub_id, f"SQL error: {sql[:50]}", e)
                     continue
                 if not match:

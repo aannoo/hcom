@@ -32,13 +32,11 @@ import sys
 import time
 from pathlib import Path
 
-# Import ready patterns from the actual code - single source of truth
-from hcom.pty.pty_common import GEMINI_READY_PATTERN, CLAUDE_READY_PATTERN, CODEX_READY_PATTERN
-
+# Ready patterns — must match src/native/src/tool.rs ready_pattern()
 READY_PATTERNS = {
-    "claude": CLAUDE_READY_PATTERN.decode(),
-    "codex": CODEX_READY_PATTERN.decode(),
-    "gemini": GEMINI_READY_PATTERN.decode(),
+    "claude": "? for shortcuts",
+    "codex": "\u203a ",
+    "gemini": "Type your message",
 }
 
 # =============================================================================
@@ -420,11 +418,18 @@ def run_test(tool: str):
     t_ready = time.time() - t0
     ok(f"Instance launched: {_instance_name} (base: {_base_name}, ready in {t_ready:.1f}s)")
 
-    # Wait for screen ready (term uses base name)
-    # Timeout allows for slow TUI render; check instance still alive on failure
+    # Wait for screen to be ready (TUI fully rendered)
+    # The ready event already fired, so the pattern was detected — poll until the
+    # screen capture reflects that state (avoids race with partial renders).
+    def _screen_ready():
+        s = get_screen(_base_name)
+        if not s or not s.get("ready"):
+            return None
+        return s
+
     screen: dict = poll_until(
-        lambda: get_screen(_base_name) or None,
-        "screen query returns data",
+        _screen_ready,
+        "screen ready (TUI fully rendered)",
         timeout=30,
         interval=1.0,
     )
@@ -432,20 +437,15 @@ def run_test(tool: str):
         # Check if instance is still running
         r = hcom(f"list --json")
         alive = _base_name in r.stdout if r.returncode == 0 else False
-        fail(f"Screen query returned empty for 30s (instance alive={alive})")
-    if REQUIRE_READY[tool] and not screen.get("ready"):
-        fail(f"Screen not ready: {screen}")
+        fail(f"Screen not ready for 30s (instance alive={alive})")
 
     # ── Validate initial screen ──────────────────────────────────
     print(f"\n[Validate] Initial screen state for {tool}...")
     validate_screen_schema(screen)
     ok("Schema valid")
-    if REQUIRE_READY[tool]:
-        validate_ready_pattern(screen, tool)
-        ok(f"Ready pattern '{READY_PATTERNS[tool]}' consistent")
-        assert screen["ready"] is True
-    else:
-        ok(f"ready={screen.get('ready')} (not required for {tool})")
+    validate_ready_pattern(screen, tool)
+    ok(f"Ready pattern '{READY_PATTERNS[tool]}' consistent")
+    assert screen["ready"] is True
     validate_prompt_consistency(screen)
     ok(f"prompt_empty={screen['prompt_empty']} input_text={screen.get('input_text')!r}")
     validate_tool_ui_elements(screen, tool)

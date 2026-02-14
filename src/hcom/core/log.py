@@ -147,7 +147,7 @@ def get_recent_logs(
                             entries.append(entry)
                 except (json.JSONDecodeError, ValueError):
                     continue
-    except Exception:
+    except (json.JSONDecodeError, ValueError, OSError):
         return []
 
     # Sort by timestamp descending (newest first) and limit

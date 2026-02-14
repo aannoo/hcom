@@ -255,8 +255,8 @@ def _generate_config_details() -> str:
     """Generate detailed config documentation for all keys."""
     from ..commands.config_cmd import _get_config_help
 
-    # Intro explaining config.env
-    intro = """Config is stored in ~/.hcom/config.env (or $HCOM_DIR/config.env).
+    # Intro explaining config.toml
+    intro = """Config is stored in ~/.hcom/config.toml (or $HCOM_DIR/config.toml).
 
 Commands:
   hcom config                 Show all values
@@ -264,7 +264,7 @@ Commands:
   hcom config <key> --info    Detailed help for a setting
   hcom config --edit          Open in $EDITOR
 
-Precedence: defaults < config.env < shell environment variables"""
+Precedence: defaults < config.toml < shell environment variables"""
 
     keys = [
         "HCOM_TAG",

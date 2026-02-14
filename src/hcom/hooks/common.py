@@ -5,7 +5,10 @@ Extracts duplicated patterns from parent.py and tool-specific hook files.
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
+
+from ..shared import ST_ACTIVE, ST_INACTIVE
 
 
 def deliver_pending_messages(instance_name: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -36,7 +39,7 @@ def deliver_pending_messages(instance_name: str) -> tuple[list[dict[str, Any]], 
     formatted = format_messages_json(deliver, instance_name)
     set_status(
         instance_name,
-        "active",
+        ST_ACTIVE,
         f"deliver:{get_display_name(deliver[0]['from'])}",
         msg_ts=deliver[-1].get("timestamp", ""),
     )
@@ -52,12 +55,12 @@ def finalize_session(instance_name: str, reason: str, updates: dict[str, Any] | 
     from ..core.tool_utils import stop_instance
     from ..core.log import log_error
 
-    set_status(instance_name, "inactive", f"exit:{reason}")
+    set_status(instance_name, ST_INACTIVE, f"exit:{reason}")
 
     try:
         if updates:
             update_instance_position(instance_name, updates)
-    except Exception as e:
+    except sqlite3.Error as e:
         log_error("hooks", "hook.error", e, hook="sessionend", instance=instance_name)
 
     stop_instance(instance_name, initiated_by="session", reason=f"exit:{reason}")
@@ -73,4 +76,4 @@ def update_tool_status(instance_name: str, tool: str, tool_name: str, tool_input
     from ..core.instances import set_status
 
     detail = extract_tool_detail(tool, tool_name, tool_input)
-    set_status(instance_name, "active", f"tool:{tool_name}", detail=detail)
+    set_status(instance_name, ST_ACTIVE, f"tool:{tool_name}", detail=detail)

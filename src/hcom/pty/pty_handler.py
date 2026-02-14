@@ -15,10 +15,6 @@ import random
 import shlex
 import shutil
 
-from .pty_common import (
-    GEMINI_READY_PATTERN,
-    CLAUDE_CODEX_READY_PATTERN,
-)
 from ..core.log import log_info, log_error
 from ..core.binary import get_native_binary
 from ..shared import TOOL_MARKER_VARS, HCOM_IDENTITY_VARS
@@ -151,7 +147,7 @@ def launch_pty(
     Args:
         tool: Tool identifier ("claude", "gemini", "codex")
         cwd: Working directory
-        env: Full instance_env dict from launcher (config.env + instance vars).
+        env: Full instance_env dict from launcher (config.toml + instance vars).
              Will be augmented with HCOM_INSTANCE_NAME and tool-specific vars.
         instance_name: HCOM instance name
         tool_args: Arguments to pass to tool command
@@ -195,7 +191,4 @@ def launch_pty(
 __all__ = [
     "create_runner_script",
     "launch_pty",
-    # Re-exports for compatibility
-    "GEMINI_READY_PATTERN",
-    "CLAUDE_CODEX_READY_PATTERN",
 ]

@@ -73,6 +73,18 @@ class HermeticWorkspace:
         return self.hcom_dir / "hcom.db"
 
 
+def _init_workspace_db(db_path: Path) -> None:
+    """Create hcom DB schema directly (no subprocess)."""
+    from hcom.core.db import init_db
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_db(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def make_workspace(*, timeout_s: int = 1, hints: str = "Hermetic hints") -> HermeticWorkspace:
     """Create a fully isolated workspace under `test/output/` (inside the repo)."""
     base = TEST_ROOT / "output" / "hermetic_e2e"
@@ -98,25 +110,26 @@ def make_workspace(*, timeout_s: int = 1, hints: str = "Hermetic hints") -> Herm
         hints=hints,
     )
 
-    # Ensure DB schema exists by invoking the real CLI once.
-    # (We seed data via sqlite for setup; this call avoids schema drift issues.)
-    result = run_hcom(ws.env(), "list")
-    if result.code != 0:
-        raise RuntimeError(f"Failed to init DB via `hcom list`: {result.stderr}\n{result.stdout}")
+    # Init DB schema directly (avoids ~270ms subprocess per workspace).
+    _init_workspace_db(ws.db_path)
     return ws
 
 
 def _write_config(*, hcom_dir: Path, timeout_s: int, hints: str) -> None:
-    content = "\n".join(
-        [
-            f"HCOM_TIMEOUT={int(timeout_s)}",
-            "HCOM_SUBAGENT_TIMEOUT=1",
-            "HCOM_TERMINAL=print",
-            f"HCOM_HINTS={hints}",
-            'HCOM_CLAUDE_ARGS="Hermetic test prompt"',
-        ]
-    )
-    (hcom_dir / "config.env").write_text(content + "\n", encoding="utf-8")
+    import tomli_w
+    data = {
+        "terminal": {"active": "print"},
+        "launch": {
+            "tag": "", "hints": hints, "notes": "",
+            "subagent_timeout": 1, "auto_subscribe": "collision",
+            "claude": {"args": "Hermetic test prompt"},
+            "gemini": {"args": "", "system_prompt": ""},
+            "codex": {"args": "", "sandbox_mode": "workspace", "system_prompt": ""},
+        },
+        "relay": {"url": "", "id": "", "token": "", "enabled": True},
+        "preferences": {"timeout": int(timeout_s), "auto_approve": True, "name_export": ""},
+    }
+    (hcom_dir / "config.toml").write_text(tomli_w.dumps(data), encoding="utf-8")
 
 
 def _coerce_stdin(stdin: Any | None) -> str | None:

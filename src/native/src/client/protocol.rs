@@ -39,8 +39,8 @@ const FORWARD_ENV: &[&str] = &[
     "HCOM_LAUNCHED_PRESET",
     // Paths and config
     "CLAUDE_ENV_FILE", "HCOM_DIR", "HCOM_GO", "HCOM_NOTES",
-    // Tool detection
-    "CLAUDECODE", "GEMINI_CLI",
+    // Tool detection (keep in sync with TOOL_MARKER_VARS in shared.py)
+    "CLAUDECODE", "GEMINI_CLI", "GEMINI_SYSTEM_MD",
     "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED",
     "CODEX_MANAGED_BY_NPM", "CODEX_MANAGED_BY_BUN",
     "CODEX_THREAD_ID",

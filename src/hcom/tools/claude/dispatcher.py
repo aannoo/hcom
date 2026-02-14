@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import sys
 from typing import Any, Final
 from ...core.instances import load_instance_position
@@ -197,7 +198,7 @@ def _bind_vanilla_from_marker(hook_data: dict[str, Any], session_id: str, curren
         update_instance_position(instance_name, {"session_id": session_id, "tool": "claude"})
 
         return instance_name
-    except Exception as e:
+    except sqlite3.Error as e:
         log_error("hooks", "bind.fail", e)
         return None
 

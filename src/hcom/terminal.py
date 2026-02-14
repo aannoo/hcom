@@ -374,7 +374,7 @@ def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_i
         return result.returncode == 0
     except subprocess.TimeoutExpired:
         return False
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -759,12 +759,12 @@ def launch_terminal(
 ) -> str | bool | None | tuple[str, int]:
     """Launch terminal with command using unified script-first approach
 
-    Environment precedence: config.env < shell environment
+    Environment precedence: config.toml < shell environment
     Internal hcom vars (HCOM_LAUNCHED, etc) don't conflict with user vars.
 
     Args:
         command: Command string from build_claude_command
-        env: Contains config.env defaults + hcom internal vars
+        env: Contains config.toml defaults + hcom internal vars
         cwd: Working directory
         background: Launch as background process
         run_here: If True, run in current terminal (blocking). Used for count=1 launches.
@@ -778,7 +778,7 @@ def launch_terminal(
     from .core.paths import LOGS_DIR
     import time
 
-    # env param contains config.env + instance vars (from launcher)
+    # env param contains config.toml + instance vars (from launcher)
     # We'll build different env sets based on launch mode
     config_and_instance_env = env.copy()
 
@@ -832,10 +832,10 @@ def launch_terminal(
     opens_new_window = not background and not run_here
 
     # Build script_env based on launch mode
-    # Principle: new windows get ONLY config.env + instance vars (nothing from shell)
+    # Principle: new windows get ONLY config.toml + instance vars (nothing from shell)
     if opens_new_window:
         # New window: launched by terminal app, no shell inheritance
-        # Want env var in new window? Put it in config.env
+        # Want env var in new window? Put it in config.toml
         script_env = config_and_instance_env
     elif run_here:
         # Run-here: os.execve REPLACES env entirely, needs full env
@@ -913,7 +913,7 @@ def launch_terminal(
             print(script_content)
             Path(script_file).unlink()  # Clean up immediately
             return True
-        except Exception as e:
+        except OSError as e:
             print(format_error(f"Failed to read script: {e}"), file=sys.stderr)
             return False
 
@@ -1010,7 +1010,7 @@ def launch_terminal(
             try:
                 subprocess.run(am_cmd, check=False)
                 return True
-            except Exception as e:
+            except (OSError, subprocess.SubprocessError) as e:
                 raise HcomError(format_error(f"Failed to launch Termux: {e}"))
 
         # Unified platform handling via helpers
@@ -1037,7 +1037,7 @@ def launch_terminal(
             return success
         except HcomError:
             raise
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             raise HcomError(format_error(f"Failed to launch terminal: {e}"))
     else:
         # User-provided string commands - parse safely without shell=True
@@ -1053,7 +1053,7 @@ def launch_terminal(
             return success
         except HcomError:
             raise
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             raise HcomError(format_error(f"Failed to execute terminal command: {e}"))
 
 
@@ -1110,7 +1110,7 @@ def _spawn_terminal_process(argv: list[str], format_error) -> tuple[bool, str]:
                 delete=False,
             )
             stderr_path = stderr_handle.name
-        except Exception:
+        except OSError:
             stderr_handle = None
             stderr_path = None
         try:
@@ -1121,7 +1121,7 @@ def _spawn_terminal_process(argv: list[str], format_error) -> tuple[bool, str]:
                 delete=False,
             )
             stdout_path = stdout_handle.name
-        except Exception:
+        except OSError:
             stdout_handle = None
             stdout_path = None
 

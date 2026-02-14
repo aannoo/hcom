@@ -10,6 +10,7 @@ import sys
 import time
 import argparse
 from hcom.api import HcomError, instances, launch, session
+from hcom.shared import ST_INACTIVE
 
 # === SYSTEM PROMPTS (from Swarms debate_with_judge.py) ===
 
@@ -254,7 +255,7 @@ def run_workers_mode(args, thread, context_section):
     for w in workers:
         if w not in available:
             errors.append(f"'{w}' not found")
-        elif available[w]["status"] in ("inactive", "stale"):
+        elif available[w]["status"] in (ST_INACTIVE, "stale"):
             errors.append(f"'{w}' is {available[w]['status']}")
 
     if errors:

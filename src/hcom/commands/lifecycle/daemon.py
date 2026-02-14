@@ -118,7 +118,7 @@ def _daemon_start() -> int:
         else:
             print("Daemon failed to start", file=sys.stderr)
             return 1
-    except Exception as e:
+    except (ProcessLookupError, ValueError, OSError) as e:
         print(f"Failed to start daemon: {e}", file=sys.stderr)
         return 1
 
@@ -166,6 +166,6 @@ def _daemon_stop() -> int:
     except ValueError:
         print("Invalid PID file", file=sys.stderr)
         return 1
-    except Exception as e:
+    except (ProcessLookupError, OSError) as e:
         print(f"Failed to stop daemon: {e}", file=sys.stderr)
         return 1

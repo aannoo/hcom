@@ -96,8 +96,10 @@ def cmd_hooks_add(argv: list[str]) -> int:
     for tool in tools:
         try:
             if tool == "claude":
-                setup_claude_hooks(include_permissions=include_permissions)
-                results[tool] = True
+                if setup_claude_hooks(include_permissions=include_permissions):
+                    results[tool] = True
+                else:
+                    results[tool] = False
             elif tool == "gemini":
                 if setup_gemini_hooks(include_permissions=include_permissions):
                     results[tool] = True
@@ -108,7 +110,7 @@ def cmd_hooks_add(argv: list[str]) -> int:
                     results[tool] = True
                 else:
                     results[tool] = False
-        except Exception as e:
+        except (OSError, ValueError) as e:
             print(f"error: Failed to add {tool} hooks: {e}", file=sys.stderr)
             results[tool] = False
 
@@ -174,7 +176,7 @@ def cmd_hooks_remove(argv: list[str]) -> int:
             elif tool == "codex":
                 remove_codex_hooks()
                 results[tool] = True
-        except Exception as e:
+        except OSError as e:
             print(f"error: Failed to remove {tool} hooks: {e}", file=sys.stderr)
             results[tool] = False
 

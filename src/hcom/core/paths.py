@@ -20,7 +20,9 @@ LOGS_DIR = ".tmp/logs"
 LAUNCH_DIR = ".tmp/launch"
 FLAGS_DIR = ".tmp/flags"
 LAUNCHES_DIR = "launches"  # Saved launch profiles
-CONFIG_FILE = "config.env"
+CONFIG_FILE = "config.env"  # Legacy — used only for migration
+CONFIG_TOML = "config.toml"
+ENV_FILE = "env"
 ARCHIVE_DIR = "archive"
 
 # Cache for resolved hcom directory (per-process, thread-safe)
@@ -292,5 +294,7 @@ __all__ = [
     "FLAGS_DIR",
     "LAUNCHES_DIR",
     "CONFIG_FILE",
+    "CONFIG_TOML",
+    "ENV_FILE",
     "ARCHIVE_DIR",
 ]

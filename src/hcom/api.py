@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -179,10 +180,9 @@ class Session:
             # Create bundle event
             bundle_id = create_bundle_event(bundle, instance=bundle_instance, created_by=identity.name)
             try:
-                from .relay import notify_relay, push
+                from .relay import trigger_push
 
-                if not notify_relay():
-                    push()
+                trigger_push()
             except Exception:
                 pass
             envelope["bundle_id"] = bundle_id
@@ -358,7 +358,7 @@ class Session:
 
         try:
             rows = get_db().execute(query, params or []).fetchall()
-        except Exception as e:
+        except sqlite3.Error as e:
             raise HcomError(f"SQL error: {e}")
 
         result = []
@@ -416,7 +416,7 @@ class Session:
                 f"SELECT * FROM events_v WHERE timestamp > ? AND ({sql}) ORDER BY id DESC LIMIT 1",
                 [lookback_ts] + params,
             ).fetchone()
-        except Exception as e:
+        except sqlite3.Error as e:
             raise HcomError(f"SQL error: {e}")
 
         if row:
@@ -432,7 +432,7 @@ class Session:
                     f"SELECT * FROM events_v WHERE id > ? AND ({sql}) ORDER BY id LIMIT 1",
                     [last_id] + params,
                 ).fetchone()
-            except Exception as e:
+            except sqlite3.Error as e:
                 raise HcomError(f"SQL error: {e}")
 
             if row:
@@ -475,7 +475,7 @@ class Session:
         conn = get_db()
         try:
             conn.execute(f"SELECT 1 FROM events_v WHERE ({sql}) LIMIT 0", params or [])
-        except Exception as e:
+        except sqlite3.Error as e:
             raise HcomError(f"Invalid SQL: {e}")
 
         now = time.time()
@@ -1096,6 +1096,7 @@ def _launch_single(
             cwd=cwd,
             batch_id=batch_id,
             name=name,
+            skip_validation=True,
         )
         if wait and result.get("batch_id"):
             from .core.launch_status import wait_for_launch
@@ -1161,6 +1162,7 @@ def _launch_single(
         cwd=cwd,
         batch_id=batch_id,
         name=name,
+        skip_validation=True,
     )
     if wait and result.get("batch_id"):
         from .core.launch_status import wait_for_launch
@@ -1362,10 +1364,9 @@ def bundle(
 
         bundle_id = create_bundle_event(bundle_data, instance=inst, created_by=identity.name)
         try:
-            from .relay import notify_relay, push
+            from .relay import trigger_push
 
-            if not notify_relay():
-                push()
+            trigger_push()
         except Exception:
             pass
         return bundle_id

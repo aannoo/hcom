@@ -6,11 +6,14 @@ Extracted from hooks/utils.py to reduce cross-package coupling.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import shlex
 from pathlib import Path
+
+from ..shared import ST_LISTENING
 
 # Platform detection
 IS_WINDOWS = sys.platform == "win32"
@@ -357,7 +360,7 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
                     terminal_id = lc_data.get("terminal_id", "")
                     lc_env = lc_data.get("env", {})
                     kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
-            except Exception:
+            except (json.JSONDecodeError, KeyError):
                 pass
             # Fallback: process_bindings table (if process_id not in launch_context)
             if not proc_id:
@@ -460,10 +463,9 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
         _send_notify_to_ports(notify_ports)
 
     try:
-        from ..relay import notify_relay, push
+        from ..relay import trigger_push
 
-        if not notify_relay():
-            push()
+        trigger_push()
     except Exception:
         pass
 
@@ -518,7 +520,7 @@ def create_orphaned_pty_identity(session_id: str, process_id: str, tool: str = "
             {"action": "created", "by": "hook", "reason": "clear_restart"},
         )
 
-        set_status(instance_name, "listening", "start")
+        set_status(instance_name, ST_LISTENING, "start")
 
         log_info(
             "hooks",

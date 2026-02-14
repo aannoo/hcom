@@ -13,9 +13,6 @@ Device Identity Model
 - Full UUID: 36-char hyphenated format (stored in ~/.hcom/.tmp/device_id)
 - Short ID: 4-char CVCV word derived(?) from UUID (e.g., 'BOXE', 'LUNA')
 
-The short ID is cached separately to ensure stability even if the word
-generation algorithm changes in future versions. (not sure this is true)
-
 Example
 -------
 >>> device_id = get_device_uuid()
@@ -54,20 +51,11 @@ def get_device_uuid() -> str:
 def get_device_short_id(device_id: str | None = None) -> str:
     """Get 4-char word-based device ID (e.g., 'BOXE').
 
-    Cached after first derivation so word list changes don't break existing devices.
+    Deterministic: same device UUID always produces the same short ID.
     """
-    cache_file = hcom_path(".tmp", "device_short_id")
-    if cache_file.exists():
-        existing = cache_file.read_text().strip()
-        if existing:
-            return existing
-
     if device_id is None:
         device_id = get_device_uuid()
-    short_id = hash_to_name(device_id).upper()
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(cache_file, short_id)
-    return short_id
+    return hash_to_name(device_id).upper()
 
 
 def add_device_suffix(name: str | None, device_id: str) -> str | None:

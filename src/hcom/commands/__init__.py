@@ -2,17 +2,12 @@
 
 from .lifecycle import cmd_launch, cmd_stop, cmd_start, cmd_kill, cmd_daemon
 from .messaging import cmd_send, cmd_listen
-from .admin import (
-    cmd_events,
-    cmd_reset,
-    cmd_help,
-    cmd_list,
-    cmd_relay,
-    cmd_config,
-    cmd_transcript,
-    cmd_archive,
-    cmd_status,
-)
+from .events import cmd_events
+from .reset import cmd_reset, cmd_help
+from .query import cmd_list, cmd_archive, cmd_status
+from .relay import cmd_relay
+from .config_cmd import cmd_config
+from .transcript import cmd_transcript
 from .shim import cmd_shim
 from .hooks_cmd import cmd_hooks
 from .bundle import cmd_bundle

@@ -26,13 +26,18 @@ if _src_dir.exists():
 # Default test timeout (short for tests)
 DEFAULT_TEST_TIMEOUT = 5
 
-# ENV-based test configuration
-BASE_TEST_ENV = {
-    'HCOM_TERMINAL': 'print',  # Don't actually launch terminals in tests
-    'HCOM_CLAUDE_ARGS': '"Say hi in chat"',
-    'HCOM_TIMEOUT': str(DEFAULT_TEST_TIMEOUT),
-    'HCOM_SUBAGENT_TIMEOUT': '30',
-    'HCOM_HINTS': '',
+# Test configuration values (written to config.toml)
+BASE_TEST_CONFIG = {
+    "terminal": {"active": "print"},  # Don't actually launch terminals in tests
+    "launch": {
+        "tag": "", "hints": "", "notes": "",
+        "subagent_timeout": 30, "auto_subscribe": "collision",
+        "claude": {"args": "Say hi in chat"},
+        "gemini": {"args": "", "system_prompt": ""},
+        "codex": {"args": "", "sandbox_mode": "workspace", "system_prompt": ""},
+    },
+    "relay": {"url": "", "id": "", "token": "", "enabled": True},
+    "preferences": {"timeout": DEFAULT_TEST_TIMEOUT, "auto_approve": True, "name_export": ""},
 }
 
 # Environment variables that affect hcom behavior — must be cleared for test isolation
@@ -46,7 +51,7 @@ IDENTITY_ENV_VARS = [
     'HCOM_PROCESS_ID',      # Process identity binding (primary identity mechanism)
 ]
 
-# Config env vars that override config.env file values
+# Config env vars that override config.toml file values
 CONFIG_ENV_VARS = [
     'HCOM_TIMEOUT',
     'HCOM_SUBAGENT_TIMEOUT',
@@ -73,7 +78,7 @@ def clean_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     for var in IDENTITY_ENV_VARS:
         env.pop(var, None)
 
-    # Clear config env vars so config.env file values are used instead
+    # Clear config env vars so config.toml file values are used instead
     for var in CONFIG_ENV_VARS:
         env.pop(var, None)
 
@@ -162,11 +167,10 @@ def hcom_env(temp_home, monkeypatch):
     hcom_dir = temp_home / '.hcom'
     hcom_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write config.env file (current format)
-    config_env = BASE_TEST_ENV.copy()
-    config_file = hcom_dir / 'config.env'
-    config_lines = [f'{key}={value}\n' for key, value in config_env.items()]
-    config_file.write_text(''.join(config_lines), encoding='utf-8')
+    # Write config.toml
+    import tomli_w
+    config_file = hcom_dir / 'config.toml'
+    config_file.write_text(tomli_w.dumps(BASE_TEST_CONFIG), encoding='utf-8')
 
     # Force reload config to use the test config file
     monkeypatch.setattr('hcom.core.config._config_cache', None)

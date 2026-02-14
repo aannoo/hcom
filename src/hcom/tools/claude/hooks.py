@@ -26,6 +26,7 @@ Key Concepts:
 
 from __future__ import annotations
 from typing import Any, TYPE_CHECKING
+import sqlite3
 import sys
 import json
 from pathlib import Path
@@ -42,11 +43,12 @@ from ...core.instances import (
     parse_running_tasks,
 )
 from ...core.config import get_config
+from ...shared import ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING
 
 from ...core.db import get_db, get_events_since
 
 from ...core.bootstrap import get_bootstrap
-from ...hooks.utils import notify_instance
+from ...core.runtime import notify_instance
 from ...hooks.family import extract_tool_detail
 from ...core.log import log_error, log_info
 
@@ -95,7 +97,7 @@ def get_real_session_id(hook_data: dict[str, Any], env_file: str | None, *, is_f
                             hook_session_id=hook_session_id,
                         )
                         return candidate
-        except Exception as e:
+        except (IndexError, ValueError) as e:
             log_error("hooks", "hook.error", e, hook="get_real_session_id")
 
     return hook_session_id
@@ -144,7 +146,7 @@ def handle_sessionstart(
         try:
             with open(env_file, "a") as f:
                 f.write(f"export HCOM_CLAUDE_UNIX_SESSION_ID={session_id}\n")
-        except Exception:
+        except OSError:
             pass  # Best effort - don't fail hook if write fails
 
     # Handle compaction: re-inject bootstrap (metadata already exists)
@@ -172,7 +174,7 @@ def handle_sessionstart(
                     }
                 }
                 return HookResult(exit_code=0, stdout=json.dumps(output))
-        except Exception as e:
+        except (sqlite3.Error, KeyError) as e:
             log_error("hooks", "hook.error", e, hook="sessionstart")
 
     # Vanilla instance - show hint
@@ -225,7 +227,7 @@ def handle_sessionstart(
                 from ...core.instances import capture_and_store_launch_context
 
                 capture_and_store_launch_context(instance_name)
-                set_status(instance_name, "listening", "start")
+                set_status(instance_name, ST_LISTENING, "start")
                 # Terminal title
                 try:
                     with open("/dev/tty", "w") as tty:
@@ -250,17 +252,8 @@ def handle_sessionstart(
                     from ...core.paths import increment_flag_counter
 
                     increment_flag_counter("instance_count")
-    except Exception as e:
+    except (sqlite3.Error, KeyError) as e:
         log_error("hooks", "bind.fail", e, hook="sessionstart")
-
-    # Pull remote events
-    try:
-        from ...relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()
-    except Exception:
-        pass
 
     stdout = json.dumps(result_output) if result_output else ""
     return HookResult(exit_code=0, stdout=stdout)
@@ -273,7 +266,7 @@ def start_task(session_id: str, hook_data: dict[str, Any]) -> dict[str, Any] | N
     Returns updatedInput dict if hcom instructions should be appended to prompt.
     """
     from ...core.db import get_session_binding
-    from ...hooks.utils import build_hcom_command
+    from ...core.tool_utils import build_hcom_command
 
     log_info("hooks", "start_task.enter", session_id=session_id)
 
@@ -296,7 +289,7 @@ def start_task(session_id: str, hook_data: dict[str, Any]) -> dict[str, Any] | N
     instance_data = load_instance_position(instance_name)
     if instance_data:
         detail = extract_tool_detail("claude", "Task", hook_data.get("tool_input", {}))
-        set_status(instance_name, "active", "tool:Task", detail=detail)
+        set_status(instance_name, ST_ACTIVE, "tool:Task", detail=detail)
 
     # Append hcom connection instructions to the Task prompt
     tool_input = hook_data.get("tool_input", {})
@@ -525,7 +518,7 @@ def handle_stop(
 
     # MAIN PATH: PTY mode exits immediately - poll thread handles injection
     if ctx.is_pty_mode:
-        set_status(instance_name, "listening")
+        set_status(instance_name, ST_LISTENING)
         notify_instance(instance_name)
         return HookResult.success()
 
@@ -560,7 +553,7 @@ def handle_stop(
     )
 
     if timed_out:
-        set_status(instance_name, "inactive", "exit:timeout")
+        set_status(instance_name, ST_INACTIVE, "exit:timeout")
 
     stdout = json.dumps(output, ensure_ascii=False) if output else ""
     return HookResult(exit_code=exit_code, stdout=stdout)
@@ -591,17 +584,8 @@ def handle_posttooluse(
     outputs_to_combine: list[dict[str, Any]] = []
 
     # Clear blocked status - tool completed means approval was granted
-    if instance_data.get("status") == "blocked":
-        set_status(instance_name, "active", f"approved:{tool_name}")
-
-    # Pull remote events (rate-limited) - receive messages during operation
-    try:
-        from ...relay import is_relay_handled_by_daemon, pull
-
-        if not is_relay_handled_by_daemon():
-            pull()  # relay.py logs errors internally
-    except Exception as e:
-        log_error("relay", "relay.error", e, hook="posttooluse")
+    if instance_data.get("status") == ST_BLOCKED:
+        set_status(instance_name, ST_ACTIVE, f"approved:{tool_name}")
 
     # Bash-specific: persist updates and check bootstrap
     # Updates critical for vanilla instances binding via hcom start
@@ -752,7 +736,7 @@ def handle_userpromptsubmit(
             from ...core.paths import increment_flag_counter
 
             increment_flag_counter("instance_count")
-            set_status(instance_name, "active", "prompt")
+            set_status(instance_name, ST_ACTIVE, "prompt")
             return HookResult(exit_code=0, stdout=json.dumps(output))
 
     # PTY mode: deliver messages (like Gemini's BeforeAgent)
@@ -773,7 +757,7 @@ def handle_userpromptsubmit(
 
             set_status(
                 instance_name,
-                "active",
+                ST_ACTIVE,
                 f"deliver:{get_display_name(deliver_messages[0]['from'])}",
                 msg_ts=deliver_messages[-1]["timestamp"],
             )
@@ -787,7 +771,7 @@ def handle_userpromptsubmit(
             return HookResult(exit_code=0, stdout=json.dumps(delivery_output, ensure_ascii=False))
 
     # Set status to active (real user prompt, not hcom injection)
-    set_status(instance_name, "active", "prompt")
+    set_status(instance_name, ST_ACTIVE, "prompt")
     return HookResult.success()
 
 
@@ -818,7 +802,7 @@ def handle_notify(
 
     if updates:
         update_instance_position(instance_name, updates)
-    set_status(instance_name, "blocked", message)
+    set_status(instance_name, ST_BLOCKED, message)
     return HookResult.success()
 
 

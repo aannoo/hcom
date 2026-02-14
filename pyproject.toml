@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hcom"
-version = "0.6.18"
+version = "0.6.19"
 description = "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,8 @@ authors = [{name = "aannoo"}]
 keywords = ["claude", "claude-code", "gemini", "codex", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
 dependencies = [
     "wcwidth",
+    "paho-mqtt>=2.0",
+    "tomli-w>=1.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

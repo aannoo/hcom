@@ -1,27 +1,29 @@
-"""Relay commands for HCOM"""
+"""Relay commands for HCOM — cross-device sync via MQTT pub/sub."""
 
+import base64
 import sys
-import json
 import time
-from pathlib import Path
-from .utils import format_error
+import uuid
 from ..shared import format_age, CommandContext
 
 
-REQUIRED_RELAY_VERSION = 1  # Bump when hcom needs new relay features
-
-
 def cmd_relay(argv: list[str], *, ctx: CommandContext | None = None) -> int:
-    """Relay management: hcom relay [on|off|pull|poll|hf]
+    """Relay management: hcom relay [new|connect|disconnect|status]
 
     Usage:
-        hcom relay                Show relay status
-        hcom relay on             Enable relay sync
-        hcom relay off            Disable relay sync
-        hcom relay pull           Manual sync (pull + push)
-        hcom relay poll [sec]     Long-poll for changes
-        hcom relay hf [token]     Setup HuggingFace Space relay
-        hcom relay hf --update    Update relay to latest version
+        hcom relay                  Show relay status and ping broker
+        hcom relay status           Same as above
+        hcom relay new              Create new relay group
+        hcom relay connect          Re-enable existing relay
+        hcom relay connect <token>  Join relay from another device
+        hcom relay off              Disable relay sync (alias: disconnect)
+        hcom relay disconnect       Disable relay sync
+
+    Private broker:
+        hcom relay new --broker mqtts://host:port [--password secret]
+        hcom relay connect <token> --broker mqtts://host:port [--password secret]
+
+    Switching groups just overwrites — previous token is printed so you can switch back.
 
     Note: --name flag is not used by relay command (no identity needed).
     """
@@ -33,17 +35,20 @@ def cmd_relay(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     if not argv:
         return _relay_status()
-    elif argv[0] == "on":
-        return _relay_toggle(True)
-    elif argv[0] == "off":
+    elif argv[0] == "new":
+        return _relay_new(argv[1:])
+    elif argv[0] == "connect":
+        return _relay_connect(argv[1:])
+    elif argv[0] in ("off", "disconnect"):
         return _relay_toggle(False)
-    elif argv[0] == "pull":
-        return _relay_pull()
-    elif argv[0] == "poll":
-        return _relay_poll(argv[1:])
-    elif argv[0] == "hf":
-        return _relay_hf(argv[1:])
+    elif argv[0] in ("on", "status"):
+        return _relay_connect([]) if argv[0] == "on" else _relay_status()
     else:
+        # Could be a token passed directly: hcom relay <token>
+        # Tokens are base64url, typically 60+ chars, no dashes at start
+        if len(argv[0]) > 20 and not argv[0].startswith("-"):
+            return _relay_connect(argv)
+
         from .utils import get_command_help
 
         print(f"Unknown subcommand: {argv[0]}\n", file=sys.stderr)
@@ -62,91 +67,88 @@ def _relay_toggle(enable: bool) -> int:
 
     config = get_config()
 
-    # Check if relay URL is configured
-    if not config.relay:
-        print("No relay URL configured.", file=sys.stderr)
-        print("Run: hcom relay hf <token>", file=sys.stderr)
+    # Check if relay_id is configured
+    if not config.relay_id:
+        print("No relay configured.", file=sys.stderr)
+        print("Run: hcom relay new", file=sys.stderr)
         return 1
+
+    # Clear retained MQTT state before disabling so remote devices stop seeing us
+    if not enable and config.relay_enabled:
+        from ..relay import clear_retained_state
+        if clear_retained_state():
+            print("Cleared remote state")
 
     # Update config
     snapshot = load_config_snapshot()
     snapshot.core.relay_enabled = enable
     save_config_snapshot(snapshot)
-    reload_config()  # Invalidate cache so push/pull see new relay_enabled value
+    reload_config()
 
     if enable:
         print("Relay enabled\n")
         return _relay_status()
     else:
         print("Relay: disabled")
-        print(f"URL still configured: {config.relay}")
-        print("\nRun 'hcom relay on' to reconnect")
+        print("\nRun 'hcom relay connect' to reconnect")
 
     return 0
 
 
 def _relay_status() -> int:
-    """Show relay status and configuration"""
+    """Show relay status and configuration."""
     from ..core.device import get_device_short_id
     from ..core.config import get_config
-    from ..core.db import kv_get
-    from ..relay import push, pull, _http
+    from ..core.db import kv_get, get_db
 
     config = get_config()
 
-    if not config.relay:
+    if not config.relay_id:
         print("Relay: not configured")
-        print("Run: hcom relay hf <token>")
+        print("Run: hcom relay new")
         return 0
 
     if not config.relay_enabled:
-        print("Relay: disabled (URL configured)")
-        print(f"URL: {config.relay}")
-        print("\nRun: hcom relay on")
+        print("Relay: disabled")
+        print("\nRun: hcom relay connect")
         return 0
 
-    exit_code = 0
+    # Show MQTT connection state from kv store
+    relay_status = kv_get("relay_status")
+    relay_error = kv_get("relay_last_error")
 
-    # Push first (heartbeat - so this device shows as active)
-    push(force=True)
-
-    # Pull to catch up immediately
-    _, pull_err = pull()
-    if pull_err:
-        print(f"Pull failed: {pull_err}", file=sys.stderr)
-        exit_code = 1
-
-    # Ping relay to check if online
-    relay_online = False
-    relay_version = None
-    url = config.relay.rstrip("/") + "/version"
-    status, content = _http("GET", url, timeout=5)
-    if status == 200 and content:
-        try:
-            relay_version = json.loads(content).get("v")
-            relay_online = True
-        except json.JSONDecodeError:
-            pass
-
-    # Version warning first (if outdated)
-    if relay_version is not None and relay_version != REQUIRED_RELAY_VERSION:
-        print(f"⚠ Relay server outdated (v{relay_version}). Run: hcom relay hf --update\n")
-
-    # Server status
-    if relay_online:
-        print("Status: online")
+    if relay_status == "ok":
+        print("Status: connected")
+    elif relay_status == "error":
+        print(f"Status: error — {relay_error or 'unknown'}")
+        # Hint for auth errors on private brokers
+        if relay_error and ("password" in relay_error or "auth" in relay_error or "not authorized" in relay_error):
+            from ..relay import DEFAULT_BROKERS
+            is_public = any(
+                config.relay in (f"mqtts://{h}:{p}", f"mqtt://{h}:{p}")
+                for h, p in DEFAULT_BROKERS
+            )
+            if not is_public and not config.relay_token:
+                print("  Hint: use --password when connecting to private brokers")
     else:
-        print("Status: OFFLINE")
-        print(f"URL: {config.relay}")
-        print("\n⚠ Cannot reach relay server. Check URL or wait for Space to start.")
-        return 1
+        print("Status: waiting (daemon may not be running)")
 
-    print(f"URL: {config.relay}")
+    # Live broker ping
+    if config.relay:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(config.relay)
+        host = parsed.hostname or config.relay
+        port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
+        ping_ms = _ping_broker(host, port)
+        if ping_ms is not None:
+            print(f"Broker: {config.relay} ({ping_ms}ms)")
+        else:
+            print(f"Broker: {config.relay} (unreachable)")
+    else:
+        print("Broker: auto (public fallback)")
     print(f"Device ID: {get_device_short_id()}")
 
-    # Queued events (local only - remote events have : in instance name)
-    from ..core.db import get_db
-
+    # Queued events (local only — remote events have : in instance name)
     conn = get_db()
     last_push_id = int(kv_get("relay_last_push_id") or 0)
     queued = conn.execute(
@@ -159,244 +161,333 @@ def _relay_status() -> int:
     last_push = float(kv_get("relay_last_push") or 0)
     print(f"Last push: {_format_time(last_push)}" if last_push else "Last push: never")
 
-    # Live remote devices from server
-    devices_url = config.relay.rstrip("/") + "/devices"
-    dev_status, dev_content = _http("GET", devices_url, timeout=5)
-    if dev_status == 200 and dev_content:
-        try:
-            remote_devices = json.loads(dev_content)
-            my_short_id = get_device_short_id()
-            active = [d for d in remote_devices if d.get("age", 9999) < 300 and d.get("short_id") != my_short_id]
+    # Remote devices — derived from KV (works even with zero agents on remote)
+    from ..relay import get_remote_devices
 
-            if active:
-                print("\nActive devices:")
-                for d in active:
-                    print(f"  {d['short_id']}: {d['instances']} agents ({format_age(d['age'])} ago)")
-            else:
-                print("\nNo other active devices")
-        except json.JSONDecodeError:
-            print("\nNo other active devices")
+    remote_devices = get_remote_devices()
+    # Count agents per device
+    agent_rows = conn.execute(
+        "SELECT origin_device_id, COUNT(*) as cnt FROM instances "
+        "WHERE origin_device_id IS NOT NULL AND origin_device_id != '' "
+        "GROUP BY origin_device_id"
+    ).fetchall()
+    agent_counts = {row["origin_device_id"]: row["cnt"] for row in agent_rows}
+
+    if remote_devices:
+        remote_parts = []
+        for device_id, info in sorted(remote_devices.items(), key=lambda x: x[1]["short_id"]):
+            short_id = info["short_id"]
+            sync_ts = info["sync_time"]
+            agents = agent_counts.get(device_id, 0)
+            parts = [short_id]
+            if sync_ts:
+                parts.append(_format_time(sync_ts))
+            if agents == 0:
+                parts.append("no agents")
+            remote_parts.append(f"{parts[0]} ({', '.join(parts[1:])})" if len(parts) > 1 else parts[0])
+        print(f"\nRemote devices: {', '.join(remote_parts)}")
     else:
-        print("\nNo other active devices")
+        print("\nNo other devices")
 
-    return exit_code
+    # Show token for adding more devices
+    if config.relay and config.relay_id:
+        token = _encode_join_token(config.relay_id, config.relay)
+        print(f"\nAdd devices: hcom relay connect {token}")
+
+    return 0
 
 
 def _format_time(timestamp: float) -> str:
-    """Format timestamp for display (wrapper around format_age)"""
+    """Format timestamp for display."""
     if not timestamp:
         return "never"
     return f"{format_age(time.time() - timestamp)} ago"
 
 
-def _check_relay_version() -> tuple[bool, str | None]:
-    """Check if relay version matches required version."""
-    from ..core.config import get_config
-    from ..relay import _http
+def _parse_broker_flags(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Parse --broker, --password from argv.
 
-    config = get_config()
-    if not config.relay:
-        return (False, None)
-
-    url = config.relay.rstrip("/") + "/version"
-    status, content = _http("GET", url, timeout=5)
-    if status == 200 and content:
-        try:
-            relay_version = json.loads(content).get("v", 0)
-            if relay_version != REQUIRED_RELAY_VERSION:
-                return (
-                    True,
-                    f"Relay v{relay_version}, need v{REQUIRED_RELAY_VERSION}. Run: hcom relay hf --update",
-                )
-        except json.JSONDecodeError:
-            pass
-    return (False, None)
-
-
-def _relay_pull() -> int:
-    """Manual sync trigger (pull + push)"""
-    from ..relay import push, pull
-
-    # Check for outdated relay
-    outdated, msg = _check_relay_version()
-    if outdated:
-        print(f"⚠ {msg}", file=sys.stderr)
-
-    ok, push_err = push(force=True)
-    if push_err:
-        print(f"Push failed: {push_err}", file=sys.stderr)
-
-    result, pull_err = pull()
-    if pull_err:
-        print(f"Pull failed: {pull_err}", file=sys.stderr)
-        return 1
-
-    devices = result.get("devices", {})
-    print(f"Synced with {len(devices)} remote devices")
-    return 0
-
-
-def _relay_poll(argv: list[str]) -> int:
-    """Long-poll for changes, exit when data arrives or timeout.
-
-    Used for manual long-polling or background workers.
-    Returns 0 if new data arrived, 1 on timeout.
+    Returns (broker_url, auth_token, remaining_argv).
     """
-    from ..relay import relay_wait
-
-    timeout = 55
-    if argv and argv[0].isdigit():
-        timeout = int(argv[0])
-
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        remaining = timeout - (time.time() - start_time)
-        if remaining <= 0:
-            break
-        if relay_wait(min(remaining, 25)):
-            return 0  # New data arrived
-        time.sleep(1)  # Brief backoff
-    return 1  # Timeout, no data
-
-
-def _relay_hf(argv: list[str]) -> int:
-    """Setup HF Space relay"""
-    import urllib.request
-    import urllib.error
-    import os
-    from ..core.config import load_config_snapshot, save_config_snapshot
-    from .utils import validate_flags
-
-    # Validate flags
-    if error := validate_flags("relay", argv):
-        print(format_error(error), file=sys.stderr)
-        return 1
-
-    SOURCE_SPACE = "aannoo/hcom-relay"
-
-    def get_hf_token() -> str | None:
-        """Get HF token from env or cached file."""
-        if token := os.getenv("HF_TOKEN"):
-            return token
-        try:
-            hf_home = Path(os.getenv("HF_HOME", Path.home() / ".cache" / "huggingface"))
-            token_path = hf_home / "token"
-            if token_path.exists():
-                return token_path.read_text().strip()
-        except (RuntimeError, OSError):
-            pass  # Home dir inaccessible
-        return None
-
-    # Parse args: [token] [--space NAME] [--update]
-    token = None
-    space_name = "hcom-relay"
-    do_update = False
+    broker = None
+    auth_token = None
+    remaining = []
     i = 0
     while i < len(argv):
-        if argv[i] == "--space" and i + 1 < len(argv):
-            space_name = argv[i + 1]
+        if argv[i] == "--broker" and i + 1 < len(argv):
+            broker = argv[i + 1]
             i += 2
-        elif argv[i] == "--update":
-            do_update = True
-            i += 1
-        elif not token and not argv[i].startswith("-"):
-            token = argv[i]
-            i += 1
+        elif argv[i] == "--password" and i + 1 < len(argv):
+            auth_token = argv[i + 1]
+            i += 2
         else:
+            remaining.append(argv[i])
             i += 1
+    return broker, auth_token, remaining
 
-    if not token:
-        token = get_hf_token()
-    if not token:
-        print("No HF token found.", file=sys.stderr)
-        print("Usage: hcom relay hf <token>", file=sys.stderr)
-        print("   or: huggingface-cli login", file=sys.stderr)
-        return 1
 
-    # Get username
-    print("Getting HF username...")
+def _ping_broker(host: str, port: int) -> int | None:
+    """TLS connect to broker, return round-trip ms or None on failure."""
+    import ssl
+    import socket
     try:
-        req = urllib.request.Request(
-            "https://huggingface.co/api/whoami-v2",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            username = data.get("name")
-    except Exception as e:
-        print(f"Failed to get username: {e}", file=sys.stderr)
-        return 1
+        t0 = time.time()
+        ctx = ssl.create_default_context()
+        sock = socket.create_connection((host, port), timeout=5)
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+        sock.close()
+        return int((time.time() - t0) * 1000)
+    except Exception:
+        return None
 
-    target_space = f"{username}/{space_name}"
-    space_url = f"https://{username}-{space_name}.hf.space/"
-    created = False
 
-    # Check if Space already exists
-    space_exists = False
-    try:
-        req = urllib.request.Request(
-            f"https://huggingface.co/api/spaces/{target_space}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            if resp.status == 200:
-                space_exists = True
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            print(f"Check failed: {e}", file=sys.stderr)
+def _test_brokers_parallel(brokers: list[tuple[str, int]]) -> list[tuple[str, int, int | None]]:
+    """Test all brokers in parallel. Returns [(host, port, ping_ms|None)] in input order."""
+    import concurrent.futures
+    results: list[tuple[str, int, int | None]] = [(h, p, None) for h, p in brokers]
+
+    def _test(idx: int, host: str, port: int) -> tuple[int, int | None]:
+        return idx, _ping_broker(host, port)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(brokers)) as pool:
+        futures = [pool.submit(_test, i, h, p) for i, (h, p) in enumerate(brokers)]
+        for f in concurrent.futures.as_completed(futures):
+            idx, ping_ms = f.result()
+            results[idx] = (brokers[idx][0], brokers[idx][1], ping_ms)
+
+    return results
+
+
+def _relay_new(argv: list[str]) -> int:
+    """Create a new relay group — generate relay_id, find/use broker, enable.
+
+    Usage:
+        hcom relay new                                    Public broker
+        hcom relay new --broker mqtts://host:port         Private broker
+        hcom relay new --broker mqtts://host:port --password secret
+    """
+    from ..core.config import load_config_snapshot, save_config_snapshot, reload_config
+    from ..relay import DEFAULT_BROKERS
+
+    broker_url, auth_token, _ = _parse_broker_flags(argv)
+
+    snapshot = load_config_snapshot()
+
+    # Show previous group FIRST so user can copy it before it's replaced
+    if snapshot.core.relay_id and snapshot.core.relay:
+        old_token = _encode_join_token(snapshot.core.relay_id, snapshot.core.relay)
+        print(f"Current group: hcom relay connect {old_token}\n")
+
+    # Generate relay_id
+    relay_id = str(uuid.uuid4())
+
+    if broker_url:
+        # Private broker — use as-is, test connectivity
+        import urllib.parse
+        parsed = urllib.parse.urlparse(broker_url)
+        host = parsed.hostname or broker_url
+        port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
+
+        print(f"Testing {host}:{port}...")
+        ping_ms = _ping_broker(host, port)
+        if ping_ms is None:
+            print(f"  {host}:{port} — failed", file=sys.stderr)
+            print("\nBroker unreachable. Check host, port, and network.", file=sys.stderr)
+            return 1
+        print(f"  {host}:{port} — {ping_ms}ms")
+        pinned_broker = broker_url
+    else:
+        # Public broker — test all in parallel, pick fastest
+        print("Testing brokers...")
+        pinned_broker = None
+        results = _test_brokers_parallel(DEFAULT_BROKERS)
+        for host, port, ping_ms in results:
+            if ping_ms is not None:
+                print(f"  {host}:{port} — {ping_ms}ms")
+                if pinned_broker is None:
+                    pinned_broker = f"mqtts://{host}:{port}"
+            else:
+                print(f"  {host}:{port} — failed")
+
+        if not pinned_broker:
+            print("\nNo broker reachable. Check your network.", file=sys.stderr)
+            print("Or use a private broker: hcom relay new --broker mqtts://host:port", file=sys.stderr)
             return 1
 
-    # Handle --update: manual instructions (delete requires admin permission)
-    if space_exists and do_update:
-        print("Update manually:")
-        print(f"  1. Edit: https://huggingface.co/spaces/{target_space}/edit/main/app.py")
-        print(f"  2. Copy from: https://huggingface.co/spaces/{SOURCE_SPACE}/raw/main/app.py")
-        return 0
+    # Save config (pinned_broker is guaranteed non-None — we return 1 above if not)
+    assert pinned_broker is not None
+    snapshot.core.relay_id = relay_id
+    snapshot.core.relay = pinned_broker
+    snapshot.core.relay_enabled = True
+    if auth_token is not None:
+        snapshot.core.relay_token = auth_token
+    save_config_snapshot(snapshot)
+    reload_config()
 
-    # Create Space if needed
-    if space_exists:
-        print(f"Space exists: {target_space}")
+    # Generate join token
+    token = _encode_join_token(relay_id, pinned_broker)
+
+    print(f"\nBroker: {pinned_broker}")
+    if auth_token:
+        print("Password: set")
+    print(f"\nOn other devices: hcom relay connect {token}")
+    if auth_token:
+        print("  (they will also need: --password <secret>)")
+
+    from ..relay import is_relay_handled_by_daemon
+    if is_relay_handled_by_daemon():
+        print("\nConnected.")
     else:
-        print(f"Creating {target_space}...")
-        try:
-            req = urllib.request.Request(
-                f"https://huggingface.co/api/spaces/{SOURCE_SPACE}/duplicate",
-                data=json.dumps({"repository": target_space, "private": True}).encode(),
-                method="POST",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status not in (200, 201):
-                    print(f"Create failed: HTTP {resp.status}", file=sys.stderr)
-                    return 1
-                created = True
-        except urllib.error.HTTPError as e2:
-            print(f"Create failed: {e2}", file=sys.stderr)
-            return 1
-
-    # Update config (save token for private Space auth)
-    config = load_config_snapshot()
-    config.core.relay = space_url
-    config.core.relay_token = token
-    save_config_snapshot(config)
-
-    # Clear version cache after update
-    if created:
-        from ..core.db import kv_set
-
-        kv_set("relay_version_check", "0")
-        kv_set("relay_version_outdated", "0")
-
-    print(f"\n{space_url}")
-    if created:
-        print("\nSpace is building (~15 seconds). Check progress:")
-        print(f"  https://huggingface.co/spaces/{target_space}")
-        print("\nConfig updated. Relay will work once Space is running.")
-        print("\nCheck status: hcom relay")
-        print("See active agents from other devices: hcom list")
-    else:
-        print("\nConfig updated.")
+        print("\nStart daemon to connect: hcom daemon start")
     return 0
+
+
+def _relay_connect(argv: list[str]) -> int:
+    """Connect to relay — re-enable existing config or join with token.
+
+    Usage:
+        hcom relay connect                               Re-enable existing
+        hcom relay connect <token>                       Join relay group
+        hcom relay connect <token> --broker ...          Override broker from token
+    """
+    from ..core.config import load_config_snapshot, save_config_snapshot, get_config, reload_config
+
+    broker_url, auth_token, remaining = _parse_broker_flags(argv)
+
+    # No token = re-enable existing config
+    token_str = remaining[0] if remaining and not remaining[0].startswith("-") else None
+
+    if not token_str:
+        # Re-enable mode
+        config = get_config()
+        if not config.relay_id:
+            print("No relay configured.", file=sys.stderr)
+            print("Run: hcom relay new", file=sys.stderr)
+            return 1
+
+        if config.relay_enabled:
+            print("Relay already enabled.\n")
+            return _relay_status()
+
+        snapshot = load_config_snapshot()
+        snapshot.core.relay_enabled = True
+        save_config_snapshot(snapshot)
+        reload_config()
+        print("Relay enabled\n")
+        return _relay_status()
+
+    # Token mode — join existing relay
+    result = _decode_join_token(token_str)
+    if result is None:
+        print("Invalid token.", file=sys.stderr)
+        return 1
+
+    relay_id, token_broker = result
+
+    # --broker overrides broker from token
+    effective_broker = broker_url or token_broker
+
+    # Test broker connectivity (non-blocking warning)
+    import urllib.parse
+    parsed = urllib.parse.urlparse(effective_broker)
+    host = parsed.hostname or effective_broker
+    port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
+    ping_ms = _ping_broker(host, port)
+
+    snapshot = load_config_snapshot()
+
+    # Show previous group FIRST if switching
+    if snapshot.core.relay_id and snapshot.core.relay and snapshot.core.relay_id != relay_id:
+        old_token = _encode_join_token(snapshot.core.relay_id, snapshot.core.relay)
+        print(f"Current group: hcom relay connect {old_token}\n")
+
+    snapshot.core.relay_id = relay_id
+    snapshot.core.relay = effective_broker
+    snapshot.core.relay_enabled = True
+    if auth_token is not None:
+        snapshot.core.relay_token = auth_token
+    save_config_snapshot(snapshot)
+    reload_config()
+
+    if ping_ms is not None:
+        print(f"Broker: {effective_broker} ({ping_ms}ms)")
+    else:
+        print(f"Broker: {effective_broker}")
+        print("  Warning: broker unreachable — check network or token", file=sys.stderr)
+
+    # Password feedback
+    if auth_token:
+        print("Password: set")
+    else:
+        # Warn if private broker (not in DEFAULT_BROKERS) without password
+        from ..relay import DEFAULT_BROKERS
+        is_public = any(
+            effective_broker in (f"mqtts://{h}:{p}", f"mqtt://{h}:{p}")
+            for h, p in DEFAULT_BROKERS
+        )
+        if not is_public:
+            print("Password: not set (use --password if broker requires auth)")
+
+    from ..relay import is_relay_handled_by_daemon
+    if is_relay_handled_by_daemon():
+        print("\nConnected.")
+    else:
+        print("\nStart daemon to connect: hcom daemon start")
+    return 0
+
+
+def _encode_join_token(relay_id: str, broker_url: str) -> str:
+    """Encode relay_id and broker URL into a compact join token.
+
+    Format (version-prefixed):
+      0x01 + 16 UUID bytes + 1 broker index  →  18 bytes → 24 char base64url (public)
+      0x02 + 16 UUID bytes + URL bytes        →  variable (private)
+    """
+    from ..relay import DEFAULT_BROKERS
+
+    uuid_bytes = uuid.UUID(relay_id).bytes
+
+    for i, (host, port) in enumerate(DEFAULT_BROKERS):
+        if broker_url in (f"mqtts://{host}:{port}", f"mqtt://{host}:{port}"):
+            return base64.urlsafe_b64encode(b"\x01" + uuid_bytes + bytes([i])).decode().rstrip("=")
+
+    return base64.urlsafe_b64encode(b"\x02" + uuid_bytes + broker_url.encode()).decode().rstrip("=")
+
+
+def _decode_join_token(token: str) -> tuple[str, str] | None:
+    """Decode a join token back to (relay_id, broker_url)."""
+    from ..relay import DEFAULT_BROKERS
+
+    padding = 4 - len(token) % 4
+    if padding != 4:
+        token += "=" * padding
+    try:
+        raw = base64.urlsafe_b64decode(token.encode())
+    except Exception:
+        return None
+
+    if len(raw) < 18:
+        return None
+
+    version = raw[0]
+    try:
+        relay_id = str(uuid.UUID(bytes=raw[1:17]))
+    except Exception:
+        return None
+
+    if version == 0x01:
+        # Public broker index
+        idx = raw[17]
+        if idx >= len(DEFAULT_BROKERS):
+            return None
+        host, port = DEFAULT_BROKERS[idx]
+        return (relay_id, f"mqtts://{host}:{port}")
+    elif version == 0x02:
+        # Private broker URL
+        try:
+            broker_url = raw[17:].decode()
+        except Exception:
+            return None
+        return (relay_id, broker_url)
+    else:
+        return None
