@@ -17,16 +17,22 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            manylinux: auto
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            manylinux: auto
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            manylinux: "off"
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            manylinux: "off"
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            manylinux: auto
           - os: macos-latest
             target: aarch64-apple-darwin
+            manylinux: auto
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -37,7 +43,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux }}
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -85,6 +91,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       id-token: write
+      contents: write
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -96,5 +103,21 @@ jobs:
       - name: List wheels
         run: ls -la dist/
 
+      - name: Separate Android wheel
+        run: |
+          mkdir -p android-dist
+          mv dist/*linux_aarch64*.whl android-dist/ || true
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Attach Android wheel to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Create release if it doesn't exist
+          gh release view "$TAG" || gh release create "$TAG" --title "$TAG" --notes "Release $TAG"
+          # Upload Android wheel
+          gh release upload "$TAG" android-dist/*.whl --clobber
