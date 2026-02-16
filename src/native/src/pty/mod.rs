@@ -540,7 +540,7 @@ impl Proxy {
                         return Err(io::Error::last_os_error());
                     }
                     // Set controlling terminal
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     // Redirect stdio to slave
@@ -986,7 +986,7 @@ impl Proxy {
             unsafe {
                 libc::ioctl(
                     self.pty_master.as_raw_fd(),
-                    libc::TIOCSWINSZ as libc::c_ulong,
+                    libc::TIOCSWINSZ.into(),
                     &winsize,
                 );
             }

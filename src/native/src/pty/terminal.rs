@@ -73,7 +73,7 @@ pub fn get_terminal_size() -> Result<Winsize> {
     let ret = unsafe {
         libc::ioctl(
             io::stdout().as_raw_fd(),
-            libc::TIOCGWINSZ as libc::c_ulong,
+            libc::TIOCGWINSZ.into(),
             &mut ws,
         )
     };
