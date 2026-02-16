@@ -96,12 +96,6 @@ impl InjectServer {
         self.clients.iter().map(|(stream, _)| stream.as_raw_fd())
     }
 
-    /// Get number of active clients
-    #[allow(dead_code)]
-    pub fn client_count(&self) -> usize {
-        self.clients.len()
-    }
-
     /// Accept a new connection
     pub fn accept(&mut self) -> Result<()> {
         match self.listener.accept() {

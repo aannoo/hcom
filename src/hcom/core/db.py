@@ -1296,6 +1296,29 @@ def _log_sub_error(sub_id: str, error: str, exc: Exception | None = None) -> Non
         log_warn("core", "subscription.error", error, sub_id=sub_id)
 
 
+def _find_collision_partner(event_id: int, instance: str, file_path: str) -> str | None:
+    """Find the other agent in a file collision (wrote same file within 20s)."""
+    from .filters import FILE_WRITE_CONTEXTS
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            f"""SELECT e.instance FROM events_v e
+            WHERE e.type = 'status' AND e.status_context IN {FILE_WRITE_CONTEXTS}
+            AND e.status_detail = ?
+            AND e.instance != ?
+            AND EXISTS (
+                SELECT 1 FROM events_v ev WHERE ev.id = ?
+                AND ABS(strftime('%s', ev.timestamp) - strftime('%s', e.timestamp)) < 20
+            )
+            ORDER BY e.id DESC LIMIT 1""",
+            (file_path, instance, event_id),
+        ).fetchone()
+        return row["instance"] if row else None
+    except Exception:
+        return None
+
+
 def _format_sub_notification(
     sub_id: str,
     event_id: int,
@@ -1315,10 +1338,14 @@ def _format_sub_notification(
         action = "went idle" if event_type == "status" else "stopped"
         return f"[sub:{sub_id}] #{event_id} {target} {action} without responding to your request #{request_id}"
 
-    # Preset-specific prefixes based on subscription filters
-    prefix = ""
-    if filters and "collision" in filters:
-        prefix = "⚠️ COLLISION: "
+    # Collision: custom format showing both agents and the file
+    if filters and "collision" in filters and event_type == "status":
+        file_path = data.get("detail", "?")
+        partner = _find_collision_partner(event_id, instance, file_path)
+        if partner:
+            return f"⚠️ COLLISION [sub:{sub_id}] #{event_id}: {instance} and {partner} both edited {file_path}"
+        # Fallback if partner lookup fails
+        return f"⚠️ COLLISION [sub:{sub_id}] #{event_id}: {instance} edited {file_path} (conflict with another agent)"
 
     parts = [f"[sub:{sub_id}]", f"#{event_id}", event_type, instance]
 
@@ -1348,7 +1375,7 @@ def _format_sub_notification(
         if by := data.get("by", ""):
             parts.append(f"by:{by}")
 
-    return prefix + " | ".join(parts)
+    return " | ".join(parts)
 
 
 def _cancel_request_watches_by_flow(

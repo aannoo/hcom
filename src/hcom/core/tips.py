@@ -24,6 +24,8 @@ TIPS = {
     "recv:intent:ack": "[tip] intent=ack: Sender confirmed receipt. No response needed.",
     # @mention matching
     "mention:matching": "[tip] @targets: @api- matches all with tag 'api' | @luna matches prefix | underscore blocks: @luna won't match luna_sub_1",
+    # Subscriptions
+    "sub:created": "[tip] You'll be notified via hcom message when the next matching event occurs. Safe to end your turn.",
 }
 
 
@@ -64,7 +66,6 @@ def print_launch_tips(
     *,
     launched: int,
     tag: str | None,
-    instance_names: list[str],
     launcher_name: str | None,
     launcher_participating: bool,
     background: bool,
@@ -80,9 +81,6 @@ def print_launch_tips(
 
     # Identity key for one-time tracking (fallback for human launches)
     tip_id = launcher_name or "_global"
-
-    name_ex = instance_names[0] if instance_names else "<name>"
-    target = name_ex if launched == 1 and instance_names else (f"tag:{tag}" if tag else "<name>")
 
     def _once(key: str, text: str) -> None:
         """Append tip if not yet seen by this launcher."""
@@ -107,7 +105,7 @@ def print_launch_tips(
     # --- Always-shown (batch-specific) ---
 
     if tag:
-        tips.append(f"[tip] Send to {tag} team: hcom send '@{tag}- message'")
+        tips.append(f"[tip] Tag prefix targets all agents with that tag: hcom send @{tag}- <message>")
 
     if inside_tool and launcher_participating:
         _once("launch:notify", "[tip] You'll be automatically notified when instances are launched & ready")
@@ -118,22 +116,22 @@ def print_launch_tips(
         if not launcher_participating:
             _once("launch:start", "[tip] Run 'hcom start' to receive notifications/messages from instances")
 
-        _once("launch:stop", f"[tip] Disconnect: hcom stop {target}")
+        _once("launch:stop", "[tip] Disconnect agents without killing them: hcom stop <name|tag:TAG>")
 
         if has_close:
-            _once("launch:kill", f"[tip] Kill + close pane: hcom kill {target}")
+            _once("launch:kill", "[tip] Kill agent and close its pane: hcom kill <name|tag:TAG>")
 
         if not background:
-            _once("launch:term", f"[tip] View screen: hcom term {name_ex} | Inject: hcom term inject {name_ex} [text] --enter")
+            _once("launch:term", "[tip] View an agent's screen: hcom term <name> | Inject keystrokes: hcom term inject <name> [text] --enter")
 
         if is_tmux:
-            _once("launch:sub-blocked", f"[tip] Subscribe to blocked: hcom events sub --blocked {name_ex}")
+            _once("launch:sub-blocked", "[tip] Get notified when an agent needs approval: hcom events sub --blocked <name>")
         else:
-            _once("launch:sub-idle", f"[tip] Subscribe to idle: hcom events sub --idle {name_ex}")
+            _once("launch:sub-idle", "[tip] Get notified when an agent goes idle: hcom events sub --idle <name>")
 
         _once("list:status", TIPS["list:status"])
     else:
-        _once("launch:send", f"[tip] Send message: hcom send '@{name_ex} hello'")
+        _once("launch:send", "[tip] Send a message to an agent: hcom send @<name> <message>")
         _once("launch:list", "[tip] Check status: hcom list")
 
     if tips:

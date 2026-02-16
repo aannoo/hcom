@@ -252,7 +252,7 @@ fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::R
                     return Err(DaemonError::ConnectionFailed(
                         "Version mismatch persists after daemon restart. \
                          Rust binary and Python package versions are out of sync. \
-                         Rebuild with: ./build.sh".to_string()
+                         Reinstall: pip install --upgrade --force-reinstall hcom".to_string()
                     ));
                 }
                 let connect_ms = connect_start.elapsed().as_secs_f64() * 1000.0;

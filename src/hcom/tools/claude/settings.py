@@ -37,18 +37,18 @@ from typing import Any
 from ...core.paths import read_file_with_retry, atomic_write
 from ...core.tool_utils import (
     build_hcom_command,
-    build_claude_permissions,
+    build_permissions,
     build_hcom_hook_patterns,
     HCOM_ENV_VAR_PATTERNS,
     _build_quoted_invocation,
-    _build_all_claude_permission_patterns,
+    _build_all_permission_patterns,
 )
 from ...shared import IS_WINDOWS
 
 # ==================== Permission Configuration ====================
 
 # Generated from centralized SAFE_HCOM_COMMANDS in core/tool_utils.py
-CLAUDE_HCOM_PERMISSIONS = build_claude_permissions()
+CLAUDE_HCOM_PERMISSIONS = build_permissions("claude")
 
 # ==================== Hook Configuration ====================
 
@@ -189,7 +189,7 @@ def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
     # Remove hcom permission patterns (both hcom and uvx hcom variants)
     if "permissions" in settings and isinstance(settings["permissions"], dict):
         if "allow" in settings["permissions"] and isinstance(settings["permissions"]["allow"], list):
-            all_hcom_patterns = _build_all_claude_permission_patterns()
+            all_hcom_patterns = _build_all_permission_patterns("claude")
             original_len = len(settings["permissions"]["allow"])
             settings["permissions"]["allow"] = [
                 p for p in settings["permissions"]["allow"] if p not in all_hcom_patterns

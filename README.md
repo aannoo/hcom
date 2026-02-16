@@ -4,9 +4,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-AI agents running in separate terminals are isolated from each other. Context doesn't transfer, decisions get repeated, file edits collide.
+Agents running in separate terminals are isolated from each other. Context doesn't transfer, decisions get repeated, file edits collide.
 
-hcom connects them. When one agent edits a file, runs a command, or sends a message, the others find out immediately.
+hcom connects your existing AI tools. When one agent edits a file, runs a command, or sends a message, other agents find out immediately.
 
 ![demo](https://raw.githubusercontent.com/aannoo/hcom/refs/heads/assets/screencapture-new-new.gif)
 
@@ -42,16 +42,14 @@ hcom
 
 Messages arrive mid-turn or wake idle agents immediately.
 
-```text
-agents → hooks → sqlite → hooks → other agents
+If 2 agents edit the same file within 20 seconds, both get collision notifications.
+
+Refer to agents by name, tool, terminal, branch, cwd, or set a custom tag.
+
+```bash
+# hooks record activity and deliver messages
+agent → hooks → db → hooks → other agent
 ```
-
-Hooks capture agent activity into sqlite. Other hooks and PTY push matching events back into agent context. 
-
-Agents get unique names. You can also refer to them by tool, terminal, branch, cwd, or set custom: *"tag yourself reviewer"*.
-
-Collision detection is on by default. If 2 agents edit the same file within 20s, both get notified.
-
 
 ---
 
@@ -78,7 +76,8 @@ Tell any agent:
 | View terminal screens, inject text/enter for approvals | `hcom term` |
 | Query event history (file edits, commands, status, lifecycle) | `hcom events` |
 | Subscribe and react to each other's activity | `hcom events sub` |
-| Spawn, fork, resume, kill agents in new terminal panes | `hcom N claude\|gemini\|codex`, `hcom kill`, `hcom r`, `hcom f` |
+| Spawn, fork, resume agents in new terminal panes | `hcom N claude\|gemini\|codex`, `hcom r`, `hcom f` |
+| Kill agents and close their terminal panes/sessions | `hcom kill` |
 | Build context bundles (files, transcript, events) for handoffs | `hcom bundle` |
 
 </details>
@@ -88,13 +87,13 @@ Tell any agent:
 
 ## Multi-agent workflows
 
-Included examples of scripts with the Python API.
+Included example scripts with the Python API.
 
-**`hcom run confess`** - agent (or background clone) writes an honesty self-eval, a spawned calibrator reads the target's transcript independently, judge compares both reports, sends back a verdict via hcom message.
+**`hcom run confess`** - An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
 
-**`hcom run debate`** - judge spawns then sets up a debate with existing agents - coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
+**`hcom run debate`** - A judge spawns and sets up a debate with existing agents. It coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
 
-**`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, answers other agents on demand.
+**`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
 Create your own by prompting:
 
@@ -154,15 +153,6 @@ hcom relay new
 hcom relay connect <token>
 ```
 
-### Cloud
-
-1. Allow network access
-2. Paste into AI tool:
-
-```
-run this and connect: pip install hcom && hcom relay connect <token> && hcom start -h
-```
-
 ---
 
 ## What gets installed
@@ -191,7 +181,7 @@ hcom status                        # diagnostics
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.19 - multi-agent communication
+hcom (hook-comms) v0.6.20 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
@@ -240,26 +230,18 @@ Query:
 
 
 Filters (same flag repeated = OR, different flags = AND):
-
-    Core:                          
     --agent NAME                   Agent name
     --type TYPE                    message | status | life
     --status VAL                   listening | active | blocked
     --context PATTERN              tool:Bash | deliver:X (supports * wildcard)
     --action VAL                   created | started | ready | stopped | batch_launched
-
-    Command / file:                
     --cmd PATTERN                  Shell command (contains, ^prefix, $suffix, =exact, *glob)
     --file PATH                    File write (*.py for glob, file.py for contains)
     --collision                    Two agents edit same file within 20s
-
-    Message:                       
     --from NAME                    Sender
     --mention NAME                 @mention target
     --intent VAL                   request | inform | ack
     --thread NAME                  Thread name
-
-    Time:                          
     --after TIME                   After timestamp (ISO-8601)
     --before TIME                  Before timestamp (ISO-8601)
 
@@ -269,17 +251,19 @@ Shortcuts:
     --blocked NAME                 --agent NAME --status blocked
 
 
-Subscribe (hcom notification when event matches):
-    events sub                     List subscriptions
-    events sub [filters]           Create subscription with filter flags
+Subscribe (next matching event delivered as messages from [hcom-events]):
+    events sub list                List active subscriptions
+    events sub [filters] [--once]  Subscribe using filter flags (listed above)
+    events sub "SQL WHERE" [--once] Subscribe using raw SQL
       --once                       Auto-remove after first match
-      --for <name>                 Subscribe for another agent
+      --for <name>                 Subscribe on behalf of another agent
     events unsub <id>              Remove subscription
 
 
 Examples:
-    events --agent peso --status listening 
     events --cmd git --agent peso  
+    events sub --idle peso         Notified when peso goes idle
+    events sub --file '*.py' --once One-shot: next .py file write
 
 
 SQL reference (events_v view):

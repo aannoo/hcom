@@ -262,21 +262,6 @@ def remove_flag_with_value(tokens: Sequence[str], flag: str) -> TokenList:
     return result
 
 
-def split_env_tokens(env_value: str) -> TokenList:
-    """Split shell-quoted environment variable into tokens.
-
-    Args:
-        env_value: Shell-quoted string (e.g., '--model opus --verbose')
-
-    Returns:
-        List of tokens
-
-    Raises:
-        ValueError: If the string has unbalanced quotes
-    """
-    return shlex.split(env_value)
-
-
 def looks_like_flag(
     token_lower: str,
     *,

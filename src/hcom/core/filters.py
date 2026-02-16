@@ -209,6 +209,14 @@ def _escape_sql_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
 
 
+def _eq_or_in(column: str, values: list[str]) -> str:
+    """Generate 'col = val' for single value, 'col IN (...)' for multiple."""
+    if len(values) == 1:
+        return f"{column} = '{_escape_sql(values[0])}'"
+    escaped = "', '".join(_escape_sql(x) for x in values)
+    return f"{column} IN ('{escaped}')"
+
+
 def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
     """Build SQL WHERE clause from filter flags.
 
@@ -248,19 +256,11 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
 
     # Instance filter
     if "instance" in filters:
-        if len(filters["instance"]) == 1:
-            clauses.append(f"instance = '{_escape_sql(filters['instance'][0])}'")
-        else:
-            instances = "', '".join(_escape_sql(x) for x in filters["instance"])
-            clauses.append(f"instance IN ('{instances}')")
+        clauses.append(_eq_or_in("instance", filters["instance"]))
 
     # Type filter (explicit)
     if "type" in filters:
-        if len(filters["type"]) == 1:
-            clauses.append(f"type = '{_escape_sql(filters['type'][0])}'")
-        else:
-            types = "', '".join(_escape_sql(x) for x in filters["type"])
-            clauses.append(f"type IN ('{types}')")
+        clauses.append(_eq_or_in("type", filters["type"]))
     # Auto-infer type from filters (validation already checked no conflicts)
     elif any(flag in filters for flag in STATUS_FLAGS):
         clauses.append("type = 'status'")
@@ -271,11 +271,7 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
 
     # Status filter
     if "status" in filters:
-        if len(filters["status"]) == 1:
-            clauses.append(f"status_val = '{_escape_sql(filters['status'][0])}'")
-        else:
-            statuses = "', '".join(_escape_sql(x) for x in filters["status"])
-            clauses.append(f"status_val IN ('{statuses}')")
+        clauses.append(_eq_or_in("status_val", filters["status"]))
 
     # Context filter
     if "context" in filters:
@@ -340,11 +336,7 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
 
     # Message filters
     if "from" in filters:
-        if len(filters["from"]) == 1:
-            clauses.append(f"msg_from = '{_escape_sql(filters['from'][0])}'")
-        else:
-            froms = "', '".join(_escape_sql(x) for x in filters["from"])
-            clauses.append(f"msg_from IN ('{froms}')")
+        clauses.append(_eq_or_in("msg_from", filters["from"]))
 
     if "mention" in filters:
         mention_clauses = []
@@ -357,33 +349,17 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
             clauses.append(f"({' OR '.join(mention_clauses)})")
 
     if "intent" in filters:
-        if len(filters["intent"]) == 1:
-            clauses.append(f"msg_intent = '{_escape_sql(filters['intent'][0])}'")
-        else:
-            intents = "', '".join(_escape_sql(x) for x in filters["intent"])
-            clauses.append(f"msg_intent IN ('{intents}')")
+        clauses.append(_eq_or_in("msg_intent", filters["intent"]))
 
     if "thread" in filters:
-        if len(filters["thread"]) == 1:
-            clauses.append(f"msg_thread = '{_escape_sql(filters['thread'][0])}'")
-        else:
-            threads = "', '".join(_escape_sql(x) for x in filters["thread"])
-            clauses.append(f"msg_thread IN ('{threads}')")
+        clauses.append(_eq_or_in("msg_thread", filters["thread"]))
 
     if "reply_to" in filters:
-        if len(filters["reply_to"]) == 1:
-            clauses.append(f"msg_reply_to = '{_escape_sql(filters['reply_to'][0])}'")
-        else:
-            reply_tos = "', '".join(_escape_sql(x) for x in filters["reply_to"])
-            clauses.append(f"msg_reply_to IN ('{reply_tos}')")
+        clauses.append(_eq_or_in("msg_reply_to", filters["reply_to"]))
 
     # Life filters
     if "action" in filters:
-        if len(filters["action"]) == 1:
-            clauses.append(f"life_action = '{_escape_sql(filters['action'][0])}'")
-        else:
-            actions = "', '".join(_escape_sql(x) for x in filters["action"])
-            clauses.append(f"life_action IN ('{actions}')")
+        clauses.append(_eq_or_in("life_action", filters["action"]))
 
     # Time range filters
     if "after" in filters:

@@ -143,16 +143,16 @@ def ensure_hooks_enabled() -> bool:
 
 from ...core.tool_utils import (
     build_hcom_command,
-    build_gemini_permissions,
+    build_permissions,
     build_hcom_hook_patterns,
     HCOM_ENV_VAR_PATTERNS,
-    _build_all_gemini_permission_patterns,
+    _build_all_permission_patterns,
 )
 
 # ==================== Permission Configuration ====================
 
 # Generated from centralized SAFE_HCOM_COMMANDS in core/tool_utils.py
-GEMINI_HCOM_PERMISSIONS = build_gemini_permissions()
+GEMINI_HCOM_PERMISSIONS = build_permissions("gemini")
 
 # ==================== Hook Configuration ====================
 
@@ -273,7 +273,7 @@ def _remove_hcom_hooks_from_gemini_settings(settings: dict[str, Any]) -> None:
     if "tools" in settings and isinstance(settings["tools"], dict):
         allowed = settings["tools"].get("allowed")
         if isinstance(allowed, list):
-            all_hcom_patterns = _build_all_gemini_permission_patterns()
+            all_hcom_patterns = _build_all_permission_patterns("gemini")
             settings["tools"]["allowed"] = [p for p in allowed if p not in all_hcom_patterns]
             if not settings["tools"]["allowed"]:
                 del settings["tools"]["allowed"]
@@ -336,7 +336,7 @@ def setup_gemini_hooks(include_permissions: bool = True) -> bool:
     else:
         # Remove hcom permissions if disabled (both hcom and uvx hcom variants)
         if "allowed" in settings["tools"]:
-            all_hcom_patterns = _build_all_gemini_permission_patterns()
+            all_hcom_patterns = _build_all_permission_patterns("gemini")
             settings["tools"]["allowed"] = [p for p in settings["tools"]["allowed"] if p not in all_hcom_patterns]
             if not settings["tools"]["allowed"]:
                 del settings["tools"]["allowed"]

@@ -238,11 +238,6 @@ import shutil
 import time
 from pathlib import Path
 
-if os.name == "nt":
-    pass
-else:
-    pass
-
 # Import from shared module
 from .shared import (
     __version__,
@@ -525,8 +520,6 @@ def _maybe_deliver_pending_messages(argv: list[str] | None = None, *, ctx: Comma
     if argv and "--json" in argv:
         return
 
-    from .shared import HcomError
-
     try:
         from .core.identity import resolve_identity
 
@@ -580,37 +573,8 @@ def _maybe_deliver_pending_messages(argv: list[str] | None = None, *, ctx: Comma
         log_error("cli", "deliver.fail", e, instance=instance_name)
 
 
-# Note: Removed backward compat aliases (_parse_env_value, etc.) - not used by any code or tests
-
 if sys.version_info < (3, 10):
     sys.exit("Error: hcom requires Python 3.10 or higher")
-
-# ==================== Constants ====================
-# Platform detection, message patterns, sender constants moved to shared.py (imported above)
-# STATUS_MAP and status constants in shared.py (imported above)
-# ANSI codes in shared.py (imported above)
-
-# ==================== Error Handling Strategy ====================
-# CLI: Can raise exceptions for user feedback. Check return values.
-# Critical I/O: atomic_write
-
-# ==================== CLI Errors ====================
-# CLIError and get_help_text moved to commands/utils.py
-
-
-# ==================== Logging ====================
-
-# ==================== Config Defaults ====================
-# Config precedence: env var > ~/.hcom/config.toml > defaults
-# All config via HcomConfig dataclass (timeout, terminal, hints, tag, claude_args)
-
-# Hook configuration now in hooks/settings.py
-
-# ==================== Configuration System ====================
-# Config classes and functions now in core/config.py
-
-# get_hook_command moved to hooks/settings.py as _get_hook_command
-
 
 def _parse_version(v: str) -> tuple:
     """Parse version string to comparable tuple"""
@@ -708,33 +672,6 @@ def _prompt_and_install_update(latest: str, cmd: str) -> bool:
     except Exception as e:
         print(f"Update failed: {e}", file=sys.stderr)
         return False
-
-
-# _build_hcom_env_value removed - use build_hcom_command() directly
-
-# ==================== Message System ====================
-# validate_message moved to commands/utils.py
-
-# ==================== Identity Management ====================
-# resolve_instance_name moved to core/instances.py
-
-# ==================== Hook Management ====================
-# get_claude_settings_path, load_claude_settings, _remove_claude_hcom_hooks moved to hooks/settings.py
-
-# build_env_string, build_claude_command moved to terminal.py
-# create_bash_script, find_bash_on_windows moved to terminal.py
-# get_macos_terminal_argv, get_windows_terminal_argv, get_linux_terminal_argv moved to terminal.py
-# windows_hidden_popen, _parse_terminal_command, launch_terminal moved to terminal.py
-
-# setup_claude_hooks, verify_claude_hooks_installed moved to hooks/settings.py
-
-# is_interactive, get_archive_timestamp, should_show_in_watch moved to commands/admin.py
-# initialize_instance_in_position_file, enable_instance moved to core/instances.py
-
-# ==================== Command Functions ====================
-# Command functions moved to commands/ package
-
-
 def ensure_hooks_current() -> bool:
     """Ensure hooks match current execution context - called on EVERY command.
     Auto-updates hooks if execution context changes (e.g., pip → uvx).
@@ -792,6 +729,18 @@ def ensure_hooks_current() -> bool:
     return True
 
 
+def _launch_tui_in_new_terminal() -> int:
+    """Launch TUI in a new terminal window."""
+    from .core.tool_utils import build_hcom_command
+    from .core.thread_context import get_cwd
+
+    env = build_claude_env()
+    env["HCOM_DIR"] = str(hcom_path())
+    hcom_cmd = build_hcom_command()
+    success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
+    return 0 if success else 1
+
+
 def _dispatch(cmd: str | None, argv: list[str], ctx: CommandContext | None) -> int:
     """Route command and return exit code. Delivery handled by caller."""
     try:
@@ -802,16 +751,8 @@ def _dispatch(cmd: str | None, argv: list[str], ctx: CommandContext | None) -> i
             argv = ["1"] + argv
             cmd = "1"  # Now it's a numeric launch
 
-        # Handle --new-terminal flag: force launch TUI in new terminal window
         if cmd == "--new-terminal":
-            from .core.tool_utils import build_hcom_command
-            from .core.thread_context import get_cwd
-
-            env = build_claude_env()
-            env["HCOM_DIR"] = str(hcom_path())
-            hcom_cmd = build_hcom_command()
-            success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
-            return 0 if success else 1
+            return _launch_tui_in_new_terminal()
 
         if not cmd:
             # TTY detection: launch TUI if interactive, otherwise launch in new terminal
@@ -829,15 +770,7 @@ def _dispatch(cmd: str | None, argv: list[str], ctx: CommandContext | None) -> i
 
                 return run_tui(hcom_path())
             else:
-                # No TTY (pipe, redirect, etc) - launch in new terminal window
-                from .core.tool_utils import build_hcom_command
-                from .core.thread_context import get_cwd
-
-                env = build_claude_env()
-                env["HCOM_DIR"] = str(hcom_path())
-                hcom_cmd = build_hcom_command()
-                success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
-                return 0 if success else 1
+                return _launch_tui_in_new_terminal()
         elif cmd in ("help", "--help", "-h"):
             return cmd_help()
         elif cmd in ("--version", "-v"):
@@ -971,42 +904,18 @@ def main(argv: list[str] | None = None) -> int | None:
         has_from = cmd == "send" and (("-b" in argv) or ("--from" in argv)) if argv else False
         if not explicit_name and not has_from:
             # No explicit identity provided - check if registered instance exists
+            is_participant = False
             try:
                 identity = ctx.identity if ctx else None
                 if identity is None:
                     from .core.identity import resolve_identity
 
                     identity = resolve_identity()
-                # Must be a registered, enabled instance
-                if not (identity.kind == "instance" and identity.instance_data):  # Row exists = participating
-                    from .core.tool_utils import build_hcom_command
-
-                    hcom_cmd = build_hcom_command()
-                    print(
-                        format_error(
-                            f"hcom identity not found, you need to run '{hcom_cmd} start' first, "
-                            f"then use '{hcom_cmd} {argv[0]}'"
-                        ),
-                        file=sys.stderr,
-                    )
-                    if is_inside_ai_tool():
-                        print("Usage:", file=sys.stderr)
-                        print(
-                            f"  {hcom_cmd} start              # New hcom identity (assigns new name)",
-                            file=sys.stderr,
-                        )
-                        print(
-                            f"  {hcom_cmd} start --as <name>  # Rebind to existing identity",
-                            file=sys.stderr,
-                        )
-                        print(
-                            f"  Then use the command: {hcom_cmd} {argv[0]} --name <name>",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(f"Usage: {hcom_cmd} start", file=sys.stderr)
-                    return 1
+                is_participant = identity.kind == "instance" and bool(identity.instance_data)
             except HcomError:
+                pass
+
+            if not is_participant:
                 from .core.tool_utils import build_hcom_command
 
                 hcom_cmd = build_hcom_command()
@@ -1071,10 +980,6 @@ def main(argv: list[str] | None = None) -> int | None:
     _maybe_deliver_pending_messages(argv, ctx=ctx)
     return result
 
-
-# ==================== Exports for UI Module ====================
-# Command functions (cmd_launch, cmd_start, cmd_stop, cmd_reset) now in commands/ package
-# Utility functions (should_show_in_watch) now in commands/admin.py
 
 # Type hints for daemon entry point (avoid circular imports at module level)
 from typing import TYPE_CHECKING

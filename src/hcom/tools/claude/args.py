@@ -57,13 +57,7 @@ _FLAG_ALIASES: Final[Mapping[str, CanonicalFlag]] = {
     "--disallowed-tools": "--disallowedTools",
 }
 
-_CANONICAL_PREFIXES: Final[Mapping[str, CanonicalFlag]] = {
-    "--model=": "--model",
-    "--allowedtools=": "--allowedTools",
-    "--allowed-tools=": "--allowedTools",
-    "--disallowedtools=": "--disallowedTools",
-    "--disallowed-tools=": "--disallowedTools",
-}
+_CANONICAL_PREFIXES: Final[Mapping[str, CanonicalFlag]] = {k + "=": v for k, v in _FLAG_ALIASES.items()}
 
 # Background switches: NOT in _BOOLEAN_FLAGS to enable special handling.
 # has_flag() detects them by scanning clean_tokens directly, so they remain
@@ -109,16 +103,7 @@ _OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
     }
 )
 
-_OPTIONAL_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
-    {
-        "--resume=",
-        "-r=",
-        "--debug=",
-        "-d=",
-        "--teleport=",
-        "--from-pr=",
-    }
-)
+_OPTIONAL_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(f + "=" for f in _OPTIONAL_VALUE_FLAGS)
 
 _OPTIONAL_ALIAS_GROUPS: Final[tuple[frozenset[str], ...]] = (
     frozenset({"--resume", "-r"}),
@@ -165,41 +150,7 @@ _VALUE_FLAGS: Final[frozenset[str]] = frozenset(
     }
 )
 
-_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
-    {
-        "--add-dir=",
-        "--agent=",
-        "--agents=",
-        "--allowedtools=",
-        "--allowed-tools=",
-        "--append-system-prompt=",
-        "--append-system-prompt-file=",
-        "--betas=",
-        "--debug-file=",
-        "--disallowedtools=",
-        "--disallowed-tools=",
-        "--fallback-model=",
-        "--file=",
-        "--input-format=",
-        "--json-schema=",
-        "--max-budget-usd=",
-        "--max-turns=",
-        "--mcp-config=",
-        "--model=",
-        "--output-format=",
-        "--permission-mode=",
-        "--permission-prompt-tool=",
-        "--plugin-dir=",
-        "--remote=",
-        "--session-id=",
-        "--setting-sources=",
-        "--settings=",
-        "--system-prompt=",
-        "--system-prompt-file=",
-        "--teammate-mode=",
-        "--tools=",
-    }
-)
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(f + "=" for f in _VALUE_FLAGS)
 
 _KNOWN_CLAUDE_FLAGS: Final[list[str]] = sorted(
     {
@@ -320,7 +271,7 @@ def resolve_claude_args(
 
     if env_value is not None:
         try:
-            tokens = _split_env(env_value)
+            tokens = shlex.split(env_value)
         except ValueError as err:
             return _parse_tokens([], "env", initial_errors=[f"invalid Claude args: {err}"])
         return _parse_tokens(tokens, "env")
@@ -716,11 +667,6 @@ def _parse_tokens(
         flag_values=dict(flag_values),
         errors=tuple(errors),
     )
-
-
-def _split_env(env_value: str) -> TokenList:
-    """Split shell-quoted environment variable into tokens."""
-    return shlex.split(env_value)
 
 
 def _extract_canonical_prefixed(token: str, token_lower: str) -> tuple[CanonicalFlag, str] | None:

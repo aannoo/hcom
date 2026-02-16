@@ -110,6 +110,38 @@ def _config_files_hint() -> str:
     return f"{hcom_path(CONFIG_TOML)}, {hcom_path(ENV_FILE)}"
 
 
+# Shared filter help entries — used by events and events sub
+FILTER_HELP: list[tuple[str, str]] = [
+    ("  --agent NAME", "Agent name"),
+    ("  --type TYPE", "message | status | life"),
+    ("  --status VAL", "listening | active | blocked"),
+    ("  --context PATTERN", "tool:Bash | deliver:X (supports * wildcard)"),
+    ("  --action VAL", "created | started | ready | stopped | batch_launched"),
+    ("  --cmd PATTERN", "Shell command (contains, ^prefix, $suffix, =exact, *glob)"),
+    ("  --file PATH", "File write (*.py for glob, file.py for contains)"),
+    ("  --collision", "Two agents edit same file within 20s"),
+    ("  --from NAME", "Sender"),
+    ("  --mention NAME", "@mention target"),
+    ("  --intent VAL", "request | inform | ack"),
+    ("  --thread NAME", "Thread name"),
+    ("  --after TIME", "After timestamp (ISO-8601)"),
+    ("  --before TIME", "Before timestamp (ISO-8601)"),
+]
+
+
+def format_filter_help(indent: str = "  ") -> str:
+    """Format filter help entries as a string for inline help text."""
+    lines = []
+    for usage, desc in FILTER_HELP:
+        usage = usage.strip()
+        if desc:
+            lines.append(f"{indent}{usage:<30} {desc}")
+        else:
+            lines.append(f"{indent}{usage}")
+    lines.append(f"{indent}Shortcuts: --idle NAME, --blocked NAME")
+    return "\n".join(lines)
+
+
 # Command registry - single source of truth for CLI help
 # Format: list of (usage, description) tuples per command
 # Entries can be static tuples or callables for dynamic content
@@ -128,43 +160,24 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
         ("", ""),
         ("Filters (same flag repeated = OR, different flags = AND):", ""),
-        ("", ""),
-        ("  Core:", ""),
-        ("  --agent NAME", "Agent name"),
-        ("  --type TYPE", "message | status | life"),
-        ("  --status VAL", "listening | active | blocked"),
-        ("  --context PATTERN", "tool:Bash | deliver:X (supports * wildcard)"),
-        ("  --action VAL", "created | started | ready | stopped | batch_launched"),
-        ("", ""),
-        ("  Command / file:", ""),
-        ("  --cmd PATTERN", "Shell command (contains, ^prefix, $suffix, =exact, *glob)"),
-        ("  --file PATH", "File write (*.py for glob, file.py for contains)"),
-        ("  --collision", "Two agents edit same file within 20s"),
-        ("", ""),
-        ("  Message:", ""),
-        ("  --from NAME", "Sender"),
-        ("  --mention NAME", "@mention target"),
-        ("  --intent VAL", "request | inform | ack"),
-        ("  --thread NAME", "Thread name"),
-        ("", ""),
-        ("  Time:", ""),
-        ("  --after TIME", "After timestamp (ISO-8601)"),
-        ("  --before TIME", "Before timestamp (ISO-8601)"),
+        *FILTER_HELP,
         ("", ""),
         ("Shortcuts:", ""),
         ("  --idle NAME", "--agent NAME --status listening"),
         ("  --blocked NAME", "--agent NAME --status blocked"),
         ("", ""),
-        ("Subscribe (hcom notification when event matches):", ""),
-        ("  events sub", "List subscriptions"),
-        ("  events sub [filters]", "Create subscription with filter flags"),
+        ("Subscribe (next matching event delivered as messages from [hcom-events]):", ""),
+        ("  events sub list", "List active subscriptions"),
+        ("  events sub [filters] [--once]", "Subscribe using filter flags (listed above)"),
+        ("  events sub \"SQL WHERE\" [--once]", "Subscribe using raw SQL"),
         ("    --once", "Auto-remove after first match"),
-        ("    --for <name>", "Subscribe for another agent"),
+        ("    --for <name>", "Subscribe on behalf of another agent"),
         ("  events unsub <id>", "Remove subscription"),
         ("", ""),
         ("Examples:", ""),
-        ("  events --agent peso --status listening", ""),
         ("  events --cmd git --agent peso", ""),
+        ("  events sub --idle peso", "Notified when peso goes idle"),
+        ("  events sub --file '*.py' --once", "One-shot: next .py file write"),
         ("", ""),
         ("SQL reference (events_v view):", ""),
         ("  Base", "id, timestamp, type, instance"),

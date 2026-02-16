@@ -903,14 +903,10 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     if bundle is not None:
         try:
-            hints = validate_bundle(bundle)
+            validate_bundle(bundle)
         except ValueError as e:
             print(format_error(str(e)), file=sys.stderr)
             return 1
-        if hints:
-            print("Bundle quality hints:", file=sys.stderr)
-            for h in hints:
-                print(f"  - {h}", file=sys.stderr)
     else:
         title = None
         if argv and not argv[0].startswith("-"):

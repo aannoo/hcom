@@ -25,8 +25,8 @@ def _require_native_binary() -> str:
     native_bin = get_native_binary()
     if not native_bin:
         raise RuntimeError(
-            "hcom binary not found. "
-            "Build with: ./build.sh"
+            "hcom native binary not found for this platform. "
+            "Reinstall: pip install --upgrade --force-reinstall hcom"
         )
     return native_bin
 

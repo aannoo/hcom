@@ -465,194 +465,184 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             )
         return 1
 
-    # Only validate and send if message is provided
-    identity: SenderIdentity | None = None
-    if message:
-        # Validate message
+    # Validate message
+    error = validate_message(message)
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+
+    # Resolve sender identity
+    # - --from: one-shot external sender
+    # - --name: strict instance lookup
+    # - Neither: auto-detect from environment
+    if from_name:
+        identity = SenderIdentity(kind="external", name=from_name)
+    elif ctx and ctx.identity:
+        identity = ctx.identity
+    elif explicit_name:
+        try:
+            identity = resolve_identity(name=explicit_name)
+        except HcomError as e:
+            print(format_error(str(e)), file=sys.stderr)
+            return 1
+    else:
+        identity = resolve_identity()
+
+    # Guard: Block sends from vanilla Claude before opt-in
+    from ..core.thread_context import get_is_claude
+
+    if identity.kind == "instance" and not identity.instance_data and get_is_claude():
+        print(format_error("Cannot send without identity."), file=sys.stderr)
+        print("Run 'hcom start' first, then use 'hcom send'.", file=sys.stderr)
+        return 1
+
+    # Status set by _set_hookless_command_status in cli.py for subagent/codex/adhoc
+
+    # Create bundle event if provided
+    if bundle_data is not None:
+        from ..core.bundles import create_bundle_event, validate_bundle
+
+        try:
+            validate_bundle(bundle_data)
+        except ValueError as e:
+            print(format_error(str(e)), file=sys.stderr)
+            return 1
+
+        bundle_instance = get_bundle_instance_name(identity)
+
+        bundle_id = create_bundle_event(bundle_data, instance=bundle_instance, created_by=identity.name)
+        try:
+            from ..relay import trigger_push
+
+            trigger_push()
+        except Exception:
+            pass
+        envelope["bundle_id"] = bundle_id
+        # Append bundle payload to message text
+        refs = bundle_data.get("refs", {})
+        events = refs.get("events", [])
+        files = refs.get("files", [])
+        transcript = refs.get("transcript", [])
+        extends = bundle_data.get("extends")
+
+        def _join(vals):
+            return ", ".join(str(v) for v in vals) if vals else ""
+
+        def _format_transcript_refs(refs):
+            """Format transcript refs back to range:detail format for display."""
+            if not refs:
+                return ""
+            formatted = []
+            for ref in refs:
+                if isinstance(ref, dict):
+                    # Normalized dict format from validate_bundle
+                    formatted.append(f"{ref['range']}:{ref['detail']}")
+                else:
+                    # Original string format (shouldn't happen after validation)
+                    formatted.append(str(ref))
+            return ", ".join(formatted)
+
+        bundle_lines = [
+            f"[Bundle {bundle_id}]",
+            f"Title: {bundle_data.get('title', '')}",
+            f"Description: {bundle_data.get('description', '')}",
+            "Refs:",
+            f"  events: {_join(events)}",
+            f"  files: {_join(files)}",
+            f"  transcript: {_format_transcript_refs(transcript)}",
+        ]
+        if extends:
+            bundle_lines.append(f"Extends: {extends}")
+
+        bundle_lines.extend(
+            [
+                "",
+                "View bundle:",
+                f"  hcom bundle cat {bundle_id}",
+            ]
+        )
+
+        message = message.rstrip() + "\n\n" + "\n".join(bundle_lines)
+        # Re-validate after append to avoid oversized payloads
         error = validate_message(message)
         if error:
             print(error, file=sys.stderr)
             return 1
 
-        # Resolve sender identity
-        # - --from: one-shot external sender
-        # - --name: strict instance lookup
-        # - Neither: auto-detect from environment
-        if from_name:
-            identity = SenderIdentity(kind="external", name=from_name)
-        elif ctx and ctx.identity:
-            identity = ctx.identity
-        elif explicit_name:
-            try:
-                identity = resolve_identity(name=explicit_name)
-            except HcomError as e:
-                print(format_error(str(e)), file=sys.stderr)
-                return 1
+    # Send message and get delivered_to list
+    # When -- separator was used, pass explicit_targets (even if empty = broadcast)
+    # When old format, pass None to fall back to @mention parsing in message
+    targets_to_pass = explicit_targets if has_separator else (explicit_targets if explicit_targets else None)
+    try:
+        delivered_to = send_message(
+            identity,
+            message,
+            envelope if envelope else None,
+            targets_to_pass,
+        )
+    except HcomError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Handle quiet mode
+    if quiet:
+        return 0
+
+    # Get recipient feedback
+    recipient_feedback = get_recipient_feedback(delivered_to)
+
+    # Show unread messages if instance context
+    if identity.kind == "instance":
+        from ..core.db import get_db
+
+        conn = get_db()
+        messages, _ = get_unread_messages(identity.name, update_position=True)
+        if messages:
+            subagent_names = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM instances WHERE parent_name = ?",
+                    (identity.name,),
+                ).fetchall()
+            }
+
+            # Separate subagent messages from main messages
+            subagent_msgs = []
+            main_msgs = []
+            for msg in messages:
+                sender = msg["from"]
+                if sender in subagent_names:
+                    subagent_msgs.append(msg)
+                else:
+                    main_msgs.append(msg)
+
+            output_parts = [recipient_feedback]
+            max_msgs = MAX_MESSAGES_PER_DELIVERY
+
+            if main_msgs:
+                formatted = format_hook_messages(main_msgs[:max_msgs], identity.name)
+                output_parts.append(f"\n{formatted}")
+
+            if subagent_msgs:
+                formatted = format_hook_messages(subagent_msgs[:max_msgs], identity.name)
+                output_parts.append(f"\n[Subagent messages]\n{formatted}")
+
+            print("".join(output_parts))
         else:
-            identity = resolve_identity()
-
-        # Guard: Block sends from vanilla Claude before opt-in
-        from ..core.thread_context import get_is_claude
-
-        if identity.kind == "instance" and not identity.instance_data and get_is_claude():
-            print(format_error("Cannot send without identity."), file=sys.stderr)
-            print("Run 'hcom start' first, then use 'hcom send'.", file=sys.stderr)
-            return 1
-
-        # For instances (not external), row existence = participating
-        # (No enabled check needed - row exists means active)
-
-        # Status set by _set_hookless_command_status in cli.py for subagent/codex/adhoc
-
-        # Create bundle event if provided
-        if bundle_data is not None:
-            from ..core.bundles import create_bundle_event, validate_bundle
-
-            try:
-                hints = validate_bundle(bundle_data)
-            except ValueError as e:
-                print(format_error(str(e)), file=sys.stderr)
-                return 1
-            if hints:
-                print("Bundle quality hints:", file=sys.stderr)
-                for h in hints:
-                    print(f"  - {h}", file=sys.stderr)
-
-            bundle_instance = get_bundle_instance_name(identity)
-
-            bundle_id = create_bundle_event(bundle_data, instance=bundle_instance, created_by=identity.name)
-            try:
-                from ..relay import trigger_push
-
-                trigger_push()
-            except Exception:
-                pass
-            envelope["bundle_id"] = bundle_id
-            # Append bundle payload to message text
-            refs = bundle_data.get("refs", {})
-            events = refs.get("events", [])
-            files = refs.get("files", [])
-            transcript = refs.get("transcript", [])
-            extends = bundle_data.get("extends")
-
-            def _join(vals):
-                return ", ".join(str(v) for v in vals) if vals else ""
-
-            def _format_transcript_refs(refs):
-                """Format transcript refs back to range:detail format for display."""
-                if not refs:
-                    return ""
-                formatted = []
-                for ref in refs:
-                    if isinstance(ref, dict):
-                        # Normalized dict format from validate_bundle
-                        formatted.append(f"{ref['range']}:{ref['detail']}")
-                    else:
-                        # Original string format (shouldn't happen after validation)
-                        formatted.append(str(ref))
-                return ", ".join(formatted)
-
-            bundle_lines = [
-                f"[Bundle {bundle_id}]",
-                f"Title: {bundle_data.get('title', '')}",
-                f"Description: {bundle_data.get('description', '')}",
-                "Refs:",
-                f"  events: {_join(events)}",
-                f"  files: {_join(files)}",
-                f"  transcript: {_format_transcript_refs(transcript)}",
-            ]
-            if extends:
-                bundle_lines.append(f"Extends: {extends}")
-
-            bundle_lines.extend(
-                [
-                    "",
-                    "View bundle:",
-                    f"  hcom bundle cat {bundle_id}",
-                ]
-            )
-
-            message = message.rstrip() + "\n\n" + "\n".join(bundle_lines)
-            # Re-validate after append to avoid oversized payloads
-            error = validate_message(message)
-            if error:
-                print(error, file=sys.stderr)
-                return 1
-
-        # Send message and get delivered_to list
-        # When -- separator was used, pass explicit_targets (even if empty = broadcast)
-        # When old format, pass None to fall back to @mention parsing in message
-        targets_to_pass = explicit_targets if has_separator else (explicit_targets if explicit_targets else None)
-        try:
-            delivered_to = send_message(
-                identity,
-                message,
-                envelope if envelope else None,
-                targets_to_pass,
-            )
-        except HcomError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
-
-        # Handle quiet mode
-        if quiet:
-            return 0
-
-        # Get recipient feedback
-        recipient_feedback = get_recipient_feedback(delivered_to)
-
-        # Show unread messages if instance context
-        if identity.kind == "instance":
-            from ..core.db import get_db
-
-            conn = get_db()
-            messages, _ = get_unread_messages(identity.name, update_position=True)
-            if messages:
-                subagent_names = {
-                    row["name"]
-                    for row in conn.execute(
-                        "SELECT name FROM instances WHERE parent_name = ?",
-                        (identity.name,),
-                    ).fetchall()
-                }
-
-                # Separate subagent messages from main messages
-                subagent_msgs = []
-                main_msgs = []
-                for msg in messages:
-                    sender = msg["from"]
-                    if sender in subagent_names:
-                        subagent_msgs.append(msg)
-                    else:
-                        main_msgs.append(msg)
-
-                output_parts = [recipient_feedback]
-                max_msgs = MAX_MESSAGES_PER_DELIVERY
-
-                if main_msgs:
-                    formatted = format_hook_messages(main_msgs[:max_msgs], identity.name)
-                    output_parts.append(f"\n{formatted}")
-
-                if subagent_msgs:
-                    formatted = format_hook_messages(subagent_msgs[:max_msgs], identity.name)
-                    output_parts.append(f"\n[Subagent messages]\n{formatted}")
-
-                print("".join(output_parts))
-            else:
-                print(recipient_feedback)
-        else:
-            # External sender - just show feedback
             print(recipient_feedback)
+    else:
+        # External sender - just show feedback
+        print(recipient_feedback)
 
-        # Show intent tip on first use (per intent type)
-        if envelope.get("intent") and identity.kind == "instance":
-            from ..core.tips import maybe_show_tip
+    # Show intent tip on first use (per intent type)
+    if envelope.get("intent") and identity.kind == "instance":
+        from ..core.tips import maybe_show_tip
 
-            maybe_show_tip(identity.name, f"send:intent:{envelope['intent']}")
+        maybe_show_tip(identity.name, f"send:intent:{envelope['intent']}")
 
     # For adhoc instances (--name with instance), append unread messages
     # This delivers pending messages to external tools using hcom send --name <name>
-    if explicit_name and identity is not None and identity.kind == "instance":
+    if explicit_name and identity.kind == "instance":
         from .utils import append_unread_messages
 
         append_unread_messages(identity.name)

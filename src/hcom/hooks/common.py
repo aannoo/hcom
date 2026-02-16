@@ -49,21 +49,22 @@ def deliver_pending_messages(instance_name: str) -> tuple[list[dict[str, Any]], 
 def finalize_session(instance_name: str, reason: str, updates: dict[str, Any] | None = None) -> None:
     """Set inactive status, persist updates, and stop instance.
 
-    Common to Claude and Gemini SessionEnd handlers.
+    Common to Claude and Gemini SessionEnd handlers. Catches all errors
+    internally — callers don't need try/except.
     """
     from ..core.instances import set_status, update_instance_position
     from ..core.tool_utils import stop_instance
-    from ..core.log import log_error
+    from ..core.log import log_info, log_error
 
-    set_status(instance_name, ST_INACTIVE, f"exit:{reason}")
+    log_info("hooks", "sessionend", instance=instance_name, reason=reason)
 
     try:
+        set_status(instance_name, ST_INACTIVE, f"exit:{reason}")
         if updates:
             update_instance_position(instance_name, updates)
-    except sqlite3.Error as e:
+        stop_instance(instance_name, initiated_by="session", reason=f"exit:{reason}")
+    except (sqlite3.Error, OSError) as e:
         log_error("hooks", "hook.error", e, hook="sessionend", instance=instance_name)
-
-    stop_instance(instance_name, initiated_by="session", reason=f"exit:{reason}")
 
 
 def update_tool_status(instance_name: str, tool: str, tool_name: str, tool_input: dict[str, Any]) -> None:

@@ -349,38 +349,26 @@ def extract_tool_detail(tool: str, tool_name: str, tool_input: dict) -> str:
 # ==================== Vanilla Binding ====================
 
 
-def bind_vanilla_instance_from_marker(
+def bind_vanilla_instance(
     *,
-    marker_text: str,
+    instance_name: str,
     session_id: str | None,
     transcript_path: str | None,
     tool: str,
     hook: str,
-    error_returns_instance: bool,
 ) -> str | None:
-    """Bind instance based on [hcom:name] marker.
+    """Persist vanilla instance binding (session + transcript + tool).
 
-    Centralizes vanilla binding logic for codex (and potentially other tools).
-    Gemini keeps its own parsing due to complex tool_response format.
+    Called after marker extraction (each tool extracts differently).
+    Returns instance_name on success or error, None only if nothing to bind.
 
     Args:
-        marker_text: Text content to search for binding marker
+        instance_name: Already-resolved instance name from marker
         session_id: Session ID to bind (if available)
         transcript_path: Transcript path to store (if available)
         tool: Tool name (claude/gemini/codex)
-        hook: Hook name for logging
-        error_returns_instance: Return instance_name on errors if True
+        hook: Hook name for error logging
     """
-    if not marker_text:
-        return None
-
-    from ..shared import BIND_MARKER_RE
-
-    match = BIND_MARKER_RE.search(marker_text)
-    if not match:
-        return None
-
-    instance_name = match.group(1)
     if not session_id and not transcript_path:
         return instance_name
 
@@ -394,10 +382,9 @@ def bind_vanilla_instance_from_marker(
             rebind_instance_session(instance_name, session_id)
         if transcript_path:
             updates["transcript_path"] = transcript_path
-        if updates:
-            update_instance_position(instance_name, updates)
+        update_instance_position(instance_name, updates)
         log_info("hooks", f"{tool}.bind.success", instance=instance_name, session_id=session_id)
         return instance_name
     except Exception as e:
         log_error("hooks", "hook.error", e, hook=hook, op="bind_vanilla")
-        return instance_name if error_returns_instance else None
+        return instance_name

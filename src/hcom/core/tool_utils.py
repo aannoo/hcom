@@ -13,10 +13,7 @@ import sys
 import shlex
 from pathlib import Path
 
-from ..shared import ST_LISTENING
-
-# Platform detection
-IS_WINDOWS = sys.platform == "win32"
+from ..shared import IS_WINDOWS, ST_LISTENING
 
 # ==================== Safe Command Configuration ====================
 # Single source of truth for commands that can run without user approval.
@@ -57,58 +54,27 @@ def _get_hcom_prefix() -> str:
     return "uvx hcom" if cmd_type == "uvx" else "hcom"
 
 
-def _build_all_claude_permission_patterns() -> set[str]:
-    """Generate ALL possible Claude permission patterns (both hcom and uvx hcom).
-
-    Used for removal - must match patterns regardless of how they were installed.
-    """
-    patterns = set()
-    for prefix in ("hcom", "uvx hcom"):
-        for cmd in SAFE_HCOM_COMMANDS:
-            suffix = "" if cmd.startswith("-") else ":*"
-            patterns.add(f"Bash({prefix} {cmd}{suffix})")
-    return patterns
-
-
-def _build_all_gemini_permission_patterns() -> set[str]:
-    """Generate ALL possible Gemini permission patterns (both hcom and uvx hcom).
-
-    Used for removal - must match patterns regardless of how they were installed.
-    """
-    patterns = set()
-    for prefix in ("hcom", "uvx hcom"):
-        for cmd in SAFE_HCOM_COMMANDS:
-            patterns.add(f"run_shell_command({prefix} {cmd})")
-    return patterns
-
-
-def build_gemini_permissions() -> list[str]:
-    """Generate Gemini permission patterns from safe commands.
-
-    Returns patterns for tools.allowed in settings.json.
-    Uses detected invocation method (hcom or uvx hcom).
-    """
-    prefix = _get_hcom_prefix()
-    permissions = []
-    for cmd in SAFE_HCOM_COMMANDS:
-        permissions.append(f"run_shell_command({prefix} {cmd})")
-    return permissions
-
-
-def build_claude_permissions() -> list[str]:
-    """Generate Claude Code permission patterns from safe commands.
-
-    Returns patterns for permissions.allow in settings.json.
-    Uses Bash() format with :* wildcard for commands that take args.
-    Uses detected invocation method (hcom or uvx hcom).
-    """
-    prefix = _get_hcom_prefix()
-    permissions = []
-    for cmd in SAFE_HCOM_COMMANDS:
-        # Commands starting with - are flags (no args), others use :* wildcard
+def _format_permission(tool: str, prefix: str, cmd: str) -> str:
+    """Format a single permission pattern. Claude uses Bash(:*), Gemini uses run_shell_command."""
+    if tool == "claude":
         suffix = "" if cmd.startswith("-") else ":*"
-        permissions.append(f"Bash({prefix} {cmd}{suffix})")
-    return permissions
+        return f"Bash({prefix} {cmd}{suffix})"
+    return f"run_shell_command({prefix} {cmd})"
+
+
+def _build_all_permission_patterns(tool: str) -> set[str]:
+    """Generate ALL permission patterns for removal (both hcom and uvx hcom prefixes)."""
+    return {
+        _format_permission(tool, prefix, cmd)
+        for prefix in ("hcom", "uvx hcom")
+        for cmd in SAFE_HCOM_COMMANDS
+    }
+
+
+def build_permissions(tool: str) -> list[str]:
+    """Generate permission patterns for installation using detected prefix."""
+    prefix = _get_hcom_prefix()
+    return [_format_permission(tool, prefix, cmd) for cmd in SAFE_HCOM_COMMANDS]
 
 
 def build_codex_rules() -> list[str]:
@@ -570,8 +536,7 @@ __all__ = [
     "SAFE_HCOM_COMMANDS",
     "HCOM_TOOL_NAMES",
     "HCOM_ENV_VAR_PATTERNS",
-    "build_claude_permissions",
-    "build_gemini_permissions",
+    "build_permissions",
     "build_codex_rules",
     "build_hcom_hook_patterns",
     "build_hcom_command",
@@ -582,6 +547,6 @@ __all__ = [
     "create_orphaned_pty_identity",
     "_detect_hcom_command_type",
     "_build_quoted_invocation",
-    "_build_all_claude_permission_patterns",
-    "_build_all_gemini_permission_patterns",
+    "_build_all_permission_patterns",
+    "_format_permission",
 ]

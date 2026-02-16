@@ -28,7 +28,7 @@ Message Delivery:
 from __future__ import annotations
 
 import json
-import sqlite3
+
 import sys
 from typing import TYPE_CHECKING
 
@@ -133,28 +133,15 @@ def _bind_vanilla_instance(
     if not match:
         return None
 
-    instance_name = match.group(1)
+    from ...hooks.family import bind_vanilla_instance
 
-    if not payload.session_id and not payload.transcript_path:
-        return instance_name
-
-    try:
-        from ...core.instances import update_instance_position
-        from ...core.db import rebind_instance_session
-
-        updates: dict = {"tool": "gemini"}
-        if payload.session_id:
-            updates["session_id"] = payload.session_id
-            rebind_instance_session(instance_name, payload.session_id)
-        if payload.transcript_path:
-            updates["transcript_path"] = payload.transcript_path
-        if updates:
-            update_instance_position(instance_name, updates)
-        log_info("hooks", "gemini.bind.success", instance=instance_name, session_id=payload.session_id)
-        return instance_name
-    except (sqlite3.Error, KeyError) as e:
-        log_error("hooks", "hook.error", e, hook="gemini-aftertool", op="bind_vanilla")
-        return instance_name
+    return bind_vanilla_instance(
+        instance_name=match.group(1),
+        session_id=payload.session_id,
+        transcript_path=payload.transcript_path,
+        tool="gemini",
+        hook="gemini-aftertool",
+    )
 
 
 # =============================================================================
@@ -474,13 +461,6 @@ def handle_sessionend(
 
     Note: Gemini DOES fire SessionStart after /clear, so orphan creation
     is handled there via create_orphaned_pty_identity, not here.
-
-    Args:
-        ctx: Execution context.
-        payload: Hook payload with reason.
-
-    Returns:
-        HookResult (always success).
     """
     from ...core.hook_result import HookResult
     from ...hooks.common import finalize_session
@@ -489,14 +469,7 @@ def handle_sessionend(
     if not instance:
         return HookResult.success()
 
-    reason = payload.raw.get("reason", "unknown")
-    log_info("hooks", "gemini.sessionend", instance=instance["name"], reason=reason)
-
-    try:
-        finalize_session(instance["name"], reason)
-    except (sqlite3.Error, OSError) as e:
-        log_error("hooks", "hook.error", e, hook="gemini-sessionend")
-
+    finalize_session(instance["name"], payload.raw.get("reason", "unknown"))
     return HookResult.success()
 
 

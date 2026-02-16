@@ -39,15 +39,6 @@ impl Tool {
         }
     }
 
-    /// Get the tool name as uppercase string (for display)
-    #[allow(dead_code)] // Reserved for future terminal title display
-    pub fn as_uppercase(&self) -> &'static str {
-        match self {
-            Tool::Claude => "CLAUDE",
-            Tool::Gemini => "GEMINI",
-            Tool::Codex => "CODEX",
-        }
-    }
 }
 
 impl FromStr for Tool {

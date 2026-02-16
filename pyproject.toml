@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hcom"
-version = "0.6.19"
+version = "0.6.20"
 description = "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -132,30 +132,18 @@ _VALUE_FLAGS: Final[frozenset[str]] = frozenset(
         "--output-format",
     }
 )
-# Note: --resume/-r moved to _OPTIONAL_VALUE_FLAGS
 
-# Flags with = syntax prefixes
-_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
+# Optional value flags (can be used with or without a value)
+# Per gemini docs: --resume [session_id] defaults to "latest" if omitted
+_OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
     {
-        "-m=",
-        "--model=",
-        "-p=",
-        "--prompt=",
-        "-i=",
-        "--prompt-interactive=",
-        "--approval-mode=",
-        "--allowed-mcp-server-names=",
-        "--allowed-tools=",
-        "-e=",
-        "--extensions=",
-        "-r=",
-        "--resume=",
-        "--delete-session=",
-        "--include-directories=",
-        "-o=",
-        "--output-format=",
+        "--resume",
+        "-r",
     }
 )
+
+# Flags with = syntax prefixes (derived from value + optional value flags)
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(f + "=" for f in (_VALUE_FLAGS | _OPTIONAL_VALUE_FLAGS))
 
 # Repeatable flags (can appear multiple times)
 _REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset(
@@ -165,15 +153,6 @@ _REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset(
         "--include-directories",
         "--allowed-mcp-server-names",
         "--allowed-tools",
-    }
-)
-
-# Optional value flags (can be used with or without a value)
-# Per gemini docs: --resume [session_id] defaults to "latest" if omitted
-_OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
-    {
-        "--resume",
-        "-r",
     }
 )
 

@@ -18,6 +18,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-latest
@@ -40,8 +44,40 @@ jobs:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
 
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK r25b
+        run: yes | sdkmanager "ndk;25.2.9519653" > /dev/null
+
+      - name: Build wheel
+        run: |
+          rustup target add aarch64-linux-android
+          pip install maturin
+
+          NDK_BIN="$ANDROID_HOME/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
+
+          maturin build --release --target aarch64-linux-android --out dist
+
+      - name: Fix wheel platform tag for Termux
+        run: |
+          cd dist && for f in *.whl; do
+            mv "$f" "$(echo "$f" | sed 's/-[^-]*\.whl$/-linux_aarch64.whl/')"
+          done
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-aarch64-linux-android
+          path: dist/*.whl
+
   publish:
-    needs: [build-wheels]
+    needs: [build-wheels, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

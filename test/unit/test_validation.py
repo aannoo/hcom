@@ -17,8 +17,7 @@ import pytest
 from hcom.shared import MENTION_PATTERN
 from hcom.core.tool_utils import (
     SAFE_HCOM_COMMANDS,
-    build_claude_permissions,
-    build_gemini_permissions,
+    build_permissions,
     build_codex_rules,
 )
 from hcom.commands.utils import validate_message
@@ -121,7 +120,7 @@ class TestHcomSafeCommands:
 
     def test_claude_permissions_include_send(self):
         """Permissions include send command (detected variant only - hcom or uvx hcom)."""
-        perms = build_claude_permissions()
+        perms = build_permissions("claude")
         # Should have exactly one variant (detected at runtime)
         has_hcom = any(p.startswith("Bash(hcom send") for p in perms)
         has_uvx = any(p.startswith("Bash(uvx hcom send") for p in perms)
@@ -130,7 +129,7 @@ class TestHcomSafeCommands:
 
     def test_gemini_permissions_include_send(self):
         """Permissions include send command (detected variant only - hcom or uvx hcom)."""
-        perms = build_gemini_permissions()
+        perms = build_permissions("gemini")
         has_hcom = "run_shell_command(hcom send)" in perms
         has_uvx = "run_shell_command(uvx hcom send)" in perms
         assert has_hcom or has_uvx, "send command not found in permissions"

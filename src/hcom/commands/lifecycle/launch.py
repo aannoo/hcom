@@ -66,8 +66,7 @@ def _print_launch_preview(tool: str, count: int, background: bool, args: list[st
             active_env[k] = os.environ[k]
 
     def fmt(k):
-        v = active_env.get(k, "")
-        return v if v else ""
+        return active_env.get(k, "")
 
     # Tool-specific args
     args_key = f"HCOM_{tool.upper()}_ARGS"
@@ -108,27 +107,21 @@ def _print_launch_preview(tool: str, count: int, background: bool, args: list[st
         cli_help = f"see `{tool} --help`"
         mode_note = ""
 
-    # Format timeout nicely
-    timeout = config.timeout
-    timeout_str = f"{timeout}s"
-    subagent_timeout = config.subagent_timeout
-    subagent_timeout_str = f"{subagent_timeout}s"
-    claude_env_vars = ""
+    # Tool-specific env vars shown in preview
+    timeout_str = f"{config.timeout}s"
+    subagent_timeout_str = f"{config.subagent_timeout}s"
     if tool == "claude":
         # HCOM_TIMEOUT only applies to headless/vanilla, not interactive PTY
         if background:
-            claude_env_vars = f"""HCOM_TIMEOUT={timeout_str}
-    HCOM_SUBAGENT_TIMEOUT={subagent_timeout_str}"""
+            tool_env_vars = f"HCOM_TIMEOUT={timeout_str}\n    HCOM_SUBAGENT_TIMEOUT={subagent_timeout_str}"
         else:
-            claude_env_vars = f"""HCOM_SUBAGENT_TIMEOUT={subagent_timeout_str}"""
-    gemini_env_vars = ""
-    if tool == "gemini":
-        gemini_env_vars = f"""HCOM_GEMINI_SYSTEM_PROMPT={config.gemini_system_prompt}"""
-    codex_env_vars = ""
-    if tool == "codex":
-        codex_env_vars = f"""HCOM_CODEX_SYSTEM_PROMPT={config.codex_system_prompt}"""
-
-    from ...core.thread_context import get_cwd
+            tool_env_vars = f"HCOM_SUBAGENT_TIMEOUT={subagent_timeout_str}"
+    elif tool == "gemini":
+        tool_env_vars = f"HCOM_GEMINI_SYSTEM_PROMPT={config.gemini_system_prompt}"
+    elif tool == "codex":
+        tool_env_vars = f"HCOM_CODEX_SYSTEM_PROMPT={config.codex_system_prompt}"
+    else:
+        tool_env_vars = ""
 
     print(f"""
 == LAUNCH PREVIEW ==
@@ -143,7 +136,7 @@ Config (override: VAR=val {hcom_cmd} ...):
   HCOM_TERMINAL={fmt("HCOM_TERMINAL") or "default"}
   HCOM_HINTS={fmt("HCOM_HINTS") or "(none)"}
   HCOM_NOTES={fmt("HCOM_NOTES") or "(none)"}
-  {claude_env_vars}{gemini_env_vars}{codex_env_vars}
+  {tool_env_vars}
 
 Args:
   From env ({args_key}): {env_args or "(none)"}
@@ -235,7 +228,7 @@ def cmd_launch_tool(
             )
 
             env_spec = resolve_claude_args(None, config.claude_args)
-            cli_spec = resolve_claude_args(forwarded if forwarded else None, None)
+            cli_spec = resolve_claude_args(forwarded or None, None)
 
             if cli_spec.clean_tokens or cli_spec.positional_tokens:
                 spec = merge_claude_args(env_spec, cli_spec)
@@ -262,7 +255,7 @@ def cmd_launch_tool(
             from ...tools.gemini.args import resolve_gemini_args, merge_gemini_args
 
             g_env = resolve_gemini_args(None, config.gemini_args)
-            g_cli = resolve_gemini_args(forwarded if forwarded else None, None)
+            g_cli = resolve_gemini_args(forwarded or None, None)
             g_spec = merge_gemini_args(g_env, g_cli) if (g_cli.clean_tokens or g_cli.positional_tokens) else g_env
 
             if g_spec.has_errors() and not skip_tool_args_validation():
@@ -290,7 +283,7 @@ def cmd_launch_tool(
             from ...tools.codex.args import resolve_codex_args, merge_codex_args
 
             x_env = resolve_codex_args(None, config.codex_args)
-            x_cli = resolve_codex_args(forwarded if forwarded else None, None)
+            x_cli = resolve_codex_args(forwarded or None, None)
             x_spec = (
                 merge_codex_args(x_env, x_cli)
                 if (x_cli.clean_tokens or x_cli.positional_tokens or x_cli.subcommand)
@@ -305,13 +298,6 @@ def cmd_launch_tool(
                     ])
                 )
 
-            # Handle resume/fork subcommand
-            if x_spec.subcommand in ("resume", "fork"):
-                if not x_spec.positional_tokens:
-                    raise CLIError(f"'codex {x_spec.subcommand}' requires explicit thread-id (interactive picker not supported)")
-                if x_spec.has_flag(["--last"]):
-                    raise CLIError(f"'codex {x_spec.subcommand} --last' not supported - use explicit thread-id")
-
             # Reject exec mode
             if x_spec.is_exec:
                 raise CLIError("'codex exec' is not supported. Use interactive codex or headless claude.")
@@ -324,8 +310,7 @@ def cmd_launch_tool(
             raise CLIError(f"Unknown tool: {tool}")
 
     # --- HCOM_GO confirmation gate ---
-    has_args = forwarded and len(forwarded) > 0
-    if is_inside_ai_tool() and not get_hcom_go() and (has_args or count > 5):
+    if is_inside_ai_tool() and not get_hcom_go() and (forwarded or count > 5):
         _print_launch_preview(tool, count, background, forwarded)
         return 0
 
@@ -381,6 +366,8 @@ def cmd_launch_tool(
         print(f"Started the launch process for {launched}/{count} {tool_label} agent{'s' if count != 1 else ''} ({failed} failed)")
     else:
         print(f"Started the launch process for {launched} {tool_label} agent{'s' if launched != 1 else ''}")
+    if instance_names:
+        print(f"Names: {', '.join(instance_names)}")
     print(f"Batch id: {batch_id}")
     print("To block until ready or fail (30s timeout), run: hcom events launch")
 
@@ -413,7 +400,6 @@ def cmd_launch_tool(
         print_launch_tips(
             launched=launched,
             tag=tag,
-            instance_names=instance_names,
             launcher_name=launcher if launcher != "user" else None,
             launcher_participating=launcher_participating,
             background=background,

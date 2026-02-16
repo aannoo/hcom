@@ -162,34 +162,7 @@ _VALUE_FLAGS: Final[frozenset[str]] = frozenset(
 _CASE_SENSITIVE_VALUE_FLAGS: Final[frozenset[str]] = frozenset({"-C", "-c"})
 
 # Flags with = syntax prefixes (lowercase for matching)
-_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
-    {
-        "-c=",
-        "--config=",
-        "--enable=",
-        "--disable=",
-        "-i=",
-        "--image=",
-        "-m=",
-        "--model=",
-        "--local-provider=",
-        "-p=",
-        "--profile=",
-        "-s=",
-        "--sandbox=",
-        "-a=",
-        "--ask-for-approval=",
-        "--cd=",
-        "--add-dir=",
-        "--color=",
-        "-o=",
-        "--output-last-message=",
-        "--output-schema=",
-        "--base=",
-        "--commit=",
-        "--title=",
-    }
-)
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(f + "=" for f in _VALUE_FLAGS)
 
 # Used for friendly "did you mean" suggestions when user typos a flag.
 _KNOWN_CODEX_OPTIONS: Final[list[str]] = sorted(
@@ -205,7 +178,7 @@ _KNOWN_CODEX_OPTIONS: Final[list[str]] = sorted(
 )
 
 # Case-sensitive prefixes
-_CASE_SENSITIVE_PREFIXES: Final[frozenset[str]] = frozenset({"-C=", "-c="})
+_CASE_SENSITIVE_PREFIXES: Final[frozenset[str]] = frozenset(f + "=" for f in _CASE_SENSITIVE_VALUE_FLAGS)
 
 # Repeatable flags (can appear multiple times)
 _REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset(

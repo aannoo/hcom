@@ -106,6 +106,14 @@ ScopeExtra = dict[str, list[str]]  # e.g., {"mentions": ["luna", "nova"]}
 ScopeResult = tuple[MessageScope, ScopeExtra]
 
 
+def _warn_missing_scope(event_id: int) -> None:
+    print(f"Error: Message event {event_id} missing 'scope' field (old format). Run 'hcom reset logs' to clear old messages.", file=sys.stderr)
+
+
+def _warn_corrupt_message(event_id: int, error: Exception) -> None:
+    print(f"Error: Corrupt message data in event {event_id}: {error}. Run 'hcom reset logs' to clear corrupt messages.", file=sys.stderr)
+
+
 def validate_message(message: str) -> str | None:
     """Validate message content and size.
 
@@ -390,44 +398,26 @@ def resolve_reply_to(reply_to: str) -> tuple[int | None, str | None]:
         return None, f"Message #{reply_to} not found"
 
 
-def get_thread_from_event(event_id: int) -> str | None:
-    """Get thread field from an event by ID.
-
-    Args:
-        event_id: Local event ID
-
-    Returns:
-        Thread string if present, else None
-    """
+def _get_event_json_field(event_id: int, field: str) -> str | None:
+    """Get a JSON field from an event by ID. Returns None if missing or empty."""
     from .db import get_db
 
     conn = get_db()
     row = conn.execute(
-        "SELECT json_extract(data, '$.thread') as thread FROM events WHERE id = ?",
+        f"SELECT json_extract(data, '$.{field}') as val FROM events WHERE id = ?",
         (event_id,),
     ).fetchone()
+    return row["val"] if row and row["val"] else None
 
-    return row["thread"] if row and row["thread"] else None
+
+def get_thread_from_event(event_id: int) -> str | None:
+    """Get thread field from an event by ID."""
+    return _get_event_json_field(event_id, "thread")
 
 
 def get_intent_from_event(event_id: int) -> str | None:
-    """Get intent field from an event by ID.
-
-    Args:
-        event_id: Local event ID
-
-    Returns:
-        Intent string if present, else None
-    """
-    from .db import get_db
-
-    conn = get_db()
-    row = conn.execute(
-        "SELECT json_extract(data, '$.intent') as intent FROM events WHERE id = ?",
-        (event_id,),
-    ).fetchone()
-
-    return row["intent"] if row and row["intent"] else None
+    """Get intent field from an event by ID."""
+    return _get_event_json_field(event_id, "intent")
 
 
 def unescape_bash(text: str) -> str:
@@ -687,13 +677,8 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
     for event in events:
         event_data = event["data"]
 
-        # Validate scope field present
         if "scope" not in event_data:
-            print(
-                f"Error: Message event {event['id']} missing 'scope' field (old format). "
-                f"Run 'hcom reset logs' to clear old messages.",
-                file=sys.stderr,
-            )
+            _warn_missing_scope(event["id"])
             continue
 
         # Skip own messages
@@ -722,11 +707,7 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
                     msg["_relay"] = relay
                 messages.append(msg)
         except ValueError as e:
-            print(
-                f"Error: Corrupt message data in event {event['id']}: {e}. "
-                f"Run 'hcom reset logs' to clear corrupt messages.",
-                file=sys.stderr,
-            )
+            _warn_corrupt_message(event["id"], e)
             continue
 
     # Max event ID from events we processed
@@ -779,10 +760,6 @@ def should_deliver_message(event_data: dict[str, Any], receiver_name: str, sende
     return False
 
 
-# Note: determine_message_recipients() removed - obsolete after scope refactor
-# Use compute_scope() + should_deliver_message() directly instead (see send_message())
-
-
 def get_subagent_messages(
     parent_name: str, since_id: int = 0, limit: int = 0
 ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
@@ -821,13 +798,8 @@ def get_subagent_messages(
     for event in events:
         event_data = event["data"]
 
-        # Validate scope field present
         if "scope" not in event_data:
-            print(
-                f"Error: Message event {event['id']} missing 'scope' field (old format). "
-                f"Run 'hcom reset logs' to clear old messages.",
-                file=sys.stderr,
-            )
+            _warn_missing_scope(event["id"])
             continue
 
         sender_name = event_data["from"]
@@ -849,11 +821,7 @@ def get_subagent_messages(
                         if should_deliver_message(event_data, subagent_name, sender_name):
                             per_subagent_counts[subagent_name] += 1
                     except ValueError as e:
-                        print(
-                            f"Error: Corrupt message data in event {event['id']}: {e}. "
-                            f"Run 'hcom reset logs' to clear corrupt messages.",
-                            file=sys.stderr,
-                        )
+                        _warn_corrupt_message(event["id"], e)
                         continue
         # Messages TO subagents via @mentions or broadcasts
         elif subagent_names:
@@ -867,11 +835,7 @@ def get_subagent_messages(
                             matched = True
                         per_subagent_counts[subagent_name] += 1
                 except ValueError as e:
-                    print(
-                        f"Error: Corrupt message data in event {event['id']}: {e}. "
-                        f"Run 'hcom reset logs' to clear corrupt messages.",
-                        file=sys.stderr,
-                    )
+                    _warn_corrupt_message(event["id"], e)
                     break  # Skip remaining subagents for this message
 
     if limit > 0:

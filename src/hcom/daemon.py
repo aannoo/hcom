@@ -190,10 +190,8 @@ def _parse_log_timestamp(ts_value):
     from datetime import datetime, timezone
 
     if isinstance(ts_value, (int, float)):
-        # Unix epoch (old Rust format)
         return datetime.fromtimestamp(ts_value, tz=timezone.utc)
-    elif isinstance(ts_value, str):
-        # ISO format (new format)
+    if isinstance(ts_value, str):
         try:
             return datetime.fromisoformat(ts_value.replace("Z", "+00:00"))
         except ValueError:
@@ -615,10 +613,9 @@ class RelayManager:
                 try:
                     success, err, has_more = push(mqtt_client=self.mqtt_client)
                     if not success:
-                        # Connection error — paho's is_connected() can lag behind
-                        # reality (e.g. after system sleep where TCP socket died
-                        # silently).  Force teardown so next iteration reconnects.
-                        if err and ("not connected" in err.lower() or "not currently" in err.lower()):
+                        # Check actual connection state rather than matching error strings.
+                        # Covers both silent TCP death (e.g. system sleep) and publish rejection.
+                        if self.mqtt_client and not self.mqtt_client.is_connected():
                             _log_warn("relay.push_loop", f"publish failed ({err}) — forcing reconnect")
                             try:
                                 self.mqtt_client.loop_stop()
@@ -834,17 +831,15 @@ def handle_hook_request(
             if hook_type == "codex-notify":
                 from .tools.codex.hooks import handle_codex_hook_with_context
 
-                result = handle_codex_hook_with_context(hook_type, ctx, payload)
+                return handle_codex_hook_with_context(hook_type, ctx, payload)
             elif hook_type.startswith("gemini-"):
                 from .tools.gemini.hooks import handle_gemini_hook_with_context
 
-                result = handle_gemini_hook_with_context(hook_type, ctx, payload)
+                return handle_gemini_hook_with_context(hook_type, ctx, payload)
             else:
                 from .tools.claude.dispatcher import handle_hook_with_context
 
-                result = handle_hook_with_context(hook_type, ctx, payload)
-
-            return result
+                return handle_hook_with_context(hook_type, ctx, payload)
 
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
@@ -1002,7 +997,6 @@ def _acquire_pidfile_lock(pid_path: Path, socket_path: Path):
 
     # No socket — but is the incumbent still starting up, or is it a zombie?
     # Normal startup creates the socket within ~2s. Give a 5s grace period.
-    import time
     try:
         pid_age = time.time() - pid_path.stat().st_mtime
     except OSError:

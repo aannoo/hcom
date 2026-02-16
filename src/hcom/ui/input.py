@@ -44,8 +44,7 @@ from .colors import (
     SHOW_CURSOR,
 )
 
-# Platform detection
-IS_WINDOWS = os.name == "nt"
+from ..shared import IS_WINDOWS
 
 
 def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:

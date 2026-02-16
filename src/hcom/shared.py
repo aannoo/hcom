@@ -11,7 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
-__version__ = "0.6.19"
+__version__ = "0.6.20"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"
@@ -531,8 +531,6 @@ TERMINAL_ENV_MAP: dict[str, str] = {
 # ===== Pure Utility Functions =====
 def shorten_path(path: str) -> str:
     """Shorten path by replacing home directory with ~"""
-    import os
-
     if not path:
         return path
     return path.replace(os.path.expanduser("~"), "~")
@@ -546,8 +544,6 @@ def get_project_tag(directory: str, max_len: int = 12) -> str:
     """
     if not directory:
         return ""
-    from pathlib import Path
-
     project = Path(directory).name
     if len(project) > max_len:
         project = project[: max_len - 1] + "…"
@@ -563,7 +559,6 @@ def parse_iso_timestamp(iso_str: str):
         return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
-
 
 
 def format_timestamp(iso_str: str, fmt: str = "%H:%M") -> str:
@@ -726,8 +721,6 @@ def skip_tool_args_validation() -> bool:
     This bypasses hcom-side "unknown option"/parse error gating so the underlying
     tool (Claude/Gemini/Codex) can be the source of truth for flags.
     """
-    import os
-
     value = os.environ.get(HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV, "")
     return value not in ("", "0", "false", "False", "no", "NO")
 

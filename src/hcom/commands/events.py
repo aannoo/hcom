@@ -445,10 +445,51 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 # ==================== Event Subscriptions ====================
 
 
-def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = False) -> int:
-    """Subscribe to events or list subscriptions.
+def _events_sub_list() -> int:
+    """List all active event subscriptions."""
+    from ..core.db import get_db
 
-    hcom events sub                             - list all subscriptions
+    conn = get_db()
+    rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'").fetchall()
+
+    if not rows:
+        print("No active subscriptions")
+        return 0
+
+    subs = []
+    for row in rows:
+        try:
+            subs.append(json.loads(row["value"]))
+        except Exception:
+            pass
+
+    if not subs:
+        print("No active subscriptions")
+        return 0
+
+    print(f"{'ID':<10} {'FOR':<12} {'MODE':<10} FILTER")
+    for sub in subs:
+        mode = "once" if sub.get("once") else "continuous"
+
+        # Handle both filter-based (new) and SQL-based (old) subscriptions
+        if "filters" in sub:
+            filter_display = json.dumps(sub["filters"])
+            if len(filter_display) > 35:
+                filter_display = filter_display[:35] + "..."
+        else:
+            sql_display = sub.get("sql", "")
+            filter_display = sql_display[:35] + "..." if len(sql_display) > 35 else sql_display
+
+        print(f"{sub['id']:<10} {sub['caller']:<12} {mode:<10} {filter_display}")
+
+    return 0
+
+
+def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = False) -> int:
+    """Subscribe to events.
+
+    hcom events sub                             - show help
+    hcom events sub list                        - list all subscriptions
     hcom events sub --collision                 - file collision warnings
     hcom events sub --idle peso                 - peso returns to listening
     hcom events sub --agent peso --cmd git      - peso's git commands
@@ -469,6 +510,10 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
         parse_event_flags,
         build_sql_from_flags,
     )
+
+    # Handle 'list' subcommand: events sub list
+    if argv and argv[0] == "list":
+        return _events_sub_list()
 
     # Validate flags
     if error := validate_flags("events sub", argv):
@@ -591,45 +636,40 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
                 test_count = conn.execute(f"SELECT COUNT(*) FROM events_v WHERE ({sql})").fetchone()[0]
                 if test_count > 0:
                     print(f"  historical matches: {test_count} events")
+                    print("  You will be notified on the next matching event(s)")
             except Exception:
                 pass  # Ignore errors in test query
 
+            from ..core.tips import maybe_show_tip
+            maybe_show_tip(caller, "sub:created")
+
         return 0
 
-    # No args = list subscriptions
+    # No filters and no SQL = show sub-specific help
     if not sql_parts:
-        rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'").fetchall()
+        from .utils import format_filter_help
 
-        if not rows:
-            print("No active subscriptions")
-            return 0
+        print(f"""Event subscriptions: get notified via hcom message when a future event matches.
 
-        subs = []
-        for row in rows:
-            try:
-                subs.append(json.loads(row["value"]))
-            except Exception:
-                pass
+When a matching event occurs, you receive a message from [hcom-events].
+You don't need to poll — end your turn and the notification will arrive automatically.
 
-        if not subs:
-            print("No active subscriptions")
-            return 0
+Usage:
+  events sub [filters] [--once]     Subscribe using filter flags
+  events sub "SQL WHERE" [--once]   Subscribe using raw SQL
+  events sub list                   List active subscriptions
+  events unsub <id>                 Remove a subscription
+    --once                          Auto-remove after first match
+    --for <name>                    Subscribe on behalf of another agent
 
-        print(f"{'ID':<10} {'FOR':<12} {'MODE':<10} FILTER")
-        for sub in subs:
-            mode = "once" if sub.get("once") else "continuous"
+Filters (same flag repeated = OR, different flags = AND):
+{format_filter_help()}
 
-            # Handle both filter-based (new) and SQL-based (old) subscriptions
-            if "filters" in sub:
-                filter_display = json.dumps(sub["filters"])
-                if len(filter_display) > 35:
-                    filter_display = filter_display[:35] + "..."
-            else:
-                sql_display = sub.get("sql", "")
-                filter_display = sql_display[:35] + "..." if len(sql_display) > 35 else sql_display
-
-            print(f"{sub['id']:<10} {sub['caller']:<12} {mode:<10} {filter_display}")
-
+Examples:
+  events sub --idle peso            Notified when peso goes idle
+  events sub --file '*.py' --once   One-shot: next .py file write
+  events sub --agent peso --cmd git peso runs a git command
+  events sub --collision            File edit conflict detection""")
         return 0
 
     # Create custom subscription (using composable filters)
@@ -703,6 +743,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
     print(f"  filter: {sql}")
     if test_count > 0:
         print(f"  historical matches: {test_count} events")
+        print("  You will be notified on the next matching event(s)")
         # Show most recent match as example
         example = conn.execute(
             f"SELECT timestamp, type, instance, data FROM events_v WHERE ({sql}) ORDER BY id DESC LIMIT 1"
@@ -738,6 +779,10 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
                     f"  Warning: field(s) not found in any events: {', '.join(missing)} \nYou should probably double check the syntax"
                 )
 
+    if not silent:
+        from ..core.tips import maybe_show_tip
+        maybe_show_tip(caller, "sub:created")
+
     return 0
 
 
@@ -768,7 +813,7 @@ def _events_unsub(argv: list[str], caller_name: str | None = None) -> int:
     row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
     if not row:
         print(f"Not found: {sub_id}", file=sys.stderr)
-        print("Use 'hcom events sub' to list active subscriptions.", file=sys.stderr)
+        print("Use 'hcom events sub list' to list active subscriptions.", file=sys.stderr)
         return 1
 
     kv_set(key, None)

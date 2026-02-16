@@ -233,12 +233,6 @@ impl ScreenTracker {
         self.last_change.elapsed().as_millis() as u64 >= ms
     }
 
-    /// Get milliseconds since last output
-    #[allow(dead_code)]
-    pub fn last_output_elapsed_ms(&self) -> u64 {
-        self.last_output.elapsed().as_millis() as u64
-    }
-
     /// Get the last output timestamp (for sharing with delivery thread)
     pub fn last_output_instant(&self) -> Instant {
         self.last_output

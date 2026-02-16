@@ -151,13 +151,7 @@ def parse_transcript_ref(ref: str | dict[str, Any]) -> dict[str, Any]:
                 f'Transcript ref must include detail level. Got: \'{ref}\'\nFormat: "range:detail" (e.g., "3-14:normal", "10:full", "20-25:detailed")'
             )
 
-        parts = ref.split(":", 1)
-        if len(parts) != 2:
-            raise ValueError(
-                f'Invalid transcript ref: \'{ref}\'\nFormat: "<range>:<detail>" where detail is normal/full/detailed\nExamples: "1-5:normal", "10:full", "20-25:detailed"'
-            )
-
-        range_part, detail = parts
+        range_part, detail = ref.split(":", 1)
         if not range_part.strip():
             raise ValueError(f"Empty range in transcript ref: '{ref}'")
         if not detail.strip():
@@ -170,20 +164,9 @@ def parse_transcript_ref(ref: str | dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Transcript ref must be a string or object, got {type(ref)}")
 
 
-def get_bundle_quality_hints(bundle: dict[str, Any]) -> list[str]:
-    """Return hints when bundle refs are empty.
-
-    Called after validation to warn about missing context.
-    Note: All refs fields (transcript, events, files) are now required.
-    """
-    # All refs are now required, so no quality hints needed
-    return []
-
-
-def validate_bundle(bundle: dict[str, Any]) -> list[str]:
+def validate_bundle(bundle: dict[str, Any]) -> None:
     """Validate bundle payload fields and types.
 
-    Returns list of quality hints (empty refs warnings).
     Raises ValueError for hard validation errors.
     """
     if not isinstance(bundle, dict):
@@ -306,8 +289,6 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
     if "bundle_id" in bundle and not isinstance(bundle.get("bundle_id"), str):
         raise ValueError("bundle_id must be a string")
 
-    return get_bundle_quality_hints(bundle)
-
 
 def create_bundle_event(bundle: dict[str, Any], *, instance: str, created_by: str | None) -> str:
     """Create a bundle event and return its bundle_id."""
@@ -330,7 +311,6 @@ __all__ = [
     "generate_bundle_id",
     "validate_bundle",
     "create_bundle_event",
-    "get_bundle_quality_hints",
     "parse_csv_list",
     "get_bundle_instance_name",
     "parse_inline_bundle_flags",

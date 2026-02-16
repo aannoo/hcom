@@ -118,8 +118,7 @@ def _get_broker_address() -> tuple[str, int] | None:
 
 def _get_relay_id() -> str | None:
     """Get relay_id from config."""
-    config = get_config()
-    return config.relay_id if config.relay_id else None
+    return get_config().relay_id or None
 
 
 def _use_tls(broker_port: int) -> bool:
@@ -272,10 +271,6 @@ def push(mqtt_client: Any = None, **_kw: Any) -> tuple[bool, str | None, bool]:
     relay_id = _get_relay_id()
     if not relay_id:
         return (False, None, False)
-
-    # Don't queue into paho's internal buffer while disconnected
-    if not mqtt_client.is_connected():
-        return (False, "not connected", False)
 
     device_id = get_device_uuid()
     state, events, max_id, has_more = build_push_payload()

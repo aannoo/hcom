@@ -53,8 +53,6 @@ def _bind_vanilla_instance(
 ) -> str | None:
     """Bind Codex thread_id to instance by searching transcript for binding marker.
 
-    Creates session binding for hook participation.
-
     Args:
         ctx: Execution context.
         payload: Normalized hook payload with thread_id.
@@ -81,19 +79,15 @@ def _bind_vanilla_instance(
     if not instance_name:
         return None
 
-    # Bind the instance
-    from ...core.instances import update_instance_position
-    from ...core.db import rebind_instance_session
+    from ...hooks.family import bind_vanilla_instance
 
-    updates: dict = {"tool": "codex"}
-    if thread_id:
-        updates["session_id"] = thread_id
-        rebind_instance_session(instance_name, thread_id)
-    if transcript_path:
-        updates["transcript_path"] = transcript_path
-    update_instance_position(instance_name, updates)
-
-    return instance_name
+    return bind_vanilla_instance(
+        instance_name=instance_name,
+        session_id=thread_id,
+        transcript_path=transcript_path,
+        tool="codex",
+        hook="codex-notify",
+    )
 
 
 def resolve_instance_codex(

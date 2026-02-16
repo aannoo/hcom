@@ -97,19 +97,9 @@ def _normalize_tool(tool: str, *, pty: bool | None) -> LaunchTool:
     raise ValueError(f"Unknown tool: {tool}")
 
 
-def _default_max_count(tool: LaunchTool) -> int:
-    """Get maximum instance count for a tool.
-
-    Args:
-        tool: Normalized tool name
-
-    Returns:
-        Maximum allowed instance count (currently 100 for all tools)
-    """
-    # Arbitrary limit - all tools support up to 100
-    match tool:
-        case "claude" | "claude-pty" | "gemini" | "codex":
-            return 100
+def _default_max_count() -> int:
+    """Maximum instance count (all tools)."""
+    return 100
 
 
 def _default_tag() -> str:
@@ -151,21 +141,6 @@ def _resolve_launcher_name(explicit: str | None) -> str:
         return "api"
 
 
-def _is_inside_ai_tool() -> bool:
-    """Detect if running inside Claude Code, Gemini CLI, or Codex.
-
-    Used to determine terminal launch strategy:
-    - Inside AI tool: Always launch in new window (don't hijack AI session)
-    - Outside: May run in current terminal based on other factors
-
-    Returns:
-        True if CLAUDECODE=1, GEMINI_CLI=1, or Codex env vars present
-    """
-    from .shared import is_inside_ai_tool
-
-    return is_inside_ai_tool()
-
-
 def will_run_in_current_terminal(
     count: int,
     background: bool,
@@ -199,7 +174,9 @@ def will_run_in_current_terminal(
     # CRITICAL: AI tool check must come BEFORE shim check!
     # Shim env var is inherited by Claude instances; without this order,
     # agents would try to launch in current terminal (hijacking AI session).
-    if _is_inside_ai_tool():
+    from .shared import is_inside_ai_tool
+
+    if is_inside_ai_tool():
         return False  # Always new window when inside AI tool
     # Via shim: user typed 'claude' in their terminal, run there
     if os.environ.get("HCOM_VIA_SHIM"):
@@ -208,59 +185,6 @@ def will_run_in_current_terminal(
         return False  # Background mode never blocks terminal
     return count == 1  # Single instance runs in current terminal
 
-
-def _parse_codex_resume(args: list[str]) -> tuple[list[str], str | None, str | None]:
-    """Parse codex resume/fork subcommand to extract thread ID.
-
-    Codex supports resuming or forking previous sessions:
-        codex resume <thread-id>  - Resume existing thread
-        codex fork <thread-id>    - Fork from existing thread
-        codex --flags resume <id> - Flags can appear before subcommand
-
-    Currently requires explicit thread-id (no --last or interactive picker).
-    TODO: investigate if interactive picker could work via PTY.
-
-    Args:
-        args: Codex CLI arguments list
-
-    Returns:
-        Tuple of (args, thread_id, subcommand):
-        - args: Original args (unchanged)
-        - thread_id: Thread ID if resume subcommand found, None for fork or no subcommand
-        - subcommand: "resume" or "fork" if found, None otherwise
-
-    Raises:
-        ValueError: If resume/fork used without explicit thread-id or with --last
-    """
-    if not args:
-        return [], None, None
-
-    # Find "resume" or "fork" anywhere in args (may have flags before it)
-    subcommand_idx = None
-    subcommand = None
-    for subcmd in ("resume", "fork"):
-        try:
-            idx = args.index(subcmd)
-            subcommand_idx = idx
-            subcommand = subcmd
-            break
-        except ValueError:
-            continue
-
-    if subcommand_idx is None:
-        return args, None, None  # No resume/fork subcommand
-
-    # Need session_id after subcommand
-    if subcommand_idx + 1 >= len(args):
-        raise ValueError(f"'codex {subcommand}' requires explicit thread-id (interactive picker not supported)")
-
-    next_arg = args[subcommand_idx + 1]
-    if next_arg == "--last":
-        raise ValueError(f"'codex {subcommand} --last' not supported - use explicit thread-id")
-    if next_arg.startswith("-"):
-        raise ValueError(f"'codex {subcommand}' requires explicit thread-id (interactive picker not supported)")
-
-    return args, next_arg, subcommand
 
 
 def _get_system_prompt_path(tool: str) -> "Path":
@@ -313,33 +237,37 @@ def _write_system_prompt_file(system_prompt: str, tool: str) -> str:
     return str(filepath)
 
 
+def _verify_then_setup(
+    verify_fn, setup_fn, tool_label: str, include_permissions: bool
+) -> tuple[bool, str | None]:
+    """Verify hooks installed, auto-setup if needed. Returns (success, error_message)."""
+    hint = f"Run: hcom hooks add {tool_label}"
+    try:
+        if verify_fn(check_permissions=include_permissions):
+            return True, None
+    except Exception as e:
+        return False, f"Failed to verify {tool_label} hooks: {e}. {hint}"
+
+    try:
+        if setup_fn(include_permissions=include_permissions):
+            return True, None
+        return False, f"Failed to setup {tool_label} hooks. {hint}"
+    except Exception as e:
+        return False, f"Failed to setup {tool_label} hooks: {e}. {hint}"
+
+
 def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool, str | None]:
     """Verify hooks are installed, setup if needed. Returns (success, error_message).
 
-    This is the single source of truth for hook setup across all launch paths.
     Uses verify-first pattern: read-only check first, only write if needed.
-
-    STRICT: Never launch if hooks aren't installed. If verify fails and setup
-    fails (permission error, etc), return error - don't attempt launch.
+    STRICT: Never launch if hooks aren't installed.
     """
     if tool in ("claude", "claude-pty"):
         from .tools.claude.settings import verify_claude_hooks_installed, setup_claude_hooks
 
-        try:
-            if verify_claude_hooks_installed(check_permissions=include_permissions):
-                return True, None
-        except Exception as e:
-            return False, f"Failed to verify Claude hooks: {e}. Run: hcom hooks add claude"
+        return _verify_then_setup(verify_claude_hooks_installed, setup_claude_hooks, "claude", include_permissions)
 
-        # Not installed - try to setup
-        try:
-            if setup_claude_hooks(include_permissions=include_permissions):
-                return True, None
-            return False, "Failed to setup Claude hooks. Run: hcom hooks add claude"
-        except Exception as e:
-            return False, f"Failed to setup Claude hooks: {e}. Run: hcom hooks add claude"
-
-    elif tool == "gemini":
+    if tool == "gemini":
         from .tools.gemini.settings import (
             verify_gemini_hooks_installed,
             setup_gemini_hooks,
@@ -347,7 +275,6 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
             GEMINI_MIN_VERSION,
         )
 
-        # Version check (moved from callers)
         version = get_gemini_version()
         if version is not None and version < GEMINI_MIN_VERSION:
             min_str = ".".join(map(str, GEMINI_MIN_VERSION))
@@ -357,36 +284,12 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
                 f"Gemini CLI {cur_str} is too old (requires {min_str}+). Update: npm i -g @google/gemini-cli@latest",
             )
 
-        try:
-            if verify_gemini_hooks_installed(check_permissions=include_permissions):
-                return True, None
-        except Exception as e:
-            return False, f"Failed to verify Gemini hooks: {e}. Run: hcom hooks add gemini"
+        return _verify_then_setup(verify_gemini_hooks_installed, setup_gemini_hooks, "gemini", include_permissions)
 
-        # Not installed - try to setup
-        try:
-            if setup_gemini_hooks(include_permissions=include_permissions):
-                return True, None
-            return False, "Failed to setup Gemini hooks. Run: hcom hooks add gemini"
-        except Exception as e:
-            return False, f"Failed to setup Gemini hooks: {e}. Run: hcom hooks add gemini"
-
-    elif tool == "codex":
+    if tool == "codex":
         from .tools.codex.settings import verify_codex_hooks_installed, setup_codex_hooks
 
-        try:
-            if verify_codex_hooks_installed(check_permissions=include_permissions):
-                return True, None
-        except Exception as e:
-            return False, f"Failed to verify Codex hooks: {e}. Run: hcom hooks add codex"
-
-        # Not installed - try to setup
-        try:
-            if setup_codex_hooks(include_permissions=include_permissions):
-                return True, None
-            return False, "Failed to setup Codex hooks. Run: hcom hooks add codex"
-        except Exception as e:
-            return False, f"Failed to setup Codex hooks: {e}. Run: hcom hooks add codex"
+        return _verify_then_setup(verify_codex_hooks_installed, setup_codex_hooks, "codex", include_permissions)
 
     return True, None  # Unknown tool - don't block
 
@@ -466,7 +369,7 @@ def launch(
         - Background mode only supported for Claude currently
         - Each instance gets a unique 4-char CVCV name (e.g., "luna")
     """
-    import os
+    import json
     import uuid
     from .shared import (
         HcomError,
@@ -501,7 +404,7 @@ def launch(
     if count <= 0:
         raise HcomError("Count must be positive")
 
-    max_count = _default_max_count(normalized)
+    max_count = _default_max_count()
     if count > max_count:
         raise HcomError(f"Too many {normalized} instances requested (max {max_count})")
 
@@ -560,15 +463,6 @@ def launch(
             if effective_tag:
                 base_env["HCOM_TAG"] = effective_tag
 
-    codex_args: list[str] | None = None
-    codex_resume_thread_id: str | None = None
-    codex_subcommand: str | None = None
-    if normalized == "codex":
-        codex_args, codex_resume_thread_id, codex_subcommand = _parse_codex_resume(args)
-        if codex_subcommand == "fork":
-            codex_resume_thread_id = None
-        if codex_resume_thread_id and count > 1:
-            raise HcomError(f"Cannot resume the same thread-id with multiple instances (count={count})")
 
     # Explicit name validation (used for resume to reuse stopped instance's name)
     if name is not None:
@@ -599,7 +493,7 @@ def launch(
         elif normalized == "codex":
             from .tools.codex.args import resolve_codex_args, validate_conflicts as validate_codex_conflicts
 
-            codex_spec = resolve_codex_args(codex_args or args, None)
+            codex_spec = resolve_codex_args(args, None)
             validation_errors = list(codex_spec.errors or ())
             # Check for exec mode rejection and other conflicts
             validation_errors.extend(validate_codex_conflicts(codex_spec))
@@ -617,13 +511,11 @@ def launch(
             base_env["GEMINI_SYSTEM_MD"] = system_prompt_file
         # Codex uses -c flag, handled in launch call
 
-    import uuid
     from .core.instances import (
         generate_unique_name,
         initialize_instance_in_position_file,
         update_instance_position,
     )
-    import json
     from .core.db import set_process_binding, delete_process_binding
     from .core.db import delete_instance
 
@@ -855,7 +747,7 @@ def launch(
                         pass
 
                     # Build base args (system_prompt first if provided, will be merged with bootstrap)
-                    effective_codex_args = list(codex_args or args or [])
+                    effective_codex_args = list(args or [])
                     if system_prompt:
                         effective_codex_args = [
                             "-c",
@@ -881,24 +773,12 @@ def launch(
 
                     effective_run_here = will_run_in_current_terminal(count, False, run_here)
 
-                    # Handle resume binding before launch (so native PTY uses correct name)
-                    effective_instance_name = instance_name
-                    if codex_resume_thread_id:
-                        try:
-                            from .core.instances import bind_session_to_process
-                            canonical = bind_session_to_process(codex_resume_thread_id, process_id)
-                            if canonical:
-                                effective_instance_name = canonical
-                                instance_env["HCOM_INSTANCE_NAME"] = canonical
-                        except Exception:
-                            pass  # Non-fatal, continue with launch
-
                     instance_env["HCOM_CODEX_SANDBOX_MODE"] = sandbox_mode
                     pty_result = launch_pty(
                         "codex",
                         working_dir,
                         instance_env,
-                        effective_instance_name,
+                        instance_name,
                         effective_codex_args,
                         run_here=effective_run_here,
                     )
@@ -907,7 +787,7 @@ def launch(
                         handles.append(
                             {
                                 "tool": "codex",
-                                "instance_name": effective_instance_name,
+                                "instance_name": instance_name,
                             }
                         )
                     else:

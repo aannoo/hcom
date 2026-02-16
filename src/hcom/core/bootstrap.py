@@ -43,15 +43,15 @@ Routing:
 
 You MUST use `hcom <cmd> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- <"message text"> (or --stdin, --file <path>, --base64 <string>)
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
 - See who's active: list [-v] [--json]
 - Read another's conversation: transcript [name] [--range N-M] [--last N] [--full]
 - See history (filter by agent, commands ran, files touched, status, msgs, sql): events --help
-- Get notified when anything in hcom happens (same filters): events sub --help
-- Handoff context: bundle prepare → send with --title
+- Event-based notifications, watch other agents, subscribe, react: events sub
+- Handoff context: bundle prepare
 - Spawn agents: [HCOM_TAG=label-or-group] hcom [num] <claude|gemini|codex>
-  Example: `HCOM_TAG=reviewer hcom 1 claude` -> automatic <hcom> notify when ready -> send task to agent via hcom message
+  Example: `HCOM_TAG=coolguy hcom 1 claude` -> automatic <hcom> msg when ready -> send task to agent via hcom message
   Resume/fork agents, background, tmux, set prompt, system, forward args: hcom <claude|gemini|codex> --help
 - Run workflows: run <script> [args] [--help]
   {scripts}
@@ -64,7 +64,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 1. Task via hcom → ack immediately, do work, report via hcom
 2. No filler messages (greetings, thanks, congratulations).
-3. Use --intent on sends: request (want reply), inform (FYI), ack (responding).
+3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
 4. User says "the gemini/claude/codex agent" or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
@@ -78,7 +78,7 @@ You are tagged "{tag}". Message your group: send @{tag}- -- msg
 """
 
 RELAY_NOTICE = """
-Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote.
+Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE.
 """
 
 HEADLESS_NOTICE = """
@@ -100,24 +100,24 @@ Messages instantly and automatically arrive via <hcom> tags — end your turn to
 
 1. Never use `sleep [sec]` instead use `hcom listen [sec]`
 2. Only use `hcom listen` when you are waiting for something not related to hcom
-- Waiting for hcom message → end your turn                                                                                                  
-- Waiting for agent progress → `hcom events sub`                                                                                                   
+- Waiting for hcom message → end your turn
+- Waiting for agent progress → `hcom events sub`, subscribe, end your turn
 """
 
 DELIVERY_CODEX_HCOM_LAUNCHED = """
 ## DELIVERY
 
-New message notifications instantly auto-arrive via <hcom> tags - end your turn to receive them.
+New message notifications instantly and automatically arrive via <hcom> tags - end your turn to receive them.
 IMPORTANT: <hcom> tags = run `hcom listen 1 --name {instance_name}` IMMEDIATELY to read message.
 
 ## WAITING RULES
 
-Never use `sleep`
-
-- For hcom message waiting: end your turn. (do not preemptively run `hcom listen`)
-- For hcom event/other agent progress waiting: use `hcom events sub --help` and subscribe.
-- For non-hcom pause/yield, use `hcom listen` instead of `sleep`
-
+1. Never use `sleep`
+2. If you need a pure time-based pause (not waiting on hcom activity):
+- use `hcom listen [sec]` instead of `sleep [sec]`
+3. If you are waiting on hcom activity, DO NOT use any sleep, listen, polling or blocking. instead:
+- Waiting for hcom message → end your turn immediately
+- Waiting for agent progress → `hcom events sub`, subscribe, end your turn immediately
 """
 
 DELIVERY_ADHOC = """

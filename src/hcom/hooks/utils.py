@@ -23,14 +23,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..core.hcom_context import HcomContext
-import sys
 
 from ..core.paths import hcom_path, LOGS_DIR
 from ..core.log import log_info
 from ..core.bootstrap import get_bootstrap
-
-# Platform detection
-IS_WINDOWS = sys.platform == "win32"
 
 
 def find_last_bind_marker(transcript_path: str) -> str | None:
