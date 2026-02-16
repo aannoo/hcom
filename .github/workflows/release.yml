@@ -118,6 +118,6 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           # Create release if it doesn't exist
-          gh release view "$TAG" || gh release create "$TAG" --title "$TAG" --notes "Release $TAG"
+          gh release view "$TAG" -R aannoo/hcom || gh release create "$TAG" -R aannoo/hcom --title "$TAG" --notes "Release $TAG"
           # Upload Android wheel
-          gh release upload "$TAG" android-dist/*.whl --clobber
+          gh release upload "$TAG" -R aannoo/hcom android-dist/*.whl --clobber
