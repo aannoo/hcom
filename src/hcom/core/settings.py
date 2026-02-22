@@ -7,12 +7,14 @@ is not an error.
 
 from __future__ import annotations
 
+import threading
 import tomllib
 from pathlib import Path
 
 from .paths import hcom_path, CONFIG_TOML
 
 _settings_cache: dict | None = None
+_settings_lock = threading.Lock()
 
 
 def load_settings() -> dict:
@@ -21,22 +23,27 @@ def load_settings() -> dict:
     if _settings_cache is not None:
         return _settings_cache
 
-    path = Path(hcom_path(CONFIG_TOML))
-    if not path.exists():
-        _settings_cache = {}
-        return _settings_cache
+    with _settings_lock:
+        if _settings_cache is not None:
+            return _settings_cache
 
-    try:
-        data = tomllib.loads(path.read_text())
-        _settings_cache = data.get("terminal", {})
-    except Exception:
-        _settings_cache = {}
-    return _settings_cache
+        path = Path(hcom_path(CONFIG_TOML))
+        if not path.exists():
+            _settings_cache = {}
+            return _settings_cache
+
+        try:
+            data = tomllib.loads(path.read_text())
+            _settings_cache = data.get("terminal", {})
+        except Exception:
+            _settings_cache = {}
+        return _settings_cache
 
 
 def invalidate_settings_cache() -> None:
     global _settings_cache
-    _settings_cache = None
+    with _settings_lock:
+        _settings_cache = None
 
 
 def get_merged_presets() -> dict[str, dict]:

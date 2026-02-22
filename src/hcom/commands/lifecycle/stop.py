@@ -14,7 +14,6 @@ from ...shared import (
     is_inside_ai_tool,
     CommandContext,
 )
-from ...core.thread_context import get_hcom_go
 from ...core.instances import (
     get_full_name,
     load_instance_position,
@@ -64,8 +63,8 @@ What happens:
 
 Instance data preserved in events table (life.stopped with snapshot).
 
-Set HCOM_GO=1 and run again to proceed:
-  HCOM_GO=1 {hcom_cmd} stop all
+Add --go flag and run again to proceed:
+  {hcom_cmd} --go stop all
 """)
     elif target == "multi":
         # Multiple explicit targets
@@ -85,8 +84,8 @@ What happens:
 
 Instance data preserved in events table (life.stopped with snapshot).
 
-Set HCOM_GO=1 and run again to proceed:
-  HCOM_GO=1 {hcom_cmd} stop {cmd_targets}
+Add --go flag and run again to proceed:
+  {hcom_cmd} --go stop {cmd_targets}
 """)
     elif target.startswith("tag:"):
         # tag:name target
@@ -106,8 +105,8 @@ What happens:
 
 Instance data preserved in events table (life.stopped with snapshot).
 
-Set HCOM_GO=1 and run again to proceed:
-  HCOM_GO=1 {hcom_cmd} stop tag:{tag}
+Add --go flag and run again to proceed:
+  {hcom_cmd} --go stop tag:{tag}
 """)
 
 
@@ -153,8 +152,8 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             print("Nothing to stop")
             return 0
 
-        # Confirmation gate: inside AI tools, require HCOM_GO=1
-        if is_inside_ai_tool() and not get_hcom_go():
+        # Confirmation gate: inside AI tools, require --go
+        if is_inside_ai_tool() and not (ctx and ctx.go):
             _print_stop_preview("all", instances)
             return 0
 
@@ -207,8 +206,8 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         if not tag_matches:
             raise CLIError(f"No instances with tag '{tag}'")
 
-        # Confirmation gate: inside AI tools, require HCOM_GO=1
-        if is_inside_ai_tool() and not get_hcom_go():
+        # Confirmation gate: inside AI tools, require --go
+        if is_inside_ai_tool() and not (ctx and ctx.go):
             _print_stop_preview(f"tag:{tag}", tag_matches)
             return 0
 
@@ -259,8 +258,8 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         if not_found:
             raise CLIError(f"Instance{'s' if len(not_found) > 1 else ''} not found: {', '.join(not_found)}")
 
-        # Confirmation gate: inside AI tools, require HCOM_GO=1
-        if is_inside_ai_tool() and not get_hcom_go():
+        # Confirmation gate: inside AI tools, require --go
+        if is_inside_ai_tool() and not (ctx and ctx.go):
             _print_stop_preview("multi", instances_to_stop, targets)
             return 0
 
@@ -457,6 +456,7 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         else:
             print(f"Sent SIGTERM to process group {pid} for '{show}'{pane_info}")
         stop_instance(name, initiated_by=initiator, reason="killed")
+        print(f"  To resume: hcom r {name}")
         return True
 
     # Handle 'all' target
@@ -558,9 +558,12 @@ def cmd_kill(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Not an active instance — check orphan processes (stopped but still running)
     from ...core.pidtrack import get_orphan_processes, remove_pid
 
+    # Check if target is a PID number (TUI sends kill by PID for orphans)
+    target_pid = int(target) if target.isdigit() else None
+
     orphans = get_orphan_processes()
     for orphan in orphans:
-        if target in orphan.get("names", []):
+        if target in orphan.get("names", []) or (target_pid and orphan["pid"] == target_pid):
             pid = orphan["pid"]
             from ...terminal import KillResult, kill_process
             o_preset = orphan.get("terminal_preset", "")

@@ -5,129 +5,9 @@ CLI tool for launching multiple AI terminals (Claude Code, Gemini, Codex) with
 interactive subagents, headless persistence, and real-time communication via hooks
 """
 
-import os
 import sqlite3
 import sys
 from collections.abc import Callable
-
-# ==================== Shim Detection (argv[0]) ====================
-# If invoked as 'claude', 'gemini', or 'codex' (via symlink), rewrite argv.
-# This enables `hcom shim install` to create symlinks that transparently wrap tools.
-#
-# BLACKLIST APPROACH: Only intercept session-starting invocations.
-# Admin/config subcommands pass through to real binary (future-proof).
-_SHIM_TOOLS = frozenset({"claude", "gemini", "codex"})
-
-# Per-tool admin subcommands that should passthrough.
-# NOTE: Duplicated from tools/*/args.py for performance (avoid import latency in hook path).
-# Must be kept in sync with _SUBCOMMANDS in respective args.py files.
-_SHIM_ADMIN_SUBCOMMANDS = {
-    "claude": {"doctor", "mcp", "update", "install", "plugin", "setup-token"},
-    "gemini": {"mcp", "extensions", "extension", "hooks", "hook"},
-    "codex": {
-        "mcp",
-        "mcp-server",
-        "app-server",
-        "login",
-        "logout",
-        "completion",
-        "sandbox",
-        "debug",
-        "apply",
-        "a",
-        "cloud",
-        "features",
-        "help",
-        # Note: "resume" is interactive (resumes session in PTY), so NOT in admin list
-        "review",  # review might be interactive too but keeping for now
-    },
-}
-
-# Admin flags that should passthrough (all tools)
-_SHIM_ADMIN_FLAGS = frozenset(
-    {
-        "--version",
-        "-v",
-        "--help",
-        "-h",
-        "--list-extensions",
-        "-l",
-        "--list-sessions",
-        "--delete-session",  # Gemini
-    }
-)
-
-# Note: Daemon imports cli.py but won't trigger this block - daemon's argv[0] is
-# "hcom-daemon" or similar, not in _SHIM_TOOLS. Only direct claude/gemini/codex
-# invocations (via symlink) enter here.
-_invoked_as = os.path.basename(sys.argv[0]) if sys.argv else ""
-if _invoked_as in _SHIM_TOOLS:
-    import shutil
-
-    _shim_dir = str(os.path.dirname(sys.argv[0]))
-    _first_arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    _first_arg_lower = _first_arg.lower()
-
-    def _find_real_binary(tool: str) -> str | None:
-        """Find real binary by excluding shim directory from PATH."""
-        # Normalize shim_dir (resolve symlinks, remove trailing slash)
-        _norm_shim = os.path.realpath(_shim_dir).rstrip("/")
-        _path_parts = os.environ.get("PATH", "").split(":")
-        # Exclude any path that resolves to shim dir
-        _clean_path = ":".join(p for p in _path_parts if os.path.realpath(p).rstrip("/") != _norm_shim)
-        _old_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = _clean_path
-        _real = shutil.which(tool)
-        os.environ["PATH"] = _old_path
-        return _real
-
-    def _passthrough() -> None:
-        """Pass through to real binary."""
-        _real = _find_real_binary(_invoked_as)
-        if _real:
-            os.execv(_real, [_real] + sys.argv[1:])
-        else:
-            print(f"Error: Real {_invoked_as} binary not found in PATH", file=sys.stderr)
-            sys.exit(1)
-
-    def _should_passthrough() -> bool:
-        """Check if invocation should passthrough to real binary.
-
-        Passthrough (real binary): admin/config commands
-        Intercept (hcom wrap): session-starting invocations
-        """
-        if not _first_arg:
-            return False  # No args = interactive session → intercept
-
-        # Admin flags (--version, --help, etc.)
-        if _first_arg in _SHIM_ADMIN_FLAGS or _first_arg_lower in _SHIM_ADMIN_FLAGS:
-            return True
-
-        # Tool-specific admin subcommands
-        admin_cmds = _SHIM_ADMIN_SUBCOMMANDS.get(_invoked_as, set())
-        if _first_arg_lower in admin_cmds:
-            return True
-
-        # Session-starting flags like --model, --resume, --continue should be intercepted
-        # Only specific admin flags passthrough (already checked in _SHIM_ADMIN_FLAGS)
-        return False  # Session-starting → intercept
-
-    # Recursion guard: if HCOM_VIA_SHIM is set, we're being called from
-    # a child process (e.g., PTY wrapper running 'claude'). Pass through to real binary.
-    # Note: This guard is INSIDE `if _invoked_as in _SHIM_TOOLS:` block, so it only triggers
-    # when invoked as claude/gemini/codex. Running `hcom send` won't hit this because
-    # _invoked_as='hcom' skips the entire block.
-    if os.environ.get("HCOM_VIA_SHIM"):
-        _passthrough()
-
-    # Check if should passthrough to real binary
-    if _should_passthrough():
-        _passthrough()
-
-    # Intercept: mark with guard, bypass preview, rewrite args
-    os.environ["HCOM_VIA_SHIM"] = "1"
-    os.environ["HCOM_GO"] = "1"
-    sys.argv = ["hcom", _invoked_as] + sys.argv[1:]
 
 # ==================== Early Hook Routing ====================
 # Gate and route hooks BEFORE heavy imports to save ~90ms for non-participants.
@@ -155,6 +35,14 @@ _GEMINI_HOOKS = frozenset(
         "gemini-aftertool",
         "gemini-notification",
         "gemini-sessionend",
+    }
+)
+_OPENCODE_HOOKS = frozenset(
+    {
+        "opencode-start",
+        "opencode-status",
+        "opencode-read",
+        "opencode-stop",
     }
 )
 
@@ -199,7 +87,7 @@ def _route_hook_early() -> bool:
     cmd = sys.argv[1]
 
     # Check if it's a hook command
-    is_hook = cmd in _CLAUDE_HOOKS or cmd in _GEMINI_HOOKS or cmd == "codex-notify"
+    is_hook = cmd in _CLAUDE_HOOKS or cmd in _GEMINI_HOOKS or cmd == "codex-notify" or cmd in _OPENCODE_HOOKS
     if not is_hook:
         return False
 
@@ -222,6 +110,11 @@ def _route_hook_early() -> bool:
         from .tools.codex.hooks import handle_codex_hook
 
         handle_codex_hook(cmd)
+        sys.exit(0)
+    elif cmd in _OPENCODE_HOOKS:
+        from .tools.opencode.hooks import handle_opencode_hook
+
+        handle_opencode_hook(cmd)
         sys.exit(0)
     return False
 
@@ -279,6 +172,15 @@ def _extract_name_flag(argv: list[str]) -> tuple[list[str], str | None]:
     return argv, name_value
 
 
+def _extract_go_flag(argv: list[str]) -> tuple[list[str], bool]:
+    """Extract and strip global --go flag (confirmation bypass)."""
+    if "--go" not in argv:
+        return argv, False
+    argv = argv.copy()
+    argv.remove("--go")
+    return argv, True
+
+
 def _find_command(argv: list[str]) -> str | None:
     """Find command name in argv, skipping identity flags but returning global flags.
 
@@ -295,6 +197,8 @@ def _find_command(argv: list[str]) -> str | None:
             return arg  # Return global flag as command
         elif arg == "--name" and i + 1 < len(argv):
             i += 2  # skip --name and its value
+        elif arg == "--go":
+            i += 1  # skip --go (boolean flag, no value)
         elif arg.startswith("-"):
             return None  # Unknown flag before command - let main() handle
         else:
@@ -369,7 +273,6 @@ from .commands import (
     cmd_transcript,
     cmd_archive,
     cmd_status,
-    cmd_shim,
     cmd_hooks,
     cmd_bundle,
     cmd_term,
@@ -389,7 +292,7 @@ def cmd_run(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     return run_script(argv)
 
 
-def _build_ctx_for_command(cmd: str | None, *, explicit_name: str | None) -> CommandContext:
+def _build_ctx_for_command(cmd: str | None, *, explicit_name: str | None, go: bool = False) -> CommandContext:
     """Build a CommandContext for this invocation (best-effort identity resolution).
 
     `start` is special: it may be invoked with `--name <agent_id>` before the
@@ -407,7 +310,7 @@ def _build_ctx_for_command(cmd: str | None, *, explicit_name: str | None) -> Com
             identity = resolve_identity()
         except Exception:
             identity = None
-    return CommandContext(explicit_name=explicit_name, identity=identity)
+    return CommandContext(explicit_name=explicit_name, identity=identity, go=go)
 
 
 # Command dispatch table — maps command name to handler function.
@@ -429,7 +332,6 @@ _COMMAND_HANDLERS: dict[str, Callable[..., int]] = {
     "archive": cmd_archive,
     "run": cmd_run,
     "status": cmd_status,
-    "shim": cmd_shim,
     "hooks": cmd_hooks,
     "term": cmd_term,
 }
@@ -747,7 +649,7 @@ def _dispatch(cmd: str | None, argv: list[str], ctx: CommandContext | None) -> i
         # Normalize shorthands: hcom gemini → hcom 1 gemini, hcom codex → hcom 1 codex
         from .shared import RELEASED_TOOLS
 
-        if cmd in ("gemini", "codex") and cmd in RELEASED_TOOLS:
+        if cmd in ("gemini", "codex", "opencode") and cmd in RELEASED_TOOLS:
             argv = ["1"] + argv
             cmd = "1"  # Now it's a numeric launch
 
@@ -871,6 +773,9 @@ def main(argv: list[str] | None = None) -> int | None:
             if argv[i] == "--name" and i + 1 < len(argv):
                 i += 2
                 continue
+            if argv[i] == "--go":
+                i += 1
+                continue
             if argv[i].startswith("-"):
                 unexpected_flag = argv[i]
                 break
@@ -887,11 +792,13 @@ def main(argv: list[str] | None = None) -> int | None:
     version_requested = cmd in ("--version", "-v")
 
     explicit_name: str | None = None
+    go: bool = False
     ctx: CommandContext | None = None
     if not (help_requested or version_requested):
         try:
             argv, explicit_name = _extract_name_flag(argv)
-            ctx = _build_ctx_for_command(cmd, explicit_name=explicit_name)
+            argv, go = _extract_go_flag(argv)
+            ctx = _build_ctx_for_command(cmd, explicit_name=explicit_name, go=go)
         except (CLIError, HcomError) as exc:
             print(format_error(str(exc)), file=sys.stderr)
             return 1

@@ -42,7 +42,7 @@ SAFE_HCOM_COMMANDS = [
 ]
 
 # Tools that support --help/-h flags (for auto-approval of help commands)
-HCOM_TOOL_NAMES = ["claude", "gemini", "codex"]
+HCOM_TOOL_NAMES = ["claude", "gemini", "codex", "opencode"]
 
 
 def _get_hcom_prefix() -> str:
@@ -306,48 +306,73 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
     from .log import log_info, log_warn
     if pid and not is_headless:
         try:
-            os.kill(pid, 0)  # Check alive
-            from .pidtrack import record_pid
-
-            # Extract terminal info from launch_context for close-on-kill
-            proc_id = ""
-            terminal_preset = ""
-            pane_id = ""
-            terminal_id = ""
-            kitty_listen_on = ""
+            pid_exists = True
             try:
-                import json as _json
-                lc = instance_data.get("launch_context", "")
-                if lc:
-                    lc_data = _json.loads(lc)
-                    terminal_preset = lc_data.get("terminal_preset", "")
-                    pane_id = lc_data.get("pane_id", "")
-                    proc_id = lc_data.get("process_id", "")
-                    terminal_id = lc_data.get("terminal_id", "")
-                    lc_env = lc_data.get("env", {})
-                    kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
-            except (json.JSONDecodeError, KeyError):
-                pass
-            # Fallback: process_bindings table (if process_id not in launch_context)
-            if not proc_id:
+                os.kill(pid, 0)  # Probe liveness/visibility
+            except ProcessLookupError:
+                pid_exists = False
+            except PermissionError:
+                # Process exists but is not signalable by this user/session.
+                # Still track it as orphan so users can see/recover/attempt kill later.
+                pid_exists = True
+
+            if pid_exists:
+                from .pidtrack import record_pid
+
+                # Extract terminal info from launch_context for close-on-kill
+                proc_id = ""
+                terminal_preset = ""
+                pane_id = ""
+                terminal_id = ""
+                kitty_listen_on = ""
                 try:
-                    from .db import get_db as _get_db
-                    row = _get_db().execute(
-                        "SELECT process_id FROM process_bindings WHERE instance_name = ?",
+                    import json as _json
+                    lc = instance_data.get("launch_context", "")
+                    if lc:
+                        lc_data = _json.loads(lc)
+                        terminal_preset = lc_data.get("terminal_preset", "")
+                        pane_id = lc_data.get("pane_id", "")
+                        proc_id = lc_data.get("process_id", "")
+                        terminal_id = lc_data.get("terminal_id", "")
+                        lc_env = lc_data.get("env", {})
+                        kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                # Fallback: process_bindings table (if process_id not in launch_context)
+                if not proc_id:
+                    try:
+                        from .db import get_db as _get_db
+                        row = _get_db().execute(
+                            "SELECT process_id FROM process_bindings WHERE instance_name = ?",
+                            (instance_name,),
+                        ).fetchone()
+                        if row:
+                            proc_id = row["process_id"]
+                    except Exception:
+                        pass
+                # Grab notify ports before DB cleanup deletes them
+                _notify_port = 0
+                _inject_port = 0
+                try:
+                    from .db import list_notify_ports, get_db as _get_db2
+                    for ep in _get_db2().execute(
+                        "SELECT kind, port FROM notify_endpoints WHERE instance = ?",
                         (instance_name,),
-                    ).fetchone()
-                    if row:
-                        proc_id = row["process_id"]
+                    ).fetchall():
+                        if ep["kind"] == "pty":
+                            _notify_port = int(ep["port"])
+                        elif ep["kind"] == "inject":
+                            _inject_port = int(ep["port"])
                 except Exception:
                     pass
-            record_pid(pid, instance_data.get("tool", "claude"), instance_name,
-                       instance_data.get("directory", ""), process_id=proc_id,
-                       terminal_preset=terminal_preset, pane_id=pane_id,
-                       terminal_id=terminal_id, kitty_listen_on=kitty_listen_on)
-            log_info("stop", "pidtrack_recorded", pid=pid, instance=instance_name,
-                     preset=terminal_preset, pane_id=pane_id)
-        except (ProcessLookupError, PermissionError):
-            pass  # Dead or not signallable — can't kill later, no point tracking
+                record_pid(pid, instance_data.get("tool", "claude"), instance_name,
+                           instance_data.get("directory", ""), process_id=proc_id,
+                           terminal_preset=terminal_preset, pane_id=pane_id,
+                           terminal_id=terminal_id, kitty_listen_on=kitty_listen_on,
+                           session_id=instance_data.get("session_id", ""),
+                           notify_port=_notify_port, inject_port=_inject_port)
+                log_info("stop", "pidtrack_recorded", pid=pid, instance=instance_name,
+                         preset=terminal_preset, pane_id=pane_id)
         except Exception as e:
             log_warn("stop", "pidtrack_error", pid=pid, instance=instance_name, error=str(e))
 
@@ -448,7 +473,7 @@ def create_orphaned_pty_identity(session_id: str, process_id: str, tool: str = "
     Args:
         session_id: The new session's ID
         process_id: HCOM_PROCESS_ID from environment
-        tool: Tool type (claude, gemini, codex)
+        tool: Tool type (claude, gemini, codex, opencode)
 
     Returns:
         New instance name if created, None on failure
@@ -476,6 +501,28 @@ def create_orphaned_pty_identity(session_id: str, process_id: str, tool: str = "
         set_process_binding(process_id, session_id, instance_name)
         rebind_session(session_id, instance_name)
 
+        # Restore PID and notify/inject endpoints from pidtrack.
+        # stop_instance saved these before deleting the old instance.
+        # Without this, the PTY delivery thread can't find the new instance
+        # (heartbeats fail → stale, no notify port → messages undeliverable).
+        from .pidtrack import get_orphan_processes, record_pid
+        from .db import upsert_notify_endpoint
+        from .instances import update_instance_position
+        notify_port = 0
+        for orphan in get_orphan_processes():
+            if orphan.get("process_id") == process_id:
+                pid = orphan["pid"]
+                notify_port = orphan.get("notify_port", 0)
+                inject_port = orphan.get("inject_port", 0)
+                update_instance_position(instance_name, {"pid": pid})
+                if notify_port:
+                    upsert_notify_endpoint(instance_name, "pty", int(notify_port))
+                if inject_port:
+                    upsert_notify_endpoint(instance_name, "inject", int(inject_port))
+                record_pid(pid, tool, instance_name, process_id=process_id,
+                           notify_port=notify_port, inject_port=inject_port)
+                break
+
         # Capture launch context
         capture_and_store_launch_context(instance_name)
 
@@ -487,6 +534,12 @@ def create_orphaned_pty_identity(session_id: str, process_id: str, tool: str = "
         )
 
         set_status(instance_name, ST_LISTENING, "start")
+
+        # Wake the PTY delivery thread so it discovers the new binding
+        # via get_process_binding() instead of waiting 30s idle timeout.
+        if notify_port:
+            from .runtime import _send_notify_to_ports
+            _send_notify_to_ports([notify_port])
 
         log_info(
             "hooks",

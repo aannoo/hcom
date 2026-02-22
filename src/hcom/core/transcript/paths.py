@@ -1,4 +1,4 @@
-"""Transcript path discovery for Claude, Gemini, and Codex."""
+"""Transcript path discovery for Claude, Gemini, Codex, and OpenCode."""
 
 from __future__ import annotations
 
@@ -55,6 +55,19 @@ def derive_gemini_transcript_path(session_id: str | None) -> str | None:
     except Exception:
         pass
 
+    return None
+
+
+def get_opencode_db_path() -> str | None:
+    """Get path to OpenCode's SQLite database.
+
+    OpenCode uses XDG_DATA_HOME/opencode/opencode.db.
+    Default XDG_DATA_HOME is ~/.local/share on Linux/macOS.
+    """
+    xdg_data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    db_path = Path(xdg_data) / "opencode" / "opencode.db"
+    if db_path.exists():
+        return str(db_path)
     return None
 
 

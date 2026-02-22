@@ -9,12 +9,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::log::{log_info, log_warn};
+use crate::log::{log_error, log_info, log_warn};
 
 use super::connection::connect_with_timeout;
 use super::protocol::{
-    build_request, parse_listen_timeout, try_send, DaemonError, Response,
-    ARGV_HOOKS, BLOCKING_HOOKS, LAUNCH_TOOLS, STDIN_HOOKS,
+    ARGV_HOOKS, BLOCKING_HOOKS, DaemonError, LAUNCH_TOOLS, Response, STDIN_HOOKS, build_request,
+    parse_listen_timeout, try_send,
 };
 
 /// Client version from Cargo.toml - used to detect daemon version mismatch
@@ -40,12 +40,18 @@ const DAEMON_SHUTDOWN_MAX_POLLS: u32 = 100; // 50ms * 100 = 5s total
 /// - count>1 opens new windows anyway, no benefit from daemon
 /// - Launches aren't performance-critical (happen once, spawn terminals)
 fn is_launch_command(args: &[String]) -> bool {
-    // Skip --name <value> prefix so we inspect the actual command
-    let args = if args.len() >= 2 && args[0] == "--name" {
-        &args[2..]
-    } else {
-        args
-    };
+    // Skip global flags in any order (--name <value>, --go) so we inspect the actual command
+    let mut start = 0;
+    while start < args.len() {
+        if args[start] == "--go" {
+            start += 1;
+        } else if args[start] == "--name" && start + 1 < args.len() {
+            start += 2;
+        } else {
+            break;
+        }
+    }
+    let args = &args[start..];
 
     let first = match args.first() {
         Some(s) => s.as_str(),
@@ -73,19 +79,26 @@ pub fn run(args: &[String]) -> Result<()> {
     let is_hook = STDIN_HOOKS.contains(&cmd) || ARGV_HOOKS.contains(&cmd);
     let is_pty_mode = Config::get().pty_mode;
 
-    log_info("client", "run.start", &format!(
-        "cmd={} args_count={} pty_mode={}",
-        cmd, args.len(), is_pty_mode
-    ));
+    log_info(
+        "client",
+        "run.start",
+        &format!(
+            "cmd={} args_count={} pty_mode={}",
+            cmd,
+            args.len(),
+            is_pty_mode
+        ),
+    );
 
     // Blocking hooks can run for hours in vanilla mode (wait_timeout=86400).
     // Skip daemon for these - use Python directly to avoid timeout complexity.
     // Exception: PTY mode (HCOM_PTY_MODE=1) where poll exits immediately.
     if BLOCKING_HOOKS.contains(&cmd) && !is_pty_mode {
-        log_info("client", "run.fallback", &format!(
-            "reason=blocking_hook cmd={} pty_mode={}",
-            cmd, is_pty_mode
-        ));
+        log_info(
+            "client",
+            "run.fallback",
+            &format!("reason=blocking_hook cmd={} pty_mode={}", cmd, is_pty_mode),
+        );
         exec_python_fallback(args);
     }
 
@@ -94,10 +107,11 @@ pub fn run(args: &[String]) -> Result<()> {
     if cmd == "listen" {
         let timeout = parse_listen_timeout(args);
         if timeout > 29 * 60 {
-            log_info("client", "run.fallback", &format!(
-                "reason=long_listen timeout={}",
-                timeout
-            ));
+            log_info(
+                "client",
+                "run.fallback",
+                &format!("reason=long_listen timeout={}", timeout),
+            );
             exec_python_fallback(args);
         }
     }
@@ -120,7 +134,11 @@ pub fn run(args: &[String]) -> Result<()> {
     if args.first().map(|s| s.as_str()) == Some("daemon") {
         if let Some(subcmd) = args.get(1).map(|s| s.as_str()) {
             if subcmd == "stop" || subcmd == "restart" {
-                log_info("client", "run.fallback", &format!("reason=daemon_{}", subcmd));
+                log_info(
+                    "client",
+                    "run.fallback",
+                    &format!("reason=daemon_{}", subcmd),
+                );
                 exec_python_fallback(args);
             }
         }
@@ -133,28 +151,47 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let sock_path = get_socket_path();
 
-    log_info("client", "run.request", &format!(
-        "request_id={} kind={} build={:.1}ms",
-        request_id, request.kind, build_ms
-    ));
+    log_info(
+        "client",
+        "run.request",
+        &format!(
+            "request_id={} kind={} build={:.1}ms",
+            request_id, request.kind, build_ms
+        ),
+    );
 
     match try_daemon(&sock_path, &request) {
         Ok(response) => {
             let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.success", &format!(
-                "request_id={} total={:.1}ms exit_code={} stdout_len={} stderr_len={}",
-                request_id, total_ms, response.exit_code, response.stdout.len(), response.stderr.len()
-            ));
+            log_info(
+                "client",
+                "run.success",
+                &format!(
+                    "request_id={} total={:.1}ms exit_code={} stdout_len={} stderr_len={}",
+                    request_id,
+                    total_ms,
+                    response.exit_code,
+                    response.stdout.len(),
+                    response.stderr.len()
+                ),
+            );
             print!("{}", response.stdout);
-            eprint!("{}", response.stderr);
+            // Hooks must not print to stderr (corrupts JSON output for Claude/Codex)
+            if !is_hook {
+                eprint!("{}", response.stderr);
+            }
             std::process::exit(response.exit_code);
         }
         Err(DaemonError::PermissionDenied(e)) => {
             let total_ms = run_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "run.permission_denied_fallback", &format!(
-                "request_id={} total={:.1}ms err={}",
-                request_id, total_ms, e
-            ));
+            log_info(
+                "client",
+                "run.permission_denied_fallback",
+                &format!(
+                    "request_id={} total={:.1}ms err={}",
+                    request_id, total_ms, e
+                ),
+            );
             exec_python_fallback(args);
         }
         Err(e) => {
@@ -166,10 +203,14 @@ pub fn run(args: &[String]) -> Result<()> {
                 DaemonError::Json { .. } => "run.json_error",
                 _ => "run.error",
             };
-            log_info("client", log_label, &format!(
-                "request_id={} total={:.1}ms err={}",
-                request_id, total_ms, e
-            ));
+            log_info(
+                "client",
+                log_label,
+                &format!(
+                    "request_id={} total={:.1}ms err={}",
+                    request_id, total_ms, e
+                ),
+            );
             // Hooks must not print to stderr (corrupts JSON output)
             if !is_hook {
                 let log_path = crate::paths::log_path();
@@ -182,8 +223,13 @@ pub fn run(args: &[String]) -> Result<()> {
                     }
                     DaemonError::ReadTimeout(msg) => {
                         eprintln!("[hcom] Daemon hung (timeout): {}", msg);
-                        eprintln!("[hcom] Command may have partially executed - check results before retrying");
-                        eprintln!("[hcom] If recurring, check daemon log: {}", log_path.display());
+                        eprintln!(
+                            "[hcom] Command may have partially executed - check results before retrying"
+                        );
+                        eprintln!(
+                            "[hcom] If recurring, check daemon log: {}",
+                            log_path.display()
+                        );
                     }
                     DaemonError::Io { source } => {
                         eprintln!("[hcom] Daemon I/O error: {}", source);
@@ -206,7 +252,10 @@ pub fn run(args: &[String]) -> Result<()> {
 
 /// Try to connect to daemon and send request.
 /// Checks daemon version first - restarts daemon if version mismatch detected.
-fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::Result<Response, DaemonError> {
+fn try_daemon(
+    path: &Path,
+    request: &super::protocol::Request,
+) -> std::result::Result<Response, DaemonError> {
     let total_start = Instant::now();
     let request_id = request.request_id.as_str();
 
@@ -217,10 +266,14 @@ fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::R
     let version_ms = version_start.elapsed().as_secs_f64() * 1000.0;
 
     if !version_ok {
-        log_info("client", "try_daemon.version_mismatch", &format!(
-            "request_id={} version_check={:.1}ms restarting_daemon=true",
-            request_id, version_ms
-        ));
+        log_info(
+            "client",
+            "try_daemon.version_mismatch",
+            &format!(
+                "request_id={} version_check={:.1}ms restarting_daemon=true",
+                request_id, version_ms
+            ),
+        );
         eprintln!("[hcom] Restarting daemon (version mismatch)");
 
         let stop_start = Instant::now();
@@ -231,43 +284,68 @@ fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::R
         start_daemon();
         let start_ms = start_start.elapsed().as_secs_f64() * 1000.0;
 
-        log_info("client", "try_daemon.restart", &format!(
-            "request_id={} stop={:.1}ms start={:.1}ms",
-            request_id, stop_ms, start_ms
-        ));
+        log_info(
+            "client",
+            "try_daemon.restart",
+            &format!(
+                "request_id={} stop={:.1}ms start={:.1}ms",
+                request_id, stop_ms, start_ms
+            ),
+        );
 
         // Wait for new daemon to start
         for (i, delay) in DAEMON_START_RETRY_DELAYS_MS.iter().enumerate() {
             std::thread::sleep(Duration::from_millis(*delay));
             let connect_start = Instant::now();
-            if let Ok(s) = connect_with_timeout(path, Duration::from_millis(RETRY_CONNECT_TIMEOUT_MS)) {
+            if let Ok(s) =
+                connect_with_timeout(path, Duration::from_millis(RETRY_CONNECT_TIMEOUT_MS))
+            {
                 // Verify version matches after restart — if not, don't send
                 // (avoids restart loop where each hcom invocation kills the daemon again)
                 if !check_daemon_version() {
                     let connect_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
-                    log_warn("client", "try_daemon.version_still_mismatched", &format!(
-                        "request_id={} attempt={} connect={:.1}ms",
-                        request_id, i + 1, connect_ms
-                    ));
+                    log_warn(
+                        "client",
+                        "try_daemon.version_still_mismatched",
+                        &format!(
+                            "request_id={} attempt={} connect={:.1}ms",
+                            request_id,
+                            i + 1,
+                            connect_ms
+                        ),
+                    );
                     return Err(DaemonError::ConnectionFailed(
                         "Version mismatch persists after daemon restart. \
                          Rust binary and Python package versions are out of sync. \
-                         Reinstall: pip install --upgrade --force-reinstall hcom".to_string()
+                         Reinstall: pip install --upgrade --force-reinstall hcom"
+                            .to_string(),
                     ));
                 }
                 let connect_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
-                log_info("client", "try_daemon.reconnect_success", &format!(
-                    "request_id={} attempt={} connect={:.1}ms total_restart={:.1}ms",
-                    request_id, i + 1, connect_ms, total_start.elapsed().as_secs_f64() * 1000.0
-                ));
+                log_info(
+                    "client",
+                    "try_daemon.reconnect_success",
+                    &format!(
+                        "request_id={} attempt={} connect={:.1}ms total_restart={:.1}ms",
+                        request_id,
+                        i + 1,
+                        connect_ms,
+                        total_start.elapsed().as_secs_f64() * 1000.0
+                    ),
+                );
                 return try_send(&s, request);
             }
         }
         let log_path = get_log_path();
-        log_info("client", "try_daemon.reconnect_failed", &format!(
-            "request_id={} total={:.1}ms",
-            request_id, total_start.elapsed().as_secs_f64() * 1000.0
-        ));
+        log_info(
+            "client",
+            "try_daemon.reconnect_failed",
+            &format!(
+                "request_id={} total={:.1}ms",
+                request_id,
+                total_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         return Err(DaemonError::ConnectionFailed(format!(
             "Failed to connect after version restart. Check daemon log: {}",
             log_path.display()
@@ -276,13 +354,18 @@ fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::R
 
     // Quick connect with short timeout - if daemon is dead, fail fast
     let connect_start = Instant::now();
-    let stream = match connect_with_timeout(path, Duration::from_millis(INITIAL_CONNECT_TIMEOUT_MS)) {
+    let stream = match connect_with_timeout(path, Duration::from_millis(INITIAL_CONNECT_TIMEOUT_MS))
+    {
         Ok(s) => {
             let connect_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "try_daemon.connect", &format!(
-                "request_id={} version_check={:.1}ms connect={:.1}ms",
-                request_id, version_ms, connect_ms
-            ));
+            log_info(
+                "client",
+                "try_daemon.connect",
+                &format!(
+                    "request_id={} version_check={:.1}ms connect={:.1}ms",
+                    request_id, version_ms, connect_ms
+                ),
+            );
             s
         }
         Err(e) => {
@@ -292,22 +375,31 @@ fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::R
             // Don't spawn a new daemon — it'll crash on bind() too, and kill the healthy one.
             // Fall back to Python direct execution instead.
             if e.raw_os_error() == Some(libc::EPERM) {
-                log_info("client", "try_daemon.permission_denied", &format!(
-                    "request_id={} version_check={:.1}ms connect={:.1}ms err={}",
-                    request_id, version_ms, connect_ms, e
-                ));
+                log_info(
+                    "client",
+                    "try_daemon.permission_denied",
+                    &format!(
+                        "request_id={} version_check={:.1}ms connect={:.1}ms err={}",
+                        request_id, version_ms, connect_ms, e
+                    ),
+                );
                 return Err(DaemonError::PermissionDenied(format!(
-                    "Socket connect blocked (sandbox?): {}", e
+                    "Socket connect blocked (sandbox?): {}",
+                    e
                 )));
             }
 
             // Always try to start — Python flock makes this idempotent.
             // If a daemon is already starting, spawn exits immediately (lock blocked).
             // If a zombie holds the lock, Python kills it and takes over.
-            log_info("client", "try_daemon.connect_failed", &format!(
-                "request_id={} version_check={:.1}ms connect={:.1}ms err={} spawning=true",
-                request_id, version_ms, connect_ms, e
-            ));
+            log_info(
+                "client",
+                "try_daemon.connect_failed",
+                &format!(
+                    "request_id={} version_check={:.1}ms connect={:.1}ms err={} spawning=true",
+                    request_id, version_ms, connect_ms, e
+                ),
+            );
             start_daemon();
 
             let start_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -316,20 +408,36 @@ fn try_daemon(path: &Path, request: &super::protocol::Request) -> std::result::R
             for (i, delay) in DAEMON_STARTING_RETRY_DELAYS_MS.iter().enumerate() {
                 std::thread::sleep(Duration::from_millis(*delay));
                 let retry_start = Instant::now();
-                if let Ok(s) = connect_with_timeout(path, Duration::from_millis(RETRY_CONNECT_TIMEOUT_MS)) {
+                if let Ok(s) =
+                    connect_with_timeout(path, Duration::from_millis(RETRY_CONNECT_TIMEOUT_MS))
+                {
                     let retry_ms = retry_start.elapsed().as_secs_f64() * 1000.0;
-                    log_info("client", "try_daemon.retry_success", &format!(
-                        "request_id={} attempt={} elapsed={:.1}ms retry_connect={:.1}ms total={:.1}ms",
-                        request_id, i + 1, start_ms, retry_ms, total_start.elapsed().as_secs_f64() * 1000.0
-                    ));
+                    log_info(
+                        "client",
+                        "try_daemon.retry_success",
+                        &format!(
+                            "request_id={} attempt={} elapsed={:.1}ms retry_connect={:.1}ms total={:.1}ms",
+                            request_id,
+                            i + 1,
+                            start_ms,
+                            retry_ms,
+                            total_start.elapsed().as_secs_f64() * 1000.0
+                        ),
+                    );
                     return try_send(&s, request);
                 }
             }
             let log_path = get_log_path();
-            log_info("client", "try_daemon.all_retries_failed", &format!(
-                "request_id={} elapsed={:.1}ms total={:.1}ms",
-                request_id, start_ms, total_start.elapsed().as_secs_f64() * 1000.0
-            ));
+            log_info(
+                "client",
+                "try_daemon.all_retries_failed",
+                &format!(
+                    "request_id={} elapsed={:.1}ms total={:.1}ms",
+                    request_id,
+                    start_ms,
+                    total_start.elapsed().as_secs_f64() * 1000.0
+                ),
+            );
             return Err(DaemonError::ConnectionFailed(format!(
                 "Failed to connect after retries. Check daemon log: {}",
                 log_path.display()
@@ -371,12 +479,19 @@ fn start_daemon() {
         .open(crate::paths::log_path())
         .map(std::process::Stdio::from)
         .unwrap_or_else(|_| std::process::Stdio::null());
-    let _ = Command::new(python)
+    if let Err(e) = Command::new(python)
         .args(["-m", "hcom.daemon"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr_file)
-        .spawn();
+        .spawn()
+    {
+        log_error(
+            "client",
+            "start_daemon.spawn_failed",
+            &format!("Failed to spawn daemon ({}): {}", python, e),
+        );
+    }
 }
 
 /// Get socket path from centralized paths module.
@@ -454,10 +569,14 @@ fn stop_daemon() {
 
             // Auto-escalate to SIGKILL if daemon didn't respond to SIGTERM
             if process_alive {
-                log_warn("client", "stop_daemon.escalate_sigkill", &format!(
-                    "Daemon (PID {}) did not respond to SIGTERM within 5s, sending SIGKILL",
-                    pid
-                ));
+                log_warn(
+                    "client",
+                    "stop_daemon.escalate_sigkill",
+                    &format!(
+                        "Daemon (PID {}) did not respond to SIGTERM within 5s, sending SIGKILL",
+                        pid
+                    ),
+                );
                 // SAFETY:
                 // - PID validity: Same PID from pidfile, already validated as i32
                 // - Stale/reused PID risk: Same risk as SIGTERM above. The daemon was sent

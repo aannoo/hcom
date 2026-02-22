@@ -3,7 +3,7 @@
 from ..utils import CLIError, resolve_identity
 from ...shared import IS_WINDOWS
 from ...core.thread_context import get_cwd
-from ...core.instances import load_instance_position, update_instance_position
+from ...core.instances import load_instance_position, update_instance_position, resolve_display_name
 
 
 def _load_stopped_snapshot(name: str) -> dict | None:
@@ -59,6 +59,8 @@ def _do_resume(name: str, prompt: str | None = None, *, run_here: bool | None = 
     """
     from ...launcher import launch as unified_launch
 
+    name = resolve_display_name(name) or name
+
     # Look up instance data — fork allows active, resume requires stopped
     active_data = load_instance_position(name)
     if fork:
@@ -84,11 +86,15 @@ def _do_resume(name: str, prompt: str | None = None, *, run_here: bool | None = 
         raise CLIError(f"'{name}' has no session_id (cannot {'fork' if fork else 'resume'})")
 
     tool = instance_data.get("tool", "claude")
-    if fork and tool not in ("claude", "codex"):
+    if fork and tool not in ("claude", "codex", "opencode"):
         raise CLIError(f"Fork not supported for {tool}")
 
+    # Strip hcom-level flags (--tag, --terminal) before tool-specific parsing
+    from .launch import _extract_hcom_flags
+    tag_override, terminal_override, clean_extra = _extract_hcom_flags(extra_args or [])
+
     # Parse extra flags through tool's arg parser for validation + headless detection
-    headless_override, extra_tokens = _parse_extra_args(tool, extra_args or [])
+    headless_override, extra_tokens = _parse_extra_args(tool, clean_extra)
 
     is_headless = headless_override if headless_override is not None else bool(instance_data.get("background", False))
     original_tag = instance_data.get("tag") or None
@@ -111,6 +117,10 @@ def _do_resume(name: str, prompt: str | None = None, *, run_here: bool | None = 
         args = ["--resume", session_id]
     elif tool == "codex":
         args = ["fork" if fork else "resume", session_id]
+    elif tool == "opencode":
+        args = ["--session", session_id]
+        if fork:
+            args.append("--fork")
     else:
         raise CLIError(f"{'Fork' if fork else 'Resume'} not supported for tool: {tool}")
 
@@ -128,6 +138,7 @@ def _do_resume(name: str, prompt: str | None = None, *, run_here: bool | None = 
 
     # Launch in original directory
     # For resume (not fork), reuse the original instance name
+    effective_tag = tag_override if tag_override is not None else original_tag
     result = unified_launch(
         tool,
         1,
@@ -140,7 +151,8 @@ def _do_resume(name: str, prompt: str | None = None, *, run_here: bool | None = 
         cwd=original_dir,
         pty=use_pty,
         name=name if not fork else None,
-        tag=original_tag,
+        tag=effective_tag,
+        terminal=terminal_override,
     )
 
     launched = result["launched"]

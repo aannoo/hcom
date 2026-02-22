@@ -3,8 +3,8 @@
 //! Single source of truth for all hcom directory and file paths.
 //! Respects HCOM_DIR env var for worktrees/dev, falls back to ~/.hcom.
 
-use std::path::PathBuf;
 use crate::config::Config;
+use std::path::PathBuf;
 
 /// Get the hcom base directory.
 ///
@@ -39,3 +39,12 @@ pub fn pid_path() -> PathBuf {
     hcom_dir().join("hcomd.pid")
 }
 
+/// Get the pidtrack file path (hcom_dir/.tmp/launched_pids.json)
+pub fn pidtrack_path() -> PathBuf {
+    hcom_dir().join(".tmp").join("launched_pids.json")
+}
+
+/// Get the config TOML path (hcom_dir/config.toml)
+pub fn config_toml_path() -> PathBuf {
+    hcom_dir().join("config.toml")
+}

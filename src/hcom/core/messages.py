@@ -182,13 +182,7 @@ def _match_target(target: str, full_names: list[str], full_to_base: dict[str, st
         return [full_to_base[fn] for fn in full_names if fn.lower().startswith(target.lower())]
 
     # Local target - prefix match on full display name
-    matches = [
-        full_to_base[fn]
-        for fn in full_names
-        if ":" not in fn
-        and fn.lower().startswith(target.lower())
-        and (len(fn) == len(target) or fn[len(target)] != "_")
-    ]
+    matches = [full_to_base[fn] for fn in full_names if ":" not in fn and fn.lower().startswith(target.lower()) and (len(fn) == len(target) or fn[len(target)] != "_")]
     if matches:
         return matches
 
@@ -196,9 +190,7 @@ def _match_target(target: str, full_names: list[str], full_to_base: dict[str, st
     return [
         full_to_base[fn]
         for fn in full_names
-        if ":" not in fn
-        and full_to_base[fn].lower().startswith(target.lower())
-        and (len(full_to_base[fn]) == len(target) or full_to_base[fn][len(target)] != "_")
+        if ":" not in fn and full_to_base[fn].lower().startswith(target.lower()) and (len(full_to_base[fn]) == len(target) or full_to_base[fn][len(target)] != "_")
     ]
 
 
@@ -333,7 +325,6 @@ def compute_scope(
 
     # No @mentions → broadcast to everyone
     return ("broadcast", {}), None
-
 
 
 # ==================== Core Message Operations ====================
@@ -494,10 +485,7 @@ def send_message(
     # Compute delivered_to: base names of participating instances in scope
     # Build scope dict for should_deliver_message (cross-device stripping is a no-op for local names)
     scope_data: dict[str, Any] = {"scope": scope, **extra}
-    delivered_to = [
-        inst["name"] for inst in participating_instances
-        if should_deliver_message(scope_data, inst["name"], identity.name)
-    ]
+    delivered_to = [inst["name"] for inst in participating_instances if should_deliver_message(scope_data, inst["name"], identity.name)]
 
     # Build event data
     # Note: 'from' and 'delivered_to' store BASE names for DB consistency.
@@ -557,12 +545,7 @@ def send_message(
         raise HcomError(f"Failed to write message to database: {e}")
 
     # Auto-create request-watch subscriptions for targeted request messages
-    if (
-        envelope
-        and envelope.get("intent") == "request"
-        and identity.kind == "instance"
-        and scope == "mentions"
-    ):
+    if envelope and envelope.get("intent") == "request" and identity.kind == "instance" and scope == "mentions":
         _create_request_watches(identity.name, event_id, delivered_to)
 
     # Push to relay server (notify daemon if running, else inline push)
@@ -617,10 +600,7 @@ def _create_request_watches(sender: str, request_event_id: int, recipients: list
         sub_id = f"reqwatch-{request_event_id}-{recipient}"
         sub_key = f"events_sub:{sub_id}"
 
-        sql = (
-            "(type='status' AND instance=? AND status_val='listening') "
-            "OR (type='life' AND instance=? AND life_action='stopped')"
-        )
+        sql = "(type='status' AND instance=? AND status_val='listening') OR (type='life' AND instance=? AND life_action='stopped')"
 
         kv_set(
             sub_key,
@@ -661,10 +641,16 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
             thread (str, optional): Thread name for grouping related messages.
             _relay (dict, optional): Relay metadata for cross-device messages.
     """
-    from .db import get_events_since
+    from .db import get_events_since, get_last_event_id
 
     # Get last processed event ID from instance file
     instance_data = load_instance_position(instance_name)
+
+    # If instance doesn't exist in DB, it's not participating - return empty
+    # Use current max event ID to prevent redelivery if instance is later recreated
+    if not instance_data:
+        return [], get_last_event_id()
+
     last_event_id = instance_data.get("last_event_id", 0)
 
     # Query new message events
@@ -706,7 +692,7 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
                 if relay := event_data.get("_relay"):
                     msg["_relay"] = relay
                 messages.append(msg)
-        except ValueError as e:
+        except (KeyError, TypeError, ValueError) as e:
             _warn_corrupt_message(event["id"], e)
             continue
 
@@ -760,9 +746,7 @@ def should_deliver_message(event_data: dict[str, Any], receiver_name: str, sende
     return False
 
 
-def get_subagent_messages(
-    parent_name: str, since_id: int = 0, limit: int = 0
-) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+def get_subagent_messages(parent_name: str, since_id: int = 0, limit: int = 0) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
     """Get messages from/to subagents of parent instance with scope-based filtering
     Args:
         parent_name: Parent instance name (e.g., 'luna')
@@ -784,10 +768,7 @@ def get_subagent_messages(
     from .db import get_db
 
     conn = get_db()
-    subagent_names = [
-        row["name"]
-        for row in conn.execute("SELECT name FROM instances WHERE parent_name = ?", (parent_name,)).fetchall()
-    ]
+    subagent_names = [row["name"] for row in conn.execute("SELECT name FROM instances WHERE parent_name = ?", (parent_name,)).fetchall()]
 
     # Initialize per-subagent counts
     per_subagent_counts = {name: 0 for name in subagent_names}
@@ -836,7 +817,7 @@ def get_subagent_messages(
                         per_subagent_counts[subagent_name] += 1
                 except ValueError as e:
                     _warn_corrupt_message(event["id"], e)
-                    break  # Skip remaining subagents for this message
+                    continue  # Skip this subagent, try remaining ones
 
     if limit > 0:
         subagent_messages = subagent_messages[-limit:]
@@ -970,9 +951,7 @@ def format_messages_json(messages: list[dict[str, Any]], instance_name: str) -> 
     return f"<hcom>{format_hook_messages(messages, instance_name)}</hcom>"
 
 
-def get_read_receipts(
-    identity: SenderIdentity, max_text_length: int = 50, limit: int | None = None
-) -> list[ReadReceipt]:
+def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit: int | None = None) -> list[ReadReceipt]:
     """Get read receipts for messages sent by sender.
     Args:
         identity: SenderIdentity for the sender (external or instance)

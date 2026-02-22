@@ -328,8 +328,10 @@ class RelayManager:
             except Exception:
                 pass
             self.notify_server = None
-        # Graceful MQTT disconnect: publish empty retained to own topic, then disconnect
-        if self.mqtt_client:
+        # Snapshot mqtt_client to local var — push_loop may set it to None concurrently
+        client = self.mqtt_client
+        if client:
+            # Graceful MQTT disconnect: publish empty retained to own topic, then disconnect
             try:
                 from .relay import _get_relay_id, _state_topic
                 from .core.device import get_device_uuid
@@ -337,13 +339,13 @@ class RelayManager:
                 relay_id = _get_relay_id()
                 if relay_id:
                     topic = _state_topic(relay_id, get_device_uuid())
-                    result = self.mqtt_client.publish(topic, b"", qos=1, retain=True)
+                    result = client.publish(topic, b"", qos=1, retain=True)
                     result.wait_for_publish(timeout=5)
             except Exception:
                 pass
             try:
-                self.mqtt_client.loop_stop()
-                self.mqtt_client.disconnect()
+                client.loop_stop()
+                client.disconnect()
             except Exception:
                 pass
             self.mqtt_client = None
@@ -767,6 +769,17 @@ def dispatch_request(req: dict, request_id: str) -> dict:
     if req["kind"] == "hook":
         hook_type = req["hook_type"]
 
+        # OpenCode hooks use argv directly (no HookPayload)
+        if hook_type.startswith("opencode-"):
+            argv = req.get("argv", [])
+            if not isinstance(argv, list):
+                return {"exit_code": 1, "stdout": "", "stderr": "Invalid argv: expected list"}
+            from .tools.opencode.hooks import handle_opencode_hook_with_context
+            from .core.thread_context import with_context
+            with with_context(ctx):
+                result = handle_opencode_hook_with_context(hook_type, ctx, argv)
+            return result_to_dict(result)
+
         # Build typed payload based on tool
         try:
             if hook_type == "codex-notify":
@@ -945,7 +958,8 @@ def setup_signal_handlers() -> None:
     """Setup graceful shutdown on SIGTERM/SIGINT."""
 
     def handle_signal(signum: int, _frame) -> None:
-        _log_info("daemon.signal", signal=signum)
+        # Don't call _log_info here — signal handlers run in the main thread,
+        # and _log_info acquires _log_lock which may already be held, causing deadlock.
         if _shutdown_event:
             _shutdown_event.set()
         if _server:
@@ -1039,8 +1053,15 @@ def run_daemon() -> None:
         os.environ.pop(var, None)
     # Also clean vars checked by accessors/commands but not in the above tuples
     os.environ.pop("CLAUDE_ENV_FILE", None)
-    os.environ.pop("HCOM_GO", None)
+    # HCOM_LAUNCHED_PRESET is excluded from HCOM_IDENTITY_VARS (runner scripts must
+    # preserve it for Rust PTY binary) but daemon must still scrub it to avoid
+    # stale preset leaking into default launches.
+    os.environ.pop("HCOM_LAUNCHED_PRESET", None)
     os.environ.pop("HCOM_CLAUDE_UNIX_SESSION_ID", None)
+    # Clean daemon's own HCOM_TAG so it doesn't leak into CLI-mode config reads.
+    # Per-request HCOM_TAG is forwarded by Rust client → request env → get_config()
+    # overlays it via request-scoped config (see config.py get_config() daemon path).
+    os.environ.pop("HCOM_TAG", None)
 
     _shutdown_event = threading.Event()
 
@@ -1098,6 +1119,18 @@ def run_daemon() -> None:
         version_path.unlink(missing_ok=True)
         _log_info("daemon.stop")
         _cleanup_done.set()
+
+
+def request_shutdown() -> None:
+    """Request graceful daemon shutdown from a handler thread.
+
+    Used when the daemon detects it's running stale code (e.g. schema version
+    newer than ours). The daemon exits; the Rust client restarts a fresh one.
+    """
+    if _shutdown_event:
+        _shutdown_event.set()
+    if _server:
+        threading.Thread(target=_server.shutdown, daemon=True).start()
 
 
 def main() -> None:

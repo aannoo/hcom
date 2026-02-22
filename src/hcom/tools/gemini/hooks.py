@@ -525,9 +525,11 @@ def handle_gemini_hook_with_context(
 
     start = _time.perf_counter()
 
-    # Check vanilla skip condition using context
+    # Skip BeforeAgent for non-participants (not launched AND no session binding)
     if not ctx.is_launched and hook_name == "gemini-beforeagent":
-        return HookResult.success()
+        from ...core.db import get_session_binding
+        if not payload.session_id or not get_session_binding(payload.session_id):
+            return HookResult.success()
 
     init_start = _time.perf_counter()
     if not ensure_hcom_directories():
@@ -561,11 +563,7 @@ def handle_gemini_hook(hook_name: str) -> None:
     from ...core.hook_payload import HookPayload
     from ...core.paths import ensure_hcom_directories
 
-    # Check vanilla skip condition
-    from ...core.thread_context import get_is_launched
-
-    if not get_is_launched() and hook_name == "gemini-beforeagent":
-        return
+    # Vanilla skip gating deferred to handle_gemini_hook_with_context()
 
     if not ensure_hcom_directories():
         return

@@ -38,6 +38,16 @@ TOOL_ALIASES = {
     "shell": "Bash",
     "shell_command": "Bash",
     "apply_patch": "Edit",
+    # OpenCode tool names (lowercase)
+    "bash": "Bash",
+    "edit": "Edit",
+    "read": "Read",
+    "glob": "Glob",
+    "grep": "Grep",
+    "write": "Write",
+    "skill": "Skill",
+    "fetch": "WebFetch",
+    "todoreplace": "Todo",
 }
 
 
@@ -305,6 +315,8 @@ def present_entry(raw: dict, role: str, agent: str) -> dict:
             result.update(_present_gemini(raw, role))
         elif agent == "codex":
             result.update(_present_codex(raw, role))
+        elif agent == "opencode":
+            result.update(_present_opencode(raw, role))
     except Exception:
         pass  # partial result on failure
 
@@ -427,6 +439,57 @@ def _present_codex(raw: dict, role: str) -> dict:
             "call_id": payload.get("call_id", ""),
             "output": payload.get("output", ""),
         }
+    else:
+        result["text"] = ""
+        result["has_user_text"] = False
+
+    return result
+
+
+def _present_opencode(raw: dict, role: str) -> dict:
+    """Extract fields from an OpenCode message dict with its parts.
+
+    OpenCode raw dict has: {id, role, data, parts, time_created}.
+    Parts are already parsed dicts with {type, text, tool, state, synthetic, ...}.
+    """
+    result: dict[str, Any] = {}
+    result["timestamp"] = raw.get("timestamp", "")
+
+    parts = raw.get("parts", [])
+
+    if role == "user":
+        # Extract text from non-synthetic TextParts
+        text_parts = []
+        for p in parts:
+            if p.get("type") == "text" and not p.get("synthetic"):
+                t = p.get("text", "")
+                if t:
+                    text_parts.append(t)
+        result["text"] = "\n".join(text_parts)
+        result["has_user_text"] = bool(text_parts)
+
+    elif role == "assistant":
+        # Extract text from TextParts
+        text_parts = []
+        files = []
+        for p in parts:
+            if p.get("type") == "text":
+                t = p.get("text", "")
+                if t:
+                    text_parts.append(t)
+            elif p.get("type") == "tool":
+                state = p.get("state", {})
+                tool_input = state.get("input", {})
+                if isinstance(tool_input, dict):
+                    for field in ("file_path", "filePath", "path", "pattern", "file"):
+                        if field in tool_input:
+                            val = tool_input[field]
+                            if isinstance(val, str) and val:
+                                files.append(Path(val).name)
+        result["text"] = "\n".join(text_parts)
+        result["has_user_text"] = False
+        result["files"] = sorted(set(files))
+
     else:
         result["text"] = ""
         result["has_user_text"] = False

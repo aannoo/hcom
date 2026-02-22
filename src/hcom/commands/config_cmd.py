@@ -402,7 +402,7 @@ Usage:
   hcom config auto_subscribe ""   # No auto-subscribe
 
 Available presets:
-  collision    - Alert when agents edit same file (within 20s window)
+  collision    - Alert when agents edit same file (within 30s window)
   created      - Notify when new instances join
   stopped      - Notify when instances leave
   blocked      - Notify when any instance is blocked (needs approval)

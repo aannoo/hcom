@@ -21,6 +21,13 @@ from hcom.core.transcript import (
     extract_tool_results,
     format_structured_patch,
 )
+from hcom.core.transcript.entries import (
+    ERROR_PATTERNS,
+    TOOL_ALIASES,
+    codex_is_error,
+    extract_bash_info,
+    extract_edit_info,
+)
 
 
 # =============================================================================
@@ -129,6 +136,12 @@ class TestExtractFilesFromContent:
     def test_string_content_returns_empty(self):
         assert extract_files_from_content("hello") == []
 
+    def test_notebook_path(self):
+        content = [
+            {"type": "tool_use", "id": "1", "name": "NotebookEdit", "input": {"notebook_path": "/nb/test.ipynb"}},
+        ]
+        assert "test.ipynb" in extract_files_from_content(content)
+
     def test_no_file_limit(self):
         """Bug fix #7: Removed internal [:10] cap - callers cap as needed."""
         content = [
@@ -188,6 +201,26 @@ class TestErrorDetection:
         result = {"is_error": False, "content": "All tests passed"}
         assert is_error_result(result) is False
 
+    def test_false_positive_error_handling(self):
+        """Bug fix #4: 'error handling code' should NOT match."""
+        assert is_error_result({"content": "error handling code"}) is False
+
+    def test_false_positive_no_errors_found(self):
+        """Bug fix #4: 'no errors found' should NOT match."""
+        assert is_error_result({"content": "no errors found"}) is False
+
+    def test_false_positive_stderr_warning(self):
+        assert is_error_result({"content": "stderr: warning"}) is False
+
+    def test_real_error_content(self):
+        assert is_error_result({"content": "Error: file not found"}) is True
+
+    def test_command_failed(self):
+        assert is_error_result({"content": "command failed with exit code 1"}) is True
+
+    def test_empty_content(self):
+        assert is_error_result({"content": ""}) is False
+
 
 class TestToolExtraction:
     """Tests for tool extraction functions."""
@@ -236,6 +269,122 @@ class TestStructuredPatch:
         patch = [{"oldStart": 1, "newStart": 1, "lines": [f"line{i}" for i in range(30)]}]
         result = format_structured_patch(patch)
         assert "... +10 more lines" in result
+
+
+# =============================================================================
+# extract_edit_info
+# =============================================================================
+
+
+class TestExtractEditInfo:
+    def test_with_structured_patch(self):
+        result = extract_edit_info({
+            "filePath": "foo.py",
+            "structuredPatch": [
+                {"oldStart": 1, "newStart": 1, "lines": ["-old", "+new"]},
+            ],
+        })
+        assert result is not None
+        assert result["file"] == "foo.py"
+        assert "@@ -1 +1 @@" in result["diff"]
+
+    def test_with_old_new_string(self):
+        result = extract_edit_info({
+            "filePath": "bar.py",
+            "oldString": "before",
+            "newString": "after",
+        })
+        assert result is not None
+        assert "-before" in result["diff"]
+        assert "+after" in result["diff"]
+
+    def test_none_input(self):
+        assert extract_edit_info(None) is None
+
+    def test_fallback_to_tool_use_input(self):
+        """Bug fix #5: when toolUseResult is absent, use tool_use input."""
+        result = extract_edit_info(
+            None,
+            tool_use_input={
+                "file_path": "baz.py",
+                "old_string": "old code",
+                "new_string": "new code",
+            },
+        )
+        assert result is not None
+        assert result["file"] == "baz.py"
+        assert "-old code" in result["diff"]
+        assert "+new code" in result["diff"]
+
+    def test_fallback_when_result_has_no_patch(self):
+        """Fallback when result exists but has no relevant keys."""
+        result = extract_edit_info(
+            {"filePath": "x.py"},
+            tool_use_input={
+                "file_path": "x.py",
+                "old_string": "a",
+                "new_string": "b",
+            },
+        )
+        assert result is not None
+        assert result["file"] == "x.py"
+
+
+# =============================================================================
+# extract_bash_info
+# =============================================================================
+
+
+class TestExtractBashInfo:
+    def test_basic(self):
+        result = extract_bash_info(
+            {"command": "ls -la", "description": "list files"},
+            "file1.py\nfile2.py",
+        )
+        assert result["command"] == "ls -la"
+        assert result["output"] == "file1.py\nfile2.py"
+
+    def test_truncates_at_500(self):
+        long_output = "x" * 1000
+        result = extract_bash_info({"command": "cat big"}, long_output)
+        assert len(result["output"]) < 600
+        assert "(+500 chars)" in result["output"]
+
+
+# =============================================================================
+# codex_is_error
+# =============================================================================
+
+
+class TestCodexIsError:
+    def test_nonzero_exit(self):
+        assert codex_is_error("Exit code: 1\nsome output") is True
+
+    def test_zero_exit(self):
+        assert codex_is_error("Exit code: 0\nsome output") is False
+
+    def test_pattern_match_no_exit_code(self):
+        assert codex_is_error("some output with error: in it") is True
+
+    def test_zero_exit_with_error_pattern(self):
+        """Bug fix #6: old code had if/elif so this was False. Now checks both."""
+        assert codex_is_error("Exit code: 0\nsome error: text") is True
+
+    def test_empty_output(self):
+        assert codex_is_error("") is False
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+
+class TestConstants:
+    def test_error_patterns_is_compiled(self):
+        assert hasattr(ERROR_PATTERNS, "search")
+
+    def test_tool_aliases_has_shell(self):
+        assert TOOL_ALIASES["shell"] == "Bash"
 
 
 # =============================================================================

@@ -67,8 +67,7 @@ pub struct InjectServer {
 impl InjectServer {
     /// Create a new injection server on localhost
     pub fn new() -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .context("Failed to bind inject server")?;
+        let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind inject server")?;
         let port = listener.local_addr()?.port();
 
         // Set non-blocking
@@ -129,9 +128,7 @@ impl InjectServer {
 
                     // Check for command (starts with \x00)
                     if data.first() == Some(&QUERY_PREFIX) {
-                        let cmd = std::str::from_utf8(&data[1..])
-                            .unwrap_or("")
-                            .trim();
+                        let cmd = std::str::from_utf8(&data[1..]).unwrap_or("").trim();
                         let (stream, _) = self.clients.remove(index);
                         let command = match cmd {
                             "SCREEN" => QueryCommand::Screen,

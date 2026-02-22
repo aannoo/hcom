@@ -6,8 +6,19 @@
 #   ./build.sh --post-build — copy + restart only (called by watch.sh)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BINARY="$SCRIPT_DIR/src/native/target/release/hcom"
+NATIVE_DIR="$SCRIPT_DIR/src/native"
 BUNDLED_DIR="$SCRIPT_DIR/src/hcom/bin"
+
+# Resolve cargo target dir (respects .cargo/config.toml override for Android/noexec filesystems)
+_cargo_target_dir() {
+    local config="$NATIVE_DIR/.cargo/config.toml"
+    if [[ -f "$config" ]]; then
+        local dir=$(grep '^target-dir' "$config" | sed 's/.*= *"\(.*\)"/\1/')
+        [[ -n "$dir" ]] && echo "$dir" && return
+    fi
+    echo "$NATIVE_DIR/target"
+}
+BINARY="$(_cargo_target_dir)/release/hcom"
 
 get_platform_tag() {
     local system=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -56,6 +67,11 @@ if [[ -n "$MISMATCH" ]]; then
     echo "[build] ERROR: Version mismatch! $MISMATCH (expected $CARGO_VER)"
     echo "[build] Sync all version files before building."
     exit 1
+fi
+
+# Ensure cargo is on PATH (zshenv may not be sourced in all environments)
+if ! command -v cargo &>/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
+    . "$HOME/.cargo/env"
 fi
 
 # Cargo has its own file lock in target/ — safe to run alongside watch.sh's cargo-watch

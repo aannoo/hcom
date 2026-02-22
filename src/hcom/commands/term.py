@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import time
 from pathlib import Path
@@ -228,7 +227,7 @@ def _list_logs() -> int:
     if not logs:
         print("No PTY debug logs found.")
         return 0
-    enabled = _flag_path().exists() or os.environ.get("HCOM_PTY_DEBUG") == "1"
+    enabled = _flag_path().exists()
     print(f"Debug logging: {'ON' if enabled else 'OFF'}")
     print(f"Log dir: {debug_dir}")
     for log in logs:

@@ -469,7 +469,6 @@ BUNDLED_AGENTS = {
     "debate": "2+ agents",
     "ensemble": "3-6 agents",
     "glue": "1 agent",
-    "ralph": "1 agent loop",
     "watcher": "1 agent",
 }
 

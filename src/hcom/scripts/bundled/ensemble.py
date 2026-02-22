@@ -352,7 +352,7 @@ Examples:
     )
     parser.add_argument(
         "--tool",
-        choices=["claude", "gemini", "codex"],
+        choices=["claude", "gemini", "codex", "opencode"],
         default="claude",
         help="AI tool to use for agents (default: claude)",
     )
@@ -387,10 +387,11 @@ Examples:
         sys.exit(1)
 
     parent_name = s.name
-    thread = f"ensemble-{int(time.time())}"
+    ts = int(time.time())
+    thread = f"ensemble-{ts}"
 
     # Create workspace folder
-    workspace = os.path.abspath(os.path.join(args.dir, f"ensemble-{int(time.time())}"))
+    workspace = os.path.abspath(os.path.join(args.dir, f"ensemble-{ts}"))
     os.makedirs(workspace, exist_ok=True)
 
     # Create coder folders
@@ -419,61 +420,78 @@ Examples:
         print(f"  {folder}/")
     print()
 
-    # Launch coders
-    for i in range(args.agents):
-        style = STYLES[i]
-        my_folder = all_folders[i]
-        system_prompt = CODER_SYSTEM_PROMPT.format(
-            style_prompt=style["prompt"],
-            workspace=workspace,
-            my_folder=my_folder,
-        )
-
-        is_last_coder = i == args.agents - 1
-        launch(
-            1,
-            tool=args.tool,
-            tag=f"coder{i}",
-            prompt=build_coder_prompt(
-                task=args.task,
-                style=style,
-                thread=thread,
-                agent_mentions=agent_mentions,
-                round_num=1,
-                total_rounds=args.rounds,
+    # Launch coders + judge, cleaning up on failure
+    launched_names = []
+    try:
+        for i in range(args.agents):
+            style = STYLES[i]
+            my_folder = all_folders[i]
+            system_prompt = CODER_SYSTEM_PROMPT.format(
+                style_prompt=style["prompt"],
                 workspace=workspace,
                 my_folder=my_folder,
-                all_folders=all_folders,
-            ),
-            background=not args.interactive,
-            system_prompt=system_prompt,
-            cwd=workspace,
-            wait=is_last_coder,
-        )
-        print(f"  Launched coder{i} ({style['name']} style, {args.tool}) → {my_folder}/")
+            )
 
-    # Launch judge
-    if not args.no_judge:
-        launch(
-            1,
-            tool=args.tool,
-            tag="judge",
-            prompt=build_judge_prompt(
-                task=args.task,
-                thread=thread,
-                num_agents=args.agents,
-                num_rounds=args.rounds,
-                parent_name=parent_name,
-                agent_mentions=agent_mentions,
-                workspace=workspace,
-                all_folders=all_folders,
-                timeout=args.timeout,
-            ),
-            background=not args.interactive,
-            system_prompt=JUDGE_SYSTEM_PROMPT,
-            cwd=workspace,
-        )
-        print(f"  Launched judge ({args.tool})")
+            is_last_coder = i == args.agents - 1
+            result = launch(
+                1,
+                tool=args.tool,
+                tag=f"coder{i}",
+                prompt=build_coder_prompt(
+                    task=args.task,
+                    style=style,
+                    thread=thread,
+                    agent_mentions=agent_mentions,
+                    round_num=1,
+                    total_rounds=args.rounds,
+                    workspace=workspace,
+                    my_folder=my_folder,
+                    all_folders=all_folders,
+                ),
+                background=not args.interactive,
+                system_prompt=system_prompt,
+                cwd=workspace,
+                wait=is_last_coder,
+            )
+            for h in result.get("handles", []):
+                launched_names.append(h["instance_name"])
+            print(f"  Launched coder{i} ({style['name']} style, {args.tool}) → {my_folder}/")
+
+        # Launch judge
+        if not args.no_judge:
+            result = launch(
+                1,
+                tool=args.tool,
+                tag="judge",
+                prompt=build_judge_prompt(
+                    task=args.task,
+                    thread=thread,
+                    num_agents=args.agents,
+                    num_rounds=args.rounds,
+                    parent_name=parent_name,
+                    agent_mentions=agent_mentions,
+                    workspace=workspace,
+                    all_folders=all_folders,
+                    timeout=args.timeout,
+                ),
+                background=not args.interactive,
+                system_prompt=JUDGE_SYSTEM_PROMPT,
+                cwd=workspace,
+            )
+            for h in result.get("handles", []):
+                launched_names.append(h["instance_name"])
+            print(f"  Launched judge ({args.tool})")
+    except Exception as e:
+        print(f"\nError during launch: {e}", file=sys.stderr)
+        if launched_names:
+            print(f"Cleaning up {len(launched_names)} launched agents...", file=sys.stderr)
+            from hcom.core.ops import op_stop
+            for name in launched_names:
+                try:
+                    op_stop(name, reason="launch_failure")
+                except Exception:
+                    pass
+        sys.exit(1)
 
     print()
     print(f"{'=' * 60}")

@@ -1,9 +1,9 @@
-//! hcom: High-performance PTY wrapper and daemon client
+//! hcom: High-performance PTY wrapper, daemon client, and TUI
 //!
 //! Modes:
 //!   hcom pty <tool> [args...]   - PTY wrapper mode
 //!   hcom <command> [args...]    - Daemon client mode (hooks/CLI)
-//!   hcom                        - TUI mode (exec Python directly)
+//!   hcom                        - TUI mode (Rust default, Python if HCOM_PYTHON_FALLBACK=1)
 //!
 //! PTY mode outputs on startup:
 //!   INJECT_PORT=<port>   - TCP port for text injection
@@ -20,6 +20,7 @@ mod paths;
 mod pty;
 mod tool;
 mod transcript;
+mod tui;
 
 use anyhow::{Context, Result, bail};
 use std::env;
@@ -33,14 +34,19 @@ enum MainAction {
     RunPty(Vec<String>),
     /// Run daemon client mode with command args
     RunClient(Vec<String>),
-    /// Fallback to Python (no args)
+    /// Run Rust TUI (default)
+    RunTui,
+    /// Fallback to Python TUI (HCOM_PYTHON_FALLBACK=1)
     FallbackToPython,
 }
 
 /// Determine what action to take based on command-line arguments
 fn determine_action(args: &[String]) -> MainAction {
     if args.len() < 2 {
-        return MainAction::FallbackToPython;
+        if env::var("HCOM_PYTHON_FALLBACK").as_deref() == Ok("1") {
+            return MainAction::FallbackToPython;
+        }
+        return MainAction::RunTui;
     }
 
     match args[1].as_str() {
@@ -55,7 +61,8 @@ fn main() -> Result<()> {
 
     // Set custom panic hook to log to file instead of stderr (prevents TUI corruption)
     panic::set_hook(Box::new(|panic_info| {
-        let location = panic_info.location()
+        let location = panic_info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
@@ -71,6 +78,9 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     match determine_action(&args) {
+        MainAction::RunTui => {
+            tui::run().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        }
         MainAction::FallbackToPython => {
             client::exec_python_fallback(&[]);
         }
@@ -122,11 +132,16 @@ fn run_pty(args: &[String]) -> Result<()> {
     let command = tool_str.as_str();
 
     // Create and run PTY
-    let mut proxy = pty::Proxy::spawn(command, &tool_args, pty::ProxyConfig {
-        ready_pattern,
-        instance_name,
-        tool: tool_name,
-    }).context("Failed to spawn PTY")?;
+    let mut proxy = pty::Proxy::spawn(
+        command,
+        &tool_args,
+        pty::ProxyConfig {
+            ready_pattern,
+            instance_name,
+            tool: tool_name,
+        },
+    )
+    .context("Failed to spawn PTY")?;
 
     let exit_code = proxy.run().context("PTY run failed")?;
 
@@ -139,24 +154,58 @@ fn run_pty(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::env;
 
-    /// Test that no args results in FallbackToPython
-    /// This validates the fix for hook-comms-tcf where dead code existed
-    /// after the redundant is_tui_invocation check
+    fn with_python_fallback<F>(value: Option<&str>, f: F)
+    where
+        F: FnOnce(),
+    {
+        let saved = env::var("HCOM_PYTHON_FALLBACK").ok();
+
+        if let Some(v) = value {
+            // SAFETY: Test-only env manipulation with serial test execution.
+            unsafe { env::set_var("HCOM_PYTHON_FALLBACK", v) };
+        } else {
+            // SAFETY: Test-only env manipulation with serial test execution.
+            unsafe { env::remove_var("HCOM_PYTHON_FALLBACK") };
+        }
+
+        f();
+
+        if let Some(v) = saved {
+            // SAFETY: Test-only env manipulation with serial test execution.
+            unsafe { env::set_var("HCOM_PYTHON_FALLBACK", v) };
+        } else {
+            // SAFETY: Test-only env manipulation with serial test execution.
+            unsafe { env::remove_var("HCOM_PYTHON_FALLBACK") };
+        }
+    }
+
+    /// Test that no args runs Rust TUI by default
     #[test]
-    fn test_no_args_falls_back_to_python() {
-        let args = vec!["hcom".to_string()];
-        assert_eq!(determine_action(&args), MainAction::FallbackToPython);
+    #[serial]
+    fn test_no_args_runs_rust_tui() {
+        with_python_fallback(None, || {
+            let args = vec!["hcom".to_string()];
+            assert_eq!(determine_action(&args), MainAction::RunTui);
+        });
+    }
+
+    /// Test that no args with HCOM_PYTHON_FALLBACK=1 falls back to Python TUI
+    #[test]
+    #[serial]
+    fn test_no_args_with_python_fallback_env() {
+        with_python_fallback(Some("1"), || {
+            let args = vec!["hcom".to_string()];
+            assert_eq!(determine_action(&args), MainAction::FallbackToPython);
+        });
     }
 
     /// Test that PTY mode is correctly identified
     #[test]
     fn test_pty_mode() {
-        let args = vec![
-            "hcom".to_string(),
-            "pty".to_string(),
-            "claude".to_string(),
-        ];
+        let args = vec!["hcom".to_string(), "pty".to_string(), "claude".to_string()];
         match determine_action(&args) {
             MainAction::RunPty(pty_args) => {
                 assert_eq!(pty_args, vec!["claude".to_string()]);
@@ -191,7 +240,11 @@ mod tests {
             MainAction::RunPty(pty_args) => {
                 assert_eq!(
                     pty_args,
-                    vec!["claude".to_string(), "--arg1".to_string(), "--arg2".to_string()]
+                    vec![
+                        "claude".to_string(),
+                        "--arg1".to_string(),
+                        "--arg2".to_string()
+                    ]
                 );
             }
             _ => panic!("Expected RunPty action"),

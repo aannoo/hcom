@@ -38,6 +38,7 @@ TOOL_EXTRA_ENV: dict[str, dict[str, str]] = {
     "claude": {"HCOM_PTY_MODE": "1"},
     "gemini": {},
     "codex": {},
+    "opencode": {},
 }
 
 
@@ -65,7 +66,7 @@ def create_runner_script(
     script overrides with identical values — see create_bash_script comment.
 
     Args:
-        tool: Tool identifier ("claude", "gemini", "codex")
+        tool: Tool identifier ("claude", "gemini", "codex", "opencode")
         cwd: Working directory
         instance_name: HCOM instance name (for script filename/comment only)
         env: Full instance environment variables dict
@@ -94,6 +95,13 @@ def create_runner_script(
     # Resolve binary paths for environments with minimal PATH (e.g. kitty panes).
     # The tool, hcom, python, and node may all be needed (tool runs, hooks call hcom).
     path_dirs: list[str] = []
+    # Dev mode: prepend worktree binary dir so child processes (plugins, hooks)
+    # find the dev hcom binary instead of the system-installed one.
+    dev_root = os.environ.get("HCOM_DEV_ROOT")
+    if dev_root:
+        dev_bin_dir = os.path.join(dev_root, "src", "native", "target", "release")
+        if os.path.isfile(os.path.join(dev_bin_dir, "hcom")):
+            path_dirs.append(dev_bin_dir)
     for bin_name in [tool, "hcom", "python3", "node"]:
         bin_path = shutil.which(bin_name)
         if bin_path:
@@ -141,11 +149,12 @@ def launch_pty(
     tool_args: list[str],
     *,
     run_here: bool = False,
+    terminal: str | None = None,
 ) -> str | None:
     """Launch a tool in a terminal via native PTY wrapper.
 
     Args:
-        tool: Tool identifier ("claude", "gemini", "codex")
+        tool: Tool identifier ("claude", "gemini", "codex", "opencode")
         cwd: Working directory
         env: Full instance_env dict from launcher (config.toml + instance vars).
              Will be augmented with HCOM_INSTANCE_NAME and tool-specific vars.
@@ -184,7 +193,7 @@ def launch_pty(
         run_here=run_here,
     )
 
-    success = launch_terminal(f"bash {shlex.quote(script_file)}", env, cwd=cwd, run_here=run_here)
+    success = launch_terminal(f"bash {shlex.quote(script_file)}", env, cwd=cwd, run_here=run_here, terminal=terminal)
     return instance_name if success else None
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from .paths import hcom_path, LOGS_DIR
 _LOG_FILE = "hcom.log"
 _MAX_BYTES = 8_000_000  # 8MB
 _BACKUPS = int(os.environ.get("HCOM_LOG_BACKUPS", 3))
+_log_lock = threading.Lock()
 
 
 def _ts() -> str:
@@ -73,9 +75,10 @@ def log(
     try:
         path = _log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate_if_needed(path)
-        with open(path, "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        with _log_lock:
+            _rotate_if_needed(path)
+            with open(path, "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=True) + "\n")
     except Exception:
         pass  # Fail silently - never break caller
 

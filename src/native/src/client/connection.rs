@@ -44,12 +44,16 @@ pub fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<U
     // Build sockaddr_un
     let path_bytes = path.as_os_str().as_encoded_bytes();
     // sun_path size varies by platform (104 on macOS, 108 on Linux)
-    let max_path_len = std::mem::size_of::<libc::sockaddr_un>()
-        - std::mem::size_of::<libc::sa_family_t>()
-        - 1;  // -1 for null terminator
+    let max_path_len =
+        std::mem::size_of::<libc::sockaddr_un>() - std::mem::size_of::<libc::sa_family_t>() - 1; // -1 for null terminator
     if path_bytes.len() >= max_path_len {
-        unsafe { libc::close(socket); }
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
+        unsafe {
+            libc::close(socket);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path too long",
+        ));
     }
 
     // SAFETY: Zero-initializes sockaddr_un struct.
@@ -71,7 +75,7 @@ pub fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<U
         std::ptr::copy_nonoverlapping(
             path_bytes.as_ptr(),
             addr.sun_path.as_mut_ptr() as *mut u8,
-            path_bytes.len()
+            path_bytes.len(),
         );
     }
 
@@ -85,14 +89,16 @@ pub fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<U
         libc::connect(
             socket,
             &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
         )
     };
 
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINPROGRESS) {
-            unsafe { libc::close(socket); }
+            unsafe {
+                libc::close(socket);
+            }
             return Err(err);
         }
     }
@@ -115,9 +121,14 @@ pub fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<U
     let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
 
     if ret <= 0 {
-        unsafe { libc::close(socket); }
+        unsafe {
+            libc::close(socket);
+        }
         if ret == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect timeout",
+            ));
         }
         return Err(std::io::Error::last_os_error());
     }
@@ -140,12 +151,19 @@ pub fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<U
     //   - Alternative would be to check return value and handle error, but the failure
     //     mode (assuming no error when getsockopt fails) is safe enough for this use case
     unsafe {
-        libc::getsockopt(socket, libc::SOL_SOCKET, libc::SO_ERROR,
-                         &mut err as *mut _ as *mut libc::c_void, &mut errlen);
+        libc::getsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut err as *mut _ as *mut libc::c_void,
+            &mut errlen,
+        );
     }
 
     if err != 0 {
-        unsafe { libc::close(socket); }
+        unsafe {
+            libc::close(socket);
+        }
         return Err(std::io::Error::from_raw_os_error(err));
     }
 

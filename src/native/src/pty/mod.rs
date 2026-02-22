@@ -7,9 +7,9 @@
 //! - Inject: TCP injection server
 //! - Delivery: Notify-driven message delivery (integrated)
 
-mod terminal;
-pub mod screen;
 mod inject;
+pub mod screen;
+mod terminal;
 
 use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
@@ -23,18 +23,18 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, RwLock};
 use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use terminal::TerminalGuard;
-use screen::ScreenTracker;
 use inject::InjectServer;
+use screen::ScreenTracker;
+use terminal::TerminalGuard;
 
 use crate::config::Config;
 use crate::db::HcomDb;
 use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop, status_icon};
-use crate::log::{log_info, log_error, log_warn};
+use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 
 /// Tracks what type of incomplete escape sequence is pending on stdout.
@@ -415,11 +415,27 @@ fn build_early_launch_context() -> String {
         }
     }
 
-    // Capture pane_id env vars for common terminal presets
-    for var in &["WEZTERM_PANE", "TMUX_PANE", "KITTY_WINDOW_ID"] {
+    // Kitty socket path for close-on-kill (needed when launching from outside kitty)
+    if let Ok(listen) = std::env::var("KITTY_LISTEN_ON") {
+        if !listen.is_empty() {
+            ctx.insert("kitty_listen_on".into(), Value::String(listen));
+        }
+    }
+
+    // Capture pane_id from terminal env vars, and derive terminal_preset
+    // for same-window (run_here) launches where HCOM_LAUNCHED_PRESET isn't set.
+    let pane_id_vars: &[(&str, &str)] = &[
+        ("WEZTERM_PANE", "wezterm-split"),
+        ("TMUX_PANE", "tmux-split"),
+        ("KITTY_WINDOW_ID", "kitty-split"),
+    ];
+    for &(var, preset) in pane_id_vars {
         if let Ok(val) = std::env::var(var) {
             if !val.is_empty() {
                 ctx.insert("pane_id".into(), Value::String(val));
+                if !ctx.contains_key("terminal_preset") {
+                    ctx.insert("terminal_preset".into(), Value::String(preset.into()));
+                }
                 break;
             }
         }
@@ -434,7 +450,10 @@ fn build_early_launch_context() -> String {
     // Retry with backoff only when pane_id not already captured from env vars
     // (tmux/wezterm set env vars directly, no file needed).
     if let Some(process_id) = ctx.get("process_id").and_then(|v| v.as_str()) {
-        let id_file = crate::paths::hcom_dir().join(".tmp").join("terminal_ids").join(process_id);
+        let id_file = crate::paths::hcom_dir()
+            .join(".tmp")
+            .join("terminal_ids")
+            .join(process_id);
         let needs_id = !ctx.contains_key("pane_id");
         let max_attempts: usize = if needs_id { 10 } else { 1 };
         let mut terminal_id_value = String::new();
@@ -456,7 +475,10 @@ fn build_early_launch_context() -> String {
         }
 
         if !terminal_id_value.is_empty() {
-            ctx.insert("terminal_id".into(), Value::String(terminal_id_value.clone()));
+            ctx.insert(
+                "terminal_id".into(),
+                Value::String(terminal_id_value.clone()),
+            );
             if !ctx.contains_key("pane_id") {
                 ctx.insert("pane_id".into(), Value::String(terminal_id_value));
             }
@@ -574,10 +596,7 @@ impl Proxy {
 
                 // Capture minimal launch context early so kill can close the terminal pane.
                 // The Python hook may later overwrite with richer context (git_branch, tty, env).
-                let _ = db.store_launch_context(
-                    instance_name,
-                    &build_early_launch_context(),
-                );
+                let _ = db.store_launch_context(instance_name, &build_early_launch_context());
             }
         }
 
@@ -595,16 +614,8 @@ impl Proxy {
             config.instance_name.as_deref(),
         );
 
-        // Start injection server
+        // Start injection server (port is registered to DB by delivery thread)
         let inject_server = InjectServer::new()?;
-
-        // Emit inject port to stderr ONLY when stderr is captured by Python adapter.
-        // When running directly in terminal (bash script), stderr is a TTY - skip printing.
-        // When running via spawn_native_pty(), stderr is a pipe - print for Python to parse.
-        let stderr_is_tty = unsafe { libc::isatty(libc::STDERR_FILENO) == 1 };
-        if !stderr_is_tty {
-            eprintln!("INJECT_PORT={}", inject_server.port());
-        }
 
         let user_activity_cooldown_ms = 500; // 0.5s for all tools (dim detection enables this for Claude)
 
@@ -685,7 +696,8 @@ impl Proxy {
 
         let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
             Ok(Tool::Claude) | Ok(Tool::Codex) => Duration::from_secs(5), // Ready pattern unreliable (Claude: accept-edits, Codex: narrow terminals)
-            _ => Duration::from_secs(60), // Gemini: ready pattern always visible
+            Ok(Tool::OpenCode) => Duration::from_secs(5), // Empty ready_pattern fires immediately; 5s fallback
+            _ => Duration::from_secs(60),                 // Gemini: ready pattern always visible
         };
 
         loop {
@@ -736,9 +748,9 @@ impl Proxy {
             // Poll timeout: 5s when debug enabled (for periodic dumps), otherwise block
             // Delivery thread has its own timing via notify.wait(), doesn't need fast polling here
             let poll_timeout = if self.screen.debug_enabled() {
-                5000u16  // 5s for debug periodic dumps
+                5000u16 // 5s for debug periodic dumps
             } else {
-                10000u16  // 10s, allows runtime debug flag check
+                10000u16 // 10s, allows runtime debug flag check
             };
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
@@ -768,7 +780,9 @@ impl Proxy {
                     );
                     // Detect lost terminal (e.g. terminal window closed, stdin redirected to /dev/null)
                     // SAFETY: stdin_raw is a valid fd obtained from stdin().as_raw_fd() at function start
-                    if !nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) }).unwrap_or(false) {
+                    if !nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                        .unwrap_or(false)
+                    {
                         break;
                     }
                     // Fall through to title write — timeout means no PTY output, safe to write.
@@ -900,20 +914,18 @@ impl Proxy {
                             inject::InjectResult::Inject(text) => {
                                 write_all(&self.pty_master, text.as_bytes())?;
                             }
-                            inject::InjectResult::Query(client) => {
-                                match client.command {
-                                    inject::QueryCommand::Screen => {
-                                        let dump = self.screen.get_screen_dump(
-                                            &self.config.tool,
-                                            self.inject_server.port(),
-                                        );
-                                        client.respond(&dump);
-                                    }
-                                    inject::QueryCommand::Unknown => {
-                                        client.respond("error: unknown command\n");
-                                    }
+                            inject::InjectResult::Query(client) => match client.command {
+                                inject::QueryCommand::Screen => {
+                                    let dump = self.screen.get_screen_dump(
+                                        &self.config.tool,
+                                        self.inject_server.port(),
+                                    );
+                                    client.respond(&dump);
                                 }
-                            }
+                                inject::QueryCommand::Unknown => {
+                                    client.respond("error: unknown command\n");
+                                }
+                            },
                             inject::InjectResult::Pending => {}
                         }
                     }
@@ -929,11 +941,22 @@ impl Proxy {
             // read after a read that ended with partial multi-byte char).
             if stdout_is_tty && title_write_safe(had_pty_output, pending_utf8, pending_escape) {
                 let (name, status) = {
-                    let n = self.current_name.read().ok().map(|n| n.clone()).unwrap_or_default();
-                    let s = self.current_status.read().ok().map(|s| s.clone()).unwrap_or_default();
+                    let n = self
+                        .current_name
+                        .read()
+                        .ok()
+                        .map(|n| n.clone())
+                        .unwrap_or_default();
+                    let s = self
+                        .current_status
+                        .read()
+                        .ok()
+                        .map(|s| s.clone())
+                        .unwrap_or_default();
                     (n, s)
                 };
-                if !name.is_empty() && (name != last_written_name || status != last_written_status) {
+                if !name.is_empty() && (name != last_written_name || status != last_written_status)
+                {
                     let icon = status_icon(&status);
                     let tool_upper = self.config.tool.to_uppercase();
                     let title = format!("{} {} [{}]", icon, name, tool_upper);
@@ -1092,8 +1115,11 @@ impl Proxy {
 
         if instance_name.is_empty() {
             // No instance name - skip delivery (hybrid mode or testing)
-            crate::log::log_warn("native", "delivery.skip.no_instance_name",
-                "No instance name - delivery disabled. Set config.instance_name or HCOM_INSTANCE_NAME env var.");
+            crate::log::log_warn(
+                "native",
+                "delivery.skip.no_instance_name",
+                "No instance name - delivery disabled. Set config.instance_name or HCOM_INSTANCE_NAME env var.",
+            );
             return Ok(());
         }
 
@@ -1126,22 +1152,38 @@ impl Proxy {
         }
 
         let handle = std::thread::spawn(move || {
-            log_info("native", "delivery.start", &format!("Starting delivery thread for {}", instance_name));
+            log_info(
+                "native",
+                "delivery.start",
+                &format!("Starting delivery thread for {}", instance_name),
+            );
 
             // Initialize delivery components with dependency injection
-            let (db, notify) = match initialize_delivery_components(
+            let (mut db, notify) = match initialize_delivery_components(
                 &instance_name,
                 HcomDb::open,
                 NotifyServer::new,
             ) {
                 Ok((db, notify)) => {
-                    log_info("native", "delivery.init.success", &format!("Initialized delivery for {}", instance_name));
+                    log_info(
+                        "native",
+                        "delivery.init.success",
+                        &format!("Initialized delivery for {}", instance_name),
+                    );
                     // Store port for shutdown wakeup
                     notify_port_shared.store(notify.port(), Ordering::Release);
-                    log_info("native", "notify.registered", &format!("Registered notify port {}", notify.port()));
+                    log_info(
+                        "native",
+                        "notify.registered",
+                        &format!("Registered notify port {}", notify.port()),
+                    );
                     // Register inject port for screen queries
                     if let Err(e) = db.register_inject_port(&instance_name, inject_port) {
-                        log_warn("native", "inject.register_fail", &format!("Failed to register inject port: {}", e));
+                        log_warn(
+                            "native",
+                            "inject.register_fail",
+                            &format!("Failed to register inject port: {}", e),
+                        );
                     }
 
                     // Signal successful initialization to parent
@@ -1149,7 +1191,11 @@ impl Proxy {
                     (db, notify)
                 }
                 Err(e) => {
-                    log_error("native", "delivery.init.fail", &format!("Failed to initialize delivery: {}", e));
+                    log_error(
+                        "native",
+                        "delivery.init.fail",
+                        &format!("Failed to initialize delivery: {}", e),
+                    );
                     let _ = init_tx.send(Err(e));
                     return;
                 }
@@ -1166,9 +1212,22 @@ impl Proxy {
             let config = ToolConfig::for_tool(&tool);
 
             // Run delivery loop (pass shared state for main loop's OSC override)
-            run_delivery_loop(running, &db, &notify, &state, &instance_name, &config, Some(shared_name), Some(shared_status));
+            run_delivery_loop(
+                running,
+                &mut db,
+                &notify,
+                &state,
+                &instance_name,
+                &config,
+                Some(shared_name),
+                Some(shared_status),
+            );
 
-            log_info("native", "delivery.stop", &format!("Delivery thread stopped for {}", instance_name));
+            log_info(
+                "native",
+                "delivery.stop",
+                &format!("Delivery thread stopped for {}", instance_name),
+            );
         });
 
         self.delivery_handle = Some(handle);
@@ -1176,19 +1235,35 @@ impl Proxy {
         // Wait for initialization result (with timeout to avoid blocking forever)
         match init_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {
-                log_info("native", "delivery.init.success", "Delivery thread initialized successfully");
+                log_info(
+                    "native",
+                    "delivery.init.success",
+                    "Delivery thread initialized successfully",
+                );
                 Ok(())
             }
             Ok(Err(e)) => {
-                log_error("native", "delivery.init.fail", &format!("Delivery thread init failed: {}", e));
+                log_error(
+                    "native",
+                    "delivery.init.fail",
+                    &format!("Delivery thread init failed: {}", e),
+                );
                 Err(e)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                log_error("native", "delivery.init.timeout", "Delivery thread init timed out after 5s");
+                log_error(
+                    "native",
+                    "delivery.init.timeout",
+                    "Delivery thread init timed out after 5s",
+                );
                 bail!("Delivery thread initialization timed out")
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                log_error("native", "delivery.init.disconnect", "Delivery thread init channel disconnected");
+                log_error(
+                    "native",
+                    "delivery.init.disconnect",
+                    "Delivery thread init channel disconnected",
+                );
                 bail!("Delivery thread initialization channel disconnected")
             }
         }
@@ -1204,7 +1279,11 @@ impl Drop for Proxy {
 
         // Wake delivery thread if it's blocked in notify.wait()
         let port = self.notify_port.load(Ordering::Acquire);
-        log_info("native", "proxy.drop.wake", &format!("Waking notify port {}", port));
+        log_info(
+            "native",
+            "proxy.drop.wake",
+            &format!("Waking notify port {}", port),
+        );
         if port != 0 {
             // Connect briefly to wake the notify server's poll()
             match std::net::TcpStream::connect_timeout(
@@ -1212,7 +1291,11 @@ impl Drop for Proxy {
                 std::time::Duration::from_millis(100),
             ) {
                 Ok(_) => log_info("native", "proxy.drop.wake_ok", "Connected to notify port"),
-                Err(e) => log_info("native", "proxy.drop.wake_fail", &format!("Failed to connect: {}", e)),
+                Err(e) => log_info(
+                    "native",
+                    "proxy.drop.wake_fail",
+                    &format!("Failed to connect: {}", e),
+                ),
             }
         }
 
@@ -1229,7 +1312,11 @@ impl Drop for Proxy {
                     break;
                 }
                 if start.elapsed() > timeout {
-                    crate::log::log_warn("native", "delivery.join_timeout", "Delivery thread did not finish in time");
+                    crate::log::log_warn(
+                        "native",
+                        "delivery.join_timeout",
+                        "Delivery thread did not finish in time",
+                    );
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1262,7 +1349,11 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     while written < data.len() {
         match write(fd, &data[written..]) {
             Ok(n) => written += n,
-            Err(Errno::EAGAIN) | Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             Err(e) => bail!("write failed: {}", e),
         }
     }
@@ -1286,12 +1377,10 @@ where
     NotifyF: FnOnce() -> Result<crate::notify::NotifyServer>,
 {
     // Open database
-    let db = db_factory()
-        .context("Failed to open database")?;
+    let db = db_factory().context("Failed to open database")?;
 
     // Create notify server
-    let notify = notify_factory()
-        .context("Failed to create notify server")?;
+    let notify = notify_factory().context("Failed to create notify server")?;
 
     // Register notify port
     db.register_notify_port(instance_name, notify.port())
@@ -1302,94 +1391,141 @@ where
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{anyhow, Context, Result};
+    use super::initialize_delivery_components;
+    use anyhow::anyhow;
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    // Test helper that mirrors initialize_delivery_components logic but uses generic types
-    fn test_init_with_factories<T, U, DbF, NotifyF>(
-        db_factory: DbF,
-        notify_factory: NotifyF,
-    ) -> Result<(T, U)>
-    where
-        DbF: FnOnce() -> Result<T>,
-        NotifyF: FnOnce() -> Result<U>,
-    {
-        let db = db_factory().context("Failed to open database")?;
-        let notify = notify_factory().context("Failed to create notify server")?;
-        Ok((db, notify))
+    fn setup_test_db(with_notify_endpoints: bool) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_pty_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+        let conn = Connection::open(&db_path).unwrap();
+
+        if with_notify_endpoints {
+            conn.execute_batch(
+                "CREATE TABLE notify_endpoints (
+                    instance TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (instance, kind)
+                );",
+            )
+            .unwrap();
+        }
+
+        db_path
+    }
+
+    fn cleanup_test_db(path: PathBuf) {
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn test_initialize_delivery_components_db_failure_propagates() {
-        // Verify that DB factory errors are propagated with proper context
+    fn initialize_delivery_components_db_failure_short_circuits_notify() {
+        let notify_called = std::cell::Cell::new(false);
 
-        let db_factory = || Err(anyhow!("DB connection refused"));
-        let notify_factory = || {
-            panic!("NotifyServer factory should not be called when DB fails");
+        let result = initialize_delivery_components(
+            "test",
+            || Err(anyhow!("DB connection refused")),
+            || {
+                notify_called.set(true);
+                crate::notify::NotifyServer::new()
+            },
+        );
+
+        let err = match result {
+            Ok(_) => panic!("db failure should propagate"),
+            Err(e) => e,
         };
-
-        let result: Result<(i32, i32)> = test_init_with_factories(
-            db_factory,
-            notify_factory,
+        assert!(
+            err.to_string().contains("Failed to open database"),
+            "missing context: {err:#}"
         );
-
-        assert!(result.is_err(), "Should return Err when DB open fails");
-        let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(err_msg.contains("Failed to open database"), "Error should have context");
+        assert!(
+            !notify_called.get(),
+            "notify factory should not be called after db failure"
+        );
     }
 
     #[test]
-    fn test_initialize_delivery_components_notify_failure_propagates() {
-        // Verify that NotifyServer factory errors are propagated with proper context
+    fn initialize_delivery_components_notify_failure_propagates() {
+        let db_path = setup_test_db(true);
 
-        let db_factory = || Ok(42); // DB succeeds
-        let notify_factory = || Err(anyhow!("Port already in use"));
-
-        let result: Result<(i32, i32)> = test_init_with_factories(
-            db_factory,
-            notify_factory,
+        let result = initialize_delivery_components(
+            "test",
+            || crate::db::HcomDb::open_at(&db_path),
+            || Err(anyhow!("Port already in use")),
         );
 
-        assert!(result.is_err(), "Should return Err when NotifyServer creation fails");
-        let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(err_msg.contains("Failed to create notify server"), "Error should have context");
-    }
-
-    #[test]
-    fn test_initialize_delivery_components_success_path() {
-        // Verify that both factories succeeding returns Ok
-
-        let db_factory = || Ok(42);
-        let notify_factory = || Ok(100);
-
-        let result: Result<(i32, i32)> = test_init_with_factories(
-            db_factory,
-            notify_factory,
-        );
-
-        assert!(result.is_ok(), "Should return Ok when both succeed");
-        let (db, notify) = result.unwrap();
-        assert_eq!(db, 42);
-        assert_eq!(notify, 100);
-    }
-
-    #[test]
-    fn test_initialize_delivery_components_db_error_short_circuits() {
-        // Verify that DB failure prevents notify factory from being called (? operator short-circuits)
-
-        let mut notify_called = false;
-        let db_factory = || Err(anyhow!("DB error"));
-        let notify_factory = || {
-            notify_called = true;
-            Ok(100)
+        let err = match result {
+            Ok(_) => panic!("notify failure should propagate"),
+            Err(e) => e,
         };
-
-        let result: Result<(i32, i32)> = test_init_with_factories(
-            db_factory,
-            notify_factory,
+        assert!(
+            err.to_string().contains("Failed to create notify server"),
+            "missing context: {err:#}"
         );
 
-        assert!(result.is_err(), "Should propagate DB error");
-        assert!(!notify_called, "Notify factory should not be called when DB fails (? short-circuits)");
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn initialize_delivery_components_register_failure_propagates() {
+        let db_path = setup_test_db(false);
+
+        let result = initialize_delivery_components(
+            "test",
+            || crate::db::HcomDb::open_at(&db_path),
+            crate::notify::NotifyServer::new,
+        );
+
+        let err = match result {
+            Ok(_) => panic!("register notify port failure should propagate"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Failed to register notify port"),
+            "missing context: {err:#}"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn initialize_delivery_components_registers_notify_port() {
+        let db_path = setup_test_db(true);
+
+        let (db, notify) = initialize_delivery_components(
+            "test",
+            || crate::db::HcomDb::open_at(&db_path),
+            crate::notify::NotifyServer::new,
+        )
+        .expect("component init should succeed");
+        let notify_port = notify.port();
+        drop(db);
+        drop(notify);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let (kind, port): (String, i64) = conn
+            .query_row(
+                "SELECT kind, port FROM notify_endpoints WHERE instance = 'test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "pty");
+        assert_eq!(port, notify_port as i64);
+
+        cleanup_test_db(db_path);
     }
 
     // ---- pending_utf8_bytes tests ----
@@ -1490,7 +1626,7 @@ mod tests {
 
     // ---- title_write_safe tests ----
 
-    use super::{PendingEscape, title_write_safe, has_pending_escape, resolve_pending_escape};
+    use super::{PendingEscape, has_pending_escape, resolve_pending_escape, title_write_safe};
 
     #[test]
     fn test_title_write_blocked_by_pty_output() {
@@ -1551,17 +1687,26 @@ mod tests {
 
     #[test]
     fn test_pending_escape_complete_osc_bel() {
-        assert_eq!(has_pending_escape(b"\x1b]8;id=link;https://example.com\x07"), PendingEscape::None);
+        assert_eq!(
+            has_pending_escape(b"\x1b]8;id=link;https://example.com\x07"),
+            PendingEscape::None
+        );
     }
 
     #[test]
     fn test_pending_escape_incomplete_osc() {
-        assert_eq!(has_pending_escape(b"\x1b]8;id=link;https://example.com"), PendingEscape::StringSeq);
+        assert_eq!(
+            has_pending_escape(b"\x1b]8;id=link;https://example.com"),
+            PendingEscape::StringSeq
+        );
     }
 
     #[test]
     fn test_pending_escape_complete_osc_st() {
-        assert_eq!(has_pending_escape(b"\x1b]8;id=link;https://example.com\x1b\\"), PendingEscape::None);
+        assert_eq!(
+            has_pending_escape(b"\x1b]8;id=link;https://example.com\x1b\\"),
+            PendingEscape::None
+        );
     }
 
     #[test]
@@ -1571,17 +1716,26 @@ mod tests {
 
     #[test]
     fn test_pending_escape_after_complete_sequence() {
-        assert_eq!(has_pending_escape(b"\x1b[38;2;100mhello"), PendingEscape::None);
+        assert_eq!(
+            has_pending_escape(b"\x1b[38;2;100mhello"),
+            PendingEscape::None
+        );
     }
 
     #[test]
     fn test_pending_escape_incomplete_dcs() {
-        assert_eq!(has_pending_escape(b"\x1bPsome data"), PendingEscape::StringSeq);
+        assert_eq!(
+            has_pending_escape(b"\x1bPsome data"),
+            PendingEscape::StringSeq
+        );
     }
 
     #[test]
     fn test_pending_escape_complete_dcs() {
-        assert_eq!(has_pending_escape(b"\x1bPsome data\x1b\\"), PendingEscape::None);
+        assert_eq!(
+            has_pending_escape(b"\x1bPsome data\x1b\\"),
+            PendingEscape::None
+        );
     }
 
     // ---- resolve_pending_escape (cross-chunk) tests ----
@@ -1589,43 +1743,64 @@ mod tests {
     #[test]
     fn test_resolve_csi_continuation_no_final() {
         // CSI params without final byte — stays pending
-        assert_eq!(resolve_pending_escape(PendingEscape::Csi, b"100;50;"), PendingEscape::Csi);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::Csi, b"100;50;"),
+            PendingEscape::Csi
+        );
     }
 
     #[test]
     fn test_resolve_csi_continuation_with_final() {
         // CSI terminated by 'm' (0x6D)
-        assert_eq!(resolve_pending_escape(PendingEscape::Csi, b"200m"), PendingEscape::None);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::Csi, b"200m"),
+            PendingEscape::None
+        );
     }
 
     #[test]
     fn test_resolve_csi_continuation_final_mid_chunk() {
         // Final byte followed by normal text
-        assert_eq!(resolve_pending_escape(PendingEscape::Csi, b"200mHello world"), PendingEscape::None);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::Csi, b"200mHello world"),
+            PendingEscape::None
+        );
     }
 
     #[test]
     fn test_resolve_string_seq_continuation_no_terminator() {
         // OSC URL continuation without BEL — stays pending
-        assert_eq!(resolve_pending_escape(PendingEscape::StringSeq, b"ample.com/path"), PendingEscape::StringSeq);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::StringSeq, b"ample.com/path"),
+            PendingEscape::StringSeq
+        );
     }
 
     #[test]
     fn test_resolve_string_seq_continuation_with_bel() {
         // OSC terminated by BEL
-        assert_eq!(resolve_pending_escape(PendingEscape::StringSeq, b"url\x07rest"), PendingEscape::None);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::StringSeq, b"url\x07rest"),
+            PendingEscape::None
+        );
     }
 
     #[test]
     fn test_resolve_none_stays_none() {
-        assert_eq!(resolve_pending_escape(PendingEscape::None, b"any data"), PendingEscape::None);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::None, b"any data"),
+            PendingEscape::None
+        );
     }
 
     #[test]
     fn test_resolve_string_seq_letters_dont_clear() {
         // Letters in OSC content (e.g., URL) must NOT clear StringSeq —
         // only BEL or ST terminates. (Letters would falsely clear CSI.)
-        assert_eq!(resolve_pending_escape(PendingEscape::StringSeq, b"https://example"), PendingEscape::StringSeq);
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::StringSeq, b"https://example"),
+            PendingEscape::StringSeq
+        );
     }
 
     #[test]
@@ -1640,7 +1815,11 @@ mod tests {
 
         // Chunk 2 has no ESC — use resolve
         let state = resolve_pending_escape(state, chunk2);
-        assert_eq!(state, PendingEscape::Csi, "must stay pending through middle chunk");
+        assert_eq!(
+            state,
+            PendingEscape::Csi,
+            "must stay pending through middle chunk"
+        );
 
         // Chunk 3 has no ESC — use resolve, 'm' terminates
         let state = resolve_pending_escape(state, chunk3);
@@ -1658,7 +1837,11 @@ mod tests {
         assert_eq!(state, PendingEscape::StringSeq);
 
         let state = resolve_pending_escape(state, chunk2);
-        assert_eq!(state, PendingEscape::StringSeq, "URL letters must not terminate OSC");
+        assert_eq!(
+            state,
+            PendingEscape::StringSeq,
+            "URL letters must not terminate OSC"
+        );
 
         let state = resolve_pending_escape(state, chunk3);
         assert_eq!(state, PendingEscape::None);

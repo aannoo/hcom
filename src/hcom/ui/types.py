@@ -133,7 +133,7 @@ class LaunchState:
     Codex) has its own prompt/system prompt fields since they persist independently.
 
     Attributes:
-        tool: Selected tool type ("claude", "gemini", "codex").
+        tool: Selected tool type ("claude", "gemini", "codex", "opencode").
         count: Number of instances to launch (as string for text input).
         prompt: Claude initial prompt text.
         prompt_cursor: Cursor position in prompt field.
@@ -186,6 +186,9 @@ class LaunchState:
     codex_system_prompt: str = ""
     codex_system_prompt_cursor: int = 0
     codex_sandbox_mode: str = "workspace"
+    # OpenCode-specific
+    opencode_prompt: str = ""
+    opencode_prompt_cursor: int = 0
     # Navigation
     current_field: LaunchField = LaunchField.COUNT
     scroll_pos: int = 0

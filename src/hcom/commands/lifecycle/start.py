@@ -35,7 +35,7 @@ def _start_adhoc_mode(tool: str = "adhoc", post_warning: str | None = None) -> i
     """Start vanilla mode for external AI tools (not launched via hcom).
 
     Args:
-        tool: Tool type ('adhoc', 'claude', 'gemini', 'codex'). Default 'adhoc' for unknown.
+        tool: Tool type ('adhoc', 'claude', 'gemini', 'codex', 'opencode'). Default 'adhoc' for unknown.
         post_warning: Optional warning to print after bootstrap (for tools that truncate from start)
     """
     from ...core.instances import (
@@ -162,6 +162,78 @@ def _start_orphaned_hcom_launched() -> int:
 
     update_instance_position(instance_name, {"name_announced": True})
 
+    return 0
+
+
+def _start_from_orphan(orphan_target: str) -> int:
+    """Recover an orphaned PTY process from pidtrack.
+
+    Resolution:
+    - Numeric target => match orphan PID
+    - Non-numeric target => match orphan names list
+
+    Naming:
+    - Reuse latest known orphan name when valid and available
+    - Otherwise generate a new random CVCV name
+    """
+    from ...core.db import iter_instances, log_event
+    from ...core.instances import generate_unique_name
+    from ...core.identity import is_valid_base_name
+    from ...core.pidtrack import get_orphan_processes, remove_pid, recover_single_orphan_to_db
+
+    # True orphans only (exclude active instance PIDs from pidtrack view)
+    active_pids: set[int] = {int(data["pid"]) for data in iter_instances() if data.get("pid")}
+    orphans = get_orphan_processes(active_pids=active_pids)
+    if not orphans:
+        raise CLIError("No orphan processes found.")
+
+    orphan: dict | None = None
+    if orphan_target.isdigit():
+        target_pid = int(orphan_target)
+        orphan = next((o for o in orphans if int(o.get("pid", -1)) == target_pid), None)
+        if not orphan:
+            raise CLIError(f"Orphan PID {target_pid} not found.")
+    else:
+        matches = [o for o in orphans if orphan_target in (o.get("names") or [])]
+        if not matches:
+            raise CLIError(f"Orphan '{orphan_target}' not found.")
+        if len(matches) > 1:
+            pids = ", ".join(str(m["pid"]) for m in matches)
+            raise CLIError(f"Multiple orphans match '{orphan_target}' (PIDs: {pids}). Use --orphan <pid>.")
+        orphan = matches[0]
+
+    assert orphan is not None
+    pid = int(orphan["pid"])
+    process_id = orphan.get("process_id") or ""
+    if not process_id:
+        raise CLIError(f"Orphan PID {pid} has no process_id and cannot be recovered.")
+
+    names = orphan.get("names") or []
+    preferred_name = names[-1] if names else ""
+    can_reuse = bool(preferred_name) and is_valid_base_name(preferred_name) and not load_instance_position(preferred_name)
+    instance_name = preferred_name if can_reuse else generate_unique_name()
+
+    # Core DB registration (shared with auto-recovery) — sets status to "listening"
+    recover_single_orphan_to_db(orphan, instance_name)
+
+    # CLI-specific: event logging, output, pidtrack cleanup
+    log_event(
+        "life",
+        instance_name,
+        {
+            "action": "started",
+            "by": "cli",
+            "reason": "orphan_recover",
+            "orphan_pid": pid,
+        },
+    )
+    remove_pid(pid)
+
+    print(f"[hcom:{instance_name}]")
+    if can_reuse:
+        print(f"Recovered orphan PID {pid} as '{instance_name}'.")
+    else:
+        print(f"Recovered orphan PID {pid} as new identity '{instance_name}' (name conflict/unavailable).")
     return 0
 
 
@@ -307,6 +379,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     Usage:
         hcom start                          # Start with new identity
         hcom start --as <name>              # Reclaim identity after compaction/resume
+        hcom start --orphan <name|pid>      # Recover orphaned PTY process
 
     The --as flag is for reclaiming your existing identity when context is lost
     (e.g., after session compaction or claude --resume). It rebinds the current
@@ -327,21 +400,35 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
         explicit_initiator, argv = parse_name_flag(argv)
 
-    # Extract --as flag (rebind session to existing instance)
+    # Extract --as / --orphan flags
     rebind_target = None
+    orphan_target = None
     i = 0
     while i < len(argv):
         if argv[i] == "--as":
             if i + 1 >= len(argv):
                 raise CLIError("Usage: hcom start --as <name>")
+            if rebind_target is not None:
+                raise CLIError("Duplicate --as flag.")
             rebind_target = argv[i + 1]
             argv = argv[:i] + argv[i + 2 :]
-            break
+            continue
+        if argv[i] == "--orphan":
+            if i + 1 >= len(argv):
+                raise CLIError("Usage: hcom start --orphan <name|pid>")
+            if orphan_target is not None:
+                raise CLIError("Duplicate --orphan flag.")
+            orphan_target = argv[i + 1]
+            argv = argv[:i] + argv[i + 2 :]
+            continue
         i += 1
+
+    if rebind_target and orphan_target:
+        raise CLIError("Cannot combine --as with --orphan.")
 
     # BLOCK DURING ACTIVE TASKS: prevents subagents from corrupting parent/sibling instances
     # When subagent runs --as or bare start, process_id resolves to parent which has running_tasks.active=True
-    if rebind_target or not explicit_initiator:
+    if rebind_target or orphan_target or not explicit_initiator:
         try:
             identity = resolve_identity()
             if identity.instance_data:
@@ -349,6 +436,8 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 if running_tasks.get("active"):
                     if rebind_target:
                         print("[HCOM] Cannot use --as while Tasks are running.")
+                    elif orphan_target:
+                        print("[HCOM] Cannot use --orphan while Tasks are running.")
                     else:
                         print(
                             "[HCOM] Cannot run 'hcom start' from within a Task subagent.\n"
@@ -398,6 +487,9 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             return 1
         # Continue to subagent registration below
 
+    if orphan_target:
+        return _start_from_orphan(orphan_target)
+
     # Handle --as rebind (non-subagents only)
     if rebind_target:
         from ...core.identity import is_valid_base_name, base_name_error
@@ -415,7 +507,10 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Reject positional arguments - stopped instances are deleted, nothing to restart
     args_without_flags = [a for a in argv if not a.startswith("--")]
     if args_without_flags:
-        raise CLIError(f"Unknown argument: {args_without_flags[0]}\nUsage: hcom start [--as <name>]")
+        raise CLIError(
+            f"Unknown argument: {args_without_flags[0]}\n"
+            "Usage: hcom start [--as <name>] [--orphan <name|pid>]"
+        )
 
     if agent_id and agent_type:
         # Check if instance already exists by agent_id (reuse name)

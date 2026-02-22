@@ -13,7 +13,7 @@ use nix::unistd::isatty;
 use std::io;
 use std::os::fd::AsRawFd;
 
-use super::{handle_sigwinch, handle_sigint, handle_sigterm, handle_sighup};
+use super::{handle_sighup, handle_sigint, handle_sigterm, handle_sigwinch};
 
 /// RAII guard that restores terminal settings on drop.
 ///
@@ -70,13 +70,7 @@ pub fn get_terminal_size() -> Result<Winsize> {
     // - ws is properly initialized via mem::zeroed() above; ioctl will write terminal size to it
     // - TIOCGWINSZ is the correct ioctl request for querying terminal window size
     // - Return value is checked below; on error (ret == -1) or invalid size, we fall back to 80x24
-    let ret = unsafe {
-        libc::ioctl(
-            io::stdout().as_raw_fd(),
-            libc::TIOCGWINSZ.into(),
-            &mut ws,
-        )
-    };
+    let ret = unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ.into(), &mut ws) };
     if ret == -1 || ws.ws_row == 0 || ws.ws_col == 0 {
         // Fallback to default size
         ws.ws_row = 24;
@@ -86,13 +80,17 @@ pub fn get_terminal_size() -> Result<Winsize> {
 }
 
 /// Setup signal handler for a specific signal
-fn setup_signal_handler(signal: Signal, handler: extern "C" fn(libc::c_int), restart: bool) -> Result<()> {
-    let flags = if restart { SaFlags::SA_RESTART } else { SaFlags::empty() };
-    let action = SigAction::new(
-        SigHandler::Handler(handler),
-        flags,
-        SigSet::empty(),
-    );
+fn setup_signal_handler(
+    signal: Signal,
+    handler: extern "C" fn(libc::c_int),
+    restart: bool,
+) -> Result<()> {
+    let flags = if restart {
+        SaFlags::SA_RESTART
+    } else {
+        SaFlags::empty()
+    };
+    let action = SigAction::new(SigHandler::Handler(handler), flags, SigSet::empty());
     unsafe { sigaction(signal, &action) }.context(format!("sigaction {:?} failed", signal))?;
     Ok(())
 }

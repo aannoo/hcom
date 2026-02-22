@@ -194,12 +194,12 @@ def get_is_codex() -> bool:
     )
 
 
-def get_hcom_go() -> bool:
-    """Get HCOM_GO - True if gating prompts should be bypassed."""
+def get_is_opencode() -> bool:
+    """Get OpenCode tool marker - True if running inside OpenCode."""
     ctx = _ctx.get()
     if ctx is not None:
-        return ctx.hcom_go
-    return os.environ.get("HCOM_GO") == "1"
+        return ctx.is_opencode
+    return os.environ.get("OPENCODE") == "1"
 
 
 def get_codex_thread_id() -> str | None:
@@ -216,6 +216,21 @@ def get_hcom_notes_text() -> str:
     if ctx is not None:
         return ctx.notes
     return os.environ.get("HCOM_NOTES") or ""
+
+
+def get_request_env() -> dict[str, str] | None:
+    """Get forwarded env dict from the current daemon request.
+
+    In daemon mode, returns the raw env dict forwarded by the Rust client
+    (contains caller's HCOM_TAG, HCOM_NOTES, etc.). Used by get_config()
+    to apply request-scoped env overrides instead of reading stale os.environ.
+
+    Returns None in CLI mode (no thread context set).
+    """
+    ctx = _ctx.get()
+    if ctx is not None and ctx.raw_env:
+        return ctx.raw_env
+    return None
 
 
 def is_in_daemon_mode() -> bool:
@@ -265,10 +280,11 @@ __all__ = [
     "get_is_claude",
     "get_is_gemini",
     "get_is_codex",
-    "get_hcom_go",
+    "get_is_opencode",
     "get_codex_thread_id",
     "get_hcom_notes_text",
     # Daemon mode
+    "get_request_env",
     "is_in_daemon_mode",
     # Context manager
     "with_context",

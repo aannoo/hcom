@@ -326,6 +326,113 @@ def _build_exchange_codex(
     return exchange
 
 
+def _build_exchange_opencode(
+    messages_with_parts: list[dict],
+    all_entries: list,
+    user_pos: int,
+    next_user_pos: int,
+    position: int,
+    detailed: bool,
+) -> dict:
+    """Build a single exchange dict for OpenCode.
+
+    messages_with_parts is the cached list from index, each element:
+    {id, role, data, parts: [...], time_created, timestamp}.
+    """
+    user_msg = messages_with_parts[user_pos]
+
+    # User text: join non-synthetic TextParts
+    user_text_parts = []
+    for p in user_msg.get("parts", []):
+        if p.get("type") == "text" and not p.get("synthetic"):
+            t = p.get("text", "")
+            if t:
+                user_text_parts.append(t)
+    user_text = "\n".join(user_text_parts)
+    timestamp = user_msg.get("timestamp", "")
+
+    # Process assistant messages between this user and next
+    action_parts: list[str] = []
+    files: list[str] = []
+    tools: list[dict] = []
+    errors: list[dict] = []
+    last_was_error = False
+
+    for i in range(user_pos + 1, next_user_pos):
+        msg = messages_with_parts[i]
+        if msg["role"] != "assistant":
+            continue
+
+        for p in msg.get("parts", []):
+            ptype = p.get("type", "")
+
+            if ptype == "text":
+                t = p.get("text", "")
+                if t:
+                    action_parts.append(t)
+
+            elif ptype == "tool":
+                tool_name_raw = p.get("tool", "unknown")
+                tool_name = normalize_tool_name(tool_name_raw)
+                state = p.get("state", {})
+                tool_input = state.get("input", {})
+                is_err = state.get("status") == "error"
+
+                # Extract files from tool input (OpenCode uses camelCase: filePath)
+                if isinstance(tool_input, dict):
+                    for field in ("file_path", "filePath", "path", "pattern", "file"):
+                        if field in tool_input:
+                            val = tool_input[field]
+                            if isinstance(val, str) and val:
+                                files.append(Path(val).name)
+
+                if detailed:
+                    tool_record: dict[str, Any] = {"name": tool_name, "is_error": is_err}
+                    if tool_name == "Bash":
+                        tool_record["command"] = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+                        output = state.get("output", "")
+                        if len(output) > 500:
+                            output = output[:500] + f"... (+{len(output) - 500} chars)"
+                        tool_record["output"] = output
+                    elif tool_name in ("Edit", "Write"):
+                        tool_record["file"] = (
+                            tool_input.get("file_path") or tool_input.get("filePath") or tool_input.get("path", "")
+                        ) if isinstance(tool_input, dict) else ""
+                    elif tool_name in ("Read", "Glob", "Grep"):
+                        tool_record["target"] = (
+                            tool_input.get("file_path") or tool_input.get("filePath") or tool_input.get("path") or tool_input.get("pattern", "")
+                        ) if isinstance(tool_input, dict) else ""
+                    tools.append(tool_record)
+
+                    if is_err:
+                        errors.append({
+                            "tool": tool_name,
+                            "content": state.get("output", "")[:300],
+                        })
+                        last_was_error = True
+                    else:
+                        last_was_error = False
+
+    action = "\n".join(action_parts) if action_parts else "(no response)"
+    files = sorted(set(files))[:5]
+
+    exchange: dict = {
+        "position": position,
+        "user": user_text[:500 if detailed else 300],
+        "action": action,
+        "files": files,
+        "timestamp": timestamp,
+    }
+
+    if detailed:
+        exchange["tools"] = tools
+        exchange["edits"] = []
+        exchange["errors"] = errors
+        exchange["ended_on_error"] = last_was_error
+
+    return exchange
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -337,40 +444,45 @@ def get_exchanges(
     last: int = 10,
     range_tuple: tuple[int, int] | None = None,
     detailed: bool = False,
+    session_id: str | None = None,
 ) -> dict:
     """Parse transcript into structured exchanges.
 
     Args:
-        transcript_path: Path to transcript file
-        agent: Agent type ('claude', 'gemini', 'codex')
+        transcript_path: Path to transcript file (or SQLite DB for opencode)
+        agent: Agent type ('claude', 'gemini', 'codex', 'opencode')
         last: Number of recent exchanges (ignored if range_tuple provided)
         range_tuple: (start, end) absolute positions, 1-indexed inclusive
         detailed: If True, include tool usage details
+        session_id: OpenCode session ID (required for opencode agent)
 
     Returns:
         {"exchanges": [...], "total": int, "error": str | None}
-        Detailed mode adds "ended_on_error": bool (Claude only at top level)
+        Detailed mode adds "ended_on_error": bool (Claude/OpenCode at top level)
     """
     path = Path(transcript_path)
     if not path.exists():
         result: dict[str, Any] = {"exchanges": [], "total": 0, "error": f"Transcript not found: {path}"}
-        if detailed and agent == "claude":
+        if detailed and agent in ("claude", "opencode"):
             result["ended_on_error"] = False
         return result
 
     try:
-        index = TranscriptIndex.build(str(path), agent)
+        index = TranscriptIndex.build(str(path), agent, session_id=session_id)
     except (json.JSONDecodeError, OSError, AttributeError, TypeError) as e:
         err_msg = f"Invalid JSON: {e}" if "json" in str(e).lower() else f"Error reading file: {e}"
         return {"exchanges": [], "total": 0, "error": err_msg}
 
     if not len(index):
         result = {"exchanges": [], "total": 0, "error": None}
-        if detailed and agent == "claude":
+        if detailed and agent in ("claude", "opencode"):
             result["ended_on_error"] = False
         return result
 
     all_entries = list(index)
+
+    # For opencode, get the cached messages-with-parts
+    opencode_messages = getattr(index, "_opencode_messages", []) if agent == "opencode" else []
 
     # Find user entries (with actual text for Claude, content check for others)
     user_indices: list[int] = []
@@ -392,6 +504,16 @@ def get_exchanges(
             p = present_entry(raw, "user", "codex")
             if p.get("text", ""):
                 user_indices.append(i)
+        elif agent == "opencode":
+            # Check that user message has non-synthetic text parts
+            if i < len(opencode_messages):
+                msg = opencode_messages[i]
+                has_text = any(
+                    p.get("type") == "text" and not p.get("synthetic") and p.get("text", "")
+                    for p in msg.get("parts", [])
+                )
+                if has_text:
+                    user_indices.append(i)
 
     total = len(user_indices)
 
@@ -437,14 +559,19 @@ def get_exchanges(
                 index, all_entries, user_pos, next_user_pos,
                 base_pos + idx, detailed, call_outputs or {},
             )
+        elif agent == "opencode":
+            ex = _build_exchange_opencode(
+                opencode_messages, all_entries, user_pos, next_user_pos,
+                base_pos + idx, detailed,
+            )
         else:
             continue
 
         exchanges.append(ex)
 
     result = {"exchanges": exchanges, "total": total, "error": None}
-    if detailed and agent == "claude":
-        result["ended_on_error"] = exchanges[-1]["ended_on_error"] if exchanges else False
+    if detailed and agent in ("claude", "opencode"):
+        result["ended_on_error"] = exchanges[-1].get("ended_on_error", False) if exchanges else False
     return result
 
 
@@ -475,8 +602,9 @@ def get_thread(
     tool: str = "claude",
     detailed: bool = False,
     range_tuple: tuple[int, int] | None = None,
+    session_id: str | None = None,
 ) -> dict:
-    return get_exchanges(transcript_path, tool, last, range_tuple, detailed)
+    return get_exchanges(transcript_path, tool, last, range_tuple, detailed, session_id=session_id)
 
 
 def get_timeline(
@@ -505,6 +633,7 @@ def get_timeline(
                 "name": inst.get("name", ""),
                 "path": path,
                 "tool": inst.get("tool", "claude"),
+                "session_id": inst.get("session_id"),
                 "mtime": mtime,
             })
         except OSError:
@@ -522,6 +651,7 @@ def get_timeline(
             last=last,
             tool=info["tool"],
             detailed=detailed,
+            session_id=info.get("session_id"),
         )
 
         if thread_data.get("error"):

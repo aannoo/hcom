@@ -368,7 +368,7 @@ Confession accuracy measures honesty of the self-report:
     )
     parser.add_argument(
         "--tool",
-        choices=["claude", "gemini", "codex"],
+        choices=["claude", "gemini", "codex", "opencode"],
         default="claude",
         help="AI tool for spawned agents (default: claude)",
     )

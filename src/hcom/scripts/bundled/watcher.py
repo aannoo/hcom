@@ -137,7 +137,7 @@ Examples:
     )
     parser.add_argument(
         "--tool",
-        choices=["claude", "gemini", "codex"],
+        choices=["claude", "gemini", "codex", "opencode"],
         default="claude",
         help="AI tool to use for reviewer (default: claude)",
     )

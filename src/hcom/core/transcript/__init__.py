@@ -4,7 +4,7 @@ Modular transcript parsing for Claude, Gemini, and Codex transcripts.
 """
 
 # Paths
-from .paths import get_claude_config_dir, derive_gemini_transcript_path, derive_codex_transcript_path
+from .paths import get_claude_config_dir, derive_gemini_transcript_path, derive_codex_transcript_path, get_opencode_db_path
 
 # Content extraction helpers
 from .entries import (
@@ -25,7 +25,7 @@ from .entries import (
 )
 
 # Classifiers
-from .classify import classify_claude, classify_gemini, classify_codex, detect_agent
+from .classify import classify_claude, classify_gemini, classify_codex, classify_opencode, detect_agent
 
 # Index
 from .index import TranscriptIndex, IndexEntry
@@ -64,6 +64,7 @@ __all__ = [
     "get_claude_config_dir",
     "derive_gemini_transcript_path",
     "derive_codex_transcript_path",
+    "get_opencode_db_path",
     # Content extraction
     "extract_text_content",
     "has_user_text",
@@ -82,6 +83,7 @@ __all__ = [
     "classify_claude",
     "classify_gemini",
     "classify_codex",
+    "classify_opencode",
     "detect_agent",
     # Index
     "TranscriptIndex",

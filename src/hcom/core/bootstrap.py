@@ -35,8 +35,8 @@ Response rules:
 - intent=inform → respond only if useful
 - intent=ack → don't respond
 
-Routing:
-- hcom message (<hcom> tags, hook feedback) → respond via hcom send
+Routing rules:
+- hcom message (<hcom> tags, hook feedback) → run `hcom send` to respond
 - Normal user chat → respond in chat
 
 ## CAPABILITIES
@@ -45,14 +45,14 @@ You MUST use `hcom <cmd> --name {instance_name}` for all hcom commands:
 
 - Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- <"message text"> (or --stdin, --file <path>, --base64 <string>)
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
-- See who's active: list [-v] [--json]
+- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
 - Read another's conversation: transcript [name] [--range N-M] [--last N] [--full]
 - See history (filter by agent, commands ran, files touched, status, msgs, sql): events --help
 - Event-based notifications, watch other agents, subscribe, react: events sub
 - Handoff context: bundle prepare
-- Spawn agents: [HCOM_TAG=label-or-group] hcom [num] <claude|gemini|codex>
-  Example: `HCOM_TAG=coolguy hcom 1 claude` -> automatic <hcom> msg when ready -> send task to agent via hcom message
-  Resume/fork agents, background, tmux, set prompt, system, forward args: hcom <claude|gemini|codex> --help
+- Spawn agents: [num] <claude|gemini|codex|opencode> [--tag label.or.group]
+  Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
+  Resume/fork agents, background, tmux, set prompt, system, forward args: <claude|gemini|codex|opencode> --help
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen, inject text/enter: term [name]
@@ -340,7 +340,7 @@ def get_bootstrap(
         parts.append(UVX_CMD_NOTICE)
 
     # Tool-specific delivery
-    if tool == "claude" or (tool == "gemini" and ctx["is_launched"]):
+    if tool in ("claude", "opencode") or (tool == "gemini" and ctx["is_launched"]):
         parts.append(DELIVERY_AUTO)
     elif tool == "codex" and ctx["is_launched"]:
         parts.append(DELIVERY_CODEX_HCOM_LAUNCHED)

@@ -278,7 +278,7 @@ def poll_messages(
                     time.sleep(wait_time)
 
                 # Update heartbeat
-                update_instance_position(instance_id, {"last_stop": time.time()})
+                update_instance_position(instance_id, {"last_stop": int(time.time())})
 
             # Timeout reached
             return (0, None, True)
@@ -326,7 +326,7 @@ def extract_tool_detail(tool: str, tool_name: str, tool_input: dict) -> str:
     Centralizes tool detail extraction across claude/gemini/codex hooks.
 
     Args:
-        tool: Tool type ("claude", "gemini", "codex")
+        tool: Tool type ("claude", "gemini", "codex", "opencode")
         tool_name: Specific tool name from hook payload
         tool_input: Tool input dictionary from hook_data
 

@@ -135,6 +135,43 @@ class ManageScreen:
         """
         self.state = state  # Shared state (explicit dependency)
         self.tui = tui  # For commands only (flash, stop_all, etc)
+        # Cached DB query results (avoid querying every frame/keystroke)
+        self._stopped_cache: list = []
+        self._stopped_cache_time: float = 0.0
+        self._stopped_cache_key: frozenset = frozenset()
+        self._orphan_cache: list = []
+        self._orphan_cache_time: float = 0.0
+        self._orphan_cache_key: frozenset = frozenset()
+
+    _CACHE_TTL = 3.0  # seconds
+
+    def _get_recently_stopped_cached(self, exclude_active: set) -> list:
+        """get_recently_stopped with 3s TTL cache, invalidated on input change."""
+        import time as _time
+
+        from ..core.db import get_recently_stopped
+
+        now = _time.time()
+        key = frozenset(exclude_active)
+        if now - self._stopped_cache_time > self._CACHE_TTL or key != self._stopped_cache_key:
+            self._stopped_cache = get_recently_stopped(exclude_active=exclude_active)
+            self._stopped_cache_time = now
+            self._stopped_cache_key = key
+        return self._stopped_cache
+
+    def _get_orphan_processes_cached(self, active_pids: set) -> list:
+        """get_orphan_processes with 3s TTL cache, invalidated on input change."""
+        import time as _time
+
+        from ..core.pidtrack import get_orphan_processes
+
+        now = _time.time()
+        key = frozenset(active_pids)
+        if now - self._orphan_cache_time > self._CACHE_TTL or key != self._orphan_cache_key:
+            self._orphan_cache = get_orphan_processes(active_pids=active_pids)
+            self._orphan_cache_time = now
+            self._orphan_cache_key = key
+        return self._orphan_cache
 
     def _render_instance_row(
         self,
@@ -437,7 +474,6 @@ class ManageScreen:
     def _build_instance_list(self, lines: List[str], instance_rows: int, width: int):
         """Build instance list rows including cursor management and scrolling."""
         from ..core.instances import is_remote_instance
-        from ..core.db import get_recently_stopped
 
         # Sort instances by creation time (newest first) - stable, no jumping
         all_instances = sorted(
@@ -452,15 +488,12 @@ class ManageScreen:
         remote_instances.sort(key=lambda x: -x[1]["data"].get("created_at", 0.0))
         remote_count = len(remote_instances)
 
-        # Get recently stopped instances (from events, last 10 min)
+        # Get recently stopped instances and orphan processes (cached, 3s TTL)
         active_names = set(self.state.manage.instances.keys())
-        recently_stopped = get_recently_stopped(exclude_active=active_names)
-
-        # Get orphan processes (running hcom-launched processes not in active instances)
-        from ..core.pidtrack import get_orphan_processes
+        recently_stopped = self._get_recently_stopped_cached(exclude_active=active_names)
 
         active_pids = {i.get("data", {}).get("pid") for _, i in all_instances if i.get("data", {}).get("pid")}
-        orphan_processes = get_orphan_processes(active_pids=active_pids)
+        orphan_processes = self._get_orphan_processes_cached(active_pids=active_pids)
 
         # Show relay separator if there are remote instances OR connected remote devices
         has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
@@ -924,7 +957,6 @@ class ManageScreen:
     def _get_display_lists(self):
         """Build local/remote instance lists for cursor navigation"""
         from ..core.instances import is_remote_instance
-        from ..core.db import get_recently_stopped
 
         all_instances = sorted(
             self.state.manage.instances.items(),
@@ -939,15 +971,12 @@ class ManageScreen:
 
         remote_count = len(remote_instances)
 
-        # Get recently stopped names (excluding currently active)
+        # Get recently stopped and orphan processes (cached, 3s TTL)
         active_names = set(self.state.manage.instances.keys())
-        recently_stopped = get_recently_stopped(exclude_active=active_names)
-
-        # Get orphan processes (running but not in active instances)
-        from ..core.pidtrack import get_orphan_processes
+        recently_stopped = self._get_recently_stopped_cached(exclude_active=active_names)
 
         active_pids = {i.get("data", {}).get("pid") for _, i in all_instances if i.get("data", {}).get("pid")}
-        orphan_processes = get_orphan_processes(active_pids=active_pids)
+        orphan_processes = self._get_orphan_processes_cached(active_pids=active_pids)
 
         # Calculate display count: local → orphans → stopped → relay → remote
         has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)
@@ -1418,7 +1447,6 @@ class ManageScreen:
     def calculate_layout(self, height: int, width: int) -> tuple[int, int, int]:
         """Calculate instance/message/input row allocation"""
         from ..core.instances import is_remote_instance
-        from ..core.db import get_recently_stopped
 
         # Dynamic input area based on buffer size
         input_rows = calculate_text_input_rows(self.state.manage.message_buffer, width)
@@ -1436,15 +1464,12 @@ class ManageScreen:
         local_count = len(local_instances)
         remote_count = len(remote_instances)
 
-        # Get recently stopped for display count
+        # Get recently stopped and orphan count (cached, 3s TTL)
         active_names = set(self.state.manage.instances.keys())
-        recently_stopped = get_recently_stopped(exclude_active=active_names)
-
-        # Get orphan process count
-        from ..core.pidtrack import get_orphan_processes
+        recently_stopped = self._get_recently_stopped_cached(exclude_active=active_names)
 
         active_pids = {i.get("data", {}).get("pid") for i in all_instances if i.get("data", {}).get("pid")}
-        orphan_count = len(get_orphan_processes(active_pids=active_pids))
+        orphan_count = len(self._get_orphan_processes_cached(active_pids=active_pids))
 
         # Build display count: local + remote section + orphans + recently_stopped
         has_remote = remote_count > 0 or bool(self.state.manage.device_sync_times)

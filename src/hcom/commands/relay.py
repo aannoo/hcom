@@ -139,7 +139,7 @@ def _relay_status() -> int:
         parsed = urllib.parse.urlparse(config.relay)
         host = parsed.hostname or config.relay
         port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
-        ping_ms = _ping_broker(host, port)
+        ping_ms = _ping_broker(host, port, use_tls=(parsed.scheme != "mqtt"))
         if ping_ms is not None:
             print(f"Broker: {config.relay} ({ping_ms}ms)")
         else:
@@ -226,15 +226,16 @@ def _parse_broker_flags(argv: list[str]) -> tuple[str | None, str | None, list[s
     return broker, auth_token, remaining
 
 
-def _ping_broker(host: str, port: int) -> int | None:
-    """TLS connect to broker, return round-trip ms or None on failure."""
-    import ssl
+def _ping_broker(host: str, port: int, use_tls: bool = True) -> int | None:
+    """Connect to broker, return round-trip ms or None on failure."""
     import socket
     try:
         t0 = time.time()
-        ctx = ssl.create_default_context()
         sock = socket.create_connection((host, port), timeout=5)
-        sock = ctx.wrap_socket(sock, server_hostname=host)
+        if use_tls:
+            import ssl
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(sock, server_hostname=host)
         sock.close()
         return int((time.time() - t0) * 1000)
     except Exception:
@@ -289,7 +290,7 @@ def _relay_new(argv: list[str]) -> int:
         port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
 
         print(f"Testing {host}:{port}...")
-        ping_ms = _ping_broker(host, port)
+        ping_ms = _ping_broker(host, port, use_tls=(parsed.scheme != "mqtt"))
         if ping_ms is None:
             print(f"  {host}:{port} — failed", file=sys.stderr)
             print("\nBroker unreachable. Check host, port, and network.", file=sys.stderr)
@@ -392,7 +393,7 @@ def _relay_connect(argv: list[str]) -> int:
     parsed = urllib.parse.urlparse(effective_broker)
     host = parsed.hostname or effective_broker
     port = parsed.port or (8883 if parsed.scheme == "mqtts" else 1883)
-    ping_ms = _ping_broker(host, port)
+    ping_ms = _ping_broker(host, port, use_tls=(parsed.scheme != "mqtt"))
 
     snapshot = load_config_snapshot()
 

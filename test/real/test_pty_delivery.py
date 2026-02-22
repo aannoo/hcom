@@ -6,20 +6,27 @@ Records full screen state at each phase for regression detection.
 
 Requires:
 - tmux installed and available
-- Target tool CLI installed (claude/gemini/codex)
+- Target tool CLI installed (claude/gemini/codex/opencode)
 
-Phases:
+Phases (claude/gemini/codex):
 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=tmux
 2. Wait for ready event, capture and validate full screen state
 3. Send message → verify delivery via events, capture post-delivery screen
 4. Inject uncommitted text → verify gate blocks delivery, capture screen
 5. Cleanup
 
+Phases (opencode — PTY bootstrap injection):
+1. Launch opencode in tmux, wait for ready event
+2. Send message → verify PTY bootstrap injection triggers plugin binding + delivery
+3. Send second message → verify plugin-based delivery (no PTY inject)
+4. Cleanup
+
 Usage:
     python test/real/test_pty_delivery.py              # claude (default)
     python test/real/test_pty_delivery.py gemini
     python test/real/test_pty_delivery.py codex
-    python test/real/test_pty_delivery.py all          # run all three sequentially
+    python test/real/test_pty_delivery.py opencode
+    python test/real/test_pty_delivery.py all          # run all four sequentially
 
     Check logs folder after
 """
@@ -37,6 +44,7 @@ READY_PATTERNS = {
     "claude": "? for shortcuts",
     "codex": "\u203a ",
     "gemini": "Type your message",
+    "opencode": "ctrl+p commands",  # Bottom status bar — TUI fully rendered
 }
 
 # =============================================================================
@@ -356,7 +364,6 @@ def run_test(tool: str):
     _base_name = None
 
     os.environ["HCOM_TERMINAL"] = "tmux"
-    os.environ["HCOM_GO"] = "1"
     os.environ["HCOM_TAG"] = "ptytest"
     init_log(tool)
 
@@ -383,7 +390,7 @@ def run_test(tool: str):
         "gemini": "",
     }
     extra = model_flags.get(tool, "")
-    r = hcom(f"1 {tool}{extra}", timeout=15)
+    r = hcom(f"--go 1 {tool}{extra}", timeout=15)
     if r.returncode != 0:
         fail(f"Launch failed: {r.stderr}")
 
@@ -640,20 +647,249 @@ def run_test(tool: str):
     print("=" * 60)
 
 
+def run_test_opencode():
+    """OpenCode PTY bootstrap injection test.
+
+    OpenCode delivery is fundamentally different from Claude/Gemini/Codex:
+    - PTY only injects the FIRST message to bootstrap the session
+    - The TypeScript plugin (hcom.ts) handles all subsequent delivery
+    - All gate checks disabled (plugin controls delivery timing)
+    - No input text detection (screen.rs returns None for OpenCode)
+
+    Phases:
+    1. Launch opencode in tmux, wait for ready event
+    2. Send message → verify PTY bootstrap injection triggers plugin binding + delivery
+    3. Send second message → verify plugin-based delivery works
+    """
+    global _instance_name, _base_name
+    _instance_name = None
+    _base_name = None
+    tool = "opencode"
+
+    os.environ["HCOM_TERMINAL"] = "tmux"
+    os.environ["HCOM_TAG"] = "ptytest"
+    init_log(tool)
+
+    print("=" * 60)
+    print(f"PTY Delivery Test: {tool} (bootstrap injection)")
+    print("=" * 60)
+
+    # Record last event ID before launch
+    pre_launch_id = 0
+    r_pre = hcom("events --last 1")
+    if r_pre.returncode == 0:
+        for line in r_pre.stdout.strip().splitlines():
+            try:
+                pre_launch_id = json.loads(line.strip()).get("id", 0)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    # ── Phase 1: Launch ──────────────────────────────────────────
+    print(f"\n[Phase 1] Launching {tool} in tmux...")
+    t0 = time.time()
+    r = hcom(f"--go 1 {tool}", timeout=15)
+    if r.returncode != 0:
+        fail(f"Launch failed: {r.stderr}")
+
+    # Poll for ready event
+    print("  Waiting for ready event...")
+
+    def find_ready_instance():
+        r = hcom("events --action ready --last 5")
+        if r.returncode != 0:
+            return None
+        for line in reversed(r.stdout.strip().splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                if (ev.get("type") == "life"
+                        and ev.get("data", {}).get("action") == "ready"
+                        and ev.get("id", 0) > pre_launch_id):
+                    return ev["instance"]
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return None
+
+    _base_name = poll_until(find_ready_instance, "ready event from launched instance", timeout=60, interval=2.0)
+    if not _base_name:
+        fail("Could not determine instance name from ready event")
+    tag = os.environ.get("HCOM_TAG", "")
+    _instance_name = f"{tag}-{_base_name}" if tag else _base_name
+
+    t_ready = time.time() - t0
+    ok(f"Instance launched: {_instance_name} (base: {_base_name}, ready in {t_ready:.1f}s)")
+
+    # Wait for screen to be ready (TUI fully rendered with ready pattern)
+    def _screen_ready():
+        s = get_screen(_base_name)
+        if not s or not s.get("ready"):
+            return None
+        return s
+
+    screen = poll_until(
+        _screen_ready,
+        "screen ready (TUI fully rendered)",
+        timeout=30,
+        interval=1.0,
+    )
+    if not screen:
+        fail("Screen not ready after 30s")
+
+    # Validate initial screen (basic schema — no prompt/frame markers for opencode)
+    print(f"\n[Validate] Initial screen state for {tool}...")
+    validate_screen_schema(screen)
+    ok("Schema valid")
+    assert screen["ready"] is True, "OpenCode should be ready after poll"
+    ok("ready=true")
+    validate_ready_pattern(screen, tool)
+    ok(f"Ready pattern '{READY_PATTERNS[tool]}' consistent")
+    # input_text is always None for opencode (no input detection in screen.rs)
+    assert screen["input_text"] is None, f"OpenCode input_text should be None, got {screen['input_text']!r}"
+    ok("input_text=None (no input detection)")
+    log_screen(screen, f"{tool} — initial")
+
+    # ── Phase 2: Bootstrap injection (first message via PTY) ─────
+    print(f"\n[Phase 2] Testing bootstrap injection (first message via PTY)...")
+
+    baseline_event = get_last_event_id(_base_name)
+    ok(f"Baseline event ID: {baseline_event}")
+
+    t1 = time.time()
+    send(f"@{_instance_name} bootstrap-test-1 do not reply")
+    ok("Message sent")
+
+    # OpenCode delivery goes through plugin, not PTY state machine.
+    # No "deliver:" status events. Verify: agent goes active (processing) then back to listening.
+    def find_status_active():
+        events = get_events(_base_name, last=30)
+        for ev in events:
+            if (ev.get("id", 0) > baseline_event
+                    and ev.get("type") == "status"
+                    and ev.get("data", {}).get("status") == "active"):
+                return ev
+        return None
+
+    active_event = poll_until(find_status_active, "agent goes active (processing bootstrap message)", timeout=30, interval=1.0)
+    ok(f"Agent went active: event={active_event['id']}")
+
+    # Wait for agent to return to listening (finished processing)
+    def find_listening_after_active():
+        events = get_events(_base_name, last=30)
+        for ev in events:
+            if (ev.get("id", 0) > active_event["id"]
+                    and ev.get("type") == "status"
+                    and ev.get("data", {}).get("status") == "listening"):
+                return ev
+        return None
+
+    listening_event = poll_until(find_listening_after_active, "agent returns to listening", timeout=60, interval=1.0)
+    t_delivery = time.time() - t1
+    ok(f"Bootstrap delivery complete: active→listening in {t_delivery:.1f}s")
+    log(f"Bootstrap: active={active_event['id']} listening={listening_event['id']}")
+
+    # Check hcom.log for bootstrap_inject confirmation (non-fatal)
+    log_path = os.path.expanduser("~/.hcom/.tmp/logs/hcom.log")
+    bootstrap_confirmed = False
+    try:
+        with open(log_path) as f:
+            for line in f:
+                if "delivery.bootstrap_inject" in line and _base_name in line:
+                    bootstrap_confirmed = True
+                    break
+    except OSError:
+        pass
+    if bootstrap_confirmed:
+        ok("Bootstrap inject confirmed in hcom.log")
+    else:
+        print("  WARN: delivery.bootstrap_inject not found in hcom.log (may have rotated)")
+
+    # Capture post-bootstrap screen
+    screen = get_screen(_base_name)
+    if screen:
+        validate_screen_schema(screen)
+        log_screen(screen, f"{tool} — post-bootstrap-delivery")
+
+    # ── Phase 3: Plugin delivery (second message, no PTY inject) ──
+    print(f"\n[Phase 3] Testing plugin delivery (second message)...")
+
+    # Wait for agent to settle
+    baseline_event2 = get_last_event_id(_base_name)
+    time.sleep(2)
+
+    t2 = time.time()
+    send(f"@{_instance_name} plugin-test-2 do not reply")
+    ok("Second message sent")
+
+    # Verify plugin delivers: active → listening cycle again
+    def find_active_for_msg2():
+        events = get_events(_base_name, last=30)
+        for ev in events:
+            if (ev.get("id", 0) > baseline_event2
+                    and ev.get("type") == "status"
+                    and ev.get("data", {}).get("status") == "active"):
+                return ev
+        return None
+
+    active2 = poll_until(find_active_for_msg2, "agent processes second message", timeout=30, interval=1.0)
+    ok(f"Agent went active for second message: event={active2['id']}")
+
+    def find_listening_after_msg2():
+        events = get_events(_base_name, last=30)
+        for ev in events:
+            if (ev.get("id", 0) > active2["id"]
+                    and ev.get("type") == "status"
+                    and ev.get("data", {}).get("status") == "listening"):
+                return ev
+        return None
+
+    poll_until(find_listening_after_msg2, "agent returns to listening after second message", timeout=60, interval=1.0)
+    t_plugin = time.time() - t2
+    ok(f"Plugin delivery complete: active→listening in {t_plugin:.1f}s")
+
+    # Capture final screen
+    screen = get_screen(_base_name)
+    if screen:
+        validate_screen_schema(screen)
+        log_screen(screen, f"{tool} — post-plugin-delivery")
+
+    # Log all events for reference
+    all_events = get_events(_base_name, last=50)
+    log(f"\n── All events for {_instance_name}")
+    for ev in all_events:
+        log(json.dumps(ev))
+
+    # ── Cleanup ──────────────────────────────────────────────────
+    print(f"\n[Cleanup] Stopping {_instance_name}...")
+    cleanup()
+    _instance_name = None
+    _base_name = None
+
+    print("\n" + "=" * 60)
+    print(f"{tool.upper()} — ALL PHASES PASSED")
+    if _log_file:
+        print(f"  Log: {_log_file}")
+    print("=" * 60)
+
+
 def main():
     tools = sys.argv[1:] or ["claude"]
     if tools == ["all"]:
-        tools = ["claude", "gemini", "codex"]
+        tools = ["claude", "gemini", "codex", "opencode"]
 
     for tool in tools:
         if tool not in READY_PATTERNS:
-            print(f"Unknown tool: {tool}. Use: claude, gemini, codex, all", file=sys.stderr)
+            print(f"Unknown tool: {tool}. Use: claude, gemini, codex, opencode, all", file=sys.stderr)
             sys.exit(1)
 
     results = {}
     for tool in tools:
         try:
-            run_test(tool)
+            if tool == "opencode":
+                run_test_opencode()
+            else:
+                run_test(tool)
             results[tool] = "PASS"
         except SystemExit:
             results[tool] = "FAIL"

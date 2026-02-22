@@ -290,7 +290,11 @@ def _parse_list_json(stdout: str) -> list[dict[str, Any]]:
         # Skip _self wrapper line
         if isinstance(obj, dict) and "_self" in obj and len(obj) == 1:
             continue
-        items.append(obj)
+        # Flatten arrays (hcom list --json may emit a JSON array per line)
+        if isinstance(obj, list):
+            items.extend(o for o in obj if isinstance(o, dict))
+        else:
+            items.append(obj)
     return items
 
 

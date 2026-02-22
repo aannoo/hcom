@@ -15,15 +15,15 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use regex::Regex;
 use serde_json::Value;
 
 use crate::db::HcomDb;
-use crate::log::{log_info, log_error};
+use crate::log::{log_error, log_info};
 
 /// Regex to extract file paths from apply_patch input
 /// Matches: *** Update File: path, *** Add File: path, *** Delete File: path
@@ -94,27 +94,30 @@ impl TranscriptWatcher {
             return 0;
         }
 
-        // Read new lines
+        // Read new lines, only advancing file_pos past complete lines
         let mut line = String::new();
         loop {
             line.clear();
+            let pos_before = reader.stream_position().unwrap_or(self.file_pos);
             match reader.read_line(&mut line) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
+                    if !line.ends_with('\n') {
+                        // Partial line (writer still appending) — revert and retry next poll
+                        self.file_pos = pos_before;
+                        break;
+                    }
                     if line.trim().is_empty() {
+                        self.file_pos = reader.stream_position().unwrap_or(self.file_pos);
                         continue;
                     }
                     if let Ok(entry) = serde_json::from_str::<Value>(&line) {
                         edits_logged += self.process_entry(&entry, db);
                     }
+                    self.file_pos = reader.stream_position().unwrap_or(self.file_pos);
                 }
                 Err(_) => break,
             }
-        }
-
-        // Update file position
-        if let Ok(pos) = reader.stream_position() {
-            self.file_pos = pos;
         }
 
         edits_logged
@@ -132,10 +135,14 @@ impl TranscriptWatcher {
         };
 
         let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Handle user messages -> log active:prompt status (filter hcom injections)
-        if payload_type == "message" && payload.get("role").and_then(|v| v.as_str()) == Some("user") {
+        if payload_type == "message" && payload.get("role").and_then(|v| v.as_str()) == Some("user")
+        {
             let text = self.extract_message_text(payload);
             // Skip hcom-injected messages, only log real user prompts
             if !text.starts_with("[hcom]") {
@@ -150,7 +157,10 @@ impl TranscriptWatcher {
         }
 
         let tool_name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+        let call_id = payload
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Skip if already processed
         if !call_id.is_empty() && self.logged_call_ids.contains(call_id) {
@@ -161,7 +171,8 @@ impl TranscriptWatcher {
 
         if tool_name == "apply_patch" {
             // Extract file paths from apply_patch input
-            let input_text = payload.get("input")
+            let input_text = payload
+                .get("input")
                 .or_else(|| payload.get("arguments"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -172,9 +183,13 @@ impl TranscriptWatcher {
                     edits += 1;
                 }
             }
-        } else if tool_name == "shell" || tool_name == "shell_command" || tool_name == "exec_command" {
+        } else if tool_name == "shell"
+            || tool_name == "shell_command"
+            || tool_name == "exec_command"
+        {
             // Log shell commands
-            let args_str = payload.get("arguments")
+            let args_str = payload
+                .get("arguments")
                 .or_else(|| payload.get("input"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -226,11 +241,13 @@ impl TranscriptWatcher {
                 // Handle array format: ["bash", "-lc", "actual command"]
                 if let Some(arr) = cmd_val.as_array() {
                     if arr.len() >= 3
-                        && arr[0].as_str() == Some("bash") && arr[1].as_str() == Some("-lc")
+                        && arr[0].as_str() == Some("bash")
+                        && arr[1].as_str() == Some("-lc")
                     {
                         return arr[2].as_str().unwrap_or("").to_string();
                     }
-                    return arr.iter()
+                    return arr
+                        .iter()
                         .filter_map(|v| v.as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
@@ -252,9 +269,17 @@ impl TranscriptWatcher {
             "active",
             "tool:apply_patch",
             Some(filepath),
-            if timestamp.is_empty() { None } else { Some(timestamp) },
+            if timestamp.is_empty() {
+                None
+            } else {
+                Some(timestamp)
+            },
         ) {
-            log_error("transcript", "log_event.fail", &format!("Failed to log file edit: {}", e));
+            log_error(
+                "transcript",
+                "log_event.fail",
+                &format!("Failed to log file edit: {}", e),
+            );
         }
 
         if !timestamp.is_empty() {
@@ -275,9 +300,17 @@ impl TranscriptWatcher {
             "active",
             "tool:shell",
             Some(command),
-            if timestamp.is_empty() { None } else { Some(timestamp) },
+            if timestamp.is_empty() {
+                None
+            } else {
+                Some(timestamp)
+            },
         ) {
-            log_error("transcript", "log_event.fail", &format!("Failed to log shell command: {}", e));
+            log_error(
+                "transcript",
+                "log_event.fail",
+                &format!("Failed to log shell command: {}", e),
+            );
         }
 
         if !timestamp.is_empty() {
@@ -298,19 +331,22 @@ impl TranscriptWatcher {
             "active",
             "prompt",
             None,
-            if timestamp.is_empty() { None } else { Some(timestamp) },
+            if timestamp.is_empty() {
+                None
+            } else {
+                Some(timestamp)
+            },
         ) {
-            log_error("transcript", "log_event.fail", &format!("Failed to log user prompt: {}", e));
+            log_error(
+                "transcript",
+                "log_event.fail",
+                &format!("Failed to log user prompt: {}", e),
+            );
         }
 
         if !timestamp.is_empty() {
-            let _ = db.update_status_if_newer(
-                &self.instance_name,
-                "active",
-                "prompt",
-                None,
-                timestamp,
-            );
+            let _ =
+                db.update_status_if_newer(&self.instance_name, "active", "prompt", None, timestamp);
         }
     }
 }
@@ -323,7 +359,11 @@ pub fn run_transcript_watcher(
     instance_name: String,
     poll_interval: Duration,
 ) {
-    log_info("transcript", "watcher.start", &format!("Starting transcript watcher for {}", instance_name));
+    log_info(
+        "transcript",
+        "watcher.start",
+        &format!("Starting transcript watcher for {}", instance_name),
+    );
 
     let mut watcher = TranscriptWatcher::new(&instance_name);
 
@@ -331,7 +371,11 @@ pub fn run_transcript_watcher(
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {
-            log_error("transcript", "db.open.fail", &format!("Failed to open DB: {}", e));
+            log_error(
+                "transcript",
+                "db.open.fail",
+                &format!("Failed to open DB: {}", e),
+            );
             return;
         }
     };
@@ -346,16 +390,22 @@ pub fn run_transcript_watcher(
                 // No transcript path set - normal case
             }
             Err(e) => {
-                log_error("native", "transcript.init", &format!(
-                    "DB error getting transcript path: {}", e
-                ));
+                log_error(
+                    "native",
+                    "transcript.init",
+                    &format!("DB error getting transcript path: {}", e),
+                );
             }
         }
 
         // Sync any new entries
         let edits = watcher.sync(&db);
         if edits > 0 {
-            log_info("transcript", "watcher.sync", &format!("Logged {} file edits for {}", edits, instance_name));
+            log_info(
+                "transcript",
+                "watcher.sync",
+                &format!("Logged {} file edits for {}", edits, instance_name),
+            );
         }
 
         // Sleep in small increments to check running flag
@@ -367,16 +417,41 @@ pub fn run_transcript_watcher(
         }
     }
 
-    log_info("transcript", "watcher.stop", &format!("Transcript watcher stopped for {}", instance_name));
+    log_info(
+        "transcript",
+        "watcher.stop",
+        &format!("Transcript watcher stopped for {}", instance_name),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn watcher() -> TranscriptWatcher {
         TranscriptWatcher::new("test")
+    }
+
+    fn setup_test_db() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_transcript_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+        let _ = Connection::open(&db_path).unwrap();
+        db_path
+    }
+
+    fn cleanup_test_db(path: PathBuf) {
+        let _ = std::fs::remove_file(path);
     }
 
     // ---- apply_patch_regex ----
@@ -385,7 +460,8 @@ mod tests {
     fn regex_matches_update_add_delete() {
         let re = apply_patch_regex();
         let input = "*** Update File: src/main.rs\n*** Add File: new.rs\n*** Delete File: old.rs\n";
-        let paths: Vec<&str> = re.captures_iter(input)
+        let paths: Vec<&str> = re
+            .captures_iter(input)
             .filter_map(|c| c.get(1).map(|m| m.as_str()))
             .collect();
         assert_eq!(paths, vec!["src/main.rs", "new.rs", "old.rs"]);
@@ -474,12 +550,28 @@ mod tests {
 
     #[test]
     fn logged_call_ids_bounds_memory() {
+        let db_path = setup_test_db();
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
         let mut w = watcher();
+
         for i in 0..10001 {
             w.logged_call_ids.insert(format!("id_{}", i));
         }
-        assert!(w.logged_call_ids.len() > 10000);
-        // Next process_entry with a call_id would trigger the clear
-        // (tested indirectly since process_entry needs DB)
+
+        let entry = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "noop",
+                "call_id": "new_id"
+            }
+        });
+        let edits = w.process_entry(&entry, &db);
+
+        assert_eq!(edits, 0);
+        assert_eq!(w.logged_call_ids.len(), 1);
+        assert!(w.logged_call_ids.contains("new_id"));
+
+        cleanup_test_db(db_path);
     }
 }

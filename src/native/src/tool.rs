@@ -11,6 +11,7 @@ pub enum Tool {
     Claude,
     Gemini,
     Codex,
+    OpenCode,
 }
 
 impl Tool {
@@ -25,6 +26,10 @@ impl Tool {
             // Use the › prompt character instead — always visible when TUI is loaded.
             Tool::Codex => "\u{203A} ".as_bytes(),
             Tool::Gemini => b"Type your message",
+            // OpenCode: bottom status bar — appears when TUI is fully rendered.
+            // Gates delivery thread startup so PTY bootstrap inject doesn't fire
+            // into a blank screen before the input box exists.
+            Tool::OpenCode => b"ctrl+p commands",
         }
     }
 
@@ -36,9 +41,9 @@ impl Tool {
             Tool::Claude => "claude",
             Tool::Gemini => "gemini",
             Tool::Codex => "codex",
+            Tool::OpenCode => "opencode",
         }
     }
-
 }
 
 impl FromStr for Tool {
@@ -49,6 +54,7 @@ impl FromStr for Tool {
             "claude" => Ok(Tool::Claude),
             "gemini" => Ok(Tool::Gemini),
             "codex" => Ok(Tool::Codex),
+            "opencode" => Ok(Tool::OpenCode),
             _ => Err(format!("Unknown tool: {}", s)),
         }
     }

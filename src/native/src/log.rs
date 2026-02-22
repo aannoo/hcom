@@ -5,11 +5,11 @@
 //! - ISO 8601 timestamps (not Unix epoch)
 //! - "subsystem" field (not "component")
 
+use crate::config::Config;
 use chrono::Utc;
 use serde::Serialize;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
-use crate::config::Config;
 
 /// Log entry structure for safe JSON serialization
 #[derive(Serialize)]
@@ -52,11 +52,7 @@ pub fn log(level: &str, subsystem: &str, event: &str, message: &str) {
     };
 
     // Append to file
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{}", log_line);
     }
 }

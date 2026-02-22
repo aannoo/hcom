@@ -87,11 +87,16 @@ pub struct ScreenTracker {
 
 impl ScreenTracker {
     /// Create a new screen tracker with instance name (for debug logging)
-    pub fn new_with_instance(rows: u16, cols: u16, ready_pattern: &[u8], instance_name: Option<&str>) -> Self {
+    pub fn new_with_instance(
+        rows: u16,
+        cols: u16,
+        ready_pattern: &[u8],
+        instance_name: Option<&str>,
+    ) -> Self {
         let config = Config::get();
         let debug_flag_path = config.hcom_dir.join(".tmp").join("pty_debug_on");
-        // Enable if env var set OR runtime flag file exists
-        let debug_enabled = config.pty_debug || debug_flag_path.exists();
+        // Enable if runtime flag file exists
+        let debug_enabled = debug_flag_path.exists();
         let debug_file = if debug_enabled {
             Self::open_debug_file(instance_name)
         } else {
@@ -189,9 +194,12 @@ impl ScreenTracker {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
-    /// Clear approval state (user typed something)
+    /// Clear approval state (user typed something).
+    /// Also clears output_buffer to prevent stale OSC9 patterns from
+    /// re-triggering approval on the next process() call.
     pub fn clear_approval(&mut self) {
         self.waiting_approval = false;
+        self.output_buffer.clear();
     }
 
     /// Check if CLI is ready for input injection.
@@ -257,8 +265,8 @@ impl ScreenTracker {
             self.debug_enabled = true;
             self.debug_file = Self::open_debug_file(self.instance_name.as_deref());
             self.debug_log("PTY Debug toggled ON at runtime via flag file");
-        } else if !flag_on && self.debug_enabled && !Config::get().pty_debug {
-            // Toggle OFF (only if not also set via env var)
+        } else if !flag_on && self.debug_enabled {
+            // Toggle OFF
             self.debug_log("PTY Debug toggled OFF at runtime (flag file removed)");
             self.debug_enabled = false;
             self.debug_file = None;
@@ -292,7 +300,11 @@ impl ScreenTracker {
         for col in start_col..cols {
             if let Some(cell) = screen.cell(row, col) {
                 let contents = cell.contents();
-                if contents.is_empty() || contents.chars().all(|c| c.is_whitespace() || c == '\u{00A0}') {
+                if contents.is_empty()
+                    || contents
+                        .chars()
+                        .all(|c| c.is_whitespace() || c == '\u{00A0}')
+                {
                     continue;
                 }
                 if cell.dim() {
@@ -323,6 +335,7 @@ impl ScreenTracker {
             Ok(Tool::Claude) => self.get_claude_input_text(),
             Ok(Tool::Gemini) => self.get_gemini_input_text(),
             Ok(Tool::Codex) => self.get_codex_input_text(),
+            Ok(Tool::OpenCode) => None, // OpenCode: plugin handles delivery, no PTY input detection needed
             Err(_) => None,
         }
     }
@@ -389,7 +402,8 @@ impl ScreenTracker {
             }
 
             // Dim text = placeholder, not real input
-            let is_placeholder = self.is_dim_after_prompt(row_idx as u16, "❯")
+            let is_placeholder = self
+                .is_dim_after_prompt(row_idx as u16, "❯")
                 .unwrap_or(true); // Can't find prompt cell = treat as placeholder
             if is_placeholder {
                 return Some(String::new());
@@ -552,14 +566,20 @@ impl ScreenTracker {
         let cursor = screen.cursor_position();
 
         let mut output = String::new();
-        output.push_str(&format!("\n=== SCREEN DUMP {}: {} ===\n", self.debug_counter, label));
+        output.push_str(&format!(
+            "\n=== SCREEN DUMP {}: {} ===\n",
+            self.debug_counter, label
+        ));
         output.push_str(&format!("Tool: {}\n", tool));
         output.push_str(&format!("Ready pattern: {:?}\n", self.ready_pattern));
         output.push_str(&format!("Inject port: {}\n", inject_port));
         output.push_str(&format!("Screen size: {}x{}\n", rows, cols));
         output.push_str(&format!("Cursor: ({}, {})\n", cursor.0, cursor.1));
         output.push_str(&format!("Waiting approval: {}\n", self.waiting_approval));
-        output.push_str(&format!("Last output: {}ms ago\n", self.last_output.elapsed().as_millis()));
+        output.push_str(&format!(
+            "Last output: {}ms ago\n",
+            self.last_output.elapsed().as_millis()
+        ));
 
         // Screen content (non-empty lines only)
         output.push_str("Screen content (non-empty lines):\n");
@@ -595,9 +615,16 @@ impl ScreenTracker {
                                     found_prompt = true;
                                     continue;
                                 }
-                                if found_prompt && !contents.is_empty() && !contents.chars().all(|c| c.is_whitespace()) {
+                                if found_prompt
+                                    && !contents.is_empty()
+                                    && !contents.chars().all(|c| c.is_whitespace())
+                                {
                                     let dim_marker = if cell.dim() { "D" } else { "-" };
-                                    attrs_info.push_str(&format!("{}:{} ", contents.chars().next().unwrap_or('?'), dim_marker));
+                                    attrs_info.push_str(&format!(
+                                        "{}:{} ",
+                                        contents.chars().next().unwrap_or('?'),
+                                        dim_marker
+                                    ));
                                 }
                             }
                         }
@@ -609,8 +636,15 @@ impl ScreenTracker {
 
         // Status checks
         output.push_str(&format!("is_ready(): {}\n", self.is_ready()));
-        output.push_str(&format!("is_output_stable(1000): {}\n", self.is_output_stable(1000)));
-        output.push_str(&format!("is_prompt_empty({}): {}\n", tool, self.is_prompt_empty(tool)));
+        output.push_str(&format!(
+            "is_output_stable(1000): {}\n",
+            self.is_output_stable(1000)
+        ));
+        output.push_str(&format!(
+            "is_prompt_empty({}): {}\n",
+            tool,
+            self.is_prompt_empty(tool)
+        ));
         if let Some(text) = self.get_input_box_text(tool) {
             output.push_str(&format!("get_input_box_text: {:?}\n", text));
         } else {
@@ -627,7 +661,8 @@ impl ScreenTracker {
         let (rows, cols) = screen.size();
         let cursor = screen.cursor_position();
 
-        let lines: Vec<String> = self.get_screen_lines()
+        let lines: Vec<String> = self
+            .get_screen_lines()
             .into_iter()
             .map(|l| l.trim_end().to_string())
             .collect();
@@ -639,14 +674,19 @@ impl ScreenTracker {
         // lines array
         j.push_str("  \"lines\": [");
         for (i, line) in lines.iter().enumerate() {
-            if i > 0 { j.push_str(", "); }
+            if i > 0 {
+                j.push_str(", ");
+            }
             j.push_str(&json_escape(line));
         }
         j.push_str("],\n");
         j.push_str(&format!("  \"size\": [{}, {}],\n", rows, cols));
         j.push_str(&format!("  \"cursor\": [{}, {}],\n", cursor.0, cursor.1));
         j.push_str(&format!("  \"ready\": {},\n", self.is_ready()));
-        j.push_str(&format!("  \"prompt_empty\": {},\n", self.is_prompt_empty(tool)));
+        j.push_str(&format!(
+            "  \"prompt_empty\": {},\n",
+            self.is_prompt_empty(tool)
+        ));
         match input_text {
             Some(ref t) => j.push_str(&format!("  \"input_text\": {}\n", json_escape(t))),
             None => j.push_str("  \"input_text\": null\n"),
@@ -774,7 +814,10 @@ mod tests {
         t.process("› <hcom>test message</hcom>\r\n? for shortcuts\r\n".as_bytes());
         // Current bug: returns empty because is_ready()=true
         // After fix: should return the actual text
-        assert_eq!(t.get_codex_input_text(), Some("<hcom>test message</hcom>".to_string()));
+        assert_eq!(
+            t.get_codex_input_text(),
+            Some("<hcom>test message</hcom>".to_string())
+        );
     }
 
     // ---- Gemini input extraction ----

@@ -14,6 +14,7 @@ import shutil
 import platform
 import random
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -72,9 +73,9 @@ def resolve_terminal_info(name: str, pid: int) -> TerminalInfo:
                 info.pane_id = lc_data.get("pane_id", "")
                 info.process_id = lc_data.get("process_id", "")
                 info.terminal_id = lc_data.get("terminal_id", "")
-                # Extract KITTY_LISTEN_ON from captured env
+                # Kitty socket: top-level field (from Rust early context) or env snapshot
                 lc_env = lc_data.get("env", {})
-                info.kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
+                info.kitty_listen_on = lc_data.get("kitty_listen_on", "") or lc_env.get("KITTY_LISTEN_ON", "")
     except Exception:
         pass
 
@@ -103,6 +104,12 @@ def resolve_terminal_info(name: str, pid: int) -> TerminalInfo:
         except Exception:
             pass
 
+    # Infer preset when Rust captured pane_id but not terminal_preset
+    # (e.g. same-window launches with older binary, or missing HCOM_LAUNCHED_PRESET)
+    if not info.preset_name and info.pane_id:
+        if info.kitty_listen_on:
+            info.preset_name = "kitty-split"
+
     return info
 
 
@@ -120,6 +127,7 @@ def _kitty_listen_fd() -> int | None:
 
 # Cache for available presets (computed once per process)
 _available_presets_cache: list[tuple[str, bool]] | None = None
+_presets_lock = threading.Lock()
 
 # macOS app bundle fallback commands for cross-platform terminals
 # Used when CLI binary isn't in PATH but .app bundle is installed
@@ -160,38 +168,42 @@ def get_available_presets() -> list[tuple[str, bool]]:
     if _available_presets_cache is not None:
         return _available_presets_cache
 
-    system = platform.system()
-    result: list[tuple[str, bool]] = [("default", True)]  # Always available
+    with _presets_lock:
+        if _available_presets_cache is not None:
+            return _available_presets_cache
 
-    from .core.settings import get_merged_presets
-    merged = get_merged_presets()
+        system = platform.system()
+        result: list[tuple[str, bool]] = [("default", True)]  # Always available
 
-    for name, preset in merged.items():
-        binary = preset.get("binary")
-        platforms = preset.get("platforms", [])
-        # Skip if not for current platform
-        if system not in platforms:
-            continue
+        from .core.settings import get_merged_presets
+        merged = get_merged_presets()
 
-        # Check availability
-        available = False
-        if binary:
-            # Check if binary exists in PATH or resolvable via app bundle
-            available = shutil.which(binary) is not None
-            if not available and system == "Darwin":
-                available = _resolve_binary_path(binary, preset, name) is not None
-        else:
-            # For macOS apps (binary=None), check app bundle locations
-            if system == "Darwin":
-                available = _find_macos_app(preset.get("app_name", name)) is not None
+        for name, preset in merged.items():
+            binary = preset.get("binary")
+            platforms = preset.get("platforms", [])
+            # Skip if not for current platform
+            if system not in platforms:
+                continue
+
+            # Check availability
+            available = False
+            if binary:
+                # Check if binary exists in PATH or resolvable via app bundle
+                available = shutil.which(binary) is not None
+                if not available and system == "Darwin":
+                    available = _resolve_binary_path(binary, preset, name) is not None
             else:
-                available = True  # Assume available if no binary check
+                # For macOS apps (binary=None), check app bundle locations
+                if system == "Darwin":
+                    available = _find_macos_app(preset.get("app_name", name)) is not None
+                else:
+                    available = True  # Assume available if no binary check
 
-        result.append((name, available))
+            result.append((name, available))
 
-    result.append(("custom", True))  # Always available
-    _available_presets_cache = result
-    return result
+        result.append(("custom", True))  # Always available
+        _available_presets_cache = result
+        return result
 
 
 def _resolve_binary_path(binary: str, preset: dict, preset_name: str) -> str | None:
@@ -486,7 +498,9 @@ def create_bash_script(
     # Detect tool from command if not specified
     if not tool_name:
         cmd_lower = command_str.lower()
-        if "gemini" in cmd_lower:
+        if "opencode" in cmd_lower:
+            tool_name = "OpenCode"
+        elif "gemini" in cmd_lower:
             tool_name = "Gemini"
         elif "codex" in cmd_lower:
             tool_name = "Codex"
@@ -747,6 +761,7 @@ def _get_launcher_env() -> dict[str, str]:
     predict what vars launcher commands need (DBUS_SESSION_BUS_ADDRESS, SystemRoot, etc).
     """
     strip = set(TOOL_MARKER_VARS) | set(HCOM_IDENTITY_VARS) | _TERMINAL_CONTEXT_VARS
+    strip.add("HCOM_LAUNCHED_PRESET")  # not in HCOM_IDENTITY_VARS but must not leak
     return {k: v for k, v in os.environ.items() if k not in strip}
 
 
@@ -756,6 +771,7 @@ def launch_terminal(
     cwd: str | None = None,
     background: bool = False,
     run_here: bool = False,
+    terminal: str | None = None,
 ) -> str | bool | None | tuple[str, int]:
     """Launch terminal with command using unified script-first approach
 
@@ -784,7 +800,7 @@ def launch_terminal(
 
     # For same-terminal modes, we need full env (config + instance + shell)
     # Build this by adding filtered shell env
-    PROPAGATE_HCOM_VARS = {"HCOM_DIR", "HCOM_VIA_SHIM"}
+    PROPAGATE_HCOM_VARS = {"HCOM_DIR"}
     NO_PROPAGATE_CONFIG_KEYS = {"HCOM_TERMINAL"}
     from .core.config import KNOWN_CONFIG_KEYS
 
@@ -815,14 +831,16 @@ def launch_terminal(
     # 1) Determine script extension
     # macOS default mode uses .command
     # All other cases (custom terminal, other platforms, background) use .sh
-    terminal_mode = get_config().terminal
+    terminal_mode = terminal or get_config().terminal
     use_command_ext = not background and platform.system() == "Darwin" and terminal_mode == "default"
     extension = ".command" if use_command_ext else ".sh"
     script_file = str(hcom_path(LAUNCH_DIR, f"hcom_{os.getpid()}_{random.randint(1000, 9999)}{extension}"))
 
     # Detect tool from command for terminal title
     cmd_lower = command_str.lower()
-    if "gemini" in cmd_lower:
+    if "opencode" in cmd_lower:
+        tool_name = "OpenCode"
+    elif "gemini" in cmd_lower:
         tool_name = "Gemini"
     elif "codex" in cmd_lower:
         tool_name = "Codex"
@@ -830,6 +848,31 @@ def launch_terminal(
         tool_name = "Claude Code"
 
     opens_new_window = not background and not run_here
+
+    # Resolve smart terminal shortcuts before script creation so the resolved
+    # preset (e.g. kitty-tab not kitty) makes it into HCOM_LAUNCHED_PRESET.
+    from .core.settings import get_merged_presets as _get_merged
+    kitty_socket = ""
+    if opens_new_window:
+        if terminal_mode == "kitty":
+            if os.environ.get("KITTY_WINDOW_ID"):
+                terminal_mode = "kitty-split"
+            else:
+                kitty_socket = _find_kitty_socket()
+                terminal_mode = "kitty-tab" if kitty_socket else "kitty-window"
+        elif terminal_mode == "wezterm":
+            if os.environ.get("WEZTERM_PANE"):
+                terminal_mode = "wezterm-split"
+            elif _wezterm_reachable():
+                terminal_mode = "wezterm-tab"
+            else:
+                terminal_mode = "wezterm-window"
+        if terminal_mode not in ("default", "print"):
+            config_and_instance_env["HCOM_LAUNCHED_PRESET"] = terminal_mode
+        # Provide KITTY_LISTEN_ON so the agent process (and Rust PTY binary) have the
+        # socket path. Needed for close-on-kill when launching from outside kitty.
+        if kitty_socket:
+            config_and_instance_env["KITTY_LISTEN_ON"] = kitty_socket
 
     # Build script_env based on launch mode
     # Principle: new windows get ONLY config.toml + instance vars (nothing from shell)
@@ -938,29 +981,8 @@ def launch_terminal(
             # Never reaches here - execve replaces the process
 
     # 4) New window or custom command mode
-    # Resolve terminal_mode: 'default' → platform auto-detect, preset name → command, else custom
+    # terminal_mode already resolved (kitty→kitty-split etc.) above for new-window launches.
     custom_cmd: str | list[str] | None
-    from .core.settings import get_merged_presets as _get_merged
-
-    # Smart terminal: "kitty" auto-detects split/tab/window, "wezterm" same pattern
-    kitty_socket = ""
-    if terminal_mode == "kitty":
-        if os.environ.get("KITTY_WINDOW_ID"):
-            terminal_mode = "kitty-split"
-        else:
-            kitty_socket = _find_kitty_socket()
-            terminal_mode = "kitty-tab" if kitty_socket else "kitty-window"
-    elif terminal_mode == "wezterm":
-        if os.environ.get("WEZTERM_PANE"):
-            terminal_mode = "wezterm-split"
-        elif _wezterm_reachable():
-            terminal_mode = "wezterm-tab"
-        else:
-            terminal_mode = "wezterm-window"
-
-    # Update HCOM_LAUNCHED_PRESET so launch_context captures the resolved preset
-    if terminal_mode != get_config().terminal:
-        env["HCOM_LAUNCHED_PRESET"] = terminal_mode
 
     if terminal_mode == "default":
         custom_cmd = None  # Will use platform default

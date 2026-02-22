@@ -1,13 +1,18 @@
-"""Unit tests for hcom term command (commands/term.py).
+"""Unit tests for hcom term command and terminal operations.
 
-Tests screen query, text injection, debug toggle, and formatting.
+Tests screen query, text injection, debug toggle, formatting,
+kill_process, close_terminal_pane, resolve_terminal_info, and pidtrack terminal fields.
 """
 
 import json
+import os
+import signal
 import socket
 import threading
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from hcom.commands.term import (
     cmd_term,
@@ -17,6 +22,14 @@ from hcom.commands.term import (
     _inject_raw,
     _inject_text,
     _query_screen,
+)
+from hcom.terminal import (
+    KillResult,
+    TerminalInfo,
+    close_terminal_pane,
+    detect_terminal_from_env,
+    kill_process,
+    resolve_terminal_info,
 )
 
 
@@ -293,3 +306,313 @@ class TestDbLookup:
         assert len(result) == 2
         names = {r["name"] for r in result}
         assert names == {"a", "b"}
+
+
+# ==================== KillResult enum ====================
+
+class TestKillResult:
+    def test_enum_values(self):
+        assert KillResult.SENT.value == "sent"
+        assert KillResult.ALREADY_DEAD.value == "already_dead"
+        assert KillResult.PERMISSION_DENIED.value == "permission_denied"
+
+    def test_all_truthy(self):
+        """All enum members are truthy (no accidental falsy comparisons)."""
+        for member in KillResult:
+            assert member
+
+
+# ==================== kill_process ====================
+
+class TestKillProcess:
+    def test_sent(self):
+        with patch("os.killpg") as mock_kill:
+            result, pane_closed = kill_process(12345)
+            assert result == KillResult.SENT
+            assert pane_closed is False
+            mock_kill.assert_called_once_with(12345, signal.SIGTERM)
+
+    def test_already_dead(self):
+        with patch("os.killpg", side_effect=ProcessLookupError):
+            result, _ = kill_process(12345)
+            assert result == KillResult.ALREADY_DEAD
+
+    def test_permission_denied(self):
+        with patch("os.killpg", side_effect=PermissionError):
+            result, _ = kill_process(12345)
+            assert result == KillResult.PERMISSION_DENIED
+
+    def test_closes_pane_before_sigterm(self):
+        """close_terminal_pane runs before SIGTERM."""
+        call_order = []
+        with (
+            patch("hcom.terminal.close_terminal_pane", side_effect=lambda *a, **k: call_order.append("close") or True) as mock_ct,
+            patch("os.killpg", side_effect=lambda *a: call_order.append("kill")),
+        ):
+            result, pane_closed = kill_process(123, preset_name="wezterm", pane_id="42")
+            assert result == KillResult.SENT
+            assert pane_closed is True
+            assert call_order == ["close", "kill"]
+            mock_ct.assert_called_once_with(123, "wezterm", pane_id="42", process_id="", kitty_listen_on="", terminal_id="")
+
+    def test_no_close_without_preset(self):
+        with (
+            patch("hcom.terminal.close_terminal_pane") as mock_ct,
+            patch("os.killpg"),
+        ):
+            kill_process(123)
+            mock_ct.assert_not_called()
+
+    def test_sigterm_sent_even_if_close_fails(self):
+        with (
+            patch("hcom.terminal.close_terminal_pane", return_value=False),
+            patch("os.killpg") as mock_kill,
+        ):
+            result, _ = kill_process(123, preset_name="wezterm", pane_id="42")
+            assert result == KillResult.SENT
+            mock_kill.assert_called_once()
+
+
+# ==================== close_terminal_pane ====================
+
+class TestCloseTerminalPane:
+    def test_no_preset(self):
+        with patch("hcom.core.settings.get_merged_preset", return_value=None):
+            assert close_terminal_pane(123, "nonexistent") is False
+
+    def test_no_close_command(self):
+        with patch("hcom.core.settings.get_merged_preset", return_value={"open": "x {script}", "close": None}):
+            assert close_terminal_pane(123, "alacritty") is False
+
+    def test_missing_pane_id(self):
+        preset = {"open": "x {script}", "close": "kill-pane --id {pane_id}"}
+        with patch("hcom.core.settings.get_merged_preset", return_value=preset):
+            assert close_terminal_pane(123, "wezterm", pane_id="") is False
+
+    def test_missing_process_id(self):
+        preset = {"open": "x {script}", "close": "close --match env:ID={process_id}"}
+        with patch("hcom.core.settings.get_merged_preset", return_value=preset):
+            assert close_terminal_pane(123, "kitty", process_id="") is False
+
+    def test_successful_close(self):
+        preset = {"open": "x {script}", "close": "wezterm cli kill-pane --pane-id {pane_id}", "binary": "wezterm"}
+        mock_result = MagicMock(returncode=0)
+        with (
+            patch("hcom.core.settings.get_merged_preset", return_value=preset),
+            patch("shutil.which", return_value="/usr/bin/wezterm"),
+            patch("subprocess.run", return_value=mock_result) as mock_run,
+        ):
+            assert close_terminal_pane(123, "wezterm", pane_id="42") is True
+            cmd = mock_run.call_args[0][0]
+            assert "42" in cmd
+            assert "{pane_id}" not in cmd
+
+    def test_failed_close(self):
+        preset = {"open": "x {script}", "close": "wezterm cli kill-pane --pane-id {pane_id}", "binary": "wezterm"}
+        mock_result = MagicMock(returncode=1)
+        with (
+            patch("hcom.core.settings.get_merged_preset", return_value=preset),
+            patch("shutil.which", return_value="/usr/bin/wezterm"),
+            patch("subprocess.run", return_value=mock_result),
+        ):
+            assert close_terminal_pane(123, "wezterm", pane_id="42") is False
+
+    def test_timeout(self):
+        import subprocess as sp
+        preset = {"open": "x {script}", "close": "slow-cmd {pane_id}", "binary": "slow-cmd"}
+        with (
+            patch("hcom.core.settings.get_merged_preset", return_value=preset),
+            patch("shutil.which", return_value="/usr/bin/slow-cmd"),
+            patch("subprocess.run", side_effect=sp.TimeoutExpired("cmd", 5)),
+        ):
+            assert close_terminal_pane(123, "test", pane_id="1") is False
+
+    def test_process_id_substitution(self):
+        """Kitty-style close with {process_id}."""
+        preset = {"open": "x {script}", "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}"}
+        mock_result = MagicMock(returncode=0)
+        with (
+            patch("hcom.core.settings.get_merged_preset", return_value=preset),
+            patch("subprocess.run", return_value=mock_result) as mock_run,
+        ):
+            assert close_terminal_pane(123, "kitty", process_id="uuid-abc") is True
+            cmd = mock_run.call_args[0][0]
+            assert "uuid-abc" in cmd
+            assert "{process_id}" not in cmd
+
+
+# ==================== detect_terminal_from_env ====================
+
+class TestDetectTerminalFromEnv:
+    def test_tmux(self):
+        with patch.dict(os.environ, {"TMUX_PANE": "%3"}, clear=False):
+            assert detect_terminal_from_env() == "tmux-split"
+
+    def test_wezterm(self):
+        with patch.dict(os.environ, {"WEZTERM_PANE": "5"}, clear=False):
+            assert detect_terminal_from_env() == "wezterm-split"
+
+    def test_kitty(self):
+        with patch.dict(os.environ, {"KITTY_WINDOW_ID": "123"}, clear=False):
+            assert detect_terminal_from_env() == "kitty-split"
+
+    def test_none(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TMUX_PANE", "WEZTERM_PANE", "KITTY_WINDOW_ID", "ZELLIJ_PANE_ID", "WAVETERM_BLOCKID")}
+        with patch.dict(os.environ, env, clear=True):
+            assert detect_terminal_from_env() is None
+
+
+# ==================== resolve_terminal_info ====================
+
+class TestResolveTerminalInfo:
+    def test_from_launch_context(self):
+        """Primary path: data from DB launch_context."""
+        lc = json.dumps({"terminal_preset": "wezterm", "pane_id": "42", "process_id": "uuid-1"})
+        pos = {"launch_context": lc}
+        with patch("hcom.core.instances.load_instance_position", return_value=pos):
+            info = resolve_terminal_info("test", 123)
+            assert info.preset_name == "wezterm"
+            assert info.pane_id == "42"
+            assert info.process_id == "uuid-1"
+
+    def test_fallback_to_pidtrack(self):
+        """When launch_context empty, falls back to pidtrack."""
+        with (
+            patch("hcom.core.instances.load_instance_position", return_value=None),
+            patch("hcom.core.pidtrack.get_preset_for_pid", return_value="tmux-split"),
+            patch("hcom.core.pidtrack.get_pane_id_for_pid", return_value="%2"),
+            patch("hcom.core.db.get_db") as mock_db,
+        ):
+            mock_db.return_value.execute.return_value.fetchone.return_value = {"process_id": "uuid-2"}
+            info = resolve_terminal_info("test", 456)
+            assert info.preset_name == "tmux-split"
+            assert info.pane_id == "%2"
+            assert info.process_id == "uuid-2"
+
+    def test_process_id_from_launch_context_skips_db(self):
+        """When process_id is in launch_context, no DB query needed."""
+        lc = json.dumps({"terminal_preset": "kitty", "pane_id": "", "process_id": "uuid-3"})
+        pos = {"launch_context": lc}
+        with (
+            patch("hcom.core.instances.load_instance_position", return_value=pos),
+            patch("hcom.core.db.get_db") as mock_db,
+        ):
+            info = resolve_terminal_info("test", 789)
+            assert info.process_id == "uuid-3"
+            mock_db.assert_not_called()
+
+    def test_all_empty(self):
+        """Graceful when nothing found."""
+        with (
+            patch("hcom.core.instances.load_instance_position", return_value=None),
+            patch("hcom.core.pidtrack.get_preset_for_pid", return_value=None),
+            patch("hcom.core.pidtrack.get_pane_id_for_pid", return_value=""),
+            patch("hcom.core.db.get_db") as mock_db,
+        ):
+            mock_db.return_value.execute.return_value.fetchone.return_value = None
+            info = resolve_terminal_info("test", 0)
+            assert info.preset_name == ""
+            assert info.pane_id == ""
+            assert info.process_id == ""
+
+
+# ==================== pidtrack terminal fields ====================
+
+class TestPidtrackTerminalFields:
+    """Test that pidtrack correctly stores and retrieves terminal info."""
+
+    @pytest.fixture(autouse=True)
+    def setup_pidtrack(self, tmp_path):
+        """Redirect pidtrack to temp file."""
+        pidfile = tmp_path / "pids.json"
+        with patch("hcom.core.pidtrack._pidfile_path", return_value=pidfile):
+            from hcom.core.pidtrack import _invalidate_cache
+            _invalidate_cache()
+            yield
+            _invalidate_cache()
+
+    def test_record_and_retrieve_preset(self):
+        from hcom.core.pidtrack import get_preset_for_pid, record_pid
+        record_pid(100, "claude", "test-inst", terminal_preset="wezterm")
+        assert get_preset_for_pid(100) == "wezterm"
+
+    def test_record_and_retrieve_pane_id(self):
+        from hcom.core.pidtrack import get_pane_id_for_pid, record_pid
+        record_pid(101, "claude", "test-inst", pane_id="42")
+        assert get_pane_id_for_pid(101) == "42"
+
+    def test_orphan_includes_terminal_fields(self):
+        from hcom.core.pidtrack import get_orphan_processes, record_pid
+        record_pid(99999, "claude", "test-inst", terminal_preset="tmux-split", pane_id="%3")
+        with patch("os.kill"):
+            orphans = get_orphan_processes(active_pids=set())
+        assert len(orphans) >= 1
+        orphan = next(o for o in orphans if o["pid"] == 99999)
+        assert orphan["terminal_preset"] == "tmux-split"
+        assert orphan["pane_id"] == "%3"
+
+    def test_no_overwrite_existing_fields(self):
+        from hcom.core.pidtrack import get_pane_id_for_pid, get_preset_for_pid, record_pid
+        record_pid(103, "claude", "inst-a", terminal_preset="wezterm", pane_id="1")
+        record_pid(103, "claude", "inst-b", terminal_preset="tmux", pane_id="2")
+        assert get_preset_for_pid(103) == "wezterm"
+        assert get_pane_id_for_pid(103) == "1"
+
+    def test_missing_fields_return_defaults(self):
+        from hcom.core.pidtrack import get_pane_id_for_pid, get_preset_for_pid, record_pid
+        record_pid(104, "claude", "test-inst")
+        assert get_preset_for_pid(104) is None
+        assert get_pane_id_for_pid(104) == ""
+
+
+# ==================== Settings merge preserves fields ====================
+
+class TestSettingsMerge:
+    def test_builtin_presets_have_pane_id_env(self):
+        from hcom.core.settings import get_merged_presets
+        merged = get_merged_presets()
+        assert merged["wezterm"].get("pane_id_env") == "WEZTERM_PANE"
+        assert merged["tmux-split"].get("pane_id_env") == "TMUX_PANE"
+
+    def test_builtin_presets_have_app_name(self):
+        from hcom.core.settings import get_merged_presets
+        merged = get_merged_presets()
+        assert merged["wezterm"].get("app_name") == "WezTerm"
+        assert merged["kitty-tab"].get("app_name") == "kitty"
+
+    def test_toml_override_preserves_builtin_fields(self):
+        """TOML override keeps pane_id_env and app_name from builtin."""
+        from hcom.core.settings import get_merged_presets, invalidate_settings_cache
+        # load_settings returns the terminal section; presets are nested under "presets"
+        toml_data = {"presets": {"wezterm": {"open": "custom-wezterm start -- bash {script}"}}}
+        with patch("hcom.core.settings.load_settings", return_value=toml_data):
+            invalidate_settings_cache()
+            merged = get_merged_presets()
+            wez = merged["wezterm"]
+            assert wez["open"] == "custom-wezterm start -- bash {script}"
+            assert wez.get("pane_id_env") == "WEZTERM_PANE"
+            assert wez.get("app_name") == "WezTerm"
+            assert wez.get("close") == "wezterm cli kill-pane --pane-id {pane_id}"
+
+
+# ==================== Preset casing alias ====================
+
+class TestPresetCasingAlias:
+    def test_config_validation_resolves_casing(self):
+        from hcom.core.config import HcomConfig
+        config = HcomConfig(terminal="WezTerm")
+        config.validate()
+        assert config.terminal == "wezterm"
+
+    def test_config_validation_resolves_alacritty(self):
+        from hcom.core.config import HcomConfig
+        config = HcomConfig(terminal="Alacritty")
+        config.validate()
+        assert config.terminal == "alacritty"
+
+    def test_lowercase_passes_unchanged(self):
+        from hcom.core.config import HcomConfig
+        config = HcomConfig(terminal="wezterm")
+        config.validate()
+        assert config.terminal == "wezterm"

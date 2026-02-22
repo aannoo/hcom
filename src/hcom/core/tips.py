@@ -11,7 +11,7 @@ TIPS = {
         "  ■ blocked (needs human user approval)  ○ inactive (dead)  ◦ unknown (neutral)"
     ),
     "list:types": (
-        "[tip] Types: [CLAUDE] [GEMINI] [CODEX] [claude] full features, automatic msg delivery"
+        "[tip] Types: [CLAUDE] [GEMINI] [CODEX] [OPENCODE] [claude] full features, automatic msg delivery"
         " | [AD-HOC] [gemini] [codex] limited"
     ),
     # Send-side (shown after send with --intent)
@@ -69,6 +69,7 @@ def print_launch_tips(
     launcher_name: str | None,
     launcher_participating: bool,
     background: bool,
+    terminal: str | None = None,
 ) -> None:
     """Print contextual tips after launch. One-time tips tracked per launcher via kv."""
     if launched == 0:
@@ -92,7 +93,7 @@ def print_launch_tips(
     from .config import get_config
     from .settings import get_merged_presets
 
-    terminal_mode = get_config().terminal
+    terminal_mode = terminal or get_config().terminal
     merged = get_merged_presets()
     has_close = bool(merged.get(terminal_mode, {}).get("close"))
     if terminal_mode in ("kitty", "wezterm"):

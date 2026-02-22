@@ -8,7 +8,6 @@ from .query import cmd_list, cmd_archive, cmd_status
 from .relay import cmd_relay
 from .config_cmd import cmd_config
 from .transcript import cmd_transcript
-from .shim import cmd_shim
 from .hooks_cmd import cmd_hooks
 from .bundle import cmd_bundle
 from .term import cmd_term
@@ -31,7 +30,6 @@ __all__ = [
     "cmd_transcript",
     "cmd_archive",
     "cmd_status",
-    "cmd_shim",
     "cmd_hooks",
     "cmd_bundle",
     "cmd_term",

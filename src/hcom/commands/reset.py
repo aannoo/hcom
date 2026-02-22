@@ -8,7 +8,6 @@ from datetime import datetime
 from .utils import format_error, get_help_text
 from ..core.paths import hcom_path, LAUNCH_DIR, LOGS_DIR, ARCHIVE_DIR
 from ..shared import shorten_path, CommandContext, is_inside_ai_tool
-from ..core.thread_context import get_hcom_go
 
 
 def get_archive_timestamp() -> str:
@@ -156,8 +155,8 @@ Actions:
 
 To reinstall: hcom hooks add
 
-Set HCOM_GO=1 and run again to proceed:
-  HCOM_GO=1 {hcom_cmd} reset hooks
+Add --go flag and run again to proceed:
+  {hcom_cmd} --go reset hooks
 """)
     elif target == "all":
         print(f"""
@@ -177,8 +176,8 @@ Actions:
   5. Archive and delete config.toml + env
   6. Clear device identity (new UUID on next relay)
 
-Set HCOM_GO=1 and run again to proceed:
-  HCOM_GO=1 {hcom_cmd} reset all
+Add --go flag and run again to proceed:
+  {hcom_cmd} --go reset all
 """)
     else:
         # Plain reset (archive db)
@@ -199,8 +198,8 @@ Actions:
 Note: Instance rows are deleted but snapshots preserved in archive.
       Query archived sessions with: {hcom_cmd} archive
 
-Set HCOM_GO=1 and run again to proceed:
-  HCOM_GO=1 {hcom_cmd} reset
+Add --go flag and run again to proceed:
+  {hcom_cmd} --go reset
 """)
 
 
@@ -239,8 +238,8 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(get_command_help("reset"), file=sys.stderr)
         return 1
 
-    # Confirmation gate: inside AI tools, require HCOM_GO=1
-    if is_inside_ai_tool() and not get_hcom_go():
+    # Confirmation gate: inside AI tools, require --go
+    if is_inside_ai_tool() and not (ctx and ctx.go):
         _print_reset_preview(target)
         return 0
 
@@ -253,7 +252,7 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         return cmd_hooks_remove(["all"])
 
     # Stop all instances before clearing database (prevents zombie processes)
-    exit_codes.append(cmd_stop(["all"]))
+    exit_codes.append(cmd_stop(["all"], ctx=ctx))
 
     # Stop daemon if running
     from .lifecycle import _daemon_stop
@@ -261,6 +260,15 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Clear database
     exit_codes.append(clear())
+
+    # For reset --all: clear pidtrack BEFORE recovery can trigger (full reset = clean slate)
+    if target == "all":
+        pidtrack_path = hcom_path(".tmp", "launched_pids.json")
+        pidtrack_path.unlink(missing_ok=True)
+    else:
+        # Trigger orphan recovery on next get_db() (pidtrack was populated by cmd_stop)
+        from ..core.db import _thread_local
+        _thread_local._post_archive = True
 
     # Log reset event (used for local import filtering + relay to other devices)
     from ..core.db import log_reset_event
@@ -277,6 +285,7 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # all: also remove hooks, reset config, clear device identity
     if target == "all":
+
         # Clear device identity (new UUID on next relay push)
         device_id_file = hcom_path(".tmp", "device_id")
         if device_id_file.exists():

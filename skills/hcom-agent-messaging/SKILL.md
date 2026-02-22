@@ -1,11 +1,11 @@
 ---
 name: hcom-agent-messaging
 description: |
-  multi-agent communication and coordination for Claude Code, Gemini CLI & Codex. Use this skill when the human user needs help, status, or reference about hcom - when user asks questions like "how to setup hcom", "hcom not working", "explain hcom", or any hcom troubleshooting.
+  Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode. Use this skill when the human user needs help, status, or reference about hcom - when user asks questions like "how to setup hcom", "hcom not working", "explain hcom", or any hcom troubleshooting.
 
 ---
 
-# hcom — Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals
+# hcom — Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode.
 
 AI agents running in separate terminals are isolated from each other. Context doesn't transfer, decisions get repeated, file edits collide. hcom connects them.
 
@@ -14,6 +14,7 @@ pip install hcom
 hcom claude
 hcom gemini
 hcom codex
+hcom opencode
 hcom                            # TUI dashboard
 ```
 
@@ -54,7 +55,7 @@ Tell any agent:
 If the user invokes this skill without arguments:
 
 1. Run `hcom status` — if "command not found", run `pip install hcom` first
-2. Tell user to run `hcom claude` or `hcom gemini` or `hcom codex` in a new terminal (auto installs hooks on first run)
+2. Tell user to run `hcom claude` or `hcom gemini` or `hcom codex` or `hcom opencode` in a new terminal (auto installs hooks on first run)
 
 | Status Output | Meaning | Action |
 |--------|---------|--------|
@@ -74,6 +75,7 @@ After adding hooks or installing hcom you must restart the current AI tool for h
 | Claude Code (incl. subagents) | automatic |
 | Gemini CLI | automatic |
 | Codex | automatic |
+| OpenCode | automatic |
 | Any AI tool | manual - via `hcom start` |
 
 
@@ -95,7 +97,7 @@ hcom relay status
 **Still broken?**
 ```bash
 hcom reset all && hcom hooks add
-# Close all claude/codex/gemini/hcom windows
+# Close all claude/codex/gemini/opencode/hcom windows
 hcom claude          # Fresh start
 ```
 

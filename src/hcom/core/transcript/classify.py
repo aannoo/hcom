@@ -3,6 +3,9 @@
 Pure functions, no imports beyond stdlib. Each classifier takes a raw JSON dict
 and returns one of: "user", "assistant", "tool_call", "tool_result", "system",
 "thinking", "unknown".
+
+OpenCode classifier uses simple role field (tool calls are parts within
+assistant messages, not separate entries).
 """
 
 
@@ -55,7 +58,7 @@ def classify_gemini(entry: dict) -> str:
     if entry_type == "user":
         return "user"
 
-    if entry_type == "info":
+    if entry_type in ("info", "error"):
         return "system"
 
     if entry_type == "gemini":
@@ -130,6 +133,22 @@ def classify_codex(entry: dict) -> str:
     return "unknown"
 
 
+def classify_opencode(data: dict) -> str:
+    """Classify an OpenCode message by its role field.
+
+    OpenCode messages have a simple 'role' field in the JSON data column.
+    Tool calls and results are parts within assistant messages, not separate entries.
+    """
+    if not data:
+        return "unknown"
+    role = data.get("role", "")
+    if role == "user":
+        return "user"
+    if role == "assistant":
+        return "assistant"
+    return "unknown"
+
+
 def detect_agent(path: str) -> str | None:
     """Detect agent type from transcript file path."""
     if ".claude" in path:
@@ -138,4 +157,7 @@ def detect_agent(path: str) -> str | None:
         return "gemini"
     if ".codex" in path:
         return "codex"
+    # OpenCode DB path contains "opencode" in the directory structure
+    if "opencode" in path:
+        return "opencode"
     return None

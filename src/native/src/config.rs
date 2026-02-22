@@ -37,8 +37,6 @@ pub struct Config {
     pub process_id: Option<String>,
     /// PTY mode flag (HCOM_PTY_MODE=1)
     pub pty_mode: bool,
-    /// PTY debug flag (HCOM_PTY_DEBUG=1)
-    pub pty_debug: bool,
     /// Python executable (HCOM_PYTHON or "python3")
     pub python: String,
 }
@@ -84,16 +82,15 @@ impl Config {
         };
 
         // HCOM_INSTANCE_NAME: optional instance name
-        let instance_name = env::var("HCOM_INSTANCE_NAME").ok().filter(|s| !s.is_empty());
+        let instance_name = env::var("HCOM_INSTANCE_NAME")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         // HCOM_PROCESS_ID: optional process ID for daemon binding
         let process_id = env::var("HCOM_PROCESS_ID").ok().filter(|s| !s.is_empty());
 
         // HCOM_PTY_MODE: boolean flag (true if "1")
         let pty_mode = env::var("HCOM_PTY_MODE").map(|v| v == "1").unwrap_or(false);
-
-        // HCOM_PTY_DEBUG: boolean flag (true if "1")
-        let pty_debug = env::var("HCOM_PTY_DEBUG").map(|v| v == "1").unwrap_or(false);
 
         // HCOM_PYTHON: python executable
         // Default: sibling python3 next to our binary (works in venvs / uv tool installs),
@@ -105,7 +102,6 @@ impl Config {
             instance_name,
             process_id,
             pty_mode,
-            pty_debug,
             python,
         }
     }
@@ -138,10 +134,7 @@ mod tests {
     where
         F: FnOnce(),
     {
-        let saved: Vec<_> = keys
-            .iter()
-            .map(|k| (k, env::var(k).ok()))
-            .collect();
+        let saved: Vec<_> = keys.iter().map(|k| (k, env::var(k).ok())).collect();
 
         // SAFETY: Tests use serial_test to run single-threaded.
         // No data races possible when tests run serially.
@@ -263,28 +256,6 @@ mod tests {
             Config::init();
             let config = Config::get();
             assert_eq!(config.pty_mode, false);
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_pty_debug_true_when_1() {
-        Config::reset();
-        with_env("HCOM_PTY_DEBUG", "1", || {
-            Config::init();
-            let config = Config::get();
-            assert_eq!(config.pty_debug, true);
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_pty_debug_false_when_unset() {
-        Config::reset();
-        without_env(&["HCOM_PTY_DEBUG"], || {
-            Config::init();
-            let config = Config::get();
-            assert_eq!(config.pty_debug, false);
         });
     }
 

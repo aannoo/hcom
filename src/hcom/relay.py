@@ -437,6 +437,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
 
         # Upsert instances from state and remove stale ones atomically
         seen_instances = set()
+        upsert_params = []
         for name, inst in state.get("instances", {}).items():
             # Skip instances with no activity or activity from before our reset
             status_time = inst.get("status_time", 0)
@@ -447,60 +448,61 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             seen_instances.add(namespaced)
             # Namespace parent with short_id suffix
             parent_namespaced = f"{inst['parent']}:{short_id}" if inst.get("parent") else None
-            # Relay-origin rows must not populate UNIQUE local identifiers
-            relay_session_id = None
-            relay_parent_session_id = None
-            relay_agent_id = None
+            upsert_params.append((
+                namespaced,
+                device_id,
+                inst.get("status", "unknown"),
+                inst.get("context", ""),
+                inst.get("detail", ""),
+                inst.get("status_time", 0),
+                parent_namespaced,
+                inst.get("directory"),
+                inst.get("transcript"),
+                time.time(),
+                None,  # relay_session_id
+                None,  # relay_parent_session_id
+                None,  # relay_agent_id
+                inst.get("wait_timeout", 86400),
+                inst.get("last_stop", 0),
+                inst.get("tcp_mode", False),
+                inst.get("tag"),
+                inst.get("tool", "claude"),
+                inst.get("background", False),
+            ))
+
+        # Batch all instance upserts under a single lock acquisition
+        if upsert_params:
             try:
                 with _write_lock:
-                    conn.execute(
-                        """
-                        INSERT INTO instances (
-                            name, origin_device_id, status, status_context, status_detail, status_time,
-                            parent_name, directory, transcript_path, created_at,
-                            session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode,
-                            tag, tool, background
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(name) DO UPDATE SET
-                            status = excluded.status,
-                            status_context = excluded.status_context, status_detail = excluded.status_detail,
-                            status_time = excluded.status_time,
-                            parent_name = excluded.parent_name,
-                            directory = excluded.directory, transcript_path = excluded.transcript_path,
-                            session_id = excluded.session_id, parent_session_id = excluded.parent_session_id,
-                            agent_id = excluded.agent_id, wait_timeout = excluded.wait_timeout,
-                            last_stop = excluded.last_stop, tcp_mode = excluded.tcp_mode,
-                            tag = excluded.tag, tool = excluded.tool, background = excluded.background
-                    """,
-                        (
-                            namespaced,
-                            device_id,
-                            inst.get("status", "unknown"),
-                            inst.get("context", ""),
-                            inst.get("detail", ""),
-                            inst.get("status_time", 0),
-                            parent_namespaced,
-                            inst.get("directory"),
-                            inst.get("transcript"),
-                            time.time(),
-                            relay_session_id,
-                            relay_parent_session_id,
-                            relay_agent_id,
-                            inst.get("wait_timeout", 86400),
-                            inst.get("last_stop", 0),
-                            inst.get("tcp_mode", False),
-                            inst.get("tag"),
-                            inst.get("tool", "claude"),
-                            inst.get("background", False),
-                        ),
-                    )
+                    for params in upsert_params:
+                        conn.execute(
+                            """
+                            INSERT INTO instances (
+                                name, origin_device_id, status, status_context, status_detail, status_time,
+                                parent_name, directory, transcript_path, created_at,
+                                session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode,
+                                tag, tool, background
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(name) DO UPDATE SET
+                                status = excluded.status,
+                                status_context = excluded.status_context, status_detail = excluded.status_detail,
+                                status_time = excluded.status_time,
+                                parent_name = excluded.parent_name,
+                                directory = excluded.directory, transcript_path = excluded.transcript_path,
+                                session_id = excluded.session_id, parent_session_id = excluded.parent_session_id,
+                                agent_id = excluded.agent_id, wait_timeout = excluded.wait_timeout,
+                                last_stop = excluded.last_stop, tcp_mode = excluded.tcp_mode,
+                                tag = excluded.tag, tool = excluded.tool, background = excluded.background
+                        """,
+                            params,
+                        )
                     conn.commit()
             except sqlite3.Error as e:
                 try:
                     conn.rollback()
                 except sqlite3.Error:
                     pass
-                log_error("relay", "relay.error", e, op="instance_upsert", instance=namespaced)
+                log_error("relay", "relay.error", e, op="instance_upsert_batch", device=device_id[:8])
 
         # Remove instances no longer in state (stopped/removed on remote)
         # Read + delete under same lock to avoid TOCTOU race

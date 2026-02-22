@@ -37,6 +37,7 @@ DEFAULT_TOML: dict[str, Any] = {
         "claude": {"args": ""},
         "gemini": {"args": "", "system_prompt": ""},
         "codex": {"args": "", "sandbox_mode": "workspace", "system_prompt": ""},
+        "opencode": {"args": ""},
     },
     "preferences": {"timeout": 86400, "auto_approve": True, "name_export": ""},
 }
@@ -55,6 +56,7 @@ TOML_KEY_MAP: dict[str, str] = {
     "codex_args": "launch.codex.args",
     "codex_sandbox_mode": "launch.codex.sandbox_mode",
     "codex_system_prompt": "launch.codex.system_prompt",
+    "opencode_args": "launch.opencode.args",
     "relay": "relay.url",
     "relay_id": "relay.id",
     "relay_token": "relay.token",
@@ -78,6 +80,7 @@ _FIELD_TO_ENV: dict[str, str] = {
     "codex_sandbox_mode": "HCOM_CODEX_SANDBOX_MODE",
     "gemini_system_prompt": "HCOM_GEMINI_SYSTEM_PROMPT",
     "codex_system_prompt": "HCOM_CODEX_SYSTEM_PROMPT",
+    "opencode_args": "HCOM_OPENCODE_ARGS",
     "relay": "HCOM_RELAY",
     "relay_id": "HCOM_RELAY_ID",
     "relay_token": "HCOM_RELAY_TOKEN",
@@ -96,20 +99,27 @@ _RELAY_FIELDS = {"relay", "relay_id", "relay_token", "relay_enabled"}
 KNOWN_CONFIG_KEYS: list[str] = list(_FIELD_TO_ENV.values())
 DEFAULT_KNOWN_VALUES: dict[str, str] = {}
 _default_config_obj = None  # Lazy — avoid constructing HcomConfig at import time
+_default_values_lock = threading.Lock()
 
 
 def _get_default_known_values() -> dict[str, str]:
     """Lazily build DEFAULT_KNOWN_VALUES from HcomConfig defaults."""
     global DEFAULT_KNOWN_VALUES, _default_config_obj
-    if not DEFAULT_KNOWN_VALUES:
+    if DEFAULT_KNOWN_VALUES:
+        return DEFAULT_KNOWN_VALUES
+    with _default_values_lock:
+        if DEFAULT_KNOWN_VALUES:
+            return DEFAULT_KNOWN_VALUES
         # Build from dataclass defaults directly
         _defaults = {f.name: f.default for f in fields(HcomConfig)}
+        result: dict[str, str] = {}
         for field_name, env_key in _FIELD_TO_ENV.items():
             val = _defaults.get(field_name, "")
             if isinstance(val, bool):
-                DEFAULT_KNOWN_VALUES[env_key] = "1" if val else "0"
+                result[env_key] = "1" if val else "0"
             else:
-                DEFAULT_KNOWN_VALUES[env_key] = str(val)
+                result[env_key] = str(val)
+        DEFAULT_KNOWN_VALUES = result
     return DEFAULT_KNOWN_VALUES
 
 
@@ -416,6 +426,7 @@ class HcomConfig:
     claude_args: str = ""
     gemini_args: str = ""
     codex_args: str = ""
+    opencode_args: str = ""
     codex_sandbox_mode: str = "workspace"
     gemini_system_prompt: str = ""
     codex_system_prompt: str = ""
@@ -613,8 +624,14 @@ class HcomConfig:
         return errors
 
     @classmethod
-    def load(cls) -> "HcomConfig":
-        """Load config with precedence: env var → config.toml → defaults"""
+    def load(cls, env_override: dict[str, str] | None = None) -> "HcomConfig":
+        """Load config with precedence: env var → config.toml → defaults.
+
+        Args:
+            env_override: If provided, use this dict for env var lookups instead
+                of os.environ. Used in daemon mode where os.environ is stale —
+                the Rust client forwards the caller's env per-request.
+        """
         toml_path = hcom_path(CONFIG_TOML, ensure_parent=True)
 
         if not toml_path.exists():
@@ -629,12 +646,15 @@ class HcomConfig:
         # Parse config.toml
         file_config = load_toml_config(toml_path) if toml_path.exists() else {}
 
+        # env_source: request env in daemon mode, os.environ in CLI mode
+        env_source = env_override if env_override is not None else os.environ
+
         def get_var(field: str) -> Any | None:
             """Get variable with precedence: env → file. Returns None if not set."""
             env_key = _FIELD_TO_ENV.get(field)
             # Relay fields are file-only (no env override)
-            if env_key and field not in _RELAY_FIELDS and env_key in os.environ:
-                return os.environ[env_key]
+            if env_key and field not in _RELAY_FIELDS and env_key in env_source:
+                return env_source[env_key]
             if field in file_config:
                 return file_config[field]
             return None
@@ -659,7 +679,7 @@ class HcomConfig:
         # Load string fields
         for str_field in (
             "terminal", "hints", "notes", "tag",
-            "claude_args", "gemini_args", "codex_args",
+            "claude_args", "gemini_args", "codex_args", "opencode_args",
             "codex_sandbox_mode", "gemini_system_prompt", "codex_system_prompt",
             "auto_subscribe", "name_export",
         ):
@@ -930,7 +950,22 @@ _config_cache_lock = threading.Lock()
 
 
 def get_config() -> HcomConfig:
-    """Get cached config, loading if needed (thread-safe with double-checked locking)"""
+    """Get cached config, loading if needed (thread-safe with double-checked locking).
+
+    In daemon mode (inside with_context), returns a request-scoped config that
+    overlays the caller's forwarded env vars on the file config. This is NOT
+    globally cached — each request gets its own config reflecting its own env.
+
+    In CLI mode, returns a globally cached config (file + os.environ).
+    """
+    # Daemon mode: request-scoped config using caller's forwarded env.
+    # Not cached globally — concurrent requests have different env (e.g. HCOM_TAG).
+    from .thread_context import get_request_env
+    req_env = get_request_env()
+    if req_env is not None:
+        return HcomConfig.load(env_override=req_env)
+
+    # CLI mode: globally cached config (existing behavior unchanged)
     global _config_cache
 
     # First check without lock (fast path for already-loaded config)

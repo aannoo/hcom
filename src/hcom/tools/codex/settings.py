@@ -341,8 +341,11 @@ def _remove_codex_hooks_from_path(config_path: Path) -> bool:
             skip_next_blank = False
             new_lines.append(line)
 
-        # Write back atomically
-        return atomic_write(config_path, "\n".join(new_lines))
+        # Write back atomically (preserve trailing newline if original had one)
+        result = "\n".join(new_lines)
+        if content.endswith("\n"):
+            result += "\n"
+        return atomic_write(config_path, result)
     except OSError:
         return False
 

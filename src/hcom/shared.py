@@ -11,7 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
-__version__ = "0.6.20"
+__version__ = "0.6.21"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"
@@ -91,9 +91,9 @@ def is_inside_ai_tool() -> bool:
     - GEMINI_CLI=1 (running inside Gemini CLI)
     - CODEX_SANDBOX* or CODEX_MANAGED_BY_* (running inside Codex)
     """
-    from .core.thread_context import get_is_claude, get_is_gemini, get_is_codex, get_is_launched
+    from .core.thread_context import get_is_claude, get_is_gemini, get_is_codex, get_is_opencode, get_is_launched
 
-    return get_is_claude() or get_is_launched() or get_is_gemini() or get_is_codex()
+    return get_is_claude() or get_is_launched() or get_is_gemini() or get_is_codex() or get_is_opencode()
 
 
 def detect_current_tool() -> str:
@@ -103,7 +103,7 @@ def detect_current_tool() -> str:
 
     Returns: 'claude', 'codex', 'gemini', or 'adhoc' if unknown.
     """
-    from .core.thread_context import get_is_claude, get_is_gemini, get_is_codex
+    from .core.thread_context import get_is_claude, get_is_gemini, get_is_codex, get_is_opencode
 
     if get_is_claude():
         return "claude"
@@ -111,6 +111,8 @@ def detect_current_tool() -> str:
         return "codex"
     if get_is_gemini():
         return "gemini"
+    if get_is_opencode():
+        return "opencode"
     return "adhoc"
 
 
@@ -131,7 +133,7 @@ def detect_vanilla_tool() -> str | None:
 
 # ===== Release Configuration =====
 # Tools available for launch (flip to enable)
-RELEASED_TOOLS = {"claude", "gemini", "codex"}  # codex: coming soon
+RELEASED_TOOLS = {"claude", "gemini", "codex", "opencode"}
 # Tools that support background/headless mode
 RELEASED_BACKGROUND = {"claude"}
 
@@ -146,6 +148,7 @@ TOOL_MARKER_VARS = (
     "CODEX_MANAGED_BY_NPM",
     "CODEX_MANAGED_BY_BUN",
     "CODEX_THREAD_ID",
+    "OPENCODE",
 )
 
 # HCOM identity vars - set per-instance, cleared to prevent parent identity leakage
@@ -153,7 +156,7 @@ TOOL_MARKER_VARS = (
 HCOM_IDENTITY_VARS = (
     "HCOM_PROCESS_ID",
     "HCOM_LAUNCHED",
-    "HCOM_LAUNCHED_PRESET",
+    # HCOM_LAUNCHED_PRESET excluded — must survive into Rust binary for hook forwarding
     "HCOM_PTY_MODE",
     "HCOM_BACKGROUND",
     "HCOM_LAUNCHED_BY",
@@ -227,6 +230,7 @@ class CommandContext:
 
     explicit_name: str | None
     identity: SenderIdentity | None
+    go: bool = False
 
 
 class HcomError(Exception):

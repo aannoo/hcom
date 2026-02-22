@@ -7,7 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, cast, overload
 
 # Single source of truth for error type
 from .shared import HcomError, SenderIdentity
@@ -49,7 +49,7 @@ class Session:
                 status (str): Current status ('active', 'listening', 'inactive').
                 transcript_path (str): Path to transcript file.
                 parent_name (str): Parent instance name (for subagents).
-                tool (str): Tool type ('claude', 'gemini', 'codex').
+                tool (str): Tool type ('claude', 'gemini', 'codex', 'opencode').
 
         Raises:
             HcomError: If instance no longer exists.
@@ -585,14 +585,15 @@ class Session:
             # Get all instances with transcripts
             conn = get_db()
             active = conn.execute("""
-                SELECT name, transcript_path, tool FROM instances
+                SELECT name, transcript_path, tool, session_id FROM instances
                 WHERE transcript_path IS NOT NULL AND transcript_path != ''
             """).fetchall()
 
             stopped = conn.execute("""
                 SELECT instance as name,
                        json_extract(data, '$.snapshot.transcript_path') as transcript_path,
-                       json_extract(data, '$.snapshot.tool') as tool
+                       json_extract(data, '$.snapshot.tool') as tool,
+                       json_extract(data, '$.snapshot.session_id') as session_id
                 FROM events
                 WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
                   AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL
@@ -608,6 +609,7 @@ class Session:
                         "name": row["name"],
                         "transcript_path": row["transcript_path"],
                         "tool": row["tool"] or "claude",
+                        "session_id": row["session_id"],
                     }
                 )
             for row in stopped:
@@ -618,6 +620,7 @@ class Session:
                             "name": row["name"],
                             "transcript_path": row["transcript_path"],
                             "tool": row["tool"] or "claude",
+                            "session_id": row["session_id"],
                         }
                     )
 
@@ -644,12 +647,14 @@ class Session:
             return []
 
         tool = data.get("tool", "claude")
+        session_id = data.get("session_id")
         result = get_thread(
             transcript_path,
             last=last,
             tool=tool,
             detailed=detailed or full,
             range_tuple=range_tuple,
+            session_id=session_id,
         )
         return result.get("exchanges", []) if not result.get("error") else []
 
@@ -709,6 +714,10 @@ def session(name: str | None = None, *, external: bool = False) -> Session:
     return Session(_name=identity.name, _external=False)
 
 
+@overload
+def instances(name: str) -> dict: ...
+@overload
+def instances(name: None = None) -> list[dict]: ...
 def instances(name: str | None = None) -> list[dict] | dict:
     """List active instances or get one by name.
 
@@ -796,7 +805,7 @@ def launch(
 
     Args:
         count: Number of instances (int) or list of spec dicts.
-        tool: One of 'claude', 'gemini', 'codex' (single mode).
+        tool: One of 'claude', 'gemini', 'codex', 'opencode' (single mode).
         tag: Group tag (single mode).
         prompt: Initial prompt (single mode).
         system_prompt: System prompt override (single mode).
@@ -1107,7 +1116,7 @@ def _launch_single(
         _restore_resume_cursor(_resolved, fork, result)
         return result
 
-    if tool not in ("gemini", "codex"):
+    if tool not in ("gemini", "codex", "opencode"):
         raise HcomError(f"Unknown tool: {tool}")
 
     # Hook setup moved to launcher.launch() - single source of truth

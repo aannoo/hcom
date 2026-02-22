@@ -121,7 +121,7 @@ from ..launcher import launch as unified_launch
 from ..commands.reset import reset_config
 
 # PTY-only tools that don't work on Windows
-_PTY_ONLY_TOOLS = {"gemini", "codex"}
+_PTY_ONLY_TOOLS = {"gemini", "codex", "opencode"}
 
 # Field storage registry - maps field_key to storage configuration
 # Format: (value_attr, cursor_attr, save_action)
@@ -142,6 +142,7 @@ _FIELD_STORAGE = {
     "HCOM_CLAUDE_ARGS": (None, None, "config_reload"),
     "HCOM_CODEX_ARGS": (None, None, "config_reload"),
     "HCOM_GEMINI_ARGS": (None, None, "config_reload"),
+    "HCOM_OPENCODE_ARGS": (None, None, "config_reload"),
 }
 
 # Tool-specific prompt storage mapping (attr names on LaunchState)
@@ -149,6 +150,7 @@ _PROMPT_STORAGE = {
     "claude": ("prompt", "prompt_cursor"),
     "gemini": ("gemini_prompt", "gemini_prompt_cursor"),
     "codex": ("codex_prompt", "codex_prompt_cursor"),
+    "opencode": ("opencode_prompt", "opencode_prompt_cursor"),
 }
 
 
@@ -176,7 +178,7 @@ class LaunchScreen:
     _claude_defaults_cache = None  # Class-level cache for claude defaults
     # Filter out PTY-only tools on Windows (they require Unix-only APIs)
     _tool_options = tuple(
-        t for t in ("claude", "gemini", "codex") if t in RELEASED_TOOLS and not (IS_WINDOWS and t in _PTY_ONLY_TOOLS)
+        t for t in ("claude", "gemini", "codex", "opencode") if t in RELEASED_TOOLS and not (IS_WINDOWS and t in _PTY_ONLY_TOOLS)
     )
 
     def __init__(self, state: UIState, tui: HcomTUI):
@@ -194,7 +196,7 @@ class LaunchScreen:
         """Check if tool CLI is installed and available in PATH.
 
         Args:
-            tool: Tool name ("claude", "gemini", or "codex").
+            tool: Tool name ("claude", "gemini", "codex", or "opencode").
 
         Returns:
             True if the tool is installed and executable.
@@ -340,8 +342,15 @@ class LaunchScreen:
             if claude_args_val != claude_args_default_normalized:
                 claude_set += 1
         else:
-            # Gemini/Codex: count non-empty fields
-            tool_prompt = self.state.launch.gemini_prompt if tool == "gemini" else self.state.launch.codex_prompt
+            # Gemini/Codex/OpenCode: count non-empty fields
+            if tool == "gemini":
+                tool_prompt = self.state.launch.gemini_prompt
+            elif tool == "codex":
+                tool_prompt = self.state.launch.codex_prompt
+            elif tool == "opencode":
+                tool_prompt = self.state.launch.opencode_prompt
+            else:
+                tool_prompt = ""
             if tool_prompt:
                 claude_set += 1
             # Count tool-specific system prompt
@@ -402,18 +411,26 @@ class LaunchScreen:
                     if not claude_spec.positional_tokens:
                         previews.append("no prompt")
             else:
-                # Gemini/Codex previews
-                tool_prompt = self.state.launch.gemini_prompt if tool == "gemini" else self.state.launch.codex_prompt
+                # Gemini/Codex/OpenCode previews
+                if tool == "gemini":
+                    tool_prompt = self.state.launch.gemini_prompt
+                elif tool == "codex":
+                    tool_prompt = self.state.launch.codex_prompt
+                elif tool == "opencode":
+                    tool_prompt = self.state.launch.opencode_prompt
+                else:
+                    tool_prompt = ""
                 if tool_prompt:
                     has_ui_prompt = True
                     prompt_preview = tool_prompt[:20] + "..." if len(tool_prompt) > 20 else tool_prompt
                     previews.append(f'prompt: "{prompt_preview}"')
-                # Tool-specific system prompt preview
-                sys_prompt = (
-                    self.state.launch.gemini_system_prompt
-                    if tool == "gemini"
-                    else self.state.launch.codex_system_prompt
-                )
+                # Tool-specific system prompt preview (opencode has none)
+                if tool == "gemini":
+                    sys_prompt = self.state.launch.gemini_system_prompt
+                elif tool == "codex":
+                    sys_prompt = self.state.launch.codex_system_prompt
+                else:
+                    sys_prompt = ""
                 if sys_prompt:
                     sys_preview = sys_prompt[:20] + "..." if len(sys_prompt) > 20 else sys_prompt
                     previews.append(f'system: "{sys_preview}"')
@@ -432,6 +449,9 @@ class LaunchScreen:
                     elif tool == "codex":
                         codex_spec = resolve_codex_args(None, args_str if args_str else None)
                         has_args_prompt = bool(codex_spec.positional_tokens)
+                    elif tool == "opencode":
+                        # OpenCode: opaque args, just check if any exist
+                        has_args_prompt = bool(args_str.strip())
                     if not has_args_prompt:
                         previews.append("no prompt")
 
@@ -444,6 +464,8 @@ class LaunchScreen:
                     lines.append(f"    {DIM}{FG_GRAY}prompt, system, append, tools, headless, args{RESET}")
                 elif tool in RELEASED_BACKGROUND:
                     lines.append(f"    {DIM}{FG_GRAY}prompt, system, headless, args{RESET}")
+                elif tool == "opencode":
+                    lines.append(f"    {DIM}{FG_GRAY}prompt, args{RESET}")
                 else:
                     lines.append(f"    {DIM}{FG_GRAY}prompt, system, args{RESET}")
 
@@ -1453,6 +1475,25 @@ class LaunchScreen:
             )
             return fields
 
+        if tool == "opencode":
+            # OpenCode: prompt and args only (no system prompt, no headless)
+            return [
+                Field(
+                    "prompt",
+                    "Prompt",
+                    "text",
+                    self.state.launch.opencode_prompt,
+                    hint="text string",
+                ),
+                Field(
+                    "opencode_args",
+                    "OpenCode Args",
+                    "text",
+                    self.state.config_edit.get("HCOM_OPENCODE_ARGS", ""),
+                    hint="flags string",
+                ),
+            ]
+
         # Gemini: prompt injected via PTY (or headless), system prompt via GEMINI_SYSTEM_MD.
         fields = [
             Field(
@@ -1533,7 +1574,7 @@ class LaunchScreen:
             elif key == "HCOM_AUTO_SUBSCRIBE":
                 # Dynamic hint: explain the currently previewed option
                 sub_hints = {
-                    "collision": "← when agents edit same file within 20s →",
+                    "collision": "← when agents edit same file within 30s →",
                     "created": "← when new agents join →",
                     "stopped": "← when agents exit →",
                     "blocked": "← when agents need user approval →",
@@ -2004,6 +2045,21 @@ class LaunchScreen:
                     prompt=self.state.launch.codex_prompt or None,
                     system_prompt=self.state.launch.codex_system_prompt or None,
                     background=headless,
+                    run_here=False,  # TUI: always launch in new terminal
+                    skip_validation=True,
+                )
+            elif tool == "opencode":
+                # OpenCode: opaque args pass-through, no background mode
+                config_args = self.state.config_edit.get("HCOM_OPENCODE_ARGS", "")
+                opencode_args = shlex.split(config_args) if config_args else []
+
+                result = unified_launch(
+                    tool,
+                    count,
+                    opencode_args,
+                    tag=(self.state.config_edit.get("HCOM_TAG", "") or None),
+                    prompt=self.state.launch.opencode_prompt or None,
+                    background=False,  # OpenCode: no background mode
                     run_here=False,  # TUI: always launch in new terminal
                     skip_validation=True,
                 )

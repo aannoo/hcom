@@ -22,8 +22,7 @@ pub struct NotifyServer {
 impl NotifyServer {
     /// Create a new notify server bound to localhost on auto-assigned port
     pub fn new() -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .context("Failed to bind notify server")?;
+        let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind notify server")?;
         let port = listener.local_addr()?.port();
 
         // Set non-blocking for poll-based waiting

@@ -1,12 +1,12 @@
 {
   "name": "hcom",
   "version": "1.0.0",
-  "description": "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals",
+  "description": "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode.",
   "author": {
     "name": "aannoo"
   },
   "homepage": "https://github.com/aannoo/hcom",
   "repository": "https://github.com/aannoo/hcom",
   "license": "MIT",
-  "keywords": ["hcom", "multi-agent", "communication", "claude", "gemini", "codex"]
+  "keywords": ["hcom", "multi-agent", "communication", "claude", "gemini", "codex", "opencode"]
 }

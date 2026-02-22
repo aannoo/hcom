@@ -52,7 +52,7 @@ LIFE_FLAGS = {"action"}
 #   Claude: tool:Write, tool:Edit
 #   Gemini: tool:write_file, tool:replace
 #   Codex: tool:apply_patch
-FILE_WRITE_CONTEXTS = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch')"
+FILE_WRITE_CONTEXTS = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit')"
 
 
 # All file operation contexts (for queries and formatting)
@@ -378,7 +378,7 @@ AND EXISTS (
     WHERE e.type = 'status' AND e.status_context IN {FILE_WRITE_CONTEXTS}
     AND e.status_detail = events_v.status_detail
     AND e.instance != events_v.instance
-    AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 20
+    AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30
 )"""
         clauses.append(f"({collision_sql})")
 

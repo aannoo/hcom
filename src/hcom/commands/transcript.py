@@ -132,7 +132,8 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
             row = conn.execute(
                 """
                 SELECT json_extract(data, '$.snapshot.transcript_path') as transcript_path,
-                       json_extract(data, '$.snapshot.tool') as tool
+                       json_extract(data, '$.snapshot.tool') as tool,
+                       json_extract(data, '$.snapshot.session_id') as session_id
                 FROM events
                 WHERE instance = ? AND type = 'life'
                   AND json_extract(data, '$.action') = 'stopped'
@@ -144,6 +145,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
                 data = {
                     "transcript_path": row["transcript_path"],
                     "tool": row["tool"] or "claude",
+                    "session_id": row["session_id"],
                 }
             else:
                 print(f"Error: '{target}' not found", file=sys.stderr)
@@ -187,6 +189,9 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
             print("May not have started a conversation yet", file=sys.stderr)
         return 1
 
+    # Extract session_id for OpenCode (needed to query the right session in SQLite)
+    session_id = data.get("session_id") if data else None
+
     # Get thread using tool-specific parser
     thread_data = get_thread(
         transcript_path,
@@ -194,6 +199,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
         tool=tool,
         detailed=detailed_output,
         range_tuple=range_tuple,
+        session_id=session_id,
     )
 
     if thread_data.get("error"):
@@ -260,9 +266,10 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
     # Get all instances with transcript paths (active + stopped from snapshots)
     conn = get_db()
 
-    # Active instances
+    # Active instances (include session_id for OpenCode)
     active = conn.execute("""
-        SELECT name, transcript_path, tool FROM instances
+        SELECT name, transcript_path, tool, session_id
+        FROM instances i
         WHERE transcript_path IS NOT NULL AND transcript_path != ''
     """).fetchall()
 
@@ -270,7 +277,8 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
     stopped = conn.execute("""
         SELECT instance as name,
                json_extract(data, '$.snapshot.transcript_path') as transcript_path,
-               json_extract(data, '$.snapshot.tool') as tool
+               json_extract(data, '$.snapshot.tool') as tool,
+               json_extract(data, '$.snapshot.session_id') as session_id
         FROM events
         WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
           AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL
@@ -286,6 +294,7 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
                 "name": row["name"],
                 "transcript_path": row["transcript_path"],
                 "tool": row["tool"] or "claude",
+                "session_id": row["session_id"],
             }
         )
     for row in stopped:
@@ -296,6 +305,7 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
                     "name": row["name"],
                     "transcript_path": row["transcript_path"],
                     "tool": row["tool"] or "claude",
+                    "session_id": row["session_id"],
                 }
             )
 
@@ -366,8 +376,8 @@ def _cmd_transcript_search(argv: list[str]) -> int:
                 return 1
         elif arg == "--agent" and i + 1 < len(argv):
             agent_filter = argv[i + 1].lower()
-            if agent_filter not in ("claude", "gemini", "codex"):
-                print(format_error("--agent must be claude, gemini, or codex"), file=sys.stderr)
+            if agent_filter not in ("claude", "gemini", "codex", "opencode"):
+                print(format_error("--agent must be claude, gemini, codex, or opencode"), file=sys.stderr)
                 return 1
             i += 1
         elif arg.startswith("-"):

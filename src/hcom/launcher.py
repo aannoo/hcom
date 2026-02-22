@@ -14,6 +14,7 @@ The launcher supports three tools with varying launch modes:
     │ claude-pty  │     ✓         │     ✗        │      Yes       │
     │ gemini      │     ✓         │     ✓*       │      Yes       │
     │ codex       │     ✓         │     ✓*       │      Yes       │
+    │ opencode    │     ✓         │     ✗        │      Yes       │
     └─────────────┴───────────────┴──────────────┴────────────────┘
     * Gemini/Codex background mode routes through PTY wrapper
 
@@ -70,7 +71,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-LaunchTool = Literal["claude", "claude-pty", "gemini", "codex"]
+LaunchTool = Literal["claude", "claude-pty", "gemini", "codex", "opencode"]
 
 
 def _normalize_tool(tool: str, *, pty: bool | None) -> LaunchTool:
@@ -78,21 +79,21 @@ def _normalize_tool(tool: str, *, pty: bool | None) -> LaunchTool:
 
     Handles the special case where "claude" + pty=True becomes "claude-pty".
     Claude has two launch modes: native hooks (claude) and PTY wrapper (claude-pty).
-    Gemini and Codex always use PTY.
+    Gemini, Codex, and OpenCode always use PTY.
 
     Args:
-        tool: Raw tool name from caller ("claude", "gemini", "codex")
+        tool: Raw tool name from caller ("claude", "gemini", "codex", "opencode")
         pty: If True and tool is "claude", use PTY mode instead of native hooks
 
     Returns:
-        Canonical LaunchTool literal: "claude", "claude-pty", "gemini", or "codex"
+        Canonical LaunchTool literal: "claude", "claude-pty", "gemini", "codex", or "opencode"
 
     Raises:
         ValueError: If tool is not a recognized name
     """
     if tool == "claude" and pty:
         return "claude-pty"
-    if tool in ("claude", "claude-pty", "gemini", "codex"):
+    if tool in ("claude", "claude-pty", "gemini", "codex", "opencode"):
         return tool  # type: ignore[return-value]
     raise ValueError(f"Unknown tool: {tool}")
 
@@ -145,6 +146,7 @@ def will_run_in_current_terminal(
     count: int,
     background: bool,
     run_here: bool | None = None,
+    terminal: str | None = None,
 ) -> bool:
     """Predict if launch will block current terminal (run in same window).
 
@@ -155,6 +157,7 @@ def will_run_in_current_terminal(
         count: Number of instances to launch
         background: Whether launching in headless/background mode
         run_here: Explicit override (None = use default logic)
+        terminal: Terminal preset override (None = use config)
 
     Returns:
         True if launch will run in current terminal (blocking), False if new window
@@ -169,18 +172,13 @@ def will_run_in_current_terminal(
     # HCOM_TERMINAL=here: internal/debug - forces current terminal
     from .core.config import get_config
 
-    if get_config().terminal == "here":
+    terminal_mode = terminal or get_config().terminal
+    if terminal_mode == "here":
         return True
-    # CRITICAL: AI tool check must come BEFORE shim check!
-    # Shim env var is inherited by Claude instances; without this order,
-    # agents would try to launch in current terminal (hijacking AI session).
     from .shared import is_inside_ai_tool
 
     if is_inside_ai_tool():
         return False  # Always new window when inside AI tool
-    # Via shim: user typed 'claude' in their terminal, run there
-    if os.environ.get("HCOM_VIA_SHIM"):
-        return True
     if background:
         return False  # Background mode never blocks terminal
     return count == 1  # Single instance runs in current terminal
@@ -291,6 +289,16 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
 
         return _verify_then_setup(verify_codex_hooks_installed, setup_codex_hooks, "codex", include_permissions)
 
+    if tool == "opencode":
+        from .tools.opencode.settings import ensure_plugin_installed
+
+        try:
+            if ensure_plugin_installed():
+                return True, None
+            return False, "Failed to setup opencode plugin. Run: hcom hooks add opencode"
+        except Exception as e:
+            return False, f"Failed to setup opencode plugin: {e}. Run: hcom hooks add opencode"
+
     return True, None  # Unknown tool - don't block
 
 
@@ -311,6 +319,7 @@ def launch(
     batch_id: str | None = None,
     name: str | None = None,
     skip_validation: bool = False,
+    terminal: str | None = None,
 ) -> dict[str, Any]:
     """Launch one or more AI tool instances with consistent tracking.
 
@@ -324,7 +333,7 @@ def launch(
     - Batch event logging for TUI and API tracking
 
     Args:
-        tool: Tool to launch ("claude", "gemini", "codex")
+        tool: Tool to launch ("claude", "gemini", "codex", "opencode")
         count: Number of instances to launch (1-100 depending on tool)
         args: CLI arguments to pass to the tool (e.g., ["--model", "sonnet"])
         tag: Group tag for instances (creates "{tag}-{name}" style names)
@@ -547,13 +556,6 @@ def launch(
         notes = get_hcom_notes_text()
         if notes:
             instance_env["HCOM_NOTES"] = notes
-        # Propagate shim marker so child's runner script exports it
-        # (previously create_runner_script read os.environ directly)
-        if os.environ.get("HCOM_VIA_SHIM"):
-            instance_env["HCOM_VIA_SHIM"] = "1"
-        # Propagate debug flag for Rust PTY binary
-        if os.environ.get("HCOM_PTY_DEBUG"):
-            instance_env["HCOM_PTY_DEBUG"] = "1"
         # Propagate dev mode env var if set (via hdev script)
         if val := os.environ.get("HCOM_DEV_ROOT"):
             instance_env["HCOM_DEV_ROOT"] = val
@@ -564,10 +566,8 @@ def launch(
         # get their correct hook_data session_id overridden by a non-resumable env_file ID.
         if normalized in ("claude", "claude-pty") and args and "--fork-session" in args:
             instance_env["HCOM_IS_FORK"] = "1"
-        # Pass resolved terminal preset so child can record it in launch_context
-        _terminal_cfg = get_config().terminal
-        if _terminal_cfg and _terminal_cfg not in ("default", "here", "print") and "{script}" not in _terminal_cfg:
-            instance_env["HCOM_LAUNCHED_PRESET"] = _terminal_cfg
+        # HCOM_LAUNCHED_PRESET is set by launch_terminal after smart resolution
+        # (kitty→kitty-tab etc.) — not here, where it would be unresolved.
         instance_name = name if name is not None else generate_unique_name()
         process_export_var = os.environ.get("HCOM_PROCESS_ID_EXPORT")
         if process_export_var:
@@ -642,7 +642,7 @@ def launch(
                         except Exception:
                             pass
 
-                        result = launch_terminal(claude_cmd, instance_env, cwd=working_dir, background=True)
+                        result = launch_terminal(claude_cmd, instance_env, cwd=working_dir, background=True, terminal=terminal)
                         if isinstance(result, tuple):
                             log_file, pid = result
                             # Store PID for hcom kill
@@ -671,12 +671,13 @@ def launch(
                         else:
                             _cleanup_instance(instance_name, process_id)
                     else:
-                        effective_run_here = will_run_in_current_terminal(count, False, run_here)
+                        effective_run_here = will_run_in_current_terminal(count, False, run_here, terminal)
                         success = launch_terminal(
                             claude_cmd,
                             instance_env,
                             cwd=working_dir,
                             run_here=effective_run_here,
+                            terminal=terminal,
                         )
                         if success:
                             launched += 1
@@ -697,7 +698,7 @@ def launch(
                     except Exception:
                         pass
 
-                    effective_run_here = will_run_in_current_terminal(count, False, run_here)
+                    effective_run_here = will_run_in_current_terminal(count, False, run_here, terminal)
                     pty_result = launch_pty(
                         "claude",
                         working_dir,
@@ -705,6 +706,7 @@ def launch(
                         instance_name,
                         list(args or []),
                         run_here=effective_run_here,
+                        terminal=terminal,
                     )
                     if pty_result:
                         launched += 1
@@ -715,7 +717,7 @@ def launch(
                 case "gemini":
                     from .pty.pty_handler import launch_pty
 
-                    effective_run_here = will_run_in_current_terminal(count, False, run_here)
+                    effective_run_here = will_run_in_current_terminal(count, False, run_here, terminal)
 
                     try:
                         update_instance_position(instance_name, {"launch_args": json.dumps(list(args or []))})
@@ -729,6 +731,7 @@ def launch(
                         instance_name,
                         list(args or []),
                         run_here=effective_run_here,
+                        terminal=terminal,
                     )
                     if pty_result:
                         launched += 1
@@ -771,7 +774,7 @@ def launch(
                     except Exception:
                         pass
 
-                    effective_run_here = will_run_in_current_terminal(count, False, run_here)
+                    effective_run_here = will_run_in_current_terminal(count, False, run_here, terminal)
 
                     instance_env["HCOM_CODEX_SANDBOX_MODE"] = sandbox_mode
                     pty_result = launch_pty(
@@ -781,6 +784,7 @@ def launch(
                         instance_name,
                         effective_codex_args,
                         run_here=effective_run_here,
+                        terminal=terminal,
                     )
                     if pty_result:
                         launched += 1
@@ -792,6 +796,36 @@ def launch(
                         )
                     else:
                         _cleanup_instance(instance_name, process_id)
+
+                case "opencode":
+                    from .pty.pty_handler import launch_pty
+
+                    # LNCH-03: Auto-approve hcom bash commands via OPENCODE_PERMISSION
+                    instance_env["OPENCODE_PERMISSION"] = json.dumps({"bash": {"hcom *": "allow"}})
+                    # Set HCOM_NAME for plugin diagnostics before identity binding
+                    instance_env["HCOM_NAME"] = instance_name
+
+                    try:
+                        update_instance_position(instance_name, {"launch_args": json.dumps(list(args or []))})
+                    except Exception:
+                        pass
+
+                    effective_run_here = will_run_in_current_terminal(count, False, run_here, terminal)
+                    pty_result = launch_pty(
+                        "opencode",
+                        working_dir,
+                        instance_env,
+                        instance_name,
+                        list(args or []),
+                        run_here=effective_run_here,
+                        terminal=terminal,
+                    )
+                    if pty_result:
+                        launched += 1
+                        handles.append({"tool": "opencode", "instance_name": instance_name})
+                    else:
+                        _cleanup_instance(instance_name, process_id)
+
         except HcomError:
             _cleanup_instance(instance_name, process_id)
             raise

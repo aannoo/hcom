@@ -160,11 +160,9 @@ def _query_archive_events(archive: dict, sql_filter: str | None, last: int) -> l
                     "data": json.loads(row["data"]) if row["data"] else {},
                 }
             )
-        conn.close()
         return list(reversed(events))  # Show oldest first
-    except sqlite3.Error as e:
+    finally:
         conn.close()
-        raise e
 
 
 def _query_archive_instances(archive: dict, sql_filter: str | None) -> list[dict]:
@@ -358,11 +356,12 @@ def _format_time(timestamp: float) -> str:
 
 
 def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
-    """List instances: hcom list [self|<name>] [field] [-v] [--json|--sh] [--name NAME]"""
+    """List instances: hcom list [self|<name>] [field] [-v] [--json|--names|--format|--sh] [--name NAME]"""
     import shlex
     from .utils import (
         resolve_identity,
         parse_name_flag,
+        parse_flag_value,
         append_unread_messages,
         validate_flags,
     )
@@ -418,6 +417,8 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     verbose_v2, argv = parse_flag_bool(argv, "--verbose")
     verbose_output = verbose_output or verbose_v2
     sh_output, argv = parse_flag_bool(argv, "--sh")
+    names_output, argv = parse_flag_bool(argv, "--names")
+    format_template, argv = parse_flag_value(argv, "--format", required=True)
 
     # Remaining non-flag args are positional
     target_name = None  # 'self' or instance name
@@ -548,16 +549,16 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     instances_for_unread = {d["name"]: d for d in sorted_instances if not is_remote_instance(d)}
     unread_counts = get_unread_counts_batch(instances_for_unread)
 
-    if json_output:
-        # JSON per line - _self entry first (skip if no identity)
-        if sender_identity:
-            self_payload = {"_self": {"name": current_name, "read_receipts": read_receipts}}
-            if verbose_output and sender_identity.session_id:
-                self_payload["_self"]["session_id"] = sender_identity.session_id
-            print(json.dumps(self_payload))
+    if names_output:
+        # Simple: one name per line, no metadata
+        for data in sorted_instances:
+            print(get_full_name(data))
+        return 0
 
+    if json_output or format_template:
         from ..core.db import get_instance_bindings
 
+        result_list = []
         for data in sorted_instances:
             # Use full display name ({tag}-{name} or {name})
             full_name = get_full_name(data)
@@ -597,7 +598,19 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 "process_bound": bindings["process_bound"],
                 "launch_context": launch_context,
             }
-            print(json.dumps(payload))
+            result_list.append(payload)
+
+        if format_template:
+            for payload in result_list:
+                try:
+                    print(format_template.format_map(payload))
+                except KeyError as e:
+                    print(format_error(f"Unknown field {e} in --format template"), file=sys.stderr)
+                    return 1
+        else:
+            # Clean JSON array
+            print(json.dumps(result_list))
+        return 0
     else:
         # Human-readable - show header with name and read receipts
         # Use full display name (with tag prefix if set)
@@ -891,8 +904,10 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 age_part = f" · {age}" if age else ""
                 print(f"  ◌ {name_str} · {o['tool']}{age_part}")
             if len(orphans) == 1 and orphans[0].get("names"):
+                print(f"  → hcom start --orphan {orphans[0]['names'][0]}")
                 print(f"  → hcom kill {orphans[0]['names'][0]}")
             else:
+                print("  → hcom start --orphan <name|pid>")
                 print("  → hcom kill <name>")
 
         # Show recently stopped summary (last 10 minutes)
@@ -985,6 +1000,8 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     claude_hooks = verify_claude_hooks_installed()
     gemini_hooks = verify_gemini_hooks_installed()
     codex_hooks = verify_codex_hooks_installed()
+    from ..tools.opencode.settings import verify_opencode_plugin_installed
+    opencode_hooks = verify_opencode_plugin_installed()
 
     # CLI tool installation (PATH + fallbacks for claude)
     from ..core.tool_utils import is_tool_installed
@@ -992,6 +1009,7 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     claude_installed = is_tool_installed("claude")
     gemini_installed = is_tool_installed("gemini")
     codex_installed = is_tool_installed("codex")
+    opencode_installed = is_tool_installed("opencode")
 
     # Terminal configuration
     terminal_config = config.terminal
@@ -1088,6 +1106,10 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 "hooks": codex_hooks,
                 "settings_path": str(codex_path),
             },
+            "opencode": {
+                "installed": opencode_installed,
+                "hooks": opencode_hooks,
+            },
         },
         "terminal": {"config": terminal_config, "available": terminal_available},
         "instances": instance_counts,
@@ -1138,7 +1160,8 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         claude_sym = tool_status(claude_installed, claude_hooks)
         gemini_sym = tool_status(gemini_installed, gemini_hooks)
         codex_sym = tool_status(codex_installed, codex_hooks)
-        print(f"tools:     Claude {claude_sym}  Gemini {gemini_sym}  Codex {codex_sym}")
+        opencode_sym = tool_status(opencode_installed, opencode_hooks)
+        print(f"tools:     Claude {claude_sym}  Gemini {gemini_sym}  Codex {codex_sym}  OpenCode {opencode_sym}")
 
         # Terminal
         if terminal_config in ("default", "custom", "print") or "{script}" in terminal_config:

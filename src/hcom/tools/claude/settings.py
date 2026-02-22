@@ -119,8 +119,7 @@ def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
     Returns:
         True if any hcom hooks/env/permissions were removed, False otherwise.
 
-    Raises:
-        ValueError: If settings structure is malformed (non-dict matchers, etc.)
+    Malformed matchers are skipped and preserved as-is (logged as warnings).
     """
     removed_any = False
 
@@ -135,18 +134,28 @@ def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
         if event not in settings["hooks"]:
             continue
 
+        # Skip malformed event values (e.g. dict or string instead of list)
+        event_matchers = settings["hooks"][event]
+        if not isinstance(event_matchers, list):
+            from ...core.log import log_info
+            log_info("hooks", "settings.malformed_event", hook_type=event, value_type=type(event_matchers).__name__)
+            continue
+
         # Process each matcher
         updated_matchers = []
-        for matcher in settings["hooks"][event]:
-            # Fail fast on malformed settings - Claude won't run with broken settings anyway
+        for matcher in event_matchers:
+            # Skip malformed matchers — preserve them as-is to avoid destroying user config
             if not isinstance(matcher, dict):
-                raise ValueError(f"Malformed settings: matcher in {event} is not a dict: {type(matcher).__name__}")
+                from ...core.log import log_info
+                log_info("hooks", "settings.malformed_matcher", hook_type=event, matcher_type=type(matcher).__name__)
+                updated_matchers.append(matcher)
+                continue
 
-            # Validate hooks field if present
             if "hooks" in matcher and not isinstance(matcher["hooks"], list):
-                raise ValueError(
-                    f"Malformed settings: hooks in {event} matcher is not a list: {type(matcher['hooks']).__name__}"
-                )
+                from ...core.log import log_info
+                log_info("hooks", "settings.malformed_hooks_field", hook_type=event, field_type=type(matcher["hooks"]).__name__)
+                updated_matchers.append(matcher)
+                continue
 
             # Work with a copy to avoid any potential reference issues
             matcher_copy = copy.deepcopy(matcher)
@@ -253,18 +262,14 @@ def setup_claude_hooks(include_permissions: bool = True) -> bool:
         if settings is None:
             settings = {}
     except (json.JSONDecodeError, PermissionError) as e:
-        raise Exception(f"Cannot read settings: {e}")
+        raise OSError(f"Cannot read settings: {e}")
 
     # Normalize hooks dict (handle malformed hooks gracefully)
     if not isinstance(settings.get("hooks"), dict):
         settings["hooks"] = {}
 
-    # Try to remove existing hcom hooks, skip if malformed
-    try:
-        _remove_claude_hcom_hooks(settings)
-    except ValueError:
-        # Malformed hooks - reset to empty and continue
-        settings["hooks"] = {}
+    # Remove existing hcom hooks (malformed entries are skipped and preserved)
+    _remove_claude_hcom_hooks(settings)
 
     # Get the hook command template
     hook_cmd_base = _get_hook_command()
@@ -318,11 +323,11 @@ def setup_claude_hooks(include_permissions: bool = True) -> bool:
     try:
         atomic_write(settings_path, json.dumps(settings, indent=2))
     except OSError as e:
-        raise Exception(f"Cannot write settings: {e}")
+        raise OSError(f"Cannot write settings: {e}") from e
 
     # Quick verification
     if not verify_claude_hooks_installed(settings_path, check_permissions=include_permissions):
-        raise Exception("Hook installation failed verification")
+        raise ValueError("Hook installation failed verification")
 
     return True
 
@@ -349,7 +354,12 @@ def _verify_claude_hooks_at(settings_path: Path, check_permissions: bool = True)
             # Find and verify HCOM hook for this type
             hcom_hook_found = False
             for matcher_dict in hook_matchers:
-                for hook in matcher_dict.get("hooks", []):
+                if not isinstance(matcher_dict, dict):
+                    continue
+                hooks_list = matcher_dict.get("hooks", [])
+                if not isinstance(hooks_list, list):
+                    continue
+                for hook in hooks_list:
                     command = hook.get("command", "")
                     # Check for HCOM and the correct subcommand
                     if ("${HCOM}" in command or "hcom" in command.lower()) and cmd_suffix in command:

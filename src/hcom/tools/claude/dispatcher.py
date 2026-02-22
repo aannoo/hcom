@@ -333,6 +333,8 @@ def _dispatch_with_context(
         if hook_type == HOOK_USERPROMPTSUBMIT:
             transcript_path = payload.transcript_path or ""
             subagent.cleanup_dead_subagents(session_id, transcript_path)
+            # Fall through to parent handler for PTY message delivery
+            # (needed for background Tasks where parent is still active)
 
         if hook_type == HOOK_SUBAGENT_START:
             agent_id = payload.agent_id

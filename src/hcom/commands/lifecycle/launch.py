@@ -1,6 +1,7 @@
 """Launch AI tool instances (Claude, Gemini, Codex)."""
 
 import os
+import shlex
 import sys
 import time
 
@@ -18,7 +19,7 @@ from ...shared import (
     skip_tool_args_validation,
     HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV,
 )
-from ...core.thread_context import get_hcom_go, get_cwd
+from ...core.thread_context import get_cwd
 from ...core.config import get_config
 from ...core.paths import hcom_path
 from ...core.instances import (
@@ -45,10 +46,58 @@ def _verify_hooks_for_tool(tool: str) -> bool:
             from ...tools.codex.settings import verify_codex_hooks_installed
 
             return verify_codex_hooks_installed(check_permissions=False)
+        elif tool == "opencode":
+            from ...tools.opencode.settings import verify_opencode_plugin_installed
+
+            return verify_opencode_plugin_installed()
         else:
             return True  # Unknown tool - don't block
     except Exception:
         return True  # On error, don't block (optimistic)
+
+
+def _resolve_launch_cwd() -> str:
+    """Resolve working directory for launched agents.
+
+    OpenCode bug workaround: opencode's bash tool runs commands with cwd="/"
+    for non-git projects. When we detect this (cwd is "/" and we're inside a
+    known instance), fall back to the instance's stored directory from the DB.
+    """
+    cwd = str(get_cwd())
+    if cwd != "/":
+        return cwd
+
+    # cwd is "/" — likely opencode non-git project bug.
+    # Try to recover from the launching instance's stored directory.
+    try:
+        from ...core.thread_context import get_process_id
+
+        process_id = get_process_id()
+        if not process_id:
+            # Also check env directly (CLI fallback mode)
+            process_id = os.environ.get("HCOM_PROCESS_ID")
+        if process_id:
+            from ...core.instances import resolve_process_binding
+
+            instance_name = resolve_process_binding(process_id)
+            if instance_name:
+                data = load_instance_position(instance_name)
+                stored_dir = data.get("directory", "") if data else ""
+                if stored_dir and stored_dir != "/":
+                    from ...core.log import log_info
+
+                    log_info(
+                        "launcher",
+                        "launch.cwd_override",
+                        from_cwd="/",
+                        to_cwd=stored_dir,
+                        instance=instance_name,
+                    )
+                    return stored_dir
+    except Exception:
+        pass  # Fall through to "/"
+
+    return cwd
 
 
 def _print_launch_preview(tool: str, count: int, background: bool, args: list[str] | None = None) -> None:
@@ -103,6 +152,13 @@ def _print_launch_preview(tool: str, count: int, background: bool, args: list[st
             if background
             else ""
         )
+    elif tool == "opencode":
+        cli_help = "args forwarded to opencode CLI (see `opencode --help`)"
+        mode_note = (
+            "\n  Note: OpenCode headless not supported, use interactive mode"
+            if background
+            else ""
+        )
     else:
         cli_help = f"see `{tool} --help`"
         mode_note = ""
@@ -120,18 +176,20 @@ def _print_launch_preview(tool: str, count: int, background: bool, args: list[st
         tool_env_vars = f"HCOM_GEMINI_SYSTEM_PROMPT={config.gemini_system_prompt}"
     elif tool == "codex":
         tool_env_vars = f"HCOM_CODEX_SYSTEM_PROMPT={config.codex_system_prompt}"
+    elif tool == "opencode":
+        tool_env_vars = f"HCOM_OPENCODE_ARGS={config.opencode_args}"
     else:
         tool_env_vars = ""
 
     print(f"""
 == LAUNCH PREVIEW ==
 This shows launch config and info.
-Set HCOM_GO=1 and run again to proceed.
+Add --go flag and run again to proceed.
 
 Tool: {tool}  Count: {count}  Mode: {"headless" if background else "interactive"}{mode_note}
 Directory: {get_cwd()}
 
-Config (override: VAR=val {hcom_cmd} ...):
+Config (override: --tag / --terminal flags, or VAR=val {hcom_cmd} ...):
   HCOM_TAG={fmt("HCOM_TAG")}
   HCOM_TERMINAL={fmt("HCOM_TERMINAL") or "default"}
   HCOM_HINTS={fmt("HCOM_HINTS") or "(none)"}
@@ -150,13 +208,42 @@ Launch Behavior:
   - Agents auto-register with hcom & get session info on startup
   - Interactive instances open in new terminal windows
   - Headless agents run in background, log to ~/.hcom/.tmp/logs/
-  - Use HCOM_TAG to group instances: HCOM_TAG=team {hcom_cmd} 3
+  - Use --tag to group instances: {hcom_cmd} 3 --tag team
   - Use `hcom events launch` to block until agents are ready or launch failed
 
 Initial Prompt Tip:
   Tell instances to use 'hcom' in the initial prompt to guarantee
   they respond correctly. Define explicit roles/tasks.
 """)
+
+
+def _extract_hcom_flags(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Strip --tag and --terminal from argv before tool-specific parsing.
+
+    Returns (tag_override, terminal_override, remaining_argv).
+    These are hcom-level flags; tool parsers would reject them as unknown options.
+    Supports both space-separated (--tag foo) and equals (--tag=foo) forms.
+    """
+    tag = terminal = None
+    remaining = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--tag" and i + 1 < len(argv):
+            tag = argv[i + 1]
+            i += 2
+        elif argv[i].startswith("--tag="):
+            tag = argv[i][6:]
+            i += 1
+        elif argv[i] == "--terminal" and i + 1 < len(argv):
+            terminal = argv[i + 1]
+            i += 2
+        elif argv[i].startswith("--terminal="):
+            terminal = argv[i][11:]
+            i += 1
+        else:
+            remaining.append(argv[i])
+            i += 1
+    return tag, terminal, remaining
 
 
 def cmd_launch_tool(
@@ -166,12 +253,12 @@ def cmd_launch_tool(
     launcher_name: str | None = None,
     ctx: "CommandContext | None" = None,
 ) -> int:
-    """Launch AI tool instances: hcom [N] [claude|gemini|codex] [args]
+    """Launch AI tool instances: hcom [N] [claude|gemini|codex|opencode] [args]
 
     Unified entry point for all tool launch commands (CLI path).
 
     Args:
-        tool: Tool name ("claude", "gemini", "codex")
+        tool: Tool name ("claude", "gemini", "codex", "opencode")
         argv: Command line arguments (identity flags already stripped)
         launcher_name: Explicit launcher identity from --name flag
         ctx: Command context with explicit_name if --name was provided
@@ -180,6 +267,28 @@ def cmd_launch_tool(
         CLIError: On argument validation failure.
         HcomError: On hook setup failure or launch failure.
     """
+    # --- Extract hcom-level flags before tool-specific arg parsing ---
+    # --tag and --terminal are hcom flags; tool parsers would reject them as unknown options.
+    tag_override, terminal_override, argv = _extract_hcom_flags(argv)
+
+    return _cmd_launch_tool_inner(
+        tool, argv,
+        launcher_name=launcher_name,
+        ctx=ctx,
+        tag_override=tag_override,
+        terminal_override=terminal_override,
+    )
+
+
+def _cmd_launch_tool_inner(
+    tool: str,
+    argv: list[str],
+    *,
+    launcher_name: str | None,
+    ctx: "CommandContext | None",
+    tag_override: str | None = None,
+    terminal_override: str | None = None,
+) -> int:
     from ...launcher import launch as unified_launch, will_run_in_current_terminal
 
     config = get_config()
@@ -306,11 +415,21 @@ def cmd_launch_tool(
             tool_args = x_spec.rebuild_tokens(include_subcommand=include_subcommand)
             system_prompt = config.codex_system_prompt or None
 
+        case "opencode":
+            # OpenCode args are opaque pass-through (no hcom validation)
+            # CLI args replace config; can't safely merge without knowing arg semantics
+            if forwarded:
+                tool_args = list(forwarded)
+            elif config.opencode_args:
+                tool_args = shlex.split(config.opencode_args)
+            else:
+                tool_args = []
+
         case _:
             raise CLIError(f"Unknown tool: {tool}")
 
-    # --- HCOM_GO confirmation gate ---
-    if is_inside_ai_tool() and not get_hcom_go() and (forwarded or count > 5):
+    # --- --go confirmation gate ---
+    if is_inside_ai_tool() and not (ctx and ctx.go) and (forwarded or count > 5):
         _print_launch_preview(tool, count, background, forwarded)
         return 0
 
@@ -328,20 +447,22 @@ def cmd_launch_tool(
     # --- PTY and terminal decisions ---
     use_pty = tool != "claude" or (not background and not IS_WINDOWS)
     ran_here = will_run_in_current_terminal(count, background)
-    tag = config.tag
+    tag = tag_override if tag_override is not None else config.tag
 
     # --- Launch ---
+    _launch_cwd = _resolve_launch_cwd()
     result = unified_launch(
         tool,
         count,
         tool_args,
         tag=tag,
         background=background,
-        cwd=str(get_cwd()),
+        cwd=_launch_cwd,
         launcher=launcher,
         pty=use_pty,
         system_prompt=system_prompt,
         skip_validation=True,
+        terminal=terminal_override,
     )
 
     # --- Surface errors ---
@@ -372,7 +493,7 @@ def cmd_launch_tool(
     print("To block until ready or fail (30s timeout), run: hcom events launch")
 
     # --- Auto-TUI or tips ---
-    terminal_mode = config.terminal
+    terminal_mode = terminal_override or config.terminal
     explicit_name_provided = ctx and ctx.explicit_name
 
     if (
@@ -403,6 +524,7 @@ def cmd_launch_tool(
             launcher_name=launcher if launcher != "user" else None,
             launcher_participating=launcher_participating,
             background=background,
+            terminal=terminal_mode,
         )
 
     return 0 if failed == 0 else 1

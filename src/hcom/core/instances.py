@@ -56,6 +56,7 @@ from __future__ import annotations
 import math
 import random
 import sqlite3
+import threading
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -97,6 +98,7 @@ from .timeouts import (
 _last_drift_check_mono: float = 0.0
 _last_drift_check_wall: float = 0.0
 _wake_grace_until: float = 0.0  # monotonic deadline for grace period
+_wake_lock = threading.Lock()
 
 
 def _is_in_wake_grace() -> bool:
@@ -108,22 +110,23 @@ def _is_in_wake_grace() -> bool:
     global _last_drift_check_mono, _last_drift_check_wall, _wake_grace_until
     now_mono = time.monotonic()
     now_wall = time.time()
-    if _last_drift_check_mono > 0:
-        drift = (now_wall - _last_drift_check_wall) - (now_mono - _last_drift_check_mono)
-        if drift > 30:
-            from .log import log_info
+    with _wake_lock:
+        if _last_drift_check_mono > 0:
+            drift = (now_wall - _last_drift_check_wall) - (now_mono - _last_drift_check_mono)
+            if drift > 30:
+                from .log import log_info
 
-            log_info("cleanup", "sleep_wake_detected", drift=f"{drift:.0f}s", grace=f"{WAKE_GRACE_PERIOD}s")
-            _wake_grace_until = now_mono + WAKE_GRACE_PERIOD
-    _last_drift_check_mono = now_mono
-    _last_drift_check_wall = now_wall
-    return now_mono < _wake_grace_until
+                log_info("cleanup", "sleep_wake_detected", drift=f"{drift:.0f}s", grace=f"{WAKE_GRACE_PERIOD}s")
+                _wake_grace_until = now_mono + WAKE_GRACE_PERIOD
+        _last_drift_check_mono = now_mono
+        _last_drift_check_wall = now_wall
+        return now_mono < _wake_grace_until
 
 
 # ==================== Type Definitions ====================
 
 # Tool types supported by hcom
-ToolType = Literal["claude", "gemini", "codex", "adhoc"]
+ToolType = Literal["claude", "gemini", "codex", "opencode", "adhoc"]
 
 # Instance status values
 StatusType = Literal["active", "listening", "blocked", "inactive", "launching"]
@@ -373,7 +376,7 @@ def capture_and_store_launch_context(instance_name: str) -> None:
     # Preserve fields from Rust PTY early context that Python hook can't recapture
     # (pane_id: Python runs in launcher env lacking TMUX_PANE/WEZTERM_PANE;
     #  terminal_id: one-shot file deleted on first read)
-    preserve_keys = ("pane_id", "terminal_id")
+    preserve_keys = ("pane_id", "terminal_id", "terminal_preset", "kitty_listen_on")
     missing = [k for k in preserve_keys if not new_ctx.get(k)]
     if missing:
         pos = load_instance_position(instance_name)
@@ -489,18 +492,19 @@ def _cleanup_stale_launch_scripts(max_age_seconds: int = 86400) -> None:
 def _cleanup_orphaned_db_rows() -> None:
     """Delete notify_endpoints and process_bindings for instances no longer in DB."""
     try:
-        from .db import get_db
+        from .db import get_db, _write_lock
 
         conn = get_db()
-        conn.execute("""
-            DELETE FROM notify_endpoints
-            WHERE instance NOT IN (SELECT name FROM instances)
-        """)
-        conn.execute("""
-            DELETE FROM process_bindings
-            WHERE instance_name NOT IN (SELECT name FROM instances)
-        """)
-        conn.commit()
+        with _write_lock:
+            conn.execute("""
+                DELETE FROM notify_endpoints
+                WHERE instance NOT IN (SELECT name FROM instances)
+            """)
+            conn.execute("""
+                DELETE FROM process_bindings
+                WHERE instance_name NOT IN (SELECT name FROM instances)
+            """)
+            conn.commit()
     except Exception as e:
         from .log import log_warn
 
@@ -539,8 +543,10 @@ def _cleanup_stale_remote_instances() -> None:
             if sync_time and (now - sync_time) <= _REMOTE_DEVICE_STALE_THRESHOLD:
                 continue
             # Device is stale or has no sync time — clean up its instances
-            conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
-            conn.commit()
+            from .db import _write_lock as _wl
+            with _wl:
+                conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
+                conn.commit()
             from ..relay import _clear_short_id
             _clear_short_id(device_id)
             from .log import log_info
@@ -1504,12 +1510,13 @@ def generate_unique_name(max_retries: int = 200) -> str:
             # Reserve name immediately with placeholder row (prevents TOCTOU race)
             # initialize_instance_in_position_file will update this row with full data
             import time
-            from .db import save_instance
+            from .db import save_instance, get_last_event_id
             save_instance(name, {
                 "name": name,
                 "status": "pending",
                 "status_context": "new",
                 "created_at": int(time.time()),
+                "last_event_id": get_last_event_id(),
             })
 
             return name
@@ -1781,7 +1788,7 @@ def initialize_instance_in_position_file(
         parent_name: Parent instance name (for subagents).
         agent_id: Claude agent ID (UUID from Task tool).
         transcript_path: Path to transcript file.
-        tool: Tool type - 'claude' (default), 'gemini', 'codex', or 'adhoc'.
+        tool: Tool type - 'claude' (default), 'gemini', 'codex', 'opencode', or 'adhoc'.
         background: If True, this is a headless instance (no interactive terminal).
         tag: Optional team tag (for @-mention groups).
         wait_timeout: Idle timeout in seconds before disconnecting.
@@ -1885,7 +1892,7 @@ def initialize_instance_in_position_file(
             "status_time": int(time.time()),
             # status_context="new" triggers ready event on first status update (see set_status)
             "status_context": "new",
-            "tool": tool or "claude",  # Tool type: claude, gemini, codex
+            "tool": tool or "claude",  # Tool type: claude, gemini, codex, opencode
             "background": int(background),  # Headless mode flag
         }
 

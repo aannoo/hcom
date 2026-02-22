@@ -14,36 +14,69 @@ use crate::log::log_info;
 
 /// Hook types that read from stdin (Claude/Gemini hooks)
 pub const STDIN_HOOKS: &[&str] = &[
-    "poll", "notify", "pre", "post", "sessionstart",
-    "userpromptsubmit", "sessionend", "subagent-start", "subagent-stop",
-    "gemini-sessionstart", "gemini-beforeagent", "gemini-afteragent",
-    "gemini-beforetool", "gemini-aftertool", "gemini-notification", "gemini-sessionend",
+    "poll",
+    "notify",
+    "pre",
+    "post",
+    "sessionstart",
+    "userpromptsubmit",
+    "sessionend",
+    "subagent-start",
+    "subagent-stop",
+    "gemini-sessionstart",
+    "gemini-beforeagent",
+    "gemini-afteragent",
+    "gemini-beforetool",
+    "gemini-aftertool",
+    "gemini-notification",
+    "gemini-sessionend",
 ];
 
-/// Hook types that read from argv (Codex hooks)
-pub const ARGV_HOOKS: &[&str] = &["codex-notify"];
+/// Hook types that read from argv (Codex/OpenCode hooks)
+pub const ARGV_HOOKS: &[&str] = &[
+    "codex-notify",
+    "opencode-start",
+    "opencode-status",
+    "opencode-read",
+    "opencode-stop",
+];
 
 /// Blocking hooks need longer timeout (Stop hook blocks 30s)
 /// Keep in sync with Python hook handlers that block (poll_messages in family.py)
 pub const BLOCKING_HOOKS: &[&str] = &["poll", "subagent-stop"];
 
 /// Tools that support launch commands (hcom [N] <tool>)
-pub const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "f", "r"];
+pub const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "f", "r"];
 
 /// Environment variables to forward to daemon
 const FORWARD_ENV: &[&str] = &[
     // Identity and mode
-    "HCOM_PROCESS_ID", "HCOM_LAUNCHED", "HCOM_PTY_MODE", "HCOM_BACKGROUND", "HCOM_IS_FORK",
+    "HCOM_PROCESS_ID",
+    "HCOM_LAUNCHED",
+    "HCOM_PTY_MODE",
+    "HCOM_BACKGROUND",
+    "HCOM_IS_FORK",
     // Launch context
-    "HCOM_LAUNCHED_BY", "HCOM_LAUNCH_BATCH_ID", "HCOM_LAUNCH_EVENT_ID",
+    "HCOM_LAUNCHED_BY",
+    "HCOM_LAUNCH_BATCH_ID",
+    "HCOM_LAUNCH_EVENT_ID",
     "HCOM_LAUNCHED_PRESET",
     // Paths and config
-    "CLAUDE_ENV_FILE", "HCOM_DIR", "HCOM_GO", "HCOM_NOTES",
+    "CLAUDE_ENV_FILE",
+    "HCOM_DIR",
+    "HCOM_NOTES",
+    "HCOM_TAG",
     // Tool detection (keep in sync with TOOL_MARKER_VARS in shared.py)
-    "CLAUDECODE", "GEMINI_CLI", "GEMINI_SYSTEM_MD",
-    "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_MANAGED_BY_NPM", "CODEX_MANAGED_BY_BUN",
+    "CLAUDECODE",
+    "GEMINI_CLI",
+    "GEMINI_SYSTEM_MD",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_MANAGED_BY_NPM",
+    "CODEX_MANAGED_BY_BUN",
     "CODEX_THREAD_ID",
+    // OpenCode tool detection
+    "OPENCODE",
 ];
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -240,13 +273,18 @@ pub fn build_request(args: &[String]) -> Request {
 
 /// Send request and receive response.
 /// Returns specific error types to distinguish connection failures from read timeouts.
-pub fn try_send(stream: &UnixStream, request: &Request) -> std::result::Result<Response, DaemonError> {
+pub fn try_send(
+    stream: &UnixStream,
+    request: &Request,
+) -> std::result::Result<Response, DaemonError> {
     let total_start = Instant::now();
     let request_id = request.request_id.as_str();
 
     let timeout = get_read_timeout(request);
     stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECS))).ok();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECS)))
+        .ok();
 
     let mut stream = stream;
 
@@ -258,10 +296,16 @@ pub fn try_send(stream: &UnixStream, request: &Request) -> std::result::Result<R
     // Write request - if this fails, request wasn't sent, safe to fallback
     let write_start = Instant::now();
     if let Err(e) = stream.write_all(json.as_bytes()) {
-        return Err(DaemonError::ConnectionFailed(format!("Failed to write: {}", e)));
+        return Err(DaemonError::ConnectionFailed(format!(
+            "Failed to write: {}",
+            e
+        )));
     }
     if let Err(e) = stream.write_all(b"\n") {
-        return Err(DaemonError::ConnectionFailed(format!("Failed to write newline: {}", e)));
+        return Err(DaemonError::ConnectionFailed(format!(
+            "Failed to write newline: {}",
+            e
+        )));
     }
     stream.shutdown(std::net::Shutdown::Write).ok();
     let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
@@ -274,27 +318,44 @@ pub fn try_send(stream: &UnixStream, request: &Request) -> std::result::Result<R
         Ok(0) => {
             // EOF - daemon closed connection (likely died or restarted)
             let read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "try_send.eof", &format!(
-                "request_id={} serialize={:.1}ms write={:.1}ms read={:.1}ms (EOF)",
-                request_id, serialize_ms, write_ms, read_ms
+            log_info(
+                "client",
+                "try_send.eof",
+                &format!(
+                    "request_id={} serialize={:.1}ms write={:.1}ms read={:.1}ms (EOF)",
+                    request_id, serialize_ms, write_ms, read_ms
+                ),
+            );
+            return Err(DaemonError::ConnectionFailed(
+                "Daemon closed connection".into(),
             ));
-            return Err(DaemonError::ConnectionFailed("Daemon closed connection".into()));
         }
         Ok(_) => {}
         Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
             let read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "try_send.timeout", &format!(
-                "request_id={} serialize={:.1}ms write={:.1}ms read={:.1}ms timeout={:?} err={}",
-                request_id, serialize_ms, write_ms, read_ms, timeout, e
-            ));
-            return Err(DaemonError::ReadTimeout(format!("Read timed out after {:.1}ms (timeout={:?}): {}", read_ms, timeout, e)));
+            log_info(
+                "client",
+                "try_send.timeout",
+                &format!(
+                    "request_id={} serialize={:.1}ms write={:.1}ms read={:.1}ms timeout={:?} err={}",
+                    request_id, serialize_ms, write_ms, read_ms, timeout, e
+                ),
+            );
+            return Err(DaemonError::ReadTimeout(format!(
+                "Read timed out after {:.1}ms (timeout={:?}): {}",
+                read_ms, timeout, e
+            )));
         }
         Err(e) => {
             let read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
-            log_info("client", "try_send.read_error", &format!(
-                "request_id={} serialize={:.1}ms write={:.1}ms read={:.1}ms err={}",
-                request_id, serialize_ms, write_ms, read_ms, e
-            ));
+            log_info(
+                "client",
+                "try_send.read_error",
+                &format!(
+                    "request_id={} serialize={:.1}ms write={:.1}ms read={:.1}ms err={}",
+                    request_id, serialize_ms, write_ms, read_ms, e
+                ),
+            );
             return Err(DaemonError::Other(format!("Failed to read: {}", e)));
         }
     }
@@ -306,10 +367,20 @@ pub fn try_send(stream: &UnixStream, request: &Request) -> std::result::Result<R
     let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
-    log_info("client", "try_send.done", &format!(
-        "request_id={} total={:.1}ms serialize={:.1}ms write={:.1}ms read={:.1}ms parse={:.1}ms response_len={}",
-        request_id, total_ms, serialize_ms, write_ms, read_ms, parse_ms, line.len()
-    ));
+    log_info(
+        "client",
+        "try_send.done",
+        &format!(
+            "request_id={} total={:.1}ms serialize={:.1}ms write={:.1}ms read={:.1}ms parse={:.1}ms response_len={}",
+            request_id,
+            total_ms,
+            serialize_ms,
+            write_ms,
+            read_ms,
+            parse_ms,
+            line.len()
+        ),
+    );
 
     result
 }
@@ -326,7 +397,9 @@ fn get_read_timeout(request: &Request) -> Duration {
         if let Some(ref argv) = request.argv {
             if let Some(cmd) = argv.first() {
                 if cmd == "listen" {
-                    return Duration::from_secs(parse_listen_timeout(argv) + LISTEN_TIMEOUT_BUFFER_SECS);
+                    return Duration::from_secs(
+                        parse_listen_timeout(argv) + LISTEN_TIMEOUT_BUFFER_SECS,
+                    );
                 }
                 if cmd == "events" {
                     // "events launch" blocks up to 60s waiting for agents to be ready
@@ -380,9 +453,7 @@ fn read_stdin_nonblocking(timeout_ms: u16) -> Option<String> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     loop {
-        let n = unsafe {
-            libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len())
-        };
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
         if n > 0 {
             buf.extend_from_slice(&tmp[..n as usize]);
         } else {
@@ -499,14 +570,18 @@ mod tests {
         // Backward compat: quoted message without --
         assert!(!cli_wants_stdin(&args(&["send", "hello"])));
         assert!(!cli_wants_stdin(&args(&["send", "--name", "foo", "hello"])));
-        assert!(!cli_wants_stdin(&args(&["send", "--intent", "request", "hello"])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send", "--intent", "request", "hello"
+        ])));
     }
 
     #[test]
     fn send_without_message_reads_stdin() {
         assert!(cli_wants_stdin(&args(&["send"])));
         assert!(cli_wants_stdin(&args(&["send", "--name", "foo"])));
-        assert!(cli_wants_stdin(&args(&["send", "--name", "foo", "--intent", "inform"])));
+        assert!(cli_wants_stdin(&args(&[
+            "send", "--name", "foo", "--intent", "inform"
+        ])));
     }
 
     #[test]
@@ -531,8 +606,12 @@ mod tests {
 
         // @targets with -- and message = no stdin
         assert!(!cli_wants_stdin(&args(&["send", "@luna", "--", "hello"])));
-        assert!(!cli_wants_stdin(&args(&["send", "@luna", "@nova", "--", "msg"])));
-        assert!(!cli_wants_stdin(&args(&["send", "@luna", "--intent", "request", "--", "msg"])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send", "@luna", "@nova", "--", "msg"
+        ])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send", "@luna", "--intent", "request", "--", "msg"
+        ])));
 
         // @targets with -- but no message = NOT stdin (-- means inline message, Python errors)
         assert!(!cli_wants_stdin(&args(&["send", "@luna", "--"])));
@@ -549,15 +628,30 @@ mod tests {
     #[test]
     fn send_with_file_flag() {
         assert!(!cli_wants_stdin(&args(&["send", "--file", "/tmp/msg.txt"])));
-        assert!(!cli_wants_stdin(&args(&["send", "@luna", "--file", "/tmp/msg.txt"])));
-        assert!(!cli_wants_stdin(&args(&["send", "--name", "foo", "--file", "/tmp/msg.txt"])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send",
+            "@luna",
+            "--file",
+            "/tmp/msg.txt"
+        ])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send",
+            "--name",
+            "foo",
+            "--file",
+            "/tmp/msg.txt"
+        ])));
     }
 
     #[test]
     fn send_with_base64_flag() {
         assert!(!cli_wants_stdin(&args(&["send", "--base64", "aGVsbG8="])));
-        assert!(!cli_wants_stdin(&args(&["send", "@luna", "--base64", "aGVsbG8="])));
-        assert!(!cli_wants_stdin(&args(&["send", "--name", "foo", "--base64", "aGVsbG8="])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send", "@luna", "--base64", "aGVsbG8="
+        ])));
+        assert!(!cli_wants_stdin(&args(&[
+            "send", "--name", "foo", "--base64", "aGVsbG8="
+        ])));
     }
 }
 

@@ -30,6 +30,13 @@ pub struct InstanceStatus {
 /// Database handle for hcom operations
 pub struct HcomDb {
     conn: Connection,
+    db_path: std::path::PathBuf,
+    db_inode: u64,
+}
+
+fn get_inode(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
 }
 
 impl HcomDb {
@@ -45,9 +52,54 @@ impl HcomDb {
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
         // Enable WAL mode for concurrent access + foreign keys for CASCADE
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+        )?;
 
-        Ok(Self { conn })
+        let inode = get_inode(db_path);
+
+        Ok(Self {
+            conn,
+            db_path: db_path.to_path_buf(),
+            db_inode: inode,
+        })
+    }
+
+    /// Reconnect if the DB file was replaced (e.g., by hcom reset / schema bump).
+    /// Returns true if reconnection happened.
+    pub fn reconnect_if_stale(&mut self) -> bool {
+        let current_inode = get_inode(&self.db_path);
+        if current_inode == 0 || current_inode == self.db_inode {
+            return false;
+        }
+        // DB file replaced — reconnect
+        use crate::log::{log_error, log_info};
+        match Connection::open(&self.db_path) {
+            Ok(new_conn) => {
+                let _ = new_conn.execute_batch(
+                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+                );
+                log_info(
+                    "native",
+                    "db.reconnect",
+                    &format!(
+                        "DB file replaced (inode {} -> {}), reconnected",
+                        self.db_inode, current_inode
+                    ),
+                );
+                self.conn = new_conn;
+                self.db_inode = current_inode;
+                true
+            }
+            Err(e) => {
+                log_error(
+                    "native",
+                    "db.reconnect_fail",
+                    &format!("Failed to reconnect: {}", e),
+                );
+                false
+            }
+        }
     }
 
     /// Get instance status by name
@@ -59,12 +111,14 @@ impl HcomDb {
     pub fn get_instance_status(&self, name: &str) -> Result<Option<InstanceStatus>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, status, status_detail, last_event_id
-             FROM instances WHERE name = ?"
+             FROM instances WHERE name = ?",
         )?;
 
         match stmt.query_row(params![name], |row| {
             Ok(InstanceStatus {
-                status: row.get::<_, String>(1).unwrap_or_else(|_| "unknown".to_string()),
+                status: row
+                    .get::<_, String>(1)
+                    .unwrap_or_else(|_| "unknown".to_string()),
                 detail: row.get::<_, String>(2).unwrap_or_default(),
                 last_event_id: row.get::<_, i64>(3).unwrap_or(0),
             })
@@ -87,7 +141,10 @@ impl HcomDb {
             Ok(Some(status)) => status.last_event_id,
             Ok(None) => 0, // No instance found
             Err(e) => {
-                eprintln!("[hcom] DB error in get_unread_messages (get_instance_status): {}", e);
+                eprintln!(
+                    "[hcom] DB error in get_unread_messages (get_instance_status): {}",
+                    e
+                );
                 0 // Fallback to 0
             }
         };
@@ -95,7 +152,7 @@ impl HcomDb {
         let mut stmt = match self.conn.prepare(
             "SELECT id, timestamp, data FROM events
              WHERE id > ? AND type = 'message'
-             ORDER BY id"
+             ORDER BY id",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -113,56 +170,63 @@ impl HcomDb {
 
         let mut messages = Vec::new();
         for (id, _timestamp, data) in rows.flatten() {
-                // Parse JSON data
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                    let from = json.get("from")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+            // Parse JSON data
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                let from = json
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
-                    // Skip own messages
-                    if from == name {
-                        continue;
-                    }
-
-                    // Check scope - "broadcast" delivers to all, "mentions" checks mentions array
-                    let scope = json.get("scope")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("broadcast");
-
-                    let should_deliver = match scope {
-                        "broadcast" => true,
-                        "mentions" => {
-                            // Check if receiver is in mentions array
-                            let mentions: Vec<String> = json.get("mentions")
-                                .and_then(|m| m.as_array())
-                                .map(|arr| arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect())
-                                .unwrap_or_default();
-                            mentions.contains(&name.to_string())
-                        }
-                        _ => false, // Unknown scope
-                    };
-
-                    if !should_deliver {
-                        continue;
-                    }
-
-                    let intent = json.get("intent")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let thread = json.get("thread")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    messages.push(Message {
-                        from,
-                        intent,
-                        thread,
-                        event_id: Some(id),
-                    });
+                // Skip own messages
+                if from == name {
+                    continue;
                 }
+
+                // Check scope - "broadcast" delivers to all, "mentions" checks mentions array
+                let scope = json
+                    .get("scope")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("broadcast");
+
+                let should_deliver = match scope {
+                    "broadcast" => true,
+                    "mentions" => {
+                        // Check if receiver is in mentions array
+                        let mentions: Vec<String> = json
+                            .get("mentions")
+                            .and_then(|m| m.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        mentions.contains(&name.to_string())
+                    }
+                    _ => false, // Unknown scope
+                };
+
+                if !should_deliver {
+                    continue;
+                }
+
+                let intent = json
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let thread = json
+                    .get("thread")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                messages.push(Message {
+                    from,
+                    intent,
+                    thread,
+                    event_id: Some(id),
+                });
+            }
         }
 
         messages
@@ -252,7 +316,8 @@ impl HcomDb {
     /// Set instance status (for cleanup)
     pub fn set_status(&self, name: &str, status: &str, context: &str) -> Result<()> {
         // Check if this is first status update (status_context="new" → ready event)
-        let is_new = self.get_status(name)?
+        let is_new = self
+            .get_status(name)?
             .map(|(_, ctx)| ctx == "new")
             .unwrap_or(false);
 
@@ -321,20 +386,27 @@ impl HcomDb {
     /// Check if all instances in a launch batch are ready; send notification if so.
     fn check_batch_completion(&self, launcher: &str, batch_id: &str) -> Result<()> {
         // Find the launch event for this batch
-        let launch_data: Option<String> = self.conn.query_row(
-            "SELECT data FROM events
+        let launch_data: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM events
              WHERE type = 'life' AND instance = ?
                AND json_extract(data, '$.action') = 'batch_launched'
                AND json_extract(data, '$.batch_id') = ?
              LIMIT 1",
-            params![launcher, batch_id],
-            |row| row.get(0),
-        ).ok();
+                params![launcher, batch_id],
+                |row| row.get(0),
+            )
+            .ok();
 
-        let Some(data_str) = launch_data else { return Ok(()) };
+        let Some(data_str) = launch_data else {
+            return Ok(());
+        };
         let data: serde_json::Value = serde_json::from_str(&data_str)?;
         let expected = data.get("launched").and_then(|v| v.as_u64()).unwrap_or(0);
-        if expected == 0 { return Ok(()) }
+        if expected == 0 {
+            return Ok(());
+        }
 
         // Count ready events with matching batch_id
         let ready_count: i64 = self.conn.query_row(
@@ -346,7 +418,9 @@ impl HcomDb {
             |row| row.get(0),
         )?;
 
-        if (ready_count as u64) < expected { return Ok(()) }
+        if (ready_count as u64) < expected {
+            return Ok(());
+        }
 
         // Check idempotency — don't send duplicate notification
         let already_sent: bool = self.conn.query_row(
@@ -359,7 +433,9 @@ impl HcomDb {
             |row| Ok(row.get::<_, i64>(0)? > 0),
         )?;
 
-        if already_sent { return Ok(()) }
+        if already_sent {
+            return Ok(());
+        }
 
         // Get instance names from this batch
         let mut stmt = self.conn.prepare(
@@ -368,7 +444,8 @@ impl HcomDb {
                AND json_extract(data, '$.action') = 'ready'
                AND json_extract(data, '$.batch_id') = ?",
         )?;
-        let names: Vec<String> = stmt.query_map(params![batch_id], |row| row.get(0))?
+        let names: Vec<String> = stmt
+            .query_map(params![batch_id], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -385,7 +462,7 @@ impl HcomDb {
             "text": text,
             "scope": "mentions",
             "mentions": [launcher],
-            "system": true,
+            "sender_kind": "system",
         });
         self.conn.execute(
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'message', 'sys_[hcom-launcher]', ?)",
@@ -455,13 +532,14 @@ impl HcomDb {
     /// - Ok(None) if instance not found
     /// - Err if database error occurs
     pub fn get_status(&self, name: &str) -> Result<Option<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT status, status_context FROM instances WHERE name = ?"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, status_context FROM instances WHERE name = ?")?;
 
         match stmt.query_row(params![name], |row| {
             Ok((
-                row.get::<_, String>(0).unwrap_or_else(|_| "unknown".to_string()),
+                row.get::<_, String>(0)
+                    .unwrap_or_else(|_| "unknown".to_string()),
                 row.get::<_, String>(1).unwrap_or_default(),
             ))
         }) {
@@ -487,13 +565,11 @@ impl HcomDb {
     /// - Ok(None) if binding not found
     /// - Err if database error occurs
     pub fn get_process_binding(&self, process_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT instance_name FROM process_bindings WHERE process_id = ?"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT instance_name FROM process_bindings WHERE process_id = ?")?;
 
-        match stmt.query_row(params![process_id], |row| {
-            row.get::<_, String>(0)
-        }) {
+        match stmt.query_row(params![process_id], |row| row.get::<_, String>(0)) {
             Ok(name) => Ok(Some(name)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -549,13 +625,11 @@ impl HcomDb {
     /// - Ok(None) if instance not found or transcript_path is empty
     /// - Err if database error occurs
     pub fn get_transcript_path(&self, name: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT transcript_path FROM instances WHERE name = ?"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT transcript_path FROM instances WHERE name = ?")?;
 
-        match stmt.query_row(params![name], |row| {
-            row.get::<_, String>(0)
-        }) {
+        match stmt.query_row(params![name], |row| row.get::<_, String>(0)) {
             Ok(path) if !path.is_empty() => Ok(Some(path)),
             Ok(_) => Ok(None), // Empty path
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -574,7 +648,7 @@ impl HcomDb {
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
                     agent_id, launch_args, origin_device_id, background_log_file, last_event_id
-             FROM instances WHERE name = ?"
+             FROM instances WHERE name = ?",
         )?;
 
         match stmt.query_row(params![name], |row| {
@@ -589,7 +663,7 @@ impl HcomDb {
                 "subagent_timeout": row.get::<_, Option<i64>>(7).unwrap_or(None),
                 "hints": row.get::<_, String>(8).unwrap_or_default(),
                 "pid": row.get::<_, Option<i64>>(9).unwrap_or(None),
-                "created_at": row.get::<_, String>(10).unwrap_or_default(),
+                "created_at": row.get::<_, f64>(10).unwrap_or(0.0),
                 "background": row.get::<_, i64>(11).unwrap_or(0),
                 "agent_id": row.get::<_, String>(12).unwrap_or_default(),
                 "launch_args": row.get::<_, String>(13).unwrap_or_default(),
@@ -606,10 +680,9 @@ impl HcomDb {
 
     /// Delete instance row from database
     pub fn delete_instance(&self, name: &str) -> Result<bool> {
-        let rows = self.conn.execute(
-            "DELETE FROM instances WHERE name = ?",
-            params![name],
-        )?;
+        let rows = self
+            .conn
+            .execute("DELETE FROM instances WHERE name = ?", params![name])?;
         Ok(rows > 0)
     }
 
@@ -661,19 +734,23 @@ impl HcomDb {
     /// Subscriptions are stored as kv entries with key 'events_sub:sub-{hash}'
     /// and a JSON value containing a "caller" field.
     pub fn cleanup_subscriptions(&self, name: &str) -> Result<u32> {
-        let mut stmt = self.conn.prepare(
-            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'"
-        )?;
-        let rows: Vec<(String, String)> = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?.filter_map(|r| r.ok()).collect();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         let mut deleted = 0u32;
         for (key, value) in &rows {
             // Parse JSON and check caller field
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(value) {
                 if obj.get("caller").and_then(|c| c.as_str()) == Some(name) {
-                    self.conn.execute("DELETE FROM kv WHERE key = ?", params![key])?;
+                    self.conn
+                        .execute("DELETE FROM kv WHERE key = ?", params![key])?;
                     deleted += 1;
                 }
             }
@@ -735,11 +812,14 @@ impl HcomDb {
         let event_time = parse_iso_timestamp(timestamp).unwrap_or(0);
 
         // Get current status_time
-        let current_time: i64 = self.conn.query_row(
-            "SELECT status_time FROM instances WHERE name = ?",
-            params![name],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let current_time: i64 = self
+            .conn
+            .query_row(
+                "SELECT status_time FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
         // Only update if event is newer
         if event_time >= current_time {
@@ -827,9 +907,12 @@ mod tests {
 
             CREATE TABLE process_bindings (
                 process_id TEXT PRIMARY KEY,
-                instance_name TEXT
-            );"
-        ).unwrap();
+                session_id TEXT,
+                instance_name TEXT,
+                updated_at REAL NOT NULL
+            );",
+        )
+        .unwrap();
 
         (conn, db_path)
     }
@@ -854,7 +937,11 @@ mod tests {
         let result = db.get_instance_status("test");
 
         // SQL error should be propagated as Err, not None
-        assert!(result.is_err(), "SQL error should propagate as Err, not None");
+        let err = result.expect_err("SQL error should propagate as Err, not None");
+        assert!(
+            err.to_string().contains("instances"),
+            "expected missing instances table error, got: {err:#}"
+        );
 
         cleanup_test_db(db_path);
     }
@@ -885,7 +972,11 @@ mod tests {
         let db = HcomDb::open_at(&db_path).unwrap();
         let result = db.get_status("test");
 
-        assert!(result.is_err(), "SQL error should propagate as Err");
+        let err = result.expect_err("SQL error should propagate as Err");
+        assert!(
+            err.to_string().contains("instances"),
+            "expected missing instances table error, got: {err:#}"
+        );
         cleanup_test_db(db_path);
     }
 
@@ -898,7 +989,11 @@ mod tests {
         let db = HcomDb::open_at(&db_path).unwrap();
         let result = db.get_process_binding("test_pid");
 
-        assert!(result.is_err(), "SQL error should propagate as Err");
+        let err = result.expect_err("SQL error should propagate as Err");
+        assert!(
+            err.to_string().contains("process_bindings"),
+            "expected missing process_bindings table error, got: {err:#}"
+        );
         cleanup_test_db(db_path);
     }
 
@@ -911,7 +1006,11 @@ mod tests {
         let db = HcomDb::open_at(&db_path).unwrap();
         let result = db.get_transcript_path("test");
 
-        assert!(result.is_err(), "SQL error should propagate as Err");
+        let err = result.expect_err("SQL error should propagate as Err");
+        assert!(
+            err.to_string().contains("instances"),
+            "expected missing instances table error, got: {err:#}"
+        );
         cleanup_test_db(db_path);
     }
 
@@ -924,7 +1023,11 @@ mod tests {
         let db = HcomDb::open_at(&db_path).unwrap();
         let result = db.get_instance_snapshot("test");
 
-        assert!(result.is_err(), "SQL error should propagate as Err");
+        let err = result.expect_err("SQL error should propagate as Err");
+        assert!(
+            err.to_string().contains("instances"),
+            "expected missing instances table error, got: {err:#}"
+        );
         cleanup_test_db(db_path);
     }
 
@@ -950,10 +1053,11 @@ mod tests {
                 instance TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 port INTEGER NOT NULL,
-                updated_at REAL,
+                updated_at REAL NOT NULL,
                 PRIMARY KEY (instance, kind)
-            );"
-        ).unwrap();
+            );",
+        )
+        .unwrap();
         (conn, db_path)
     }
 
@@ -964,11 +1068,14 @@ mod tests {
 
         db.register_inject_port("test", 5555).unwrap();
 
-        let port: i64 = db.conn.query_row(
-            "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'inject'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let port: i64 = db
+            .conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'inject'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(port, 5555);
 
         cleanup_test_db(db_path);
@@ -982,19 +1089,25 @@ mod tests {
         db.register_inject_port("test", 5555).unwrap();
         db.register_inject_port("test", 6666).unwrap();
 
-        let port: i64 = db.conn.query_row(
-            "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'inject'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let port: i64 = db
+            .conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'inject'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(port, 6666);
 
         // Should be exactly one row
-        let count: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'test'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         cleanup_test_db(db_path);

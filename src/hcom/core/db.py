@@ -15,7 +15,7 @@ from ..shared import parse_iso_timestamp
 
 # Database configuration
 DB_FILE = "hcom.db"
-SCHEMA_VERSION = 15  # Add bundle fields to events_v
+SCHEMA_VERSION = 16  # Add FTS5 events_fts index + trigger for TUI search
 _thread_local = threading.local()  # Per-thread connection storage
 _write_lock = threading.Lock()  # Serializes writes within this process (daemon threads). Cross-process: WAL mode + busy_timeout.
 
@@ -78,10 +78,27 @@ def get_db() -> sqlite3.Connection:
 
         # Check schema version - archives and reconnects if outdated
         if not check_schema_version(_thread_local.conn):
+            # Set flag so recovery runs after fresh DB is ready.
+            # Note: log_reset_event() inside check_schema_version already calls get_db()
+            # creating a new connection, so the recursive call below may find conn set.
+            _thread_local._post_archive = True
             # Reconnect after archive (recursive call with fresh DB)
             return get_db()
 
         init_db(_thread_local.conn)
+
+    # After fresh init post-archive, re-register orphaned instances from pidtrack.
+    # Outside the if-block because log_reset_event() may have already created the conn.
+    if getattr(_thread_local, "_post_archive", False):
+        _thread_local._post_archive = False
+        try:
+            from .pidtrack import recover_orphans_to_db
+            n = recover_orphans_to_db()
+            if n:
+                import sys
+                print(f"hcom: Recovered {n} orphaned instance{'s' if n != 1 else ''}", file=sys.stderr)
+        except Exception:
+            pass  # Best effort — don't block DB init
 
     return _thread_local.conn
 
@@ -175,6 +192,41 @@ def archive_db(reason: str = "schema") -> str | None:
         return str(session_archive)
 
 
+def _snapshot_running_to_pidtrack(conn: sqlite3.Connection) -> None:
+    """Snapshot live instances to pidtrack before DB archive (schema bump).
+
+    Called before archive in check_schema_version so orphan recovery can
+    re-register them into the fresh DB. Can't call cmd_stop (would recurse).
+    Includes notify ports so recovery can wake the PTY immediately.
+    """
+    from .pidtrack import record_pid
+
+    try:
+        rows = conn.execute(
+            "SELECT i.name, i.pid, i.tool, i.directory, i.session_id, p.process_id, "
+            "n_pty.port AS notify_port, n_inj.port AS inject_port "
+            "FROM instances i "
+            "LEFT JOIN process_bindings p ON i.name = p.instance_name "
+            "LEFT JOIN notify_endpoints n_pty ON i.name = n_pty.instance AND n_pty.kind = 'pty' "
+            "LEFT JOIN notify_endpoints n_inj ON i.name = n_inj.instance AND n_inj.kind = 'inject' "
+            "WHERE i.pid IS NOT NULL"
+        ).fetchall()
+    except Exception:
+        return
+
+    for row in rows:
+        name, pid, tool, directory, session_id, process_id, notify_port, inject_port = row
+        try:
+            os.kill(pid, 0)  # alive?
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass  # alive but different user — still snapshot
+        record_pid(pid, tool or "claude", name, directory or "",
+                   process_id=process_id or "", session_id=session_id or "",
+                   notify_port=notify_port or 0, inject_port=inject_port or 0)
+
+
 def check_schema_version(conn: sqlite3.Connection) -> bool:
     """Check if DB schema version matches current. Returns True if compatible.
 
@@ -229,9 +281,10 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
             import sys
 
             print("hcom: Pre-versioned DB found, archiving...", file=sys.stderr)
+            _snapshot_running_to_pidtrack(conn)
             conn.close()
             _thread_local.conn = None
-            archive_path = archive_db("schema")
+            archive_path = archive_db()
             if archive_path:
                 print(f"hcom: Archived to {archive_path}", file=sys.stderr)
                 print("       Query with: hcom archive 1", file=sys.stderr)
@@ -244,16 +297,34 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
 
     # Check version matches
     if version != SCHEMA_VERSION:
-        # Version mismatch - archive and recreate
+        if version > SCHEMA_VERSION:
+            # DB is newer than our code — we're the stale process (dev scenario:
+            # schema bumped but this process has old code cached in memory).
+            # Don't archive; just work with the newer DB.
+            from .log import log_warn
+            log_warn("db", "schema.stale_process",
+                     db_version=version, code_version=SCHEMA_VERSION)
+            # If we're the daemon, shut down so next request spawns a fresh one
+            from .thread_context import is_in_daemon_mode
+            if is_in_daemon_mode():
+                import sys
+                print(f"hcom: Daemon stale (code v{SCHEMA_VERSION}, DB v{version}), shutting down for restart...",
+                      file=sys.stderr)
+                from ..daemon import request_shutdown
+                request_shutdown()
+            return True
+
+        # DB is older than our code - archive and recreate
         import sys
 
         print(
             f"hcom: DB version mismatch (DB v{version}, code v{SCHEMA_VERSION}), archiving...",
             file=sys.stderr,
         )
+        _snapshot_running_to_pidtrack(conn)
         conn.close()
         _thread_local.conn = None
-        archive_path = archive_db("schema")
+        archive_path = archive_db()
         if archive_path:
             print(f"hcom: Archived to {archive_path}", file=sys.stderr)
             print("       Query with: hcom archive 1", file=sys.stderr)
@@ -270,9 +341,10 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
 
         missing = required - tables
         print(f"hcom: DB missing tables {missing}, archiving...", file=sys.stderr)
+        _snapshot_running_to_pidtrack(conn)
         conn.close()
         _thread_local.conn = None
-        archive_path = archive_db("corruption")
+        archive_path = archive_db()
         if archive_path:
             print(f"hcom: Archived to {archive_path}", file=sys.stderr)
             log_reset_event()  # Log to fresh DB
@@ -290,9 +362,10 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
         import sys
 
         print("hcom: DB schema missing instances.tool, archiving...", file=sys.stderr)
+        _snapshot_running_to_pidtrack(conn)
         conn.close()
         _thread_local.conn = None
-        archive_path = archive_db("schema")
+        archive_path = archive_db()
         if archive_path:
             print(f"hcom: Archived to {archive_path}", file=sys.stderr)
             log_reset_event()  # Log to fresh DB
@@ -343,7 +416,6 @@ def init_db(conn: Optional[sqlite3.Connection] = None, _attempt: int = 0) -> Non
     """)
 
         # Notify endpoints: multiple concurrent waiters per instance (pty wrappers, `hcom listen`, hooks).
-        # This avoids clobbering a single instances.notify_port when multiple listeners coexist.
         connection.execute("""
         CREATE TABLE IF NOT EXISTS notify_endpoints (
             instance TEXT NOT NULL,
@@ -401,11 +473,9 @@ def init_db(conn: Optional[sqlite3.Connection] = None, _attempt: int = 0) -> Non
             transcript_path TEXT DEFAULT '',
             tcp_mode INTEGER DEFAULT 0,
             wait_timeout INTEGER DEFAULT 86400,
-            notify_port INTEGER,  -- DEAD: replaced by notify_endpoints table. Remove on next schema bump.
             background INTEGER DEFAULT 0,
             background_log_file TEXT DEFAULT '',
             name_announced INTEGER DEFAULT 0,
-            launch_context_announced INTEGER DEFAULT 0,  -- DEAD: never read or written. Remove on next schema bump.
             agent_id TEXT UNIQUE,
             running_tasks TEXT DEFAULT '',
             origin_device_id TEXT DEFAULT '',
@@ -479,6 +549,29 @@ def init_db(conn: Optional[sqlite3.Connection] = None, _attempt: int = 0) -> Non
             json_extract(data, '$.batch_id') as life_batch_id,
             json_extract(data, '$.reason') as life_reason
         FROM events
+    """)
+
+        # FTS5 index for full-history event search in TUI
+        connection.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+            searchable,
+            tokenize='unicode61'
+        )
+    """)
+        connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS events_fts_insert
+        AFTER INSERT ON events BEGIN
+            INSERT INTO events_fts(rowid, searchable) VALUES (
+                new.id,
+                COALESCE(json_extract(new.data, '$.text'), '') || ' ' ||
+                COALESCE(json_extract(new.data, '$.from'), '') || ' ' ||
+                COALESCE(new.instance, '') || ' ' ||
+                COALESCE(json_extract(new.data, '$.context'), '') || ' ' ||
+                COALESCE(json_extract(new.data, '$.detail'), '') || ' ' ||
+                COALESCE(json_extract(new.data, '$.action'), '') || ' ' ||
+                COALESCE(json_extract(new.data, '$.reason'), '')
+            );
+        END
     """)
 
         # Set schema version
@@ -665,43 +758,56 @@ def get_session_binding(session_id: str) -> str | None:
 def set_session_binding(session_id: str, instance_name: str) -> None:
     """Create or update session binding.
 
-    Raises ValueError if session_id is already bound to a different instance.
+    Raises HcomError if session_id is already bound to a different instance.
     Use rebind_session() to explicitly change bindings.
     """
     if not session_id or not instance_name:
         return
 
-    # Check for existing binding to different instance
-    existing = get_session_binding(session_id)
-    if existing and existing != instance_name:
-        from ..shared import HcomError
+    conn = get_db()
+    with _write_lock:
+        # Check for existing binding to different instance (under lock to prevent TOCTOU)
+        row = conn.execute(
+            "SELECT instance_name FROM session_bindings WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        existing = row["instance_name"] if row else None
 
-        # Check if this is a subagent trying to bind without --name <agent_id>
-        # Subagents share parent's session but need explicit agent_id registration
-        conn = get_db()
-        row = conn.execute("SELECT running_tasks FROM instances WHERE name = ?", (existing,)).fetchone()
+        if existing and existing != instance_name:
+            from ..shared import HcomError
 
-        if row and row["running_tasks"]:
-            import json
+            # Check if this is a subagent trying to bind without --name <agent_id>
+            task_row = conn.execute("SELECT running_tasks FROM instances WHERE name = ?", (existing,)).fetchone()
 
-            try:
-                running_tasks = json.loads(row["running_tasks"])
-                subagents = running_tasks.get("subagents", [])
-                if subagents:
-                    # This is likely a subagent - provide helpful error
-                    agent_ids = [s.get("agent_id", "?") for s in subagents]
-                    raise HcomError(
-                        f"Session bound to parent '{existing}'. "
-                        f"Subagents must use: hcom start --name <agent_id>\n"
-                        f"Active agent_ids: {', '.join(agent_ids)}"
-                    )
-            except json.JSONDecodeError:
-                pass
+            if task_row and task_row["running_tasks"]:
+                import json
 
-        # Default error for non-subagent case
-        raise HcomError(f"Session {session_id[:8]}... already bound to {existing}, cannot bind to {instance_name}")
+                try:
+                    running_tasks = json.loads(task_row["running_tasks"])
+                    subagents = running_tasks.get("subagents", [])
+                    if subagents:
+                        agent_ids = [s.get("agent_id", "?") for s in subagents]
+                        raise HcomError(
+                            f"Session bound to parent '{existing}'. "
+                            f"Subagents must use: hcom start --name <agent_id>\n"
+                            f"Active agent_ids: {', '.join(agent_ids)}"
+                        )
+                except json.JSONDecodeError:
+                    pass
 
-    _upsert_session_binding(session_id, instance_name)
+            raise HcomError(f"Session {session_id[:8]}... already bound to {existing}, cannot bind to {instance_name}")
+
+        conn.execute(
+            """
+            INSERT INTO session_bindings (session_id, instance_name, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                instance_name = excluded.instance_name,
+                created_at = excluded.created_at
+            """,
+            (session_id, instance_name, time.time()),
+        )
+        conn.commit()
 
 
 def clear_session_id_from_other_instances(session_id: str, exclude_instance: str) -> None:
@@ -769,8 +875,29 @@ def rebind_instance_session(instance_name: str, session_id: str) -> None:
     Clears existing bindings first to avoid UNIQUE constraint violation.
     Use this instead of separate delete + rebind calls.
     """
-    delete_session_bindings_for_instance(instance_name)
-    rebind_session(session_id, instance_name)
+    if not instance_name or not session_id:
+        return
+    conn = get_db()
+    with _write_lock:
+        conn.execute(
+            "DELETE FROM session_bindings WHERE instance_name = ?",
+            (instance_name,),
+        )
+        conn.execute(
+            "UPDATE instances SET session_id = NULL WHERE session_id = ? AND name != ?",
+            (session_id, instance_name),
+        )
+        conn.execute(
+            """
+            INSERT INTO session_bindings (session_id, instance_name, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                instance_name = excluded.instance_name,
+                created_at = excluded.created_at
+            """,
+            (session_id, instance_name, time.time()),
+        )
+        conn.commit()
 
 
 def has_session_binding(instance_name: str) -> bool:
@@ -879,7 +1006,7 @@ def log_event(
         assert event_id is not None  # SQLite always returns lastrowid after INSERT
 
     # Check event subscriptions (inline, no daemon)
-    _check_event_subscriptions(event_id, event_type, instance, data, timestamp)
+    _check_event_subscriptions(event_id, event_type, instance, data)
 
     # Sync export moved to hook dispatcher (rate-limited, builds from SQLite)
     # No duplicate JSONL append needed - single source of truth
@@ -1297,7 +1424,7 @@ def _log_sub_error(sub_id: str, error: str, exc: Exception | None = None) -> Non
 
 
 def _find_collision_partner(event_id: int, instance: str, file_path: str) -> str | None:
-    """Find the other agent in a file collision (wrote same file within 20s)."""
+    """Find the other agent in a file collision (wrote same file within 30s)."""
     from .filters import FILE_WRITE_CONTEXTS
 
     conn = get_db()
@@ -1309,7 +1436,7 @@ def _find_collision_partner(event_id: int, instance: str, file_path: str) -> str
             AND e.instance != ?
             AND EXISTS (
                 SELECT 1 FROM events_v ev WHERE ev.id = ?
-                AND ABS(strftime('%s', ev.timestamp) - strftime('%s', e.timestamp)) < 20
+                AND ABS(strftime('%s', ev.timestamp) - strftime('%s', e.timestamp)) < 30
             )
             ORDER BY e.id DESC LIMIT 1""",
             (file_path, instance, event_id),
@@ -1410,7 +1537,7 @@ def _cancel_request_watches_by_flow(
 
 
 def _check_event_subscriptions(
-    event_id: int, event_type: str, instance: str, data: dict[str, Any], timestamp: str
+    event_id: int, event_type: str, instance: str, data: dict[str, Any]
 ) -> None:
     """Check subscriptions and send matching events to subscribers.
 

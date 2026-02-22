@@ -2,9 +2,9 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "hcom",
   "version": "1.0.0",
-  "description": "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals",
+  "description": "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode.",
   "metadata": {
-    "description": "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
+    "description": "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode."
   },
   "owner": {
     "name": "aannoo"
@@ -13,7 +13,7 @@
     {
       "name": "hcom",
       "source": "./plugin/hcom",
-      "description": "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals",
+      "description": "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode.",
       "category": "productivity",
       "homepage": "https://github.com/aannoo/hcom"
     }

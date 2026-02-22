@@ -14,12 +14,12 @@ Design:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 
-ToolType = Literal["claude", "gemini", "codex", "adhoc"]
+ToolType = Literal["claude", "gemini", "codex", "opencode", "adhoc"]
 
 
 @dataclass(frozen=True)
@@ -38,14 +38,14 @@ class HcomContext:
         hcom_dir: Path to HCOM data directory (~/.hcom or HCOM_DIR).
         hcom_dir_override: True if HCOM_DIR was explicitly set (not defaulted).
         cwd: Current working directory when context was captured.
-        tool: Tool type (claude/gemini/codex/adhoc).
+        tool: Tool type (claude/gemini/codex/opencode/adhoc).
         claude_env_file: CLAUDE_ENV_FILE path (for session ID extraction).
         stdin_is_tty: True if client's stdin is a TTY (for is_interactive checks).
         stdout_is_tty: True if client's stdout is a TTY (for is_interactive checks).
         is_claude: True if CLAUDECODE=1 or CLAUDE_ENV_FILE set (for tool detection).
         is_gemini: True if GEMINI_CLI=1 (for tool detection).
         is_codex: True if any CODEX_* env var present (for tool detection).
-        hcom_go: True if HCOM_GO=1 (bypass gating prompts).
+        is_opencode: True if OPENCODE=1 (for tool detection).
     """
 
     process_id: str | None
@@ -64,7 +64,7 @@ class HcomContext:
     is_claude: bool = False
     is_gemini: bool = False
     is_codex: bool = False
-    hcom_go: bool = False
+    is_opencode: bool = False
     is_fork: bool = False  # HCOM_IS_FORK=1 (--fork-session launch)
     # Codex thread ID (session equivalent) - available in all Codex child processes
     codex_thread_id: str | None = None
@@ -74,6 +74,9 @@ class HcomContext:
     launch_event_id: str | None = None
     launched_preset: str | None = None
     notes: str = ""
+    # Full forwarded env dict from request — used by get_config() in daemon mode
+    # to apply request-scoped env overrides instead of reading stale os.environ.
+    raw_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(
@@ -108,7 +111,7 @@ class HcomContext:
             or "CODEX_MANAGED_BY_BUN" in env
             or "CODEX_THREAD_ID" in env
         )
-        hcom_go = env.get("HCOM_GO") == "1"
+        is_opencode = env.get("OPENCODE") == "1"
         is_fork = env.get("HCOM_IS_FORK") == "1"
 
         # Determine tool type from markers
@@ -119,6 +122,8 @@ class HcomContext:
             tool = "gemini"
         elif is_codex:
             tool = "codex"
+        elif is_opencode:
+            tool = "opencode"
 
         # Resolve hcom_dir (expand ~ for paths like ~/custom/.hcom)
         hcom_dir_str = env.get("HCOM_DIR")
@@ -143,7 +148,7 @@ class HcomContext:
             is_claude=is_claude,
             is_gemini=is_gemini,
             is_codex=is_codex,
-            hcom_go=hcom_go,
+            is_opencode=is_opencode,
             is_fork=is_fork,
             codex_thread_id=env.get("CODEX_THREAD_ID") or None,
             launched_by=env.get("HCOM_LAUNCHED_BY") or None,
@@ -151,6 +156,7 @@ class HcomContext:
             launch_event_id=env.get("HCOM_LAUNCH_EVENT_ID") or None,
             launched_preset=env.get("HCOM_LAUNCHED_PRESET") or None,
             notes=env.get("HCOM_NOTES") or "",
+            raw_env=dict(env),
         )
 
     @classmethod
@@ -185,13 +191,14 @@ class HcomContext:
             is_claude=self.is_claude,
             is_gemini=self.is_gemini,
             is_codex=self.is_codex,
-            hcom_go=self.hcom_go,
+            is_opencode=self.is_opencode,
             is_fork=self.is_fork,
             codex_thread_id=self.codex_thread_id,
             launched_by=self.launched_by,
             launch_batch_id=self.launch_batch_id,
             launch_event_id=self.launch_event_id,
             notes=self.notes,
+            raw_env=self.raw_env,
         )
 
     # === Derived Properties ===

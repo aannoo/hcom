@@ -416,6 +416,7 @@ def _bundle_prepare(argv: list[str], *, ctx: CommandContext | None = None, json_
     # Get transcript path
     transcript_path = instance_data.get("transcript_path")
     tool = instance_data.get("tool", "claude")
+    session_id = instance_data.get("session_id")
 
     # --- GET ACTUAL TRANSCRIPT TEXT ---
     transcript_text = None
@@ -424,7 +425,7 @@ def _bundle_prepare(argv: list[str], *, ctx: CommandContext | None = None, json_
 
     if transcript_path:
         try:
-            thread = get_thread(transcript_path, last=last_transcript, tool=tool)
+            thread = get_thread(transcript_path, last=last_transcript, tool=tool, session_id=session_id)
             if thread and not thread.get("error"):
                 exchanges = thread.get("exchanges", [])
                 total_entries = thread.get("total", 0)

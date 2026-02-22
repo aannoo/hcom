@@ -8,7 +8,7 @@ from ..shared import CommandContext, detect_current_tool
 from .utils import CLIError
 
 # Valid tool names
-HOOK_TOOLS = ("claude", "gemini", "codex")
+HOOK_TOOLS = ("claude", "gemini", "codex", "opencode")
 
 
 def _get_tool_status() -> dict[str, dict]:
@@ -25,6 +25,10 @@ def _get_tool_status() -> dict[str, dict]:
         get_codex_config_path,
         verify_codex_hooks_installed,
     )
+    from ..tools.opencode.settings import (
+        get_opencode_plugin_path,
+        verify_opencode_plugin_installed,
+    )
 
     return {
         "claude": {
@@ -38,6 +42,10 @@ def _get_tool_status() -> dict[str, dict]:
         "codex": {
             "installed": verify_codex_hooks_installed(check_permissions=False),
             "path": str(get_codex_config_path()),
+        },
+        "opencode": {
+            "installed": verify_opencode_plugin_installed(check_permissions=False),
+            "path": str(get_opencode_plugin_path()),
         },
     }
 
@@ -89,7 +97,7 @@ def cmd_hooks_add(argv: list[str]) -> int:
     elif argv[0] in HOOK_TOOLS:
         tools = [argv[0]]
     else:
-        raise CLIError(f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, all")
+        raise CLIError(f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, opencode, all")
 
     # Install hooks
     results = {}
@@ -107,6 +115,12 @@ def cmd_hooks_add(argv: list[str]) -> int:
                     results[tool] = False
             elif tool == "codex":
                 if setup_codex_hooks(include_permissions=include_permissions):
+                    results[tool] = True
+                else:
+                    results[tool] = False
+            elif tool == "opencode":
+                from ..tools.opencode.settings import install_opencode_plugin
+                if install_opencode_plugin():
                     results[tool] = True
                 else:
                     results[tool] = False
@@ -136,6 +150,8 @@ def cmd_hooks_add(argv: list[str]) -> int:
                 tool_name = "Gemini CLI"
             elif tools[0] == "codex":
                 tool_name = "Codex"
+            elif tools[0] == "opencode":
+                tool_name = "OpenCode"
             print(f"Restart {tool_name} to activate hooks.")
         else:
             print("Restart the tool(s) to activate hooks.")
@@ -161,7 +177,7 @@ def cmd_hooks_remove(argv: list[str]) -> int:
     elif argv[0] in HOOK_TOOLS:
         tools = [argv[0]]
     else:
-        raise CLIError(f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, all")
+        raise CLIError(f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, opencode, all")
 
     # Remove hooks
     results = {}
@@ -175,6 +191,10 @@ def cmd_hooks_remove(argv: list[str]) -> int:
                 results[tool] = True
             elif tool == "codex":
                 remove_codex_hooks()
+                results[tool] = True
+            elif tool == "opencode":
+                from ..tools.opencode.settings import remove_opencode_plugin
+                remove_opencode_plugin()
                 results[tool] = True
         except OSError as e:
             print(f"error: Failed to remove {tool} hooks: {e}", file=sys.stderr)
@@ -197,8 +217,8 @@ def cmd_hooks(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     Usage:
         hcom hooks                  Show hook status for all tools
         hcom hooks status           Same as above
-        hcom hooks add [tool]       Add hooks (claude|gemini|codex|all)
-        hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|all)
+        hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|all)
+        hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|all)
     """
     if not argv or argv[0] in ("--help", "-h"):
         if not argv:

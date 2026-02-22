@@ -126,7 +126,7 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
     detection (claude, gemini, codex). Cleans up any stale subscriptions first
     (from previously stopped instances with reused names).
     """
-    if tool not in ("claude", "gemini", "codex"):
+    if tool not in ("claude", "gemini", "codex", "opencode"):
         return
 
     try:

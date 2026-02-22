@@ -558,6 +558,16 @@ class HcomTUI:
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to save Codex args: {e}\n")
 
+        # Save OpenCode prompt to dedicated key (not HCOM_OPENCODE_ARGS which is for CLI args)
+        try:
+            opencode_prompt = self.state.launch.opencode_prompt
+            if opencode_prompt:
+                self.state.config_edit["HCOM_OPENCODE_PROMPT"] = opencode_prompt
+            else:
+                self.state.config_edit.pop("HCOM_OPENCODE_PROMPT", None)
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to save OpenCode args: {e}\n")
+
         # Save system prompts to dedicated env vars (Gemini/Codex don't have CLI flags for this)
         self.state.config_edit["HCOM_GEMINI_SYSTEM_PROMPT"] = self.state.launch.gemini_system_prompt
         self.state.config_edit["HCOM_CODEX_SYSTEM_PROMPT"] = self.state.launch.codex_system_prompt
@@ -633,6 +643,17 @@ class HcomTUI:
             )
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to load Gemini args: {e}\n")
+
+        # Load OpenCode prompt from dedicated key
+        try:
+            opencode_prompt_str = self.state.config_edit.get("HCOM_OPENCODE_PROMPT", "")
+            self.state.launch.opencode_prompt = opencode_prompt_str
+            self.state.launch.opencode_prompt_cursor = min(
+                self.state.launch.opencode_prompt_cursor,
+                len(self.state.launch.opencode_prompt),
+            )
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to load OpenCode args: {e}\n")
 
         # Load system prompts from dedicated env vars (Gemini/Codex don't have CLI flags for this)
         self.state.launch.gemini_system_prompt = self.state.config_edit.get("HCOM_GEMINI_SYSTEM_PROMPT", "")

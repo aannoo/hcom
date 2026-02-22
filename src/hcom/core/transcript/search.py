@@ -33,6 +33,8 @@ def _get_live_transcript_paths(agent_filter: str | None = None) -> list[str]:
                     continue
                 if agent_filter == "codex" and "codex" not in tool:
                     continue
+                if agent_filter == "opencode" and "opencode" not in tool:
+                    continue
             if path and Path(path).exists():
                 paths.append(path)
     except Exception:
@@ -60,6 +62,10 @@ def _agent_from_path(path: str) -> str:
         if part == ".codex" and i + 1 < len(parts) and parts[i + 1] == "sessions":
             return "codex"
 
+    # OpenCode: DB path contains "opencode" in directory structure
+    if p.name == "opencode.db" or any(part == "opencode" for part in parts):
+        return "opencode"
+
     return "unknown"
 
 
@@ -81,6 +87,8 @@ def _get_hcom_tracked_paths(agent_filter: str | None = None) -> list[str]:
             if agent_filter == "gemini" and "gemini" in tool:
                 return True
             if agent_filter == "codex" and "codex" in tool:
+                return True
+            if agent_filter == "opencode" and "opencode" in tool:
                 return True
         agent = _agent_from_path(path)
         return agent == agent_filter

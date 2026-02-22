@@ -181,7 +181,7 @@ def inject_bootstrap_once(
         instance_name: Instance identifier (e.g., "alice", "bob_general_1")
         instance_data: Instance position data containing name_announced flag.
                       Typically from load_instance_position(instance_name).
-        tool: Tool type for bootstrap customization. One of: "claude", "gemini", "codex".
+        tool: Tool type for bootstrap customization. One of: "claude", "gemini", "codex", "opencode".
              Defaults to "claude".
 
     Returns:
@@ -222,10 +222,10 @@ def init_hook_context(
     hook_data: dict[str, Any],
     hook_type: str | None = None,  # noqa: ARG001 - kept for API compatibility
 ) -> tuple[str | None, dict[str, Any], bool]:
-    """Initialize instance context from hook_data via session binding lookup.
+    """Initialize instance context from hook_data via binding lookup.
 
-    Primary gate for hook participation: session must be bound to an instance
-    via session_bindings table. If not bound, falls back to transcript marker.
+    Primary gate for hook participation. Resolution order matches
+    resolve_instance_from_binding: process_binding → session_binding → transcript marker.
 
     Args:
         ctx: Execution context with cwd and background info.
@@ -239,31 +239,47 @@ def init_hook_context(
         - is_matched_resume: True if session_id matches stored value (resume scenario)
 
     Gate Logic:
-        1. Look up session_id in session_bindings → instance_name
-        2. If not found, try transcript marker fallback
-        3. If still not found → (None, {}, False) - non-participant
+        1. HCOM_PROCESS_ID → process_bindings → instance_name
+        2. session_id → session_bindings → instance_name
+        3. transcript marker fallback
+        4. If still not found → (None, {}, False) - non-participant
     """
     import time as _time
-    from ..core.db import get_session_binding, get_instance
+    from ..core.db import get_session_binding, get_instance, get_process_binding
+    from ..core.thread_context import get_process_id
 
     start = _time.perf_counter()
     session_id = hook_data.get("session_id", "")
     transcript_path = hook_data.get("transcript_path", "")
 
-    # Session binding is the sole gate for hook participation
-    binding_start = _time.perf_counter()
-    instance_name = get_session_binding(session_id)
-    binding_ms = (_time.perf_counter() - binding_start) * 1000
+    # Path 1: Process binding (hcom-launched instances, survives DB reset)
+    instance_name = None
+    process_ms = 0.0
+    process_id = get_process_id()
+    if process_id:
+        process_start = _time.perf_counter()
+        binding = get_process_binding(process_id)
+        if binding:
+            instance_name = binding.get("instance_name")
+        process_ms = (_time.perf_counter() - process_start) * 1000
 
+    # Path 2: Session binding
+    binding_ms = 0.0
+    if not instance_name:
+        binding_start = _time.perf_counter()
+        instance_name = get_session_binding(session_id)
+        binding_ms = (_time.perf_counter() - binding_start) * 1000
+
+    # Path 3: Transcript marker fallback (handles !hcom start)
     transcript_ms = 0.0
     if not instance_name:
-        # Fallback: check transcript for binding marker (handles !hcom start)
         transcript_start = _time.perf_counter()
         instance_name = _try_bind_from_transcript(session_id, transcript_path)
         transcript_ms = (_time.perf_counter() - transcript_start) * 1000
         if not instance_name:
             total_ms = (_time.perf_counter() - start) * 1000
             log_info("hooks", "init_hook_context.timing",
+                     process_ms=round(process_ms, 2),
                      binding_ms=round(binding_ms, 2),
                      transcript_ms=round(transcript_ms, 2),
                      total_ms=round(total_ms, 2),
@@ -289,7 +305,8 @@ def init_hook_context(
 
     total_ms = (_time.perf_counter() - start) * 1000
     log_info("hooks", "init_hook_context.timing",
-             instance=instance_name, binding_ms=round(binding_ms, 2),
+             instance=instance_name, process_ms=round(process_ms, 2),
+             binding_ms=round(binding_ms, 2),
              transcript_ms=round(transcript_ms, 2),
              instance_ms=round(instance_ms, 2),
              total_ms=round(total_ms, 2))

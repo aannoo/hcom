@@ -6,4 +6,4 @@
 mod connection;
 mod daemon;
 mod protocol;
-pub use daemon::{run, exec_python_fallback};
+pub use daemon::{exec_python_fallback, run};

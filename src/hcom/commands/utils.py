@@ -119,7 +119,7 @@ FILTER_HELP: list[tuple[str, str]] = [
     ("  --action VAL", "created | started | ready | stopped | batch_launched"),
     ("  --cmd PATTERN", "Shell command (contains, ^prefix, $suffix, =exact, *glob)"),
     ("  --file PATH", "File write (*.py for glob, file.py for contains)"),
-    ("  --collision", "Two agents edit same file within 20s"),
+    ("  --collision", "Two agents edit same file within 30s"),
     ("  --from NAME", "Sender"),
     ("  --mention NAME", "@mention target"),
     ("  --intent VAL", "request | inform | ack"),
@@ -200,7 +200,9 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
     "list": [
         ("list", "All alive agents, read receipts"),
         ("  -v", "Verbose (directory, session, etc)"),
-        ("  --json", "Verbose JSON (NDJSON, one per line)"),
+        ("  --json", "JSON array of all agents"),
+        ("  --names", "Just names, one per line"),
+        ("  --format TPL", "Template per agent: --format '{name} {status}'"),
         ("", ""),
         ("list [self|<name>]", "Single agent details"),
         ("  [field]", "Print specific field (status, directory, session_id, ...)"),
@@ -218,9 +220,9 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("", "◦  unknown     neutral"),
         ("", ""),
         ("Tool labels:", ""),
-        ("", "[CLAUDE] [GEMINI] [CODEX]  hcom-launched (PTY + hooks)"),
-        ("", "[claude] [gemini] [codex]  vanilla (hooks only)"),
-        ("", "[AD-HOC]                   manual polling"),
+        ("", "[CLAUDE] [GEMINI] [CODEX] [OPENCODE]  hcom-launched (PTY + hooks)"),
+        ("", "[claude] [gemini] [codex] [opencode]  vanilla (hooks only)"),
+        ("", "[AD-HOC]                              manual polling"),
     ],
     "send": [
         ("Usage:", ""),
@@ -334,6 +336,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
     "start": [
         ("start", "Connect to hcom (from inside any AI session)"),
         ("start --as <name>", "Reclaim identity (after compaction/resume/clear)"),
+        ("start --orphan <name|pid>", "Recover orphaned PTY process from pidtrack"),
         ("", ""),
         ("", ""),
         (
@@ -377,7 +380,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("Sandbox / local mode:", ""),
         ("", "If you can't write to ~/.hcom, set:"),
         ('', '  export HCOM_DIR="$PWD/.hcom"'),
-        ("", "Hooks install under $PWD (.claude/.gemini/.codex), state in $HCOM_DIR"),
+        ("", "Hooks install under $PWD (.claude/.gemini/.codex) or ~/.config/opencode/, state in $HCOM_DIR"),
         ("", ""),
         ("", "To remove local setup:"),
         ("", '  hcom hooks remove && rm -rf "$HCOM_DIR"'),
@@ -402,7 +405,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  hints", "Text appended to all messages agent receives"),
         ("  notes", "Notes appended to agent bootstrap"),
         ("  subagent_timeout", "Subagent keep-alive seconds after task"),
-        ("  claude_args / gemini_args / codex_args", ""),
+        ("  claude_args / gemini_args / codex_args / opencode_args", ""),
         ("  auto_approve", "Auto-approve safe hcom commands"),
         ("  auto_subscribe", "Event auto-subscribe presets"),
         ("  name_export", "Export agent name to custom env var"),
@@ -441,7 +444,7 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  --live", "Only currently alive agents"),
         ("  --all", "All transcripts (includes non-hcom sessions)"),
         ("  --limit N", "Max results (default: 20)"),
-        ("  --agent TYPE", "Filter: claude | gemini | codex"),
+        ("  --agent TYPE", "Filter: claude | gemini | codex | opencode"),
         ("  --exclude-self", "Exclude the searching agent's own transcript"),
         ("  --json", "JSON output"),
         ("", ""),
@@ -478,10 +481,10 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  hcom N claude (N>1)", "Opens new terminal windows"),
         ('  hcom N claude "initial prompt"', "Initial prompt (positional)"),
         ('  hcom 3 claude -p "prompt"', "3 headless in background"),
-        ("  HCOM_TAG=api hcom 2 claude", "Group tag (creates api-*)"),
+        ("  hcom 2 claude --tag api", "Group tag (creates api-*)"),
+        ("  hcom 1 claude --terminal tmux", "detached tmux launch"),
         ("  hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
         ('  hcom 1 claude --system-prompt "text"', "System prompt"),
-        ("  HCOM_TERMINAL=tmux hcom 1 claude", "detached tmux launch"),
         ("", ""),
         ("Environment:", ""),
         ("  HCOM_TAG", "Group/label tag (agents become tag-*)"),
@@ -505,8 +508,8 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  hcom N gemini (N>1)", "Opens new terminal windows"),
         ('  hcom N gemini -i "initial prompt"', "Initial prompt (-i flag required)"),
         ("  hcom N gemini --yolo", "Flags forwarded to gemini"),
-        ("  HCOM_TAG=api hcom 2 gemini", "Group tag (creates api-*)"),
-        ("  HCOM_TERMINAL=tmux hcom 1 gemini", "detached tmux launch"),
+        ("  hcom 2 gemini --tag api", "Group tag (creates api-*)"),
+        ("  hcom 1 gemini --terminal tmux", "detached tmux launch"),
         ("", ""),
         ("Environment:", ""),
         ("  HCOM_TAG", "Group tag (agents become tag-*)"),
@@ -530,8 +533,8 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("  hcom N codex (N>1)", "Opens new terminal windows"),
         ('  hcom N codex "initial prompt"', "Initial prompt (positional)"),
         ("  hcom codex --sandbox danger-full-access", "Flags forwarded to codex"),
-        ("  HCOM_TAG=api hcom 2 codex", "Group tag (creates api-*)"),
-        ("  HCOM_TERMINAL=tmux hcom 1 codex", "detached tmux launch"),
+        ("  hcom 2 codex --tag api", "Group tag (creates api-*)"),
+        ("  hcom 1 codex --terminal tmux", "detached tmux launch"),
         ("", ""),
         ("Environment:", ""),
         ("  HCOM_TAG", "Group tag (agents become tag-*)"),
@@ -548,6 +551,35 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
         ("", 'Run "codex --help" for Codex options.'),
         ("", 'Run "hcom config terminal --info" for terminal presets.'),
     ],
+    "opencode": [
+        ("[N] opencode [args...]", "Launch N OpenCode agents (default N=1)"),
+        ("", ""),
+        _dynamic_terminal_help("opencode"),
+        ("  hcom N opencode (N>1)", "Opens new terminal windows"),
+        ('  hcom opencode --prompt "task"', "Initial prompt"),
+        ("  hcom 2 opencode --tag api", "Group tag (creates api-*)"),
+        ("  hcom 1 opencode --terminal tmux", "detached tmux launch"),
+        ("", ""),
+        ("Environment:", ""),
+        ("  HCOM_TAG", "Group tag (agents become tag-*)"),
+        ("  HCOM_TERMINAL", 'default | <preset> | "cmd {script}"'),
+        ("  HCOM_OPENCODE_ARGS", "Default args (merged with CLI)"),
+        ("  HCOM_HINTS", "Appended to messages received"),
+        ("  HCOM_NOTES", "One-time bootstrap notes"),
+        ("", ""),
+        ("Resume / Fork:", ""),
+        ("  hcom r <name>", "Resume stopped agent by name"),
+        ("  hcom f <name>", "Fork agent session (active or stopped)"),
+        ("", ""),
+        ("", 'Run "opencode --help" for opencode options.'),
+        ("", 'Run "hcom config terminal --info" for terminal presets.'),
+    ],
+    "daemon": [
+        ("daemon", "Show daemon status"),
+        ("daemon start", "Start the background daemon"),
+        ("daemon stop", "Stop the daemon (SIGKILL after 5s)"),
+        ("daemon restart", "Restart the daemon"),
+    ],
     "status": [
         ("status", "Installation status and diagnostics"),
         ("status --logs", "Include recent errors and warnings"),
@@ -556,8 +588,8 @@ COMMAND_HELP: dict[str, list[HelpEntry]] = {
     "hooks": [
         ("hooks", "Show hook status"),
         ("hooks status", "Same as above"),
-        ("hooks add [tool]", "Add hooks (claude | gemini | codex | all)"),
-        ("hooks remove [tool]", "Remove hooks (claude | gemini | codex | all)"),
+        ("hooks add [tool]", "Add hooks (claude | gemini | codex | opencode | all)"),
+        ("hooks remove [tool]", "Remove hooks (claude | gemini | codex | opencode | all)"),
         ("", ""),
         ("", "Hooks enable automatic message delivery and status tracking."),
         ("", "Without hooks, use ad-hoc mode (run hcom start inside any AI tool)."),
@@ -614,7 +646,7 @@ def get_help_text() -> str:
 
 Usage:
   hcom                                  TUI dashboard
-  hcom <N> claude|gemini|codex [args]   Launch agents (args forwarded to tool)
+  hcom <N> claude|gemini|codex|opencode [args]   Launch agents (args forwarded to tool)
   hcom <command>                        Run command
 
 Commands:
@@ -633,6 +665,7 @@ Commands:
   archive      Query past hcom sessions
   reset        Archive and clear database
   hooks        Add or remove hooks
+  daemon       Manage the hcom background daemon
   status       Installation and diagnostics
   term         View/inject into agent PTY screens
 
@@ -691,9 +724,9 @@ KNOWN_FLAGS: dict[str, set[str]] = {
     "events sub": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--once", "--for"},
     "events unsub": _GLOBAL_FLAGS,
     "events launch": _GLOBAL_FLAGS | {"--timeout"},
-    "list": _GLOBAL_FLAGS | {"--json", "-v", "--verbose", "--sh", "--stopped", "--all"},
+    "list": _GLOBAL_FLAGS | {"--json", "-v", "--verbose", "--sh", "--stopped", "--all", "--names", "--format"},
     "listen": _GLOBAL_FLAGS | _FILTER_FLAGS | {"--timeout", "--json", "--sql"},
-    "start": _GLOBAL_FLAGS | {"--as"},
+    "start": _GLOBAL_FLAGS | {"--as", "--orphan"},
     "kill": _GLOBAL_FLAGS,
     "stop": _GLOBAL_FLAGS,
     "transcript": _GLOBAL_FLAGS | {"--last", "--range", "--json", "--full", "--detailed"},

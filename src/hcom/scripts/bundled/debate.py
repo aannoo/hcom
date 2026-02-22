@@ -120,7 +120,7 @@ Examples:
 
     parser.add_argument(
         "--tool",
-        choices=["claude", "gemini", "codex"],
+        choices=["claude", "gemini", "codex", "opencode"],
         default="claude",
         help="AI tool to use for spawned instances (default: claude)",
     )
@@ -196,19 +196,23 @@ Wait for the judge to start, then present your opening argument when prompted.
 Use: hcom send "@judge- @con- [your argument]" --thread {thread} --intent inform
 (The @prefix- pattern matches any instance with that prefix)"""
 
-    pro_result = launch(
-        1,
-        tool=args.tool,
-        tag="pro",
-        prompt=pro_prompt,
-        background=not args.interactive,
-        system_prompt=PRO_SYSTEM_PROMPT,
-        wait=True,
-    )
-    print(f"PRO debater launched ({args.tool}, batch: {pro_result['batch_id']})")
+    launched_names = []
+    try:
+        pro_result = launch(
+            1,
+            tool=args.tool,
+            tag="pro",
+            prompt=pro_prompt,
+            background=not args.interactive,
+            system_prompt=PRO_SYSTEM_PROMPT,
+            wait=True,
+        )
+        for h in pro_result.get("handles", []):
+            launched_names.append(h["instance_name"])
+        print(f"PRO debater launched ({args.tool}, batch: {pro_result['batch_id']})")
 
-    # Launch CON debater
-    con_prompt = f"""You are the CON debater in thread '{thread}'.
+        # Launch CON debater
+        con_prompt = f"""You are the CON debater in thread '{thread}'.
 Topic: {args.topic}
 
 Argue AGAINST this proposition. A judge will coordinate the debate.
@@ -218,30 +222,43 @@ Wait for the judge to start, then present your argument when prompted.
 Use: hcom send "@judge- @pro- [your argument]" --thread {thread} --intent inform
 (The @prefix- pattern matches any instance with that prefix)"""
 
-    con_result = launch(
-        1,
-        tool=args.tool,
-        tag="con",
-        prompt=con_prompt,
-        background=not args.interactive,
-        system_prompt=CON_SYSTEM_PROMPT,
-        wait=True,
-    )
-    print(f"CON debater launched ({args.tool}, batch: {con_result['batch_id']})")
+        con_result = launch(
+            1,
+            tool=args.tool,
+            tag="con",
+            prompt=con_prompt,
+            background=not args.interactive,
+            system_prompt=CON_SYSTEM_PROMPT,
+            wait=True,
+        )
+        for h in con_result.get("handles", []):
+            launched_names.append(h["instance_name"])
+        print(f"CON debater launched ({args.tool}, batch: {con_result['batch_id']})")
 
-    # Extract actual instance names for SQL queries
-    pro_name = pro_result["handles"][0]["instance_name"] if pro_result.get("handles") else None
-    con_name = con_result["handles"][0]["instance_name"] if con_result.get("handles") else None
+        # Extract actual instance names for SQL queries
+        pro_name = pro_result["handles"][0]["instance_name"] if pro_result.get("handles") else None
+        con_name = con_result["handles"][0]["instance_name"] if con_result.get("handles") else None
 
-    # Launch judge with actual debater names
-    launch_judge(
-        args,
-        thread,
-        context_section,
-        structured=True,
-        pro_name=pro_name,
-        con_name=con_name,
-    )
+        # Launch judge with actual debater names
+        launch_judge(
+            args,
+            thread,
+            context_section,
+            structured=True,
+            pro_name=pro_name,
+            con_name=con_name,
+        )
+    except Exception as e:
+        print(f"\nError during launch: {e}", file=sys.stderr)
+        if launched_names:
+            print(f"Cleaning up {len(launched_names)} launched agents...", file=sys.stderr)
+            from hcom.core.ops import op_stop
+            for name in launched_names:
+                try:
+                    op_stop(name, reason="launch_failure")
+                except Exception:
+                    pass
+        sys.exit(1)
 
 
 def run_workers_mode(args, thread, context_section):

@@ -1,11 +1,11 @@
 [package]
 name = "hcom"
-version = "0.6.20"
+version = "0.6.21"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.86"
 
 [[bin]]
 name = "hcom"
@@ -24,6 +24,14 @@ thiserror = "2"
 # Client mode dependencies
 dirs = "5"
 chrono = "0.4"
+# TUI dependencies
+ratatui = { version = "0.30", features = ["scrolling-regions"] }
+crossterm = "0.29"
+color-eyre = "0.6"
+unicode-width = "0.2"
+unicode-segmentation = "1.12.0"
+shell-words = "1"
+toml = "0.8"
 
 [dev-dependencies]
 serial_test = "3"

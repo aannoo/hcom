@@ -24,6 +24,7 @@ Run agents with `hcom` in front:
 hcom claude
 hcom gemini
 hcom codex
+hcom opencode
 ```
 
 Prompt:
@@ -42,7 +43,7 @@ hcom
 
 Messages arrive mid-turn or wake idle agents immediately.
 
-If 2 agents edit the same file within 20 seconds, both get collision notifications.
+If 2 agents edit the same file within 30 seconds, both get collision notifications.
 
 Refer to agents by name, tool, terminal, branch, cwd, or set a custom tag.
 
@@ -76,7 +77,7 @@ Tell any agent:
 | View terminal screens, inject text/enter for approvals | `hcom term` |
 | Query event history (file edits, commands, status, lifecycle) | `hcom events` |
 | Subscribe and react to each other's activity | `hcom events sub` |
-| Spawn, fork, resume agents in new terminal panes | `hcom N claude\|gemini\|codex`, `hcom r`, `hcom f` |
+| Spawn, fork, resume agents in new terminal panes | `hcom N claude\|gemini\|codex\|opencode`, `hcom r`, `hcom f` |
 | Kill agents and close their terminal panes/sessions | `hcom kill` |
 | Build context bundles (files, transcript, events) for handoffs | `hcom bundle` |
 
@@ -104,7 +105,7 @@ Create your own by prompting:
 
 ## Tools
 
-**Claude Code, Gemini CLI, Codex** — messages are delivered automatically, events are tracked.
+**Claude Code, Gemini CLI, Codex, OpenCode** — messages are delivered automatically, events are tracked.
 
 **Any AI tool that can run shell commands** - send and receive messages manually. Tell agent "run `hcom start`"
 
@@ -181,11 +182,11 @@ hcom status                        # diagnostics
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.20 - multi-agent communication
+hcom (hook-comms) v0.6.21 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
-  hcom <N> claude|gemini|codex [args]   Launch agents (args forwarded to tool)
+  hcom <N> claude|gemini|codex|opencode [args]   Launch agents (args forwarded to tool)
   hcom <command>                        Run command
 
 Commands:
@@ -204,6 +205,7 @@ Commands:
   archive      Query past hcom sessions
   reset        Archive and clear database
   hooks        Add or remove hooks
+  daemon       Manage the hcom background daemon
   status       Installation and diagnostics
   term         View/inject into agent PTY screens
 
@@ -237,7 +239,7 @@ Filters (same flag repeated = OR, different flags = AND):
     --action VAL                   created | started | ready | stopped | batch_launched
     --cmd PATTERN                  Shell command (contains, ^prefix, $suffix, =exact, *glob)
     --file PATH                    File write (*.py for glob, file.py for contains)
-    --collision                    Two agents edit same file within 20s
+    --collision                    Two agents edit same file within 30s
     --from NAME                    Sender
     --mention NAME                 @mention target
     --intent VAL                   request | inform | ack
@@ -286,7 +288,9 @@ SQL reference (events_v view):
 Usage:
   hcom list                       All alive agents, read receipts
     -v                             Verbose (directory, session, etc)
-    --json                         Verbose JSON (NDJSON, one per line)
+    --json                         JSON array of all agents
+    --names                        Just names, one per line
+    --format TPL                   Template per agent: --format '{name} {status}'
 
   hcom list [self|<name>]         Single agent details
     [field]                        Print specific field (status, directory, session_id, ...)
@@ -306,9 +310,9 @@ Status icons:
 
 
 Tool labels:
-  [CLAUDE] [GEMINI] [CODEX]  hcom-launched (PTY + hooks)
-  [claude] [gemini] [codex]  vanilla (hooks only)
-  [AD-HOC]                   manual polling
+  [CLAUDE] [GEMINI] [CODEX] [OPENCODE]  hcom-launched (PTY + hooks)
+  [claude] [gemini] [codex] [opencode]  vanilla (hooks only)
+  [AD-HOC]                              manual polling
 
 ## send
 
@@ -435,6 +439,7 @@ Usage:
 Usage:
   hcom start                      Connect to hcom (from inside any AI session)
   hcom start --as <name>          Reclaim identity (after compaction/resume/clear)
+  hcom start --orphan <name|pid>  Recover orphaned PTY process from pidtrack
 
 
   Inside a sandbox? Prefix all hcom commands with: HCOM_DIR=$PWD/.hcom
@@ -485,7 +490,7 @@ Usage:
 Sandbox / local mode:
   If you can't write to ~/.hcom, set:
     export HCOM_DIR="$PWD/.hcom"
-  Hooks install under $PWD (.claude/.gemini/.codex), state in $HCOM_DIR
+  Hooks install under $PWD (.claude/.gemini/.codex) or ~/.config/opencode/, state in $HCOM_DIR
 
   To remove local setup:
     hcom hooks remove && rm -rf "$HCOM_DIR"
@@ -514,7 +519,7 @@ Keys:
     hints                          Text appended to all messages agent receives
     notes                          Notes appended to agent bootstrap
     subagent_timeout               Subagent keep-alive seconds after task
-    claude_args / gemini_args / codex_args 
+    claude_args / gemini_args / codex_args / opencode_args 
     auto_approve                   Auto-approve safe hcom commands
     auto_subscribe                 Event auto-subscribe presets
     name_export                    Export agent name to custom env var
@@ -559,7 +564,7 @@ Usage:
     --live                         Only currently alive agents
     --all                          All transcripts (includes non-hcom sessions)
     --limit N                      Max results (default: 20)
-    --agent TYPE                   Filter: claude | gemini | codex
+    --agent TYPE                   Filter: claude | gemini | codex | opencode
     --exclude-self                 Exclude the searching agent's own transcript
     --json                         JSON output
 
@@ -602,10 +607,10 @@ Usage:
     hcom N claude (N>1)            Opens new terminal windows
     hcom N claude "initial prompt" Initial prompt (positional)
     hcom 3 claude -p "prompt"      3 headless in background
-    HCOM_TAG=api hcom 2 claude     Group tag (creates api-*)
+    hcom 2 claude --tag api        Group tag (creates api-*)
+    hcom 1 claude --terminal tmux  detached tmux launch
     hcom 1 claude --agent <name>   .claude/agents/<name>.md
     hcom 1 claude --system-prompt "text" System prompt
-    HCOM_TERMINAL=tmux hcom 1 claude detached tmux launch
 
 
 Environment:
@@ -633,8 +638,8 @@ Usage:
     hcom N gemini (N>1)            Opens new terminal windows
     hcom N gemini -i "initial prompt" Initial prompt (-i flag required)
     hcom N gemini --yolo           Flags forwarded to gemini
-    HCOM_TAG=api hcom 2 gemini     Group tag (creates api-*)
-    HCOM_TERMINAL=tmux hcom 1 gemini detached tmux launch
+    hcom 2 gemini --tag api        Group tag (creates api-*)
+    hcom 1 gemini --terminal tmux  detached tmux launch
 
 
 Environment:
@@ -662,8 +667,8 @@ Usage:
     hcom N codex (N>1)             Opens new terminal windows
     hcom N codex "initial prompt"  Initial prompt (positional)
     hcom codex --sandbox danger-full-access Flags forwarded to codex
-    HCOM_TAG=api hcom 2 codex      Group tag (creates api-*)
-    HCOM_TERMINAL=tmux hcom 1 codex detached tmux launch
+    hcom 2 codex --tag api         Group tag (creates api-*)
+    hcom 1 codex --terminal tmux   detached tmux launch
 
 
 Environment:
@@ -682,6 +687,41 @@ Resume / Fork:
   Run "codex --help" for Codex options.
   Run "hcom config terminal --info" for terminal presets.
 
+## opencode
+
+Usage:
+  hcom [N] opencode [args...]     Launch N OpenCode agents (default N=1)
+
+    hcom opencode                  Runs in current terminal
+    hcom N opencode (N>1)          Opens new terminal windows
+    hcom opencode --prompt "task"  Initial prompt
+    hcom 2 opencode --tag api      Group tag (creates api-*)
+    hcom 1 opencode --terminal tmux detached tmux launch
+
+
+Environment:
+    HCOM_TAG                       Group tag (agents become tag-*)
+    HCOM_TERMINAL                  default | <preset> | "cmd {script}"
+    HCOM_OPENCODE_ARGS             Default args (merged with CLI)
+    HCOM_HINTS                     Appended to messages received
+    HCOM_NOTES                     One-time bootstrap notes
+
+
+Resume / Fork:
+    hcom r <name>                  Resume stopped agent by name
+    hcom f <name>                  Fork agent session (active or stopped)
+
+  Run "opencode --help" for opencode options.
+  Run "hcom config terminal --info" for terminal presets.
+
+## daemon
+
+Usage:
+  hcom daemon                     Show daemon status
+  hcom daemon start               Start the background daemon
+  hcom daemon stop                Stop the daemon (SIGKILL after 5s)
+  hcom daemon restart             Restart the daemon
+
 ## status
 
 Usage:
@@ -694,8 +734,8 @@ Usage:
 Usage:
   hcom hooks                      Show hook status
   hcom hooks status               Same as above
-  hcom hooks add [tool]           Add hooks (claude | gemini | codex | all)
-  hcom hooks remove [tool]        Remove hooks (claude | gemini | codex | all)
+  hcom hooks add [tool]           Add hooks (claude | gemini | codex | opencode | all)
+  hcom hooks remove [tool]        Remove hooks (claude | gemini | codex | opencode | all)
 
   Hooks enable automatic message delivery and status tracking.
   Without hooks, use ad-hoc mode (run hcom start inside any AI tool).
@@ -947,7 +987,7 @@ Usage:
   hcom config auto_subscribe ""   # No auto-subscribe
 
 Available presets:
-  collision    - Alert when agents edit same file (within 20s window)
+  collision    - Alert when agents edit same file (within 30s window)
   created      - Notify when new instances join
   stopped      - Notify when instances leave
   blocked      - Notify when any instance is blocked (needs approval)
@@ -1051,7 +1091,7 @@ Group launch (heterogeneous agents, shared batch):
 
 Args:
     count: Number of instances (int) or list of spec dicts.
-    tool: One of 'claude', 'gemini', 'codex' (single mode).
+    tool: One of 'claude', 'gemini', 'codex', 'opencode' (single mode).
     tag: Group tag (single mode).
     prompt: Initial prompt (single mode).
     system_prompt: System prompt override (single mode).
@@ -1159,7 +1199,7 @@ Fresh instance info from database.
             status (str): Current status ('active', 'listening', 'inactive').
             transcript_path (str): Path to transcript file.
             parent_name (str): Parent instance name (for subagents).
-            tool (str): Tool type ('claude', 'gemini', 'codex').
+            tool (str): Tool type ('claude', 'gemini', 'codex', 'opencode').
 
     Raises:
         HcomError: If instance no longer exists.

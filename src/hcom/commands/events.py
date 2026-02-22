@@ -212,6 +212,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     filter_query = ""
 
     # PHASE 3: Generate SQL from filter flags
+    flag_sql = ""
     if filters:
         try:
             flag_sql = build_sql_from_flags(filters)
@@ -410,10 +411,18 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if search_all:
         from .query import _list_archives, _query_archive_events
 
+        # Combine structured filters + raw --sql for archive queries
+        archive_filter_parts = []
+        if flag_sql:
+            archive_filter_parts.append(f"({flag_sql})")
+        if sql_where:
+            archive_filter_parts.append(f"({sql_where})")
+        archive_filter = " AND ".join(archive_filter_parts) or None
+
         archives = _list_archives()
         for archive in archives:
             try:
-                archive_events = _query_archive_events(archive, sql_where, last_n)
+                archive_events = _query_archive_events(archive, archive_filter, last_n)
                 for event in archive_events:
                     event["ts"] = event.pop("timestamp")
                     event["source"] = archive["name"]

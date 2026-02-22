@@ -102,8 +102,14 @@ def capture_context() -> dict[str, Any]:
     from .thread_context import get_launched_preset
     terminal_preset = get_launched_preset() or ""
     if not terminal_preset:
-        from ..terminal import detect_terminal_from_env
-        terminal_preset = detect_terminal_from_env() or ""
+        # Detect from env vars (TMUX_PANE, KITTY_WINDOW_ID, etc.) only when
+        # os.environ is the agent's actual env — i.e. CLI mode (hooks running
+        # in the agent's process). In daemon mode, os.environ is the daemon's
+        # env, not the agent's, so detection would stamp the wrong preset.
+        from .thread_context import is_in_daemon_mode
+        if not is_in_daemon_mode():
+            from ..terminal import detect_terminal_from_env
+            terminal_preset = detect_terminal_from_env() or ""
     if terminal_preset:
         ctx["terminal_preset"] = terminal_preset
         from ..core.settings import get_merged_preset
