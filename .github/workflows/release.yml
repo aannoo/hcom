@@ -119,7 +119,7 @@ jobs:
       - name: Separate Android wheel
         run: |
           mkdir -p android-dist
-          mv dist/*linux_aarch64*.whl android-dist/ || true
+          mv dist/*-linux_aarch64.whl android-dist/ || true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -160,6 +160,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Install cross-linker (ARM Linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -174,6 +177,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
       - name: Build (Android)
         if: matrix.target == 'aarch64-linux-android'
         run: |
