@@ -915,6 +915,22 @@ pub fn run_delivery_loop(
                                 log_warn("native", "delivery.set_status_fail", &format!("Failed to set blocked status: {}", e));
                             }
                         } else if gate.reason == "not_idle" {
+                            // Immediate recovery: if approval just cleared but DB still says blocked,
+                            // clear it now — no need to wait for stability timeout.
+                            match db.get_status(&current_name) {
+                                Ok(Some((status, _))) if status == "blocked" => {
+                                    if let Err(e) = db.set_status(
+                                        &current_name,
+                                        "listening",
+                                        "pty:approval_cleared",
+                                    ) {
+                                        log_warn("native", "delivery.set_status_fail", &format!("Failed to clear blocked: {}", e));
+                                    }
+                                    attempt = 0;
+                                    continue;
+                                }
+                                _ => {}
+                            }
                             // Stability-based recovery: if status stuck "active" but output stable 10s,
                             // assume ESC cancelled or hook didn't fire - flip to listening.
                             // NOTE: stability tracking has false positives from escape sequences,
