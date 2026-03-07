@@ -62,7 +62,7 @@ pub fn do_resume(
     }
 
     // Load snapshot: from active instance (fork) or stopped event (resume)
-    let (tool, session_id, launch_args_str, tag, background, last_event_id) = if fork {
+    let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir) = if fork {
         load_instance_data(&db, name)?
     } else {
         load_stopped_snapshot(&db, name)?
@@ -72,8 +72,38 @@ pub fn do_resume(
         bail!("No session ID found for '{}' — cannot {}", name, if fork { "fork" } else { "resume" });
     }
 
-    // Extract hcom-level flags (--tag, --terminal) from extra args before tool parsing
-    let (tag_override, terminal_override, clean_extra) = extract_hcom_flags(extra_args);
+    // Extract hcom-level flags (--tag, --terminal, --dir) from extra args before tool parsing
+    let (tag_override, terminal_override, dir_override, clean_extra) = extract_hcom_flags(extra_args);
+
+    // Determine effective working directory:
+    // - Explicit --dir flag wins (validated and canonicalized)
+    // - For resume: use snapshot directory (continue where you left off)
+    // - For fork: use current directory (start fresh in new context)
+    let effective_cwd = if let Some(ref dir) = dir_override {
+        let path = std::path::Path::new(dir);
+        if !path.is_dir() {
+            bail!("--dir path does not exist or is not a directory: {}", dir);
+        }
+        path.canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| dir.clone())
+    } else if fork {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    } else if !snapshot_dir.is_empty() && std::path::Path::new(&snapshot_dir).is_dir() {
+        snapshot_dir.clone()
+    } else {
+        if !snapshot_dir.is_empty() {
+            eprintln!(
+                "Warning: original directory '{}' no longer exists, using current directory",
+                snapshot_dir
+            );
+        }
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    };
 
     // Build tool-specific resume args
     let mut tool_args = build_resume_args(&tool, &session_id, fork);
@@ -130,11 +160,7 @@ pub fn do_resume(
             }),
             pty: use_pty,
             background: is_headless,
-            cwd: Some(
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string()),
-            ),
+            cwd: Some(effective_cwd),
             env: None,
             launcher: Some(launcher_name),
             run_here: None,
@@ -174,9 +200,10 @@ pub fn do_resume(
 
 /// Extract hcom-level flags (--tag, --terminal, --name, --go) from args.
 /// Returns (tag, terminal, remaining) with hcom flags stripped.
-fn extract_hcom_flags(args: &[String]) -> (Option<String>, Option<String>, Vec<String>) {
+fn extract_hcom_flags(args: &[String]) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
     let mut tag = None;
     let mut terminal = None;
+    let mut dir = None;
     let mut remaining = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -192,6 +219,12 @@ fn extract_hcom_flags(args: &[String]) -> (Option<String>, Option<String>, Vec<S
         } else if args[i].starts_with("--terminal=") {
             terminal = Some(args[i][11..].to_string());
             i += 1;
+        } else if args[i] == "--dir" && i + 1 < args.len() {
+            dir = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i].starts_with("--dir=") {
+            dir = Some(args[i][6..].to_string());
+            i += 1;
         } else if args[i] == "--name" && i + 1 < args.len() {
             // --name is a global hcom flag, strip it so it doesn't leak to tool CLI
             i += 2;
@@ -202,11 +235,11 @@ fn extract_hcom_flags(args: &[String]) -> (Option<String>, Option<String>, Vec<S
             i += 1;
         }
     }
-    (tag, terminal, remaining)
+    (tag, terminal, dir, remaining)
 }
 
 /// Load data from an active or stopped instance.
-fn load_instance_data(db: &HcomDb, name: &str) -> Result<(String, String, String, String, bool, i64)> {
+fn load_instance_data(db: &HcomDb, name: &str) -> Result<(String, String, String, String, bool, i64, String)> {
     // Try active instance first
     if let Ok(Some(inst)) = db.get_instance_full(name) {
         return Ok((
@@ -216,6 +249,7 @@ fn load_instance_data(db: &HcomDb, name: &str) -> Result<(String, String, String
             inst.tag.as_deref().unwrap_or("").to_string(),
             inst.background != 0,
             inst.last_event_id,
+            inst.directory.clone(),
         ));
     }
 
@@ -224,7 +258,7 @@ fn load_instance_data(db: &HcomDb, name: &str) -> Result<(String, String, String
 }
 
 /// Load stopped snapshot from life events.
-fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<(String, String, String, String, bool, i64)> {
+fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<(String, String, String, String, bool, i64, String)> {
     // Query the latest "stopped" life event for this instance
     let mut stmt = db.conn().prepare(
         "SELECT data FROM events WHERE type='life' AND instance=? ORDER BY id DESC LIMIT 10",
@@ -245,8 +279,9 @@ fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<(String, String, Str
                     let tag = snapshot.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let background = snapshot.get("background").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
                     let last_event_id = snapshot.get("last_event_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let directory = snapshot.get("directory").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                    return Ok((tool, session_id, launch_args, tag, background, last_event_id));
+                    return Ok((tool, session_id, launch_args, tag, background, last_event_id, directory));
                 }
             }
         }
@@ -393,33 +428,46 @@ mod tests {
 
     #[test]
     fn test_extract_hcom_flags_terminal() {
-        let (tag, terminal, remaining) = extract_hcom_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
+        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
         assert_eq!(tag, None);
         assert_eq!(terminal, Some("alacritty".to_string()));
+        assert_eq!(dir, None);
         assert_eq!(remaining, s(&["--model", "opus"]));
     }
 
     #[test]
     fn test_extract_hcom_flags_tag_and_terminal() {
-        let (tag, terminal, remaining) = extract_hcom_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
+        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
         assert_eq!(tag, Some("test".to_string()));
         assert_eq!(terminal, Some("kitty".to_string()));
+        assert_eq!(dir, None);
         assert!(remaining.is_empty());
     }
 
     #[test]
     fn test_extract_hcom_flags_equals_form() {
-        let (tag, terminal, remaining) = extract_hcom_flags(&s(&["--tag=test", "--terminal=alacritty"]));
+        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--tag=test", "--terminal=alacritty"]));
         assert_eq!(tag, Some("test".to_string()));
         assert_eq!(terminal, Some("alacritty".to_string()));
+        assert_eq!(dir, None);
         assert!(remaining.is_empty());
     }
 
     #[test]
     fn test_extract_hcom_flags_none() {
-        let (tag, terminal, remaining) = extract_hcom_flags(&s(&["--model", "opus"]));
+        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--model", "opus"]));
         assert_eq!(tag, None);
         assert_eq!(terminal, None);
+        assert_eq!(dir, None);
+        assert_eq!(remaining, s(&["--model", "opus"]));
+    }
+
+    #[test]
+    fn test_extract_hcom_flags_dir() {
+        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
+        assert_eq!(tag, None);
+        assert_eq!(terminal, None);
+        assert_eq!(dir, Some("/tmp/test".to_string()));
         assert_eq!(remaining, s(&["--model", "opus"]));
     }
 }
