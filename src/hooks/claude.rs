@@ -1067,55 +1067,31 @@ fn handle_stop(
     db: &HcomDb,
     ctx: &HcomContext,
     instance_name: &str,
-    instance_data: &InstanceRow,
+    _instance_data: &InstanceRow,
 ) -> (i32, String) {
-    log::log_info(
-        "hooks",
-        "stop.enter",
-        &format!(
-            "instance={} is_headless={} pty_mode={}",
-            instance_name, ctx.is_background, ctx.is_pty_mode
-        ),
-    );
+    log::log_info("hooks", "stop.enter", &format!("instance={}", instance_name));
 
-    // PTY mode: exit immediately, PTY wrapper handles injection
+    // PTY mode: exit immediately, PTY wrapper handles injection (unchanged)
     if ctx.is_pty_mode {
         instances::set_status(db, instance_name, ST_LISTENING, "", "", "", None, None);
         common::notify_hook_instance_with_db(db, instance_name);
         return (0, String::new());
     }
 
-    // Non-PTY: poll for messages
-    let wait_timeout = instance_data.wait_timeout;
-    let timeout = wait_timeout.unwrap_or_else(|| {
-        HcomConfig::load(None).ok().map(|c| c.timeout).unwrap_or(120)
-    });
-
-    // Persist effective timeout
-    let mut updates = serde_json::Map::new();
-    updates.insert("wait_timeout".into(), serde_json::json!(timeout));
-    instances::update_instance_position(db, instance_name, &updates);
-
-    let (exit_code, output, timed_out) =
-        common::poll_messages(db, instance_name, timeout as u64, ctx.is_background);
-
-    if timed_out {
-        instances::set_status(
-            db,
-            instance_name,
-            ST_INACTIVE,
-            "exit:timeout",
-            "",
-            "",
-            None,
-            None,
-        );
+    // Non-PTY: instant non-blocking check + deliver
+    let (_delivered, formatted) = common::deliver_pending_messages(db, instance_name);
+    if let Some(formatted) = formatted {
+        // Messages found — deliver them (exit code 2 = "block" → triggers new turn)
+        let output = serde_json::json!({
+            "decision": "block",
+            "reason": formatted,
+        });
+        return (2, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    let stdout = output
-        .map(|v| serde_json::to_string(&v).unwrap_or_default())
-        .unwrap_or_default();
-    (exit_code, stdout)
+    // No messages — set status to LISTENING and exit immediately
+    instances::set_status(db, instance_name, ST_LISTENING, "", "", "", None, None);
+    (0, String::new())
 }
 
 // ==================== UserPromptSubmit (1E.3) ====================
@@ -1228,6 +1204,18 @@ fn handle_userpromptsubmit(
                 serde_json::to_string(&output).unwrap_or_default(),
             );
         }
+    }
+
+    // Non-PTY: deliver pending messages (closes gap from non-blocking Stop hook)
+    let (_delivered, formatted) = common::deliver_pending_messages(db, instance_name);
+    if let Some(formatted) = formatted {
+        let output = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": formatted,
+            }
+        });
+        return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
     // Set status to active
@@ -1847,7 +1835,7 @@ const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
     ("UserPromptSubmit", "", "userpromptsubmit", None),
     ("PreToolUse", "Bash|Task|Write|Edit", "pre", None),
     ("PostToolUse", "", "post", Some(86400)),
-    ("Stop", "", "poll", Some(86400)),
+    ("Stop", "", "poll", None),
     ("SubagentStart", "", "subagent-start", None),
     ("SubagentStop", "", "subagent-stop", Some(86400)),
     ("Notification", "", "notify", None),

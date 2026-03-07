@@ -84,8 +84,8 @@ pub static HOOK_REGISTRY: LazyLock<Vec<HookInfo>> = LazyLock::new(|| {
             event_name: "Stop",
             command_suffix: "poll",
             matcher: "",
-            timeout: Some(86400),
-            categories: &[HookCategory::Stdin, HookCategory::Blocking],
+            timeout: None,
+            categories: &[HookCategory::Stdin],
         },
         HookInfo {
             event_name: "SubagentStart",
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_blocking_hooks() {
-        assert!(BLOCKING_HOOKS.contains("Stop"));
+        assert!(!BLOCKING_HOOKS.contains("Stop"));
         assert!(BLOCKING_HOOKS.contains("SubagentStop"));
         assert!(!BLOCKING_HOOKS.contains("PostToolUse"));
         assert!(!BLOCKING_HOOKS.contains("SessionStart"));
@@ -176,7 +176,7 @@ mod tests {
     fn test_get_hook_info() {
         let info = get_hook_info("Stop").unwrap();
         assert_eq!(info.command_suffix, "poll");
-        assert_eq!(info.timeout, Some(86400));
+        assert_eq!(info.timeout, None);
 
         let info = get_hook_info("PreToolUse").unwrap();
         assert_eq!(info.matcher, "Bash|Task|Write|Edit");

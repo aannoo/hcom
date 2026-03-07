@@ -756,26 +756,14 @@ Usage:
   Changing after launch has no effect (bootstrap already delivered)."),
 
         "HCOM_TIMEOUT" => Some("\
-HCOM_TIMEOUT - Advanced: idle timeout for headless/vanilla Claude (seconds)
+HCOM_TIMEOUT - Deprecated: no longer used (since v0.7.3)
 
-Default: 86400 (24 hours)
+Previously controlled the idle timeout for headless/vanilla Claude's
+Stop hook blocking poll. The Stop hook is now non-blocking.
 
-This setting only applies to:
-  - Headless Claude: hcom N claude -p
-  - Vanilla Claude: claude + hcom start
-
-Does NOT apply to:
-  - Interactive PTY mode: hcom N claude (main path)
-  - Gemini or Codex
-
-How it works:
-  - Claude's Stop hook runs when Claude goes idle
-  - Hook waits up to TIMEOUT seconds for a message
-  - If no message within timeout, instance is unregistered
-
-Usage (if needed):
-  hcom config HCOM_TIMEOUT 3600   # 1 hour
-  export HCOM_TIMEOUT=3600        # via environment"),
+Related settings that ARE still active:
+  - HCOM_SUBAGENT_TIMEOUT: timeout for Claude subagents (SubagentStop)
+  - hcom listen --timeout N: timeout for explicit message waiting"),
 
         "HCOM_SUBAGENT_TIMEOUT" => Some("\
 HCOM_SUBAGENT_TIMEOUT - Timeout for Claude subagents (seconds)
