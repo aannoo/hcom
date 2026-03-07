@@ -546,6 +546,7 @@ fn start_rebind(
         None,  // wait_timeout
         None,  // subagent_timeout
         None,  // hints
+        None,  // cwd_override
     );
 
     // Restore cursor position + mark as announced
@@ -745,6 +746,7 @@ fn start_bare(
         None,  // wait_timeout
         None,  // subagent_timeout
         None,  // hints
+        None,  // cwd_override
     );
 
     // Bind process if we have a process_id

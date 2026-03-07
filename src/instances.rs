@@ -1278,10 +1278,15 @@ pub fn initialize_instance_in_position_file(
     wait_timeout: Option<i64>,
     subagent_timeout: Option<i64>,
     hints: Option<&str>,
+    cwd_override: Option<&str>,
 ) -> bool {
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let cwd = cwd_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
     let is_launched = std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1");
 
     // Check if already exists
@@ -1458,6 +1463,7 @@ pub fn create_orphaned_pty_identity(
         None,  // wait_timeout
         None,  // subagent_timeout
         None,  // hints
+        None,  // cwd_override
     );
 
     if !success {
