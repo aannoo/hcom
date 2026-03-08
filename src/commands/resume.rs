@@ -5,9 +5,13 @@
 
 use anyhow::{Result, bail};
 use serde_json::json;
+use std::io::BufRead;
 
+use crate::commands::transcript::{claude_config_dir, detect_agent_type};
 use crate::db::HcomDb;
 use crate::hooks::claude_args;
+use crate::hooks::codex::derive_codex_transcript_path;
+use crate::hooks::gemini::derive_gemini_transcript_path;
 use crate::identity;
 use crate::launcher::{self, LaunchParams};
 use crate::log::log_info;
@@ -61,6 +65,11 @@ pub fn do_resume(
     let db = HcomDb::open()?;
     let name = crate::instances::resolve_display_name_or_stopped(&db, name)
         .unwrap_or_else(|| name.to_string());
+
+    // If the input looks like a session UUID, branch to session-ID resume
+    if is_session_id(&name) {
+        return do_resume_by_session_id(&name, fork, extra_args, flags, &db);
+    }
 
     // For resume (not fork): reject if instance is still active
     if !fork {
@@ -391,6 +400,246 @@ fn is_headless_from_args(tool: &str, args: &[String]) -> bool {
     }
 }
 
+/// Check if a string looks like a UUID session ID.
+fn is_session_id(s: &str) -> bool {
+    uuid::Uuid::parse_str(s).is_ok()
+}
+
+/// Find a session transcript on disk by session ID.
+/// Returns (tool, transcript_path) if found.
+fn find_session_on_disk(session_id: &str) -> Option<(String, String)> {
+    // 1. Claude: iterate project dirs, check for exact filename
+    let projects_dir = claude_config_dir().join("projects");
+    if projects_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let candidate = entry.path().join(format!("{}.jsonl", session_id));
+                    if candidate.exists() {
+                        let path_str = candidate.to_string_lossy().to_string();
+                        let tool = detect_agent_type(&path_str).to_string();
+                        return Some((tool, path_str));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Codex: reuse existing glob-based search
+    if let Some(path) = derive_codex_transcript_path(session_id) {
+        let tool = detect_agent_type(&path).to_string();
+        return Some((tool, path));
+    }
+
+    // 3. Gemini: reuse existing prefix-based search
+    if let Some(path) = derive_gemini_transcript_path(session_id) {
+        let tool = detect_agent_type(&path).to_string();
+        return Some((tool, path));
+    }
+
+    None
+}
+
+/// Extract the last working directory from a session transcript.
+/// Returns None if no CWD found (e.g., Gemini transcripts).
+fn extract_last_cwd(path: &str, tool: &str) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last_cwd: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+
+        let parsed: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match tool {
+            "claude" => {
+                // Top-level "cwd" key on most JSONL lines
+                if let Some(cwd) = parsed.get("cwd").and_then(|v| v.as_str()) {
+                    if !cwd.is_empty() {
+                        last_cwd = Some(cwd.to_string());
+                    }
+                }
+            }
+            "codex" => {
+                // payload.cwd on turn_context or session_meta lines
+                if let Some(cwd) = parsed
+                    .get("payload")
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !cwd.is_empty() {
+                        last_cwd = Some(cwd.to_string());
+                    }
+                }
+            }
+            _ => {
+                // Gemini and others: no CWD in transcripts
+                return None;
+            }
+        }
+    }
+
+    last_cwd
+}
+
+/// Resume/fork a session identified by UUID, not by hcom instance name.
+fn do_resume_by_session_id(
+    session_id: &str,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+    db: &HcomDb,
+) -> Result<i32> {
+    // Check if any active instance holds this session
+    if let Ok(Some(instance_name)) = db.get_session_binding(session_id) {
+        if let Ok(Some(_)) = db.get_instance_full(&instance_name) {
+            bail!(
+                "Session {} is currently active as '{}' — kill it first or resume by name",
+                session_id,
+                instance_name
+            );
+        }
+        // Instance exists in session_bindings but is not active — delegate to existing name-based path
+        return do_resume(&instance_name, fork, extra_args, flags);
+    }
+
+    // Not in DB — search for transcript on disk
+    let (tool, transcript_path) = find_session_on_disk(session_id).ok_or_else(|| {
+        let projects_dir = claude_config_dir().join("projects");
+        anyhow::anyhow!(
+            "Session {} not found. Searched:\n  - Claude: {}/*/{}.jsonl\n  - Codex: ~/.codex/sessions/**/*-{}.jsonl\n  - Gemini: ~/.gemini/tmp/*/chats/session-*-{}*.json",
+            session_id,
+            projects_dir.display(),
+            session_id,
+            session_id,
+            &session_id.split('-').next().unwrap_or(session_id),
+        )
+    })?;
+
+    // Extract hcom-level flags
+    let (tag_override, terminal_override, dir_override, clean_extra) = extract_hcom_flags(extra_args);
+
+    // Determine working directory
+    let effective_cwd = if let Some(ref dir) = dir_override {
+        let path = std::path::Path::new(dir);
+        if !path.is_dir() {
+            bail!("--dir path does not exist or is not a directory: {}", dir);
+        }
+        path.canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| dir.clone())
+    } else if fork {
+        // Fork uses current directory
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    } else {
+        // Resume uses transcript's last CWD
+        match extract_last_cwd(&transcript_path, &tool) {
+            Some(cwd) if std::path::Path::new(&cwd).is_dir() => cwd,
+            Some(cwd) => {
+                eprintln!(
+                    "Warning: transcript directory '{}' no longer exists, using current directory",
+                    cwd
+                );
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
+            }
+            None => {
+                if tool == "gemini" {
+                    eprintln!(
+                        "Warning: Gemini transcripts don't store working directory — using current directory. Use --dir to override."
+                    );
+                }
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
+            }
+        }
+    };
+
+    // Build tool-specific resume args
+    let mut tool_args = build_resume_args(&tool, session_id, fork);
+    tool_args.extend(clean_extra.into_iter());
+
+    // Detect headless
+    let is_headless = is_headless_from_args(&tool, &tool_args);
+    let use_pty = tool == "claude" && !is_headless && cfg!(unix);
+
+    // Resolve launcher name
+    let launcher_name = flags.name.clone().unwrap_or_else(|| {
+        identity::resolve_identity(
+            db, None, None, None,
+            std::env::var("HCOM_PROCESS_ID").ok().as_deref(),
+            None, None,
+        )
+        .map(|id| id.name)
+        .unwrap_or_else(|_| "user".to_string())
+    });
+
+    // Launch
+    let result = launcher::launch(
+        db,
+        LaunchParams {
+            tool: tool.clone(),
+            count: 1,
+            args: tool_args,
+            tag: tag_override,
+            system_prompt: Some(if fork {
+                format!(
+                    "YOUR SESSION HAS BEEN FORKED from session {}. \
+                     You have the same history but are a NEW agent under hcom management. \
+                     Run hcom start to get your own identity.",
+                    session_id
+                )
+            } else {
+                "YOUR SESSION HAS BEEN RESUMED under hcom management.".to_string()
+            }),
+            pty: use_pty,
+            background: is_headless,
+            cwd: Some(effective_cwd.clone()),
+            env: None,
+            launcher: Some(launcher_name),
+            run_here: None,
+            initial_prompt: None,
+            batch_id: None,
+            name: None, // auto-generated
+            skip_validation: true,
+            terminal: terminal_override,
+        },
+    )?;
+
+    if result.launched > 0 {
+        let action = if fork { "Forked" } else { "Resumed" };
+        println!(
+            "{} session {} ({}) in {}",
+            action, session_id, tool, effective_cwd
+        );
+    }
+
+    log_info(
+        if fork { "fork" } else { "resume" },
+        &format!("cmd.{}_session", if fork { "fork" } else { "resume" }),
+        &format!(
+            "session_id={} tool={} transcript={} launched={}",
+            session_id, tool, transcript_path, result.launched
+        ),
+    );
+
+    Ok(if result.launched > 0 { 0 } else { 1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +728,70 @@ mod tests {
         assert_eq!(terminal, Some("alacritty".to_string()));
         assert_eq!(dir, None);
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_is_session_id_valid() {
+        assert!(is_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+        assert!(is_session_id("521cfc2b-be38-403a-b32e-4a49c9551b27"));
+    }
+
+    #[test]
+    fn test_is_session_id_rejects_names() {
+        assert!(!is_session_id("cafe"));
+        assert!(!is_session_id("boho"));
+        assert!(!is_session_id("my-agent"));
+        assert!(!is_session_id("impl-luna"));
+        assert!(!is_session_id("review-kira"));
+        assert!(!is_session_id(""));
+    }
+
+    #[test]
+    fn test_extract_last_cwd_claude() {
+        let dir = std::env::temp_dir().join("hcom_test_cwd_claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","cwd":"/first/dir","message":"hi"}
+{"type":"assistant","cwd":"/first/dir","message":"hello"}
+{"type":"user","cwd":"/second/dir","message":"cd somewhere"}
+{"type":"assistant","cwd":"/second/dir","message":"ok"}
+"#,
+        )
+        .unwrap();
+        let result = extract_last_cwd(path.to_str().unwrap(), "claude");
+        assert_eq!(result, Some("/second/dir".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_extract_last_cwd_codex() {
+        let dir = std::env::temp_dir().join("hcom_test_cwd_codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"cwd":"/start/dir"}}
+{"type":"event_msg","payload":{"content":"hello"}}
+{"type":"turn_context","payload":{"cwd":"/changed/dir"}}
+"#,
+        )
+        .unwrap();
+        let result = extract_last_cwd(path.to_str().unwrap(), "codex");
+        assert_eq!(result, Some("/changed/dir".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_extract_last_cwd_gemini() {
+        let dir = std::env::temp_dir().join("hcom_test_cwd_gemini");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.json");
+        std::fs::write(&path, r#"{"messages":[]}"#).unwrap();
+        let result = extract_last_cwd(path.to_str().unwrap(), "gemini");
+        assert_eq!(result, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
