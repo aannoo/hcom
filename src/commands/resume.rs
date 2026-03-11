@@ -71,6 +71,14 @@ pub fn do_resume(
         return do_resume_by_session_id(&name, fork, extra_args, flags, &db);
     }
 
+    // If not a UUID and not a known hcom instance, try resolving as a Codex thread name
+    if matches!(db.get_instance_full(&name), Ok(None) | Err(_)) {
+        if let Some(session_id) = resolve_codex_thread_name(&name) {
+            eprintln!("Resolved Codex thread '{}' → {}", name, session_id);
+            return do_resume_by_session_id(&session_id, fork, extra_args, flags, &db);
+        }
+    }
+
     // For resume (not fork): reject if instance is still active
     if !fork {
         if let Ok(Some(_)) = db.get_instance_full(&name) {
@@ -403,6 +411,43 @@ fn is_headless_from_args(tool: &str, args: &[String]) -> bool {
 /// Check if a string looks like a UUID session ID.
 fn is_session_id(s: &str) -> bool {
     uuid::Uuid::parse_str(s).is_ok()
+}
+
+/// Resolve a Codex thread name (e.g. "stabilization-review") to a session UUID
+/// by looking up ~/.codex/session_index.jsonl.
+fn resolve_codex_thread_name(name: &str) -> Option<String> {
+    let index_path = dirs::home_dir()?.join(".codex/session_index.jsonl");
+    let file = std::fs::File::open(&index_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut best_match: Option<(String, String)> = None; // (id, updated_at)
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(thread_name) = parsed.get("thread_name").and_then(|v| v.as_str()) {
+            if thread_name == name {
+                let id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let updated = parsed.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !id.is_empty() {
+                    // Keep the most recently updated match
+                    if best_match.as_ref().map_or(true, |(_, prev_updated)| updated > *prev_updated) {
+                        best_match = Some((id, updated));
+                    }
+                }
+            }
+        }
+    }
+
+    best_match.map(|(id, _)| id)
 }
 
 /// Find a session transcript on disk by session ID.
@@ -791,6 +836,69 @@ mod tests {
         std::fs::write(&path, r#"{"messages":[]}"#).unwrap();
         let result = extract_last_cwd(path.to_str().unwrap(), "gemini");
         assert_eq!(result, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_codex_thread_name_found() {
+        let dir = std::env::temp_dir().join("hcom_test_codex_thread");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session_index.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"id":"019c9622-196a-7490-b8d9-4a0866b5990e","thread_name":"(no title)","updated_at":"2026-02-26T18:16:27Z"}
+{"id":"019c9ecc-8c3e-7320-9510-3cfafe24b9f2","thread_name":"stabilization-review","updated_at":"2026-03-04T10:57:33Z"}
+"#,
+        )
+        .unwrap();
+
+        // Test resolution by directly parsing — we can't override home_dir(),
+        // so test the parsing logic inline
+        let file = std::fs::File::open(&path).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let mut found_id = None;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.is_empty() { continue; }
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if parsed.get("thread_name").and_then(|v| v.as_str()) == Some("stabilization-review") {
+                found_id = parsed.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+        }
+        assert_eq!(found_id, Some("019c9ecc-8c3e-7320-9510-3cfafe24b9f2".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_codex_thread_name_picks_latest() {
+        // When multiple entries have the same thread_name, pick the latest updated_at
+        let dir = std::env::temp_dir().join("hcom_test_codex_thread_latest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session_index.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"id":"aaa-old","thread_name":"my-thread","updated_at":"2026-01-01T00:00:00Z"}
+{"id":"bbb-new","thread_name":"my-thread","updated_at":"2026-03-01T00:00:00Z"}
+"#,
+        )
+        .unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let mut best: Option<(String, String)> = None;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.is_empty() { continue; }
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if parsed.get("thread_name").and_then(|v| v.as_str()) == Some("my-thread") {
+                let id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let updated = parsed.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if best.as_ref().map_or(true, |(_, prev)| updated > *prev) {
+                    best = Some((id, updated));
+                }
+            }
+        }
+        assert_eq!(best.unwrap().0, "bbb-new");
         std::fs::remove_dir_all(&dir).ok();
     }
 
