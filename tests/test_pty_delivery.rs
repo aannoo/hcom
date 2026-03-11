@@ -41,11 +41,11 @@ fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
-/// Write to both stderr and the log file.
+/// Write to both stdout and the log file.
 macro_rules! logln {
     ($log:expr, $($arg:tt)*) => {{
         let _msg = format!($($arg)*);
-        eprintln!("{}", _msg);
+        println!("{}", _msg);
         $log.log(&_msg);
     }};
 }
@@ -208,19 +208,12 @@ struct TestLog {
 impl TestLog {
     fn new(tool: &str) -> Self {
         let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("_archive/test/public/real/logs");
+            .join("target/test-logs");
         fs::create_dir_all(&log_dir).ok();
 
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let timestamped = log_dir.join(format!("pty_delivery_{tool}_{ts}.log"));
-        let latest = log_dir
-            .parent()
-            .unwrap()
-            .join(format!("test_pty_delivery_{tool}.latest.log"));
+        let latest = log_dir.join(format!("test_pty_delivery_{tool}.latest.log"));
 
         let start = Instant::now();
         let header = format!(
@@ -232,7 +225,7 @@ impl TestLog {
         for path in [&timestamped, &latest] {
             let _ = fs::write(path, &header);
         }
-        eprintln!("{header}");
+        println!("{header}");
 
         TestLog {
             timestamped,
