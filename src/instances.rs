@@ -559,13 +559,19 @@ pub fn get_display_name(db: &HcomDb, base_name: &str) -> String {
 }
 
 /// Resolve base name or tag-name (e.g., "team-luna") to base name.
+/// Handles multi-hyphen tags like "vc-p0-p1-parallel-vani" → tag="vc-p0-p1-parallel", name="vani".
 pub fn resolve_display_name(db: &HcomDb, input_name: &str) -> Option<String> {
     // Direct match
     if let Ok(Some(_)) = db.get_instance_full(input_name) {
         return Some(input_name.to_string());
     }
-    // Try tag-name split
-    if let Some((tag, name)) = input_name.split_once('-') {
+    // Try all possible tag-name split points (tags can contain hyphens)
+    for (i, _) in input_name.match_indices('-') {
+        let tag = &input_name[..i];
+        let name = &input_name[i + 1..];
+        if name.is_empty() {
+            continue;
+        }
         if let Ok(Some(data)) = db.get_instance_full(name) {
             if data.tag.as_deref() == Some(tag) {
                 return Some(name.to_string());
@@ -599,8 +605,13 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
         return Some(input_name.to_string());
     }
 
-    // Stopped tag-name match against the stored snapshot tag.
-    if let Some((tag, name)) = input_name.split_once('-') {
+    // Stopped tag-name match against the stored snapshot tag (try all split points).
+    for (i, _) in input_name.match_indices('-') {
+        let tag = &input_name[..i];
+        let name = &input_name[i + 1..];
+        if name.is_empty() {
+            continue;
+        }
         if db
             .conn()
             .query_row(
