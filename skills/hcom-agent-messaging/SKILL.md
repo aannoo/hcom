@@ -101,6 +101,15 @@ hcom reset all && hcom hooks add
 hcom claude          # Fresh start
 ```
 
+### "No inject port for ..."
+
+This means `hcom term` could not resolve the display name to a running PTY instance.
+
+1. **Check hcom version:** Multi-hyphen tags (e.g., `vc-p0-p1-parallel-vani`) require hcom ≥ 0.7.5. Run `pip install --upgrade hcom` if needed.
+2. **Check the instance is running:** `hcom list` — is the base instance name present and `active`?
+3. **Check PTY wrapping:** The instance must have been launched via `hcom N <tool>` (PTY-wrapped). Instances started with `hcom start` from inside a session do not get PTY injection ports.
+4. **Try the base name directly:** `hcom term <base-name>` (e.g., `hcom term vani` instead of `hcom term vc-p0-p1-parallel-vani`).
+
 ### "messages not arriving"
 
 1. **Check recipient:** `hcom list` — are they `listening` or `active`?
