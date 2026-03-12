@@ -36,7 +36,7 @@ Tell any agent:
 
 ---
 
-## What agents can do 
+## What agents can do
 
 - Message each other (@mentions, intents, threads, broadcast)
 - Read each other's transcripts (ranges, detail levels)
@@ -47,6 +47,37 @@ Tell any agent:
 - Build context bundles (files, transcript, events) for handoffs
 - Collision detection — 2 agents edit same file within 20s, both notified
 - Cross-device — connect agents across machines via MQTT relay
+
+---
+
+## `hcom send` vs `hcom term inject` — when to use which
+
+**`hcom send`** — for task instructions, questions, coordination between agents.
+The recipient's AI tool receives the message through its hooks and processes it as a first-class input. The sender can then `hcom listen` for a reply.
+
+```bash
+# Correct: task delegation via messaging
+hcom send silo "Run focus-routing E2E: cd ~/repos/dasha-code && npm run test:e2e -- --only focus-routing"
+hcom listen 60    # wait for reply
+```
+
+**`hcom term inject`** — for terminal-level control only: pressing Enter on a confirmation prompt, approving a tool call, typing 'y' to proceed. The target AI tool does NOT know the text came from another agent. Do NOT use for task instructions.
+
+```bash
+# Correct: approve a pending prompt
+hcom term inject silo --enter            # press Enter
+hcom term inject silo "y" --enter        # type 'y' and press Enter
+
+# WRONG: sending task instructions via inject
+# The AI tool may not be at a prompt, text may be lost or garbled
+hcom term inject silo "Run the E2E tests now"   # DON'T DO THIS
+```
+
+**Rules:**
+- **Sending tasks/instructions to another agent** → always `hcom send`
+- **Approving a prompt, pressing enter, typing a short confirmation** → `hcom term inject`
+- **Never mix**: don't `term inject` a task then `hcom listen` for a reply — `listen` only receives `hcom send` messages, not terminal output
+- **Always quote inject text**: `hcom term inject <name> "quoted text" --enter`
 
 ---
 
