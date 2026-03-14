@@ -413,6 +413,25 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
     Ok(clauses.join(" AND "))
 }
 
+/// Validate timestamp format: must start with YYYY-MM-DD.
+/// YYYY-MM-DD: positions [0-3]=year, [4]='-', [5-6]=month, [7]='-', [8-9]=day
+fn parse_timestamp(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    if b.len() >= 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && s[..4].parse::<u16>().is_ok()
+        && s[5..7].parse::<u8>().is_ok()
+        && s[8..10].parse::<u8>().is_ok()
+    {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "'{s}' is not a valid timestamp (expected YYYY-MM-DD[THH:MM:SS[Z]])"
+        ))
+    }
+}
+
 /// Clap-compatible filter args for events, listen, events sub.
 ///
 /// Replaces `parse_event_flags` + `expand_shortcuts` when used with clap.
@@ -421,9 +440,9 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
 pub struct EventFilterArgs {
     #[arg(long)]
     pub agent: Vec<String>,
-    #[arg(long = "type")]
+    #[arg(long = "type", value_parser = clap::builder::PossibleValuesParser::new(["message", "status", "life"]))]
     pub event_type: Vec<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["active", "listening", "blocked", "inactive", "launching", "error"]))]
     pub status: Vec<String>,
     #[arg(long)]
     pub context: Vec<String>,
@@ -435,13 +454,13 @@ pub struct EventFilterArgs {
     pub from: Vec<String>,
     #[arg(long)]
     pub mention: Vec<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "ready", "stopped", "batch_launched"]))]
     pub action: Vec<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = parse_timestamp)]
     pub after: Vec<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = parse_timestamp)]
     pub before: Vec<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["request", "inform", "ack"]))]
     pub intent: Vec<String>,
     #[arg(long)]
     pub thread: Vec<String>,
