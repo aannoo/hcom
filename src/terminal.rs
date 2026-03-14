@@ -129,9 +129,9 @@ pub fn detect_terminal_from_env() -> Option<String> {
     // TERM_PROGRAM value-based detection (terminals without a unique env var)
     if let Ok(term_prog) = std::env::var("TERM_PROGRAM") {
         match term_prog.as_str() {
-            "ghostty" => return Some("Ghostty".to_string()),
-            "iTerm.app" => return Some("iTerm".to_string()),
-            "Apple_Terminal" => return Some("Terminal.app".to_string()),
+            "ghostty" => return Some("ghostty".to_string()),
+            "iTerm.app" => return Some("iterm".to_string()),
+            "Apple_Terminal" => return Some("terminal.app".to_string()),
             _ => {}
         }
     }
@@ -221,7 +221,7 @@ fn rewrite_macos_open_app_command(template: &str, app_name: &str) -> String {
 }
 
 fn should_use_command_extension(background: bool, terminal_mode: &str) -> bool {
-    !background && cfg!(target_os = "macos") && (terminal_mode == "default" || terminal_mode == "Terminal.app")
+    !background && cfg!(target_os = "macos") && (terminal_mode == "default" || terminal_mode == "terminal.app")
 }
 
 /// Find kitten binary — PATH first, then macOS app bundle.
@@ -1520,9 +1520,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn test_should_use_command_extension_for_terminal_app() {
         assert!(should_use_command_extension(false, "default"));
-        assert!(should_use_command_extension(false, "Terminal.app"));
-        assert!(!should_use_command_extension(false, "iTerm"));
-        assert!(!should_use_command_extension(true, "Terminal.app"));
+        assert!(should_use_command_extension(false, "terminal.app"));
+        assert!(!should_use_command_extension(false, "iterm"));
+        assert!(!should_use_command_extension(true, "terminal.app"));
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
     vec![
         // macOS native
         (
-            "Terminal.app",
+            "terminal.app",
             p(
                 None,
                 None,
@@ -56,7 +56,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             ),
         ),
         (
-            "iTerm",
+            "iterm",
             p(
                 None,
                 None,
@@ -67,7 +67,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             ),
         ),
         (
-            "Ghostty",
+            "ghostty",
             p(
                 None,
                 None,
@@ -240,7 +240,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
         ),
         // Windows terminals
         (
-            "Windows Terminal",
+            "windows-terminal",
             p(
                 Some("wt"),
                 None,
@@ -351,14 +351,14 @@ pub const TERMINAL_ENV_MAP: &[(&str, &str)] = &[
     ("KITTY_WINDOW_ID", "kitty-split"),
     ("WAVETERM_BLOCKID", "waveterm"),
     // Bare terminal emulators (no split API, but open in correct app)
-    ("GHOSTTY_RESOURCES_DIR", "Ghostty"),
-    ("ITERM_SESSION_ID", "iTerm"),
+    ("GHOSTTY_RESOURCES_DIR", "ghostty"),
+    ("ITERM_SESSION_ID", "iterm"),
     ("ALACRITTY_WINDOW_ID", "alacritty"),
     ("GNOME_TERMINAL_SCREEN", "gnome-terminal"),
     ("KONSOLE_DBUS_WINDOW", "konsole"),
     ("TERMINATOR_UUID", "terminator"),
     ("TILIX_ID", "tilix"),
-    ("WT_SESSION", "Windows Terminal"),
+    ("WT_SESSION", "windows-terminal"),
 ];
 
 #[cfg(test)]

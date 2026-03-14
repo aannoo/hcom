@@ -1174,19 +1174,19 @@ struct PresetDef {
 const BUILTIN_PRESETS: &[PresetDef] = &[
     // macOS native
     PresetDef {
-        name: "Terminal.app",
+        name: "terminal.app",
         binary: None,
         app_name: "Terminal",
         platforms: &["Darwin"],
     },
     PresetDef {
-        name: "iTerm",
+        name: "iterm",
         binary: None,
         app_name: "iTerm",
         platforms: &["Darwin"],
     },
     PresetDef {
-        name: "Ghostty",
+        name: "ghostty",
         binary: None,
         app_name: "Ghostty",
         platforms: &["Darwin"],
@@ -1257,7 +1257,7 @@ const BUILTIN_PRESETS: &[PresetDef] = &[
     },
     // Windows
     PresetDef {
-        name: "Windows Terminal",
+        name: "windows-terminal",
         binary: Some("wt"),
         app_name: "",
         platforms: &["Windows"],

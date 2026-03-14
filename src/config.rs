@@ -1460,8 +1460,8 @@ mod tests {
             "wezterm",
             "tmux",
             "alacritty",
-            "Terminal.app",
-            "iTerm",
+            "terminal.app",
+            "iterm",
         ] {
             config.terminal = preset.to_string();
             assert!(
