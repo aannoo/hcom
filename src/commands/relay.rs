@@ -297,6 +297,7 @@ fn relay_toggle(db: &HcomDb, enable: bool) -> i32 {
 
     if enable {
         println!("Relay enabled\n");
+        crate::relay::worker::ensure_worker(false);
         relay_status(db)
     } else {
         println!("{FG_YELLOW}Relay: disabled{RESET}");
@@ -306,7 +307,7 @@ fn relay_toggle(db: &HcomDb, enable: bool) -> i32 {
 }
 
 /// Create a new relay group.
-fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
+fn relay_new(_db: &HcomDb, argv: &[String]) -> i32 {
     let (broker_url, auth_token, _) = parse_broker_flags(argv);
 
     let config = config::load_config_snapshot().core;
@@ -390,10 +391,12 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
         }
     }
 
-    if relay::is_relay_handled_by_daemon(db) {
+    if crate::relay::worker::ensure_worker(false) {
         println!("\nConnected.");
+    } else if crate::relay::worker::is_relay_worker_running() {
+        println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
     } else {
-        println!("\nStart daemon to connect: hcom relay daemon start");
+        println!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
     }
     0
 }
@@ -478,10 +481,12 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
         }
     }
 
-    if relay::is_relay_handled_by_daemon(db) {
+    if crate::relay::worker::ensure_worker(false) {
         println!("\nConnected.");
+    } else if crate::relay::worker::is_relay_worker_running() {
+        println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
     } else {
-        println!("\nStart daemon to connect: hcom relay daemon start");
+        println!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
     }
     0
 }

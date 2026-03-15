@@ -477,7 +477,7 @@ fn handle_sessionstart(
     }
 
     // Auto-spawn relay-worker now that an instance is active
-    crate::relay::worker::maybe_auto_spawn();
+    crate::relay::worker::ensure_worker(true);
 
     let stdout = result_output
         .map(|v| serde_json::to_string(&v).unwrap_or_default())

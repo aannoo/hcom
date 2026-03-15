@@ -66,7 +66,9 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
     // Log reset event to fresh DB
     super::reset_ops::bootstrap_fresh_db();
 
-    // Push reset event to relay so remote devices see it immediately
+    // Respawn relay worker (was stopped above) and push reset event to remote devices.
+    // ensure_worker re-reads config, so this is a no-op when relay is not configured.
+    crate::relay::worker::ensure_worker(false);
     crate::relay::trigger_push();
 
     // all: also remove hooks, reset config, clear device identity

@@ -230,7 +230,7 @@ fn handle_notify(db: &HcomDb, ctx: &HcomContext, raw: &Value) -> i32 {
     common::notify_hook_instance_with_db(db, &instance_name);
 
     // Auto-spawn relay-worker if needed
-    crate::relay::worker::maybe_auto_spawn();
+    crate::relay::worker::ensure_worker(true);
 
     0
 }

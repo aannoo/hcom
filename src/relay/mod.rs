@@ -214,36 +214,32 @@ pub fn notify_relay_daemon() -> bool {
         .unwrap_or(false)
 }
 
-/// Notify daemon to push; fall back to direct push if daemon isn't running.
+/// Notify the relay daemon to push immediately.
+/// Handles three cases:
+///  - Daemon running and ready: TCP notify succeeds, returns immediately.
+///  - Daemon running but in startup window (port not yet bound): retries notify for up
+///    to 150ms so the push isn't delayed to the worker's next periodic cycle.
+///  - No daemon: spawns one (fire-and-forget); events push on its first cycle.
 pub fn trigger_push() {
     if notify_relay_daemon() {
         return;
     }
-    // No daemon — do direct push via ephemeral client
-    let config = match crate::config::HcomConfig::load(None) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if !is_relay_enabled(&config) {
-        return;
+    if worker::is_relay_worker_running() {
+        // Startup window: worker is running but port not yet in KV.
+        // Retry notify briefly before giving up.
+        let start = std::time::Instant::now();
+        let limit = std::time::Duration::from_millis(150);
+        while start.elapsed() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if notify_relay_daemon() {
+                return;
+            }
+        }
+        // Still not ready — events push on the worker's next periodic cycle.
+    } else {
+        // No worker — spawn one so events push on its first cycle.
+        worker::try_spawn_worker();
     }
-    let ephemeral = match client::create_ephemeral_client(&config) {
-        Some(c) => c,
-        None => return,
-    };
-    let db = match HcomDb::open() {
-        Ok(db) => db,
-        Err(_) => return,
-    };
-    let device_uuid = read_device_uuid();
-    let _ = push::push(
-        &db,
-        ephemeral.client_ref(),
-        &config.relay_id,
-        &device_uuid,
-        false,
-    );
-    ephemeral.disconnect();
 }
 
 /// Wait for relay data. Returns true if new remote events arrived in DB.

@@ -66,15 +66,10 @@ fn poll_until<T>(
 }
 
 fn parse_token(output: &str) -> Option<String> {
+    // Token is the last word on any line containing "relay connect"
     for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("  hcom relay connect ") {
-            return Some(rest.trim().to_string());
-        }
-        if line.contains("hcom relay connect ") {
-            if let Some(pos) = line.find("hcom relay connect ") {
-                let after = &line[pos + "hcom relay connect ".len()..];
-                return Some(after.trim().to_string());
-            }
+        if line.contains("relay connect ") {
+            return line.split_whitespace().last().map(|s| s.to_string());
         }
     }
     None
@@ -102,7 +97,7 @@ fn read_device_uuid(hcom_dir: &str) -> Option<String> {
 }
 
 fn kill_daemon(hcom_dir: &str) {
-    let pid_path = Path::new(hcom_dir).join("hcomd.pid");
+    let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
     if let Ok(content) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = content.trim().parse::<i32>() {
             unsafe {
@@ -180,10 +175,7 @@ fn test_relay_roundtrip() {
     let token = parse_token(&output).expect("Could not parse token from relay new output");
     eprintln!("  OK: Token: {}...", &token[..token.len().min(24)]);
 
-    // Start daemon so relay actually connects to broker
-    check("A", "relay daemon start", &path_a);
-    eprintln!("  OK: Device A daemon started");
-
+    // relay new auto-starts the daemon via ensure_worker; wait for it to connect
     // Wait for connected
     poll_until(
         || {
@@ -250,10 +242,7 @@ fn test_relay_roundtrip() {
     eprint!("{}", output.trim_end());
     eprintln!();
 
-    // Start daemon so relay actually connects to broker
-    check("B", "relay daemon start", &path_b);
-    eprintln!("  OK: Device B daemon started");
-
+    // relay connect auto-starts the daemon via ensure_worker; wait for it to connect
     poll_until(
         || {
             let out = hcom_with_dir("relay status", &path_b);
@@ -380,6 +369,84 @@ fn test_relay_roundtrip() {
         Duration::from_secs(2),
     );
     eprintln!("  OK: {remote_line}");
+
+    // ── Phase 6: Device B → Device A (bidirectional) ─────────────
+    eprintln!("\n[Phase 6] Device B: sending test message to Device A...");
+
+    let marker_b = format!("relay-rt-b-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    check(
+        "B",
+        &format!("send --from relaytest -- \"{marker_b}\""),
+        &path_b,
+    );
+    eprintln!("  OK: Sent: {marker_b}");
+
+    poll_until(
+        || {
+            let out = hcom_with_dir("relay status", &path_b);
+            if out.status.success() {
+                let lower = String::from_utf8_lossy(&out.stdout).to_lowercase();
+                if lower.contains("up to date") {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "Device B push queue drained",
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    );
+    eprintln!("  OK: Device B: pushed to broker");
+
+    let actual_uuid_b = read_device_uuid(&path_b).expect("Could not read Device B UUID");
+    let short_b_for_ns = short_b.clone();
+
+    let (_, data_b) = poll_until(
+        || {
+            let out = hcom_with_dir("events --last 50", &path_a);
+            if !out.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                    let mut data = ev["data"].clone();
+                    if let Some(s) = data.as_str() {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                            data = parsed;
+                        }
+                    }
+                    if data["text"].as_str().map(|t| t.contains(&marker_b)).unwrap_or(false) {
+                        return Some((ev, data));
+                    }
+                }
+            }
+            None
+        },
+        &format!("Device A sees '{marker_b}'"),
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    );
+    eprintln!("  OK: B→A event received");
+
+    let expected_from_b = format!("relaytest:{short_b_for_ns}");
+    let actual_from_b = data_b["from"].as_str().unwrap_or("");
+    assert_eq!(
+        actual_from_b, expected_from_b,
+        "from={actual_from_b}, expected {expected_from_b}"
+    );
+    eprintln!("  OK: from namespaced: {actual_from_b}");
+
+    assert_eq!(
+        data_b["_relay"]["device"].as_str().unwrap_or(""),
+        actual_uuid_b,
+        "_relay.device={}, expected {actual_uuid_b}",
+        data_b["_relay"]["device"]
+    );
+    eprintln!(
+        "  OK: _relay.device = Device B ({}...)",
+        &actual_uuid_b[..actual_uuid_b.len().min(8)]
+    );
 
     // Cleanup handled by guard Drop
     eprintln!("\n{}", "=".repeat(60));

@@ -3,103 +3,50 @@
 //! Accessed via `hcom relay daemon [start|stop|restart|status]`.
 //! Manages the `hcom relay-worker` background process for MQTT relay.
 
-use std::fs;
-use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use crate::paths::hcom_dir;
-
-fn pid_path() -> PathBuf {
-    hcom_dir().join(".tmp").join("relay.pid")
-}
-
-fn read_pid() -> Option<u32> {
-    fs::read_to_string(pid_path())
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
 pub(crate) fn daemon_status() -> i32 {
-    let pid = match read_pid() {
-        Some(p) => p,
-        None => {
-            println!("Daemon not running");
-            return 0;
-        }
-    };
-
-    if !crate::pidtrack::is_alive(pid) {
-        println!("Daemon: stale PID file (process not running)");
-        return 0;
+    match crate::relay::worker::relay_worker_pid() {
+        Some(pid) => println!("Daemon: running (PID {pid})"),
+        None => println!("Daemon not running"),
     }
-
-    println!("Daemon: running (PID {pid})");
     0
 }
 
 pub(crate) fn daemon_start() -> i32 {
-    let pp = pid_path();
-
-    // Check if already running
-    if let Some(pid) = read_pid() {
-        if crate::pidtrack::is_alive(pid) {
-            println!("Daemon already running (PID {pid})");
-            return 0;
+    let was_running = crate::relay::worker::is_relay_worker_running();
+    if crate::relay::worker::ensure_worker(false) {
+        let pid = crate::relay::worker::relay_worker_pid();
+        let pid_str = pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
+        if was_running {
+            println!("Daemon already running{pid_str}");
+        } else {
+            println!("Daemon started{pid_str}");
         }
-        let _ = fs::remove_file(&pp);
-    }
-
-    // Ensure .tmp dir exists for relay.pid
-    let _ = fs::create_dir_all(hcom_dir().join(".tmp"));
-
-    // Find our own binary path
-    let hcom_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hcom"));
-
-    // Start relay-worker as background process
-    let result = std::process::Command::new(&hcom_bin)
-        .arg("relay-worker")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-
-    match result {
-        Ok(_child) => {
-            // Wait for relay worker to write its own PID file
-            for _ in 0..20 {
-                thread::sleep(Duration::from_millis(100));
-                if let Some(pid) = read_pid() {
-                    println!("Daemon started (PID {pid})");
-                    return 0;
-                }
-            }
-            println!("Daemon started (waiting for relay worker)");
+        0
+    } else {
+        // ensure_worker may have timed out on readiness — check if process actually started
+        if crate::relay::worker::is_relay_worker_running() {
+            let pid = crate::relay::worker::relay_worker_pid();
+            let pid_str = pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
+            println!("Daemon started{pid_str} (notify port not yet ready)");
             0
-        }
-        Err(e) => {
-            eprintln!("Failed to start daemon: {e}");
+        } else {
+            eprintln!("Failed to start daemon (relay disabled or config error)");
             1
         }
     }
 }
 
 pub(crate) fn daemon_stop() -> i32 {
-    let pp = pid_path();
-
-    let pid = match read_pid() {
+    let pid = match crate::relay::worker::relay_worker_pid() {
         Some(p) => p,
         None => {
             println!("Daemon not running");
             return 0;
         }
     };
-
-    if !crate::pidtrack::is_alive(pid) {
-        println!("Daemon not running (stale PID file)");
-        let _ = fs::remove_file(&pp);
-        return 0;
-    }
 
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
@@ -110,7 +57,7 @@ pub(crate) fn daemon_stop() -> i32 {
         thread::sleep(Duration::from_millis(100));
         if !crate::pidtrack::is_alive(pid) {
             println!("Daemon stopped");
-            let _ = fs::remove_file(&pp);
+            crate::relay::worker::remove_relay_pid_file();
             return 0;
         }
     }
@@ -125,7 +72,7 @@ pub(crate) fn daemon_stop() -> i32 {
         return 1;
     }
     println!("Daemon killed (SIGKILL)");
-    let _ = fs::remove_file(&pp);
+    crate::relay::worker::remove_relay_pid_file();
     0
 }
 

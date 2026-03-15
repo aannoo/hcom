@@ -230,11 +230,15 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
     }
 }
 
-/// Count local (non-remote) instances.
+/// Count active local (non-remote) instances.
+/// Mirrors the filter in ensure_worker(true) so the watchdog exits when no syncable
+/// instances remain, not merely when all instances are stopped/dead.
 fn local_instance_count(db: &HcomDb) -> i64 {
     db.conn()
         .query_row(
-            "SELECT COUNT(*) FROM instances WHERE COALESCE(origin_device_id, '') = ''",
+            "SELECT COUNT(*) FROM instances \
+             WHERE COALESCE(origin_device_id, '') = '' \
+             AND status NOT IN ('stopped', 'dead')",
             [],
             |r| r.get(0),
         )
@@ -243,49 +247,17 @@ fn local_instance_count(db: &HcomDb) -> i64 {
 
 // ── Auto-spawn ──────────────────────────────────────────────────────
 
-/// Spawn relay-worker if relay is enabled, not already running, and instances exist.
-/// Safe to call from any context (hooks, send, TUI). No-op if conditions aren't met.
-pub fn maybe_auto_spawn() {
-    // Load config
-    let config = match HcomConfig::load(None) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    if !super::is_relay_enabled(&config) {
-        return;
-    }
-
-    // Already running?
+/// Spawn the relay-worker process (caller must check preconditions).
+/// Detaches via setsid() so the worker survives terminal close.
+/// Returns true if spawned successfully, false if already running or spawn failed.
+fn do_spawn() -> bool {
     if is_relay_worker_running() {
-        return;
+        return false;
     }
 
-    // Any local instances alive?
-    let db = match HcomDb::open() {
-        Ok(db) => db,
-        Err(_) => return,
-    };
-
-    let count: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM instances \
-             WHERE COALESCE(origin_device_id, '') = '' \
-             AND status NOT IN ('stopped', 'dead')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    if count == 0 {
-        return;
-    }
-
-    // Spawn relay-worker process
     let binary = match std::env::current_exe() {
         Ok(b) => b,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let mut cmd = Command::new(&binary);
@@ -313,11 +285,126 @@ pub fn maybe_auto_spawn() {
                 "relay_worker.spawned",
                 &format!("pid={}", child.id()),
             );
+            true
         }
         Err(e) => {
             log::log_warn("relay", "relay_worker.spawn_err", &format!("{}", e));
+            false
         }
     }
+}
+
+/// Ensure the relay worker is running.
+///
+/// `require_instances` — if true, only spawn when active local instances exist
+/// (auto-spawn from hooks/send/TUI: no-op when nothing to sync). Fire-and-forget:
+/// no readiness wait, events push on the worker's next cycle.
+///
+/// If false, spawns whenever relay is enabled (relay connect/new/on, daemon start).
+/// On the explicit command path, polls until the notify port is live (max 500ms)
+/// even when the worker was already running, to handle the startup window before
+/// port bind.
+///
+/// Returns true if the worker is running (and port-ready when require_instances=false).
+pub fn ensure_worker(require_instances: bool) -> bool {
+    let config = match HcomConfig::load(None) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if !super::is_relay_enabled(&config) {
+        return false;
+    }
+
+    if require_instances {
+        // Auto-spawn path: fire-and-forget, no readiness check.
+        if is_relay_worker_running() {
+            return true;
+        }
+        let db = match HcomDb::open() {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances \
+                 WHERE COALESCE(origin_device_id, '') = '' \
+                 AND status NOT IN ('stopped', 'dead')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if count == 0 {
+            return false;
+        }
+        return do_spawn();
+    }
+
+    // Explicit command path: ensure running AND port-ready.
+    if is_relay_worker_running() {
+        // Process exists but may be in startup window before port bind.
+        return poll_until_ready(300);
+    }
+    if !do_spawn() {
+        // TOCTOU: another process may have spawned between our check and do_spawn().
+        if is_relay_worker_running() {
+            return poll_until_ready(300);
+        }
+        return false;
+    }
+    poll_until_ready(500)
+}
+
+/// Spawn the relay worker if relay is enabled and not already running.
+/// Fire-and-forget: no instance check, no readiness wait.
+/// Used by trigger_push() when no daemon is running, so events push on the
+/// worker's first cycle instead of sitting in the DB indefinitely.
+pub fn try_spawn_worker() {
+    let config = match HcomConfig::load(None) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if super::is_relay_enabled(&config) {
+        do_spawn();
+    }
+}
+
+/// Poll until the worker's TCP notify port is in KV and accepting connections.
+/// Opens DB once before the loop to avoid repeated open overhead.
+/// Returns true if ready within timeout_ms, false on timeout.
+fn poll_until_ready(timeout_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(timeout_ms);
+    let db = HcomDb::open().ok();
+
+    while start.elapsed() < deadline {
+        if let Some(ref db) = db {
+            if let Some(port_str) = super::safe_kv_get(db, "relay_daemon_port") {
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    use std::net::{SocketAddr, TcpStream};
+                    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                    if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    false
+}
+
+/// Return the PID of the running relay worker, or None if not running.
+pub fn relay_worker_pid() -> Option<u32> {
+    read_pid_file()
+}
+
+/// Remove the relay worker PID file (for post-SIGKILL cleanup).
+pub fn remove_relay_pid_file() {
+    remove_pid_file();
 }
 
 /// Stop a running relay-worker by sending SIGTERM to the PID from PID file.

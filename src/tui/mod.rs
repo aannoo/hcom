@@ -178,7 +178,7 @@ fn run_inner(viewport_height: u16) -> Result<()> {
     let mut app = App::new();
 
     // Auto-spawn relay-worker if relay is configured
-    crate::relay::worker::maybe_auto_spawn();
+    crate::relay::worker::ensure_worker(true);
 
     // HCOM_TUI_FULLSCREEN=1 starts directly in alternate screen (fullscreen) mode,
     // bypassing inline viewport which requires cursor position queries.

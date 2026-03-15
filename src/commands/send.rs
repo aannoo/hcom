@@ -794,7 +794,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             db,
         ) {
             Ok(bundle_id) => {
-                crate::relay::worker::maybe_auto_spawn();
+                crate::relay::worker::ensure_worker(true);
                 envelope.bundle_id = Some(bundle_id.clone());
 
                 // Append bundle summary text to message
@@ -901,7 +901,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     // ── Feedback ──
     if args.quiet {
-        crate::relay::worker::maybe_auto_spawn();
+        crate::relay::worker::ensure_worker(true);
         return 0;
     }
 
@@ -987,7 +987,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     }
 
-    crate::relay::worker::maybe_auto_spawn();
+    crate::relay::worker::ensure_worker(true);
 
     0
 }

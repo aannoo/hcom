@@ -275,7 +275,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::runtime_env::set_terminal_title(&instance_name);
 
     // Auto-spawn relay-worker now that an instance is active
-    crate::relay::worker::maybe_auto_spawn();
+    crate::relay::worker::ensure_worker(true);
 
     // Bootstrap injection moved to BeforeAgent only
     // Reason: Gemini doesn't display SessionStart hook output after /clear

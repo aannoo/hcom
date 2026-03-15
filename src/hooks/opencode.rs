@@ -240,7 +240,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     );
 
     // Auto-spawn relay-worker now that an instance is active
-    crate::relay::worker::maybe_auto_spawn();
+    crate::relay::worker::ensure_worker(true);
 
     let mut response = serde_json::json!({
         "name": instance_name,
