@@ -233,9 +233,12 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
     if current_status == ST_LISTENING {
         let last_stop = data.last_stop;
         let is_remote = data.origin_device_id.is_some();
+        let is_adhoc = data.tool == "adhoc";
 
         if is_remote {
             age = 0; // Trust synced status
+        } else if is_adhoc {
+            age = 0; // Ad-hoc instances have no heartbeat mechanism; skip stale check
         } else {
             let heartbeat_age = if last_stop > 0 {
                 now - last_stop
