@@ -103,9 +103,9 @@ copy_to_bundled
 # Deploy to PATH — on noexec filesystems (Android shared storage), copy directly
 hcom_path=$(command -v hcom 2>/dev/null || true)
 if [[ -n "$hcom_path" ]] && [[ ! -L "$hcom_path" || "$(readlink "$hcom_path" 2>/dev/null)" == */bin/hcom* ]]; then
-    # Existing install — update in place
-    cp "$BINARY" "$hcom_path" && echo "Updated $hcom_path"
+    # Atomic replace: temp file + mv so running processes keep the old inode
+    cp "$BINARY" "$hcom_path.tmp.$$" && mv "$hcom_path.tmp.$$" "$hcom_path" && echo "Updated $hcom_path"
 elif [[ -z "$hcom_path" ]]; then
     mkdir -p "$HOME/.local/bin"
-    cp "$BINARY" "$HOME/.local/bin/hcom" && echo "Installed to ~/.local/bin/hcom"
+    cp "$BINARY" "$HOME/.local/bin/hcom.tmp.$$" && mv "$HOME/.local/bin/hcom.tmp.$$" "$HOME/.local/bin/hcom" && echo "Installed to ~/.local/bin/hcom"
 fi
