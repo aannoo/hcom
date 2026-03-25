@@ -1548,7 +1548,7 @@ mod tests {
 
         let result = initialize_delivery_components(
             "test",
-            || crate::db::HcomDb::open_at(&db_path),
+            || crate::db::HcomDb::open_raw(&db_path),
             || Err(anyhow!("Port already in use")),
         );
 
@@ -1570,7 +1570,7 @@ mod tests {
 
         let result = initialize_delivery_components(
             "test",
-            || crate::db::HcomDb::open_at(&db_path),
+            || crate::db::HcomDb::open_raw(&db_path),
             crate::notify::NotifyServer::new,
         );
 
@@ -1592,7 +1592,7 @@ mod tests {
 
         let (db, notify) = initialize_delivery_components(
             "test",
-            || crate::db::HcomDb::open_at(&db_path),
+            || crate::db::HcomDb::open_raw(&db_path),
             crate::notify::NotifyServer::new,
         )
         .expect("component init should succeed");

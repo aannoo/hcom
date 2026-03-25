@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn test_resolve_filter_names_with_tag() {
         // Create in-memory DB with an instance that has a tag
-        let db = crate::db::HcomDb::open_at(std::path::Path::new(":memory:")).unwrap();
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
 
         // Insert instance "luna" with tag "team"
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_resolve_filter_names_direct_match() {
-        let db = crate::db::HcomDb::open_at(std::path::Path::new(":memory:")).unwrap();
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
 
         db.conn()
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_resolve_filter_names_unknown_keeps_original() {
-        let db = crate::db::HcomDb::open_at(std::path::Path::new(":memory:")).unwrap();
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
 
         let (mut filters, _) = parse_event_flags(&s(&["--agent", "nonexistent"])).unwrap();
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_resolve_filter_names_no_instance_key() {
-        let db = crate::db::HcomDb::open_at(std::path::Path::new(":memory:")).unwrap();
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
 
         let (mut filters, _) = parse_event_flags(&s(&["--status", "listening"])).unwrap();

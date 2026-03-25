@@ -955,7 +955,7 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
                         .and_then(|n| n.to_str())
                         .unwrap_or("archive");
 
-                    if let Ok(archive_db) = HcomDb::open_at(&db_path) {
+                    if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
                         // Build archive query with same filters
                         let archive_filter = filter_query.clone();
                         let query = format!(

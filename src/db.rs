@@ -18,7 +18,7 @@ const MIGRATIONS: &[(i32, &str)] = &[(
      ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
      UPDATE instances
      SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
-     WHERE json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+     WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
 )];
 
 use crate::shared::constants::{MENTION_PATTERN, ST_LISTENING};
@@ -191,14 +191,21 @@ impl HcomDb {
         &self.conn
     }
 
-    /// Open the hcom database at ~/.hcom/hcom.db
+    /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
     pub fn open() -> Result<Self> {
         let db_path = crate::paths::db_path();
         Self::open_at(&db_path)
     }
 
-    /// Open the hcom database at a specific path (for testing)
+    /// Open the hcom database at a specific path with schema migration/compat.
     pub fn open_at(db_path: &std::path::Path) -> Result<Self> {
+        let mut db = Self::open_raw(db_path)?;
+        db.ensure_schema()?;
+        Ok(db)
+    }
+
+    /// Open DB connection without schema checks (for testing only).
+    pub fn open_raw(db_path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
@@ -439,14 +446,21 @@ impl HcomDb {
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {
                 if let Some(version) = old_version {
-                    match self.try_apply_migrations(version) {
+                    // If version matches but columns are missing (stamped without migration),
+                    // repair by running migrations from version-1.
+                    let migrate_from = if version == SCHEMA_VERSION {
+                        version - 1
+                    } else {
+                        version
+                    };
+                    match self.try_apply_migrations(migrate_from) {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
                         Err(e) => {
                             crate::log::log_warn(
                                 "db",
                                 "schema.migration_failed",
-                                &format!("v{} -> v{} failed: {}", version, SCHEMA_VERSION, e),
+                                &format!("v{} -> v{} failed: {}", migrate_from, SCHEMA_VERSION, e),
                             );
                         }
                     }
@@ -3025,7 +3039,7 @@ mod tests {
         drop(conn);
 
         // Now HcomDb will fail when trying to query
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
 
         let result = db.get_instance_status("test");
 
@@ -3044,7 +3058,7 @@ mod tests {
         // Verify that "not found" is distinguished from "error" via Ok(None)
 
         let (_conn, db_path) = setup_test_db();
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
 
         // Query non-existent instance
         let result = db.get_instance_status("nonexistent");
@@ -3062,7 +3076,7 @@ mod tests {
         conn.execute("DROP TABLE instances", []).unwrap();
         drop(conn);
 
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         let result = db.get_status("test");
 
         let err = result.expect_err("SQL error should propagate as Err");
@@ -3079,7 +3093,7 @@ mod tests {
         conn.execute("DROP TABLE process_bindings", []).unwrap();
         drop(conn);
 
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         let result = db.get_process_binding("test_pid");
 
         let err = result.expect_err("SQL error should propagate as Err");
@@ -3096,7 +3110,7 @@ mod tests {
         conn.execute("DROP TABLE instances", []).unwrap();
         drop(conn);
 
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         let result = db.get_transcript_path("test");
 
         let err = result.expect_err("SQL error should propagate as Err");
@@ -3113,7 +3127,7 @@ mod tests {
         conn.execute("DROP TABLE instances", []).unwrap();
         drop(conn);
 
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         let result = db.get_instance_snapshot("test");
 
         let err = result.expect_err("SQL error should propagate as Err");
@@ -3127,7 +3141,7 @@ mod tests {
     #[test]
     fn test_all_methods_return_ok_none_when_not_found() {
         let (_conn, db_path) = setup_test_db();
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
 
         // All these should return Ok(None) for non-existent data
         assert!(db.get_instance_status("nonexistent").unwrap().is_none());
@@ -3157,7 +3171,7 @@ mod tests {
     #[test]
     fn test_register_inject_port_inserts() {
         let (_conn, db_path) = setup_test_db_with_endpoints();
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
 
         db.register_inject_port("test", 5555).unwrap();
 
@@ -3177,7 +3191,7 @@ mod tests {
     #[test]
     fn test_register_inject_port_upserts() {
         let (_conn, db_path) = setup_test_db_with_endpoints();
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
 
         db.register_inject_port("test", 5555).unwrap();
         db.register_inject_port("test", 6666).unwrap();
@@ -3219,7 +3233,7 @@ mod tests {
             test_id
         ));
 
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (db, db_path)
     }
@@ -3368,7 +3382,7 @@ mod tests {
             test_id
         ));
 
-        let mut db = HcomDb::open_at(&db_path).unwrap();
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
         db.ensure_schema().unwrap();
 
         // Should have full schema
@@ -3408,7 +3422,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut db = HcomDb::open_at(&db_path).unwrap();
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
         db.ensure_schema().unwrap();
 
         // Should have been archived and recreated at current version
@@ -3468,7 +3482,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut db = HcomDb::open_at(&db_path).unwrap();
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
         db.ensure_schema().unwrap();
 
         let version: i32 = db
@@ -3527,7 +3541,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut db = HcomDb::open_at(&db_path).unwrap();
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
 
         // check_schema_compat should detect missing column
         match db.check_schema_compat().unwrap() {
@@ -3545,6 +3559,131 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+
+        cleanup_test_db(db_path);
+    }
+
+    /// Regression test for issue #16: init_db() stamped user_version=17 without
+    /// actually adding the terminal_preset_* columns. ensure_schema must repair
+    /// this via migration instead of archiving (which would lose data).
+    #[test]
+    fn test_ensure_schema_repairs_stamped_but_not_migrated_db() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(4000);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_repair_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        // Simulate the bug: create a v16-style DB but stamp it as v17
+        // (this is what init_db() did — CREATE IF NOT EXISTS is a no-op on
+        // existing tables, then it unconditionally set user_version = 17)
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, type TEXT NOT NULL, instance TEXT NOT NULL, data TEXT NOT NULL);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     session_id TEXT UNIQUE,
+                     parent_session_id TEXT,
+                     parent_name TEXT,
+                     tag TEXT,
+                     last_event_id INTEGER DEFAULT 0,
+                     status TEXT DEFAULT 'active',
+                     status_time INTEGER DEFAULT 0,
+                     status_context TEXT DEFAULT '',
+                     status_detail TEXT DEFAULT '',
+                     last_stop INTEGER DEFAULT 0,
+                     directory TEXT,
+                     created_at REAL NOT NULL,
+                     transcript_path TEXT DEFAULT '',
+                     tcp_mode INTEGER DEFAULT 0,
+                     wait_timeout INTEGER DEFAULT 86400,
+                     background INTEGER DEFAULT 0,
+                     background_log_file TEXT DEFAULT '',
+                     name_announced INTEGER DEFAULT 0,
+                     agent_id TEXT UNIQUE,
+                     running_tasks TEXT DEFAULT '',
+                     origin_device_id TEXT DEFAULT '',
+                     hints TEXT DEFAULT '',
+                     subagent_timeout INTEGER,
+                     tool TEXT DEFAULT 'claude',
+                     launch_args TEXT DEFAULT '',
+                     idle_since TEXT DEFAULT '',
+                     pid INTEGER DEFAULT NULL,
+                     launch_context TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT NOT NULL, kind TEXT NOT NULL, port INTEGER NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE process_bindings (process_id TEXT PRIMARY KEY, session_id TEXT, instance_name TEXT, updated_at REAL NOT NULL);
+                 PRAGMA user_version = 17;",
+            )
+            .unwrap();
+            // Insert test data that should survive the repair
+            conn.execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('luna', 'claude', 1.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Verify columns are missing before repair
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(instances)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(
+                !cols.contains(&"terminal_preset_requested".to_string()),
+                "column should be missing before repair"
+            );
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        // Should be at current version
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Columns should now exist
+        let cols: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(instances)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            cols.contains(&"terminal_preset_requested".to_string()),
+            "terminal_preset_requested column should exist after repair"
+        );
+        assert!(
+            cols.contains(&"terminal_preset_effective".to_string()),
+            "terminal_preset_effective column should exist after repair"
+        );
+
+        // Test data should have survived (not archived)
+        let name: String = db
+            .conn
+            .query_row("SELECT name FROM instances WHERE name = 'luna'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "luna");
 
         cleanup_test_db(db_path);
     }

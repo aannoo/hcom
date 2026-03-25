@@ -529,7 +529,7 @@ mod tests {
 
     fn make_test_db() -> (HcomDb, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let db = HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
         db.init_db().unwrap();
         (db, dir)
     }

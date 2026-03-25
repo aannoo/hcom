@@ -2761,7 +2761,7 @@ mod tests {
     #[test]
     fn test_correlate_paths_to_hcom_uses_session_id_for_opencode() {
         let dir = tempfile::tempdir().unwrap();
-        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("hcom.db")).unwrap();
         db.conn()
             .execute_batch(
                 "CREATE TABLE instances (

@@ -408,7 +408,7 @@ mod tests {
     fn make_test_db() -> (HcomDb, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (db, dir)
     }

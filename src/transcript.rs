@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn logged_call_ids_bounds_memory() {
         let db_path = setup_test_db();
-        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
         let mut w = watcher();
 
         for i in 0..10001 {

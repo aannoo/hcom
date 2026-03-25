@@ -546,7 +546,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
     }
     let init_ms = init_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Open DB
+    // Open DB (includes schema migration/compat check)
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {

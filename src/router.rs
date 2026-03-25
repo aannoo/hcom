@@ -657,15 +657,9 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         return crate::commands::daemon::cmd_daemon(&cmd_argv[1..]);
     }
 
-    // Open DB and ensure schema exists
+    // Open DB (includes schema migration/compat check)
     let db = match HcomDb::open() {
-        Ok(db) => {
-            if let Err(e) = db.init_db() {
-                eprintln!("Error: Failed to initialize database schema: {e}");
-                return 1;
-            }
-            db
-        }
+        Ok(db) => db,
         Err(e) => {
             eprintln!("Error: Failed to open database: {e}");
             return 1;

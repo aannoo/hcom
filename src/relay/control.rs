@@ -265,7 +265,7 @@ mod tests {
 
         // own_short_id is "WXYZ" — event targets "ABCD", so nothing should happen
         let db =
-            HcomDb::open_at(&tempfile::NamedTempFile::new().unwrap().into_temp_path()).unwrap();
+            HcomDb::open_raw(&tempfile::NamedTempFile::new().unwrap().into_temp_path()).unwrap();
         handle_control_events(&db, &events, "WXYZ", "device-123");
 
         // No crash, no panic — event was filtered

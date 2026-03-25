@@ -67,7 +67,7 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    // Open DB
+    // Open DB (includes schema migration/compat check)
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {

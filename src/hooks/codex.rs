@@ -260,7 +260,7 @@ pub fn dispatch_codex_hook(args: &[String]) -> i32 {
         }
     };
 
-    // Open DB — soft-fail on error (exit 0, don't break Codex)
+    // Open DB (includes schema migration/compat) — soft-fail on error (exit 0, don't break Codex)
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {

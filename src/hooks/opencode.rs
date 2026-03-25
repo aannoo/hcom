@@ -418,7 +418,7 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     // On clean HOME/HCOM_DIR the DB parent dir won't exist yet.
     crate::paths::ensure_hcom_directories_at(&ctx.hcom_dir);
 
-    // Open DB
+    // Open DB (includes schema migration/compat)
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {
@@ -609,7 +609,7 @@ mod tests {
     fn test_db() -> (tempfile::TempDir, HcomDb) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (dir, db)
     }

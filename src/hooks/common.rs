@@ -1237,7 +1237,7 @@ mod tests {
     fn make_test_db() -> (tempfile::TempDir, crate::db::HcomDb) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (dir, db)
     }

@@ -575,7 +575,7 @@ mod tests {
         // DB without init_db → no instances table → INSERT fails
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
         // Deliberately NOT calling db.init_db()
 
         let orphan = OrphanProcess {

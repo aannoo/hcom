@@ -473,7 +473,7 @@ mod tests {
     fn setup_test_db() -> (TempDir, HcomDb) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (tmp, db)
     }

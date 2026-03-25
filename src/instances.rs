@@ -2118,7 +2118,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let db = HcomDb::open_at(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         (db, db_path)
     }
 
