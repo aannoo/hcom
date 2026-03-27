@@ -1445,6 +1445,74 @@ mod tests {
     }
 
     #[test]
+    fn test_format_hook_messages_appends_recv_tip_once() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let msgs = vec![serde_json::json!({
+            "from": "luna",
+            "message": "hi",
+            "event_id": 1,
+            "intent": "request",
+            "delivered_to": ["nova"],
+        })];
+        let marks = Rc::new(Cell::new(0));
+        let tip_checker = |_: &str, _: &str| -> (bool, Box<dyn Fn()>) {
+            let marks = Rc::clone(&marks);
+            let mark = Box::new(move || marks.set(marks.get() + 1)) as Box<dyn Fn()>;
+            (false, mark)
+        };
+
+        let result = format_hook_messages(
+            &msgs,
+            "nova",
+            &|_name| None,
+            &|| String::new(),
+            Some(&tip_checker),
+        );
+        assert!(result.contains("[tip] intent=request: Sender expects a response."));
+        assert_eq!(marks.get(), 1);
+    }
+
+    #[test]
+    fn test_format_messages_json_marks_tip_without_duplicate_text() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let msgs = vec![serde_json::json!({
+            "from": "luna",
+            "message": "hi",
+            "event_id": 1,
+            "intent": "request",
+            "delivered_to": ["nova"],
+        })];
+        let seen = Rc::new(Cell::new(false));
+        let tip_checker = |_: &str, _: &str| -> (bool, Box<dyn Fn()>) {
+            let seen = Rc::clone(&seen);
+            let already_seen = seen.get();
+            let mark = Box::new(move || seen.set(true)) as Box<dyn Fn()>;
+            (already_seen, mark)
+        };
+
+        let first = format_messages_json(
+            &msgs,
+            "nova",
+            &|_name| None,
+            &|| String::new(),
+            Some(&tip_checker),
+        );
+        let second = format_messages_json(
+            &msgs,
+            "nova",
+            &|_name| None,
+            &|| String::new(),
+            Some(&tip_checker),
+        );
+        assert!(first.contains("[tip] intent=request: Sender expects a response."));
+        assert!(!second.contains("[tip] intent=request: Sender expects a response."));
+    }
+
+    #[test]
     fn test_format_hook_messages_with_others() {
         let msgs = vec![serde_json::json!({
             "from": "luna",

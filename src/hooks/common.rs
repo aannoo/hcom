@@ -136,6 +136,24 @@ pub(crate) fn make_instance_lookup(db: &HcomDb) -> impl Fn(&str) -> Option<Value
     |name: &str| db.get_instance(name).ok().flatten()
 }
 
+/// Build a tip-tracking callback for hook message formatting.
+pub(crate) fn make_tip_checker(
+    db: &HcomDb,
+) -> impl Fn(&str, &str) -> (bool, Box<dyn Fn()>) + '_ {
+    move |instance_name: &str, tip_key: &str| {
+        let seen = crate::core::tips::has_seen_tip(db, instance_name, tip_key);
+        let db_path = db.path().to_path_buf();
+        let instance_name = instance_name.to_string();
+        let tip_key = tip_key.to_string();
+        let mark = Box::new(move || {
+            if let Ok(mark_db) = HcomDb::open_at(&db_path) {
+                crate::core::tips::mark_tip_seen(&mark_db, &instance_name, &tip_key);
+            }
+        }) as Box<dyn Fn()>;
+        (seen, mark)
+    }
+}
+
 /// Fetch unread messages, update cursor, set delivery status.
 ///
 /// Returns (delivered_messages, formatted_json). Empty vec and None if no messages.
@@ -181,7 +199,6 @@ fn deliver_raw_messages(
     let get_instance_data = make_instance_lookup(db);
     let hints = load_config_hints();
     let get_config_hints = || hints.clone();
-
     let formatted = messages::format_messages_json(
         &deliver,
         instance_name,

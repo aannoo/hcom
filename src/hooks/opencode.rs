@@ -322,12 +322,13 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         let get_instance_data = common::make_instance_lookup(db);
         let hints = common::load_config_hints();
         let get_config_hints = || hints.clone();
+        let tip_checker = common::make_tip_checker(db);
         let formatted = messages::format_messages_json(
             deliver,
             &name,
             &get_instance_data,
             &get_config_hints,
-            None,
+            Some(&tip_checker),
         );
         return (0, formatted);
     }
