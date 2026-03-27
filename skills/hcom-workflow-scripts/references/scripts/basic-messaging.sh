@@ -23,7 +23,7 @@ name_arg=""
 task="${task:-count from 1 to 5}"
 thread="basic-$(date +%s)"
 
-trap cleanup ERR
+trap cleanup ERR INT TERM
 
 launch_out=$(hcom 1 claude --tag worker --go --headless \
   --hcom-prompt "Do this: ${task}. Send result to @reviewer- via: hcom send \"@reviewer-\" --thread ${thread} --intent inform -- \"RESULT: <your answer>\". Then stop: hcom stop" 2>&1)

@@ -30,7 +30,7 @@ Typical combos: Claude designs/reviews + Codex implements, Claude plans + Gemini
 - **Session binding**: On first `codex-notify` event, 5-10 seconds after launch
 - **Launch to ready**: 5-10 seconds
 - **Message delivery**: PTY text injection, 1-3 seconds latency
-- **Stale cleanup risk**: If session does not bind within 30 seconds, instance cleaned up as stale
+- **Stale cleanup risk**: If session does not bind within 120 seconds, instance cleaned up as stale
 - **Sandbox modes**: `workspace` (--full-auto + network), `untrusted` (--sandbox workspace-write), `danger-full-access` (--dangerously-bypass-approvals-and-sandbox), `none` (raw)
 - **Bootstrap injection**: Via `-c developer_instructions=<bootstrap>` at launch time
 - **Transcript path**: Derived from thread ID, searched via glob in `$CODEX_HOME/sessions/`
@@ -70,7 +70,7 @@ hcom events --wait 30 --idle "$codex_name" $name_arg >/dev/null 2>&1
 
 **Why this matters:**
 1. Codex launches in ~5-10s but session only binds on first agent-turn-complete
-2. If no activity happens within 30s, hcom cleanup marks instance as stale
+2. If no activity happens within 120s, hcom cleanup marks instance as stale
 3. Messages sent before binding have no recipient to deliver to
 4. The `--idle` wait confirms the session has bound and agent is ready
 
@@ -148,7 +148,7 @@ track_launch "$launch_out"
 | Session binding | Instant | 5-10s | Instant | 2-3s |
 | Message delivery | under 1s | 1-3s | under 1s | under 1s |
 | Full 2-agent round-trip | 15-25s | 25-40s | 15-25s | 15-25s |
-| Stale cleanup window | N/A | 30s | N/A | N/A |
+| Stale cleanup window | N/A | 120s | N/A | N/A |
 
 ## Cross-Tool Gotchas
 

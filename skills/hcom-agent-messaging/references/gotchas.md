@@ -91,16 +91,18 @@ hcom events --sql "msg_text LIKE '% APPROVED%' OR msg_text LIKE 'APPROVED%'"
 
 ## hcom events --wait Exit Code
 
-Returns 0 on both match AND timeout. You cannot use exit code to distinguish. Check output instead:
+Returns **0** on match, **1** on timeout, **2** on SQL error. Use exit code directly:
 
 ```bash
-result=$(hcom events --wait 60 --sql "msg_thread='${thread}' AND msg_text LIKE '%DONE%'" $name_arg 2>/dev/null)
-if [[ -n "$result" ]]; then
-  echo "MATCHED"
-else
-  echo "TIMEOUT - no matching event within 60s"
-fi
+hcom events --wait 60 --sql "msg_thread='${thread}' AND msg_text LIKE '%DONE%'" $name_arg >/dev/null 2>&1
+case $? in
+  0) echo "MATCHED" ;;
+  1) echo "TIMEOUT" ;;
+  2) echo "SQL ERROR — check your query" ;;
+esac
 ```
+
+In scripts where you only care about success vs failure, `&& echo PASS || echo FAIL` is fine — exit codes 1 and 2 are both failures.
 
 ## Agent Name Capture
 

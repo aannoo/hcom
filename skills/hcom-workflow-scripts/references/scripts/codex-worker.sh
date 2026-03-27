@@ -23,7 +23,7 @@ name_arg=""
 task="${task:-write /tmp/hello.py that prints hello world and run it}"
 thread="codex-$(date +%s)"
 
-trap cleanup ERR
+trap cleanup ERR INT TERM
 
 launch_out=$(hcom 1 codex --tag coder --go --headless \
   --hcom-prompt "Do this: ${task}. When done, send output: hcom send \"@reviewer-\" --thread ${thread} --intent inform -- \"CODE DONE: <output>\". Then stop: hcom stop" 2>&1)

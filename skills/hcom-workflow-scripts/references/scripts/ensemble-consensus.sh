@@ -23,7 +23,7 @@ name_arg=""
 task="${task:-what is 17 * 23}"
 thread="ens-$(date +%s)"
 
-trap cleanup ERR
+trap cleanup ERR INT TERM
 
 for i in 1 2 3; do
   launch_out=$(hcom 1 claude --tag "c${i}" --go --headless \

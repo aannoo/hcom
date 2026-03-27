@@ -23,7 +23,7 @@ name_arg=""
 task="${task:-list 5 prime numbers}"
 thread="casc-$(date +%s)"
 
-trap cleanup ERR
+trap cleanup ERR INT TERM
 
 # Stage 1: Planner
 launch_out=$(hcom 1 claude --tag plan --go --headless \

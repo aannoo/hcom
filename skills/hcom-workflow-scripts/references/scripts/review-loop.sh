@@ -23,7 +23,7 @@ name_arg=""
 task="${task:-count from 1 to 10 in Turkish}"
 thread="review-$(date +%s)"
 
-trap cleanup ERR
+trap cleanup ERR INT TERM
 
 launch_out=$(hcom 1 claude --tag worker --go --headless \
   --hcom-prompt "Task: ${task}. Do it, then send: hcom send \"@reviewer-\" --thread ${thread} --intent inform -- \"ROUND 1 DONE: <result>\". If you get feedback, fix and resend as ROUND 2 DONE. After APPROVED, send: hcom send \"@bigboss\" --thread ${thread} --intent inform -- \"FINAL\". Then stop: hcom stop" 2>&1)
