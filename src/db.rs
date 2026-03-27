@@ -191,6 +191,11 @@ impl HcomDb {
         &self.conn
     }
 
+    /// Access the filesystem path backing this DB handle.
+    pub fn path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
     /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
     pub fn open() -> Result<Self> {
         let db_path = crate::paths::db_path();
@@ -603,7 +608,10 @@ impl HcomDb {
             }
             // DB older - needs archive
             return Ok(SchemaCompat::NeedsArchive(
-                format!("DB version mismatch (DB v{}, code v{})", version, SCHEMA_VERSION),
+                format!(
+                    "DB version mismatch (DB v{}, code v{})",
+                    version, SCHEMA_VERSION
+                ),
                 Some(version),
             ));
         }
@@ -628,8 +636,15 @@ impl HcomDb {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(|r| r.ok())
                     .collect();
-                let required = ["tool", "terminal_preset_requested", "terminal_preset_effective"];
-                Ok(required.iter().find(|c| !cols.contains(&c.to_string())).map(|s| s.to_string()))
+                let required = [
+                    "tool",
+                    "terminal_preset_requested",
+                    "terminal_preset_effective",
+                ];
+                Ok(required
+                    .iter()
+                    .find(|c| !cols.contains(&c.to_string()))
+                    .map(|s| s.to_string()))
             })
             .unwrap_or(None);
         if let Some(col) = missing_col {
@@ -3679,9 +3694,11 @@ mod tests {
         // Test data should have survived (not archived)
         let name: String = db
             .conn
-            .query_row("SELECT name FROM instances WHERE name = 'luna'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT name FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(name, "luna");
 

@@ -202,7 +202,9 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
         } else {
             let detail = get_or_finalize_launch_failure_detail(db, data)
                 .or_else(|| extract_launch_failure_detail(data))
-                .unwrap_or_else(|| "launch probably failed - check logs or hcom list -v".to_string());
+                .unwrap_or_else(|| {
+                    "launch probably failed - check logs or hcom list -v".to_string()
+                });
             return ComputedStatus {
                 status: ST_INACTIVE.to_string(),
                 age_string: format_age(age),
@@ -374,9 +376,7 @@ pub(crate) fn finalize_launch_failure_detail(
         "detail": detail.clone(),
     });
     if detail.is_empty() {
-        event_data
-            .as_object_mut()
-            .map(|obj| obj.remove("detail"));
+        event_data.as_object_mut().map(|obj| obj.remove("detail"));
     }
     let _ = db.log_event("status", &data.name, &event_data);
 
@@ -903,7 +903,12 @@ pub fn hash_to_name(input: &str, collision_attempt: u32) -> String {
 pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
     use std::fs::{File, create_dir_all};
 
-    let lock_path = crate::paths::hcom_dir().join(".tmp").join("name_gen.lock");
+    let lock_path = db
+        .path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".tmp")
+        .join("name_gen.lock");
     if let Some(parent) = lock_path.parent() {
         create_dir_all(parent)?;
     }
@@ -1010,7 +1015,9 @@ pub fn persist_terminal_launch_context(
         .ok()
         .flatten()
         .and_then(|pos| pos.launch_context)
-        .and_then(|json| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok())
+        .and_then(|json| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
+        })
         .unwrap_or_default();
 
     if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
@@ -1043,12 +1050,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
 
     // Preserve fields from prior context that can't be recaptured in hook env
-    let preserve_keys = [
-        "pane_id",
-        "terminal_id",
-        "kitty_listen_on",
-        "process_id",
-    ];
+    let preserve_keys = ["pane_id", "terminal_id", "kitty_listen_on", "process_id"];
     let mut ctx = new_ctx;
 
     let missing: Vec<&str> = preserve_keys
@@ -1608,13 +1610,11 @@ pub fn initialize_instance_in_position_file(
     hints: Option<&str>,
     cwd_override: Option<&str>,
 ) -> bool {
-    let cwd = cwd_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default()
-        });
+    let cwd = cwd_override.map(|s| s.to_string()).unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
     let is_launched = std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1");
 
     // Check if already exists
@@ -2244,7 +2244,10 @@ mod tests {
         row.insert("name".into(), serde_json::json!("test"));
         row.insert("status".into(), serde_json::json!(ST_INACTIVE));
         row.insert("status_context".into(), serde_json::json!("new"));
-        row.insert("created_at".into(), serde_json::json!((now - LAUNCH_PLACEHOLDER_TIMEOUT - 1) as f64));
+        row.insert(
+            "created_at".into(),
+            serde_json::json!((now - LAUNCH_PLACEHOLDER_TIMEOUT - 1) as f64),
+        );
         row.insert("status_time".into(), serde_json::json!(0));
         row.insert("tool".into(), serde_json::json!("codex"));
         db.save_instance_named("test", &row).unwrap();
@@ -2287,7 +2290,9 @@ Error: Operation not permitted (os error 1)
         let result = parse_tmux_launch_failure_output(captured, "codex");
         assert_eq!(
             result.as_deref(),
-            Some("Error: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry.")
+            Some(
+                "Error: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry."
+            )
         );
     }
 
@@ -2301,7 +2306,9 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let result = parse_tmux_launch_failure_output(captured, "codex");
         assert_eq!(
             result.as_deref(),
-            Some("WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry.")
+            Some(
+                "WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry."
+            )
         );
     }
 
@@ -2474,13 +2481,15 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
             .execute(
                 "INSERT INTO events (timestamp, type, instance, data)
                  VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', 'luna', ?1)",
-                rusqlite::params![serde_json::json!({
-                    "action": "stopped",
-                    "snapshot": {
-                        "tag": "team"
-                    }
-                })
-                .to_string()],
+                rusqlite::params![
+                    serde_json::json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "tag": "team"
+                        }
+                    })
+                    .to_string()
+                ],
             )
             .unwrap();
 
