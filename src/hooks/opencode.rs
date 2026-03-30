@@ -490,6 +490,12 @@ pub const PLUGIN_SOURCE: &str = include_str!("../opencode_plugin/hcom.ts");
 
 const PLUGIN_FILENAME: &str = "hcom.ts";
 
+fn current_home_dir() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
+}
+
 /// Resolve XDG_CONFIG_HOME with fallback to ~/.config.
 fn xdg_config_home() -> String {
     std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
@@ -500,29 +506,34 @@ fn xdg_config_home() -> String {
 
 /// Get the canonical plugin install directory.
 ///
-/// Uses XDG_CONFIG_HOME with fallback to ~/.config.
-pub fn get_global_plugin_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(xdg_config_home())
-        .join("opencode")
-        .join("plugins")
+/// Uses the XDG global plugin dir in the default HOME-backed case, and a
+/// project-local `.opencode/plugins/` dir when HCOM_DIR points at a project root.
+pub fn get_opencode_plugin_dir() -> std::path::PathBuf {
+    let tool_root = crate::runtime_env::tool_config_root();
+    let home = current_home_dir();
+    if tool_root == home {
+        std::path::PathBuf::from(xdg_config_home())
+            .join("opencode")
+            .join("plugins")
+    } else {
+        tool_root.join(".opencode").join("plugins")
+    }
 }
 
 /// Get the canonical install path for the hcom.ts plugin.
 pub fn get_opencode_plugin_path() -> std::path::PathBuf {
-    get_global_plugin_dir().join(PLUGIN_FILENAME)
+    get_opencode_plugin_dir().join(PLUGIN_FILENAME)
 }
 
 /// Scan all directories where hcom.ts plugin might exist.
 ///
-/// Checks both plugin/ and plugins/ under:
-/// - ~/.config/opencode/ (or XDG equivalent)
-/// - OPENCODE_CONFIG_DIR if set
+/// Checks both plugin/ and plugins/ under the XDG global location and the
+/// project-local tool_config_root() location when applicable.
 fn scan_plugin_dirs() -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
-
-    let opencode_base = std::path::PathBuf::from(xdg_config_home()).join("opencode");
-    candidates.push(opencode_base.join("plugin"));
-    candidates.push(opencode_base.join("plugins"));
+    let xdg_base = std::path::PathBuf::from(xdg_config_home()).join("opencode");
+    candidates.push(xdg_base.join("plugin"));
+    candidates.push(xdg_base.join("plugins"));
 
     if let Ok(custom_dir) = std::env::var("OPENCODE_CONFIG_DIR") {
         let custom_base = std::path::PathBuf::from(custom_dir);
@@ -530,25 +541,40 @@ fn scan_plugin_dirs() -> Vec<std::path::PathBuf> {
         candidates.push(custom_base.join("plugins"));
     }
 
-    candidates.into_iter().filter(|d| d.exists()).collect()
+    let tool_root = crate::runtime_env::tool_config_root();
+    let home = current_home_dir();
+    if tool_root != home {
+        let tool_base = tool_root.join(".opencode");
+        candidates.push(tool_base.join("plugin"));
+        candidates.push(tool_base.join("plugins"));
+    }
+
+    let mut deduped = Vec::new();
+    for dir in candidates.into_iter().filter(|d| d.exists()) {
+        if !deduped.contains(&dir) {
+            deduped.push(dir);
+        }
+    }
+    deduped
 }
 
 /// Check if hcom.ts plugin is installed in any OpenCode plugin directory.
 pub fn verify_opencode_plugin_installed() -> bool {
-    if get_opencode_plugin_path().exists() {
+    if plugin_matches_source(&get_opencode_plugin_path()) {
         return true;
     }
     scan_plugin_dirs()
         .iter()
-        .any(|d| d.join(PLUGIN_FILENAME).exists())
+        .map(|d| d.join(PLUGIN_FILENAME))
+        .any(|path| plugin_matches_source(&path))
 }
 
 /// Install the hcom.ts plugin to the canonical plugin directory.
 ///
-/// Creates ~/.config/opencode/plugins/ if needed.
+/// Creates the canonical OpenCode plugin dir if needed.
 /// Writes the embedded plugin source directly (no file copy needed).
 pub fn install_opencode_plugin() -> std::io::Result<bool> {
-    let target_dir = get_global_plugin_dir();
+    let target_dir = get_opencode_plugin_dir();
     let target = target_dir.join(PLUGIN_FILENAME);
 
     std::fs::create_dir_all(&target_dir)?;
@@ -579,10 +605,8 @@ pub fn remove_opencode_plugin() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Check if installed plugin matches the embedded source.
-fn plugin_is_current() -> bool {
-    let installed = get_opencode_plugin_path();
-    match std::fs::read_to_string(&installed) {
+fn plugin_matches_source(path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(path) {
         Ok(content) => content == PLUGIN_SOURCE,
         Err(_) => false,
     }
@@ -592,7 +616,7 @@ fn plugin_is_current() -> bool {
 ///
 /// Used by the launcher for auto-install on first launch.
 pub fn ensure_plugin_installed() -> bool {
-    if verify_opencode_plugin_installed() && plugin_is_current() {
+    if verify_opencode_plugin_installed() {
         return true;
     }
     install_opencode_plugin().unwrap_or(false)
@@ -601,6 +625,8 @@ pub fn ensure_plugin_installed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::EnvGuard;
+    use serial_test::serial;
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -657,9 +683,38 @@ mod tests {
     }
 
     #[test]
-    fn test_get_global_plugin_dir() {
-        let dir = get_global_plugin_dir();
-        assert!(dir.ends_with("opencode/plugins"));
+    #[serial]
+    fn test_get_opencode_plugin_dir_defaults_to_xdg_global_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_hcom = std::env::var("HCOM_DIR").ok();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        std::fs::create_dir_all(home.join(".hcom")).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        }
+
+        assert_eq!(get_opencode_plugin_dir(), xdg.join("opencode").join("plugins"));
+
+        if let Some(home) = saved_home {
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        if let Some(hcom) = saved_hcom {
+            unsafe { std::env::set_var("HCOM_DIR", hcom) };
+        } else {
+            unsafe { std::env::remove_var("HCOM_DIR") };
+        }
+        if let Some(xdg) = saved_xdg {
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) };
+        } else {
+            unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        }
     }
 
     #[test]
@@ -671,6 +726,81 @@ mod tests {
     #[test]
     fn test_plugin_filename_constant() {
         assert_eq!(PLUGIN_FILENAME, "hcom.ts");
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_plugin_installed_rejects_stale_canonical_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_hcom = std::env::var("HCOM_DIR").ok();
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("HCOM_DIR", dir.path().join(".hcom"));
+        }
+
+        let plugin_path = get_opencode_plugin_path();
+        std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+        std::fs::write(&plugin_path, "// stale plugin").unwrap();
+
+        assert!(!verify_opencode_plugin_installed());
+
+        if let Some(home) = saved_home {
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        if let Some(hcom) = saved_hcom {
+            unsafe { std::env::set_var("HCOM_DIR", hcom) };
+        } else {
+            unsafe { std::env::remove_var("HCOM_DIR") };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_project_local_plugin_path_uses_hcom_dir_parent() {
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let hcom_dir = workspace.join(".hcom");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("HCOM_DIR", &hcom_dir);
+            std::env::set_var("HOME", &home);
+        }
+
+        assert_eq!(
+            get_opencode_plugin_path(),
+            workspace.join(".opencode").join("plugins").join("hcom.ts")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_and_remove_support_opencode_config_dir() {
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let custom = dir.path().join("custom-opencode");
+        std::fs::create_dir_all(home.join(".hcom")).unwrap();
+        std::fs::create_dir_all(custom.join("plugins")).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("OPENCODE_CONFIG_DIR", &custom);
+        }
+
+        let plugin_path = custom.join("plugins").join("hcom.ts");
+        std::fs::write(&plugin_path, PLUGIN_SOURCE).unwrap();
+
+        assert!(verify_opencode_plugin_installed());
+        remove_opencode_plugin().unwrap();
+        assert!(!plugin_path.exists());
     }
 
     // ── Transcript path ──
