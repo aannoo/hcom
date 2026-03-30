@@ -122,11 +122,12 @@ LISTENING REQUIREMENT:
 - After receiving a task via hcom → do the work, report, then enter CONNECTED MODE
 - User says "stay connected" → enter CONNECTED MODE
 
-CONNECTED MODE (infinite listen loop):
-1. Run: `hcom listen --name {instance_name} --timeout [large_num]`
-2. Timeout → you MUST run listen again
-3. Message received → handle it, then listen again
-4. Exit only when user says stop
+CONNECTED MODE:
+1. Run exactly one foreground blocking command:
+  `hcom listen --name {instance_name} --timeout [large_num]`
+2. When it returns, read/handle the output, then you MUST manually run `hcom listen` again.
+3. You MUST repeat steps 1 and 2 until the user says stop.
+- Do not wrap `hcom listen` in `while`, `watch`, `xargs`, tmux helpers, or background jobs.
 
 WRONG: hcom listen & (background)
 RIGHT: hcom listen --timeout [sec] (blocking)

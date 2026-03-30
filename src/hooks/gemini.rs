@@ -1139,15 +1139,12 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
         None => return false,
     };
 
-    let expected_hcom_cmd = crate::runtime_env::build_hcom_command();
-
     for &(hook_type, expected_matcher, cmd_suffix, expected_timeout, _) in GEMINI_HOOK_CONFIGS {
         let hook_matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
             Some(arr) if !arr.is_empty() => arr,
             _ => return false,
         };
 
-        let expected_command = format!("{} {}", expected_hcom_cmd, cmd_suffix);
         let expected_name = format!("hcom-{}", hook_type.to_lowercase());
         let mut found = false;
 
@@ -1184,7 +1181,10 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
                     {
                         return false;
                     }
-                    if hook.get("command").and_then(|v| v.as_str()) != Some(&expected_command) {
+                    let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    let has_hcom =
+                        command.contains("${HCOM}") || command.to_ascii_lowercase().contains("hcom");
+                    if !has_hcom || !command.contains(cmd_suffix) {
                         return false;
                     }
                     found = true;
@@ -2259,7 +2259,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_verify_gemini_detects_command_drift() {
+    fn test_verify_accepts_alternate_hcom_prefix() {
         let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
 
         assert!(setup_gemini_hooks(false));
@@ -2274,7 +2274,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!verify_hooks_at(&settings_path, false));
+        assert!(verify_hooks_at(&settings_path, false));
 
         drop(_guard);
     }

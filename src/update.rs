@@ -177,6 +177,7 @@ fn get_update_cmd() -> &'static str {
     // Dev build
     if path_str.contains("/hook-comms/")
         || path_str.contains("/target/")
+        || path_str.contains("/cargo-target/")
         || path_str.contains("/.hcom-build/")
     {
         return "./build.sh";
