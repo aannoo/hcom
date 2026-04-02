@@ -1,3 +1,9 @@
+- name: Set up JDK 17 (required by Android SDK tools)
+  if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
+  uses: actions/setup-java@v4
+  with:
+    java-version: '17'
+    distribution: temurin
 - name: Set up Android SDK
   if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
   uses: android-actions/setup-android@v3
