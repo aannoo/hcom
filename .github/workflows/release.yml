@@ -127,6 +127,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Set up JDK 17 (required by Android SDK tools)"
+        uses: "actions/setup-java@v4"
+        if: "${{ contains(matrix.targets, 'aarch64-linux-android') }}"
+        with:
+          "distribution": "temurin"
+          "java-version": "17"
       - name: "Set up Android SDK"
         uses: "android-actions/setup-android@v3"
         if: "${{ contains(matrix.targets, 'aarch64-linux-android') }}"
