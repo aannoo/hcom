@@ -37,8 +37,8 @@ pub use context::HcomContext;
 pub use errors::{CLIError, HcomError, HookError};
 pub use identity::{CommandContext, SenderIdentity, SenderKind};
 pub use platform::{
-    detect_current_tool_from_env, is_inside_ai_tool, is_termux, is_wsl, platform_name,
-    shorten_path, shorten_path_max,
+    detect_current_tool_from_env, dev_root_binary, is_inside_ai_tool, is_termux, is_wsl,
+    platform_name, shorten_path, shorten_path_max,
 };
 pub use terminal_presets::{TerminalPreset, get_terminal_preset};
 pub use time::{format_age, now_epoch_f64, now_epoch_i64, system_time_to_epoch_f64};

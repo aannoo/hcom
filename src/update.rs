@@ -1,11 +1,10 @@
 //! Auto-update checker — checks latest release via git ls-remote once daily.
 //! Uses git ls-remote instead of the GitHub REST API to avoid rate limits.
 
-use std::path::Path;
 
 use crate::paths::{FLAGS_DIR, atomic_write, hcom_path};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(86400); // 24 hours
@@ -170,18 +169,9 @@ fn get_update_cmd() -> &'static str {
         }
     };
 
-    // Resolve symlink — build.sh copies binary and symlinks ~/.local/bin/hcom -> repo bin/
-    let resolved = std::fs::canonicalize(&exe).unwrap_or(exe.clone());
+    // Resolve symlinks (e.g. Homebrew Cellar, uv shims).
+    let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
     let path_str = resolved.to_string_lossy();
-
-    // Dev build
-    if path_str.contains("/hook-comms/")
-        || path_str.contains("/target/")
-        || path_str.contains("/cargo-target/")
-        || path_str.contains("/.hcom-build/")
-    {
-        return "./build.sh";
-    }
 
     // Homebrew install (Cellar path on both Apple Silicon and Intel)
     if path_str.contains("/Cellar/") {
@@ -201,6 +191,7 @@ fn get_update_cmd() -> &'static str {
     // Default: curl installer
     "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh"
 }
+
 
 /// Check for updates (once daily cached). Returns (latest_version, update_cmd) or None.
 ///
@@ -272,7 +263,9 @@ mod tests {
 
     #[test]
     fn test_get_update_cmd_default() {
-        // In test context, binary is in target/debug, which contains /target/
-        assert_eq!(get_update_cmd(), "./build.sh");
+        // Test binary path won't match any known install method, so we expect
+        // the curl installer fallback.
+        let cmd = get_update_cmd();
+        assert!(cmd.contains("curl"), "expected curl fallback, got: {cmd}");
     }
 }

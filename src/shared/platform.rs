@@ -1,6 +1,7 @@
 //! Platform detection utilities.
 //!
 
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Cached WSL detection result.
@@ -153,6 +154,81 @@ pub fn detect_current_tool_from_env() -> &'static str {
     }
 }
 
+fn resolve_target_dir_path(base: &Path, value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(trimmed);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    })
+}
+
+fn cargo_target_dir_from_config(dev_root: &Path) -> Option<PathBuf> {
+    for rel in [".cargo/config.toml", ".cargo/config"] {
+        let path = dev_root.join(rel);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(parsed) = content.parse::<toml::Table>() else {
+            continue;
+        };
+
+        if let Some(target_dir) = parsed
+            .get("build")
+            .and_then(|build| build.get("target-dir"))
+            .and_then(|value| value.as_str())
+            .and_then(|value| resolve_target_dir_path(dev_root, value))
+        {
+            return Some(target_dir);
+        }
+    }
+
+    None
+}
+
+fn cargo_target_dir(dev_root: &Path) -> PathBuf {
+    std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .and_then(|value| resolve_target_dir_path(dev_root, &value))
+        .or_else(|| cargo_target_dir_from_config(dev_root))
+        .unwrap_or_else(|| dev_root.join("target"))
+}
+
+/// Returns the best available hcom binary under `dev_root`'s cargo target dir.
+///
+/// Target dir resolution order:
+/// 1. `CARGO_TARGET_DIR`
+/// 2. `.cargo/config.toml` or `.cargo/config` `build.target-dir`
+/// 3. `target/`
+///
+/// Prefers whichever of `release/hcom` and `debug/hcom` was modified more
+/// recently, so both `cargo build` and `cargo build --release` do the right
+/// thing. Falls back to debug if mtimes are unavailable. Returns `None` if
+/// neither binary exists.
+pub fn dev_root_binary(dev_root: &Path) -> Option<PathBuf> {
+    let target_dir = cargo_target_dir(dev_root);
+    let release = target_dir.join("release/hcom");
+    let debug = target_dir.join("debug/hcom");
+
+    let mtime = |p: &Path| {
+        std::fs::metadata(p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+    };
+
+    match (mtime(&release), mtime(&debug)) {
+        (Some(r), Some(d)) => Some(if d >= r { debug } else { release }),
+        (Some(_), None) => Some(release),
+        (None, Some(_)) => Some(debug),
+        (None, None) => None,
+    }
+}
+
 /// Current platform name
 pub fn platform_name() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -169,6 +245,38 @@ pub fn platform_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct CargoTargetDirGuard {
+        saved: Option<String>,
+    }
+
+    impl CargoTargetDirGuard {
+        fn new() -> Self {
+            Self {
+                saved: std::env::var("CARGO_TARGET_DIR").ok(),
+            }
+        }
+    }
+
+    impl Drop for CargoTargetDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.saved {
+                    Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
+                    None => std::env::remove_var("CARGO_TARGET_DIR"),
+                }
+            }
+        }
+    }
+
+    fn touch_binary(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, b"bin").unwrap();
+    }
 
     #[test]
     fn test_platform_name_is_known() {
@@ -200,5 +308,59 @@ mod tests {
     #[test]
     fn test_platform_is_darwin() {
         assert_eq!(platform_name(), "Darwin");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_root_binary_uses_default_target_dir() {
+        let _target_guard = CargoTargetDirGuard::new();
+        let dir = TempDir::new().unwrap();
+        let release = dir.path().join("target/release/hcom");
+        touch_binary(&release);
+
+        unsafe {
+            std::env::remove_var("CARGO_TARGET_DIR");
+        }
+
+        assert_eq!(dev_root_binary(dir.path()), Some(release));
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_root_binary_uses_target_dir_from_env() {
+        let _target_guard = CargoTargetDirGuard::new();
+        let dir = TempDir::new().unwrap();
+        let custom_target = dir.path().join(".cargo-target");
+        let debug = custom_target.join("debug/hcom");
+        touch_binary(&debug);
+
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", ".cargo-target");
+        }
+
+        assert_eq!(dev_root_binary(dir.path()), Some(debug));
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_root_binary_uses_target_dir_from_cargo_config() {
+        let _target_guard = CargoTargetDirGuard::new();
+        let dir = TempDir::new().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        let custom_target = dir.path().join(".hcom-build");
+        let release = custom_target.join("release/hcom");
+        touch_binary(&release);
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\ntarget-dir = \".hcom-build\"\n",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("CARGO_TARGET_DIR");
+        }
+
+        assert_eq!(dev_root_binary(dir.path()), Some(release));
     }
 }

@@ -567,7 +567,6 @@ const UPDATE_HELP: &[HelpEntry] = &[
     ("", "  uv tool install → uv tool upgrade hcom"),
     ("", "  pip install     → pip install -U hcom"),
     ("", "  curl installer  → re-run hcom-installer.sh"),
-    ("", "  dev build       → use ./build.sh manually"),
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[

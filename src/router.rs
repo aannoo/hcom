@@ -10,6 +10,7 @@ use std::process::Command;
 use clap::Parser;
 
 use crate::log::{log_error, log_info, log_warn};
+use crate::shared::dev_root_binary;
 
 // ── Hook name registries ──────────────
 
@@ -348,34 +349,23 @@ pub fn maybe_reexec_dev_root() {
         Err(_) => return,
     };
 
-    // The dev root's binary lives at bin/hcom-<platform> or the cargo
-    // target dir. Check the bundled location first (matches build.sh output).
-    let platform_tag = get_platform_tag();
-    let dev_binary = dev_root.join("bin").join(format!("hcom-{}", platform_tag));
-
-    // Also check cargo target dir (for when running cargo build without build.sh)
-    let dev_binary_cargo = dev_root.join("target/release/hcom");
-
-    let target_binary = if dev_binary.exists() {
-        &dev_binary
-    } else if dev_binary_cargo.exists() {
-        &dev_binary_cargo
-    } else {
-        log_warn(
-            "router",
-            "dev_root_no_binary",
-            &format!(
-                "HCOM_DEV_ROOT={} set but no dev binary found (checked {} and {}). Run build.sh in the worktree.",
-                dev_root.display(),
-                dev_binary.display(),
-                dev_binary_cargo.display()
-            ),
-        );
-        return;
+    let target_binary = match dev_root_binary(&dev_root) {
+        Some(p) => p,
+        None => {
+            log_warn(
+                "router",
+                "dev_root_no_binary",
+                &format!(
+                    "HCOM_DEV_ROOT={} set but no dev binary found. Run `cargo build` or `cargo build --release` in the worktree.",
+                    dev_root.display(),
+                ),
+            );
+            return;
+        }
     };
 
     // Don't re-exec if we're already running the right binary
-    if is_same_file(&current_exe, target_binary) {
+    if is_same_file(&current_exe, &target_binary) {
         return;
     }
 
@@ -391,29 +381,13 @@ pub fn maybe_reexec_dev_root() {
 
     // Re-exec: replace this process with the dev root's binary
     let args: Vec<String> = env::args().collect();
-    let err = Command::new(target_binary).args(&args[1..]).exec();
+    let err = Command::new(&target_binary).args(&args[1..]).exec();
     // exec() only returns on error
     log_error(
         "router",
         "dev_root_reexec_failed",
         &format!("failed to exec {}: {}", target_binary.display(), err),
     );
-}
-
-fn get_platform_tag() -> String {
-    let system = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    // Normalize to match build.sh conventions
-    let system = match system {
-        "macos" => "darwin",
-        other => other,
-    };
-    let arch = match arch {
-        "aarch64" => "arm64",
-        "x86_64" => "x86_64",
-        other => other,
-    };
-    format!("{}-{}", system, arch)
 }
 
 /// Check if two paths refer to the same file (follows symlinks).
@@ -1169,18 +1143,6 @@ mod tests {
         assert!(is_command("run"));
         assert!(!is_command("poll"));
         assert!(!is_command("claude"));
-    }
-
-    // ── Platform tag ────────────────────────────────────────────────────
-
-    #[test]
-    fn platform_tag_format() {
-        let tag = get_platform_tag();
-        assert!(tag.contains('-'), "expected 'os-arch' format, got: {}", tag);
-        let parts: Vec<&str> = tag.split('-').collect();
-        assert_eq!(parts.len(), 2);
-        assert!(!parts[0].is_empty());
-        assert!(!parts[1].is_empty());
     }
 
     // ── Dev root re-exec path building ──────────────────────────────────

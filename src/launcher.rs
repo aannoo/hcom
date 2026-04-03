@@ -350,11 +350,12 @@ pub fn create_runner_script(
     // Resolve binary paths for minimal PATH environments
     let mut path_dirs: Vec<String> = Vec::new();
 
-    // Dev mode: prepend worktree binary dir
+    // Dev mode: prepend the worktree's Cargo output dir
     if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT") {
-        let dev_bin = format!("{}/target/release", dev_root);
-        if Path::new(&dev_bin).join("hcom").exists() {
-            path_dirs.push(dev_bin);
+        if let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root)) {
+            if let Some(dir) = bin.parent() {
+                path_dirs.push(dir.to_string_lossy().into_owned());
+            }
         }
     }
 

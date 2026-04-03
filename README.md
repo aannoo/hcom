@@ -677,7 +677,6 @@ Usage:
     uv tool install → uv tool upgrade hcom
     pip install     → pip install -U hcom
     curl installer  → re-run hcom-installer.sh
-    dev build       → use ./build.sh manually
 
 ## claude
 
@@ -1174,10 +1173,17 @@ Available scripts:
 
 git clone https://github.com/aannoo/hcom.git
 cd hcom
-./build.sh
+cargo test
+cargo install --path . --force
+```
 
-# Put binary on PATH
-ln -sf "$(pwd)/bin/hcom" ~/.local/bin/hcom
+Worktrees use the installed `hcom` as a bootstrap binary. Build inside the
+worktree, then point `HCOM_DEV_ROOT` at it:
+
+```bash
+cd /path/to/worktree
+cargo build --release
+HCOM_DEV_ROOT=/path/to/worktree hcom list
 ```
 
 </details>
@@ -1187,7 +1193,7 @@ ln -sf "$(pwd)/bin/hcom" ~/.local/bin/hcom
 
 ## Contributing
 
-Issues and PRs welcome. The codebase is Rust — `./build.sh` builds, runs tests, and copies the binary.
+Issues and PRs welcome. The codebase is Rust — `cargo test && cargo install --path . --force` is the standard local workflow.
 
 ---
 
