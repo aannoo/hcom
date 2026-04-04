@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema version - bump on any schema change.
 const SCHEMA_VERSION: i32 = 17;
@@ -1274,13 +1274,77 @@ impl HcomDb {
     }
 
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
-    /// Only writes if launch_context is currently empty (don't overwrite hook-captured context).
+    /// Merges incoming keys into existing JSON, only filling fields that are
+    /// currently missing or empty so late-bound PTY metadata can be persisted
+    /// without clobbering richer hook-captured context.
     pub fn store_launch_context(&self, name: &str, context_json: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE instances SET launch_context = ? WHERE name = ? AND (launch_context IS NULL OR launch_context = '')",
-            params![context_json, name],
-        )?;
-        Ok(())
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            let existing_json: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT launch_context FROM instances WHERE name = ?",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            let existing_json = existing_json.unwrap_or_default();
+            if existing_json.is_empty() {
+                self.conn.execute(
+                    "UPDATE instances SET launch_context = ? WHERE name = ?",
+                    params![context_json, name],
+                )?;
+                return Ok(());
+            }
+
+            let mut existing =
+                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                    &existing_json,
+                ) {
+                    Ok(map) => map,
+                    Err(_) => return Ok(()),
+                };
+            let incoming = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                context_json,
+            ) {
+                Ok(map) => map,
+                Err(_) => return Ok(()),
+            };
+
+            let mut changed = false;
+            for (key, value) in incoming {
+                let should_fill = existing.get(&key).is_none_or(|current| {
+                    current.is_null() || current.as_str().is_some_and(str::is_empty)
+                });
+                if should_fill {
+                    existing.insert(key, value);
+                    changed = true;
+                }
+            }
+
+            if changed {
+                self.conn.execute(
+                    "UPDATE instances SET launch_context = ? WHERE name = ?",
+                    params![
+                        serde_json::to_string(&existing).unwrap_or_else(|_| "{}".to_string()),
+                        name
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Get instance tag (for display name computation).
@@ -3903,6 +3967,48 @@ mod tests {
 
         assert!(id1 > 0);
         assert_eq!(id2, id1 + 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_store_launch_context_merges_late_pty_metadata() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"process_id":"proc-1","terminal_preset_effective":"kitty-split","terminal_preset":"kitty-split"}"#
+                ],
+            )
+            .unwrap();
+
+        db.store_launch_context(
+            "luna",
+            r#"{"process_id":"proc-2","kitty_listen_on":"unix:/tmp/kitty","terminal_id":"11","pane_id":"11"}"#,
+        )
+        .unwrap();
+
+        let launch_context: String = db
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+
+        assert_eq!(launch_context["process_id"], "proc-1");
+        assert_eq!(launch_context["terminal_preset_effective"], "kitty-split");
+        assert_eq!(launch_context["terminal_preset"], "kitty-split");
+        assert_eq!(launch_context["kitty_listen_on"], "unix:/tmp/kitty");
+        assert_eq!(launch_context["terminal_id"], "11");
+        assert_eq!(launch_context["pane_id"], "11");
 
         cleanup_test_db(db_path);
     }
