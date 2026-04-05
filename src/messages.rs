@@ -572,8 +572,21 @@ pub fn format_hook_messages(
         result = format!("{} | [{}]", result, hints);
     }
 
-    // Show recv:intent tip on first receipt of each intent type
+    // Show recv:thread tip on first receipt in each thread
     if let Some(tip_fn) = tip_checker {
+        for msg in messages {
+            if let Some(thread) = msg.get("thread").and_then(|v| v.as_str()) {
+                let tip_key = format!("recv:thread:{thread}");
+                let (seen, mark) = tip_fn(instance_name, &tip_key);
+                if !seen {
+                    mark();
+                    result = format!("{}\n{}", result, get_thread_tip_text(instance_name, thread));
+                    return result;
+                }
+            }
+        }
+
+        // Show recv:intent tip on first receipt of each intent type
         for msg in messages {
             if let Some(intent) = msg.get("intent").and_then(|v| v.as_str()) {
                 let tip_key = format!("recv:intent:{}", intent);
@@ -647,6 +660,23 @@ fn others_count(msg: &Value) -> usize {
 /// Tip text for recv:intent tips. Delegates to core::tips for centralized text.
 fn get_tip_text(tip_key: &str) -> Option<&'static str> {
     crate::core::tips::get_tip(tip_key)
+}
+
+fn build_thread_membership_sub_id(thread: &str, member: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(format!("thread-member:{thread}:{member}").as_bytes());
+    let hash = hasher.finalize();
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sub-{}", &hex[..8])
+}
+
+fn get_thread_tip_text(instance_name: &str, thread: &str) -> String {
+    let sub_id = build_thread_membership_sub_id(thread, instance_name);
+    format!(
+        "[tip] You joined thread {thread}. To leave: hcom events unsub {sub_id} (find your sub-id with: hcom events sub list)"
+    )
 }
 
 /// Remove bash escape sequences from message content.
@@ -1524,6 +1554,38 @@ mod tests {
         let result = format_hook_messages(&msgs, "nova", &|_name| None, &|| String::new(), None);
         // Should show "+2 others" for single message
         assert!(result.contains("+2 others"));
+    }
+
+    #[test]
+    fn test_format_hook_messages_appends_thread_tip_once() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let msgs = vec![serde_json::json!({
+            "from": "luna",
+            "message": "hi",
+            "thread": "debate-1",
+            "event_id": 1,
+            "delivered_to": ["nova"],
+        })];
+        let marks = Rc::new(Cell::new(0));
+        let tip_checker = |_: &str, tip_key: &str| -> (bool, Box<dyn Fn()>) {
+            assert_eq!(tip_key, "recv:thread:debate-1");
+            let marks = Rc::clone(&marks);
+            let mark = Box::new(move || marks.set(marks.get() + 1)) as Box<dyn Fn()>;
+            (false, mark)
+        };
+
+        let result = format_hook_messages(
+            &msgs,
+            "nova",
+            &|_name| None,
+            &|| String::new(),
+            Some(&tip_checker),
+        );
+        assert!(result.contains("[tip] You joined thread debate-1."));
+        assert!(result.contains("hcom events unsub sub-"));
+        assert_eq!(marks.get(), 1);
     }
 
     // ---- compute_read_receipts ----

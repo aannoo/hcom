@@ -359,17 +359,18 @@ pub fn resolve_terminal_mode_for_tips(
     background: bool,
     run_here: bool,
 ) -> (String, bool) {
-    let explicit_terminal = terminal
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            (config_terminal != "default" && !config_terminal.is_empty()).then_some(config_terminal)
-        });
+    let explicit_terminal = terminal.filter(|t| !t.is_empty()).or_else(|| {
+        (config_terminal != "default" && !config_terminal.is_empty()).then_some(config_terminal)
+    });
 
     let requested = explicit_terminal.unwrap_or("default").to_string();
     let (resolved, _) =
         normalize_terminal_mode_for_launch(requested, !background && !run_here, run_here);
 
-    (resolved.clone(), explicit_terminal.is_none() && resolved != "default")
+    (
+        resolved.clone(),
+        explicit_terminal.is_none() && resolved != "default",
+    )
 }
 
 /// Check if a wezterm mux server is reachable.
@@ -1580,8 +1581,7 @@ mod tests {
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
         }
 
-        let (mode, socket) =
-            normalize_terminal_mode_for_launch("default".to_string(), true, false);
+        let (mode, socket) = normalize_terminal_mode_for_launch("default".to_string(), true, false);
 
         assert_eq!(mode, "kitty-split");
         assert_eq!(socket, "unix:/tmp/kitty-test");

@@ -1029,10 +1029,16 @@ pub fn persist_terminal_launch_context(
             serde_json::json!(effective_preset),
         );
         // Legacy compatibility for older readers and migration logic.
-        ctx.insert("terminal_preset".into(), serde_json::json!(effective_preset));
+        ctx.insert(
+            "terminal_preset".into(),
+            serde_json::json!(effective_preset),
+        );
     }
     if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
-        ctx.insert("terminal_preset_requested".into(), serde_json::json!(requested));
+        ctx.insert(
+            "terminal_preset_requested".into(),
+            serde_json::json!(requested),
+        );
     }
 
     let mut updates = serde_json::Map::new();
@@ -1991,7 +1997,7 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
 
     // Clean up stale subscriptions from previously stopped instances with reused names
     let _ = db.cleanup_subscriptions(instance_name);
-
+    let _ = db.cleanup_thread_memberships_for_name_reuse(instance_name);
     let config = match crate::config::HcomConfig::load(None) {
         Ok(c) => c,
         Err(_) => return,
@@ -2300,20 +2306,15 @@ mod tests {
             )
             .unwrap();
 
-        persist_terminal_launch_context(
-            &db,
-            "luna",
-            Some("kitty"),
-            "kitty-tab",
-            Some("proc-1"),
-        );
+        persist_terminal_launch_context(&db, "luna", Some("kitty"), "kitty-tab", Some("proc-1"));
 
         let row = db.get_instance_full("luna").unwrap().unwrap();
         let ctx: serde_json::Value =
             serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
 
         assert_eq!(
-            ctx.get("terminal_preset_effective").and_then(|v| v.as_str()),
+            ctx.get("terminal_preset_effective")
+                .and_then(|v| v.as_str()),
             Some("kitty-tab")
         );
         assert_eq!(
@@ -2321,10 +2322,14 @@ mod tests {
             Some("kitty-tab")
         );
         assert_eq!(
-            ctx.get("terminal_preset_requested").and_then(|v| v.as_str()),
+            ctx.get("terminal_preset_requested")
+                .and_then(|v| v.as_str()),
             Some("kitty")
         );
-        assert_eq!(ctx.get("process_id").and_then(|v| v.as_str()), Some("proc-1"));
+        assert_eq!(
+            ctx.get("process_id").and_then(|v| v.as_str()),
+            Some("proc-1")
+        );
 
         cleanup(path);
     }
@@ -3136,6 +3141,39 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
             )
             .unwrap();
         assert_eq!(count, 0, "non-tool should not create subscriptions");
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_auto_subscribe_name_reuse_cleans_thread_memberships() {
+        let (db, path) = setup_test_db();
+
+        let normal = serde_json::json!({
+            "id": "sub-normal",
+            "caller": "test-agent",
+            "sql": "type = 'message'",
+            "last_id": 0
+        });
+        let thread_member = serde_json::json!({
+            "id": "sub-thread",
+            "caller": "test-agent",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false
+        });
+        db.kv_set("events_sub:sub-normal", Some(&normal.to_string()))
+            .unwrap();
+        db.kv_set("events_sub:sub-thread", Some(&thread_member.to_string()))
+            .unwrap();
+
+        auto_subscribe_defaults(&db, "test-agent", "codex");
+
+        assert!(db.kv_get("events_sub:sub-normal").unwrap().is_none());
+        assert!(db.kv_get("events_sub:sub-thread").unwrap().is_none());
 
         cleanup(path);
     }

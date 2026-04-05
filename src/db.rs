@@ -37,6 +37,25 @@ use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 /// File-write tool contexts for collision detection
 const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit')";
 
+fn thread_membership_sub_id(thread: &str, member: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(format!("thread-member:{thread}:{member}").as_bytes());
+    let hash = hasher.finalize();
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sub-{}", &hex[..8])
+}
+
+fn subscription_is_delivery_only(sub: &serde_json::Value) -> bool {
+    match sub.get("delivery_only") {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(n)) => n.as_i64() == Some(1),
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("true") || s == "1",
+        _ => false,
+    }
+}
+
 /// Message from the events table
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -1298,13 +1317,13 @@ impl HcomDb {
                 return Ok(());
             }
 
-            let mut existing =
-                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                    &existing_json,
-                ) {
-                    Ok(map) => map,
-                    Err(_) => return Ok(()),
-                };
+            let mut existing = match serde_json::from_str::<
+                serde_json::Map<String, serde_json::Value>,
+            >(&existing_json)
+            {
+                Ok(map) => map,
+                Err(_) => return Ok(()),
+            };
             let incoming = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
                 context_json,
             ) {
@@ -1657,10 +1676,117 @@ impl HcomDb {
     /// and a JSON value containing a "caller" field.
     pub fn cleanup_subscriptions(&self, name: &str) -> Result<u32> {
         let deleted = self.conn.execute(
-            "DELETE FROM kv WHERE key LIKE 'events_sub:%' AND json_extract(value, '$.caller') = ?",
+            "DELETE FROM kv
+             WHERE key LIKE 'events_sub:%'
+               AND json_extract(value, '$.caller') = ?
+               AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
             params![name],
         )?;
         Ok(deleted as u32)
+    }
+
+    /// Remove delivery-only thread memberships for an instance.
+    ///
+    /// This is used when a stopped name is being reused by a fresh instance:
+    /// normal stop/resume should preserve memberships, but identity replacement
+    /// must not inherit old thread state.
+    pub fn cleanup_thread_memberships_for_name_reuse(&self, name: &str) -> Result<u32> {
+        let deleted = self.conn.execute(
+            "DELETE FROM kv
+             WHERE key LIKE 'events_sub:%'
+               AND json_extract(value, '$.caller') = ?
+               AND json_extract(value, '$.auto_thread_member') = 1
+               AND COALESCE(json_extract(value, '$.delivery_only'), 0) = 1",
+            params![name],
+        )?;
+        Ok(deleted as u32)
+    }
+
+    /// Return active members of a thread in join order.
+    pub fn get_thread_members(&self, thread: &str) -> Vec<String> {
+        let active_instances: std::collections::HashSet<String> = self
+            .conn()
+            .prepare("SELECT name FROM instances")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let rows: Vec<String> = self
+            .conn()
+            .prepare(
+                "SELECT value FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.auto_thread_member') = 1
+                   AND json_extract(value, '$.thread_name') = ?
+                 ORDER BY json_extract(value, '$.created') ASC, key ASC",
+            )
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(rusqlite::params![thread], |row| row.get::<_, String>(0))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut members = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for value in rows {
+            let caller = serde_json::from_str::<serde_json::Value>(&value)
+                .ok()
+                .and_then(|sub| sub.get("caller").and_then(|v| v.as_str()).map(String::from));
+            if let Some(caller) = caller {
+                if active_instances.contains(&caller) && seen.insert(caller.clone()) {
+                    members.push(caller);
+                }
+            }
+        }
+        members
+    }
+
+    /// Upsert memberships for recipients of a thread message.
+    pub fn add_thread_memberships(
+        &self,
+        thread: &str,
+        sender: Option<&str>,
+        recipients: &[String],
+    ) {
+        let mut members = recipients.to_vec();
+        if let Some(sender) = sender {
+            members.push(sender.to_string());
+        }
+
+        let now = crate::shared::time::now_epoch_f64();
+        let last_id = self.get_last_event_id();
+        let mut seen = std::collections::HashSet::new();
+        for (idx, member) in members.into_iter().enumerate() {
+            if !seen.insert(member.clone()) {
+                continue;
+            }
+            let sub_id = thread_membership_sub_id(thread, &member);
+            let key = format!("events_sub:{sub_id}");
+            let data = serde_json::json!({
+                "id": sub_id,
+                "caller": member,
+                "thread_name": thread,
+                "auto_thread_member": true,
+                "delivery_only": true,
+                "sql": "0",
+                "created": now + (idx as f64 * 0.000001),
+                "last_id": last_id,
+                "once": false,
+            });
+            let _ = self.kv_set(&key, Some(&data.to_string()));
+        }
     }
 
     /// Get value from kv table.
@@ -2074,10 +2200,12 @@ impl HcomDb {
 
         // Snapshot subscriptions. Request-watch cancellation can delete KV rows
         // concurrently, so later code re-checks key existence before acting.
-        let rows: Vec<(String, String)> = match self
-            .conn
-            .prepare_cached("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'")
-        {
+        let rows: Vec<(String, String)> = match self.conn.prepare_cached(
+            "SELECT key, value FROM kv
+             WHERE key LIKE 'events_sub:%'
+               AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1
+               AND COALESCE(json_extract(value, '$.delivery_only'), 'false') != 'true'",
+        ) {
             Ok(mut stmt) => stmt
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2097,6 +2225,9 @@ impl HcomDb {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            if subscription_is_delivery_only(&sub) {
+                continue;
+            }
             let sub_id = sub
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -4489,6 +4620,164 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.len(), 1);
         assert!(delivered.contains(&"luna".to_string()));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_delivery_only_subscription_does_not_emit_notifications() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let member = serde_json::json!({
+            "id": "sub-thread123",
+            "caller": "luna",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false
+        });
+        db.kv_set("events_sub:sub-thread123", Some(&member.to_string()))
+            .unwrap();
+
+        let data = serde_json::json!({
+            "from": "nova",
+            "sender_kind": "instance",
+            "scope": "broadcast",
+            "text": "hello",
+            "delivered_to": ["luna"]
+        });
+        db.log_event("message", "nova", &data).unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "delivery-only subscriptions must not create notifications"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_delivery_only_subscription_does_not_emit_status_notifications() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let member = serde_json::json!({
+            "id": "sub-thread123",
+            "caller": "luna",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false
+        });
+        db.kv_set("events_sub:sub-thread123", Some(&member.to_string()))
+            .unwrap();
+
+        let data = serde_json::json!({
+            "status": "active",
+            "context": "tool:shell",
+            "detail": "hcom listen 1 --name nova"
+        });
+        db.log_event("status", "nova", &data).unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "delivery-only subscriptions must not create status notifications"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_cleanup_subscriptions_keeps_delivery_only_memberships() {
+        let (db, db_path) = setup_full_test_db();
+
+        let normal = serde_json::json!({
+            "id": "sub-normal",
+            "caller": "luna",
+            "sql": "type = 'message'",
+            "last_id": 0
+        });
+        let thread_member = serde_json::json!({
+            "id": "sub-thread",
+            "caller": "luna",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0
+        });
+        db.kv_set("events_sub:sub-normal", Some(&normal.to_string()))
+            .unwrap();
+        db.kv_set("events_sub:sub-thread", Some(&thread_member.to_string()))
+            .unwrap();
+
+        let deleted = db.cleanup_subscriptions("luna").unwrap();
+        assert_eq!(deleted, 1);
+        assert!(db.kv_get("events_sub:sub-normal").unwrap().is_none());
+        assert!(db.kv_get("events_sub:sub-thread").unwrap().is_some());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_get_thread_members_filters_stale_names() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        db.add_thread_memberships(
+            "debate-1",
+            Some("luna"),
+            &["nova".to_string(), "ghost".to_string()],
+        );
+
+        let stored: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM kv WHERE key = ?",
+                params![format!(
+                    "events_sub:{}",
+                    thread_membership_sub_id("debate-1", "luna")
+                )],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("\"sql\":\"0\""));
+
+        assert_eq!(
+            db.get_thread_members("debate-1"),
+            vec!["nova".to_string(), "luna".to_string()]
+        );
 
         cleanup_test_db(db_path);
     }

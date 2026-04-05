@@ -1410,7 +1410,6 @@ pub fn run_delivery_loop(
         if let Err(e) = db.cleanup_subscriptions(&current_name) {
             log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
         }
-
         // 4. Log life event BEFORE delete — if log fails, row stays (stale cleanup catches it).
         //    Previous order (delete first) lost snapshots when log_life_event hit DB lock.
         if let Err(e) = db.log_life_event(&current_name, "stopped", "pty", exit_reason, snapshot) {

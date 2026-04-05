@@ -39,7 +39,7 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- "message text"
+- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "message text" 
   Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']

@@ -260,20 +260,47 @@ pub fn send_message(
         .filter_map(|r| r.ok())
         .collect();
 
-    // Compute scope and routing
+    // Compute scope and routing. Thread-only sends keep their original message
+    // semantics; membership only affects the delivery target set.
     let scope_result = compute_scope(message, &rows, explicit_targets.map(|t| t as &[String]))?;
+    let thread_delivery_members =
+        if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
+            if scope_result.scope == MessageScope::Broadcast {
+                let members = db.get_thread_members(thread);
+                if members.is_empty() {
+                    return Err(format!(
+                        "Thread '{thread}' has no members. Seed it with @mentions first."
+                    ));
+                }
+                members
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+    let is_thread_resolved = !thread_delivery_members.is_empty();
+    let effective_scope = if thread_delivery_members.is_empty() {
+        scope_result.scope
+    } else {
+        MessageScope::Mentions
+    };
+    let effective_mentions = if thread_delivery_members.is_empty() {
+        scope_result.mentions.clone()
+    } else {
+        thread_delivery_members.clone()
+    };
 
     // Build scope data for should_deliver_message
-    let scope_str = scope_result.scope.as_str();
-    let mentions_json: Vec<serde_json::Value> = scope_result
-        .mentions
+    let scope_str = effective_scope.as_str();
+    let mentions_json: Vec<serde_json::Value> = effective_mentions
         .iter()
         .map(|m| serde_json::json!(m))
         .collect();
     let mut scope_data = serde_json::json!({
         "scope": scope_str,
     });
-    if !scope_result.mentions.is_empty() {
+    if !effective_mentions.is_empty() {
         scope_data["mentions"] = serde_json::json!(mentions_json);
     }
     // Add group_id if identity has one
@@ -303,8 +330,8 @@ pub fn send_message(
     });
 
     // Add scope extra data (mentions)
-    if !scope_result.mentions.is_empty() {
-        data["mentions"] = serde_json::json!(scope_result.mentions);
+    if !effective_mentions.is_empty() {
+        data["mentions"] = serde_json::json!(effective_mentions);
     }
 
     if let Some(env) = envelope {
@@ -352,9 +379,18 @@ pub fn send_message(
 
     // Auto-create request-watch subscriptions for targeted requests
     if let Some(env) = envelope {
+        if let Some(thread) = env.thread.as_deref() {
+            db.add_thread_memberships(
+                thread,
+                matches!(identity.kind, SenderKind::Instance).then_some(identity.name.as_str()),
+                &delivered_to,
+            );
+        }
+
         if env.intent.as_ref().map(|i| i.as_str()) == Some("request")
             && matches!(identity.kind, SenderKind::Instance)
-            && scope_result.scope == MessageScope::Mentions
+            && effective_scope == MessageScope::Mentions
+            && !is_thread_resolved
         {
             create_request_watches(db, &identity.name, _event_id, &delivered_to);
         }
@@ -1052,6 +1088,7 @@ fn cli_context_build_prefix(
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_basic_send() {
@@ -1243,6 +1280,202 @@ mod tests {
         let (targets, msg) = process_positionals(&[]);
         assert!(targets.is_empty());
         assert!(msg.is_none());
+    }
+
+    fn setup_test_db() -> (HcomDb, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_send_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (db, db_path)
+    }
+
+    fn cleanup_test_db(path: PathBuf) {
+        let _ = std::fs::remove_file(&path);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    fn send_message_threads_seed_and_reuse_memberships() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            thread: Some("debate-1".into()),
+            ..Default::default()
+        };
+
+        let delivered = send_message(
+            &db,
+            &sender,
+            "hello",
+            Some(&envelope),
+            Some(&["nova".to_string(), "miso".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
+
+        let members = db.get_thread_members("debate-1");
+        assert_eq!(
+            members,
+            vec!["nova".to_string(), "miso".to_string(), "luna".to_string()]
+        );
+
+        let delivered = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
+        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn send_message_thread_without_members_errors() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            thread: Some("empty-thread".into()),
+            ..Default::default()
+        };
+
+        let err = send_message(&db, &sender, "hello", Some(&envelope), None).unwrap_err();
+        assert!(err.contains("has no members"));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn send_message_external_sender_does_not_auto_subscribe_to_thread() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            thread: Some("ops".into()),
+            ..Default::default()
+        };
+
+        let delivered = send_message(
+            &db,
+            &sender,
+            "hello",
+            Some(&envelope),
+            Some(&["nova".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["nova".to_string()]);
+        assert_eq!(db.get_thread_members("ops"), vec!["nova".to_string()]);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn send_message_thread_request_does_not_create_request_watch_rows() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let seed_envelope = MessageEnvelope {
+            thread: Some("ops".into()),
+            ..Default::default()
+        };
+        send_message(
+            &db,
+            &sender,
+            "seed",
+            Some(&seed_envelope),
+            Some(&["nova".to_string()]),
+        )
+        .unwrap();
+
+        let request_envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            thread: Some("ops".into()),
+            ..Default::default()
+        };
+        let delivered =
+            send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
+        assert_eq!(delivered, vec!["nova".to_string()]);
+
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 0);
+
+        let (scope, mentions_json): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.scope'), json_extract(data, '$.mentions')
+                 FROM events
+                 WHERE type = 'message'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scope, "mentions");
+        assert!(mentions_json.contains("nova"));
+
+        cleanup_test_db(path);
     }
 
     #[test]

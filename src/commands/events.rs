@@ -237,13 +237,25 @@ fn events_sub_list(db: &HcomDb) -> i32 {
     for sub in &subs {
         let id = sub.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
-        let mode = if sub.get("once").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let is_thread_member = sub
+            .get("auto_thread_member")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mode = if is_thread_member {
+            "thread"
+        } else if sub.get("once").and_then(|v| v.as_bool()).unwrap_or(false) {
             "once"
         } else {
             "continuous"
         };
 
-        let filter_display = if let Some(filters) = sub.get("filters") {
+        let filter_display = if is_thread_member {
+            let thread = sub
+                .get("thread_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("thread-member:{thread}")
+        } else if let Some(filters) = sub.get("filters") {
             let s = filters.to_string();
             if s.len() > 35 {
                 {

@@ -497,7 +497,10 @@ fn print_docs(show_cli: bool, show_config: bool, show_api: bool) -> i32 {
 
     if show_all || show_config {
         println!("# Config Settings\n");
-        println!("File: {}", crate::paths::hcom_dir().join("config.toml").display());
+        println!(
+            "File: {}",
+            crate::paths::hcom_dir().join("config.toml").display()
+        );
         println!("Precedence: defaults < config.toml < env vars\n");
         println!("Commands:");
         println!("  hcom config                 Show all values");

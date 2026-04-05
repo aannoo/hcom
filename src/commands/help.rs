@@ -102,7 +102,10 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
         "  status_context",
         "tool:X, deliver:X, approval, prompt, exit:X",
     ),
-    ("  life_action", "created, started, ready, stopped, batch_launched"),
+    (
+        "  life_action",
+        "created, started, ready, stopped, batch_launched",
+    ),
     ("", ""),
     (
         "",

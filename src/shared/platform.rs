@@ -215,11 +215,7 @@ pub fn dev_root_binary(dev_root: &Path) -> Option<PathBuf> {
     let release = target_dir.join("release/hcom");
     let debug = target_dir.join("debug/hcom");
 
-    let mtime = |p: &Path| {
-        std::fs::metadata(p)
-            .ok()
-            .and_then(|m| m.modified().ok())
-    };
+    let mtime = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
 
     match (mtime(&release), mtime(&debug)) {
         (Some(r), Some(d)) => Some(if d >= r { debug } else { release }),
