@@ -388,3 +388,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-post-announce-compare-link:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/post-announce-compare-link.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit

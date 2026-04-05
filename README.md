@@ -213,7 +213,7 @@ brew uninstall hcom  # or: rm $(which hcom)
 <summary>CLI</summary>
 
 ```
-hcom (hook-comms) v0.7.8 - multi-agent communication
+hcom (hook-comms) v0.7.9 - multi-agent communication
 
 Usage:
 hcom                                  TUI dashboard

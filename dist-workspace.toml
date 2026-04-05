@@ -18,6 +18,8 @@ unix-archive = ".tar.gz"
 local-artifacts-jobs = ["./build-wheels"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew", "./publish-pypi"]
+# Post-announce jobs to run after the release is published
+post-announce-jobs = ["./post-announce-compare-link"]
 # Extra setup steps to run before dist builds
 github-build-setup = "../build-setup.yml"
 # Custom permissions for reusable workflow jobs
