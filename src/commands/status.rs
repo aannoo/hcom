@@ -198,6 +198,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
 
     let tools = get_tool_statuses();
     let counts = get_agent_counts(db);
+    let dev_root = crate::router::resolve_effective_dev_root(db.path());
 
     // Check config validity
     let mut config_errors: Vec<String> = Vec::new();
@@ -241,7 +242,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         let log_summary = crate::log::get_log_summary(1.0);
         // Call get_update_info once to avoid inconsistent state (it has side effects)
         let update_info = crate::update::get_update_info();
-        let result = json!({
+        let mut result = json!({
             "version": {
                 "current": env!("CARGO_PKG_VERSION"),
                 "latest": update_info.as_ref().map(|(v, _)| v.clone()),
@@ -305,6 +306,14 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 "entries": [],
             },
         });
+        if let Some((path, source)) = &dev_root {
+            result["dev_root"] = json!({
+                "path": path.to_string_lossy(),
+                "source": source,
+                "binary": crate::shared::dev_root_binary(path)
+                    .map(|p| p.to_string_lossy().into_owned()),
+            });
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
@@ -356,6 +365,9 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         let available = crate::config::is_known_terminal_preset_pub(&terminal_config);
         let sym = if available { "✓" } else { "✗" };
         println!("terminal:  {terminal_config} {sym}");
+    }
+    if let Some((path, source)) = &dev_root {
+        println!("dev-root:  {} [{source}]", path.display());
     }
 
     println!(); // Blank line before instance section
@@ -487,6 +499,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DEV_ROOT_KV_KEY;
 
     #[test]
     fn test_tool_symbol() {
@@ -517,5 +530,19 @@ mod tests {
         // ls should be in PATH on any Unix system
         assert!(is_in_path("ls"));
         assert!(!is_in_path("definitely_not_a_real_binary_xyz123"));
+    }
+
+    #[test]
+    fn test_status_json_includes_dev_root_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+
+        assert_eq!(db.kv_get(DEV_ROOT_KV_KEY).unwrap(), None);
+
+        db.kv_set(DEV_ROOT_KV_KEY, Some("/tmp/dev-root")).unwrap();
+        assert_eq!(
+            crate::router::resolve_effective_dev_root(&dir.path().join("hcom.db")),
+            Some((std::path::PathBuf::from("/tmp/dev-root"), "kv"))
+        );
     }
 }

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
 use crate::instances;
 use crate::shared::CommandContext;
@@ -31,6 +32,9 @@ pub struct ConfigArgs {
     /// Open config in editor
     #[arg(long)]
     pub edit: bool,
+    /// Unset value (supported for dev_root)
+    #[arg(long)]
+    pub unset: bool,
     /// Reset config
     #[arg(long)]
     pub reset: bool,
@@ -329,6 +333,85 @@ fn config_get(key: &str) -> (String, &'static str) {
     (default.to_string(), "default")
 }
 
+fn config_dev_root(
+    db: &HcomDb,
+    value: Option<&str>,
+    unset: bool,
+    json_mode: bool,
+    wants_info: bool,
+) -> i32 {
+    if wants_info {
+        println!(
+            "dev_root - Persistent dev-worktree fallback for binary re-exec\n\
+             \n\
+             Stored in kv key `{}` under the active HCOM_DIR.\n\
+             Router precedence is:\n\
+               1. HCOM_DEV_ROOT env\n\
+               2. kv dev_root fallback\n\
+             \n\
+             Examples:\n\
+               hcom config dev_root /path/to/worktree\n\
+               hcom config dev_root\n\
+               hcom config dev_root --unset",
+            DEV_ROOT_KV_KEY
+        );
+        return 0;
+    }
+
+    if unset {
+        match db.kv_set(DEV_ROOT_KV_KEY, None) {
+            Ok(()) => {
+                println!("Unset dev_root");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to unset dev_root: {e}");
+                return 1;
+            }
+        }
+    }
+
+    if let Some(value) = value {
+        match db.kv_set(DEV_ROOT_KV_KEY, Some(value)) {
+            Ok(()) => {
+                println!("Set dev_root = {value}");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to set dev_root: {e}");
+                return 1;
+            }
+        }
+    }
+
+    match db.kv_get(DEV_ROOT_KV_KEY) {
+        Ok(Some(value)) => {
+            if json_mode {
+                let mut m = serde_json::Map::new();
+                m.insert("dev_root".into(), serde_json::Value::String(value));
+                println!("{}", serde_json::Value::Object(m));
+            } else {
+                println!("{value}");
+            }
+            0
+        }
+        Ok(None) => {
+            if json_mode {
+                let mut m = serde_json::Map::new();
+                m.insert("dev_root".into(), serde_json::Value::Null);
+                println!("{}", serde_json::Value::Object(m));
+            } else {
+                println!("dev_root: (not set)");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: Failed to read dev_root: {e}");
+            1
+        }
+    }
+}
+
 // ── Instance Config ──────────────────────────────────────────────────────
 
 /// Handle instance-level config: `hcom config -i <name> [key] [value]`
@@ -571,6 +654,7 @@ fn config_instance(
 pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) -> i32 {
     let json_mode = args.json;
     let edit_mode = args.edit;
+    let unset_mode = args.unset;
     let reset_mode = args.reset;
     let info_mode = args.info;
     let setup_mode = args.setup;
@@ -637,6 +721,21 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     }
 
     let key_arg = &argv[0];
+
+    if key_arg == "dev_root" {
+        return config_dev_root(
+            db,
+            argv.get(1).map(|s| s.as_str()),
+            unset_mode,
+            json_mode,
+            info_mode,
+        );
+    }
+
+    if unset_mode {
+        eprintln!("Error: --unset is only supported with 'hcom config dev_root'");
+        return 1;
+    }
 
     // Terminal subcommand
     if key_arg == "terminal" {
@@ -765,6 +864,7 @@ fn get_runtime_overrides(
 /// Show all config keys with values and sources.
 fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -> i32 {
     let runtime_overrides = get_runtime_overrides(db, ctx);
+    let dev_root = crate::router::resolve_effective_dev_root(db.path());
 
     if json_mode {
         let mut result = serde_json::Map::new();
@@ -777,6 +877,16 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
                 value
             };
             result.insert(key.to_string(), serde_json::Value::String(display));
+        }
+        if let Some((path, source)) = dev_root {
+            result.insert(
+                "dev_root".to_string(),
+                serde_json::Value::String(path.to_string_lossy().into_owned()),
+            );
+            result.insert(
+                "dev_root_source".to_string(),
+                serde_json::Value::String(source.to_string()),
+            );
         }
         println!(
             "{}",
@@ -803,8 +913,11 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
             };
             println!("  {key:<28} {display:<30} [{source}]");
         }
+        if let Some((path, source)) = dev_root {
+            println!("  {:<28} {:<30} [{}]", "dev_root", path.display(), source);
+        }
         println!(
-            "\n[env] = environment, [toml] = config.toml, [file] = env file, [runtime] = agent override, (blank) = default"
+            "\n[env] = environment, [toml] = config.toml, [file] = env file, [runtime] = agent override, [kv] = hcom.db key-value, (blank) = default"
         );
         println!("\nEdit: hcom config --edit");
     }
@@ -1660,6 +1773,15 @@ mod tests {
     }
 
     #[test]
+    fn test_config_args_dev_root_unset() {
+        use clap::Parser;
+        let args = ConfigArgs::try_parse_from(["config", "dev_root", "--unset"]).unwrap();
+        assert_eq!(args.key, Some("dev_root".to_string()));
+        assert!(args.unset);
+        assert!(args.value.is_none());
+    }
+
+    #[test]
     fn test_config_args_hyphen_value() {
         use clap::Parser;
         // "hcom config codex_args '--model o3'" — quoted so shell passes as one token
@@ -1695,6 +1817,28 @@ mod tests {
             assert!(!desc.is_empty());
             assert!(!typ.is_empty());
         }
+    }
+
+    #[test]
+    fn test_config_dev_root_set_get_unset() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+
+        let set_args = ConfigArgs::try_parse_from(["config", "dev_root", "/tmp/worktree"]).unwrap();
+        assert_eq!(cmd_config(&db, &set_args, None), 0);
+        assert_eq!(
+            db.kv_get(DEV_ROOT_KV_KEY).unwrap(),
+            Some("/tmp/worktree".to_string())
+        );
+
+        let get_args = ConfigArgs::try_parse_from(["config", "dev_root"]).unwrap();
+        assert_eq!(cmd_config(&db, &get_args, None), 0);
+
+        let unset_args = ConfigArgs::try_parse_from(["config", "dev_root", "--unset"]).unwrap();
+        assert_eq!(cmd_config(&db, &unset_args, None), 0);
+        assert_eq!(db.kv_get(DEV_ROOT_KV_KEY).unwrap(), None);
     }
 
     #[test]

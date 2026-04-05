@@ -9,6 +9,7 @@ use std::process::Command;
 
 use clap::Parser;
 
+use crate::db::DEV_ROOT_KV_KEY;
 use crate::log::{log_error, log_info, log_warn};
 use crate::shared::dev_root_binary;
 
@@ -338,9 +339,9 @@ pub fn resolve_action(argv: &[String]) -> Action {
 /// so worktree development works: `HCOM_DEV_ROOT=/path/to/worktree hcom list`
 /// will run the worktree's hcom binary instead of the installed one.
 pub fn maybe_reexec_dev_root() {
-    let dev_root = match env::var("HCOM_DEV_ROOT") {
-        Ok(r) if !r.is_empty() => PathBuf::from(r),
-        _ => return,
+    let (dev_root, source) = match resolve_effective_dev_root(&crate::paths::db_path()) {
+        Some(v) => v,
+        None => return,
     };
 
     // Find current binary's location
@@ -356,7 +357,7 @@ pub fn maybe_reexec_dev_root() {
                 "router",
                 "dev_root_no_binary",
                 &format!(
-                    "HCOM_DEV_ROOT={} set but no dev binary found. Run `cargo build` or `cargo build --release` in the worktree.",
+                    "dev_root={} ({source}) but no dev binary found. Run `cargo build` or `cargo build --release` in the worktree.",
                     dev_root.display(),
                 ),
             );
@@ -373,9 +374,10 @@ pub fn maybe_reexec_dev_root() {
         "router",
         "dev_root_reexec",
         &format!(
-            "re-exec to {} (current={})",
+            "re-exec to {} (current={}, source={})",
             target_binary.display(),
-            current_exe.display()
+            current_exe.display(),
+            source,
         ),
     );
 
@@ -388,6 +390,39 @@ pub fn maybe_reexec_dev_root() {
         "dev_root_reexec_failed",
         &format!("failed to exec {}: {}", target_binary.display(), err),
     );
+}
+
+pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
+    if let Ok(r) = env::var("HCOM_DEV_ROOT") {
+        if !r.is_empty() {
+            return Some((PathBuf::from(r), "env"));
+        }
+    }
+
+    read_dev_root_from_kv(db_path).map(|path| (path, "kv"))
+}
+
+fn read_dev_root_from_kv(db_path: &Path) -> Option<PathBuf> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+
+    let value = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = ?",
+            rusqlite::params![DEV_ROOT_KV_KEY],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()?;
+
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
 }
 
 /// Check if two paths refer to the same file (follows symlinks).
@@ -827,9 +862,40 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DEV_ROOT_KV_KEY;
 
     fn sv(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn read_dev_root_from_kv_returns_stored_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+            rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_dev_root_from_kv(&db_path),
+            Some(PathBuf::from("/tmp/dev-root"))
+        );
+    }
+
+    #[test]
+    fn read_dev_root_from_kv_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+
+        assert_eq!(read_dev_root_from_kv(&db_path), None);
     }
 
     // ── resolve_action tests ────────────────────────────────────────────

@@ -14,8 +14,18 @@ pub struct UpdateArgs {
     pub check: bool,
 }
 
+fn print_dev_root_notice(db: &HcomDb) {
+    if let Some((path, source)) = crate::router::resolve_effective_dev_root(db.path()) {
+        println!("Using local build: {} [{}]", path.display(), source);
+        println!("`hcom update` updates the installed hcom, not this local checkout.");
+        println!("Unset with `hcom config dev_root --unset` to update the installed binary.");
+        println!();
+    }
+}
+
 pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>) -> i32 {
     println!("Checking for updates...");
+    print_dev_root_notice(_db);
 
     let info = match crate::update::fetch_update_info() {
         Ok(i) => i,
@@ -104,5 +114,12 @@ mod tests {
     fn update_args_check_flag() {
         let args = UpdateArgs::try_parse_from(["update", "--check"]).unwrap();
         assert!(args.check);
+    }
+
+    #[test]
+    fn print_dev_root_notice_is_safe_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        print_dev_root_notice(&db);
     }
 }

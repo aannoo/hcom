@@ -22,6 +22,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema version - bump on any schema change.
 const SCHEMA_VERSION: i32 = 17;
+pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[(
     17,
     "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
