@@ -33,10 +33,19 @@ fn relay_tls_config() -> TlsConfiguration {
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     // Also add native system certs if available, for private broker support
-    if let Ok(native_certs) = load_native_certs() {
-        for cert in native_certs {
-            let _ = root_store.add(cert);
-        }
+    let native_certs = load_native_certs();
+    for cert in native_certs.certs {
+        let _ = root_store.add(cert);
+    }
+    if !native_certs.errors.is_empty() {
+        log::log_warn(
+            "relay",
+            "relay.native_certs_partial",
+            &format!(
+                "failed to load {} native cert(s); continuing with bundled roots",
+                native_certs.errors.len()
+            ),
+        );
     }
 
     let tls_config = rustls::ClientConfig::builder()

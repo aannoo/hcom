@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::json;
 
 use crate::config::{self, HcomConfig};

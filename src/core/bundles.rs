@@ -3,7 +3,7 @@
 //! packages with event references, file lists, and transcript ranges.
 //! Used by `hcom bundle` and `hcom send --title`.
 
-use rand::Rng;
+use rand::RngExt;
 use serde_json::Value;
 use std::path::Path;
 

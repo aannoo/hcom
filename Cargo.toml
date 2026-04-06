@@ -15,39 +15,39 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.30", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
+nix = { version = "0.31.2", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
 vt100 = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2.184"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 regex = "1"
 thiserror = "2"
 # Client mode dependencies
-dirs = "5"
+dirs = "6.0.0"
 chrono = "0.4"
 # TUI dependencies
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
 crossterm = "0.29"
 unicode-width = "0.2"
-unicode-segmentation = "1.12.0"
+unicode-segmentation = "1.13.2"
 shell-words = "1"
-toml = "1"
-toml_edit = "0.25"
+toml = "1.1.2"
+toml_edit = "0.25.10"
 tempfile = "3"
-rand = "0.9"
+rand = "0.10.0"
 glob = "0.3"
-signal-hook = "0.3"
-uuid = { version = "1", features = ["v4"] }
+signal-hook = "0.4.4"
+uuid = { version = "1.23.0", features = ["v4"] }
 # Relay (MQTT) dependencies
-rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11.0"
 bytes = "1"
-rustls = "0.22"
-webpki-roots = "0.26"
-rustls-native-certs = "0.7"
+rustls = "0.23.37"
+webpki-roots = "1.0.6"
+rustls-native-certs = "0.8.3"
 
 [dev-dependencies]
 serial_test = "3"

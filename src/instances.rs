@@ -830,7 +830,7 @@ fn allocate_name(
     top_window: usize,
     temperature: f64,
 ) -> Result<String> {
-    use rand::Rng;
+    use rand::RngExt;
     let pool = name_pool();
     let mut rng = rand::rng();
 

@@ -94,8 +94,10 @@ impl DbDataSource {
             Some(c) => c,
             None => return true,
         };
-        let version: u64 = conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
+        let version = conn
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0);
         if version != self.last_data_version {
             return true;
@@ -113,7 +115,9 @@ impl DbDataSource {
 
         // Update cached data_version + config mtime
         self.last_data_version = conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0);
         self.config_mtime = config_toml_mtime();
 
