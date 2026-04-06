@@ -73,12 +73,16 @@ hcom
 
 ## How it works
 
+hcom acts as a local message bus and event log.
+
 ```bash
-# hooks/pty record activity and deliver messages
-agent → hooks → db → hooks → other agent
+# hooks record activity to db and deliver messages from the db
+agent → hooks/cli → db → hooks/pty → other agent
 ```
 
-Messages arrive mid-turn or wake idle agents immediately. If 2 agents edit the same file within 30 seconds, both get collision alerts. Agents learn hcom commands at session start via hooks (~700 tokens). Hooks live in each tool's config directory and run automatically, no modifications to claude/codex/opencode/gemini needed.
+When an agent does something, hooks record it as an event. When other agents do something, hooks deliver relevant events (unread messages, file edit collisions, watch subscriptions) to them from the database. If an agent is idle, pty wakes it so hooks can deliver new events immediately.
+
+At session start, agents get a ~700-token hcom cli primer through hooks. Hooks sit in each tool's config directory and fire automatically with no modifications to Claude, Codex, OpenCode, or Gemini.
 
 ---
 
@@ -1192,32 +1196,28 @@ cargo build
 
 ---
 
-### Using Local Build
+### Using local build
 
-To route the installed `hcom` to your local build, persist the path once:
+Two options:
+
+**Symlink** — simple, dev build is global.
 
 ```bash
-hcom config dev_root $(pwd)   # stored in hcom.db
-hcom config dev_root          # read current value
-hcom config dev_root --unset  # clear it
+ln -sf $(pwd)/target/debug/hcom ~/.cargo/bin/hcom
 ```
 
-The `HCOM_DEV_ROOT` env var takes precedence over the stored config if set.
-
----
-
-### Worktrees
-
-For concurrent worktrees, use separate `HCOM_DIR` environments:
+**dev_root** — works regardless of how hcom was installed (brew, pip, etc.); picks the newer of debug/release automatically:
 
 ```bash
-# Worktree A
-cd /path/to/worktree-a && cargo build
-HCOM_DIR=/path/to/worktree-a/.hcom HCOM_DEV_ROOT=/path/to/worktree-a hcom claude
+hcom config dev_root $(pwd)
+hcom config dev_root --unset  # revert
+hcom -v    # run local build
+```
 
-# Worktree B (independent session, separate DB)
-cd /path/to/worktree-b && cargo build
-HCOM_DIR=/path/to/worktree-b/.hcom HCOM_DEV_ROOT=/path/to/worktree-b hcom claude
+For concurrent worktrees, scope each to its own DB:
+
+```bash
+HCOM_DIR=$(pwd)/.hcom HCOM_DEV_ROOT=$(pwd) hcom claude
 ```
 
 </details>
@@ -1230,7 +1230,8 @@ Issues and PRs welcome. The codebase is Rust.
 
 ```bash
 cargo test && cargo build
-# cp binary to PATH or set: hcom config dev_root $(pwd)
+hcom config dev_root $(pwd)
+hcom -v
 ```
 
 ---
