@@ -572,30 +572,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
     }
 
-    // Inject --hcom-prompt into tool args (translated per-tool)
-    if let Some(ref prompt) = params.initial_prompt {
-        match normalized {
-            LaunchTool::Claude | LaunchTool::ClaudePty => {
-                // Claude: positional argument (after --)
-                params.args.push("--".to_string());
-                params.args.push(prompt.clone());
-            }
-            LaunchTool::Gemini => {
-                // Gemini: positional arg = interactive mode (--prompt would make it headless)
-                params.args.push(prompt.clone());
-            }
-            LaunchTool::Codex => {
-                // Codex: positional argument
-                params.args.push(prompt.clone());
-            }
-            LaunchTool::OpenCode => {
-                // OpenCode: --prompt flag
-                params.args.push("--prompt".to_string());
-                params.args.push(prompt.clone());
-            }
-        }
-    }
-
     let working_dir = params.cwd.as_deref().unwrap_or(".");
     let launcher_name: String = params.launcher.unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
@@ -613,6 +589,38 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             Err(_) => "api".to_string(),
         }
     });
+
+    // Inject --hcom-prompt into tool args (translated per-tool).
+    // When a real hcom participant launched us, append a reply instruction so
+    // the spawned agent knows to send its result back.
+    if let Some(ref prompt) = params.initial_prompt {
+        let reply_suffix = if launcher_name != "api" && launcher_name != "user" {
+            format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")
+        } else {
+            String::new()
+        };
+        let full_prompt = format!("{prompt}{reply_suffix}");
+        match normalized {
+            LaunchTool::Claude | LaunchTool::ClaudePty => {
+                // Claude: positional argument (after --)
+                params.args.push("--".to_string());
+                params.args.push(full_prompt);
+            }
+            LaunchTool::Gemini => {
+                // Gemini: positional arg = interactive mode (--prompt would make it headless)
+                params.args.push(full_prompt);
+            }
+            LaunchTool::Codex => {
+                // Codex: positional argument
+                params.args.push(full_prompt);
+            }
+            LaunchTool::OpenCode => {
+                // OpenCode: --prompt flag
+                params.args.push("--prompt".to_string());
+                params.args.push(full_prompt);
+            }
+        }
+    }
     let batch_id = params
         .batch_id
         .unwrap_or_else(|| format!("{:08x}", rand::rng().random::<u32>()));

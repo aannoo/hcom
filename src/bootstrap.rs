@@ -43,7 +43,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
-- Read another's conversation: transcript [name] [--range N-M] [--last N] [--full]
+- Read another's conversation: transcript [name] [--range N-M] [--last N] [--full] | transcript --search "text" [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
