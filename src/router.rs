@@ -405,9 +405,20 @@ pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'s
 fn read_dev_root_from_kv(db_path: &Path) -> Option<PathBuf> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
+    .map_err(|e| {
+        log_warn(
+            "router",
+            "dev_root_kv_open_failed",
+            &format!("failed to open db at {}: {e}", db_path.display()),
+        );
+        e
+    })
     .ok()?;
+
+    conn.busy_timeout(std::time::Duration::from_millis(200))
+        .ok();
 
     let value = conn
         .query_row(
@@ -415,6 +426,14 @@ fn read_dev_root_from_kv(db_path: &Path) -> Option<PathBuf> {
             rusqlite::params![DEV_ROOT_KV_KEY],
             |row| row.get::<_, Option<String>>(0),
         )
+        .map_err(|e| {
+            log_warn(
+                "router",
+                "dev_root_kv_read_failed",
+                &format!("failed to read dev_root from kv: {e}"),
+            );
+            e
+        })
         .ok()
         .flatten()?;
 
