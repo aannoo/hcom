@@ -150,7 +150,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     }
 
     // 3. Not found
-    crate::log::log_warn(
+    crate::log::log_info(
         "identity",
         "resolve_from_name.not_found",
         &format!("name={}", resolved_name),
@@ -181,13 +181,14 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 /// 5. `transcript_fallback` - transcript marker scan (hook extension point)
 /// 6. Error if no identity
 #[allow(clippy::type_complexity)]
-pub fn resolve_identity(
+fn resolve_identity_with_expectation(
     db: &HcomDb,
     name: Option<&str>,
     system_sender: Option<&str>,
     session_id: Option<&str>,
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
+    identity_expected: bool,
     transcript_fallback: Option<&dyn Fn(&HcomDb) -> Option<SenderIdentity>>,
 ) -> Result<SenderIdentity, HcomError> {
     // 1. System sender (internal use)
@@ -331,11 +332,13 @@ pub fn resolve_identity(
                     }
                 }
                 None => {
-                    crate::log::log_warn(
-                        "identity",
-                        "resolve.process_binding_expired",
-                        &format!("process_id={}", pid),
-                    );
+                    if identity_expected {
+                        crate::log::log_warn(
+                            "identity",
+                            "resolve.process_binding_expired",
+                            &format!("process_id={}", pid),
+                        );
+                    }
                     return Err(HcomError::IdentityRequired(
                         "Session expired. Run 'hcom start' to reconnect.".to_string(),
                     ));
@@ -352,19 +355,43 @@ pub fn resolve_identity(
     }
 
     // 6. No identity
-    crate::log::log_warn(
-        "identity",
-        "resolve.no_identity",
-        &format!(
-            "has_process_id={}, has_name={}",
-            process_id.is_some_and(|s| !s.is_empty()),
-            name.is_some_and(|s| !s.is_empty()),
-        ),
-    );
+    if identity_expected {
+        crate::log::log_warn(
+            "identity",
+            "resolve.no_identity",
+            &format!(
+                "has_process_id={}, has_name={}",
+                process_id.is_some_and(|s| !s.is_empty()),
+                name.is_some_and(|s| !s.is_empty()),
+            ),
+        );
+    }
     Err(HcomError::IdentityRequired(
         "No hcom identity. Run 'hcom start' first, then use --name <yourname> on commands."
             .to_string(),
     ))
+}
+
+#[allow(clippy::type_complexity)]
+pub fn resolve_identity(
+    db: &HcomDb,
+    name: Option<&str>,
+    system_sender: Option<&str>,
+    session_id: Option<&str>,
+    process_id: Option<&str>,
+    codex_thread_id: Option<&str>,
+    transcript_fallback: Option<&dyn Fn(&HcomDb) -> Option<SenderIdentity>>,
+) -> Result<SenderIdentity, HcomError> {
+    resolve_identity_with_expectation(
+        db,
+        name,
+        system_sender,
+        session_id,
+        process_id,
+        codex_thread_id,
+        crate::shared::is_inside_ai_tool(),
+        transcript_fallback,
+    )
 }
 
 /// Check if a command requires identity gating.
@@ -568,7 +595,8 @@ mod tests {
         let (db, _dir) = make_test_db();
 
         let identity =
-            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None, None).unwrap();
+            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None, None)
+                .unwrap();
         assert!(matches!(identity.kind, SenderKind::System));
         assert_eq!(identity.name, "hcom-launcher");
     }
@@ -579,7 +607,8 @@ mod tests {
         insert_instance(&db, "luna", Some("sess-1"), None);
         insert_session_binding(&db, "sess-1", "luna");
 
-        let identity = resolve_identity(&db, None, None, Some("sess-1"), None, None, None).unwrap();
+        let identity =
+            resolve_identity(&db, None, None, Some("sess-1"), None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::Instance));
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
@@ -590,7 +619,8 @@ mod tests {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", None, None);
 
-        let identity = resolve_identity(&db, Some("luna"), None, None, None, None, None).unwrap();
+        let identity =
+            resolve_identity(&db, Some("luna"), None, None, None, None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 
@@ -637,7 +667,9 @@ mod tests {
         let (db, _dir) = make_test_db();
         // No process binding exists
 
-        let err = resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap_err();
+        let err =
+            resolve_identity(&db, None, None, None, Some("pid-123"), None, None)
+                .unwrap_err();
         assert!(err.to_string().contains("expired"));
     }
 
@@ -697,7 +729,8 @@ mod tests {
 
         // session_id takes priority over name
         let identity =
-            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None, None).unwrap();
+            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None, None)
+                .unwrap();
         assert_eq!(identity.name, "luna");
     }
 

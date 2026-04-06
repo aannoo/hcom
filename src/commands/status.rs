@@ -355,8 +355,15 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     println!("tools:     {tools_str}");
 
     // Terminal — show preset name with availability
-    if terminal_config == "default"
-        || terminal_config == "custom"
+    if terminal_config == "default" {
+        let detected = crate::terminal::detect_terminal_from_env();
+        if let Some(ref name) = detected {
+            println!("terminal:  default (auto: {name})");
+        } else {
+            let fallback = crate::terminal::get_default_fallback_terminal_name();
+            println!("terminal:  default (fallback: {fallback})");
+        }
+    } else if terminal_config == "custom"
         || terminal_config == "print"
         || terminal_config.contains("{script}")
     {
@@ -434,7 +441,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         }
     }
 
-    // Logs — always show summary, detail with --logs
+    // Logs — always show summary; show recent entries when issues exist
     let log_summary = crate::log::get_log_summary(1.0);
     let error_count = log_summary
         .get("error_count")
@@ -460,15 +467,19 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 if warn_count != 1 { "s" } else { "" }
             ));
         }
-        println!("logs:      {} (1h)", parts.join(", "));
-    }
-
-    if show_logs {
         let log_path = hcom_dir.join(".tmp/logs/hcom.log");
-        if log_path.exists() {
-            println!("           {}", log_path.display());
+        if show_logs {
+            println!("logs:      {} (1h)", parts.join(", "));
+        } else {
+            println!(
+                "logs:      {} (1h)  (hcom status --logs)",
+                parts.join(", ")
+            );
+        }
+        println!("           {}", log_path.display());
+        if show_logs {
             let entries = crate::log::get_recent_logs(1.0, &["ERROR", "WARN"], 20);
-            for entry in entries {
+            for entry in &entries {
                 let ts = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
                 let level = entry
                     .get("level")

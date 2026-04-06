@@ -82,7 +82,15 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     // running_tasks.active=True. Only --name <agent_id> (explicit initiator) bypasses this gate.
     if rebind_target.is_some() || orphan_target.is_some() || instance_name.is_none() {
         if let Ok(ident) =
-            identity::resolve_identity(&db, None, None, None, ctx.process_id.as_deref(), None, None)
+            identity::resolve_identity(
+                &db,
+                None,
+                None,
+                None,
+                ctx.process_id.as_deref(),
+                None,
+                None,
+            )
         {
             if let Some(inst_data) = &ident.instance_data {
                 let rt_str = inst_data

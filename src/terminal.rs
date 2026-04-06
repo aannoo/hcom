@@ -816,6 +816,35 @@ fn get_macos_terminal_command() -> String {
     rewrite_macos_open_app_command("open -a Terminal {script}", "Terminal")
 }
 
+/// Return a human-readable name for the platform's built-in fallback terminal
+/// (used when `terminal = "default"` and no terminal is detected from env).
+pub fn get_default_fallback_terminal_name() -> &'static str {
+    if platform::is_termux() {
+        return "Termux";
+    }
+    match platform::platform_name() {
+        "Darwin" => "Terminal.app",
+        "Linux" => {
+            if platform::is_wsl() {
+                if which_bin("wt.exe").is_some() {
+                    "Windows Terminal"
+                } else {
+                    "cmd.exe"
+                }
+            } else if which_bin("gnome-terminal").is_some() {
+                "gnome-terminal"
+            } else if which_bin("konsole").is_some() {
+                "konsole"
+            } else if which_bin("xterm").is_some() {
+                "xterm"
+            } else {
+                "none"
+            }
+        }
+        _ => "unknown",
+    }
+}
+
 /// Get first available standard Linux terminal.
 fn get_linux_terminal_argv() -> Option<Vec<String>> {
     let terminals = [

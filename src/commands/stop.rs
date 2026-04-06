@@ -262,7 +262,8 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             if let Some(ref id) = c.identity {
                 Some(id.clone())
             } else {
-                identity::resolve_identity(db, explicit_name, None, None, None, None, None).ok()
+                identity::resolve_identity(db, explicit_name, None, None, None, None, None)
+                    .ok()
             }
         } else {
             identity::resolve_identity(db, None, None, None, None, None, None).ok()
