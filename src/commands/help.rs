@@ -646,6 +646,7 @@ const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
     unique_examples: &[
         ("hcom 3 claude -p \"prompt\"", "3 headless in background"),
         ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
+        ("hcom claude --model sonnet|opus|haiku", "Use a specific model"),
     ],
     extra_env: &[(
         "HCOM_SUBAGENT_TIMEOUT",
@@ -657,7 +658,13 @@ const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
 const GEMINI_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "gemini",
     label: "Gemini",
-    unique_examples: &[("hcom N gemini --yolo", "Flags forwarded to gemini")],
+    unique_examples: &[
+        ("hcom N gemini --yolo", "Flags forwarded to gemini"),
+        (
+            "hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash",
+            "Use a specific model",
+        ),
+    ],
     extra_env: &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")],
     has_fork: false,
 };
@@ -665,10 +672,16 @@ const GEMINI_SPEC: ToolHelpSpec = ToolHelpSpec {
 const CODEX_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "codex",
     label: "Codex",
-    unique_examples: &[(
-        "hcom codex --sandbox danger-full-access",
-        "Flags forwarded to codex",
-    )],
+    unique_examples: &[
+        (
+            "hcom codex --sandbox danger-full-access",
+            "Flags forwarded to codex",
+        ),
+        (
+            "hcom codex --model gpt-5.4|gpt-5.4-mini",
+            "Use a specific model",
+        ),
+    ],
     extra_env: &[(
         "HCOM_CODEX_SYSTEM_PROMPT",
         "System prompt (env var or config)",
@@ -679,7 +692,10 @@ const CODEX_SPEC: ToolHelpSpec = ToolHelpSpec {
 const OPENCODE_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "opencode",
     label: "OpenCode",
-    unique_examples: &[],
+    unique_examples: &[(
+        "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
+        "Use a specific model",
+    )],
     extra_env: &[],
     has_fork: true,
 };
