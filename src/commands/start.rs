@@ -15,6 +15,7 @@ use crate::bootstrap;
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::identity;
+use crate::instance_names;
 use crate::instances;
 use crate::log::log_info;
 use crate::paths;
@@ -436,7 +437,7 @@ fn start_from_orphan(
     let name = if can_reuse {
         preferred_name
     } else {
-        instances::generate_unique_name(db)?
+        instance_names::generate_unique_name(db)?
     };
 
     // Core DB registration
@@ -723,7 +724,7 @@ fn start_bare(
     let name = if let Some(n) = explicit_name {
         n.to_string()
     } else {
-        instances::generate_unique_name(db)?
+        instance_names::generate_unique_name(db)?
     };
 
     // Remote instance — send control via relay

@@ -16,6 +16,7 @@ pub mod worker;
 
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
+use crate::instance_names;
 
 /// Public MQTT brokers (TLS, port 8883/8886). Tried in order during initial setup;
 /// first success gets pinned to config. Append-only (never insert/reorder) to preserve
@@ -98,7 +99,7 @@ pub fn read_device_uuid() -> String {
 
 /// Get device short ID — FNV-1a hash to CVCV word, uppercased.
 pub fn device_short_id(device_uuid: &str) -> String {
-    crate::instances::hash_to_name(device_uuid, 0).to_uppercase()
+    instance_names::hash_to_name(device_uuid, 0).to_uppercase()
 }
 
 /// Add device short ID suffix to a name (e.g., "luna" → "luna:XABC").

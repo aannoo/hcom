@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::config::{self, HcomConfig};
 use crate::db::HcomDb;
+use crate::instance_names;
 use crate::instances;
 use crate::paths;
 use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
@@ -672,7 +673,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         let instance_name = if let Some(ref name) = params.name {
             name.clone()
         } else {
-            instances::generate_unique_name(db)?
+            instance_names::generate_unique_name(db)?
         };
 
         // Process ID export: allow custom env var name
