@@ -15,6 +15,7 @@ use crate::bootstrap;
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::identity;
+use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instance_names;
 use crate::instances;
@@ -84,15 +85,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     // running_tasks.active=True. Only --name <agent_id> (explicit initiator) bypasses this gate.
     if rebind_target.is_some() || orphan_target.is_some() || instance_name.is_none() {
         if let Ok(ident) =
-            identity::resolve_identity(
-                &db,
-                None,
-                None,
-                None,
-                ctx.process_id.as_deref(),
-                None,
-                None,
-            )
+            identity::resolve_identity(&db, None, None, None, ctx.process_id.as_deref(), None, None)
         {
             if let Some(inst_data) = &ident.instance_data {
                 let rt_str = inst_data
@@ -350,7 +343,7 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
     };
 
     // Capture launch context
-    instances::capture_and_store_launch_context(db, &subagent_name);
+    instance_binding::capture_and_store_launch_context(db, &subagent_name);
 
     // Set active status (logs life event)
     lifecycle::set_status(
@@ -552,7 +545,7 @@ fn start_rebind(
 
     // Create fresh instance with the target name
     let tool = ctx.tool.as_str();
-    instances::initialize_instance_in_position_file(
+    instance_binding::initialize_instance_in_position_file(
         db,
         &target_name,
         session_id.as_deref(),
@@ -761,7 +754,7 @@ fn start_bare(
         }
     }
 
-    instances::initialize_instance_in_position_file(
+    instance_binding::initialize_instance_in_position_file(
         db,
         &name,
         None, // session_id

@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::family;
+use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
@@ -69,7 +70,7 @@ pub fn derive_codex_transcript_path(thread_id: &str) -> Option<String> {
 ///
 /// Resolve Codex instance from process or session binding.
 fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, thread_id: &str) -> Option<InstanceRow> {
-    instances::resolve_instance_from_binding(
+    instance_binding::resolve_instance_from_binding(
         db,
         Some(thread_id).filter(|s| !s.is_empty()),
         ctx.process_id.as_deref(),
@@ -174,7 +175,7 @@ fn handle_notify(db: &HcomDb, ctx: &HcomContext, raw: &Value) -> i32 {
         if !thread_id.is_empty() {
             if let Some(ref pid) = ctx.process_id {
                 let canonical =
-                    instances::bind_session_to_process(db, thread_id, Some(pid.as_str()));
+                    instance_binding::bind_session_to_process(db, thread_id, Some(pid.as_str()));
                 if let Some(ref name) = canonical {
                     if name != &instance_name {
                         instance_name = name.clone();
@@ -185,7 +186,7 @@ fn handle_notify(db: &HcomDb, ctx: &HcomContext, raw: &Value) -> i32 {
         }
 
         // Capture launch context
-        instances::capture_and_store_launch_context(db, &instance_name);
+        instance_binding::capture_and_store_launch_context(db, &instance_name);
 
         // Build position updates
         let mut updates = serde_json::Map::new();

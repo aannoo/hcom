@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::bootstrap;
 use crate::db::HcomDb;
+use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log::{log_error, log_info};
@@ -142,16 +143,16 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     }
 
     // Normal binding path
-    let instance_name = match instances::bind_session_to_process(db, &session_id, Some(&process_id))
-    {
-        Some(name) => name,
-        None => {
-            return (
-                0,
-                r#"{"error":"No instance bound to this process"}"#.to_string(),
-            );
-        }
-    };
+    let instance_name =
+        match instance_binding::bind_session_to_process(db, &session_id, Some(&process_id)) {
+            Some(name) => name,
+            None => {
+                return (
+                    0,
+                    r#"{"error":"No instance bound to this process"}"#.to_string(),
+                );
+            }
+        };
 
     // Rebind session and initialize
     if let Err(e) = db.rebind_instance_session(&instance_name, &session_id) {
@@ -190,7 +191,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     );
 
     // Capture launch context (preserves pane_id/terminal_preset from Rust PTY)
-    instances::capture_and_store_launch_context(db, &instance_name);
+    instance_binding::capture_and_store_launch_context(db, &instance_name);
 
     // Update instance position
     let mut updates = serde_json::Map::new();

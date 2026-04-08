@@ -17,6 +17,7 @@ use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::HookPayload;
 use crate::hooks::common;
 use crate::hooks::family;
+use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
@@ -497,7 +498,9 @@ fn handle_compact_recovery(
         .get_session_binding(session_id)
         .ok()
         .flatten()
-        .or_else(|| process_id.and_then(|pid| instances::resolve_process_binding(db, Some(pid))))?;
+        .or_else(|| {
+            process_id.and_then(|pid| instance_binding::resolve_process_binding(db, Some(pid)))
+        })?;
 
     let bootstrap = if process_id.is_some() {
         // hcom-launched: inject full bootstrap
@@ -542,12 +545,17 @@ fn bind_and_bootstrap(
     session_id: &str,
     process_id: &str,
 ) -> Result<Option<Value>, String> {
-    let mut instance_name = instances::bind_session_to_process(db, session_id, Some(process_id));
+    let mut instance_name =
+        instance_binding::bind_session_to_process(db, session_id, Some(process_id));
 
     // Orphaned PTY: process_id exists but no binding (e.g., after /clear)
     if instance_name.is_none() {
-        instance_name =
-            instances::create_orphaned_pty_identity(db, session_id, Some(process_id), "claude");
+        instance_name = instance_binding::create_orphaned_pty_identity(
+            db,
+            session_id,
+            Some(process_id),
+            "claude",
+        );
         log::log_info(
             "hooks",
             "sessionstart.orphan_created",
@@ -565,7 +573,7 @@ fn bind_and_bootstrap(
     let _ = db.rebind_instance_session(&instance_name, session_id);
 
     // Capture launch context
-    instances::capture_and_store_launch_context(db, &instance_name);
+    instance_binding::capture_and_store_launch_context(db, &instance_name);
 
     lifecycle::set_status(
         db,

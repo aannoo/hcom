@@ -284,7 +284,7 @@ fn resolve_identity_with_expectation(
                                 if let Some(thread_id) = codex_thread_id {
                                     if !thread_id.is_empty() {
                                         if let Some(resolved) =
-                                            crate::instances::bind_session_to_process(
+                                            crate::instance_binding::bind_session_to_process(
                                                 db, thread_id, process_id,
                                             )
                                         {
@@ -595,8 +595,7 @@ mod tests {
         let (db, _dir) = make_test_db();
 
         let identity =
-            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None, None)
-                .unwrap();
+            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::System));
         assert_eq!(identity.name, "hcom-launcher");
     }
@@ -607,8 +606,7 @@ mod tests {
         insert_instance(&db, "luna", Some("sess-1"), None);
         insert_session_binding(&db, "sess-1", "luna");
 
-        let identity =
-            resolve_identity(&db, None, None, Some("sess-1"), None, None, None).unwrap();
+        let identity = resolve_identity(&db, None, None, Some("sess-1"), None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::Instance));
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
@@ -619,8 +617,7 @@ mod tests {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", None, None);
 
-        let identity =
-            resolve_identity(&db, Some("luna"), None, None, None, None, None).unwrap();
+        let identity = resolve_identity(&db, Some("luna"), None, None, None, None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 
@@ -667,9 +664,7 @@ mod tests {
         let (db, _dir) = make_test_db();
         // No process binding exists
 
-        let err =
-            resolve_identity(&db, None, None, None, Some("pid-123"), None, None)
-                .unwrap_err();
+        let err = resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap_err();
         assert!(err.to_string().contains("expired"));
     }
 
@@ -729,8 +724,7 @@ mod tests {
 
         // session_id takes priority over name
         let identity =
-            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None, None)
-                .unwrap();
+            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 

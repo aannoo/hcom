@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::config::{self, HcomConfig};
 use crate::db::HcomDb;
+use crate::instance_binding;
 use crate::instance_names;
 use crate::instances;
 use crate::paths;
@@ -470,7 +471,7 @@ pub fn launch_pty(
         inside_ai_tool,
     )?;
 
-    instances::persist_terminal_launch_context(
+    instance_binding::persist_terminal_launch_context(
         &crate::db::HcomDb::open()?,
         instance_name,
         terminal,
@@ -696,7 +697,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {
-            instances::initialize_instance_in_position_file(
+            instance_binding::initialize_instance_in_position_file(
                 db,
                 &instance_name,
                 None,            // session_id
@@ -774,7 +775,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             terminal_mode,
                             inside_ai_tool,
                         )?;
-                        instances::persist_terminal_launch_context(
+                        instance_binding::persist_terminal_launch_context(
                             db,
                             &instance_name,
                             terminal_mode,
@@ -830,7 +831,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             terminal_mode,
                             inside_ai_tool,
                         )?;
-                        instances::persist_terminal_launch_context(
+                        instance_binding::persist_terminal_launch_context(
                             db,
                             &instance_name,
                             terminal_mode,

@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::{HookPayload, HookResult};
+use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
@@ -157,7 +158,7 @@ fn try_capture_transcript_path(db: &HcomDb, instance_name: &str, payload: &HookP
 
 /// Resolve instance using process binding or session binding.
 fn resolve_instance_gemini(db: &HcomDb, payload: &HookPayload) -> Option<InstanceRow> {
-    instances::resolve_instance_from_binding(db, payload.session_id.as_deref(), None)
+    instance_binding::resolve_instance_from_binding(db, payload.session_id.as_deref(), None)
 }
 
 /// Bind vanilla Gemini instance by parsing tool_result for [hcom:X] marker.
@@ -213,7 +214,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     };
 
     let instance_name =
-        instances::bind_session_to_process(db, session_id, ctx.process_id.as_deref());
+        instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref());
 
     log::log_info(
         "hooks",
@@ -229,7 +230,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         Some(name) => name,
         None => {
             if let Some(ref pid) = ctx.process_id {
-                match instances::create_orphaned_pty_identity(
+                match instance_binding::create_orphaned_pty_identity(
                     db,
                     session_id,
                     Some(pid.as_str()),
@@ -254,7 +255,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     let _ = db.rebind_instance_session(&instance_name, session_id);
 
     // Capture launch context
-    instances::capture_and_store_launch_context(db, &instance_name);
+    instance_binding::capture_and_store_launch_context(db, &instance_name);
 
     let mut updates = serde_json::Map::new();
     updates.insert(

@@ -13,6 +13,7 @@ mod db;
 mod delivery;
 pub mod hooks;
 pub mod identity;
+mod instance_binding;
 mod instance_lifecycle;
 mod instance_names;
 mod instances;
