@@ -240,12 +240,12 @@ pub(crate) fn prepare_delivery_batch(
         .unwrap_or("")
         .to_string();
 
-    instances::set_status(
+    lifecycle::set_status(
         db,
         instance_name,
         ST_ACTIVE,
         &format!("deliver:{}", sender_display),
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             msg_ts: &msg_ts,
             ..Default::default()
         },
