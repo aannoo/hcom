@@ -1055,9 +1055,11 @@ impl Proxy {
 
         let exit_code = exit_code_from_status(exit_status);
         let fallback = format!("process exited before startup completed (exit code {exit_code})");
-        let Some(detail) =
-            crate::instance_lifecycle::finalize_launch_failure_detail(&db, &instance, Some(&fallback))
-        else {
+        let Some(detail) = crate::instance_lifecycle::finalize_launch_failure_detail(
+            &db,
+            &instance,
+            Some(&fallback),
+        ) else {
             return;
         };
 

@@ -198,8 +198,8 @@ pub fn update_instance_position(
 mod tests {
     use super::*;
     use crate::instance_names::{
-        allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name,
-        is_too_similar, name_pool, score_name,
+        allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name, is_too_similar,
+        name_pool, score_name,
     };
     use rusqlite::Connection;
     use std::collections::HashSet;

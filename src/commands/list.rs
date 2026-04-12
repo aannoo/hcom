@@ -12,9 +12,7 @@ use crate::instance_lifecycle::{
     RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
     get_instance_status,
 };
-use crate::instances::{
-    get_full_name, is_remote_instance, resolve_display_name,
-};
+use crate::instances::{get_full_name, is_remote_instance, resolve_display_name};
 use crate::shared::{CommandContext, SENDER, ST_LISTENING, shorten_path_max, status_icon};
 
 /// Parsed arguments for `hcom list`.

@@ -119,7 +119,8 @@ fn get_batch_failure_details_for_ids(db: &HcomDb, batch_ids: &[String]) -> Vec<S
             let Ok(Some(inst)) = db.get_instance_full(&name) else {
                 continue;
             };
-            if let Some(detail) = instance_lifecycle::get_or_finalize_launch_failure_detail(db, &inst)
+            if let Some(detail) =
+                instance_lifecycle::get_or_finalize_launch_failure_detail(db, &inst)
             {
                 details.push(format!("{}: {}", name, detail));
             }

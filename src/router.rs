@@ -397,7 +397,10 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
     let (positional, _, _) = extract_global_flags_full(argv);
     let mut iter = positional.iter().take_while(|a| a.as_str() != "--");
     matches!(
-        (iter.next().map(String::as_str), iter.next().map(String::as_str)),
+        (
+            iter.next().map(String::as_str),
+            iter.next().map(String::as_str)
+        ),
         (Some("config"), Some("dev_root"))
     )
 }
@@ -413,19 +416,17 @@ pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'s
 }
 
 fn read_dev_root_from_kv(db_path: &Path) -> Option<PathBuf> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| {
-        log_warn(
-            "router",
-            "dev_root_kv_open_failed",
-            &format!("failed to open db at {}: {e}", db_path.display()),
-        );
-        e
-    })
-    .ok()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| {
+                log_warn(
+                    "router",
+                    "dev_root_kv_open_failed",
+                    &format!("failed to open db at {}: {e}", db_path.display()),
+                );
+                e
+            })
+            .ok()?;
 
     conn.busy_timeout(std::time::Duration::from_millis(200))
         .ok();
@@ -933,14 +934,20 @@ mod tests {
     #[test]
     fn is_config_dev_root_invocation_matches_expected_shapes() {
         assert!(is_config_dev_root_invocation(&sv(&["config", "dev_root"])));
-        assert!(is_config_dev_root_invocation(&sv(&["config", "dev_root", "/tmp/x"])));
-        assert!(is_config_dev_root_invocation(&sv(&["config", "dev_root", "--unset"])));
+        assert!(is_config_dev_root_invocation(&sv(&[
+            "config", "dev_root", "/tmp/x"
+        ])));
+        assert!(is_config_dev_root_invocation(&sv(&[
+            "config", "dev_root", "--unset"
+        ])));
         assert!(is_config_dev_root_invocation(&sv(&[
             "--name", "vami", "config", "dev_root", "/tmp/x"
         ])));
 
         assert!(!is_config_dev_root_invocation(&sv(&["config"])));
-        assert!(!is_config_dev_root_invocation(&sv(&["config", "terminal", "tmux"])));
+        assert!(!is_config_dev_root_invocation(&sv(&[
+            "config", "terminal", "tmux"
+        ])));
         assert!(!is_config_dev_root_invocation(&sv(&["list"])));
         assert!(!is_config_dev_root_invocation(&[]));
     }

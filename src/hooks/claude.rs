@@ -1827,7 +1827,11 @@ fn build_all_claude_permission_patterns() -> Vec<String> {
 /// Check if a hook command string matches any hcom hook pattern.
 fn is_hcom_hook_command(command: &str) -> bool {
     // Env var patterns: ${HCOM} or %HCOM%
-    if command.contains("${HCOM}") || command.contains("$HCOM") || command.contains("%HCOM%") || command.contains("${HCOM:-") {
+    if command.contains("${HCOM}")
+        || command.contains("$HCOM")
+        || command.contains("%HCOM%")
+        || command.contains("${HCOM:-")
+    {
         return true;
     }
 

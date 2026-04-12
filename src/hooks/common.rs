@@ -205,7 +205,13 @@ pub(crate) fn format_hook_messages_for_instance(
     let get_instance_data = make_instance_lookup(db);
     let hints = load_config_hints();
     let get_config_hints = || hints.clone();
-    messages::format_hook_messages(messages, instance_name, &get_instance_data, &get_config_hints, None)
+    messages::format_hook_messages(
+        messages,
+        instance_name,
+        &get_instance_data,
+        &get_config_hints,
+        None,
+    )
 }
 
 pub(crate) fn prepare_delivery_batch(
@@ -1396,9 +1402,7 @@ mod tests {
                 "SELECT data FROM events WHERE type = 'status' AND instance = 'nova' ORDER BY id DESC LIMIT 1",
             )
             .unwrap();
-        let event_data: String = deliver_events
-            .query_row([], |row| row.get(0))
-            .unwrap();
+        let event_data: String = deliver_events.query_row([], |row| row.get(0)).unwrap();
         let event_json: serde_json::Value = serde_json::from_str(&event_data).unwrap();
 
         assert_eq!(instance.status, ST_ACTIVE);

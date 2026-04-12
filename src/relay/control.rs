@@ -254,7 +254,11 @@ pub fn send_rpc_request_and_wait_with_db(
 }
 
 pub fn require_successful_rpc_result(response: Value) -> Result<Value, String> {
-    if response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if response
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return Ok(response);
     }
 

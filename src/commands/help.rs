@@ -646,7 +646,10 @@ const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
     unique_examples: &[
         ("hcom 3 claude -p \"prompt\"", "3 headless in background"),
         ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
-        ("hcom claude --model sonnet|opus|haiku", "Use a specific model"),
+        (
+            "hcom claude --model sonnet|opus|haiku",
+            "Use a specific model",
+        ),
     ],
     extra_env: &[(
         "HCOM_SUBAGENT_TIMEOUT",
@@ -1066,6 +1069,8 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(help.contains("hcom f <name>                         Fork agent session (claude/codex/opencode)"));
+        assert!(help.contains(
+            "hcom f <name>                         Fork agent session (claude/codex/opencode)"
+        ));
     }
 }

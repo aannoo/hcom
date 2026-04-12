@@ -193,7 +193,11 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
 
     let mut current_status = status.to_string();
     let mut current_context = status_context.to_string();
-    let mut age = if status_time > 0 { now - status_time } else { 0 };
+    let mut age = if status_time > 0 {
+        now - status_time
+    } else {
+        0
+    };
     if status_time == 0 {
         let created_at = data.created_at as i64;
         if created_at > 0 {

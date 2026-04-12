@@ -471,10 +471,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         if show_logs {
             println!("logs:      {} (1h)", parts.join(", "));
         } else {
-            println!(
-                "logs:      {} (1h)  (hcom status --logs)",
-                parts.join(", ")
-            );
+            println!("logs:      {} (1h)  (hcom status --logs)", parts.join(", "));
         }
         println!("           {}", log_path.display());
         if show_logs {

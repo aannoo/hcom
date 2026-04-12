@@ -422,13 +422,7 @@ mod tests {
 
     #[test]
     fn test_strip_developer_instructions_space_syntax() {
-        let args = s(&[
-            "fork",
-            "-c",
-            "developer_instructions=OLD",
-            "--model",
-            "o3",
-        ]);
+        let args = s(&["fork", "-c", "developer_instructions=OLD", "--model", "o3"]);
         let result = strip_codex_developer_instructions(&args);
         assert_eq!(result, s(&["fork", "--model", "o3"]));
     }
