@@ -188,6 +188,10 @@ fn setup_notify_listener(cmd_tx: &std::sync::mpsc::Sender<RelayCommand>) -> Opti
 
 /// Auto-exit watchdog: every 30s, check if any local instances exist.
 /// If none for 2 consecutive checks, or shutdown signal received, send Shutdown.
+///
+/// When relay is enabled and configured, the worker stays alive even with zero
+/// local instances so it can receive remote RPCs (e.g. the first `launch` on a
+/// fresh device).
 fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: Arc<AtomicBool>) {
     let mut consecutive_empty = 0u32;
     let mut db = HcomDb::open().ok();
@@ -214,6 +218,13 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
         };
 
         if count == 0 {
+            // Keep the worker alive when relay is enabled so it can accept
+            // remote RPCs (launch, config, etc.) on a device with no agents yet.
+            if relay_enabled_in_config() {
+                consecutive_empty = 0;
+                continue;
+            }
+
             consecutive_empty += 1;
             if consecutive_empty >= 2 {
                 log::log_info(
@@ -228,6 +239,13 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             consecutive_empty = 0;
         }
     }
+}
+
+/// Check if relay is enabled in the current config (non-empty relay_id + relay_enabled flag).
+fn relay_enabled_in_config() -> bool {
+    HcomConfig::load(None)
+        .map(|c| super::is_relay_enabled(&c))
+        .unwrap_or(false)
 }
 
 /// Count active local (non-remote) instances.

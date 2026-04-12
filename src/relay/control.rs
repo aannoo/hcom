@@ -383,14 +383,21 @@ fn allows_one_way_remote_action(action: &str) -> bool {
     action == "relay_off"
 }
 
+/// Peers whose last relay sync is older than this are considered offline.
+/// Must match REMOTE_DEVICE_STALE_THRESHOLD in instance_lifecycle.rs.
+const PEER_STALE_THRESHOLD_SECS: f64 = 90.0;
+
 /// Three distinct states a remote peer's capability advertisement can be in.
 /// Keeping these separate is load-bearing for mixed-version relays:
 /// a peer that predates the capability field (`Legacy`) must NOT be
 /// hard-blocked like one that explicitly advertises `[]`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum CachedCapabilities {
     /// No state message from this peer yet — caller should retry briefly.
     NotSynced,
+    /// Peer was seen before but its last sync is older than the staleness
+    /// threshold. Contains the age in whole seconds for error messages.
+    Stale(u64),
     /// State arrived but had no `capabilities` field. Pre-capability peer;
     /// let the request through and rely on the RPC timeout if unsupported.
     Legacy,
@@ -406,6 +413,22 @@ fn read_remote_capabilities(
     else {
         return Ok(CachedCapabilities::NotSynced);
     };
+
+    // Check freshness before trusting cached capabilities.
+    let sync_time = safe_kv_get(db, &format!("relay_sync_time_{}", device_id))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if sync_time > 0.0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let age = now - sync_time;
+        if age > PEER_STALE_THRESHOLD_SECS {
+            return Ok(CachedCapabilities::Stale(age as u64));
+        }
+    }
+
     let Some(raw) = safe_kv_get(db, &format!("relay_caps_{}", device_id)) else {
         return Ok(CachedCapabilities::NotSynced);
     };
@@ -441,9 +464,25 @@ fn check_remote_action_for_db(
         // peer can't handle it, the RPC wait will time out and surface a
         // clear "timed out waiting for rpc_result" error.
         CachedCapabilities::Legacy => Ok(()),
+        CachedCapabilities::Stale(age_secs) => {
+            let age_str = format_age(age_secs);
+            Err(format!(
+                "device {target_device_short_id}{detail} is offline (last seen {age_str} ago) — is the remote relay worker running?"
+            ))
+        }
         CachedCapabilities::NotSynced => Err(format!(
             "device {target_device_short_id}{detail} has not yet synced remote capabilities — try again in a few seconds"
         )),
+    }
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 120 {
+        format!("{secs}s")
+    } else if secs < 7200 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
     }
 }
 
@@ -460,8 +499,10 @@ fn ensure_remote_action_supported(
             std::thread::sleep(RETRY_DELAY);
         }
         match read_remote_capabilities(&db, target_device_short_id)? {
-            CachedCapabilities::Advertised(_) | CachedCapabilities::Legacy => {
-                // Cache is warm (explicit list or legacy sentinel) — no point retrying.
+            // Cache is warm or peer is stale — resolve immediately, no retry.
+            CachedCapabilities::Advertised(_)
+            | CachedCapabilities::Legacy
+            | CachedCapabilities::Stale(_) => {
                 return check_remote_action_for_db(
                     &db,
                     target_device_short_id,

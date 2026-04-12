@@ -403,6 +403,20 @@ fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// Build an appropriate error message when transcript resolution fails.
+/// Uses resolve_display_name_or_stopped (which already handles prefix matching)
+/// to check if the instance exists without a transcript.
+fn no_transcript_error(db: &HcomDb, name: &str) -> String {
+    if let Some(resolved) = crate::instances::resolve_display_name_or_stopped(db, name) {
+        format!(
+            "Agent '{}' has no transcript yet — no messages have been exchanged",
+            resolved
+        )
+    } else {
+        format!("Agent '{name}' not found")
+    }
+}
+
 // ── Transcript Parsing (simplified) ──────────────────────────────────────
 
 /// An exchange in a transcript.
@@ -2642,7 +2656,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         match resolved {
             Some(r) => r,
             None => {
-                eprintln!("Error: Agent '{name}' not found or has no transcript");
+                eprintln!("Error: {}", no_transcript_error(db, name));
                 return 1;
             }
         }
@@ -2815,7 +2829,7 @@ fn render_instance_transcript_with_options_internal(
 ) -> Result<String, String> {
     let (instance_name, transcript_path, agent_type, session_id) =
         resolve_instance_transcript(db, name)
-            .ok_or_else(|| format!("Agent '{}' not found or has no transcript", name))?;
+            .ok_or_else(|| no_transcript_error(db, name))?;
     let (range_start, range_end) = if let Some(r) = range {
         parse_range(r)
     } else {
