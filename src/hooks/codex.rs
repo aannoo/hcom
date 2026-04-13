@@ -285,8 +285,7 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         None => return hook_noop(),
     };
 
-    let detail = family::extract_tool_detail("codex", &payload.tool_name, &payload.tool_input);
-    lifecycle::set_status(db, &instance.name, ST_ACTIVE, &detail, Default::default());
+    common::update_tool_status(db, &instance.name, "codex", &payload.tool_name, &payload.tool_input);
     hook_noop()
 }
 
@@ -514,6 +513,9 @@ fn merge_hcom_hooks(existing: &mut Value) {
         *existing = serde_json::json!({ "hooks": {} });
     }
 
+    // Strip existing hcom hooks first so stale matchers don't accumulate.
+    remove_hcom_hooks_from_json(existing);
+
     let hooks_obj = existing
         .as_object_mut()
         .unwrap()
@@ -651,12 +653,13 @@ fn hooks_json_has_expected_hooks(hooks_path: &Path) -> bool {
         return false;
     };
 
-    CODEX_HOOK_COMMANDS.iter().all(|(event, command, matcher)| {
-        let groups = json
-            .get("hooks")
-            .and_then(|v| v.get(*event))
-            .and_then(|v| v.as_array());
-        let Some(groups) = groups else {
+    let Some(hooks_obj) = json.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
+    };
+
+    // Check all expected hooks are present with correct matchers.
+    let all_present = CODEX_HOOK_COMMANDS.iter().all(|(event, command, matcher)| {
+        let Some(groups) = hooks_obj.get(*event).and_then(|v| v.as_array()) else {
             return false;
         };
         groups.iter().any(|group| {
@@ -679,7 +682,46 @@ fn hooks_json_has_expected_hooks(hooks_path: &Path) -> bool {
                         })
                     })
         })
-    })
+    });
+    if !all_present {
+        return false;
+    }
+
+    // Check no stale hcom hooks exist in groups with non-matching matchers.
+    for (event, groups) in hooks_obj {
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let has_hcom_command = group
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(is_hcom_codex_command)
+                    })
+                });
+            if !has_hcom_command {
+                continue;
+            }
+            // This group has an hcom command — it must match an expected entry.
+            let group_matcher = group.get("matcher").and_then(|v| v.as_str());
+            let is_expected = CODEX_HOOK_COMMANDS.iter().any(|(exp_event, _, exp_matcher)| {
+                *exp_event == event.as_str()
+                    && match exp_matcher {
+                        Some(m) => group_matcher == Some(*m),
+                        None => group_matcher.is_none() || group_matcher == Some(""),
+                    }
+            });
+            if !is_expected {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 fn build_codex_rules() -> String {

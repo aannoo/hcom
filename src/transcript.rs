@@ -21,6 +21,10 @@ fn apply_patch_regex() -> Regex {
 }
 
 /// Transcript watcher state
+///
+/// Only used for Codex — monitors rollout JSONL for apply_patch file edits.
+/// Shell commands and prompts are handled by native hooks, so only file edits
+/// are logged here.
 pub struct TranscriptWatcher {
     instance_name: String,
     transcript_path: Option<String>,
@@ -129,14 +133,8 @@ impl TranscriptWatcher {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Handle user messages -> log active:prompt status (filter hcom injections)
-        if payload_type == "message" && payload.get("role").and_then(|v| v.as_str()) == Some("user")
-        {
-            let text = self.extract_message_text(payload);
-            // Skip hcom-injected messages, only log real user prompts
-            if !text.starts_with("[hcom]") {
-                self.log_user_prompt(timestamp, db);
-            }
+        // User prompt status is handled by native hooks (UserPromptSubmit)
+        if payload_type == "message" {
             return 0;
         }
 
@@ -172,22 +170,8 @@ impl TranscriptWatcher {
                     edits += 1;
                 }
             }
-        } else if tool_name == "shell"
-            || tool_name == "shell_command"
-            || tool_name == "exec_command"
-        {
-            // Log shell commands
-            let args_str = payload
-                .get("arguments")
-                .or_else(|| payload.get("input"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let cmd = self.extract_shell_command(args_str);
-            if !cmd.is_empty() {
-                self.log_shell_command(&cmd, timestamp, db);
-            }
         }
+        // Shell commands are handled by native hooks (PreToolUse)
 
         // Track call_id to avoid duplicates
         if !call_id.is_empty() {
@@ -199,56 +183,6 @@ impl TranscriptWatcher {
         }
 
         edits
-    }
-
-    /// Extract message text from user message payload
-    fn extract_message_text(&self, payload: &Value) -> String {
-        let content = match payload.get("content") {
-            Some(c) => c,
-            None => return String::new(),
-        };
-
-        let mut text = String::new();
-        if let Some(arr) = content.as_array() {
-            for part in arr {
-                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    text.push_str(t);
-                } else if let Some(s) = part.as_str() {
-                    text.push_str(s);
-                }
-            }
-        }
-        text.trim().to_string()
-    }
-
-    /// Extract command from shell tool arguments
-    fn extract_shell_command(&self, args_str: &str) -> String {
-        // Try to parse as JSON
-        if let Ok(args) = serde_json::from_str::<Value>(args_str) {
-            let cmd = args.get("command").or_else(|| args.get("cmd"));
-            if let Some(cmd_val) = cmd {
-                // Handle array format: ["bash", "-lc", "actual command"]
-                if let Some(arr) = cmd_val.as_array() {
-                    if arr.len() >= 3
-                        && arr[0].as_str() == Some("bash")
-                        && arr[1].as_str() == Some("-lc")
-                    {
-                        return arr[2].as_str().unwrap_or("").to_string();
-                    }
-                    return arr
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                }
-                // Handle string format
-                if let Some(s) = cmd_val.as_str() {
-                    return s.to_string();
-                }
-            }
-        }
-        // Fallback: truncate raw string
-        args_str.chars().take(500).collect()
     }
 
     /// Log a file edit status event for collision detection
@@ -273,49 +207,6 @@ impl TranscriptWatcher {
 
     }
 
-    /// Log a shell command status event
-    fn log_shell_command(&self, command: &str, timestamp: &str, db: &HcomDb) {
-        if let Err(e) = db.log_status_event(
-            &self.instance_name,
-            "active",
-            "tool:shell",
-            Some(command),
-            if timestamp.is_empty() {
-                None
-            } else {
-                Some(timestamp)
-            },
-        ) {
-            log_error(
-                "transcript",
-                "log_event.fail",
-                &format!("Failed to log shell command: {}", e),
-            );
-        }
-
-    }
-
-    /// Log user prompt status event
-    fn log_user_prompt(&self, timestamp: &str, db: &HcomDb) {
-        if let Err(e) = db.log_status_event(
-            &self.instance_name,
-            "active",
-            "prompt",
-            None,
-            if timestamp.is_empty() {
-                None
-            } else {
-                Some(timestamp)
-            },
-        ) {
-            log_error(
-                "transcript",
-                "log_event.fail",
-                &format!("Failed to log user prompt: {}", e),
-            );
-        }
-
-    }
 }
 
 /// Run transcript watcher loop in a thread
@@ -447,70 +338,6 @@ mod tests {
         let input = "*** Update File: path/to/file.py";
         let caps = re.captures(input).unwrap();
         assert_eq!(caps.get(1).unwrap().as_str(), "path/to/file.py");
-    }
-
-    // ---- extract_message_text ----
-
-    #[test]
-    fn extract_text_from_array_content() {
-        let w = watcher();
-        let payload = json!({
-            "content": [{"text": "hello "}, {"text": "world"}]
-        });
-        assert_eq!(w.extract_message_text(&payload), "hello world");
-    }
-
-    #[test]
-    fn extract_text_from_string_array() {
-        let w = watcher();
-        let payload = json!({
-            "content": ["hello", "world"]
-        });
-        assert_eq!(w.extract_message_text(&payload), "helloworld");
-    }
-
-    #[test]
-    fn extract_text_missing_content() {
-        let w = watcher();
-        let payload = json!({"role": "user"});
-        assert_eq!(w.extract_message_text(&payload), "");
-    }
-
-    // ---- extract_shell_command ----
-
-    #[test]
-    fn shell_cmd_bash_lc_array() {
-        let w = watcher();
-        let args = r#"{"command": ["bash", "-lc", "ls -la"]}"#;
-        assert_eq!(w.extract_shell_command(args), "ls -la");
-    }
-
-    #[test]
-    fn shell_cmd_string_format() {
-        let w = watcher();
-        let args = r#"{"command": "echo hello"}"#;
-        assert_eq!(w.extract_shell_command(args), "echo hello");
-    }
-
-    #[test]
-    fn shell_cmd_generic_array() {
-        let w = watcher();
-        let args = r#"{"command": ["ls", "-la", "/tmp"]}"#;
-        assert_eq!(w.extract_shell_command(args), "ls -la /tmp");
-    }
-
-    #[test]
-    fn shell_cmd_fallback_raw_string() {
-        let w = watcher();
-        let args = "not json at all";
-        assert_eq!(w.extract_shell_command(args), "not json at all");
-    }
-
-    #[test]
-    fn shell_cmd_truncates_long_fallback() {
-        let w = watcher();
-        let args = "x".repeat(1000);
-        assert_eq!(w.extract_shell_command(&args).len(), 500);
     }
 
     // ---- deduplication ----
