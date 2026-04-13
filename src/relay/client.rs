@@ -302,53 +302,139 @@ impl MqttRelay {
                 return;
             }
 
-            // Poll MQTT events with timeout (allows command checks between polls)
-            match event_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Ok(event)) => {
-                    backoff.reset();
-                    last_event_from_conn = Instant::now();
-                    consecutive_errors = 0;
-                    if self.handle_event(event, &mut connected) {
-                        let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
-                        pending_push_at = Some(
-                            pending_push_at.map_or(next_push, |existing| existing.min(next_push)),
-                        );
-                    }
-                }
-                Ok(Err(conn_err)) => {
-                    last_event_from_conn = Instant::now();
-                    consecutive_errors += 1;
-                    let err_msg = format!("{:?}", conn_err);
+            // Drain queued MQTT events (up to a cap), then poll once with
+            // timeout. This prevents stale error backlogs from burying a
+            // ConnAck behind hours of one-error-per-backoff processing,
+            // while capping per-tick work so cmd_rx and push timers stay
+            // responsive under sustained inbound traffic.
+            let mut drained = false;
+            let mut channel_disconnected = false;
+            let mut trigger_push = false;
+            let mut drain_count: u32 = 0;
+            const MAX_DRAIN_PER_TICK: u32 = 1024;
 
-                    // Log first error, then every 10th, and when backoff maxes out
-                    if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
-                        log::log_warn(
-                            "relay",
-                            "relay.disconnected",
-                            &format!(
-                                "{} (consecutive={})",
-                                err_msg, consecutive_errors
-                            ),
-                        );
-                    }
-
-                    if connected {
-                        connected = false;
-                        if let Ok(db) = HcomDb::open() {
-                            set_relay_status(&db, "error", Some(&err_msg), true);
+            // Phase 1: drain queued events without blocking (bounded)
+            while drain_count < MAX_DRAIN_PER_TICK {
+                match event_rx.try_recv() {
+                    Ok(Ok(event)) => {
+                        drain_count += 1;
+                        drained = true;
+                        backoff.reset();
+                        last_event_from_conn = Instant::now();
+                        consecutive_errors = 0;
+                        if self.handle_event(event, &mut connected) {
+                            trigger_push = true;
                         }
                     }
-                    backoff_until = Instant::now() + backoff.wait_duration();
-                    backoff.increase();
+                    Ok(Err(conn_err)) => {
+                        drain_count += 1;
+                        drained = true;
+                        last_event_from_conn = Instant::now();
+                        consecutive_errors += 1;
+                        let err_msg = format!("{:?}", conn_err);
+
+                        // Log first error, then every 10th
+                        if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
+                            log::log_warn(
+                                "relay",
+                                "relay.disconnected",
+                                &format!(
+                                    "{} (consecutive={})",
+                                    err_msg, consecutive_errors
+                                ),
+                            );
+                        }
+
+                        if connected {
+                            connected = false;
+                            if let Ok(db) = HcomDb::open() {
+                                set_relay_status(&db, "error", Some(&err_msg), true);
+                            }
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Queue fully drained — safe to apply backoff if needed.
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        channel_disconnected = true;
+                        break;
+                    }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // No events — loop back to check commands and push timer
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Connection thread died
-                    log::log_info("relay", "relay.shutdown", "connection thread ended");
-                    self.shutdown_graceful(&event_rx);
-                    return;
+            }
+            let drain_hit_cap = drain_count >= MAX_DRAIN_PER_TICK;
+
+            if channel_disconnected {
+                log::log_info("relay", "relay.shutdown", "connection thread ended");
+                self.shutdown_graceful(&event_rx);
+                return;
+            }
+
+            // Apply backoff only when we drained to Empty and the latest
+            // state is still an error. If we stopped because we hit the cap,
+            // skip backoff — loop back to check cmd_rx/timers, then continue
+            // draining the backlog on the next tick.
+            if drained && consecutive_errors > 0 && !drain_hit_cap {
+                backoff_until = Instant::now() + backoff.wait_duration();
+                backoff.increase();
+            }
+
+            if trigger_push {
+                let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
+                pending_push_at = Some(
+                    pending_push_at.map_or(next_push, |existing| existing.min(next_push)),
+                );
+            }
+
+            // Phase 2: if nothing was drained, do one blocking poll
+            if !drained {
+                match event_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(event)) => {
+                        backoff.reset();
+                        last_event_from_conn = Instant::now();
+                        consecutive_errors = 0;
+                        if self.handle_event(event, &mut connected) {
+                            let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
+                            pending_push_at = Some(
+                                pending_push_at.map_or(next_push, |existing| {
+                                    existing.min(next_push)
+                                }),
+                            );
+                        }
+                    }
+                    Ok(Err(conn_err)) => {
+                        last_event_from_conn = Instant::now();
+                        consecutive_errors += 1;
+                        let err_msg = format!("{:?}", conn_err);
+
+                        if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
+                            log::log_warn(
+                                "relay",
+                                "relay.disconnected",
+                                &format!(
+                                    "{} (consecutive={})",
+                                    err_msg, consecutive_errors
+                                ),
+                            );
+                        }
+
+                        if connected {
+                            connected = false;
+                            if let Ok(db) = HcomDb::open() {
+                                set_relay_status(&db, "error", Some(&err_msg), true);
+                            }
+                        }
+                        backoff_until = Instant::now() + backoff.wait_duration();
+                        backoff.increase();
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // No events — loop back to check commands and push timer
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        log::log_info("relay", "relay.shutdown", "connection thread ended");
+                        self.shutdown_graceful(&event_rx);
+                        return;
+                    }
                 }
             }
         }
