@@ -80,6 +80,15 @@ pub use common::{
 pub use family::{bind_vanilla_instance, extract_tool_detail};
 pub use utils::{HOOK_REGISTRY, HookCategory, HookInfo};
 
+/// Delivery cursor/status update to apply after hook output is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryAck {
+    pub instance_name: String,
+    pub last_event_id: i64,
+    pub status_context: String,
+    pub msg_ts: String,
+}
+
 /// Normalized hook payload — unified across all tools.
 ///
 /// Each tool's raw hook JSON is different. Factory methods normalize into
@@ -204,21 +213,28 @@ impl HookPayload {
         }
     }
 
-    /// Build from Codex hook JSON.
+    /// Build from native Codex hook JSON.
     ///
-    /// Codex notify payload (passed as argv[2]):
-    ///   { "type": "agent-turn-complete", "thread-id": "uuid",
-    ///     "turn-id", "cwd", "input-messages", "last-assistant-message" }
-    /// Note: Codex has no tool_name/tool_input — only event_type.
-    pub fn from_codex(raw: Value) -> Self {
+    /// Codex hooks pass JSON on stdin with snake_case fields such as:
+    ///   { "session_id", "transcript_path", "hook_event_name",
+    ///     "tool_name", "tool_input", "tool_response", "prompt", "source" }
+    pub fn from_codex_native(hook_type: &str, raw: Value) -> Self {
         Self {
-            session_id: Self::opt_str_field(&raw, &["thread-id"]),
+            session_id: Self::opt_str_field(&raw, &["session_id"]),
             transcript_path: Self::opt_str_field(&raw, &["transcript_path", "session_path"]),
-            hook_name: Self::str_field(&raw, &["type"]),
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name"])
+            } else {
+                hook_type.to_string()
+            },
             tool: "codex".to_string(),
-            tool_name: String::new(),
-            tool_input: Value::Object(Default::default()),
-            tool_result: String::new(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result: match raw.get("tool_response") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
             notification_type: None,
             raw,
         }
@@ -253,6 +269,8 @@ pub enum HookResult {
         additional_context: Option<String>,
         /// System message update (Claude-specific).
         system_message: Option<String>,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Block the operation (exit 2, with reason for blocking).
@@ -325,17 +343,19 @@ mod tests {
 
     #[test]
     fn test_hook_payload_from_codex() {
-        // Matches actual Codex notify payload: thread-id (hyphen), no tool_name
+        // Matches native Codex stdin payload
         let raw = serde_json::json!({
-            "thread-id": "thread-789",
-            "type": "agent-turn-complete",
-            "cwd": "/tmp/project"
+            "session_id": "thread-789",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pwd"},
+            "tool_response": {"output": "ok"}
         });
-        let payload = HookPayload::from_codex(raw);
+        let payload = HookPayload::from_codex_native("PostToolUse", raw);
         assert_eq!(payload.session_id.as_deref(), Some("thread-789"));
         assert_eq!(payload.tool, "codex");
-        assert_eq!(payload.hook_name, "agent-turn-complete");
-        assert_eq!(payload.tool_name, "");
+        assert_eq!(payload.hook_name, "PostToolUse");
+        assert_eq!(payload.tool_name, "Bash");
+        assert_eq!(payload.tool_input["command"], "pwd");
     }
 
     #[test]
@@ -408,15 +428,18 @@ mod tests {
         let result = HookResult::Allow {
             additional_context: Some("bootstrap text".into()),
             system_message: None,
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 0);
         match &result {
             HookResult::Allow {
                 additional_context,
                 system_message,
+                delivery_ack,
             } => {
                 assert_eq!(additional_context.as_deref(), Some("bootstrap text"));
                 assert!(system_message.is_none());
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Allow"),
         }
@@ -427,15 +450,18 @@ mod tests {
         let result = HookResult::Allow {
             additional_context: None,
             system_message: None,
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 0);
         match &result {
             HookResult::Allow {
                 additional_context,
                 system_message,
+                delivery_ack,
             } => {
                 assert!(additional_context.is_none());
                 assert!(system_message.is_none());
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Allow"),
         }

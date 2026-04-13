@@ -12,7 +12,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::db::HcomDb;
-use crate::log::{log_error, log_info, log_warn};
+use crate::log::{log_error, log_info};
 
 /// Regex to extract file paths from apply_patch input
 /// Matches: *** Update File: path, *** Add File: path, *** Delete File: path
@@ -271,21 +271,6 @@ impl TranscriptWatcher {
             );
         }
 
-        if !timestamp.is_empty() {
-            if let Err(e) = db.update_status_if_newer(
-                &self.instance_name,
-                "active",
-                "tool:apply_patch",
-                Some(filepath),
-                timestamp,
-            ) {
-                log_warn(
-                    "transcript",
-                    "status_update.fail",
-                    &format!("Failed to update status: {}", e),
-                );
-            }
-        }
     }
 
     /// Log a shell command status event
@@ -308,21 +293,6 @@ impl TranscriptWatcher {
             );
         }
 
-        if !timestamp.is_empty() {
-            if let Err(e) = db.update_status_if_newer(
-                &self.instance_name,
-                "active",
-                "tool:shell",
-                Some(command),
-                timestamp,
-            ) {
-                log_warn(
-                    "transcript",
-                    "status_update.fail",
-                    &format!("Failed to update status: {}", e),
-                );
-            }
-        }
     }
 
     /// Log user prompt status event
@@ -345,17 +315,6 @@ impl TranscriptWatcher {
             );
         }
 
-        if !timestamp.is_empty() {
-            if let Err(e) =
-                db.update_status_if_newer(&self.instance_name, "active", "prompt", None, timestamp)
-            {
-                log_warn(
-                    "transcript",
-                    "sync.status_update_failed",
-                    &format!("failed to update status for {}: {e}", self.instance_name),
-                );
-            }
-        }
     }
 }
 

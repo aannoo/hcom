@@ -158,10 +158,6 @@ pub(crate) struct DeliveryBatch {
 }
 
 impl DeliveryBatch {
-    pub(crate) fn into_messages(self) -> Vec<Value> {
-        self.messages
-    }
-
     pub(crate) fn format_model_context(&self, db: &HcomDb, instance_name: &str) -> String {
         format_messages_json_for_instance(db, &self.messages, instance_name)
     }
@@ -169,6 +165,15 @@ impl DeliveryBatch {
     pub(crate) fn format_user_display(&self, db: &HcomDb, instance_name: &str) -> String {
         format_hook_messages_for_instance(db, &self.messages, instance_name)
     }
+}
+
+/// Prepared delivery — messages formatted but cursor not yet advanced.
+///
+/// Used by tools that need to ensure stdout write succeeds before committing.
+pub struct PreparedDelivery {
+    pub messages: Vec<Value>,
+    pub formatted: String,
+    pub ack: super::DeliveryAck,
 }
 
 pub(crate) fn limit_delivery_messages(messages: &[Value]) -> Vec<Value> {
@@ -260,6 +265,77 @@ pub(crate) fn prepare_delivery_batch(
     Some(DeliveryBatch { messages: deliver })
 }
 
+/// Prepare pending messages for delivery without committing cursor advance.
+///
+/// Returns formatted text + ack token. Caller must call `commit_delivery_ack`
+/// after the output is successfully written (e.g. stdout flush).
+pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<PreparedDelivery> {
+    let raw_messages = db.get_unread_messages(instance_name);
+    prepare_raw_messages(db, instance_name, raw_messages)
+}
+
+/// Commit a deferred delivery ack — advance cursor and set status.
+pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
+    let mut updates = serde_json::Map::new();
+    updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
+    instances::update_instance_position(db, &ack.instance_name, &updates);
+
+    lifecycle::set_status(
+        db,
+        &ack.instance_name,
+        ST_ACTIVE,
+        &ack.status_context,
+        lifecycle::StatusUpdate {
+            msg_ts: &ack.msg_ts,
+            ..Default::default()
+        },
+    );
+}
+
+/// Prepare raw messages into a PreparedDelivery without committing cursor/status.
+///
+/// Unlike `prepare_delivery_batch` (which commits immediately for Claude),
+/// this defers cursor advance and status update to `commit_delivery_ack`.
+fn prepare_raw_messages(
+    db: &HcomDb,
+    instance_name: &str,
+    raw_messages: Vec<Message>,
+) -> Option<PreparedDelivery> {
+    if raw_messages.is_empty() {
+        return None;
+    }
+
+    let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
+    let deliver = limit_delivery_messages(&messages);
+    let formatted = format_messages_json_for_instance(db, &deliver, instance_name);
+
+    let sender = deliver
+        .first()
+        .and_then(|m| m.get("from").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let sender_display = instances::get_display_name(db, sender);
+    let last_id = deliver
+        .last()
+        .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    let msg_ts = deliver
+        .last()
+        .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    Some(PreparedDelivery {
+        messages: deliver,
+        formatted,
+        ack: super::DeliveryAck {
+            instance_name: instance_name.to_string(),
+            last_event_id: last_id,
+            status_context: format!("deliver:{}", sender_display),
+            msg_ts,
+        },
+    })
+}
+
 /// Fetch unread messages, update cursor, set delivery status.
 ///
 /// Returns (delivered_messages, formatted_json). Empty vec and None if no messages.
@@ -267,23 +343,11 @@ pub(crate) fn prepare_delivery_batch(
 ///
 pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>, Option<String>) {
     let raw_messages = db.get_unread_messages(instance_name);
-    deliver_raw_messages(db, instance_name, raw_messages)
-}
-
-/// Process pre-fetched raw messages: convert, limit, advance cursor, format, update status.
-///
-/// Shared by `deliver_pending_messages` (fetches then calls this) and `poll_loop`
-/// (fetches once for orphan check, then calls this to avoid double-fetch).
-fn deliver_raw_messages(
-    db: &HcomDb,
-    instance_name: &str,
-    raw_messages: Vec<Message>,
-) -> (Vec<Value>, Option<String>) {
-    let Some(batch) = prepare_delivery_batch(db, instance_name, raw_messages) else {
+    let Some(prepared) = prepare_raw_messages(db, instance_name, raw_messages) else {
         return (vec![], None);
     };
-    let formatted = batch.format_model_context(db, instance_name);
-    (batch.into_messages(), Some(formatted))
+    commit_delivery_ack(db, &prepared.ack);
+    (prepared.messages, Some(prepared.formatted))
 }
 
 /// Stop hook polling loop — NOT used by main PTY path.
@@ -405,11 +469,11 @@ fn poll_loop(
                 return Ok((0, None, false));
             }
 
-            let (_deliver, formatted) = deliver_raw_messages(db, instance_name, raw_messages);
-            if let Some(formatted) = formatted {
+            if let Some(prepared) = prepare_raw_messages(db, instance_name, raw_messages) {
+                commit_delivery_ack(db, &prepared.ack);
                 let output = serde_json::json!({
                     "decision": "block",
-                    "reason": formatted,
+                    "reason": prepared.formatted,
                 });
                 return Ok((2, Some(output), false));
             }
@@ -1389,26 +1453,50 @@ mod tests {
         assert_eq!(cursor, expected_last_id);
 
         let instance = db.get_instance_full("nova").unwrap().unwrap();
-        let last_msg_ts = batch
-            .messages
-            .last()
-            .and_then(|m| m.get("timestamp"))
-            .and_then(|v| v.as_str())
-            .unwrap();
         let delivered_name = crate::instances::get_display_name(&db, "luna");
-        let mut deliver_events = db
-            .conn()
-            .prepare(
-                "SELECT data FROM events WHERE type = 'status' AND instance = 'nova' ORDER BY id DESC LIMIT 1",
-            )
-            .unwrap();
-        let event_data: String = deliver_events.query_row([], |row| row.get(0)).unwrap();
-        let event_json: serde_json::Value = serde_json::from_str(&event_data).unwrap();
 
         assert_eq!(instance.status, ST_ACTIVE);
         assert_eq!(instance.status_context, format!("deliver:{delivered_name}"));
-        assert_eq!(event_json["msg_ts"], last_msg_ts);
-        assert_eq!(event_json["context"], format!("deliver:{delivered_name}"));
+    }
+
+    #[test]
+    fn test_prepare_and_commit_delivery() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+        insert_test_message(&db, "luna", "luna", "hello", "2026-01-01T00:00:01Z");
+
+        let prepared = prepare_pending_messages(&db, "nova").unwrap();
+        assert!(!prepared.formatted.is_empty());
+        assert_eq!(prepared.ack.instance_name, "nova");
+
+        // Before commit: cursor not advanced (prepare_raw_messages defers)
+        let cursor_before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_before, 0);
+
+        // Commit
+        commit_delivery_ack(&db, &prepared.ack);
+
+        // After commit: cursor advanced, status updated
+        let cursor_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_after, prepared.ack.last_event_id);
+
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.status, ST_ACTIVE);
+        assert!(instance.status_context.starts_with("deliver:"));
     }
 
     #[test]

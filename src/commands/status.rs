@@ -56,24 +56,9 @@ fn check_gemini_hooks() -> bool {
     }
 }
 
-/// Check Codex hook installation (must have codex-notify + rules file).
+/// Check Codex hook installation (native hooks.json + feature flag + rules file).
 fn check_codex_hooks() -> bool {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return false,
-    };
-    let config_path = home.join(".codex/config.toml");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    // Must contain codex-notify command (not just any "notify" string)
-    if !content.contains("codex-notify") {
-        return false;
-    }
-    // Must have execpolicy rules file
-    let rules_path = home.join(".codex/rules/hcom.rules");
-    rules_path.exists()
+    crate::hooks::codex::verify_codex_hooks_installed(true)
 }
 
 /// Check OpenCode plugin installation.

@@ -96,20 +96,6 @@ Messages instantly and automatically arrive via <hcom> tags — end your turn to
 - Waiting for hcom message → end your turn
 - Waiting for agent progress → `hcom events sub`, subscribe, end your turn"#;
 
-const DELIVERY_CODEX_HCOM_LAUNCHED: &str = r#"## DELIVERY
-
-New message notifications instantly and automatically arrive via <hcom> tags - end your turn to receive them.
-IMPORTANT: <hcom> tags = run `hcom listen 1 --name {instance_name}` IMMEDIATELY to read message.
-
-## WAITING RULES
-
-1. Never use `sleep`
-2. If you need a pure time-based pause (not waiting on hcom activity):
-- use `hcom listen [sec]` instead of `sleep [sec]`
-3. If you are waiting on hcom activity, DO NOT use any sleep, listen, polling or blocking. instead:
-- Waiting for hcom message → end your turn immediately
-- Waiting for agent progress → `hcom events sub`, subscribe, end your turn immediately"#;
-
 const DELIVERY_ADHOC: &str = r#"## DELIVERY
 
 Messages do NOT arrive automatically.
@@ -402,10 +388,10 @@ pub fn get_bootstrap(
     }
 
     // Tool-specific delivery
-    if tool == "claude" || tool == "opencode" || (tool == "gemini" && ctx.is_launched) {
+    if tool == "claude"
+        || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
+    {
         parts.push(DELIVERY_AUTO);
-    } else if tool == "codex" && ctx.is_launched {
-        parts.push(DELIVERY_CODEX_HCOM_LAUNCHED);
     } else {
         parts.push(DELIVERY_ADHOC);
     }
@@ -608,7 +594,7 @@ mod tests {
             None,
         );
 
-        assert!(result.contains("IMMEDIATELY to read message"));
+        assert!(result.contains("Messages instantly and automatically arrive"));
         assert!(!result.contains("SUBAGENTS")); // Not claude
     }
 
@@ -787,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_bootstrap_opencode_gets_auto_delivery() {
+    fn test_get_bootstrap_opencode_launched_gets_auto_delivery() {
         let (tmp, db) = setup_test_db();
 
         let result = get_bootstrap(
@@ -796,7 +782,7 @@ mod tests {
             "nova",
             "opencode",
             false,
-            false,
+            true, // is_launched
             "",
             "",
             false,
@@ -804,6 +790,26 @@ mod tests {
         );
 
         assert!(result.contains("Messages instantly and automatically arrive"));
+    }
+
+    #[test]
+    fn test_get_bootstrap_opencode_vanilla_gets_adhoc_delivery() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "nova",
+            "opencode",
+            false,
+            false, // not launched
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(result.contains("Messages do NOT arrive automatically"));
     }
 
     #[test]

@@ -276,8 +276,9 @@ fn resolve_identity_with_expectation(
                                 .and_then(|v| v.as_str())
                                 .is_some_and(|s| !s.is_empty());
 
-                            // Opportunistic session binding for Codex (no SessionStart hook).
-                            // First hcom command the Codex agent runs triggers this.
+                            // Opportunistic Codex session binding for command-time recovery.
+                            // Native SessionStart is the primary binding path; this keeps
+                            // resume/orphan flows tolerant if a command arrives first.
                             // Uses bind_session_to_process for proper resume/placeholder handling.
                             let mut final_name = inst_name.clone();
                             if !has_session {

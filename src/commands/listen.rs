@@ -374,22 +374,6 @@ fn listen_loop(
                     "message received",
                     Default::default(),
                 );
-            } else if tool == "codex" {
-                let msg_ts = messages
-                    .last()
-                    .and_then(|m| m.timestamp.as_deref())
-                    .unwrap_or("");
-                let from_display = get_display_name(db, &messages[0].from);
-                set_status(
-                    db,
-                    instance_name,
-                    ST_ACTIVE,
-                    &format!("deliver:{from_display}"),
-                    StatusUpdate {
-                        msg_ts,
-                        ..Default::default()
-                    },
-                );
             } else {
                 set_status(
                     db,

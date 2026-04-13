@@ -32,7 +32,10 @@ pub static TOOL_NAME_MAPPINGS: LazyLock<
     m.insert("gemini", gemini);
 
     let mut codex = HashMap::new();
-    codex.insert("bash", vec!["execute_command", "shell", "shell_command"]);
+    codex.insert(
+        "bash",
+        vec!["Bash", "execute_command", "shell", "shell_command"],
+    );
     codex.insert("file", vec!["apply_patch"]);
     m.insert("codex", codex);
 

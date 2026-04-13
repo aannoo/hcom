@@ -40,8 +40,14 @@ const GEMINI_HOOKS: &[&str] = &[
     "gemini-sessionend",
 ];
 
-/// Codex hooks (read payload from argv)
-const CODEX_HOOKS: &[&str] = &["codex-notify"];
+/// Codex hooks (read payload from stdin)
+const CODEX_HOOKS: &[&str] = &[
+    "codex-sessionstart",
+    "codex-userpromptsubmit",
+    "codex-pretooluse",
+    "codex-posttooluse",
+    "codex-stop",
+];
 
 /// OpenCode hooks (read payload from argv)
 const OPENCODE_HOOKS: &[&str] = &[
@@ -505,9 +511,9 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Hook { ref hook, ref args } if hook == "codex-notify" => {
-            // Codex notify hook — handled natively in Rust.
-            let exit_code = crate::hooks::codex::dispatch_codex_hook(args);
+        Action::Hook { ref hook, .. } if CODEX_HOOKS.contains(&hook.as_str()) => {
+            // Codex native hooks — handled natively in Rust.
+            let exit_code = crate::hooks::codex::dispatch_codex_hook_native(hook);
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -1008,11 +1014,10 @@ mod tests {
 
     #[test]
     fn codex_hook_detected() {
-        let action = resolve_action(&sv(&["codex-notify", "{\"event\":\"idle\"}"]));
+        let action = resolve_action(&sv(&["codex-sessionstart"]));
         match &action {
-            Action::Hook { hook, args } => {
-                assert_eq!(hook, "codex-notify");
-                assert_eq!(*args, sv(&["codex-notify", "{\"event\":\"idle\"}"]));
+            Action::Hook { hook, .. } => {
+                assert_eq!(hook, "codex-sessionstart");
             }
             _ => panic!("expected Hook, got {:?}", action),
         }
@@ -1257,7 +1262,7 @@ mod tests {
         assert!(is_hook("poll"));
         assert!(is_hook("sessionstart"));
         assert!(is_hook("gemini-beforeagent"));
-        assert!(is_hook("codex-notify"));
+        assert!(is_hook("codex-sessionstart"));
         assert!(is_hook("opencode-start"));
         assert!(!is_hook("send"));
         assert!(!is_hook("unknown"));

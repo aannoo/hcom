@@ -17,7 +17,7 @@
 //! - Registering notify endpoints
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema version - bump on any schema change.
@@ -2982,51 +2982,6 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance status if timestamp is newer than current
-    ///
-    /// Used by TranscriptWatcher to update instance cache with retroactive events.
-    pub fn update_status_if_newer(
-        &self,
-        name: &str,
-        status: &str,
-        context: &str,
-        detail: Option<&str>,
-        timestamp: &str,
-    ) -> Result<()> {
-        // Parse timestamp to epoch seconds
-        let event_time = parse_iso_timestamp(timestamp).unwrap_or(0);
-
-        // Get current status_time
-        let current_time: i64 = self
-            .conn
-            .query_row(
-                "SELECT status_time FROM instances WHERE name = ?",
-                params![name],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        // Only update if event is newer
-        if event_time >= current_time {
-            match detail {
-                Some(d) => {
-                    self.conn.execute(
-                        "UPDATE instances SET status = ?, status_context = ?, status_detail = ?, status_time = ? WHERE name = ?",
-                        params![status, context, d, event_time, name],
-                    )?;
-                }
-                None => {
-                    self.conn.execute(
-                        "UPDATE instances SET status = ?, status_context = ?, status_time = ? WHERE name = ?",
-                        params![status, context, event_time, name],
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Get full instance row by name.
     pub fn get_instance_full(&self, name: &str) -> Result<Option<InstanceRow>> {
         let mut stmt = self
@@ -3190,19 +3145,6 @@ impl HcomDb {
 /// Generate ISO timestamp for current time.
 fn chrono_now_iso() -> String {
     crate::shared::time::now_iso()
-}
-
-/// Parse ISO 8601 timestamp to epoch seconds using chrono
-fn parse_iso_timestamp(ts: &str) -> Option<i64> {
-    // Try parsing with timezone offset (e.g., 2026-01-25T00:11:38.208360+00:00)
-    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-        return Some(dt.timestamp());
-    }
-    // Try parsing with just 'Z' suffix
-    if let Ok(dt) = ts.parse::<DateTime<Utc>>() {
-        return Some(dt.timestamp());
-    }
-    None
 }
 
 #[cfg(test)]

@@ -131,25 +131,29 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
-/// Build message preview with DB access for Gemini/Codex injection.
+/// Build message preview with DB access for Gemini/OpenCode bootstrap injection.
 ///
 /// Format: `<hcom>sender → recipient (+N)</hcom>`
 ///
 /// ## Why different tools need different injection strategies:
 ///
 /// - **Claude**: Injects minimal `<hcom>` trigger only. The Claude hook shows the full
-///   message to human via system message in TUI + separate JSON for agent. Minimal
+///   message to human via system message in TUI + separate text for agent. Minimal
 ///   trigger is sufficient since hook handles both human and agent presentation.
+///
+/// - **Codex**: Similar to Claude except the agent message is shown to humans as well.
+///   So theres no seperate system message, the hook shows the full message in TUI.
+///   Minimal <hcom> trigger because the hook shows the full message in TUI already.
 ///
 /// - **Gemini**: Injects message preview for human visibility. The Gemini hook only
 ///   shows JSON to agent (no human-visible system message like Claude). Preview in
 ///   terminal gives human context since hook output is agent-only. BeforeAgent hook
 ///   still delivers full message to agent via additionalContext.
-///
-/// - **Codex**: Injects message preview + hcom listen instruction. Preview shows human
-///   message context in terminal (like Gemini). Bash command output is truncated for
-///   agent only (command execution-based delivery). No BeforeAgent-style hook exists -
-///   Codex executes 'hcom listen' as shell command.
+/// 
+/// - **OpenCode**: Similar to Gemini.
+///   The OpenCode plugin just shows this one line and not the full message in TUI.
+///   So preview gives more context than a minimal <hcom> trigger.
+
 fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
     let messages = db.get_unread_messages(name);
     if messages.is_empty() {
@@ -189,13 +193,6 @@ fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
 
     // Reuse messages.rs truncation + wrapping (max 60 chars)
     crate::messages::build_message_preview(&preview, 60)
-}
-
-/// Build Codex inject text with hint after failed inject
-/// Format: <hcom>sender → recipient (+N)</hcom> | Run: hcom listen
-fn build_codex_inject_with_hint(db: &HcomDb, name: &str) -> String {
-    let preview = build_message_preview_with_db(db, name);
-    format!("{} | Run: hcom listen", preview)
 }
 
 /// Tool-specific configuration for delivery gate.
@@ -287,8 +284,8 @@ impl ToolConfig {
     ///   footer in narrow terminals, making it unreliable as a gate signal.
     /// - `require_prompt_empty=true`: Uses vt100 dim attribute detection on the `›` prompt
     ///   character (always visible) to distinguish placeholder text from user input.
-    /// - `require_idle=true`: Status tracking is reliable (~5s lag from transcript watcher).
-    ///   Status correctly shows `listening` when idle, `active` when busy.
+    /// - `require_idle=true`: Native hooks set status synchronously (SessionStart→listening,
+    ///   UserPromptSubmit→active), so idle detection is near-instant.
     pub fn codex() -> Self {
         Self {
             tool: "codex".to_string(),
@@ -854,13 +851,9 @@ pub fn run_delivery_loop(
 
                         let parsed_tool = Tool::from_str(&config.tool).ok();
                         let text = match parsed_tool {
-                            Some(Tool::Claude) => "<hcom>".to_string(),
-                            Some(Tool::Codex) if inject_attempt > 0 => {
-                                // Codex retry: add hint to prompt agent to run hcom listen
-                                build_codex_inject_with_hint(db, &current_name)
-                            }
+                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
                             _ => {
-                                // Gemini/Codex first attempt: build preview from DB
+                                // Gemini/OpenCode: build preview from DB
                                 build_message_preview_with_db(db, &current_name)
                             }
                         };

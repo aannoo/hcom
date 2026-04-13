@@ -3,6 +3,7 @@
 //! Lifecycle: SessionStart → BeforeAgent → [BeforeTool → AfterTool]* → AfterAgent → SessionEnd
 
 use std::env;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -205,6 +206,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
                 crate::runtime_env::build_hcom_command()
             )),
             system_message: None,
+            delivery_ack: None,
         };
     }
 
@@ -346,9 +348,10 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
     }
 
     // Deliver pending messages
-    let (_msgs, formatted) = common::deliver_pending_messages(db, instance_name);
-    if let Some(formatted) = formatted {
-        outputs.push(formatted);
+    let mut delivery_ack = None;
+    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+        outputs.push(prepared.formatted);
+        delivery_ack = Some(prepared.ack);
     } else {
         // Real user prompt (not hcom injection)
         lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
@@ -362,6 +365,7 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
+        delivery_ack,
     }
 }
 
@@ -430,9 +434,10 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
     }
 
     // Deliver pending messages (JSON format)
-    let (_msgs, formatted) = common::deliver_pending_messages(db, instance_name);
-    if let Some(formatted) = formatted {
-        outputs.push(formatted);
+    let mut delivery_ack = None;
+    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+        outputs.push(prepared.formatted);
+        delivery_ack = Some(prepared.ack);
     }
 
     if outputs.is_empty() {
@@ -443,6 +448,7 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
+        delivery_ack,
     }
 }
 
@@ -488,6 +494,7 @@ fn hook_noop() -> HookResult {
     HookResult::Allow {
         additional_context: None,
         system_message: None,
+        delivery_ack: None,
     }
 }
 
@@ -583,6 +590,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         HookResult::Allow {
             additional_context: None,
             system_message: None,
+            delivery_ack: None,
         },
         || handler(&db, &ctx, &payload),
     );
@@ -642,7 +650,16 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         }
     };
     if let Some(json) = output_json {
-        let _ = serde_json::to_writer(std::io::stdout().lock(), &json);
+        let mut stdout = std::io::stdout().lock();
+        if serde_json::to_writer(&mut stdout, &json).is_ok() && stdout.flush().is_ok() {
+            if let HookResult::Allow {
+                delivery_ack: Some(ack),
+                ..
+            } = &result
+            {
+                common::commit_delivery_ack(&db, ack);
+            }
+        }
     }
 
     exit_code
@@ -1566,9 +1583,11 @@ mod tests {
             HookResult::Allow {
                 additional_context,
                 system_message,
+                delivery_ack,
             } => {
                 assert!(additional_context.is_none());
                 assert!(system_message.is_none());
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Allow"),
         }
