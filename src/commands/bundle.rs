@@ -15,6 +15,51 @@ use crate::shared::{CommandContext, SenderKind};
 // Re-use transcript parsing for bundle prepare/cat (C5 fix)
 use super::transcript::{TranscriptQuery, format_exchanges_pub, get_exchanges_pub};
 
+fn lookup_bundle_transcript_source(
+    db: &HcomDb,
+    agent: &str,
+) -> (Option<String>, String, Option<String>) {
+    if let Ok((path, tool, sid)) = db.conn().query_row(
+        "SELECT transcript_path, tool, session_id FROM instances WHERE name = ?",
+        rusqlite::params![agent],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    ) {
+        return (path, tool, sid);
+    }
+
+    if let Ok((path, tool, sid)) = db.conn().query_row(
+        "SELECT
+            json_extract(data, '$.snapshot.transcript_path'),
+            json_extract(data, '$.snapshot.tool'),
+            json_extract(data, '$.snapshot.session_id')
+         FROM events
+         WHERE type = 'life'
+           AND instance = ?
+           AND json_extract(data, '$.action') = 'stopped'
+           AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL
+         ORDER BY id DESC
+         LIMIT 1",
+        rusqlite::params![agent],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    ) {
+        return (path, tool, sid);
+    }
+
+    (None, "claude".into(), None)
+}
+
 /// Parsed arguments for `hcom bundle`.
 ///
 /// Uses manual subcommand routing to support:
@@ -725,22 +770,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
     };
 
     // C5 fix: get transcript text
-    let transcript_path: Option<String> = db
-        .conn()
-        .query_row(
-            "SELECT transcript_path FROM instances WHERE name = ?",
-            rusqlite::params![agent],
-            |row| row.get(0),
-        )
-        .ok();
-    let (tool, bundle_session_id): (String, Option<String>) = db
-        .conn()
-        .query_row(
-            "SELECT tool, session_id FROM instances WHERE name = ?",
-            rusqlite::params![agent],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-        .unwrap_or_else(|_| ("claude".into(), None));
+    let (transcript_path, tool, bundle_session_id) = lookup_bundle_transcript_source(db, &agent);
 
     let mut transcript_text: Option<String> = None;
     let mut transcript_range: Option<String> = None;
@@ -1341,6 +1371,8 @@ pub fn cmd_bundle(db: &HcomDb, args: &BundleArgs, ctx: Option<&CommandContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::time::now_epoch_f64;
+    use std::fs;
 
     #[test]
     fn test_format_age() {
@@ -1452,5 +1484,73 @@ mod tests {
     #[test]
     fn test_bundle_list_rejects_bogus() {
         assert!(BundleListArgs::try_parse_from(["list", "--bogus"]).is_err());
+    }
+
+    fn test_db() -> HcomDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
+    }
+
+    #[test]
+    fn test_lookup_bundle_transcript_source_falls_back_to_stopped_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("claude.jsonl");
+        let db = test_db();
+
+        let lines = [
+            json!({
+                "type": "user",
+                "timestamp": "2026-04-13T12:00:00Z",
+                "message": {
+                    "content": [{"type": "text", "text": "remember marker"}]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "timestamp": "2026-04-13T12:00:01Z",
+                "message": {
+                    "content": [{"type": "text", "text": "ack marker"}]
+                }
+            }),
+        ];
+        fs::write(
+            &transcript_path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let snapshot = json!({
+            "name": "huno",
+            "tool": "claude",
+            "session_id": "sess-123",
+            "transcript_path": transcript_path.to_string_lossy().to_string(),
+            "created_at": now_epoch_f64(),
+        });
+        db.log_life_event("huno", "stopped", "cli", "killed", Some(snapshot))
+            .unwrap();
+
+        let (path, tool, sid) = lookup_bundle_transcript_source(&db, "huno");
+        assert_eq!(path.as_deref(), Some(transcript_path.to_string_lossy().as_ref()));
+        assert_eq!(tool, "claude");
+        assert_eq!(sid.as_deref(), Some("sess-123"));
+
+        let tq = TranscriptQuery {
+            path: path.as_deref().unwrap(),
+            agent: &tool,
+            last: 10,
+            detailed: false,
+            session_id: sid.as_deref(),
+        };
+        let exchanges = get_exchanges_pub(&tq).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0]["position"], 1);
     }
 }
