@@ -784,9 +784,9 @@ fn test_relay_roundtrip() {
                     return Some(line.trim().to_string());
                 }
             }
-            let remote_line = stdout
-                .lines()
-                .find(|l| l.contains("online:") || l.contains("Remote") || l.contains("other devices"));
+            let remote_line = stdout.lines().find(|l| {
+                l.contains("online:") || l.contains("Remote") || l.contains("other devices")
+            });
             eprintln!(
                 "    relay status: {}",
                 remote_line.unwrap_or("(no remote line)")

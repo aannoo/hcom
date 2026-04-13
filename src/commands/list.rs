@@ -784,6 +784,7 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
             } else {
                 entry.timestamp.clone()
             };
+            let dir = snapshot["directory"].as_str().unwrap_or("");
             let tag_part = if tag.is_empty() {
                 String::new()
             } else {
@@ -794,8 +795,13 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
             } else {
                 format!(" by:{by}")
             };
+            let dir_part = if dir.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", shorten_path_max(dir, 40))
+            };
             println!(
-                "  {} ({tool}{tag_part}) {age} ago  [{reason}{by_part}]",
+                "  {} ({tool}{tag_part}) {age} ago  [{reason}{by_part}]{dir_part}",
                 entry.instance
             );
         }

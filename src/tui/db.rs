@@ -992,7 +992,8 @@ fn parse_status_or_life_row(
                     detail_text = format!("{} ({})", action, parts.join(", "));
                 }
             }
-            "relay_device_join" | "relay_device_leave" => { // relay::ACTION_DEVICE_*
+            "relay_device_join" | "relay_device_leave" => {
+                // relay::ACTION_DEVICE_*
                 let text = json_str(&json, "text", action);
                 detail_text = text.to_string();
             }
