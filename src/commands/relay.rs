@@ -529,6 +529,10 @@ fn persist_relay_config(
 fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     let (broker_url, auth_token, _) = parse_broker_flags(argv);
 
+    // Ensure device_id file exists before spawning the daemon worker,
+    // so both CLI and daemon use the same UUID (avoids TOCTOU race).
+    relay::read_device_uuid();
+
     let config = config::load_config_snapshot().core;
 
     // Show previous group token if switching
@@ -627,6 +631,10 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
 /// Connect to relay — re-enable or join with token.
 fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
     let (broker_url, auth_token, remaining) = parse_broker_flags(argv);
+
+    // Ensure device_id file exists before spawning the daemon worker,
+    // so both CLI and daemon use the same UUID (avoids TOCTOU race).
+    relay::read_device_uuid();
 
     let token_str = remaining.first().filter(|s| !s.starts_with("-")).cloned();
 
