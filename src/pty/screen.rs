@@ -362,7 +362,10 @@ impl ScreenTracker {
         let lines = self.get_screen_lines();
         let num_lines = lines.len();
 
-        for (row_idx, line) in lines.iter().enumerate() {
+        // Search bottom-to-top to find the actual current input box,
+        // not stale output lines that happen to match the ❯ + ─ border pattern
+        for row_idx in (1..num_lines).rev() {
+            let line = &lines[row_idx];
             // Find ❯ at start of line (Claude's prompt character)
             let trimmed = line.trim_start();
             if !trimmed.starts_with('❯') {
@@ -370,9 +373,6 @@ impl ScreenTracker {
             }
 
             // Check for borders above and below (input box frame)
-            if row_idx == 0 {
-                continue;
-            }
             let line_above = &lines[row_idx - 1];
             if !line_above.contains('─') {
                 continue;
@@ -986,6 +986,27 @@ mod tests {
         t.process(&data);
         t.process(b"\r\n"); // empty continuation row
         t.process("────────────────────────────────────────────────────\r\n".as_bytes());
+        assert_eq!(t.get_claude_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn claude_prompt_picks_bottom_input_box_over_stale_output() {
+        // Regression: cargo build output can produce ❯ + ─ patterns in the
+        // scrollback that look like an input box. The parser must find the
+        // *bottom-most* match (the real input box), not the first one.
+        let mut t = make_tracker(30, 69, "? for shortcuts");
+        // Stale output with ❯ between ─ lines
+        t.process("─────    Finished `dev` profile [unoptimized + debuginfo] target   ──\r\n".as_bytes());
+        t.process("❯    (s) in 1.36s\r\n".as_bytes());
+        t.process(" ─   Stale entry added, SessionStart groups: 3───────────────────────\r\n".as_bytes());
+        // Some output in between
+        t.process("Some other output\r\n".as_bytes());
+        t.process("\r\n".as_bytes());
+        // Real input box at the bottom
+        t.process("─────────────────────────────────────────────────────────────────────\r\n".as_bytes());
+        t.process("❯\r\n".as_bytes());
+        t.process("─────────────────────────────────────────────────────────────────────\r\n".as_bytes());
+        // Real prompt is empty — parser should find this, not the stale one
         assert_eq!(t.get_claude_input_text(), Some(String::new()));
     }
 
