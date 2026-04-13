@@ -68,42 +68,6 @@ fn inject_raw(port: i32, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Inject text into PTY via inject port.
-fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool) -> i32 {
-    let port = match get_inject_port(db, name) {
-        Some(p) => p,
-        None => {
-            println!("No inject port for '{name}'.");
-            return 1;
-        }
-    };
-
-    if !text.is_empty() {
-        if let Err(e) = inject_raw(port, text.as_bytes()) {
-            println!("Failed to inject to '{name}' (port {port}): {e}");
-            return 1;
-        }
-    }
-
-    if enter {
-        if !text.is_empty() {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if let Err(e) = inject_raw(port, b"\r") {
-            println!("Failed to inject enter to '{name}' (port {port}): {e}");
-            return 1;
-        }
-    }
-
-    let label = match (text.is_empty(), enter) {
-        (false, true) => format!("{} chars + enter", text.len()),
-        (false, false) => format!("{} chars", text.len()),
-        (true, _) => "enter".to_string(),
-    };
-    println!("Injected {label} to {name}");
-    0
-}
-
 pub fn inject_text_remote_result(
     db: &HcomDb,
     name: &str,
@@ -128,6 +92,20 @@ pub fn inject_text_remote_result(
         (true, _) => format!("Injected enter to {}", name),
     };
     Ok(label)
+}
+
+/// Inject text into PTY via inject port (CLI wrapper).
+fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool) -> i32 {
+    match inject_text_remote_result(db, name, text, enter) {
+        Ok(msg) => {
+            println!("{msg}");
+            0
+        }
+        Err(e) => {
+            println!("{e}");
+            1
+        }
+    }
 }
 
 /// Send screen query to inject port, get back parsed JSON.
@@ -398,28 +376,16 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
             return 1;
         }
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
-            return match crate::relay::control::dispatch_remote(
+            return crate::relay::control::dispatch_remote_and_print(
                 db,
                 device,
                 Some(&name),
-                "term_inject",
+                crate::relay::control::rpc_action::TERM_INJECT,
                 &serde_json::json!({"target": base_name, "text": text, "enter": enter}),
                 crate::relay::control::RPC_DEFAULT_TIMEOUT,
-            ) {
-                Ok(inner) => {
-                    println!(
-                        "{}",
-                        inner["message"]
-                            .as_str()
-                            .unwrap_or("Remote term inject completed")
-                    );
-                    0
-                }
-                Err(e) => {
-                    eprintln!("Remote term inject failed: {e}");
-                    1
-                }
-            };
+                "message",
+                "Remote term inject completed",
+            );
         }
         return inject_text(db, &name, &text, enter);
     }
@@ -435,28 +401,16 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
         let name = resolve_display_name(db, name_arg).unwrap_or_else(|| name_arg.clone());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
             let raw_json = argv.iter().any(|a| a == "--json");
-            return match crate::relay::control::dispatch_remote(
+            return crate::relay::control::dispatch_remote_and_print(
                 db,
                 device,
                 Some(&name),
-                "term_screen",
+                crate::relay::control::rpc_action::TERM_SCREEN,
                 &serde_json::json!({"target": base_name, "json": raw_json}),
                 crate::relay::control::RPC_DEFAULT_TIMEOUT,
-            ) {
-                Ok(inner) => {
-                    println!(
-                        "{}",
-                        inner["content"]
-                            .as_str()
-                            .unwrap_or("No remote screen content")
-                    );
-                    0
-                }
-                Err(e) => {
-                    eprintln!("Remote term screen failed: {e}");
-                    1
-                }
-            };
+                "content",
+                "No remote screen content",
+            );
         }
     }
 

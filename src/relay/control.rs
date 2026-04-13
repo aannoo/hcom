@@ -324,6 +324,35 @@ pub fn dispatch_remote(
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
+/// Dispatch a remote RPC and print the result field to stdout.
+/// Returns the CLI exit code (0 on success, 1 on error).
+/// `result_key` is the JSON key in the result to extract (e.g. "content", "message").
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_remote_and_print(
+    db: &HcomDb,
+    device_short_id: &str,
+    target_name: Option<&str>,
+    action: &str,
+    params: &Value,
+    timeout: Duration,
+    result_key: &str,
+    fallback_msg: &str,
+) -> i32 {
+    match dispatch_remote(db, device_short_id, target_name, action, params, timeout) {
+        Ok(inner) => {
+            println!(
+                "{}",
+                inner[result_key].as_str().unwrap_or(fallback_msg)
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("Remote {action} failed: {e}");
+            1
+        }
+    }
+}
+
 /// Default timeout for remote RPC commands (kill, resume, term, transcript, config).
 pub const RPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -351,18 +380,31 @@ pub fn split_device_suffix(name: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// RPC action name constants — use these instead of raw string literals.
+pub mod rpc_action {
+    pub const LAUNCH: &str = "launch";
+    pub const KILL: &str = "kill";
+    pub const RESUME: &str = "resume";
+    pub const CONFIG_GET: &str = "config_get";
+    pub const CONFIG_SET: &str = "config_set";
+    pub const RELAY_OFF: &str = "relay_off";
+    pub const TERM_SCREEN: &str = "term_screen";
+    pub const TERM_INJECT: &str = "term_inject";
+    pub const TRANSCRIPT: &str = "transcript";
+}
+
 type RemoteRpcHandler = fn(&HcomDb, &Value, &str, &HcomConfig) -> Result<Value, String>;
 
 const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
-    ("launch", handle_remote_launch),
-    ("kill", handle_remote_kill),
-    ("resume", handle_remote_resume),
-    ("config_get", handle_remote_config_get),
-    ("config_set", handle_remote_config_set),
-    ("relay_off", handle_remote_relay_off),
-    ("term_screen", handle_remote_term_screen),
-    ("term_inject", handle_remote_term_inject),
-    ("transcript", handle_remote_transcript),
+    (rpc_action::LAUNCH, handle_remote_launch),
+    (rpc_action::KILL, handle_remote_kill),
+    (rpc_action::RESUME, handle_remote_resume),
+    (rpc_action::CONFIG_GET, handle_remote_config_get),
+    (rpc_action::CONFIG_SET, handle_remote_config_set),
+    (rpc_action::RELAY_OFF, handle_remote_relay_off),
+    (rpc_action::TERM_SCREEN, handle_remote_term_screen),
+    (rpc_action::TERM_INJECT, handle_remote_term_inject),
+    (rpc_action::TRANSCRIPT, handle_remote_transcript),
 ];
 
 pub fn advertised_remote_capabilities() -> Vec<&'static str> {
@@ -380,7 +422,7 @@ fn find_remote_rpc_handler(action: &str) -> Option<RemoteRpcHandler> {
 }
 
 fn allows_one_way_remote_action(action: &str) -> bool {
-    action == "relay_off"
+    action == rpc_action::RELAY_OFF
 }
 
 /// Peers whose last relay sync is older than this are considered offline.

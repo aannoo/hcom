@@ -435,16 +435,15 @@ impl MqttRelay {
             }
         };
 
+        let mut ctx = super::pull::InboundContext {
+            psk: &psk,
+            relay_id: &self.relay_id,
+            topic,
+            replay_guard: &mut guard,
+        };
+
         if suffix == "control" {
-            super::pull::handle_control_message(
-                &db,
-                payload,
-                &self.device_uuid,
-                &psk,
-                &self.relay_id,
-                topic,
-                &mut guard,
-            )
+            super::pull::handle_control_message(&db, payload, &self.device_uuid, &mut ctx)
         } else {
             // State message from a remote device
             let device_id = suffix;
@@ -456,11 +455,8 @@ impl MqttRelay {
                 device_id,
                 payload,
                 &self.device_uuid,
-                &psk,
-                &self.relay_id,
-                topic,
                 is_retained,
-                &mut guard,
+                &mut ctx,
             )
         }
     }

@@ -19,7 +19,7 @@ use crate::tools::{codex_args, gemini_args};
 
 struct PreparedResume {
     output: ResumeOutputContext,
-    launch: ResumeLaunchContext,
+    launch: LaunchParams,
     last_event_id: i64,
     session_id: String,
 }
@@ -32,23 +32,6 @@ struct ResumeOutputContext {
     background: bool,
     run_here: Option<bool>,
     launcher_name: String,
-}
-
-struct ResumeLaunchContext {
-    tool: String,
-    args: Vec<String>,
-    tag: Option<String>,
-    system_prompt: String,
-    initial_prompt: Option<String>,
-    pty: bool,
-    background: bool,
-    cwd: String,
-    launcher_name: String,
-    run_here: Option<bool>,
-    batch_id: Option<String>,
-    name: Option<String>,
-    terminal: Option<String>,
-    append_reply_handoff: bool,
 }
 
 /// Run the resume command. `argv` is the full argv[1..].
@@ -125,7 +108,7 @@ pub fn do_resume(
             &db,
             device,
             Some(&name),
-            "resume",
+            crate::relay::control::rpc_action::RESUME,
             &json!({
                 "target": base_name,
                 "fork": fork,
@@ -336,16 +319,18 @@ fn prepare_resume_plan(
             run_here: launch_flags.run_here,
             launcher_name: launcher_name_for_output,
         },
-        launch: ResumeLaunchContext {
+        launch: LaunchParams {
             tool: tool.clone(),
+            count: 1,
             args: merged_args,
             tag: launch_tag,
-            system_prompt: effective_system_prompt,
+            system_prompt: Some(effective_system_prompt),
             initial_prompt: fork_initial_prompt,
             pty: use_pty,
             background: is_headless,
-            cwd: effective_cwd,
-            launcher_name,
+            cwd: Some(effective_cwd),
+            env: None,
+            launcher: Some(launcher_name),
             run_here: launch_flags.run_here,
             batch_id: launch_flags.batch_id.clone(),
             name: if fork {
@@ -353,6 +338,7 @@ fn prepare_resume_plan(
             } else {
                 Some(name.to_string())
             },
+            skip_validation: false,
             terminal: launch_flags.terminal.clone(),
             append_reply_handoff: !(fork && tool == "codex"),
         },
@@ -403,28 +389,7 @@ fn execute_prepared_resume_result(
     fork: bool,
     plan: &PreparedResume,
 ) -> Result<LaunchResult> {
-    let result = launcher::launch(
-        db,
-        LaunchParams {
-            tool: plan.launch.tool.clone(),
-            count: 1,
-            args: plan.launch.args.clone(),
-            tag: plan.launch.tag.clone(),
-            system_prompt: Some(plan.launch.system_prompt.clone()),
-            pty: plan.launch.pty,
-            background: plan.launch.background,
-            cwd: Some(plan.launch.cwd.clone()),
-            env: None,
-            launcher: Some(plan.launch.launcher_name.clone()),
-            run_here: plan.launch.run_here,
-            initial_prompt: plan.launch.initial_prompt.clone(),
-            batch_id: plan.launch.batch_id.clone(),
-            name: plan.launch.name.clone(),
-            skip_validation: false,
-            terminal: plan.launch.terminal.clone(),
-            append_reply_handoff: plan.launch.append_reply_handoff,
-        },
-    )?;
+    let result = launcher::launch(db, plan.launch.clone())?;
 
     if !fork && plan.last_event_id > 0 {
         crate::instances::update_instance_position(
@@ -482,7 +447,8 @@ fn print_resume_preview(
     } else {
         format!("Resume target: {} (same identity)", name)
     };
-    let cwd_note = format!("Directory source: {}", plan.launch.cwd);
+    let cwd_str = plan.launch.cwd.as_deref().unwrap_or(".");
+    let cwd_note = format!("Directory source: {}", cwd_str);
     let notes = [identity_note.as_str(), cwd_note.as_str()];
     print_launch_preview(LaunchPreview {
         action: &plan.output.action,
@@ -491,7 +457,7 @@ fn print_resume_preview(
         background: plan.output.background,
         args: &plan.launch.args,
         tag: plan.output.tag.as_deref(),
-        cwd: Some(&plan.launch.cwd),
+        cwd: Some(cwd_str),
         terminal: plan.output.terminal.as_deref(),
         config: hcom_config,
         show_config_args: false,

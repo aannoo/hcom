@@ -95,7 +95,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             &db,
             device,
             None,
-            "launch",
+            crate::relay::control::rpc_action::LAUNCH,
             &params,
             crate::relay::control::RPC_LAUNCH_TIMEOUT,
         ) {

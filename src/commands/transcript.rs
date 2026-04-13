@@ -2593,11 +2593,11 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         let resolved = crate::instances::resolve_display_name_or_stopped(db, stripped)
             .unwrap_or_else(|| stripped.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
-            return match crate::relay::control::dispatch_remote(
+            return crate::relay::control::dispatch_remote_and_print(
                 db,
                 device,
                 Some(&resolved),
-                "transcript",
+                crate::relay::control::rpc_action::TRANSCRIPT,
                 &json!({
                     "target": base_name,
                     "last": last_n,
@@ -2607,21 +2607,9 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
                     "detailed": detailed,
                 }),
                 crate::relay::control::RPC_DEFAULT_TIMEOUT,
-            ) {
-                Ok(inner) => {
-                    println!(
-                        "{}",
-                        inner["content"]
-                            .as_str()
-                            .unwrap_or("No remote transcript content")
-                    );
-                    0
-                }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    1
-                }
-            };
+                "content",
+                "No remote transcript content",
+            );
         }
     }
 
@@ -2781,12 +2769,42 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
     0
 }
 
+/// Display options for transcript rendering.
+pub struct TranscriptRenderOpts<'a> {
+    pub range: Option<&'a str>,
+    pub last_n: usize,
+    pub json_mode: bool,
+    pub full_mode: bool,
+    pub detailed: bool,
+    pub retry_codex: bool,
+}
+
+impl Default for TranscriptRenderOpts<'_> {
+    fn default() -> Self {
+        Self {
+            range: None,
+            last_n: 10,
+            json_mode: false,
+            full_mode: false,
+            detailed: false,
+            retry_codex: true,
+        }
+    }
+}
+
 pub fn render_instance_transcript(
     db: &HcomDb,
     name: &str,
     last_n: usize,
 ) -> Result<String, String> {
-    render_instance_transcript_with_options(db, name, None, last_n, false, false, false)
+    render_instance_transcript_impl(
+        db,
+        name,
+        &TranscriptRenderOpts {
+            last_n,
+            ..Default::default()
+        },
+    )
 }
 
 pub fn render_instance_transcript_with_options_no_retry(
@@ -2798,8 +2816,17 @@ pub fn render_instance_transcript_with_options_no_retry(
     full_mode: bool,
     detailed: bool,
 ) -> Result<String, String> {
-    render_instance_transcript_with_options_internal(
-        db, name, range, last_n, json_mode, full_mode, detailed, false,
+    render_instance_transcript_impl(
+        db,
+        name,
+        &TranscriptRenderOpts {
+            range,
+            last_n,
+            json_mode,
+            full_mode,
+            detailed,
+            retry_codex: false,
+        },
     )
 }
 
@@ -2812,25 +2839,28 @@ pub fn render_instance_transcript_with_options(
     full_mode: bool,
     detailed: bool,
 ) -> Result<String, String> {
-    render_instance_transcript_with_options_internal(
-        db, name, range, last_n, json_mode, full_mode, detailed, true,
+    render_instance_transcript_impl(
+        db,
+        name,
+        &TranscriptRenderOpts {
+            range,
+            last_n,
+            json_mode,
+            full_mode,
+            detailed,
+            retry_codex: true,
+        },
     )
 }
 
-fn render_instance_transcript_with_options_internal(
+fn render_instance_transcript_impl(
     db: &HcomDb,
     name: &str,
-    range: Option<&str>,
-    last_n: usize,
-    json_mode: bool,
-    full_mode: bool,
-    detailed: bool,
-    retry_codex: bool,
+    opts: &TranscriptRenderOpts<'_>,
 ) -> Result<String, String> {
     let (instance_name, transcript_path, agent_type, session_id) =
-        resolve_instance_transcript(db, name)
-            .ok_or_else(|| no_transcript_error(db, name))?;
-    let (range_start, range_end) = if let Some(r) = range {
+        resolve_instance_transcript(db, name).ok_or_else(|| no_transcript_error(db, name))?;
+    let (range_start, range_end) = if let Some(r) = opts.range {
         parse_range(r)
     } else {
         (None, None)
@@ -2838,15 +2868,15 @@ fn render_instance_transcript_with_options_internal(
     let effective_last = if range_start.is_some() {
         usize::MAX
     } else {
-        last_n
+        opts.last_n
     };
     let exchanges = get_exchanges(
         &transcript_path,
         &agent_type,
         effective_last,
-        detailed,
+        opts.detailed,
         session_id.as_deref(),
-        retry_codex,
+        opts.retry_codex,
     )
     .map_err(|e| e.to_string())?;
 
@@ -2860,7 +2890,7 @@ fn render_instance_transcript_with_options_internal(
         exchanges.iter().collect()
     };
 
-    if json_mode {
+    if opts.json_mode {
         let json_output: Vec<Value> = filtered
             .iter()
             .map(|ex| {
@@ -2871,7 +2901,7 @@ fn render_instance_transcript_with_options_internal(
                     "files": ex.files,
                     "timestamp": ex.timestamp,
                 });
-                if detailed {
+                if opts.detailed {
                     obj["tools"] = json!(
                         ex.tools
                             .iter()
@@ -2907,7 +2937,7 @@ fn render_instance_transcript_with_options_internal(
     let first_pos = filtered.first().map(|e| e.position).unwrap_or(1);
     let last_pos = filtered.last().map(|e| e.position).unwrap_or(1);
     let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
-    let formatted = format_exchanges(&owned, &instance_name, full_mode, detailed);
+    let formatted = format_exchanges(&owned, &instance_name, opts.full_mode, opts.detailed);
     Ok(format!(
         "Recent conversation ({} exchanges, {}-{} of {}) - @{}:\n\n{}",
         owned.len(),

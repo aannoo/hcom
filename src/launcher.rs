@@ -73,6 +73,7 @@ impl LaunchTool {
 }
 
 /// Launch parameters.
+#[derive(Clone)]
 pub struct LaunchParams {
     pub tool: String,
     pub count: usize,
@@ -467,51 +468,56 @@ pub fn launch_pty(
     }
 }
 
+/// Identity and tracking context for a background launch, shared across tool types.
+struct BackgroundLaunchCtx<'a> {
+    db: &'a HcomDb,
+    tool: &'a str,
+    instance_name: &'a str,
+    process_id: &'a str,
+    terminal_mode: Option<&'a str>,
+    tag: &'a str,
+    working_dir: &'a str,
+    log_files: &'a mut Vec<String>,
+    handles: &'a mut Vec<serde_json::Value>,
+}
+
 /// Shared bookkeeping after a successful background launch for gemini/codex/opencode.
 /// Persists the launch context, updates position, records the PID, and appends
 /// log_file / handle entries. Per-tool differences (args, prompt) stay in the caller.
 fn finalize_background_launch(
-    db: &HcomDb,
-    tool: &str,
-    instance_name: &str,
-    process_id: &str,
-    terminal_mode: Option<&str>,
-    tag: &str,
-    working_dir: &str,
+    ctx: &mut BackgroundLaunchCtx<'_>,
     log_file: String,
     pid: u32,
     effective_preset: String,
-    log_files: &mut Vec<String>,
-    handles: &mut Vec<serde_json::Value>,
 ) {
     instance_binding::persist_terminal_launch_context(
-        db,
-        instance_name,
-        terminal_mode,
+        ctx.db,
+        ctx.instance_name,
+        ctx.terminal_mode,
         &effective_preset,
-        Some(process_id),
+        Some(ctx.process_id),
     );
     instances::update_instance_position(
-        db,
-        instance_name,
+        ctx.db,
+        ctx.instance_name,
         &serde_json::Map::from_iter([("pid".to_string(), json!(pid))]),
     );
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
-        process_id,
+        process_id: ctx.process_id,
         terminal_preset: &effective_preset,
-        tag,
+        tag: ctx.tag,
         ..crate::pidtrack::PidRecord::new(
             &crate::paths::hcom_dir(),
             pid,
-            tool,
-            instance_name,
-            working_dir,
+            ctx.tool,
+            ctx.instance_name,
+            ctx.working_dir,
         )
     });
-    log_files.push(log_file.clone());
-    handles.push(json!({
-        "tool": tool,
-        "instance_name": instance_name,
+    ctx.log_files.push(log_file.clone());
+    ctx.handles.push(json!({
+        "tool": ctx.tool,
+        "instance_name": ctx.instance_name,
         "log_file": log_file,
         "pid": pid,
     }));
@@ -553,6 +559,55 @@ fn launch_background_runner(
     match launch_result {
         terminal::LaunchResult::Background(log_file, pid) => Ok((log_file, pid, effective_preset)),
         _ => bail!("background launch failed"),
+    }
+}
+
+/// Common launch path for gemini/codex/opencode: background or PTY foreground.
+///
+/// Handles `launch_background_runner` + `finalize_background_launch` for background,
+/// and `will_run_in_current_terminal` + `launch_pty` for foreground.
+fn launch_pty_or_background(
+    ctx: &mut BackgroundLaunchCtx<'_>,
+    instance_env: &mut HashMap<String, String>,
+    tool_args: &[String],
+    params: &LaunchParams,
+    inside_ai_tool: bool,
+) -> Result<bool> {
+    if params.background {
+        let (log_file, pid, effective_preset) = launch_background_runner(
+            ctx.tool,
+            ctx.working_dir,
+            ctx.instance_name,
+            instance_env,
+            tool_args,
+            ctx.terminal_mode,
+            inside_ai_tool,
+        )?;
+        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        Ok(true)
+    } else {
+        let effective_run_here = will_run_in_current_terminal(
+            params.count,
+            false,
+            params.run_here,
+            ctx.terminal_mode,
+            inside_ai_tool,
+        );
+        let ok = launch_pty(
+            ctx.tool,
+            ctx.working_dir,
+            instance_env,
+            ctx.instance_name,
+            tool_args,
+            effective_run_here,
+            ctx.terminal_mode,
+            inside_ai_tool,
+        )?;
+        if ok {
+            ctx.handles
+                .push(json!({"tool": ctx.tool, "instance_name": ctx.instance_name}));
+        }
+        Ok(ok)
     }
 }
 
@@ -645,7 +700,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
-    let launcher_name: String = params.launcher.unwrap_or_else(|| {
+    let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
         let process_id = std::env::var("HCOM_PROCESS_ID").ok();
         match crate::identity::resolve_identity(
@@ -696,6 +751,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
     let batch_id = params
         .batch_id
+        .take()
         .unwrap_or_else(|| format!("{:08x}", rand::rng().random::<u32>()));
 
     let inside_ai_tool = crate::shared::context::HcomContext::from_os().is_inside_ai_tool();
@@ -846,41 +902,24 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             terminal_mode,
                             inside_ai_tool,
                         )?;
-                        instance_binding::persist_terminal_launch_context(
-                            db,
-                            &instance_name,
-                            terminal_mode,
-                            &effective_preset,
-                            Some(&process_id),
-                        );
-
                         match launch_result {
                             terminal::LaunchResult::Background(log_file, pid) => {
-                                instances::update_instance_position(
-                                    db,
-                                    &instance_name,
-                                    &serde_json::Map::from_iter([("pid".to_string(), json!(pid))]),
-                                );
-                                // Track PID for orphan detection
-                                crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
-                                    process_id: &process_id,
-                                    terminal_preset: &effective_preset,
-                                    tag: params.tag.as_deref().unwrap_or(""),
-                                    ..crate::pidtrack::PidRecord::new(
-                                        &crate::paths::hcom_dir(),
-                                        pid,
-                                        "claude",
-                                        &instance_name,
+                                finalize_background_launch(
+                                    &mut BackgroundLaunchCtx {
+                                        db,
+                                        tool: "claude",
+                                        instance_name: &instance_name,
+                                        process_id: &process_id,
+                                        terminal_mode,
+                                        tag: params.tag.as_deref().unwrap_or(""),
                                         working_dir,
-                                    )
-                                });
-                                log_files.push(log_file.clone());
-                                handles.push(json!({
-                                    "tool": "claude",
-                                    "instance_name": instance_name,
-                                    "log_file": log_file,
-                                    "pid": pid,
-                                }));
+                                        log_files: &mut log_files,
+                                        handles: &mut handles,
+                                    },
+                                    log_file,
+                                    pid,
+                                    effective_preset,
+                                );
                                 Ok(true)
                             }
                             _ => Ok(false),
@@ -963,54 +1002,23 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             json!(params.args),
                         )]),
                     );
-                    if params.background {
-                        let (log_file, pid, effective_preset) = launch_background_runner(
-                            "gemini",
-                            working_dir,
-                            &instance_name,
-                            &mut instance_env,
-                            &params.args,
-                            terminal_mode,
-                            inside_ai_tool,
-                        )?;
-                        finalize_background_launch(
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
                             db,
-                            "gemini",
-                            &instance_name,
-                            &process_id,
+                            tool: "gemini",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
                             terminal_mode,
-                            params.tag.as_deref().unwrap_or(""),
+                            tag: params.tag.as_deref().unwrap_or(""),
                             working_dir,
-                            log_file,
-                            pid,
-                            effective_preset,
-                            &mut log_files,
-                            &mut handles,
-                        );
-                        Ok(true)
-                    } else {
-                        let effective_run_here = will_run_in_current_terminal(
-                            params.count,
-                            false,
-                            params.run_here,
-                            terminal_mode,
-                            inside_ai_tool,
-                        );
-                        let ok = launch_pty(
-                            "gemini",
-                            working_dir,
-                            &instance_env,
-                            &instance_name,
-                            &params.args,
-                            effective_run_here,
-                            terminal_mode,
-                            inside_ai_tool,
-                        )?;
-                        if ok {
-                            handles.push(json!({"tool": "gemini", "instance_name": instance_name}));
-                        }
-                        Ok(ok)
-                    }
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
                 }
 
                 LaunchTool::Codex => {
@@ -1066,54 +1074,23 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
                     instance_env.insert("HCOM_CODEX_SANDBOX_MODE".to_string(), sandbox_mode);
 
-                    if params.background {
-                        let (log_file, pid, effective_preset) = launch_background_runner(
-                            "codex",
-                            working_dir,
-                            &instance_name,
-                            &mut instance_env,
-                            &effective_args,
-                            terminal_mode,
-                            inside_ai_tool,
-                        )?;
-                        finalize_background_launch(
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
                             db,
-                            "codex",
-                            &instance_name,
-                            &process_id,
+                            tool: "codex",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
                             terminal_mode,
-                            params.tag.as_deref().unwrap_or(""),
+                            tag: params.tag.as_deref().unwrap_or(""),
                             working_dir,
-                            log_file,
-                            pid,
-                            effective_preset,
-                            &mut log_files,
-                            &mut handles,
-                        );
-                        Ok(true)
-                    } else {
-                        let effective_run_here = will_run_in_current_terminal(
-                            params.count,
-                            false,
-                            params.run_here,
-                            terminal_mode,
-                            inside_ai_tool,
-                        );
-                        let ok = launch_pty(
-                            "codex",
-                            working_dir,
-                            &instance_env,
-                            &instance_name,
-                            &effective_args,
-                            effective_run_here,
-                            terminal_mode,
-                            inside_ai_tool,
-                        )?;
-                        if ok {
-                            handles.push(json!({"tool": "codex", "instance_name": instance_name}));
-                        }
-                        Ok(ok)
-                    }
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &effective_args,
+                        &params,
+                        inside_ai_tool,
+                    )
                 }
 
                 LaunchTool::OpenCode => {
@@ -1131,55 +1108,23 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         )]),
                     );
 
-                    if params.background {
-                        let (log_file, pid, effective_preset) = launch_background_runner(
-                            "opencode",
-                            working_dir,
-                            &instance_name,
-                            &mut instance_env,
-                            &params.args,
-                            terminal_mode,
-                            inside_ai_tool,
-                        )?;
-                        finalize_background_launch(
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
                             db,
-                            "opencode",
-                            &instance_name,
-                            &process_id,
+                            tool: "opencode",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
                             terminal_mode,
-                            params.tag.as_deref().unwrap_or(""),
+                            tag: params.tag.as_deref().unwrap_or(""),
                             working_dir,
-                            log_file,
-                            pid,
-                            effective_preset,
-                            &mut log_files,
-                            &mut handles,
-                        );
-                        Ok(true)
-                    } else {
-                        let effective_run_here = will_run_in_current_terminal(
-                            params.count,
-                            false,
-                            params.run_here,
-                            terminal_mode,
-                            inside_ai_tool,
-                        );
-                        let ok = launch_pty(
-                            "opencode",
-                            working_dir,
-                            &instance_env,
-                            &instance_name,
-                            &params.args,
-                            effective_run_here,
-                            terminal_mode,
-                            inside_ai_tool,
-                        )?;
-                        if ok {
-                            handles
-                                .push(json!({"tool": "opencode", "instance_name": instance_name}));
-                        }
-                        Ok(ok)
-                    }
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
                 }
             }
         })();

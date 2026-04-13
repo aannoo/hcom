@@ -897,9 +897,9 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
             instances::resolve_display_name(db, inst).unwrap_or_else(|| inst.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
             let action = if argv.len() >= 2 {
-                "config_set"
+                crate::relay::control::rpc_action::CONFIG_SET
             } else {
-                "config_get"
+                crate::relay::control::rpc_action::CONFIG_GET
             };
             let params = if argv.len() >= 2 {
                 json!({
@@ -922,7 +922,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
                 crate::relay::control::RPC_DEFAULT_TIMEOUT,
             ) {
                 Ok(inner) => {
-                    if action == "config_get" {
+                    if action == crate::relay::control::rpc_action::CONFIG_GET {
                         println!(
                             "{}",
                             render_config_instance_get(

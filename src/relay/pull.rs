@@ -16,6 +16,14 @@ use super::crypto;
 use super::replay::ReplayGuard;
 use super::{device_short_id, safe_kv_get, safe_kv_set};
 
+/// Crypto + replay context shared by all inbound message handlers.
+pub struct InboundContext<'a> {
+    pub psk: &'a [u8; 32],
+    pub relay_id: &'a str,
+    pub topic: &'a str,
+    pub replay_guard: &'a mut ReplayGuard,
+}
+
 struct OpenedEnvelope {
     plaintext: Vec<u8>,
     ts_secs: u64,
@@ -40,14 +48,11 @@ fn record_state_ts_watermark(db: &HcomDb, device_id: &str, ts_secs: u64) {
 /// JSON bytes ready for `serde_json::from_slice`. Errors are logged inline so
 /// caller sites stay short.
 fn open_envelope_for_handler(
-    psk: &[u8; 32],
-    relay_id: &str,
-    topic: &str,
+    ctx: &mut InboundContext<'_>,
     sender_short: &str,
     payload: &[u8],
     allow_stale: bool,
     retained_watermark: Option<u64>,
-    replay_guard: &mut ReplayGuard,
 ) -> Option<OpenedEnvelope> {
     let parsed = match crypto::parse_envelope(payload) {
         Ok(p) => p,
@@ -58,7 +63,7 @@ fn open_envelope_for_handler(
     };
     let now_secs = crate::shared::time::now_epoch_f64() as u64;
     let replay_result = if allow_stale {
-        replay_guard.check_retained(
+        ctx.replay_guard.check_retained(
             sender_short,
             parsed.nonce,
             parsed.ts_secs,
@@ -66,16 +71,20 @@ fn open_envelope_for_handler(
             retained_watermark,
         )
     } else {
-        replay_guard.check(sender_short, parsed.nonce, parsed.ts_secs, now_secs)
+        ctx.replay_guard
+            .check(sender_short, parsed.nonce, parsed.ts_secs, now_secs)
     };
     if let Err(e) = replay_result {
         log::log_warn("relay", "relay.replay", &format!("{}", e));
         return None;
     }
 
-    match crypto::open(psk, relay_id, topic, payload) {
+    match crypto::open(ctx.psk, ctx.relay_id, ctx.topic, payload) {
         Ok(pt) => {
-            if let Err(e) = replay_guard.record_nonce(sender_short, parsed.nonce, now_secs) {
+            if let Err(e) =
+                ctx.replay_guard
+                    .record_nonce(sender_short, parsed.nonce, now_secs)
+            {
                 log::log_warn("relay", "relay.replay", &format!("{}", e));
                 return None;
             }
@@ -127,21 +136,9 @@ pub fn handle_control_message(
     db: &HcomDb,
     payload: &[u8],
     own_device: &str,
-    psk: &[u8; 32],
-    relay_id: &str,
-    topic: &str,
-    replay_guard: &mut ReplayGuard,
+    ctx: &mut InboundContext<'_>,
 ) -> bool {
-    let opened = match open_envelope_for_handler(
-        psk,
-        relay_id,
-        topic,
-        "control",
-        payload,
-        false,
-        None,
-        replay_guard,
-    ) {
+    let opened = match open_envelope_for_handler(ctx, "control", payload, false, None) {
         Some(p) => p,
         None => return false,
     };
@@ -182,11 +179,8 @@ pub fn handle_state_message(
     device_id: &str,
     payload: &[u8],
     own_device: &str,
-    psk: &[u8; 32],
-    relay_id: &str,
-    topic: &str,
     allow_stale: bool,
-    replay_guard: &mut ReplayGuard,
+    ctx: &mut InboundContext<'_>,
 ) -> bool {
     let t0 = std::time::Instant::now();
 
@@ -195,16 +189,7 @@ pub fn handle_state_message(
     } else {
         None
     };
-    let opened = match open_envelope_for_handler(
-        psk,
-        relay_id,
-        topic,
-        device_id,
-        payload,
-        allow_stale,
-        retained_watermark,
-        replay_guard,
-    ) {
+    let opened = match open_envelope_for_handler(ctx, device_id, payload, allow_stale, retained_watermark) {
         Some(p) => p,
         None => return false,
     };
@@ -837,11 +822,13 @@ mod tests {
             "device-1234",
             &envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             false,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         );
 
         let row = db
@@ -880,11 +867,13 @@ mod tests {
             "device-1234",
             &envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             false,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
 
         assert_eq!(
@@ -922,11 +911,13 @@ mod tests {
             "device-1234",
             &envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             false,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
 
         assert_eq!(
@@ -981,11 +972,13 @@ mod tests {
             "device-1234",
             &envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             true,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
 
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_some());
@@ -1035,11 +1028,13 @@ mod tests {
             "device-1234",
             &envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             true,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
 
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
@@ -1075,11 +1070,13 @@ mod tests {
             "device-1234",
             &bad_envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             false,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
         assert_eq!(
             guard.len(),
@@ -1092,11 +1089,13 @@ mod tests {
             "device-1234",
             &good_envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             false,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
         assert_eq!(guard.len(), 1);
     }
@@ -1130,11 +1129,13 @@ mod tests {
             "device-1234",
             &envelope,
             "own-device-5678",
-            &psk,
-            "relay-test",
-            topic,
             true,
-            &mut guard,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
         ));
 
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
