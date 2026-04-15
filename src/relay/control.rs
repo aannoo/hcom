@@ -500,7 +500,7 @@ fn check_remote_action_for_db(
                 Ok(())
             } else {
                 Err(format!(
-                    "device {target_device_short_id}{detail} does not advertise remote action '{action}'"
+                    "device {target_device_short_id}{detail} does not advertise remote action '{action}' — peer may be running an older binary, or its relay worker may need a restart to pick up newly-installed capabilities (hcom relay off && hcom relay on on the peer)."
                 ))
             }
         }
@@ -922,7 +922,9 @@ fn handle_remote_transcript(
 }
 
 const REMOTE_EVENTS_HARD_CAP: usize = 2000;
-const REMOTE_EVENTS_BYTE_CAP: usize = 2 * 1024 * 1024;
+// Cap RPC response below the rumqttc client's 128 KiB accept limit
+// (src/relay/client.rs), leaving room for envelope + AEAD overhead.
+const REMOTE_EVENTS_BYTE_CAP: usize = 98_304;
 
 fn handle_remote_events(
     db: &HcomDb,
@@ -1416,7 +1418,11 @@ mod tests {
         safe_kv_set(&db, "relay_caps_device-123", Some(r#"["launch"]"#));
 
         let err = check_remote_action_for_db(&db, "WXYZ", "resume", None).unwrap_err();
-        assert_eq!(err, "device WXYZ does not advertise remote action 'resume'");
+        assert!(
+            err.starts_with("device WXYZ does not advertise remote action 'resume'"),
+            "unexpected err: {err}"
+        );
+        assert!(err.contains("hcom relay off"), "missing restart hint: {err}");
     }
 
     #[test]
@@ -1426,9 +1432,11 @@ mod tests {
         safe_kv_set(&db, "relay_caps_device-123", Some(r#"["launch"]"#));
 
         let err = check_remote_action_for_db(&db, "WXYZ", "kill", Some("luna:WXYZ")).unwrap_err();
-        assert_eq!(
-            err,
-            "device WXYZ (target luna:WXYZ) does not advertise remote action 'kill'"
+        assert!(
+            err.starts_with(
+                "device WXYZ (target luna:WXYZ) does not advertise remote action 'kill'"
+            ),
+            "unexpected err: {err}"
         );
     }
 
@@ -1629,12 +1637,12 @@ mod tests {
     #[test]
     fn test_handle_remote_events_truncates_when_envelope_exceeds_cap() {
         let db = test_db();
-        // Big payload per event so a few rows blow past 2 MiB.
-        let big = "x".repeat(50_000);
-        for _ in 0..60 {
+        // Big payload per event so a few rows blow past the 96 KiB cap.
+        let big = "x".repeat(8_000);
+        for _ in 0..20 {
             db.log_event("message", "luna", &json!({"blob": big})).unwrap();
         }
-        let input_count = 60usize;
+        let input_count = 20usize;
         let out = handle_remote_events(
             &db,
             &json!({"last": input_count}),
