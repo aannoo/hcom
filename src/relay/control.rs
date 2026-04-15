@@ -1074,10 +1074,10 @@ fn handle_remote_sub_create(
     }
 
     let outcome = if filters.is_empty() {
-        crate::commands::events::build_and_insert_sql_subscription(db, &sql_parts, &caller, once)?
+        crate::commands::events::build_and_insert_sql_subscription(db, &sql_parts, &caller, once, None)?
     } else {
         crate::commands::events::build_and_insert_filter_subscription(
-            db, &filters, &sql_parts, &caller, once,
+            db, &filters, &sql_parts, &caller, once, None,
         )?
     };
 

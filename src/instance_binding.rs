@@ -726,6 +726,7 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
                 instance_name,
                 false,
                 true,
+                None,
             );
         }
     }
@@ -1182,6 +1183,7 @@ mod tests {
             "test-agent",
             false,
             true,
+            None,
         );
         assert_eq!(result, 0, "subscription creation should succeed");
 

@@ -2390,6 +2390,22 @@ impl HcomDb {
             );
             let _ = self.send_sub_notification(caller, &notification);
 
+            if let Some(on_hit_text) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
+                // caller_kind is captured at sub creation and frozen — provenance
+                // stays stable even if the caller instance stops before fire time.
+                let caller_kind = sub
+                    .get("caller_kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("external");
+                if let Err(e) = self.send_message_as(caller, caller_kind, on_hit_text) {
+                    crate::log::log_error(
+                        "db",
+                        "check_event_subscriptions.on_hit",
+                        &format!("{e}"),
+                    );
+                }
+            }
+
             // Update last_id or remove if --once
             if sub.get("once").and_then(|v| v.as_bool()).unwrap_or(false) {
                 if let Err(e) = self.kv_set(key, None) {
@@ -2686,7 +2702,18 @@ impl HcomDb {
     /// Send a system notification message (simplified inline version).
     /// Parses @mentions, computes scope, inserts message event.
     pub fn send_system_message(&self, sender_name: &str, message: &str) -> Result<Vec<String>> {
-        // Get all instances
+        self.send_message_as(sender_name, "system", message)
+    }
+
+    /// Like `send_system_message` but lets the caller specify `sender_kind`
+    /// ("instance" | "external" | "system"). Used by subscription on-hit to
+    /// preserve the sub caller's real identity on the event.
+    pub fn send_message_as(
+        &self,
+        sender_name: &str,
+        sender_kind: &str,
+        message: &str,
+    ) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT name, tag FROM instances")?;
@@ -2697,15 +2724,12 @@ impl HcomDb {
             .filter_map(|r| r.ok())
             .collect();
 
-        // Parse @mentions from message
         let mentions: Vec<String> = MENTION_PATTERN
             .captures_iter(message)
             .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
             .collect();
 
-        // Compute scope and delivered_to
         let (scope, mention_list, delivered_to) = if mentions.is_empty() {
-            // Broadcast
             let delivered: Vec<String> = instances
                 .iter()
                 .filter(|(name, _)| name != sender_name)
@@ -2713,7 +2737,6 @@ impl HcomDb {
                 .collect();
             ("broadcast".to_string(), vec![], delivered)
         } else {
-            // Targeted - match mentions against instances (full name or base name)
             let mut matched = Vec::new();
             for mention in &mentions {
                 let mention_lower = mention.to_lowercase();
@@ -2738,10 +2761,9 @@ impl HcomDb {
             ("mentions".to_string(), matched, delivered)
         };
 
-        // Build event data
         let mut event_data = serde_json::json!({
             "from": sender_name,
-            "sender_kind": "system",
+            "sender_kind": sender_kind,
             "scope": scope,
             "text": message,
             "delivered_to": delivered_to,
@@ -2750,8 +2772,11 @@ impl HcomDb {
             event_data["mentions"] = serde_json::json!(mention_list);
         }
 
-        // Insert with sys_ prefix for routing instance
-        let routing_instance = format!("sys_{}", sender_name);
+        let routing_instance = match sender_kind {
+            "instance" => sender_name.to_string(),
+            "external" => format!("ext_{}", sender_name),
+            _ => format!("sys_{}", sender_name),
+        };
         self.log_event("message", &routing_instance, &event_data)?;
 
         Ok(delivered_to)
@@ -4567,6 +4592,304 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.len(), 1);
         assert!(delivered.contains(&"luna".to_string()));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_on_hit_provenance_instance_caller() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sub = serde_json::json!({
+            "id": "sub-onhit1",
+            "caller": "luna",
+            "caller_kind": "instance",
+            "sql": "type = 'message' AND msg_from = 'nova'",
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false,
+            "on_hit_text": "starting review now",
+        });
+        db.kv_set("events_sub:sub-onhit1", Some(&sub.to_string()))
+            .unwrap();
+
+        db.log_event(
+            "message",
+            "nova",
+            &serde_json::json!({
+                "from": "nova",
+                "sender_kind": "instance",
+                "scope": "broadcast",
+                "text": "heads up",
+                "delivered_to": ["luna"],
+            }),
+        )
+        .unwrap();
+
+        // Find the on-hit event: from=luna, sender_kind=instance, text matches
+        let row: Option<(String, String)> = db
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.sender_kind'), json_extract(data, '$.text') \
+                 FROM events WHERE json_extract(data, '$.from') = 'luna' \
+                 AND json_extract(data, '$.text') = 'starting review now' LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok();
+        assert!(row.is_some(), "on-hit message should be logged");
+        let (kind, text) = row.unwrap();
+        assert_eq!(kind, "instance", "caller 'luna' is an instance → sender_kind=instance");
+        assert_eq!(text, "starting review now", "on-hit text sent verbatim, no @-prefix");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_on_hit_external_caller_and_mention_routing() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('dbadmin', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Caller 'bigboss' is NOT in instances → external kind.
+        // on_hit_text mentions @dbadmin → normal mention routing must deliver to dbadmin only.
+        let sub = serde_json::json!({
+            "id": "sub-onhit2",
+            "caller": "bigboss",
+            "caller_kind": "external",
+            "sql": "type = 'message' AND msg_from = 'nova'",
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false,
+            "on_hit_text": "@dbadmin review the change",
+        });
+        db.kv_set("events_sub:sub-onhit2", Some(&sub.to_string()))
+            .unwrap();
+
+        db.log_event(
+            "message",
+            "nova",
+            &serde_json::json!({
+                "from": "nova",
+                "sender_kind": "instance",
+                "scope": "broadcast",
+                "text": "trigger",
+                "delivered_to": ["dbadmin"],
+            }),
+        )
+        .unwrap();
+
+        let row: Option<(String, String, String)> = db
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.sender_kind'), \
+                        json_extract(data, '$.scope'), \
+                        json_extract(data, '$.delivered_to') \
+                 FROM events WHERE json_extract(data, '$.from') = 'bigboss' LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        assert!(row.is_some(), "on-hit message from bigboss should be logged");
+        let (kind, scope, delivered) = row.unwrap();
+        assert_eq!(kind, "external", "non-instance caller → sender_kind=external");
+        assert_eq!(scope, "mentions", "text contains @mention → mentions scope");
+        assert!(delivered.contains("dbadmin"), "delivered_to must include dbadmin");
+        assert!(!delivered.contains("bigboss"), "caller itself is not auto-mentioned");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_on_hit_caller_kind_captured_at_creation() {
+        // Verify resolve_caller_kind via build_and_insert_filter_subscription:
+        // instance caller → caller_kind=instance
+        // non-instance caller (e.g. bigboss from -b) → caller_kind=external
+        use crate::commands::events::build_and_insert_filter_subscription;
+        use std::collections::HashMap;
+
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("agent".to_string(), vec!["luna".to_string()]);
+        filters.insert("status".to_string(), vec!["listening".to_string()]);
+
+        build_and_insert_filter_subscription(&db, &filters, &[], "luna", false, Some("hi"))
+            .unwrap();
+        build_and_insert_filter_subscription(&db, &filters, &[], "bigboss", false, Some("hi"))
+            .unwrap();
+
+        let luna_kind: String = db
+            .conn
+            .query_row(
+                "SELECT json_extract(value, '$.caller_kind') FROM kv \
+                 WHERE key LIKE 'events_sub:%' \
+                 AND json_extract(value, '$.caller') = 'luna' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(luna_kind, "instance");
+
+        let bb_kind: String = db
+            .conn
+            .query_row(
+                "SELECT json_extract(value, '$.caller_kind') FROM kv \
+                 WHERE key LIKE 'events_sub:%' \
+                 AND json_extract(value, '$.caller') = 'bigboss' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(bb_kind, "external");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_on_hit_provenance_stable_after_caller_stops() {
+        // Sub created by an instance stays sender_kind=instance at fire time
+        // even if that instance row has been deleted before the match.
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sub = serde_json::json!({
+            "id": "sub-stab1",
+            "caller": "luna",
+            "caller_kind": "instance",
+            "sql": "type = 'message' AND msg_from = 'nova'",
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false,
+            "on_hit_text": "still luna",
+        });
+        db.kv_set("events_sub:sub-stab1", Some(&sub.to_string()))
+            .unwrap();
+
+        // Caller disappears before the sub fires.
+        db.conn
+            .execute("DELETE FROM instances WHERE name = 'luna'", [])
+            .unwrap();
+
+        db.log_event(
+            "message",
+            "nova",
+            &serde_json::json!({
+                "from": "nova",
+                "sender_kind": "instance",
+                "scope": "broadcast",
+                "text": "trigger",
+                "delivered_to": [],
+            }),
+        )
+        .unwrap();
+
+        let kind: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.sender_kind') FROM events \
+                 WHERE json_extract(data, '$.from') = 'luna' \
+                 AND json_extract(data, '$.text') = 'still luna' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        assert_eq!(
+            kind.as_deref(),
+            Some("instance"),
+            "provenance captured at creation must survive caller stop"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_on_hit_unmatched_mention_delivers_to_nobody() {
+        // Documents current behavior: an on-hit text mentioning a nonexistent
+        // agent produces a mentions-scope event with empty delivered_to.
+        // This mirrors how send_system_message behaves for typos — no error,
+        // no fallback to broadcast. If we ever tighten mention validation for
+        // on-hit, update this test.
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sub = serde_json::json!({
+            "id": "sub-typo1",
+            "caller": "luna",
+            "caller_kind": "instance",
+            "sql": "type = 'message' AND msg_from = 'nova'",
+            "created": 1000.0,
+            "last_id": 0,
+            "once": false,
+            "on_hit_text": "@notarealagent hello",
+        });
+        db.kv_set("events_sub:sub-typo1", Some(&sub.to_string()))
+            .unwrap();
+
+        db.log_event(
+            "message",
+            "nova",
+            &serde_json::json!({
+                "from": "nova",
+                "sender_kind": "instance",
+                "scope": "broadcast",
+                "text": "trigger",
+                "delivered_to": [],
+            }),
+        )
+        .unwrap();
+
+        let row: Option<(String, String)> = db
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.scope'), \
+                        json_extract(data, '$.delivered_to') \
+                 FROM events WHERE json_extract(data, '$.from') = 'luna' \
+                 AND json_extract(data, '$.text') = '@notarealagent hello' LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok();
+        assert!(row.is_some(), "on-hit message should still be logged");
+        let (scope, delivered) = row.unwrap();
+        assert_eq!(scope, "mentions", "unmatched @ still produces mentions scope");
+        assert_eq!(delivered, "[]", "nobody matched → empty delivered_to");
 
         cleanup_test_db(db_path);
     }

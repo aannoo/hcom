@@ -74,6 +74,15 @@ pub struct EventsSubArgs {
     /// Target remote device short_id (e.g., NUVA) — installs the sub on that device
     #[arg(long)]
     pub device: Option<String>,
+    /// Attach a message (sent from the sub's caller) whenever it fires. Supports @mentions.
+    #[arg(long = "on-hit")]
+    pub on_hit: Option<String>,
+    /// Create the sub as an external sender (same semantics as `hcom send --from`).
+    /// Use `-b` as shorthand for `--as bigboss`.
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
+    #[arg(short = 'b', long = "bigboss", default_value_t = false)]
+    pub from_bigboss: bool,
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
@@ -293,6 +302,9 @@ fn events_sub_list(db: &HcomDb) -> i32 {
         };
 
         println!("{id:<10} {caller:<12} {mode:<10} {filter_display}");
+        if let Some(on_hit) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
+            println!("{:<10} {:<12} {:<10} on-hit: {on_hit:?}", "", "", "");
+        }
     }
 
     0
@@ -311,8 +323,23 @@ fn events_sub_filter(
     sql_parts: &[String],
     caller: &str,
     once: bool,
+    on_hit: Option<&str>,
 ) -> i32 {
-    create_filter_subscription(db, filters, sql_parts, caller, once, false)
+    create_filter_subscription(db, filters, sql_parts, caller, once, false, on_hit)
+}
+
+/// Determine sender_kind for a sub caller at creation time.
+/// Stored on the sub so on-hit provenance stays stable across caller lifecycle.
+fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
+    let exists: bool = db
+        .conn()
+        .query_row(
+            "SELECT 1 FROM instances WHERE name = ?",
+            rusqlite::params![caller],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if exists { "instance" } else { "external" }
 }
 
 /// Outcome of a subscription insert attempt.
@@ -329,6 +356,7 @@ pub(crate) fn build_and_insert_filter_subscription(
     sql_parts: &[String],
     caller: &str,
     once: bool,
+    on_hit: Option<&str>,
 ) -> Result<SubCreateOutcome, String> {
     // Build SQL from filters
     let mut sql = match build_sql_from_flags(filters) {
@@ -360,11 +388,12 @@ pub(crate) fn build_and_insert_filter_subscription(
 
     // Generate subscription ID from SHA256 hash
     let id_source = format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         caller,
         serde_json::to_string(filters).unwrap_or_default(),
         sql,
-        once
+        once,
+        on_hit.unwrap_or(""),
     );
     let hash = sha256_hash(&id_source);
     let sub_id = format!("sub-{}", &hash[..8]);
@@ -378,7 +407,7 @@ pub(crate) fn build_and_insert_filter_subscription(
     let now = crate::shared::time::now_epoch_f64();
     let last_id = db.get_last_event_id();
 
-    let sub_data = json!({
+    let mut sub_data = json!({
         "id": sub_id,
         "caller": caller,
         "filters": filters,
@@ -387,6 +416,12 @@ pub(crate) fn build_and_insert_filter_subscription(
         "last_id": last_id,
         "once": once,
     });
+    if let Some(text) = on_hit {
+        sub_data["on_hit_text"] = json!(text);
+        // Capture caller_kind at creation so on-hit provenance stays stable
+        // even if the caller instance stops before the sub fires.
+        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
+    }
 
     let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
 
@@ -405,8 +440,9 @@ pub(crate) fn create_filter_subscription(
     caller: &str,
     once: bool,
     silent: bool,
+    on_hit: Option<&str>,
 ) -> i32 {
-    let outcome = match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once) {
+    let outcome = match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
         Ok(o) => o,
         Err(e) => {
             if !silent {
@@ -451,6 +487,7 @@ pub(crate) fn build_and_insert_sql_subscription(
     sql_parts: &[String],
     caller: &str,
     once: bool,
+    on_hit: Option<&str>,
 ) -> Result<SubCreateOutcome, String> {
     let sql = sql_parts.join(" ").replace("\\!", "!");
 
@@ -461,7 +498,7 @@ pub(crate) fn build_and_insert_sql_subscription(
         return Err(format!("Invalid SQL: {e}"));
     }
 
-    let hash = sha256_hash(&format!("{caller}{sql}{once}"));
+    let hash = sha256_hash(&format!("{caller}{sql}{once}{}", on_hit.unwrap_or("")));
     let sub_id = format!("sub-{}", &hash[..8]);
     let sub_key = format!("events_sub:{sub_id}");
 
@@ -472,7 +509,7 @@ pub(crate) fn build_and_insert_sql_subscription(
     let now = crate::shared::time::now_epoch_f64();
     let last_id = db.get_last_event_id();
 
-    let sub_data = json!({
+    let mut sub_data = json!({
         "id": sub_id,
         "sql": sql,
         "caller": caller,
@@ -480,6 +517,10 @@ pub(crate) fn build_and_insert_sql_subscription(
         "last_id": last_id,
         "created": now,
     });
+    if let Some(text) = on_hit {
+        sub_data["on_hit_text"] = json!(text);
+        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
+    }
 
     let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
 
@@ -490,8 +531,8 @@ pub(crate) fn build_and_insert_sql_subscription(
 }
 
 /// Create a raw SQL subscription.
-fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool) -> i32 {
-    let outcome = match build_and_insert_sql_subscription(db, sql_parts, caller, once) {
+fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool, on_hit: Option<&str>) -> i32 {
+    let outcome = match build_and_insert_sql_subscription(db, sql_parts, caller, once, on_hit) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("{e}");
@@ -600,6 +641,10 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
                 return 1;
             }
         }
+    } else if args.from_bigboss || args.as_name.is_some() {
+        args.as_name
+            .clone()
+            .unwrap_or_else(|| crate::shared::constants::SENDER.to_string())
     } else if let Some(name) = caller_name {
         name.to_string()
     } else {
@@ -615,7 +660,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     // Filter-based subscription
     if !filters.is_empty() {
-        return events_sub_filter(db, &filters, &sql_parts, &caller, once);
+        return events_sub_filter(db, &filters, &sql_parts, &caller, once, args.on_hit.as_deref());
     }
 
     // No filters and no SQL: show help
@@ -628,7 +673,8 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
              \x20 events sub list                   List active subscriptions\n\
              \x20 events unsub <id>                 Remove a subscription\n\
              \x20   --once                          Auto-remove after first match\n\
-             \x20   --for <name>                    Subscribe on behalf of another agent\n\n\
+             \x20   --for <name>                    Subscribe on behalf of another agent\n\
+             \x20   --on-hit <TEXT>                 Attach message (sent from caller) when sub fires\n\n\
              Filters (same flag repeated = OR, different flags = AND):\n\
              \x20 --agent NAME                      Agent name\n\
              \x20 --type TYPE                       message | status | life\n\
@@ -654,7 +700,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
     }
 
     // SQL-based subscription
-    events_sub_sql(db, &sql_parts, &caller, once)
+    events_sub_sql(db, &sql_parts, &caller, once, args.on_hit.as_deref())
 }
 
 /// Handle `hcom events unsub <id>`.
