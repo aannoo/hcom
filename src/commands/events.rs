@@ -43,6 +43,12 @@ pub struct EventsArgs {
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
+    /// Fetch events from a remote device instead of local DB
+    #[arg(long)]
+    pub remote_fetch: bool,
+    /// Target device short_id for --remote-fetch (e.g., NUVA)
+    #[arg(long)]
+    pub device: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -871,6 +877,10 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
     // Handle subcommands
     if let Some(ref subcmd) = args.subcmd {
+        if args.remote_fetch {
+            eprintln!("Error: --remote-fetch is only supported in query mode");
+            return 1;
+        }
         match subcmd {
             EventsSubcmd::Launch(launch_args) => {
                 return cmd_events_launch(db, launch_args, instance_name.as_deref());
@@ -894,6 +904,64 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
     resolve_filter_names(&mut filters, db);
+
+    // Remote one-shot fetch
+    if args.remote_fetch {
+        if wait_timeout.is_some() {
+            eprintln!("Error: --wait is not supported with --remote-fetch");
+            return 1;
+        }
+        let device = match args.device.as_deref() {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => {
+                eprintln!("Error: --remote-fetch requires --device <SHORT_ID>");
+                return 1;
+            }
+        };
+        let filters_json = match serde_json::to_value(&filters) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: failed to serialize filters: {e}");
+                return 1;
+            }
+        };
+        let mut params = json!({
+            "filters": filters_json,
+            "last": last_n,
+        });
+        if let Some(ref s) = sql_where {
+            params["sql"] = json!(s);
+        }
+        match crate::relay::control::dispatch_remote(
+            db,
+            &device,
+            None,
+            crate::relay::control::rpc_action::EVENTS,
+            &params,
+            crate::relay::control::RPC_DEFAULT_TIMEOUT,
+        ) {
+            Ok(result) => {
+                if let Some(events) = result.get("events").and_then(|v| v.as_array()) {
+                    for event in events {
+                        let output = if full_output {
+                            event.clone()
+                        } else {
+                            streamline_event(event, &filters)
+                        };
+                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                    }
+                }
+                if result.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    println!("{}", json!({"truncated": true, "note": "response size capped"}));
+                }
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("Remote events fetch failed: {e}");
+                return 1;
+            }
+        }
+    }
 
     // Build filter SQL
     let mut filter_query = String::new();

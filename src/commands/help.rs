@@ -52,6 +52,7 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ("  --all", "Include archived sessions"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
+    ("  --remote-fetch --device ID", "One-shot fetch from remote device"),
 ];
 
 // events help continued after FILTER_HELP splice
