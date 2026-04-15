@@ -391,6 +391,7 @@ pub mod rpc_action {
     pub const TERM_SCREEN: &str = "term_screen";
     pub const TERM_INJECT: &str = "term_inject";
     pub const TRANSCRIPT: &str = "transcript";
+    pub const EVENTS: &str = "events";
 }
 
 type RemoteRpcHandler = fn(&HcomDb, &Value, &str, &HcomConfig) -> Result<Value, String>;
@@ -405,6 +406,7 @@ const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
     (rpc_action::TERM_SCREEN, handle_remote_term_screen),
     (rpc_action::TERM_INJECT, handle_remote_term_inject),
     (rpc_action::TRANSCRIPT, handle_remote_transcript),
+    (rpc_action::EVENTS, handle_remote_events),
 ];
 
 pub fn advertised_remote_capabilities() -> Vec<&'static str> {
@@ -498,7 +500,7 @@ fn check_remote_action_for_db(
                 Ok(())
             } else {
                 Err(format!(
-                    "device {target_device_short_id}{detail} does not advertise remote action '{action}'"
+                    "device {target_device_short_id}{detail} does not advertise remote action '{action}' — peer may be running an older binary, or its relay worker may need a restart to pick up newly-installed capabilities (hcom relay off && hcom relay on on the peer)."
                 ))
             }
         }
@@ -919,6 +921,101 @@ fn handle_remote_transcript(
     Ok(json!({"target": target, "content": content}))
 }
 
+const REMOTE_EVENTS_HARD_CAP: usize = 2000;
+// Cap RPC response below the rumqttc client's 128 KiB accept limit
+// (src/relay/client.rs), leaving room for envelope + AEAD overhead.
+const REMOTE_EVENTS_BYTE_CAP: usize = 98_304;
+
+fn handle_remote_events(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let filters: crate::core::filters::FilterMap = match params.get("filters") {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid filters param: {e}"))?,
+        _ => crate::core::filters::FilterMap::new(),
+    };
+    let sql = optional_param(params, "sql").map(|s| s.to_string());
+    let mut last_n = usize_param(params, "last", 20);
+    if last_n == 0 {
+        last_n = 20;
+    }
+    if last_n > REMOTE_EVENTS_HARD_CAP {
+        last_n = REMOTE_EVENTS_HARD_CAP;
+    }
+
+    crate::core::filters::validate_type_constraints(&filters)
+        .map_err(|e| format!("filter error: {e}"))?;
+
+    let mut where_clause = String::new();
+    match crate::core::filters::build_sql_from_flags(&filters) {
+        Ok(s) if !s.is_empty() => where_clause.push_str(&format!(" AND ({s})")),
+        Ok(_) => {}
+        Err(e) => return Err(format!("filter error: {e}")),
+    }
+    if let Some(ref s) = sql {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            where_clause.push_str(&format!(" AND ({trimmed})"));
+        }
+    }
+
+    let query = format!(
+        "SELECT id, timestamp, type, instance, data FROM events_v WHERE 1=1{where_clause} ORDER BY id DESC LIMIT {last_n}"
+    );
+    let mut stmt = db
+        .conn()
+        .prepare(&query)
+        .map_err(|e| format!("sql error: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let ts: String = row.get(1)?;
+            let etype: String = row.get(2)?;
+            let instance: String = row.get(3)?;
+            let data_str: String = row.get(4)?;
+            Ok((id, ts, etype, instance, data_str))
+        })
+        .map_err(|e| format!("sql error: {e}"))?;
+
+    let mut events: Vec<Value> = Vec::new();
+    for row in rows {
+        match row {
+            Ok((id, ts, etype, instance, data_str)) => {
+                let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
+                events.push(json!({
+                    "id": id,
+                    "ts": ts,
+                    "type": etype,
+                    "instance": instance,
+                    "data": data,
+                }));
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let mut truncated = false;
+    let build_envelope = |events: &Vec<Value>, truncated: bool| -> Value {
+        let mut out = json!({"events": events, "count": events.len()});
+        if truncated {
+            out["truncated"] = json!(true);
+        }
+        out
+    };
+    let mut out = build_envelope(&events, truncated);
+    let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
+    while serialized_len > REMOTE_EVENTS_BYTE_CAP && !events.is_empty() {
+        events.pop();
+        truncated = true;
+        out = build_envelope(&events, truncated);
+        serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
+    }
+    Ok(out)
+}
+
 /// Process incoming control events targeting this device.
 /// Deduplicates by timestamp to avoid re-processing.
 pub fn handle_control_events(
@@ -1321,7 +1418,11 @@ mod tests {
         safe_kv_set(&db, "relay_caps_device-123", Some(r#"["launch"]"#));
 
         let err = check_remote_action_for_db(&db, "WXYZ", "resume", None).unwrap_err();
-        assert_eq!(err, "device WXYZ does not advertise remote action 'resume'");
+        assert!(
+            err.starts_with("device WXYZ does not advertise remote action 'resume'"),
+            "unexpected err: {err}"
+        );
+        assert!(err.contains("hcom relay off"), "missing restart hint: {err}");
     }
 
     #[test]
@@ -1331,9 +1432,11 @@ mod tests {
         safe_kv_set(&db, "relay_caps_device-123", Some(r#"["launch"]"#));
 
         let err = check_remote_action_for_db(&db, "WXYZ", "kill", Some("luna:WXYZ")).unwrap_err();
-        assert_eq!(
-            err,
-            "device WXYZ (target luna:WXYZ) does not advertise remote action 'kill'"
+        assert!(
+            err.starts_with(
+                "device WXYZ (target luna:WXYZ) does not advertise remote action 'kill'"
+            ),
+            "unexpected err: {err}"
         );
     }
 
@@ -1402,6 +1505,7 @@ mod tests {
                 "term_screen",
                 "term_inject",
                 "transcript",
+                "events",
             ]
         );
     }
@@ -1456,5 +1560,114 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "relay_psk is not remotely queryable");
+    }
+
+    fn seed_events(db: &HcomDb, count: usize) {
+        for i in 0..count {
+            let etype = if i % 2 == 0 { "message" } else { "status" };
+            db.log_event(etype, "luna", &json!({"i": i})).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_handle_remote_events_empty_filters_returns_all() {
+        let db = test_db();
+        seed_events(&db, 5);
+        let out = handle_remote_events(&db, &json!({}), "initiator", &HcomConfig::default())
+            .unwrap();
+        assert_eq!(out["count"].as_u64().unwrap(), 5);
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn test_handle_remote_events_type_message_filter() {
+        let db = test_db();
+        seed_events(&db, 6);
+        let out = handle_remote_events(
+            &db,
+            &json!({"filters": {"type": ["message"]}, "last": 50}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        for e in events {
+            assert_eq!(e["type"].as_str().unwrap(), "message");
+        }
+    }
+
+    #[test]
+    fn test_handle_remote_events_hard_cap() {
+        let db = test_db();
+        seed_events(&db, 10);
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 9999}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["count"].as_u64().unwrap(), 10);
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 3}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["count"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_handle_remote_events_missing_filters_ok() {
+        let db = test_db();
+        seed_events(&db, 2);
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 10}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["count"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_handle_remote_events_truncates_when_envelope_exceeds_cap() {
+        let db = test_db();
+        // Big payload per event so a few rows blow past the 96 KiB cap.
+        let big = "x".repeat(8_000);
+        for _ in 0..20 {
+            db.log_event("message", "luna", &json!({"blob": big})).unwrap();
+        }
+        let input_count = 20usize;
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": input_count}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        let returned = out["events"].as_array().unwrap().len();
+        assert!(returned < input_count, "expected truncation, got {returned}");
+        let envelope_len = serde_json::to_string(&out).unwrap().len();
+        assert!(envelope_len <= REMOTE_EVENTS_BYTE_CAP, "envelope {envelope_len} bytes exceeds cap");
+    }
+
+    #[test]
+    fn test_handle_remote_events_invalid_sql_returns_err() {
+        let db = test_db();
+        seed_events(&db, 2);
+        let err = handle_remote_events(
+            &db,
+            &json!({"sql": "not a real column = 1"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("sql error"), "unexpected err: {err}");
     }
 }
