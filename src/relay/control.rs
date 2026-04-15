@@ -996,17 +996,20 @@ fn handle_remote_events(
     }
 
     let mut truncated = false;
-    let mut serialized_len = serde_json::to_string(&events).map(|s| s.len()).unwrap_or(0);
+    let build_envelope = |events: &Vec<Value>, truncated: bool| -> Value {
+        let mut out = json!({"events": events, "count": events.len()});
+        if truncated {
+            out["truncated"] = json!(true);
+        }
+        out
+    };
+    let mut out = build_envelope(&events, truncated);
+    let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     while serialized_len > REMOTE_EVENTS_BYTE_CAP && !events.is_empty() {
         events.pop();
         truncated = true;
-        serialized_len = serde_json::to_string(&events).map(|s| s.len()).unwrap_or(0);
-    }
-
-    let count = events.len();
-    let mut out = json!({"events": events, "count": count});
-    if truncated {
-        out["truncated"] = json!(true);
+        out = build_envelope(&events, truncated);
+        serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     }
     Ok(out)
 }
@@ -1621,6 +1624,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["count"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_handle_remote_events_truncates_when_envelope_exceeds_cap() {
+        let db = test_db();
+        // Big payload per event so a few rows blow past 2 MiB.
+        let big = "x".repeat(50_000);
+        for _ in 0..60 {
+            db.log_event("message", "luna", &json!({"blob": big})).unwrap();
+        }
+        let input_count = 60usize;
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": input_count}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        let returned = out["events"].as_array().unwrap().len();
+        assert!(returned < input_count, "expected truncation, got {returned}");
+        let envelope_len = serde_json::to_string(&out).unwrap().len();
+        assert!(envelope_len <= REMOTE_EVENTS_BYTE_CAP, "envelope {envelope_len} bytes exceeds cap");
     }
 
     #[test]

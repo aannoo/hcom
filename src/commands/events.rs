@@ -941,15 +941,22 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
             crate::relay::control::RPC_DEFAULT_TIMEOUT,
         ) {
             Ok(result) => {
-                if let Some(events) = result.get("events").and_then(|v| v.as_array()) {
-                    for event in events {
-                        let output = if full_output {
-                            event.clone()
-                        } else {
-                            streamline_event(event, &filters)
-                        };
-                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                let events_arr = match result.get("events").and_then(|v| v.as_array()) {
+                    Some(a) => a,
+                    None => {
+                        eprintln!(
+                            "Remote events fetch: malformed peer response (missing 'events' array)"
+                        );
+                        return 1;
                     }
+                };
+                for event in events_arr {
+                    let output = if full_output {
+                        event.clone()
+                    } else {
+                        streamline_event(event, &filters)
+                    };
+                    println!("{}", serde_json::to_string(&output).unwrap_or_default());
                 }
                 if result.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
                     println!("{}", json!({"truncated": true, "note": "response size capped"}));
