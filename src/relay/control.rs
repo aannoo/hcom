@@ -892,7 +892,8 @@ fn handle_remote_term_screen(
 ) -> Result<Value, String> {
     let target = required_param(params, "target")?;
     let raw_json = bool_param(params, "json", false);
-    let content = crate::commands::term::read_instance_screen(db, target, raw_json)?;
+    let clean = bool_param(params, "clean", false);
+    let content = crate::commands::term::read_instance_screen(db, target, raw_json, clean)?;
     Ok(json!({"target": target, "content": content}))
 }
 

@@ -124,7 +124,12 @@ fn query_screen(port: i32) -> Option<serde_json::Value> {
     serde_json::from_slice(&data).ok()
 }
 
-pub fn read_instance_screen(db: &HcomDb, name: &str, raw_json: bool) -> Result<String, String> {
+pub fn read_instance_screen(
+    db: &HcomDb,
+    name: &str,
+    raw_json: bool,
+    clean: bool,
+) -> Result<String, String> {
     let port = get_inject_port(db, name).ok_or_else(|| {
         format!(
             "No inject port for '{}'. Instance not running or not PTY-managed.",
@@ -136,12 +141,12 @@ pub fn read_instance_screen(db: &HcomDb, name: &str, raw_json: bool) -> Result<S
     if raw_json {
         Ok(serde_json::to_string(&result).unwrap_or_default())
     } else {
-        Ok(format_screen(&result))
+        Ok(format_screen(&result, clean))
     }
 }
 
 /// Format screen JSON as readable text.
-fn format_screen(data: &serde_json::Value) -> String {
+fn format_screen(data: &serde_json::Value, clean: bool) -> String {
     let lines = data["lines"].as_array();
     let cursor = data["cursor"].as_array();
     let size = data["size"].as_array();
@@ -169,24 +174,28 @@ fn format_screen(data: &serde_json::Value) -> String {
     let input_text = data.get("input_text");
 
     let mut out = Vec::new();
-    out.push(format!("Screen {rows}x{cols}  cursor ({cr},{cc})"));
-    out.push(format!(
-        "ready={ready}  prompt_empty={prompt_empty}  input_text={input_text}",
-        ready = ready.map(|v| v.to_string()).unwrap_or("null".into()),
-        prompt_empty = prompt_empty.map(|v| v.to_string()).unwrap_or("null".into()),
-        input_text = input_text
-            .map(|v| match v.as_str() {
-                Some(s) => format!("\"{}\"", s),
-                None => v.to_string(),
-            })
-            .unwrap_or("null".into()),
-    ));
-    out.push(String::new());
+    if !clean {
+        out.push(format!("Screen {rows}x{cols}  cursor ({cr},{cc})"));
+        out.push(format!(
+            "ready={ready}  prompt_empty={prompt_empty}  input_text={input_text}",
+            ready = ready.map(|v| v.to_string()).unwrap_or("null".into()),
+            prompt_empty = prompt_empty.map(|v| v.to_string()).unwrap_or("null".into()),
+            input_text = input_text
+                .map(|v| match v.as_str() {
+                    Some(s) => format!("\"{}\"", s),
+                    None => v.to_string(),
+                })
+                .unwrap_or("null".into()),
+        ));
+        out.push(String::new());
+    }
 
     if let Some(lines) = lines {
         for (i, line) in lines.iter().enumerate() {
             let text = line.as_str().unwrap_or("");
-            if !text.is_empty() {
+            if clean {
+                out.push(text.to_string());
+            } else if !text.is_empty() {
                 out.push(format!("  {i:3}: {text}"));
             }
         }
@@ -273,9 +282,10 @@ fn list_logs() -> i32 {
 /// Handle screen query: hcom term [name] [--json]
 fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
     let raw_json = argv.iter().any(|a| a == "--json");
+    let clean = argv.iter().any(|a| a == "--clean");
     let args: Vec<&str> = argv
         .iter()
-        .filter(|a| a.as_str() != "--json")
+        .filter(|a| a.as_str() != "--json" && a.as_str() != "--clean")
         .map(|s| s.as_str())
         .collect();
     let name = args.first().copied();
@@ -296,7 +306,7 @@ fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
                 if raw_json {
                     println!("{}", serde_json::to_string(&result).unwrap_or_default());
                 } else {
-                    println!("{}", format_screen(&result));
+                    println!("{}", format_screen(&result, clean));
                 }
                 0
             }
@@ -325,7 +335,7 @@ fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
                     println!("{}", serde_json::to_string(&merged).unwrap_or_default());
                 } else {
                     println!("[{inst_name}]");
-                    println!("{}", format_screen(&result));
+                    println!("{}", format_screen(&result, clean));
                 }
                 found = true;
             } else {
@@ -348,6 +358,7 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
              hcom term                  Query all PTY screens\n  \
              hcom term <name>           Query specific instance screen\n  \
              hcom term <name> --json    JSON output\n  \
+             hcom term <name> --clean   Plain text, no header or line numbers\n  \
              hcom term inject <name> [text] [--enter]   Inject text/enter\n  \
              hcom term debug on|off|logs                 PTY debug logging"
         );
@@ -401,12 +412,13 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
         let name = resolve_display_name(db, name_arg).unwrap_or_else(|| name_arg.clone());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
             let raw_json = argv.iter().any(|a| a == "--json");
+            let clean = argv.iter().any(|a| a == "--clean");
             return crate::relay::control::dispatch_remote_and_print(
                 db,
                 device,
                 Some(&name),
                 crate::relay::control::rpc_action::TERM_SCREEN,
-                &serde_json::json!({"target": base_name, "json": raw_json}),
+                &serde_json::json!({"target": base_name, "json": raw_json, "clean": clean}),
                 crate::relay::control::RPC_DEFAULT_TIMEOUT,
                 "content",
                 "No remote screen content",
@@ -444,7 +456,7 @@ mod tests {
             "prompt_empty": false,
             "input_text": "test",
         });
-        let result = format_screen(&data);
+        let result = format_screen(&data, false);
         assert!(result.contains("Screen 24x80"));
         assert!(result.contains("cursor (2,5)"));
         assert!(result.contains("hello"));
@@ -548,7 +560,7 @@ mod tests {
                 .unwrap();
         });
 
-        let rendered = read_instance_screen(&db, "luna", false).unwrap();
+        let rendered = read_instance_screen(&db, "luna", false, false).unwrap();
         handle.join().unwrap();
 
         assert!(rendered.contains("Screen 24x80  cursor (2,5)"));
