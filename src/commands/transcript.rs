@@ -264,14 +264,14 @@ fn normalize_tool_name(name: &str) -> &str {
 // ── Transcript Path Discovery ────────────────────────────────────────────
 
 /// Get Claude config directory.
-fn claude_config_dir() -> PathBuf {
+pub(crate) fn claude_config_dir() -> PathBuf {
     std::env::var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".claude"))
 }
 
 /// Detect agent type from transcript path.
-fn detect_agent_type(path: &str) -> &str {
+pub(crate) fn detect_agent_type(path: &str) -> &str {
     if path.contains(".claude") || path.contains("/projects/") {
         "claude"
     } else if path.contains(".gemini") {
