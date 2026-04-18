@@ -745,16 +745,17 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
         lines.push(ex(u, d));
     }
 
-    // hcom flags
+    // hcom flags — shared with resume/fork, plus --device which only applies
+    // at launch (resume uses the `<target>:<device>` suffix instead).
     lines.push(String::new());
     lines.push("hcom Flags:".to_string());
-    lines.push("    --tag <name>                 Group tag (names become tag-*)".to_string());
-    lines.push("    --terminal <preset>          Where new windows open".to_string());
-    lines.push("    --dir <path>                  Working directory for launch".to_string());
-    lines.push("    --headless                   Run in background (no terminal window)".to_string());
-    lines.push("    --device <name>              Launch on a remote relay device".to_string());
-    lines.push("    --hcom-prompt <text>          Initial prompt".to_string());
-    lines.push("    --hcom-system-prompt <text>   System prompt".to_string());
+    for (flag, desc) in SHARED_LAUNCH_FLAGS {
+        lines.push(format!("    {:<29}{}", flag, desc));
+    }
+    lines.push(format!(
+        "    {:<29}{}",
+        "--device <name>", "Launch on a remote relay device"
+    ));
 
     // Environment
     lines.push(String::new());
@@ -784,13 +785,22 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     lines.push(String::new());
     if spec.has_fork {
         lines.push("Resume / Fork:".to_string());
-        lines.push("    hcom r <name>                  Resume stopped agent by name".to_string());
         lines.push(
-            "    hcom f <name>                  Fork agent session (active or stopped)".to_string(),
+            "    hcom r <target>                Resume by name / session UUID / thread name"
+                .to_string(),
+        );
+        lines.push(
+            "    hcom f <target>                Fork an active or stopped session".to_string(),
+        );
+        lines.push(
+            "    (append :<device> to run on a remote device; see `hcom r --help`)".to_string(),
         );
     } else {
         lines.push("Resume:".to_string());
-        lines.push("    hcom r <name>                  Resume stopped agent by name".to_string());
+        lines.push(
+            "    hcom r <target>                Resume by name / session UUID / thread name"
+                .to_string(),
+        );
         lines.push(format!(
             "  {} does not support session forking (hcom f).",
             spec.label
@@ -901,6 +911,49 @@ Commands:\n\
     )
 }
 
+/// Flags accepted by both `hcom <tool>` (fresh launch) and `hcom r` / `hcom f`
+/// (resume/fork). Indented to 4 spaces for tool help, re-indented for resume.
+const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
+    ("--tag <name>", "Group tag (names become tag-*)"),
+    ("--terminal <preset>", "Where new windows open"),
+    ("--dir <path>", "Working directory"),
+    ("--headless", "Run in background (no terminal window)"),
+    ("--run-here", "Run in current terminal"),
+    ("--hcom-prompt <text>", "Initial prompt"),
+    ("--hcom-system-prompt <text>", "System prompt"),
+];
+
+/// Shared help body for `hcom r` / `hcom f` (both accept the same target
+/// forms and launch flags; only the header, blurb, and see-also differ).
+fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> String {
+    let mut flags = String::new();
+    for (flag, desc) in SHARED_LAUNCH_FLAGS {
+        flags.push_str(&format!("  {:<34}{}\n", flag, desc));
+    }
+    flags.push_str(&format!("  {:<34}{}", "--go", "Skip preview, run immediately"));
+    format!(
+        "Usage:\n\
+         \x20 {usage_line}\n\
+         \n\
+         <target> can be:\n\
+         \x20 <name>                            hcom name (4-letter)\n\
+         \x20 <uuid>                            claude/codex/gemini session UUID\n\
+         \x20 ses_<id>                          opencode session ID\n\
+         \x20 <thread-name>                     claude /rename title or codex thread_name\n\
+         \x20 <target>:<device>                 run on a remote device via relay\n\
+         \n\
+         {blurb}\n\
+         \n\
+         Flags (parsed before tool args; pass `--` to stop parsing):\n\
+         {flags}\n\
+         \n\
+         Extra args after flags are forwarded to the underlying tool.\n\
+         \n\
+         See also:\n\
+         \x20 {see_also_line}",
+    )
+}
+
 /// Get formatted help for a single command.
 pub fn get_command_help(name: &str) -> String {
     let mut lines = vec!["Usage:".to_string()];
@@ -910,27 +963,24 @@ pub fn get_command_help(name: &str) -> String {
         return generate_tool_help(spec);
     }
 
-    // Resume / Fork shortcuts
+    // Resume / Fork shortcuts — share the target/flag body, differ only on header + see-also.
     if name == "r" || name == "resume" {
-        return "Usage:\n\
-                \x20 hcom r <name> [tool-args...]    Resume a stopped agent by name\n\
-                \n\
-                Extra args are forwarded to the tool on relaunch.\n\
-                \n\
-                See also:\n\
-                \x20 hcom f <name>                   Fork an agent session (claude/codex/opencode)"
-            .to_string();
+        return resume_fork_help(
+            "hcom r <target> [tool-args...]    Resume a stopped agent",
+            "Adopting by UUID or thread-name reclaims the original hcom\n\
+             identity if one existed; otherwise a new identity is assigned.\n\
+             CWD is recovered from the session's transcript/DB.",
+            "hcom f <target>                   Fork an agent session (claude/codex/opencode)",
+        );
     }
     if name == "f" || name == "fork" {
-        return "Usage:\n\
-                \x20 hcom f <name> [tool-args...]    Fork an agent session (active or stopped)\n\
-                \n\
-                Creates a new agent that continues from the forked session.\n\
-                Supported tools: claude, codex, opencode.\n\
-                \n\
-                See also:\n\
-                \x20 hcom r <name>                   Resume a stopped agent"
-            .to_string();
+        return resume_fork_help(
+            "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
+            "Creates a new agent that continues from the forked session.\n\
+             Supported tools: claude, codex, opencode. (gemini does not fork.)\n\
+             Remote fork (`:<device>`) requires --dir to pin the target cwd.",
+            "hcom r <target>                   Resume a stopped agent",
+        );
     }
 
     let entries: Option<&[HelpEntry]> = match name {
