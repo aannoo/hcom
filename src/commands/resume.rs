@@ -588,9 +588,17 @@ fn execute_prepared_resume_result(
         );
     }
     if fork {
-        // Anchor fork child's cursor at current position so it doesn't replay
-        // historical broadcasts. Pre-registration may inherit a stale
-        // HCOM_LAUNCH_EVENT_ID from the parent environment.
+        // Named-fork belt-and-suspenders: the pre-registered instance row
+        // was created with last_event_id=0 and may inherit a stale
+        // HCOM_LAUNCH_EVENT_ID from the parent's env if the tool doesn't
+        // propagate our override cleanly. Stamp the current position
+        // directly on the DB so there's no replay window.
+        //
+        // Adoption-fork (plan.launch.name=None) doesn't need the belt:
+        // there's no pre-reg row, so the SessionStart hook creates the
+        // instance fresh using HCOM_LAUNCH_EVENT_ID (always set by
+        // launcher::launch to current max) — no zero-cursor window to
+        // protect against.
         let current_max = db.get_last_event_id();
         if let Some(ref child_name) = plan.launch.name {
             crate::instances::update_instance_position(
@@ -766,9 +774,14 @@ fn load_stopped_snapshot(
     db: &HcomDb,
     name: &str,
 ) -> Result<(String, String, String, String, bool, i64, String)> {
-    // Query the latest "stopped" life event for this instance
+    // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
+    // (old 10-row LIMIT could drop the snapshot after many relaunches).
     let mut stmt = db.conn().prepare(
-        "SELECT data FROM events WHERE type='life' AND instance=? ORDER BY id DESC LIMIT 10",
+        "SELECT data FROM events
+         WHERE type='life'
+           AND instance=?
+           AND json_extract(data, '$.action') = 'stopped'
+         ORDER BY id DESC LIMIT 1",
     )?;
 
     let rows: Vec<String> = stmt
@@ -945,11 +958,19 @@ fn resolve_thread_name(name: &str) -> Result<Option<String>> {
             );
         }
         (Some(id), None) => {
-            eprintln!("Resolved Claude thread '{}' → {}", name, id);
+            log_info(
+                "resume",
+                "resolve_thread_name.claude",
+                &format!("name={} session_id={}", name, id),
+            );
             Ok(Some(id))
         }
         (None, Some(id)) => {
-            eprintln!("Resolved Codex thread '{}' → {}", name, id);
+            log_info(
+                "resume",
+                "resolve_thread_name.codex",
+                &format!("name={} session_id={}", name, id),
+            );
             Ok(Some(id))
         }
         (None, None) => Ok(None),
