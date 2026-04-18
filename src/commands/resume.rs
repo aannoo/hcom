@@ -120,6 +120,30 @@ pub fn do_resume(
         return do_adopt_session(&db, &name, fork, extra_args, flags, &hcom_config);
     }
 
+    // If not a UUID and not a known hcom instance, try resolving as a thread name.
+    // Claude and Codex both support user-assigned session names; scan their indexes
+    // and error on cross-tool ambiguity rather than silently picking one.
+    if matches!(db.get_instance_full(&name), Ok(None) | Err(_))
+        && crate::relay::control::split_device_suffix(&name).is_none()
+    {
+        if let Some(session_id) = resolve_thread_name(&name)? {
+            // Route through the same adoption machinery (collision guard, CWD recovery, etc.)
+            if let Ok(Some(instance_name)) = db.get_session_binding(&session_id) {
+                if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
+                    bail!(
+                        "Session {} (thread '{}') is currently active as '{}' — run hcom stop {} first",
+                        session_id,
+                        name,
+                        instance_name,
+                        instance_name
+                    );
+                }
+                return do_resume(&instance_name, fork, extra_args, flags);
+            }
+            return do_adopt_session(&db, &session_id, fork, extra_args, flags, &hcom_config);
+        }
+    }
+
     if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
         if fork {
             let has_dir = extra_args
@@ -749,12 +773,8 @@ fn load_stopped_snapshot(
     }
 
     bail!(
-        "No stopped snapshot found for '{name}'.\n\
-         If this is a session UUID, the transcript wasn't found on disk.\n\
-         If this is a Claude/Codex thread name, resume it natively instead:\n  \
-         hcom claude --resume '{name}'   (Claude resolves /rename titles)\n  \
-         hcom codex  resume '{name}'     (Codex resolves thread names)\n  \
-         hcom gemini --resume '{name}'   (Gemini accepts UUID, index, or 'latest')"
+        "No stopped snapshot found for '{name}'. Not a known hcom instance, \
+         session UUID, or recognized thread name."
     )
 }
 
@@ -842,6 +862,153 @@ fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
     let mut merged = resume.to_vec();
     merged.extend(preserved);
     merged
+}
+
+// ── Thread-name resolution ───────────────────────────────────────────────
+
+/// Resolve a user-visible thread name (e.g. a Claude `/rename` title or a
+/// Codex thread name) to a session UUID by scanning tool-specific indexes.
+///
+/// Returns `Ok(Some(uuid))` on a unique match, `Ok(None)` if no tool
+/// recognizes the name, or `Err` if multiple tools match (ambiguity).
+fn resolve_thread_name(name: &str) -> Result<Option<String>> {
+    let claude_match = resolve_claude_thread_name(name);
+    let codex_match = resolve_codex_thread_name(name);
+
+    match (claude_match, codex_match) {
+        (Some(claude_id), Some(codex_id)) => {
+            bail!(
+                "Thread name '{}' matches both Claude (session {}) and Codex (session {}).\n\
+                 Use `hcom claude --resume '{}'` or `hcom codex resume '{}'` to disambiguate.",
+                name,
+                claude_id,
+                codex_id,
+                name,
+                name
+            );
+        }
+        (Some(id), None) => {
+            eprintln!("Resolved Claude thread '{}' → {}", name, id);
+            Ok(Some(id))
+        }
+        (None, Some(id)) => {
+            eprintln!("Resolved Codex thread '{}' → {}", name, id);
+            Ok(Some(id))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Resolve a Claude Code custom title to a session UUID by scanning
+/// `~/.claude/projects/*/*.jsonl` for `{"type":"custom-title","customTitle":"..."}`.
+/// Picks the most recently modified match.
+fn resolve_claude_thread_name(name: &str) -> Option<String> {
+    let projects_dir = claude_config_dir().join("projects");
+    if !projects_dir.is_dir() {
+        return None;
+    }
+
+    let mut best_match: Option<(String, std::time::SystemTime)> = None;
+
+    let entries = std::fs::read_dir(&projects_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let sub_entries = match std::fs::read_dir(entry.path()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for sub_entry in sub_entries.flatten() {
+            let path = sub_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                // Fast pre-filter: skip lines that can't contain a custom-title entry.
+                if !line.contains("custom-title") {
+                    continue;
+                }
+                let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if parsed.get("type").and_then(|v| v.as_str()) == Some("custom-title")
+                    && parsed.get("customTitle").and_then(|v| v.as_str()) == Some(name)
+                {
+                    if let Some(session_id) = parsed.get("sessionId").and_then(|v| v.as_str()) {
+                        let mtime = sub_entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        if best_match
+                            .as_ref()
+                            .map_or(true, |(_, prev_mtime)| mtime > *prev_mtime)
+                        {
+                            best_match = Some((session_id.to_string(), mtime));
+                        }
+                    }
+                    break; // Only one custom-title per file
+                }
+            }
+        }
+    }
+
+    best_match.map(|(id, _)| id)
+}
+
+/// Resolve a Codex thread name to a session UUID by scanning
+/// `~/.codex/session_index.jsonl`. Picks the most recently updated match.
+fn resolve_codex_thread_name(name: &str) -> Option<String> {
+    let index_path = dirs::home_dir()?.join(".codex/session_index.jsonl");
+    let file = std::fs::File::open(&index_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut best_match: Option<(String, String)> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed.get("thread_name").and_then(|v| v.as_str()) == Some(name) {
+            let id = parsed
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let updated = parsed
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !id.is_empty()
+                && best_match
+                    .as_ref()
+                    .map_or(true, |(_, prev)| updated > *prev)
+            {
+                best_match = Some((id, updated));
+            }
+        }
+    }
+
+    best_match.map(|(id, _)| id)
 }
 
 // ── Session-ID adoption ──────────────────────────────────────────────────
