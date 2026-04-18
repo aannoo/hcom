@@ -102,18 +102,27 @@ pub fn do_resume(
 
     // Adoption path: UUID input for a session not yet tracked as an hcom instance.
     if is_session_id(&name) {
-        // Collision guard: if the UUID is bound to a running hcom instance, refuse.
-        // If bound to a stopped instance, delegate to the normal name-based path
-        // (preserves the existing hcom identity across re-resumes).
+        // Identity reclaim: `session_bindings` is a live lookaside that the FK
+        // cascade + explicit DELETE in hooks/common.rs clear on every stop/kill,
+        // so `get_session_binding` only sees rows for currently-running or
+        // crash/orphaned instances. life.stopped events are the real source of
+        // truth — they persist forever and carry the snapshot.session_id. Try
+        // the binding first (collision guard for active instances), then fall
+        // back to the events scan so `hcom r <uuid>` after stop/kill reclaims
+        // the original 4-letter identity instead of allocating a new one.
         if let Ok(Some(instance_name)) = db.get_session_binding(&name) {
             if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
                 bail!(
-                    "Session {} is currently active as '{}' — run hcom stop {} first",
+                    "Session {} is currently active as '{}' — run hcom kill {} first",
                     name,
                     instance_name,
                     instance_name
                 );
             }
+            return do_resume(&instance_name, fork, extra_args, flags);
+        }
+
+        if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&name) {
             return do_resume(&instance_name, fork, extra_args, flags);
         }
 
@@ -131,13 +140,16 @@ pub fn do_resume(
             if let Ok(Some(instance_name)) = db.get_session_binding(&session_id) {
                 if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
                     bail!(
-                        "Session {} (thread '{}') is currently active as '{}' — run hcom stop {} first",
+                        "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
                         session_id,
                         name,
                         instance_name,
                         instance_name
                     );
                 }
+                return do_resume(&instance_name, fork, extra_args, flags);
+            }
+            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
                 return do_resume(&instance_name, fork, extra_args, flags);
             }
             return do_adopt_session(&db, &session_id, fork, extra_args, flags, &hcom_config);
