@@ -1106,15 +1106,17 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
 
 /// Recover the session's working directory from the tool's on-disk state.
 ///
-/// - **Claude**: `cwd` is on every line; read line 1 only (O(1) I/O).
+/// - **Claude**: `cwd` is on most entry lines but NOT on line 1 (which is a
+///   `permission-mode` header). Scan the first few lines until one carries a
+///   non-empty `cwd`; give up after a small cap to keep I/O bounded.
 /// - **Codex**: first line is `session_meta` with `payload.cwd`; read line 1.
 /// - **Gemini**: the session JSON has `projectHash = sha256(cwd)` (hex).
 ///   `~/.gemini/projects.json` maps `cwd → short-id`. Hash each key and
 ///   match against `projectHash` to recover the original CWD.
 fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
     match tool {
-        "claude" => read_first_line_cwd(path, |v| v.get("cwd").and_then(|c| c.as_str())),
-        "codex" => read_first_line_cwd(path, |v| {
+        "claude" => scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str())),
+        "codex" => scan_lines_for_cwd(path, 1, |v| {
             v.get("payload")
                 .and_then(|p| p.get("cwd"))
                 .and_then(|c| c.as_str())
@@ -1124,21 +1126,31 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
     }
 }
 
-/// Read one line from a transcript and extract a CWD via the accessor.
-fn read_first_line_cwd(path: &str, pick: impl Fn(&serde_json::Value) -> Option<&str>) -> Option<String> {
+/// Read up to `max_lines` lines from a JSONL transcript and return the first
+/// non-empty CWD produced by `pick`. Malformed lines are skipped.
+fn scan_lines_for_cwd(
+    path: &str,
+    max_lines: usize,
+    pick: impl Fn(&serde_json::Value) -> Option<&str>,
+) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-    if reader.read_line(&mut line).ok()? == 0 {
-        return None;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(max_lines) {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(cwd) = pick(&parsed) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
     }
-    let parsed: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    let cwd = pick(&parsed)?;
-    if cwd.is_empty() {
-        None
-    } else {
-        Some(cwd.to_string())
-    }
+    None
 }
 
 /// Gemini session JSON has `projectHash = hex(sha256(cwd))`. Read it, then
@@ -1647,6 +1659,46 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, Some("/start/dir".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_extract_cwd_claude_skips_permission_mode_header() {
+        // Real Claude transcripts start with a `permission-mode` line that has
+        // no `cwd`; cwd first appears on a later entry. Must scan forward.
+        let dir = std::env::temp_dir().join("hcom_test_cwd_claude_header");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"abc"}
+{"type":"snapshot","messageId":"m1"}
+{"parentUuid":null,"type":"user","cwd":"/real/cwd","message":"hi"}
+"#,
+        )
+        .unwrap();
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
+        assert_eq!(result, Some("/real/cwd".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_extract_cwd_claude_gives_up_after_cap() {
+        // If no cwd appears in the first 20 lines, return None rather than
+        // reading the full transcript.
+        let dir = std::env::temp_dir().join("hcom_test_cwd_claude_cap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.jsonl");
+        let mut content = String::new();
+        for _ in 0..25 {
+            content.push_str(r#"{"type":"noise"}"#);
+            content.push('\n');
+        }
+        content.push_str(r#"{"type":"user","cwd":"/late/cwd"}"#);
+        content.push('\n');
+        std::fs::write(&path, content).unwrap();
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
+        assert_eq!(result, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
