@@ -78,6 +78,8 @@ agent → hooks → db → hooks → other agent
 
 For **Claude Code**, **Gemini CLI**, **Codex**, and **OpenCode**, messages arrive mid-turn (injected between tool calls) or wake idle agents immediately. Any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
+Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
+
 Hooks go into tool config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
 
 ---
@@ -86,8 +88,10 @@ Hooks go into tool config dirs under `~/` (or `HCOM_DIR`) on first run. If you a
 
 Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, and **tmux** additionally support closing panes from `hcom kill`.
 
+To configure a custom terminal open/close setup, tell agent to run:
+
 ```bash
-hcom config terminal --info   # tell agent to run this to configure other terminals
+hcom config terminal --info
 ```
 
 ---
@@ -181,32 +185,26 @@ brew uninstall hcom                   # or: rm $(which hcom)
 ## Reference
 
 <details>
-<summary>Tools & Launch</summary>
+<summary>Tools</summary>
 
 ### Supported tools
 
-| Tool | Automatic delivery | Connect |
+| Tool | Message delivery | Connect |
 |---|---|---|
-| Claude Code | yes, hooks | `hcom claude` |
-| Gemini CLI | yes, hooks | `hcom gemini` |
-| Codex CLI | yes, hooks | `hcom codex` |
-| OpenCode | yes, plugin | `hcom opencode` |
-| Anything else | manual poll via `hcom listen` | `hcom start` (run inside tool) |
-
-### Launch
-
-**`hcom [N] <tool> [tool-args] [hcom-flags]`**
+| Claude Code | automatic | `hcom claude` |
+| Gemini CLI | automatic | `hcom gemini` |
+| Codex CLI | automatic | `hcom codex` |
+| OpenCode | automatic | `hcom opencode` |
+| Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
-hcom 3 claude                 # launch 3 instances
-hcom claude --model sonnet    # unknown args forwarded to tool
-hcom claude --terminal kitty  # launch in a specific terminal
-hcom claude --headless        # run in background with hcom pty
+hcom r <session_id>           # Resume a session started outside hcom
+hcom f <session_id>           # Fork a session in hcom
 ```
 
-### Claude Code headless and subagents
+#### Claude Code headless and subagents
 
-Detached background processes in print mode stay alive. Manage them through the TUI.
+Detached background processes in print mode stay alive. Manage through the TUI.
 
 ```bash
 hcom claude -p 'say hi in hcom'
@@ -229,63 +227,38 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom                                # TUI dashboard
-hcom [N] claude|gemini|codex|opencode   # launch N agents (default 1)
-hcom r <name>                       # resume stopped agent
-hcom f <name>                       # fork session (claude/codex/opencode)
-hcom kill <name|tag:T|all>          # kill + close terminal pane
+hcom [N] claude|gemini|codex|opencode   # launch N agents
+hcom r <name|session_id>                # resume agent
+hcom f <name|session_id>                # fork session
+hcom kill <name|tag:T|all>              # kill + close terminal pane
 ```
 
 hcom launch flags:
 
 | Flag | Purpose |
 |---|---|
-| `--tag <name>` | Group label — agents spawn as `tag-name` and can be addressed as `@tag` |
-| `--terminal <preset>` | Where windows open: `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, … |
-| `--dir <path>` | Working directory for the agent |
+| `--tag <name>` | Group label — agents can be addressed as `@tag` |
+| `--terminal <preset>` | Where windows open: `default` (auto-detect), `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, etc… |
+| `--dir <path>` | Directory where the agent launches |
 | `--headless` | Run in background with no terminal window |
 | `--device <name>` | Spawn on a remote device (via relay) |
 | `--hcom-prompt <text>` | Initial user prompt |
-| `--hcom-system-prompt <text>` | System prompt override |
+| `--hcom-system-prompt <text>` | Append to system prompt |
 
-Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, `--sandbox danger-full-access`, `-p`, etc.
+Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 
-### Observe
-
-```bash
-hcom list                           # who's alive, status, unread counts
-hcom term [name]                    # view/inject into an agent's PTY screen
-hcom transcript <name> [N-M]        # read an agent's conversation
-hcom events --agent <name>          # event history (messages, file edits, lifecycle)
-```
-
-### Drive
+### Other commands
 
 ```bash
+hcom                                # TUI dashboard
 hcom send -b @luna -- hey           # one-off message to an agent
-hcom run <script>                   # run a workflow (debate, confess, fatcow, …)
-hcom run                            # list available scripts
+hcom list                           # show all active agents
+hcom term [name]                    # view/inject into an agent's PTY screen
+hcom events --wait <filters>         # Block until match for scripting
+hcom update                         # update hcom version
 ```
 
-### Configure
-
-```bash
-hcom hooks add|remove [tool]        # install/remove tool hooks
-hcom config                         # view/edit global + per-agent settings
-hcom status [--logs]                # installation + diagnostics
-hcom archive [N]                    # browse past sessions
-hcom reset [all]                    # archive + clear (+ reset hooks/config)
-hcom update                         # self-update
-```
-
-### Sync across devices
-
-```bash
-hcom relay new                      # create group, get join token
-hcom relay connect <token>          # join from another device
-hcom relay on|off                   # toggle sync
-hcom relay daemon start|stop        # manage background daemon
-```
+`hcom --help` for all commands.
 
 </details>
 
@@ -301,8 +274,7 @@ hcom config                       # show all values with sources
 hcom config <key>                 # get
 hcom config <key> <value>         # set
 hcom config <key> --info          # detailed help for a key
-hcom config --edit                # open config.toml in $EDITOR
-hcom config -i <name|self> ...    # per-agent override (tag, timeout, hints, subagent_timeout)
+hcom config -i <name|self> ...    # per-agent override at runtime
 ```
 
 ### Keys
@@ -314,14 +286,11 @@ hcom config -i <name|self> ...    # per-agent override (tag, timeout, hints, sub
 | `notes` | Text appended to bootstrap (one-time, at launch) |
 | `auto_approve` | Auto-approve safe hcom commands (send/list/events/…) |
 | `auto_subscribe` | Event subscription presets: `collision`, `created`, `stopped`, `blocked` |
-| `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
-| `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
 | `name_export` | Export instance name to a custom env var |
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool (launch-time args win) |
-| `codex_sandbox_mode` | `off`, `workspace`, … |
-| `gemini_system_prompt` / `codex_system_prompt` | System prompt injected on launch |
-| `relay` / `relay_id` / `relay_token` / `relay_psk` / `relay_enabled` | Relay config (see `hcom relay --help`) |
+| `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
+| `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool |
 
 ### Scope
 
@@ -334,13 +303,13 @@ HCOM_TAG=dev hcom 3 claude                      # per-launch env
 ### Per-project isolation
 
 ```bash
-export HCOM_DIR="$PWD/.hcom"    # isolate state + hooks to this project
+export HCOM_DIR="$PWD/.hcom"    # isolate state + hooks to this folder
 hcom hooks remove && rm -rf "$HCOM_DIR"
 ```
 
 Run `hcom config <key> --info` or `hcom run docs --config` for the full per-key reference.
 
-Edit `~/.hcom/env` to set env vars passed to every launched agent (e.g. `ANTHROPIC_MODEL`, `GEMINI_MODEL`, API keys). Any non-`HCOM_*` key works.
+Edit `~/.hcom/env` to set external env vars passed to every launched agent.
 
 </details>
 
