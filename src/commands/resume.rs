@@ -16,11 +16,22 @@ use crate::db::HcomDb;
 use crate::hooks::claude_args;
 use crate::hooks::codex::derive_codex_transcript_path;
 use crate::hooks::gemini::derive_gemini_transcript_path;
-use crate::identity;
 use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::tools::{codex_args, gemini_args};
+
+/// Where to load the resume/fork plan from.
+enum ResumeSource<'a> {
+    /// Resume an hcom-tracked instance by name (active or stopped).
+    Instance { name: &'a str },
+    /// Adopt a session from its on-disk transcript (first-time bring-in under hcom).
+    Disk {
+        session_id: String,
+        tool: String,
+        cwd_hint: Option<String>,
+    },
+}
 
 struct PreparedResume {
     output: ResumeOutputContext,
@@ -89,23 +100,24 @@ pub fn do_resume(
     let hcom_config = load_hcom_config();
     let ctx = crate::shared::HcomContext::from_os();
 
-    // If the input looks like a session UUID, branch to session-ID resume
+    // Adoption path: UUID input for a session not yet tracked as an hcom instance.
     if is_session_id(&name) {
-        return do_resume_by_session_id(&name, fork, extra_args, flags, &db);
-    }
+        // Collision guard: if the UUID is bound to a running hcom instance, refuse.
+        // If bound to a stopped instance, delegate to the normal name-based path
+        // (preserves the existing hcom identity across re-resumes).
+        if let Ok(Some(instance_name)) = db.get_session_binding(&name) {
+            if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
+                bail!(
+                    "Session {} is currently active as '{}' — run hcom stop {} first",
+                    name,
+                    instance_name,
+                    instance_name
+                );
+            }
+            return do_resume(&instance_name, fork, extra_args, flags);
+        }
 
-    // If not a UUID and not a known hcom instance, try resolving as a thread name
-    if matches!(db.get_instance_full(&name), Ok(None) | Err(_)) {
-        // Try Claude Code thread name first (most common)
-        if let Some(session_id) = resolve_claude_thread_name(&name) {
-            eprintln!("Resolved Claude thread '{}' → {}", name, session_id);
-            return do_resume_by_session_id(&session_id, fork, extra_args, flags, &db);
-        }
-        // Then Codex thread name
-        if let Some(session_id) = resolve_codex_thread_name(&name) {
-            eprintln!("Resolved Codex thread '{}' → {}", name, session_id);
-            return do_resume_by_session_id(&session_id, fork, extra_args, flags, &db);
-        }
+        return do_adopt_session(&db, &name, fork, extra_args, flags, &hcom_config);
     }
 
     if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
@@ -188,25 +200,58 @@ fn prepare_resume_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
-    // For resume (not fork): reject if instance is still active
-    if !fork {
-        if let Ok(Some(_)) = db.get_instance_full(name) {
-            bail!("'{}' is still active — run hcom stop {} first", name, name);
-        }
-    }
+    prepare_resume_plan_from_source(db, ResumeSource::Instance { name }, fork, extra_args, flags)
+}
 
-    // Load snapshot: from active instance (fork) or stopped event (resume)
-    let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir) = if fork
-    {
-        load_instance_data(db, name)?
-    } else {
-        load_stopped_snapshot(db, name)?
-    };
+fn prepare_resume_plan_from_source(
+    db: &HcomDb,
+    source: ResumeSource<'_>,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<PreparedResume> {
+    let is_adoption = matches!(source, ResumeSource::Disk { .. });
+
+    // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, display_name)
+    // from either the DB (instance) or the on-disk transcript (adoption).
+    let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir, display_name) =
+        match source {
+            ResumeSource::Instance { name } => {
+                if !fork {
+                    if let Ok(Some(_)) = db.get_instance_full(name) {
+                        bail!("'{}' is still active — run hcom stop {} first", name, name);
+                    }
+                }
+                let (tool, sid, largs, tag, bg, leid, snap) = if fork {
+                    load_instance_data(db, name)?
+                } else {
+                    load_stopped_snapshot(db, name)?
+                };
+                (tool, sid, largs, tag, bg, leid, snap, name.to_string())
+            }
+            ResumeSource::Disk {
+                session_id,
+                tool,
+                cwd_hint,
+            } => {
+                let display = session_id.clone();
+                (
+                    tool,
+                    session_id,
+                    String::new(),
+                    String::new(),
+                    false,
+                    0,
+                    cwd_hint.unwrap_or_default(),
+                    display,
+                )
+            }
+        };
 
     if session_id.is_empty() {
         bail!(
             "No session ID found for '{}' — cannot {}",
-            name,
+            display_name,
             if fork { "fork" } else { "resume" }
         );
     }
@@ -223,8 +268,8 @@ fn prepare_resume_plan(
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
-    // - For resume: use snapshot directory (continue where you left off)
-    // - For fork: use current directory (start fresh in new context)
+    // - For fork (tracked instance): use current directory (start fresh in new context)
+    // - Otherwise: use snapshot/transcript directory, falling back to current
     let effective_cwd = if let Some(ref dir) = dir_override {
         let path = std::path::Path::new(dir);
         if !path.is_dir() {
@@ -233,7 +278,7 @@ fn prepare_resume_plan(
         path.canonicalize()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| dir.clone())
-    } else if fork {
+    } else if fork && !is_adoption {
         std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string())
@@ -254,14 +299,13 @@ fn prepare_resume_plan(
     let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
     cli_tool_args.extend(clean_extra);
 
-    // Merge with original launch args
+    // Merge with original launch args (only applicable for tracked instances).
     let original_args: Vec<String> = if !launch_args_str.is_empty() {
         serde_json::from_str(&launch_args_str).unwrap_or_default()
     } else {
         Vec::new()
     };
 
-    // For resume, merge original args with new args (new overrides)
     let merged_cli_args = if !original_args.is_empty() {
         merge_resume_args(&tool, &original_args, &cli_tool_args)
     } else {
@@ -287,7 +331,11 @@ fn prepare_resume_plan(
     let launcher_name =
         resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_for_output = launcher_name.clone();
-    let fork_child_name = if fork {
+
+    // Pre-allocate a fork child name only for tracked-instance forks, since the
+    // identity-reset prompts reference it. For adoption-fork there is no prior
+    // hcom identity in the transcript, so the SessionStart hook handles naming.
+    let fork_child_name = if fork && !is_adoption {
         let (alive_names, taken_names) = crate::instance_names::collect_taken_names(db)?;
         let candidate = crate::instance_names::allocate_name(
             &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
@@ -301,21 +349,25 @@ fn prepare_resume_plan(
         None
     };
     let effective_tag = launch_flags.tag.clone().or(inherited_tag.clone());
-    let fork_initial_prompt = if fork && tool == "codex" {
+
+    // Codex fork identity-reset: only for tracked-instance forks. Adoption-fork
+    // transcripts have no prior hcom identity to override.
+    let fork_initial_prompt = if fork && tool == "codex" && !is_adoption {
         let child_name = fork_child_name
             .as_deref()
             .expect("fork child name should be generated");
-        let display_name = effective_tag
+        let child_display = effective_tag
             .as_deref()
             .map(|tag| format!("{tag}-{child_name}"))
             .unwrap_or_else(|| child_name.to_string());
+        let parent = display_name.as_str();
         let identity_reset = format!(
-            "You are a fork of {name}, but your new hcom identity is now {display_name}.\n\
+            "You are a fork of {parent}, but your new hcom identity is now {child_display}.\n\
              Your hcom name is {child_name}.\n\
-             Do not use {name}'s hcom identity anymore, even if it appears in inherited thread history.\n\
+             Do not use {parent}'s hcom identity anymore, even if it appears in inherited thread history.\n\
              Use [hcom:{child_name}] in your first response only.\n\
              Use `hcom ... --name {child_name}` for all hcom commands.\n\
-             If asked about your identity, answer exactly: {display_name}"
+             If asked about your identity, answer exactly: {child_display}"
         );
         Some(match launch_flags.initial_prompt.as_deref() {
             Some(user_prompt) if !user_prompt.trim().is_empty() => {
@@ -328,11 +380,44 @@ fn prepare_resume_plan(
     };
     let output_tag = effective_tag.clone();
     let launch_tag = effective_tag.clone();
-    let base_system_prompt = resume_system_prompt(&tool, name, fork, fork_child_name.as_deref());
-    let effective_system_prompt = match launch_flags.system_prompt.as_deref() {
-        Some(custom) if !custom.trim().is_empty() => format!("{base_system_prompt}\n\n{custom}"),
-        _ => base_system_prompt,
+
+    // System prompt:
+    // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
+    // - Adoption: None — the SessionStart hook issues the normal fresh-launch
+    //   bootstrap under the auto-allocated name. The transcript has no prior hcom
+    //   context to override.
+    let base_system_prompt = if is_adoption {
+        None
+    } else {
+        Some(resume_system_prompt(
+            &tool,
+            &display_name,
+            fork,
+            fork_child_name.as_deref(),
+        ))
     };
+    let effective_system_prompt = match (base_system_prompt, launch_flags.system_prompt.as_deref())
+    {
+        (Some(base), Some(custom)) if !custom.trim().is_empty() => {
+            Some(format!("{base}\n\n{custom}"))
+        }
+        (Some(base), _) => Some(base),
+        (None, Some(custom)) if !custom.trim().is_empty() => Some(custom.to_string()),
+        (None, _) => None,
+    };
+
+    // Instance name for LaunchParams:
+    // - Adoption: None (launcher allocates; SessionStart hook binds via session_bindings)
+    // - Tracked fork: pre-allocated fork_child_name
+    // - Tracked resume: preserve existing hcom name
+    let launch_name = if is_adoption {
+        None
+    } else if fork {
+        fork_child_name.clone()
+    } else {
+        Some(display_name.clone())
+    };
+
     Ok(PreparedResume {
         output: ResumeOutputContext {
             action: if fork { "fork" } else { "resume" }.to_string(),
@@ -348,7 +433,7 @@ fn prepare_resume_plan(
             count: 1,
             args: merged_args,
             tag: launch_tag,
-            system_prompt: Some(effective_system_prompt),
+            system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
             pty: use_pty,
             background: is_headless,
@@ -357,14 +442,13 @@ fn prepare_resume_plan(
             launcher: Some(launcher_name),
             run_here: launch_flags.run_here,
             batch_id: launch_flags.batch_id.clone(),
-            name: if fork {
-                fork_child_name
-            } else {
-                Some(name.to_string())
-            },
+            name: launch_name,
             skip_validation: false,
             terminal: launch_flags.terminal.clone(),
-            append_reply_handoff: !(fork && tool == "codex"),
+            // Codex tracked-instance fork uses initial_prompt for an identity
+            // reset; don't dilute it with a reply-handoff suffix. Adoption-fork
+            // has no identity-reset prompt, so normal handoff rules apply.
+            append_reply_handoff: !(fork && tool == "codex" && !is_adoption),
         },
         last_event_id,
         session_id,
@@ -466,8 +550,11 @@ fn print_resume_preview(
     name: &str,
     fork: bool,
 ) {
+    let is_adoption = plan.launch.name.is_none();
     let identity_note = if fork {
         format!("Fork source: {} (new identity)", name)
+    } else if is_adoption {
+        format!("Adopting session: {} (new hcom identity)", name)
     } else {
         format!("Resume target: {} (same identity)", name)
     };
@@ -661,7 +748,14 @@ fn load_stopped_snapshot(
         }
     }
 
-    bail!("No stopped snapshot found for '{}'", name)
+    bail!(
+        "No stopped snapshot found for '{name}'.\n\
+         If this is a session UUID, the transcript wasn't found on disk.\n\
+         If this is a Claude/Codex thread name, resume it natively instead:\n  \
+         hcom claude --resume '{name}'   (Claude resolves /rename titles)\n  \
+         hcom codex  resume '{name}'     (Codex resolves thread names)\n  \
+         hcom gemini --resume '{name}'   (Gemini accepts UUID, index, or 'latest')"
+    )
 }
 
 /// Build tool-specific resume/fork args.
@@ -750,127 +844,68 @@ fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
     merged
 }
 
-// ── Session-ID and thread-name resume ────────────────────────────────────
+// ── Session-ID adoption ──────────────────────────────────────────────────
 
-/// Check if a string looks like a UUID session ID.
+/// Check if a string looks like a known session-ID format.
+/// Claude, Codex, and Gemini use UUIDs. Opencode uses `ses_<hex+base62>`.
 fn is_session_id(s: &str) -> bool {
-    uuid::Uuid::parse_str(s).is_ok()
+    uuid::Uuid::parse_str(s).is_ok() || is_opencode_session_id(s)
 }
 
-/// Resolve a Codex thread name (e.g. "stabilization-review") to a session UUID
-/// by looking up ~/.codex/session_index.jsonl.
-fn resolve_codex_thread_name(name: &str) -> Option<String> {
-    let index_path = dirs::home_dir()?.join(".codex/session_index.jsonl");
-    let file = std::fs::File::open(&index_path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut best_match: Option<(String, String)> = None;
+/// Opencode session IDs are `ses_` followed by 26 hex+base62 chars
+/// (see opencode/packages/opencode/src/id/id.ts).
+fn is_opencode_session_id(s: &str) -> bool {
+    s.starts_with("ses_")
+        && s.len() >= 8
+        && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
+}
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() {
-            continue;
-        }
-        let parsed: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if parsed.get("thread_name").and_then(|v| v.as_str()) == Some(name) {
-            let id = parsed
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let updated = parsed
-                .get("updated_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !id.is_empty()
-                && best_match
-                    .as_ref()
-                    .map_or(true, |(_, prev)| updated > *prev)
-            {
-                best_match = Some((id, updated));
-            }
-        }
+/// Locate an opencode session's data dir: `$XDG_DATA_HOME/opencode` on
+/// Linux, `~/Library/Application Support/opencode` on macOS,
+/// `%LOCALAPPDATA%\opencode` on Windows (via `dirs::data_dir`).
+fn opencode_data_dir() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("opencode"))
+}
+
+/// Query opencode's SQLite DB for a session's working directory.
+/// Returns (exists, cwd). `exists=true, cwd=None` is impossible given the
+/// schema (directory is NOT NULL), so `cwd=None` implies the row is absent.
+fn lookup_opencode_session(session_id: &str) -> Option<String> {
+    let db_path = opencode_data_dir()?.join("opencode.db");
+    if !db_path.exists() {
+        return None;
     }
-
-    best_match.map(|(id, _)| id)
+    // Open read-only; no hcom-side schema assumptions beyond `session(id, directory)`.
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT directory FROM session WHERE id = ?1",
+        rusqlite::params![session_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
 }
 
-/// Resolve a Claude Code thread name (e.g. "skills-work") to a session UUID
-/// by scanning ~/.claude/projects/*/*.jsonl for {"type":"custom-title","customTitle":"..."} entries.
-fn resolve_claude_thread_name(name: &str) -> Option<String> {
-    let projects_dir = claude_config_dir().join("projects");
-    if !projects_dir.is_dir() {
+/// Resolve a session ID to the owning tool and (optionally) a pre-recovered
+/// working directory.
+///
+/// - Claude, Codex, Gemini: returns `(tool, Some(transcript_path))`.
+///   Caller reads the transcript's first line to recover CWD.
+/// - Opencode: returns `(tool="opencode", None)` — opencode stores sessions
+///   in SQLite; CWD comes from a separate DB query, not a transcript file.
+fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
+    // 1. Opencode: prefix-scoped, query the SQLite DB directly.
+    if is_opencode_session_id(session_id) {
+        if lookup_opencode_session(session_id).is_some() {
+            return Some(("opencode".to_string(), None));
+        }
         return None;
     }
 
-    let mut best_match: Option<(String, std::time::SystemTime)> = None;
-
-    let entries = std::fs::read_dir(&projects_dir).ok()?;
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let sub_entries = match std::fs::read_dir(entry.path()) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for sub_entry in sub_entries.flatten() {
-            let path = sub_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let reader = std::io::BufReader::new(file);
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                if !line.contains("custom-title") {
-                    continue;
-                }
-                let parsed: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if parsed.get("type").and_then(|v| v.as_str()) == Some("custom-title")
-                    && parsed.get("customTitle").and_then(|v| v.as_str()) == Some(name)
-                {
-                    if let Some(session_id) = parsed.get("sessionId").and_then(|v| v.as_str()) {
-                        let mtime = sub_entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        if best_match
-                            .as_ref()
-                            .map_or(true, |(_, prev_mtime)| mtime > *prev_mtime)
-                        {
-                            best_match = Some((session_id.to_string(), mtime));
-                        }
-                    }
-                    break; // Only one custom-title per file
-                }
-            }
-        }
-    }
-
-    best_match.map(|(id, _)| id)
-}
-
-/// Find a session transcript on disk by session ID.
-/// Returns (tool, transcript_path) if found.
-fn find_session_on_disk(session_id: &str) -> Option<(String, String)> {
-    // 1. Claude: iterate project dirs, check for exact filename
+    // 2. Claude: iterate project dirs, check for exact filename
     let projects_dir = claude_config_dir().join("projects");
     if projects_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&projects_dir) {
@@ -880,221 +915,188 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, String)> {
                     if candidate.exists() {
                         let path_str = candidate.to_string_lossy().to_string();
                         let tool = detect_agent_type(&path_str).to_string();
-                        return Some((tool, path_str));
+                        return Some((tool, Some(path_str)));
                     }
                 }
             }
         }
     }
 
-    // 2. Codex
+    // 3. Codex
     if let Some(path) = derive_codex_transcript_path(session_id) {
         let tool = detect_agent_type(&path).to_string();
-        return Some((tool, path));
+        return Some((tool, Some(path)));
     }
 
-    // 3. Gemini
+    // 4. Gemini
     if let Some(path) = derive_gemini_transcript_path(session_id) {
         let tool = detect_agent_type(&path).to_string();
-        return Some((tool, path));
+        return Some((tool, Some(path)));
     }
 
     None
 }
 
-/// Extract the last working directory from a session transcript.
-/// Returns None if no CWD found (e.g., Gemini transcripts).
-fn extract_last_cwd(path: &str, tool: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut last_cwd: Option<String> = None;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        match tool {
-            "claude" => {
-                if let Some(cwd) = parsed.get("cwd").and_then(|v| v.as_str()) {
-                    if !cwd.is_empty() {
-                        last_cwd = Some(cwd.to_string());
-                    }
-                }
-            }
-            "codex" => {
-                if let Some(cwd) = parsed
-                    .get("payload")
-                    .and_then(|p| p.get("cwd"))
-                    .and_then(|v| v.as_str())
-                {
-                    if !cwd.is_empty() {
-                        last_cwd = Some(cwd.to_string());
-                    }
-                }
-            }
-            _ => return None,
-        }
+/// Recover the session's working directory from the tool's on-disk state.
+///
+/// - **Claude**: `cwd` is on every line; read line 1 only (O(1) I/O).
+/// - **Codex**: first line is `session_meta` with `payload.cwd`; read line 1.
+/// - **Gemini**: the session JSON has `projectHash = sha256(cwd)` (hex).
+///   `~/.gemini/projects.json` maps `cwd → short-id`. Hash each key and
+///   match against `projectHash` to recover the original CWD.
+fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
+    match tool {
+        "claude" => read_first_line_cwd(path, |v| v.get("cwd").and_then(|c| c.as_str())),
+        "codex" => read_first_line_cwd(path, |v| {
+            v.get("payload")
+                .and_then(|p| p.get("cwd"))
+                .and_then(|c| c.as_str())
+        }),
+        "gemini" => recover_gemini_cwd(path),
+        _ => None,
     }
-
-    last_cwd
 }
 
-/// Resume/fork a session identified by UUID, not by hcom instance name.
-fn do_resume_by_session_id(
+/// Read one line from a transcript and extract a CWD via the accessor.
+fn read_first_line_cwd(path: &str, pick: impl Fn(&serde_json::Value) -> Option<&str>) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let cwd = pick(&parsed)?;
+    if cwd.is_empty() {
+        None
+    } else {
+        Some(cwd.to_string())
+    }
+}
+
+/// Gemini session JSON has `projectHash = hex(sha256(cwd))`. Read it, then
+/// reverse-lookup in `~/.gemini/projects.json` which maps `cwd → short-id`.
+fn recover_gemini_cwd(transcript_path: &str) -> Option<String> {
+    // The session file is a plain JSON object (not JSONL), so read the whole
+    // file — but only as far as needed to parse the outer object. For
+    // moderately large transcripts this is still comparable to a handful of
+    // line reads, and there is no cheaper path.
+    let data = std::fs::read_to_string(transcript_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let target_hash = parsed.get("projectHash").and_then(|v| v.as_str())?;
+
+    let gemini_base = if let Ok(cli_home) = std::env::var("GEMINI_CLI_HOME") {
+        std::path::PathBuf::from(cli_home).join(".gemini")
+    } else {
+        dirs::home_dir()?.join(".gemini")
+    };
+    let registry_path = gemini_base.join("projects.json");
+    let registry_data = std::fs::read_to_string(&registry_path).ok()?;
+    let registry: serde_json::Value = serde_json::from_str(&registry_data).ok()?;
+    let projects = registry.get("projects").and_then(|v| v.as_object())?;
+
+    use sha2::{Digest, Sha256};
+    for cwd in projects.keys() {
+        let digest = Sha256::digest(cwd.as_bytes());
+        let hex = digest.iter().fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{:02x}", b);
+            acc
+        });
+        if hex == target_hash {
+            return Some(cwd.clone());
+        }
+    }
+    None
+}
+
+/// Adopt a session into hcom by UUID: locate its transcript on disk, recover
+/// the original working directory when possible, and launch through the
+/// normal resume plan machinery so fork/resume semantics stay consistent.
+fn do_adopt_session(
+    db: &HcomDb,
     session_id: &str,
     fork: bool,
     extra_args: &[String],
     flags: &GlobalFlags,
-    db: &HcomDb,
+    hcom_config: &crate::config::HcomConfig,
 ) -> Result<i32> {
-    // Check if any active instance holds this session
-    if let Ok(Some(instance_name)) = db.get_session_binding(session_id) {
-        if let Ok(Some(_)) = db.get_instance_full(&instance_name) {
-            bail!(
-                "Session {} is currently active as '{}' — kill it first or resume by name",
-                session_id,
-                instance_name
-            );
-        }
-        // Instance exists in session_bindings but is not active — delegate to normal path
-        return do_resume(&instance_name, fork, extra_args, flags);
-    }
-
-    // Not in DB — search for transcript on disk
     let (tool, transcript_path) = find_session_on_disk(session_id).ok_or_else(|| {
-        let projects_dir = claude_config_dir().join("projects");
+        let claude_projects = claude_config_dir().join("projects");
+        let opencode_db = opencode_data_dir()
+            .map(|d| d.join("opencode.db").display().to_string())
+            .unwrap_or_else(|| "(no data dir)".to_string());
         anyhow::anyhow!(
-            "Session {} not found. Searched:\n  - Claude: {}/*/{}.jsonl\n  - Codex: ~/.codex/sessions/**/*-{}.jsonl\n  - Gemini: ~/.gemini/tmp/*/chats/session-*-{}*.json",
-            session_id,
-            projects_dir.display(),
-            session_id,
-            session_id,
-            &session_id.split('-').next().unwrap_or(session_id),
+            "Session {sid} not found. Searched:\n  \
+             - Claude:   {claude}/*/{sid}.jsonl\n  \
+             - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
+             - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
+             - Opencode: {opencode_db} (table 'session')",
+            sid = session_id,
+            claude = claude_projects.display(),
+            short = session_id.split('-').next().unwrap_or(session_id),
+            opencode_db = opencode_db,
         )
     })?;
 
-    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
-
-    // Determine working directory
-    let effective_cwd = if let Some(ref dir) = dir_override {
-        let path = std::path::Path::new(dir);
-        if !path.is_dir() {
-            bail!("--dir path does not exist or is not a directory: {}", dir);
-        }
-        path.canonicalize()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| dir.clone())
-    } else if fork {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string())
+    // CWD recovery: for opencode, the session row carries `directory` directly.
+    // For Claude/Codex, read only the first line of the transcript (CWD is
+    // fixed at session start; no tool changes CWD mid-session). For fork we
+    // start in $PWD (or --dir) by design.
+    let cwd_hint = if fork {
+        None
     } else {
-        match extract_last_cwd(&transcript_path, &tool) {
-            Some(cwd) if std::path::Path::new(&cwd).is_dir() => cwd,
+        let raw = if tool == "opencode" {
+            lookup_opencode_session(session_id)
+        } else if let Some(ref path) = transcript_path {
+            extract_cwd_from_transcript(path, &tool)
+        } else {
+            None
+        };
+
+        match raw {
+            Some(cwd) if std::path::Path::new(&cwd).is_dir() => Some(cwd),
             Some(cwd) => {
                 eprintln!(
-                    "Warning: transcript directory '{}' no longer exists, using current directory",
+                    "Warning: original directory '{}' no longer exists, using current directory",
                     cwd
                 );
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
+                None
             }
-            None => {
-                if tool == "gemini" {
-                    eprintln!(
-                        "Warning: Gemini transcripts don't store working directory — using current directory. Use --dir to override."
-                    );
-                }
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            }
+            None => None,
         }
     };
 
-    let mut tool_args = build_resume_args(&tool, session_id, fork);
-    tool_args.extend(clean_extra.into_iter());
-
-    let is_background = launch_flags.headless || is_background_from_args(&tool, &tool_args);
-    let use_pty = tool == "claude" && !is_background && cfg!(unix);
-
-    let launcher_name = flags.name.clone().unwrap_or_else(|| {
-        identity::resolve_identity(
-            db,
-            None,
-            None,
-            None,
-            std::env::var("HCOM_PROCESS_ID").ok().as_deref(),
-            None,
-            None,
-        )
-        .map(|id| id.name)
-        .unwrap_or_else(|_| "user".to_string())
-    });
-
-    let system_prompt = Some(if fork {
-        format!(
-            "YOUR SESSION HAS BEEN FORKED from session {}. \
-             You have the same history but are a NEW agent under hcom management. \
-             Run hcom start to get your own identity.",
-            session_id
-        )
-    } else {
-        "YOUR SESSION HAS BEEN RESUMED under hcom management.".to_string()
-    });
-
-    let result = launcher::launch(
+    let plan = prepare_resume_plan_from_source(
         db,
-        LaunchParams {
+        ResumeSource::Disk {
+            session_id: session_id.to_string(),
             tool: tool.clone(),
-            count: 1,
-            args: tool_args,
-            tag: launch_flags.tag,
-            system_prompt,
-            pty: use_pty,
-            background: is_background,
-            cwd: Some(effective_cwd.clone()),
-            env: None,
-            launcher: Some(launcher_name),
-            run_here: launch_flags.run_here,
-            initial_prompt: launch_flags.initial_prompt,
-            batch_id: launch_flags.batch_id,
-            name: None,
-            skip_validation: true,
-            terminal: launch_flags.terminal,
-            append_reply_handoff: true,
+            cwd_hint,
         },
+        fork,
+        extra_args,
+        flags,
     )?;
 
-    if result.launched > 0 {
-        let action = if fork { "Forked" } else { "Resumed" };
-        println!(
-            "{} session {} ({}) in {}",
-            action, session_id, tool, effective_cwd
-        );
+    let ctx = crate::shared::HcomContext::from_os();
+    if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
+        print_resume_preview(&plan, hcom_config, session_id, fork);
+        return Ok(0);
     }
 
+    let exit = execute_prepared_resume(db, session_id, fork, &plan, hcom_config, true)?;
     log_info(
         if fork { "fork" } else { "resume" },
-        &format!("cmd.{}_session", if fork { "fork" } else { "resume" }),
+        &format!("cmd.adopt_{}", if fork { "fork" } else { "resume" }),
         &format!(
-            "session_id={} tool={} transcript={} launched={}",
-            session_id, tool, transcript_path, result.launched
+            "session_id={} tool={} source={}",
+            session_id,
+            tool,
+            transcript_path.as_deref().unwrap_or("opencode-db")
         ),
     );
-
-    Ok(if result.launched > 0 { 0 } else { 1 })
+    Ok(exit)
 }
 
 #[cfg(test)]
@@ -1439,9 +1441,16 @@ mod tests {
     }
 
     #[test]
-    fn test_is_session_id_valid() {
+    fn test_is_session_id_valid_uuid() {
         assert!(is_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
         assert!(is_session_id("521cfc2b-be38-403a-b32e-4a49c9551b27"));
+    }
+
+    #[test]
+    fn test_is_session_id_valid_opencode() {
+        // opencode IDs are `ses_` + ULID-ish suffix (see opencode/src/id/id.ts)
+        assert!(is_session_id("ses_019b12abcdefGHIJK0123456789"));
+        assert!(is_session_id("ses_abcdef"));
     }
 
     #[test]
@@ -1452,29 +1461,31 @@ mod tests {
         assert!(!is_session_id("impl-luna"));
         assert!(!is_session_id("review-kira"));
         assert!(!is_session_id(""));
+        assert!(!is_session_id("ses_")); // prefix alone, no suffix
+        assert!(!is_session_id("ses_with-dash")); // opencode IDs are alnum only
     }
 
     #[test]
-    fn test_extract_last_cwd_claude() {
+    fn test_extract_cwd_claude() {
+        // Claude records cwd in the first (and every) line. Read one line.
         let dir = std::env::temp_dir().join("hcom_test_cwd_claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.jsonl");
         std::fs::write(
             &path,
-            r#"{"type":"user","cwd":"/first/dir","message":"hi"}
-{"type":"assistant","cwd":"/first/dir","message":"hello"}
-{"type":"user","cwd":"/second/dir","message":"cd somewhere"}
-{"type":"assistant","cwd":"/second/dir","message":"ok"}
+            r#"{"type":"user","cwd":"/start/dir","message":"hi"}
+{"type":"assistant","cwd":"/start/dir","message":"hello"}
 "#,
         )
         .unwrap();
-        let result = extract_last_cwd(path.to_str().unwrap(), "claude");
-        assert_eq!(result, Some("/second/dir".to_string()));
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
+        assert_eq!(result, Some("/start/dir".to_string()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_extract_last_cwd_codex() {
+    fn test_extract_cwd_codex() {
+        // Codex records cwd in the session_meta payload on line 1.
         let dir = std::env::temp_dir().join("hcom_test_cwd_codex");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.jsonl");
@@ -1482,23 +1493,82 @@ mod tests {
             &path,
             r#"{"type":"session_meta","payload":{"cwd":"/start/dir"}}
 {"type":"event_msg","payload":{"content":"hello"}}
-{"type":"turn_context","payload":{"cwd":"/changed/dir"}}
 "#,
         )
         .unwrap();
-        let result = extract_last_cwd(path.to_str().unwrap(), "codex");
-        assert_eq!(result, Some("/changed/dir".to_string()));
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "codex");
+        assert_eq!(result, Some("/start/dir".to_string()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_extract_last_cwd_gemini() {
-        let dir = std::env::temp_dir().join("hcom_test_cwd_gemini");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.json");
-        std::fs::write(&path, r#"{"messages":[]}"#).unwrap();
-        let result = extract_last_cwd(path.to_str().unwrap(), "gemini");
+    #[serial_test::serial]
+    fn test_extract_cwd_gemini_reverse_hash_lookup() {
+        // Gemini writes sha256(cwd) as `projectHash` in the session JSON, and
+        // stores cwd → short-id in ~/.gemini/projects.json. This test wires up
+        // a fake GEMINI_CLI_HOME and confirms the reverse lookup.
+        use sha2::{Digest, Sha256};
+        let base = std::env::temp_dir().join("hcom_test_cwd_gemini_ok");
+        let gemini = base.join(".gemini");
+        let session_dir = gemini.join("tmp/myproj/chats");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let fake_cwd = "/some/fake/cwd";
+        let hex = Sha256::digest(fake_cwd.as_bytes())
+            .iter()
+            .fold(String::new(), |mut a, b| {
+                use std::fmt::Write;
+                let _ = write!(a, "{:02x}", b);
+                a
+            });
+
+        // projects.json: cwd → short-id
+        std::fs::write(
+            gemini.join("projects.json"),
+            format!(r#"{{"projects":{{"{fake_cwd}":"myproj"}}}}"#),
+        )
+        .unwrap();
+
+        // Session JSON: projectHash = sha256(cwd)
+        let session_path = session_dir.join("session-x.json");
+        std::fs::write(&session_path, format!(r#"{{"projectHash":"{hex}"}}"#)).unwrap();
+
+        // Stub GEMINI_CLI_HOME so recover_gemini_cwd reads from our fake tree.
+        let prev = std::env::var("GEMINI_CLI_HOME").ok();
+        // SAFETY: test is single-threaded enough for this module; serial_test
+        // isn't in scope here, but other tests don't touch GEMINI_CLI_HOME.
+        unsafe {
+            std::env::set_var("GEMINI_CLI_HOME", &base);
+        }
+        let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
+            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
+        }
+
+        assert_eq!(result, Some(fake_cwd.to_string()));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_extract_cwd_gemini_no_registry_returns_none() {
+        // When projects.json is missing, we can't reverse the hash → return None.
+        let base = std::env::temp_dir().join("hcom_test_cwd_gemini_noreg");
+        let gemini = base.join(".gemini/tmp/x/chats");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let path = gemini.join("test.json");
+        std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
+        let prev = std::env::var("GEMINI_CLI_HOME").ok();
+        unsafe {
+            std::env::set_var("GEMINI_CLI_HOME", &base);
+        }
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
+            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
+        }
         assert_eq!(result, None);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&base).ok();
     }
 }
