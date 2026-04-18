@@ -100,62 +100,6 @@ pub fn do_resume(
     let hcom_config = load_hcom_config();
     let ctx = crate::shared::HcomContext::from_os();
 
-    // Adoption path: UUID input for a session not yet tracked as an hcom instance.
-    if is_session_id(&name) {
-        // Identity reclaim: `session_bindings` is a live lookaside that the FK
-        // cascade + explicit DELETE in hooks/common.rs clear on every stop/kill,
-        // so `get_session_binding` only sees rows for currently-running or
-        // crash/orphaned instances. life.stopped events are the real source of
-        // truth — they persist forever and carry the snapshot.session_id. Try
-        // the binding first (collision guard for active instances), then fall
-        // back to the events scan so `hcom r <uuid>` after stop/kill reclaims
-        // the original 4-letter identity instead of allocating a new one.
-        if let Ok(Some(instance_name)) = db.get_session_binding(&name) {
-            if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
-                bail!(
-                    "Session {} is currently active as '{}' — run hcom kill {} first",
-                    name,
-                    instance_name,
-                    instance_name
-                );
-            }
-            return do_resume(&instance_name, fork, extra_args, flags);
-        }
-
-        if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&name) {
-            return do_resume(&instance_name, fork, extra_args, flags);
-        }
-
-        return do_adopt_session(&db, &name, fork, extra_args, flags, &hcom_config);
-    }
-
-    // If not a UUID and not a known hcom instance, try resolving as a thread name.
-    // Claude and Codex both support user-assigned session names; scan their indexes
-    // and error on cross-tool ambiguity rather than silently picking one.
-    if matches!(db.get_instance_full(&name), Ok(None) | Err(_))
-        && crate::relay::control::split_device_suffix(&name).is_none()
-    {
-        if let Some(session_id) = resolve_thread_name(&name)? {
-            // Route through the same adoption machinery (collision guard, CWD recovery, etc.)
-            if let Ok(Some(instance_name)) = db.get_session_binding(&session_id) {
-                if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
-                    bail!(
-                        "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
-                        session_id,
-                        name,
-                        instance_name,
-                        instance_name
-                    );
-                }
-                return do_resume(&instance_name, fork, extra_args, flags);
-            }
-            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
-                return do_resume(&instance_name, fork, extra_args, flags);
-            }
-            return do_adopt_session(&db, &session_id, fork, extra_args, flags, &hcom_config);
-        }
-    }
-
     if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
         if fork {
             let has_dir = extra_args
@@ -209,17 +153,26 @@ pub fn do_resume(
         return Ok(0);
     }
 
-    let plan = prepare_resume_plan(&db, &name, fork, extra_args, flags)?;
+    let (resolved, plan) = resolve_name_to_plan(&db, &name, fork, extra_args, flags)?;
+    let is_adoption = plan.launch.name.is_none();
     if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
-        print_resume_preview(&plan, &hcom_config, &name, fork);
+        print_resume_preview(&plan, &hcom_config, &resolved, fork);
         return Ok(0);
     }
 
-    execute_prepared_resume(&db, &name, fork, &plan, &hcom_config, true)
+    let exit = execute_prepared_resume(&db, &resolved, fork, &plan, &hcom_config, true)?;
+    if is_adoption {
+        log_info(
+            if fork { "fork" } else { "resume" },
+            &format!("cmd.adopt_{}", if fork { "fork" } else { "resume" }),
+            &format!("session_id={}", resolved),
+        );
+    }
+    Ok(exit)
 }
 
 /// Remote-RPC entry point: run the same resolution chain as `do_resume`
-/// (UUID → binding → events-fallback → thread-name → adoption → name-based
+/// (UUID/thread-name → binding → events-fallback → adoption → name-based
 /// resume) but return a `LaunchResult` instead of printing feedback. Called
 /// by `handle_remote_resume` on the target device, where the device suffix
 /// has already been stripped by the dispatcher.
@@ -230,66 +183,95 @@ pub fn run_local_resume_result(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<LaunchResult> {
-    let name = crate::instances::resolve_display_name_or_stopped(db, name)
-        .unwrap_or_else(|| name.to_string());
-
-    if is_session_id(&name) {
-        if let Ok(Some(instance_name)) = db.get_session_binding(&name) {
-            if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
-                bail!(
-                    "Session {} is currently active as '{}' — run hcom kill {} first",
-                    name,
-                    instance_name,
-                    instance_name
-                );
-            }
-            return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
-        }
-        if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&name) {
-            return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
-        }
-        return adopt_session_result(db, &name, fork, extra_args, flags);
-    }
-
-    if matches!(db.get_instance_full(&name), Ok(None) | Err(_))
-        && crate::relay::control::split_device_suffix(&name).is_none()
-    {
-        if let Some(session_id) = resolve_thread_name(&name)? {
-            if let Ok(Some(instance_name)) = db.get_session_binding(&session_id) {
-                if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
-                    bail!(
-                        "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
-                        session_id,
-                        name,
-                        instance_name,
-                        instance_name
-                    );
-                }
-                return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
-            }
-            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
-                return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
-            }
-            return adopt_session_result(db, &session_id, fork, extra_args, flags);
-        }
-    }
-
-    let plan = prepare_resume_plan(db, &name, fork, extra_args, flags)?;
-    execute_prepared_resume_result(db, &name, fork, &plan)
+    let (resolved, plan) = resolve_name_to_plan(db, name, fork, extra_args, flags)?;
+    execute_prepared_resume_result(db, &resolved, fork, &plan)
 }
 
-/// Adoption variant that returns a `LaunchResult` for remote callers.
-/// Mirrors the plan-building path of `do_adopt_session` without preview/
-/// printing/logging.
-fn adopt_session_result(
+/// Walk the resume/fork resolution chain once, in a single place:
+///
+/// 1. Resolve display-name or stopped-name shorthand to a canonical name.
+/// 2. If input is a session ID (UUID or `ses_`), check `session_bindings`
+///    as a collision guard against a live instance, then try to reclaim
+///    identity via the life.stopped events lookup, then fall through to
+///    on-disk adoption. The binding is a best-effort lookaside — a stale
+///    row (crash/orphaned) must NOT short-circuit to a name-based resume
+///    whose snapshot might be missing or out of date; events are the
+///    source of truth.
+/// 3. If the name isn't a known hcom instance and lacks a device suffix,
+///    try resolving it as a Claude/Codex thread name, then run the same
+///    binding → events → adoption chain on the resolved session ID.
+/// 4. Otherwise, prepare a plan for an existing hcom instance.
+///
+/// Returns `(resolved_name_for_display, prepared_plan)`. The loop form
+/// avoids re-opening the DB that the old recursive `do_resume` calls did.
+fn resolve_name_to_plan(
     db: &HcomDb,
-    session_id: &str,
+    name: &str,
     fork: bool,
     extra_args: &[String],
     flags: &GlobalFlags,
-) -> Result<LaunchResult> {
-    let plan = build_adopt_plan(db, session_id, fork, extra_args, flags)?;
-    execute_prepared_resume_result(db, session_id, fork, &plan)
+) -> Result<(String, PreparedResume)> {
+    let mut current = crate::instances::resolve_display_name_or_stopped(db, name)
+        .unwrap_or_else(|| name.to_string());
+
+    // A loop over reclaim hops (binding → events → redirect to instance name).
+    // Bounded by MAX_HOPS in case of pathological DB state.
+    for _ in 0..8 {
+        if is_session_id(&current) {
+            if let Ok(Some(bound)) = db.get_session_binding(&current) {
+                if matches!(db.get_instance_full(&bound), Ok(Some(_))) {
+                    bail!(
+                        "Session {} is currently active as '{}' — run hcom kill {} first",
+                        current,
+                        bound,
+                        bound
+                    );
+                }
+                // Stale binding: events are authoritative. Fall through.
+            }
+            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&current) {
+                current = instance_name;
+                continue;
+            }
+            let plan = build_adopt_plan(db, &current, fork, extra_args, flags)?;
+            return Ok((current, plan));
+        }
+
+        if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
+            && crate::relay::control::split_device_suffix(&current).is_none()
+        {
+            if let Some(session_id) = resolve_thread_name(&current)? {
+                if let Ok(Some(bound)) = db.get_session_binding(&session_id) {
+                    if matches!(db.get_instance_full(&bound), Ok(Some(_))) {
+                        bail!(
+                            "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
+                            session_id,
+                            current,
+                            bound,
+                            bound
+                        );
+                    }
+                    // Stale binding: fall through to events.
+                }
+                if let Ok(Some(instance_name)) =
+                    db.find_stopped_instance_by_session_id(&session_id)
+                {
+                    current = instance_name;
+                    continue;
+                }
+                let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
+                return Ok((session_id, plan));
+            }
+        }
+
+        let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
+        return Ok((current, plan));
+    }
+
+    bail!(
+        "Name resolution for '{}' did not converge (possible circular binding)",
+        name
+    );
 }
 
 fn prepare_resume_plan(
@@ -318,7 +300,7 @@ fn prepare_resume_plan_from_source(
             ResumeSource::Instance { name } => {
                 if !fork {
                     if let Ok(Some(_)) = db.get_instance_full(name) {
-                        bail!("'{}' is still active — run hcom stop {} first", name, name);
+                        bail!("'{}' is still active — run hcom kill {} first", name, name);
                     }
                 }
                 let (tool, sid, largs, tag, bg, leid, snap) = if fork {
@@ -1354,37 +1336,8 @@ fn recover_gemini_cwd(transcript_path: &str) -> Option<String> {
     None
 }
 
-/// Adopt a session into hcom by UUID: locate its transcript on disk, recover
-/// the original working directory when possible, and launch through the
-/// normal resume plan machinery so fork/resume semantics stay consistent.
-fn do_adopt_session(
-    db: &HcomDb,
-    session_id: &str,
-    fork: bool,
-    extra_args: &[String],
-    flags: &GlobalFlags,
-    hcom_config: &crate::config::HcomConfig,
-) -> Result<i32> {
-    let plan = build_adopt_plan(db, session_id, fork, extra_args, flags)?;
-
-    let ctx = crate::shared::HcomContext::from_os();
-    if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
-        print_resume_preview(&plan, hcom_config, session_id, fork);
-        return Ok(0);
-    }
-
-    let exit = execute_prepared_resume(db, session_id, fork, &plan, hcom_config, true)?;
-    log_info(
-        if fork { "fork" } else { "resume" },
-        &format!("cmd.adopt_{}", if fork { "fork" } else { "resume" }),
-        &format!("session_id={}", session_id),
-    );
-    Ok(exit)
-}
-
 /// Locate a session on disk, recover its CWD, and build the `PreparedResume`.
-/// Split out so both the interactive adoption path (`do_adopt_session`) and
-/// the remote-RPC path (`adopt_session_result`) share identical behavior.
+/// Callers: `resolve_name_to_plan` (both interactive and RPC paths).
 fn build_adopt_plan(
     db: &HcomDb,
     session_id: &str,
