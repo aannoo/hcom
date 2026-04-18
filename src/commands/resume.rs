@@ -1240,21 +1240,30 @@ fn do_adopt_session(
     hcom_config: &crate::config::HcomConfig,
 ) -> Result<i32> {
     let (tool, transcript_path) = find_session_on_disk(session_id).ok_or_else(|| {
-        let claude_projects = claude_config_dir().join("projects");
+        // find_session_on_disk short-circuits for `ses_` IDs (only opencode is
+        // searched), so scope the error to match what was actually checked.
         let opencode_db = opencode_data_dir()
             .map(|d| d.join("opencode.db").display().to_string())
             .unwrap_or_else(|| "(no data dir)".to_string());
-        anyhow::anyhow!(
-            "Session {sid} not found. Searched:\n  \
-             - Claude:   {claude}/*/{sid}.jsonl\n  \
-             - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
-             - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
-             - Opencode: {opencode_db} (table 'session')",
-            sid = session_id,
-            claude = claude_projects.display(),
-            short = session_id.split('-').next().unwrap_or(session_id),
-            opencode_db = opencode_db,
-        )
+        if is_opencode_session_id(session_id) {
+            anyhow::anyhow!(
+                "Session {sid} not found. Searched:\n  \
+                 - Opencode: {opencode_db} (table 'session')",
+                sid = session_id,
+                opencode_db = opencode_db,
+            )
+        } else {
+            let claude_projects = claude_config_dir().join("projects");
+            anyhow::anyhow!(
+                "Session {sid} not found. Searched:\n  \
+                 - Claude:   {claude}/*/{sid}.jsonl\n  \
+                 - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
+                 - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json",
+                sid = session_id,
+                claude = claude_projects.display(),
+                short = session_id.split('-').next().unwrap_or(session_id),
+            )
+        }
     })?;
 
     // CWD recovery: for opencode, the session row carries `directory` directly.
