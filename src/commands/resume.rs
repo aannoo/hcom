@@ -945,10 +945,10 @@ fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
 /// Codex thread name) to a session UUID by scanning tool-specific indexes.
 ///
 /// Returns `Ok(Some(uuid))` on a unique match, `Ok(None)` if no tool
-/// recognizes the name, or `Err` if multiple tools match (ambiguity).
+/// recognizes the name, or `Err` on within-tool or cross-tool ambiguity.
 fn resolve_thread_name(name: &str) -> Result<Option<String>> {
-    let claude_match = resolve_claude_thread_name(name);
-    let codex_match = resolve_codex_thread_name(name);
+    let claude_match = resolve_claude_thread_name(name)?;
+    let codex_match = resolve_codex_thread_name(name)?;
 
     match (claude_match, codex_match) {
         (Some(claude_id), Some(codex_id)) => {
@@ -974,18 +974,36 @@ fn resolve_thread_name(name: &str) -> Result<Option<String>> {
     }
 }
 
+/// One candidate match produced while scanning a tool's thread-name index.
+struct ThreadMatch {
+    session_id: String,
+    /// Human-readable "when last touched" (mtime ISO-ish for Claude,
+    /// `updated_at` for Codex). Used only in ambiguity error messages.
+    when: String,
+}
+
 /// Resolve a Claude Code custom title to a session UUID by scanning
 /// `~/.claude/projects/*/*.jsonl` for `{"type":"custom-title","customTitle":"..."}`.
-/// Picks the most recently modified match.
-fn resolve_claude_thread_name(name: &str) -> Option<String> {
+///
+/// `/rename` appends a new `custom-title` entry each time, so within a single
+/// transcript only the LAST entry reflects the session's current title. A
+/// session renamed `A → B → C` must not match for `A` or `B`.
+///
+/// Across files, if multiple distinct sessions currently have the same title,
+/// we bail rather than silently pick the most recent — the user may have
+/// accidentally reused a name.
+fn resolve_claude_thread_name(name: &str) -> Result<Option<String>> {
     let projects_dir = claude_config_dir().join("projects");
     if !projects_dir.is_dir() {
-        return None;
+        return Ok(None);
     }
 
-    let mut best_match: Option<(String, std::time::SystemTime)> = None;
+    let mut matches: Vec<ThreadMatch> = Vec::new();
 
-    let entries = std::fs::read_dir(&projects_dir).ok()?;
+    let entries = match std::fs::read_dir(&projects_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
             continue;
@@ -1004,6 +1022,9 @@ fn resolve_claude_thread_name(name: &str) -> Option<String> {
                 Err(_) => continue,
             };
             let reader = std::io::BufReader::new(file);
+            // Track the LAST custom-title entry in the file — that's the
+            // session's current title.
+            let mut last_title: Option<(String, String)> = None;
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
@@ -1017,38 +1038,50 @@ fn resolve_claude_thread_name(name: &str) -> Option<String> {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if parsed.get("type").and_then(|v| v.as_str()) == Some("custom-title")
-                    && parsed.get("customTitle").and_then(|v| v.as_str()) == Some(name)
-                {
-                    if let Some(session_id) = parsed.get("sessionId").and_then(|v| v.as_str()) {
-                        let mtime = sub_entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        if best_match
-                            .as_ref()
-                            .map_or(true, |(_, prev_mtime)| mtime > *prev_mtime)
-                        {
-                            best_match = Some((session_id.to_string(), mtime));
-                        }
-                    }
-                    break; // Only one custom-title per file
+                if parsed.get("type").and_then(|v| v.as_str()) != Some("custom-title") {
+                    continue;
+                }
+                let title = match parsed.get("customTitle").and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => continue,
+                };
+                let session_id = match parsed.get("sessionId").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                last_title = Some((title, session_id));
+            }
+            if let Some((title, session_id)) = last_title {
+                if title == name {
+                    let when = sub_entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(format_system_time)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    matches.push(ThreadMatch { session_id, when });
                 }
             }
         }
     }
 
-    best_match.map(|(id, _)| id)
+    resolve_one_match("Claude", name, matches)
 }
 
 /// Resolve a Codex thread name to a session UUID by scanning
-/// `~/.codex/session_index.jsonl`. Picks the most recently updated match.
-fn resolve_codex_thread_name(name: &str) -> Option<String> {
-    let index_path = dirs::home_dir()?.join(".codex/session_index.jsonl");
-    let file = std::fs::File::open(&index_path).ok()?;
+/// `~/.codex/session_index.jsonl`. If multiple rows currently share the
+/// name, bail instead of silently picking by `updated_at`.
+fn resolve_codex_thread_name(name: &str) -> Result<Option<String>> {
+    let index_path = match dirs::home_dir() {
+        Some(h) => h.join(".codex/session_index.jsonl"),
+        None => return Ok(None),
+    };
+    let file = match std::fs::File::open(&index_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
     let reader = std::io::BufReader::new(file);
-    let mut best_match: Option<(String, String)> = None;
+    let mut matches: Vec<ThreadMatch> = Vec::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -1062,28 +1095,58 @@ fn resolve_codex_thread_name(name: &str) -> Option<String> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if parsed.get("thread_name").and_then(|v| v.as_str()) == Some(name) {
-            let id = parsed
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let updated = parsed
-                .get("updated_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !id.is_empty()
-                && best_match
-                    .as_ref()
-                    .map_or(true, |(_, prev)| updated > *prev)
-            {
-                best_match = Some((id, updated));
-            }
+        if parsed.get("thread_name").and_then(|v| v.as_str()) != Some(name) {
+            continue;
         }
+        let Some(id) = parsed.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let when = parsed
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        matches.push(ThreadMatch {
+            session_id: id.to_string(),
+            when,
+        });
     }
 
-    best_match.map(|(id, _)| id)
+    resolve_one_match("Codex", name, matches)
+}
+
+/// Turn a vec of candidate matches into at most one. >1 → ambiguity bail.
+fn resolve_one_match(tool: &str, name: &str, matches: Vec<ThreadMatch>) -> Result<Option<String>> {
+    if matches.len() <= 1 {
+        return Ok(matches.into_iter().next().map(|m| m.session_id));
+    }
+
+    let mut lines = String::new();
+    for m in &matches {
+        lines.push_str(&format!("  - {} (touched {})\n", m.session_id, m.when));
+    }
+    bail!(
+        "Thread name '{}' matches {} {} sessions:\n{}\
+         Pass the UUID directly to disambiguate.",
+        name,
+        matches.len(),
+        tool,
+        lines,
+    );
+}
+
+/// Format a SystemTime as an ISO-8601-ish UTC string for error messages.
+fn format_system_time(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0);
+    dt.map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // ── Session-ID adoption ──────────────────────────────────────────────────
@@ -1736,6 +1799,114 @@ mod tests {
         assert_eq!(output.action, "fork");
         assert_eq!(output.tool, "codex");
         assert!(!output.background);
+    }
+
+    #[test]
+    fn test_resolve_one_match_zero_or_one() {
+        assert_eq!(resolve_one_match("Claude", "x", vec![]).unwrap(), None);
+        let single = vec![ThreadMatch {
+            session_id: "abc".to_string(),
+            when: "t1".to_string(),
+        }];
+        assert_eq!(
+            resolve_one_match("Claude", "x", single).unwrap(),
+            Some("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_one_match_ambiguous_bails() {
+        let multi = vec![
+            ThreadMatch {
+                session_id: "sid-a".to_string(),
+                when: "2026-01-01T00:00:00Z".to_string(),
+            },
+            ThreadMatch {
+                session_id: "sid-b".to_string(),
+                when: "2026-02-01T00:00:00Z".to_string(),
+            },
+        ];
+        let err = resolve_one_match("Claude", "dup", multi).unwrap_err().to_string();
+        assert!(err.contains("matches 2 Claude sessions"), "got: {err}");
+        assert!(err.contains("sid-a") && err.contains("sid-b"), "got: {err}");
+        assert!(err.contains("UUID directly"), "got: {err}");
+    }
+
+    /// Point claude_config_dir() at `dir` for the duration of `f` by setting
+    /// CLAUDE_CONFIG_DIR. Restored on exit. serial_test required.
+    fn with_claude_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        // SAFETY: tests using this must be serial_test::serial — only one
+        // test at a time touches this env var.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", dir);
+        }
+        let out = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        out
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_claude_thread_name_prefers_last_custom_title() {
+        // A session renamed A → B → C must match for C (the current title),
+        // not A or B (obsolete).
+        let cfg = std::env::temp_dir().join("hcom_test_claude_rename_chain");
+        let projects = cfg.join("projects/proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("s1.jsonl"),
+            r#"{"type":"custom-title","customTitle":"A","sessionId":"s1"}
+{"type":"custom-title","customTitle":"B","sessionId":"s1"}
+{"type":"custom-title","customTitle":"C","sessionId":"s1"}
+"#,
+        )
+        .unwrap();
+
+        let (old, mid, cur) = with_claude_config_dir(&cfg, || {
+            (
+                resolve_claude_thread_name("A").unwrap(),
+                resolve_claude_thread_name("B").unwrap(),
+                resolve_claude_thread_name("C").unwrap(),
+            )
+        });
+
+        assert_eq!(old, None, "obsolete title A must not resolve");
+        assert_eq!(mid, None, "obsolete title B must not resolve");
+        assert_eq!(cur, Some("s1".to_string()), "current title C must resolve");
+        std::fs::remove_dir_all(&cfg).ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_claude_thread_name_bails_on_within_tool_duplicate() {
+        // Two distinct sessions both currently have customTitle="dup" — must
+        // bail rather than silently pick by mtime.
+        let cfg = std::env::temp_dir().join("hcom_test_claude_dup_title");
+        let projects = cfg.join("projects/proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("s1.jsonl"),
+            r#"{"type":"custom-title","customTitle":"dup","sessionId":"sess-aaaa"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            projects.join("s2.jsonl"),
+            r#"{"type":"custom-title","customTitle":"dup","sessionId":"sess-bbbb"}
+"#,
+        )
+        .unwrap();
+
+        let res = with_claude_config_dir(&cfg, || resolve_claude_thread_name("dup"));
+
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("matches 2 Claude sessions"), "got: {err}");
+        assert!(err.contains("sess-aaaa") && err.contains("sess-bbbb"), "got: {err}");
+        std::fs::remove_dir_all(&cfg).ok();
     }
 
     #[test]
