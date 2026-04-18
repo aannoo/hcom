@@ -218,6 +218,11 @@ pub fn do_resume(
     execute_prepared_resume(&db, &name, fork, &plan, &hcom_config, true)
 }
 
+/// Remote-RPC entry point: run the same resolution chain as `do_resume`
+/// (UUID → binding → events-fallback → thread-name → adoption → name-based
+/// resume) but return a `LaunchResult` instead of printing feedback. Called
+/// by `handle_remote_resume` on the target device, where the device suffix
+/// has already been stripped by the dispatcher.
 pub fn run_local_resume_result(
     db: &HcomDb,
     name: &str,
@@ -225,8 +230,66 @@ pub fn run_local_resume_result(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<LaunchResult> {
-    let plan = prepare_resume_plan(db, name, fork, extra_args, flags)?;
-    execute_prepared_resume_result(db, name, fork, &plan)
+    let name = crate::instances::resolve_display_name_or_stopped(db, name)
+        .unwrap_or_else(|| name.to_string());
+
+    if is_session_id(&name) {
+        if let Ok(Some(instance_name)) = db.get_session_binding(&name) {
+            if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
+                bail!(
+                    "Session {} is currently active as '{}' — run hcom kill {} first",
+                    name,
+                    instance_name,
+                    instance_name
+                );
+            }
+            return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
+        }
+        if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&name) {
+            return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
+        }
+        return adopt_session_result(db, &name, fork, extra_args, flags);
+    }
+
+    if matches!(db.get_instance_full(&name), Ok(None) | Err(_))
+        && crate::relay::control::split_device_suffix(&name).is_none()
+    {
+        if let Some(session_id) = resolve_thread_name(&name)? {
+            if let Ok(Some(instance_name)) = db.get_session_binding(&session_id) {
+                if matches!(db.get_instance_full(&instance_name), Ok(Some(_))) {
+                    bail!(
+                        "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
+                        session_id,
+                        name,
+                        instance_name,
+                        instance_name
+                    );
+                }
+                return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
+            }
+            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
+                return run_local_resume_result(db, &instance_name, fork, extra_args, flags);
+            }
+            return adopt_session_result(db, &session_id, fork, extra_args, flags);
+        }
+    }
+
+    let plan = prepare_resume_plan(db, &name, fork, extra_args, flags)?;
+    execute_prepared_resume_result(db, &name, fork, &plan)
+}
+
+/// Adoption variant that returns a `LaunchResult` for remote callers.
+/// Mirrors the plan-building path of `do_adopt_session` without preview/
+/// printing/logging.
+fn adopt_session_result(
+    db: &HcomDb,
+    session_id: &str,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<LaunchResult> {
+    let plan = build_adopt_plan(db, session_id, fork, extra_args, flags)?;
+    execute_prepared_resume_result(db, session_id, fork, &plan)
 }
 
 fn prepare_resume_plan(
@@ -1239,6 +1302,33 @@ fn do_adopt_session(
     flags: &GlobalFlags,
     hcom_config: &crate::config::HcomConfig,
 ) -> Result<i32> {
+    let plan = build_adopt_plan(db, session_id, fork, extra_args, flags)?;
+
+    let ctx = crate::shared::HcomContext::from_os();
+    if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
+        print_resume_preview(&plan, hcom_config, session_id, fork);
+        return Ok(0);
+    }
+
+    let exit = execute_prepared_resume(db, session_id, fork, &plan, hcom_config, true)?;
+    log_info(
+        if fork { "fork" } else { "resume" },
+        &format!("cmd.adopt_{}", if fork { "fork" } else { "resume" }),
+        &format!("session_id={}", session_id),
+    );
+    Ok(exit)
+}
+
+/// Locate a session on disk, recover its CWD, and build the `PreparedResume`.
+/// Split out so both the interactive adoption path (`do_adopt_session`) and
+/// the remote-RPC path (`adopt_session_result`) share identical behavior.
+fn build_adopt_plan(
+    db: &HcomDb,
+    session_id: &str,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<PreparedResume> {
     let (tool, transcript_path) = find_session_on_disk(session_id).ok_or_else(|| {
         // find_session_on_disk short-circuits for `ses_` IDs (only opencode is
         // searched), so scope the error to match what was actually checked.
@@ -1267,7 +1357,7 @@ fn do_adopt_session(
     })?;
 
     // CWD recovery: for opencode, the session row carries `directory` directly.
-    // For Claude/Codex, read only the first line of the transcript (CWD is
+    // For Claude/Codex, scan transcript entries for the recorded cwd (CWD is
     // fixed at session start; no tool changes CWD mid-session). For fork we
     // start in $PWD (or --dir) by design.
     let cwd_hint = if fork {
@@ -1294,36 +1384,17 @@ fn do_adopt_session(
         }
     };
 
-    let plan = prepare_resume_plan_from_source(
+    prepare_resume_plan_from_source(
         db,
         ResumeSource::Disk {
             session_id: session_id.to_string(),
-            tool: tool.clone(),
+            tool,
             cwd_hint,
         },
         fork,
         extra_args,
         flags,
-    )?;
-
-    let ctx = crate::shared::HcomContext::from_os();
-    if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
-        print_resume_preview(&plan, hcom_config, session_id, fork);
-        return Ok(0);
-    }
-
-    let exit = execute_prepared_resume(db, session_id, fork, &plan, hcom_config, true)?;
-    log_info(
-        if fork { "fork" } else { "resume" },
-        &format!("cmd.adopt_{}", if fork { "fork" } else { "resume" }),
-        &format!(
-            "session_id={} tool={} source={}",
-            session_id,
-            tool,
-            transcript_path.as_deref().unwrap_or("opencode-db")
-        ),
-    );
-    Ok(exit)
+    )
 }
 
 #[cfg(test)]
@@ -1665,6 +1736,49 @@ mod tests {
         assert_eq!(output.action, "fork");
         assert_eq!(output.tool, "codex");
         assert!(!output.background);
+    }
+
+    #[test]
+    fn test_run_local_resume_result_routes_uuid_to_adoption() {
+        // Remote-RPC entrypoint must walk the UUID/thread-name resolution
+        // chain. A UUID with no on-disk transcript should error with the
+        // adoption "Session not found" message (proving we hit find_session_on_disk),
+        // not the name-based "No stopped snapshot found" message.
+        let db = test_db();
+        let err = run_local_resume_result(
+            &db,
+            "12345678-1234-5678-1234-567812345678",
+            false,
+            &[],
+            &GlobalFlags::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Session 12345678-1234-5678-1234-567812345678 not found"),
+            "expected adoption error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_local_resume_result_routes_opencode_uuid_to_adoption() {
+        // Sanity: opencode-style IDs also route through adoption, with the
+        // opencode-specific error.
+        let db = test_db();
+        let err = run_local_resume_result(
+            &db,
+            "ses_nonexistentfakesession12345",
+            false,
+            &[],
+            &GlobalFlags::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Session ses_nonexistentfakesession12345 not found"),
+            "expected adoption error, got: {err}"
+        );
+        assert!(err.contains("Opencode"), "error should mention opencode: {err}");
     }
 
     #[test]
