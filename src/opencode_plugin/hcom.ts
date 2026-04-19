@@ -84,8 +84,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   //     next wake event.
   //   pendingAckId — set after messages are read, cleared by transform.
   //     Prevents re-delivery while a prior injection is still being processed.
-  //     If promptAsync throws synchronously after pendingAckId is set, the id
-  //     remains until the next transform fires or the session resets.
+  //     If promptAsync fails to queue, pendingAckId is cleared immediately.
   async function deliverPendingToIdle(sid: string): Promise<boolean> {
     if (permissionPending) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "permission_pending" })
@@ -125,10 +124,29 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       // the loop is actually processing the message. This keeps messages
       // unread until delivery is confirmed.
       pendingAckId = maxId
-      client.session.promptAsync({
-        path: { id: sid },
-        body: { parts: [{ type: "text", text: formatted }] },
-      } as any)
+      try {
+        const promptAsyncResult = client.session.promptAsync({
+          path: { id: sid },
+          body: { parts: [{ type: "text", text: formatted }] },
+        } as any)
+        if (promptAsyncResult && typeof (promptAsyncResult as Promise<unknown>).then === "function") {
+          void (promptAsyncResult as Promise<unknown>).catch((e) => {
+            if (pendingAckId === maxId) pendingAckId = null
+            log("ERROR", "plugin.delivery_prompt_failed", instanceName, {
+              error: String(e),
+              pending_ack: maxId,
+            })
+          })
+        }
+      } catch (e) {
+        pendingAckId = null
+        log("ERROR", "plugin.delivery_prompt_failed", instanceName, {
+          error: String(e),
+          pending_ack: maxId,
+          sync_throw: true,
+        })
+        return false
+      }
       log("INFO", "plugin.delivery_pending", instanceName, {
         msg: `promptAsync, ack deferred to transform (maxId=${maxId})`,
         count: rawMessages.length,
@@ -328,6 +346,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             bindingPromise = null
             lastReportedStatus = null
             pendingAckId = null
+            deliveryInFlight = false
             permissionPending = false
             break
           case "file.edited": {
