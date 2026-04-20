@@ -25,14 +25,14 @@ thread="duo-$(date +%s)"
 
 trap cleanup ERR INT TERM
 
-# Launch Codex first and wait for session binding before Claude can send it anything
+# Launch Codex engineer
 launch_out=$(hcom 1 codex --tag eng --go --headless \
   --hcom-prompt "Wait for spec from @arch-. Implement it. Then confirm: hcom send \"@arch-\" --thread ${thread} --intent inform -- \"IMPLEMENTED\". Then stop: hcom stop" 2>&1)
 track_launch "$launch_out"
 eng=$(echo "$launch_out" | grep '^Names: ' | sed 's/^Names: //' | tr -d ' ')
 echo "Engineer (Codex): $eng"
-hcom events --wait 30 --idle "$eng" $name_arg >/dev/null 2>&1
 
+# Launch Claude architect
 launch_out=$(hcom 1 claude --tag arch --go --headless \
   --hcom-prompt "Design a 2-3 sentence spec for: ${task}. Send to @eng-: hcom send \"@eng-\" --thread ${thread} --intent request -- \"SPEC: <spec>\". Wait for confirmation. Then send: hcom send \"@bigboss\" --thread ${thread} --intent inform -- \"APPROVED\". Then stop: hcom stop" 2>&1)
 track_launch "$launch_out"
