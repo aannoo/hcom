@@ -427,9 +427,17 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (input.sessionID && !instanceName) {
           await bindIdentity(input.sessionID)
         }
-        if (input.agent) currentAgent = input.agent
-        const resolvedModel = normalizePromptModel(input.model)
-        if (resolvedModel) currentModel = resolvedModel
+        const isBoundSession = !input.sessionID || !sessionId || input.sessionID === sessionId
+        if (isBoundSession) {
+          if (input.agent) currentAgent = input.agent
+          const resolvedModel = normalizePromptModel(input.model)
+          if (resolvedModel) currentModel = resolvedModel
+        } else {
+          log("DEBUG", "plugin.chat_message_ignored_foreign_session", instanceName, {
+            session_id: input.sessionID,
+            bound_session_id: sessionId,
+          })
+        }
         log("DEBUG", "plugin.chat_message", instanceName, {
           session_id: input.sessionID,
           agent: input.agent,
