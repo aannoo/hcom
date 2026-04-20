@@ -6,6 +6,42 @@ import { homedir } from "os"
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
 
+// NOTE: parseCliArgValue / parseCliModelArg always return null in practice.
+// hcom launches OpenCode via a PTY wrapper (launcher.rs); the plugin process
+// inherits the OpenCode binary argv, not the outer `hcom opencode --agent …`
+// invocation. currentAgent / currentModel are seeded to null here and
+// populated correctly by the chat.message hook on the first user turn.
+// Long-term fix: seed from the `opencode-start` hcom response payload.
+function parseCliArgValue(...flags: string[]): string | null {
+  for (let i = 0; i < process.argv.length; i++) {
+    const token = process.argv[i]
+    for (const flag of flags) {
+      if (token === flag) return process.argv[i + 1] ?? null
+      if (token.startsWith(`${flag}=`)) return token.slice(flag.length + 1)
+    }
+  }
+  return null
+}
+
+function parseCliModelArg() {
+  const raw = parseCliArgValue("--model", "-m")
+  if (!raw) return null
+  const slash = raw.indexOf("/")
+  if (slash <= 0 || slash === raw.length - 1) return null
+  return {
+    providerID: raw.slice(0, slash),
+    modelID: raw.slice(slash + 1),
+  }
+}
+
+function normalizePromptModel(model: unknown) {
+  if (!model || typeof model !== "object") return null
+  const providerID = (model as Record<string, unknown>).providerID
+  const modelID = (model as Record<string, unknown>).modelID
+  if (typeof providerID !== "string" || typeof modelID !== "string") return null
+  return { providerID, modelID }
+}
+
 function log(
   level: "DEBUG" | "INFO" | "WARN" | "ERROR",
   event: string,
@@ -31,11 +67,16 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let bootstrapText: string | null = null     // BOOT-01: cached from opencode-start
   let bindingPromise: Promise<void> | null = null  // Prevents duplicate binding
   let reconcileTimer: ReturnType<typeof setInterval> | null = null  // Periodic status sync + delivery fallback
+  let reconcileInFlight = false                 // Prevents concurrent reconcile calls from overlapping interval ticks
   let notifyServer: ReturnType<typeof Bun.listen> | null = null  // TCP notify server for instant message wake
   let lastReportedStatus: string | null = null  // Skip redundant status updates
   let pendingAckId: number | null = null        // Deferred ack: set by deliverPendingToIdle, acked by transform
   let deliveryInFlight = false                  // Delivery guard flag: rejects concurrent callers (not a queuing mutex)
   let permissionPending = false                  // Exact permission gate from OpenCode events
+  let launchedAgent: string | null = parseCliArgValue("--agent")
+  let launchedModel: { providerID: string; modelID: string } | null = parseCliModelArg()
+  let currentAgent: string | null = launchedAgent
+  let currentModel: { providerID: string; modelID: string } | null = launchedModel
 
   // SAFE-02: Lazy PATH detection on first hook callback
   function checkHcom(): boolean {
@@ -47,15 +88,6 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       }
     }
     return hcomAvailable
-  }
-
-  function findLastUserMessage(
-    messages: Array<{ info: { id: string; sessionID: string; role: string }; parts: any[] }>
-  ) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].info.role === "user") return messages[i]
-    }
-    return null
   }
 
   function formatMessagesForInjection(messages: any[], recipientName: string): string {
@@ -124,11 +156,22 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       // the loop is actually processing the message. This keeps messages
       // unread until delivery is confirmed.
       pendingAckId = maxId
+      log("DEBUG", "plugin.delivery_payload", instanceName, {
+        session_id: sid,
+        current_agent: currentAgent,
+        current_model: currentModel?.modelID ?? null,
+      })
       try {
+        // Runtime contract note: OpenCode accepts agent/model in async prompt bodies,
+        // but current SDK typings omit them on promptAsync.
         const promptAsyncResult = client.session.promptAsync({
           path: { id: sid },
-          body: { parts: [{ type: "text", text: formatted }] },
-        } as any)
+          body: {
+            agent: currentAgent ?? undefined,
+            model: currentModel ?? undefined,
+            parts: [{ type: "text", text: formatted }],
+          },
+        } as any) // SDK types don't expose agent/model on the async variant; body shape matches the sync prompt endpoint
         if (promptAsyncResult && typeof (promptAsyncResult as Promise<unknown>).then === "function") {
           void (promptAsyncResult as Promise<unknown>).catch((e) => {
             if (pendingAckId === maxId) pendingAckId = null
@@ -163,8 +206,10 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   // daemon down, etc. other made up scenario etc.). Does NOT deliver messages — that's handled by
   // TCP notify (on message arrival) and session.status events (on idle).
   async function reconcile(): Promise<void> {
+    if (reconcileInFlight) return
     if (permissionPending) return
     if (!instanceName || !sessionId) return
+    reconcileInFlight = true
     try {
       const statusResult = await client.session.status()
       if (!statusResult.data) return
@@ -178,6 +223,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       }
     } catch (e) {
       log("ERROR", "plugin.reconcile_error", instanceName, { error: String(e) })
+    } finally {
+      reconcileInFlight = false
     }
   }
 
@@ -245,7 +292,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         instanceName = json.name
         sessionId = json.session_id
         bootstrapText = json.bootstrap || null
-        log("INFO", "plugin.bound", instanceName, { session_id: sessionId, notify_port: notifyPort, bootstrap_len: bootstrapText?.length ?? 0 })
+        log("INFO", "plugin.bound", instanceName, {
+          session_id: sessionId,
+          notify_port: notifyPort,
+          bootstrap_len: bootstrapText?.length ?? 0,
+          launched_agent: launchedAgent,
+          launched_model: launchedModel?.modelID ?? null,
+        })
       } catch (e) {
         log("ERROR", "plugin.bind_error", null, { error: String(e) })
         stopNotifyServer()
@@ -281,7 +334,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             }
             if (instanceName) {
               lastReportedStatus = "blocked"
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status blocked --context ${"approval"} --detail ${event.properties.permission}`.quiet()
+              await $.nothrow()`hcom opencode-status --name ${instanceName} --status blocked --context ${"approval"} --detail ${String(event.properties.permission ?? "")}`.quiet()
               log("INFO", "plugin.permission_asked", instanceName, { permission: event.properties.permission, request_id: event.properties.id })
             }
             break
@@ -348,11 +401,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             pendingAckId = null
             deliveryInFlight = false
             permissionPending = false
+            currentAgent = launchedAgent
+            currentModel = launchedModel
             break
           case "file.edited": {
             const filePath = event.properties.file
             if (instanceName) {
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --context ${"tool:write"} --detail ${filePath}`.quiet()
+              await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --context ${"tool:write"} --detail ${String(filePath ?? "")}`.quiet()
             }
             break
           }
@@ -372,6 +427,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (input.sessionID && !instanceName) {
           await bindIdentity(input.sessionID)
         }
+        if (input.agent) currentAgent = input.agent
+        const resolvedModel = normalizePromptModel(input.model)
+        if (resolvedModel) currentModel = resolvedModel
         log("DEBUG", "plugin.chat_message", instanceName, {
           session_id: input.sessionID,
           agent: input.agent,
@@ -404,11 +462,12 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
               synthetic: true,
             })
             log("DEBUG", "plugin.transform_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount, bootstrap_len: bootstrapText.length })
+            bootstrapText = null
           } else {
             log("WARN", "plugin.transform_no_user_msg", instanceName, { msg_count: msgCount })
           }
         } else {
-          log("WARN", "plugin.transform_no_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount })
+          log("DEBUG", "plugin.transform_no_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount })
         }
 
         // Deferred ack: deliverPendingToIdle called promptAsync but didn't ack.
