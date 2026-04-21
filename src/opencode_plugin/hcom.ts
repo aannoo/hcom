@@ -6,12 +6,15 @@ import { homedir } from "os"
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
 
-// NOTE: parseCliArgValue / parseCliModelArg always return null in practice.
-// hcom launches OpenCode via a PTY wrapper (launcher.rs); the plugin process
-// inherits the OpenCode binary argv, not the outer `hcom opencode --agent …`
-// invocation. currentAgent / currentModel are seeded to null here and
-// populated correctly by the chat.message hook on the first user turn.
-// Long-term fix: seed from the `opencode-start` hcom response payload.
+type PromptModel = {
+  providerID: string
+  modelID: string
+}
+
+// Best-effort fallback for non-hcom/manual plugin runs.
+// Normal hcom launches seed launch agent/model through the `opencode-start`
+// response payload, since the plugin process does not inherit the outer
+// `hcom opencode --agent/--model` argv in PTY-launched OpenCode.
 function parseCliArgValue(...flags: string[]): string | null {
   for (let i = 0; i < process.argv.length; i++) {
     const token = process.argv[i]
@@ -74,9 +77,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let deliveryInFlight = false                  // Delivery guard flag: rejects concurrent callers (not a queuing mutex)
   let permissionPending = false                  // Exact permission gate from OpenCode events
   let launchedAgent: string | null = parseCliArgValue("--agent")
-  let launchedModel: { providerID: string; modelID: string } | null = parseCliModelArg()
+  let launchedModel: PromptModel | null = parseCliModelArg()
   let currentAgent: string | null = launchedAgent
-  let currentModel: { providerID: string; modelID: string } | null = launchedModel
+  let currentModel: PromptModel | null = launchedModel
 
   // SAFE-02: Lazy PATH detection on first hook callback
   function checkHcom(): boolean {
@@ -88,6 +91,19 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       }
     }
     return hcomAvailable
+  }
+
+  function isBoundSession(candidateSessionId?: string | null): boolean {
+    return !candidateSessionId || !sessionId || candidateSessionId === sessionId
+  }
+
+  function ignoreForeignSession(event: string, candidateSessionId?: string | null): boolean {
+    if (isBoundSession(candidateSessionId)) return false
+    log("DEBUG", event, instanceName, {
+      session_id: candidateSessionId,
+      bound_session_id: sessionId,
+    })
+    return true
   }
 
   function formatMessagesForInjection(messages: any[], recipientName: string): string {
@@ -123,6 +139,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       return false
     }
     if (!instanceName) return false
+    if (ignoreForeignSession("plugin.delivery_ignored_foreign_session", sid)) {
+      return false
+    }
     if (deliveryInFlight) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "delivery_in_flight" })
       return false
@@ -162,8 +181,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         current_model: currentModel?.modelID ?? null,
       })
       try {
-        // Runtime contract note: OpenCode accepts agent/model in async prompt bodies,
-        // but current SDK typings omit them on promptAsync.
+        // Runtime contract note: keep this cast until the plugin's bundled client
+        // typings are aligned across shipped OpenCode builds.
         const promptAsyncResult = client.session.promptAsync({
           path: { id: sid },
           body: {
@@ -289,9 +308,14 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           stopNotifyServer()
           return
         }
+        const boundModel = normalizePromptModel(json.model)
+        if (typeof json.agent === "string") launchedAgent = json.agent
+        if (boundModel) launchedModel = boundModel
         instanceName = json.name
         sessionId = json.session_id
         bootstrapText = json.bootstrap || null
+        currentAgent = launchedAgent
+        currentModel = launchedModel
         log("INFO", "plugin.bound", instanceName, {
           session_id: sessionId,
           notify_port: notifyPort,
@@ -316,6 +340,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         const eventSessionId = event.properties?.sessionID ?? event.properties?.info?.id
         if (eventSessionId && !sessionId) {
           sessionId = eventSessionId as string
+        }
+        if (instanceName && ignoreForeignSession("plugin.event_ignored_foreign_session", eventSessionId)) {
+          return
         }
         switch (event.type) {
           case "session.created": {
@@ -427,16 +454,12 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (input.sessionID && !instanceName) {
           await bindIdentity(input.sessionID)
         }
-        const isBoundSession = !input.sessionID || !sessionId || input.sessionID === sessionId
-        if (isBoundSession) {
+        if (isBoundSession(input.sessionID)) {
           if (input.agent) currentAgent = input.agent
           const resolvedModel = normalizePromptModel(input.model)
           if (resolvedModel) currentModel = resolvedModel
         } else {
-          log("DEBUG", "plugin.chat_message_ignored_foreign_session", instanceName, {
-            session_id: input.sessionID,
-            bound_session_id: sessionId,
-          })
+          ignoreForeignSession("plugin.chat_message_ignored_foreign_session", input.sessionID)
         }
         log("DEBUG", "plugin.chat_message", instanceName, {
           session_id: input.sessionID,

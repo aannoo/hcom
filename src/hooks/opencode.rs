@@ -10,8 +10,8 @@ use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log::{log_error, log_info};
-use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
+use crate::shared::ST_LISTENING;
 
 use super::common;
 use super::common::finalize_session;
@@ -27,6 +27,58 @@ fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
 /// Check if a bare flag exists in argv (no value).
 fn has_flag(argv: &[String], flag: &str) -> bool {
     argv.iter().any(|a| a == flag)
+}
+
+/// Extract `--flag value` or `--flag=value` from argv.
+fn parse_value_arg(argv: &[String], flags: &[&str]) -> Option<String> {
+    for (idx, token) in argv.iter().enumerate() {
+        for flag in flags {
+            if token == flag {
+                return argv.get(idx + 1).cloned();
+            }
+            let prefix = format!("{flag}=");
+            if let Some(value) = token.strip_prefix(&prefix) {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_launch_model(raw: &str) -> Option<Value> {
+    let (provider_id, model_id) = raw.split_once('/')?;
+    if provider_id.is_empty() || model_id.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "providerID": provider_id,
+        "modelID": model_id,
+    }))
+}
+
+fn launch_agent_and_model_from_args(launch_args: Option<&str>) -> (Option<String>, Option<Value>) {
+    let Some(raw_args) = launch_args.filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+    let argv: Vec<String> = match serde_json::from_str(raw_args) {
+        Ok(args) => args,
+        Err(_) => return (None, None),
+    };
+
+    let agent = parse_value_arg(&argv, &["--agent"]);
+    let model =
+        parse_value_arg(&argv, &["--model", "-m"]).and_then(|value| parse_launch_model(&value));
+    (agent, model)
+}
+
+fn launch_agent_and_model(db: &HcomDb, instance_name: &str) -> (Option<String>, Option<Value>) {
+    db.get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .map(|instance| launch_agent_and_model_from_args(instance.launch_args.as_deref()))
+        .unwrap_or((None, None))
 }
 
 /// Upsert plugin notify endpoint in DB.
@@ -132,11 +184,18 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
             &format!("instance={} session_id={}", existing_name, session_id),
         );
 
+        let (launch_agent, launch_model) = launch_agent_and_model(db, &existing_name);
         let mut result = serde_json::json!({
             "name": existing_name,
             "session_id": session_id,
         });
         result["bootstrap"] = Value::String(bootstrap_text);
+        if let Some(agent) = launch_agent {
+            result["agent"] = Value::String(agent);
+        }
+        if let Some(model) = launch_model {
+            result["model"] = model;
+        }
         return (0, serde_json::to_string(&result).unwrap_or_default());
     }
 
@@ -242,11 +301,18 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     // Auto-spawn relay-worker now that an instance is active
     crate::relay::worker::ensure_worker(true);
 
+    let (launch_agent, launch_model) = launch_agent_and_model(db, &instance_name);
     let mut response = serde_json::json!({
         "name": instance_name,
         "session_id": session_id,
     });
     response["bootstrap"] = Value::String(bootstrap_text);
+    if let Some(agent) = launch_agent {
+        response["agent"] = Value::String(agent);
+    }
+    if let Some(model) = launch_model {
+        response["model"] = model;
+    }
     (0, serde_json::to_string(&response).unwrap_or_default())
 }
 
@@ -689,6 +755,105 @@ mod tests {
         assert!(!has_flag(&argv, "--ack"));
     }
 
+    #[test]
+    fn test_parse_value_arg_supports_split_and_equals_forms() {
+        let split = sv(&["--agent", "reviewer", "-m", "openai/gpt-5.4"]);
+        assert_eq!(
+            parse_value_arg(&split, &["--agent"]),
+            Some("reviewer".to_string())
+        );
+        assert_eq!(
+            parse_value_arg(&split, &["--model", "-m"]),
+            Some("openai/gpt-5.4".to_string())
+        );
+
+        let equals = sv(&["--agent=planner", "--model=anthropic/claude-sonnet-4-6"]);
+        assert_eq!(
+            parse_value_arg(&equals, &["--agent"]),
+            Some("planner".to_string())
+        );
+        assert_eq!(
+            parse_value_arg(&equals, &["--model", "-m"]),
+            Some("anthropic/claude-sonnet-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_launch_model_validates_provider_and_model() {
+        assert_eq!(
+            parse_launch_model("openai/gpt-5.4"),
+            Some(serde_json::json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.4",
+            }))
+        );
+        assert_eq!(parse_launch_model("openai"), None);
+        assert_eq!(parse_launch_model("/gpt-5.4"), None);
+        assert_eq!(parse_launch_model("openai/"), None);
+    }
+
+    #[test]
+    fn test_launch_agent_and_model_from_args_parses_stored_launch_args() {
+        let launch_args =
+            serde_json::to_string(&sv(&["--agent=planner", "--model", "openai/gpt-5.4"])).unwrap();
+
+        let (agent, model) = launch_agent_and_model_from_args(Some(&launch_args));
+        assert_eq!(agent.as_deref(), Some("planner"));
+        assert_eq!(
+            model,
+            Some(serde_json::json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.4",
+            }))
+        );
+    }
+
+    #[test]
+    fn test_launch_agent_and_model_from_args_supports_short_model_flag() {
+        let launch_args = serde_json::to_string(&sv(&[
+            "--agent",
+            "reviewer",
+            "-m",
+            "anthropic/claude-opus-4",
+        ]))
+        .unwrap();
+
+        let (agent, model) = launch_agent_and_model_from_args(Some(&launch_args));
+        assert_eq!(agent.as_deref(), Some("reviewer"));
+        assert_eq!(
+            model,
+            Some(serde_json::json!({
+                "providerID": "anthropic",
+                "modelID": "claude-opus-4",
+            }))
+        );
+    }
+
+    #[test]
+    fn test_launch_agent_and_model_reads_instance_launch_args() {
+        let (_dir, db) = test_db();
+        let launch_args =
+            serde_json::to_string(&sv(&["--agent", "reviewer", "--model", "openai/gpt-5.4"]))
+                .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, launch_args)
+                 VALUES (?1, 'opencode', 'active', 0, ?2)",
+                rusqlite::params!["luna", launch_args],
+            )
+            .unwrap();
+
+        let (agent, model) = launch_agent_and_model(&db, "luna");
+        assert_eq!(agent.as_deref(), Some("reviewer"));
+        assert_eq!(
+            model,
+            Some(serde_json::json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.4",
+            }))
+        );
+    }
+
     // ── Plugin management ──
 
     #[test]
@@ -843,6 +1008,52 @@ mod tests {
         let (code, output) = handle_start(&ctx, &db, &argv);
         assert_eq!(code, 0);
         assert!(output.contains("Missing --session-id"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_start_rebind_includes_launch_identity() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+        let launch_args =
+            serde_json::to_string(&sv(&["--agent", "reviewer", "--model", "openai/gpt-5.4"]))
+                .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, launch_args)
+                 VALUES (?1, 'opencode', 'active', 0, ?2)",
+                rusqlite::params!["luna", launch_args],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "luna").unwrap();
+
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-123".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+
+        let (code, output) = handle_start(&ctx, &db, &sv(&["--session-id", "sess-1"]));
+        assert_eq!(code, 0);
+
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["name"], "luna");
+        assert_eq!(payload["session_id"], "sess-1");
+        assert_eq!(payload["agent"], "reviewer");
+        assert_eq!(
+            payload["model"],
+            serde_json::json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.4",
+            })
+        );
+        assert!(payload["bootstrap"].as_str().is_some());
     }
 
     #[test]
