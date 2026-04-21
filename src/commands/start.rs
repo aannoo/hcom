@@ -9,6 +9,7 @@
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::bootstrap;
 use crate::config::HcomConfig;
@@ -497,21 +498,14 @@ fn start_rebind(
         }
     }
 
+    let target_meta = load_rebind_target_metadata(db, &target_name).ok();
+    if let Some(ref meta) = target_meta {
+        ensure_rebind_compatible(&target_name, meta, ctx)?;
+    }
+
     // Preserve last_event_id from target (cursor preservation)
-    let mut last_event_id: Option<i64> = None;
+    let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
-
-    if let Some(ref td) = target_data {
-        last_event_id = Some(td.last_event_id);
-    }
-
-    // Fallback: read cursor from stopped snapshot if instance row missing
-    if last_event_id.is_none() {
-        // Query stopped life event for last_event_id from snapshot
-        if let Ok(eid) = load_stopped_snapshot_event_id(db, &target_name) {
-            last_event_id = Some(eid);
-        }
-    }
 
     // Final fallback: use current max to avoid re-delivering old messages
     if last_event_id.is_none() {
@@ -544,6 +538,7 @@ fn start_rebind(
 
     // Create fresh instance with the target name
     let tool = ctx.tool.as_str();
+    let cwd_override = ctx.cwd.to_string_lossy().to_string();
     instance_binding::initialize_instance_in_position_file(
         db,
         &target_name,
@@ -558,7 +553,7 @@ fn start_rebind(
         None,  // wait_timeout
         None,  // subagent_timeout
         None,  // hints
-        None,  // cwd_override
+        Some(&cwd_override),
     );
 
     // Restore cursor position + mark as announced
@@ -627,9 +622,57 @@ fn start_rebind(
     Ok(0)
 }
 
-/// Extract last_event_id from a stopped life event snapshot.
-/// Used as fallback when the instance row is already deleted.
-fn load_stopped_snapshot_event_id(db: &HcomDb, name: &str) -> Result<i64> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RebindTargetMetadata {
+    tool: String,
+    directory: String,
+    last_event_id: i64,
+}
+
+fn ensure_rebind_compatible(
+    target_name: &str,
+    meta: &RebindTargetMetadata,
+    ctx: &HcomContext,
+) -> Result<()> {
+    let current_tool = ctx.tool.as_str();
+    if !meta.tool.is_empty() && meta.tool != current_tool {
+        bail!(
+            "Refusing to reclaim '{target_name}': latest identity used tool '{}' but current session is '{}'",
+            meta.tool,
+            current_tool
+        );
+    }
+
+    let current_dir = ctx.cwd.to_string_lossy();
+    if !meta.directory.is_empty() && !same_path(&meta.directory, &current_dir) {
+        bail!(
+            "Refusing to reclaim '{target_name}': latest identity used directory '{}' but current session is '{}'",
+            meta.directory,
+            current_dir
+        );
+    }
+
+    Ok(())
+}
+
+fn same_path(left: &str, right: &str) -> bool {
+    normalize_path_for_compare(left) == normalize_path_for_compare(right)
+}
+
+fn normalize_path_for_compare(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// Load rebind metadata from the live row first, then the latest stopped snapshot.
+fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMetadata> {
+    if let Some(inst) = db.get_instance_full(name)? {
+        return Ok(RebindTargetMetadata {
+            tool: inst.tool,
+            directory: inst.directory,
+            last_event_id: inst.last_event_id,
+        });
+    }
+
     let mut stmt = db.conn().prepare(
         "SELECT data FROM events WHERE type='life' AND instance=? ORDER BY id DESC LIMIT 10",
     )?;
@@ -643,15 +686,28 @@ fn load_stopped_snapshot_event_id(db: &HcomDb, name: &str) -> Result<i64> {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
             if data.get("action").and_then(|v| v.as_str()) == Some("stopped") {
                 if let Some(snapshot) = data.get("snapshot") {
-                    if let Some(eid) = snapshot.get("last_event_id").and_then(|v| v.as_i64()) {
-                        return Ok(eid);
-                    }
+                    return Ok(RebindTargetMetadata {
+                        tool: snapshot
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        directory: snapshot
+                            .get("directory")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        last_event_id: snapshot
+                            .get("last_event_id")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                    });
                 }
             }
         }
     }
 
-    bail!("No stopped snapshot found for '{}'", name)
+    bail!("No rebind metadata found for '{}'", name)
 }
 
 /// Path C: Bare start — detect tool or create adhoc instance.
@@ -809,7 +865,42 @@ mod tests {
     use super::*;
     use clap::Parser;
     use rusqlite::params;
+    use serde_json::json;
     use serial_test::serial;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        for (k, v) in tool_env {
+            env.insert((*k).to_string(), (*v).to_string());
+        }
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    fn log_stopped_snapshot(
+        db: &HcomDb,
+        name: &str,
+        tool: &str,
+        directory: &str,
+        session_id: &str,
+        last_event_id: i64,
+    ) {
+        db.log_event(
+            "life",
+            name,
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": tool,
+                    "directory": directory,
+                    "session_id": session_id,
+                    "last_event_id": last_event_id
+                }
+            }),
+        )
+        .unwrap();
+    }
     #[test]
     fn test_start_args_bare() {
         let args = StartArgs::try_parse_from(["start"]).unwrap();
@@ -874,5 +965,111 @@ mod tests {
             err.to_string().contains("Remote start is not supported"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_rejects_cross_tool_stopped_snapshot_hijack() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        log_stopped_snapshot(
+            &db,
+            "fama",
+            "codex",
+            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
+            "sid-fama",
+            42,
+        );
+
+        let ctx = make_ctx(
+            &[("CLAUDECODE", "1")],
+            "/tmp/hcom-gan-harness/.worktrees/bench-infra",
+        );
+
+        let err = start_rebind(&db, "fama", &ctx, None).unwrap_err();
+        assert!(
+            err.to_string().contains("Refusing to reclaim 'fama'"),
+            "unexpected error: {err}"
+        );
+
+        assert!(db.get_instance_full("fama").unwrap().is_none());
+        assert_eq!(db.get_session_binding("sid-fama").unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_allows_matching_stopped_snapshot_reclaim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        log_stopped_snapshot(
+            &db,
+            "nova",
+            "claude",
+            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
+            "sid-nova",
+            77,
+        );
+
+        let ctx = make_ctx(
+            &[("CLAUDECODE", "1")],
+            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
+        );
+
+        let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
+        assert_eq!(exit_code, 0);
+
+        let inst = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(inst.tool, "claude");
+        assert_eq!(
+            inst.directory,
+            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes"
+        );
+        assert_eq!(inst.last_event_id, 77);
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_rejects_cross_directory_stopped_snapshot_hijack() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        log_stopped_snapshot(
+            &db,
+            "mira",
+            "claude",
+            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
+            "sid-mira",
+            18,
+        );
+
+        let ctx = make_ctx(
+            &[("CLAUDECODE", "1")],
+            "/tmp/hcom-gan-harness/.worktrees/bench-infra",
+        );
+
+        let err = start_rebind(&db, "mira", &ctx, None).unwrap_err();
+        assert!(
+            err.to_string().contains("Refusing to reclaim 'mira'"),
+            "unexpected error: {err}"
+        );
+
+        assert!(db.get_instance_full("mira").unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_same_path_resolves_symlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert!(same_path(
+            real.to_string_lossy().as_ref(),
+            alias.to_string_lossy().as_ref()
+        ));
     }
 }
