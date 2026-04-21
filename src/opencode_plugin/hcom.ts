@@ -478,11 +478,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (!instanceName && sessionId) await bindIdentity(sessionId)
         if (!instanceName || !sessionId) return
 
-        // Inject bootstrap on first user message (ephemeral — clone discarded after each turn)
-        const msgCount = output.messages?.length ?? 0
-        const userMsgCount = output.messages?.filter((m: any) => m.info.role === "user").length ?? 0
+        // OpenCode transform mutations are prompt-local, not persisted to stored
+        // session history, so keep injecting the original bootstrap payload.
+        const messages = output.messages ?? []
+        const msgCount = messages.length
+        const userMsgCount = messages.filter((m: any) => m.info.role === "user").length
         if (bootstrapText) {
-          const firstUserMsg = output.messages.find((m: any) => m.info.role === "user")
+          const firstUserMsg = messages.find((m: any) => m.info.role === "user")
           if (firstUserMsg) {
             firstUserMsg.parts.push({
               id: crypto.randomUUID(),
@@ -493,7 +495,6 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
               synthetic: true,
             })
             log("DEBUG", "plugin.transform_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount, bootstrap_len: bootstrapText.length })
-            bootstrapText = null
           } else {
             log("WARN", "plugin.transform_no_user_msg", instanceName, { msg_count: msgCount })
           }
