@@ -675,6 +675,10 @@ impl Proxy {
         // with any incomplete escape sequence (CSI, OSC, UTF-8, etc.).
         let mut had_pty_output: bool;
 
+        // Whether to include stdin in the poll set. Set to false when stdin is a non-TTY
+        // that reaches EOF (e.g. /dev/null in headless mode), to avoid busy-waiting.
+        let mut poll_stdin = true;
+
         // For Claude in accept-edits mode, ready pattern may be hidden.
         // Start delivery after timeout if ready pattern not seen.
         use crate::tool::Tool;
@@ -720,7 +724,7 @@ impl Proxy {
 
             let mut poll_fds = vec![
                 PollFd::new(master_fd, PollFlags::POLLIN),
-                PollFd::new(stdin_borrowed, PollFlags::POLLIN),
+                PollFd::new(stdin_borrowed, if poll_stdin { PollFlags::POLLIN } else { PollFlags::empty() }),
                 PollFd::new(inject_listener_fd, PollFlags::POLLIN),
             ];
 
@@ -764,13 +768,6 @@ impl Proxy {
                         self.inject_server.port(),
                         "Periodic dump (main loop)",
                     );
-                    // Detect lost terminal (e.g. terminal window closed, stdin redirected to /dev/null)
-                    // SAFETY: stdin_raw is a valid fd obtained from stdin().as_raw_fd() at function start
-                    if !nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
-                        .unwrap_or(false)
-                    {
-                        break;
-                    }
                     // Fall through to title write — timeout means no PTY output, safe to write.
                 }
                 Ok(_) => {}
@@ -919,7 +916,16 @@ impl Proxy {
                 }
                 if revents.contains(PollFlags::POLLIN) {
                     match nix_read(&stdin_fd, &mut buf) {
-                        Ok(0) => break, // stdin EOF = terminal gone, exit cleanly
+                        Ok(0) => {
+                            // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
+                            // When running headless, stdin may be /dev/null or a pipe,
+                            // which is always at EOF but does not mean the terminal is gone.
+                            if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) }).unwrap_or(false) {
+                                break;
+                            }
+                            // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
+                            poll_stdin = false;
+                        }
                         Ok(n) => {
                             self.last_user_input = Instant::now();
                             self.screen.clear_approval();
