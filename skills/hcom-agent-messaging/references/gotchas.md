@@ -1,6 +1,6 @@
 # hcom Script Gotchas
 
-Issues discovered during real testing with hcom v0.7.6 on 2026-03-24. Every entry below was hit during actual test runs.
+Common issues and fixes discovered during real testing.
 
 ## Script Hangs Forever
 
@@ -37,30 +37,6 @@ hcom events --agent luna     # What has luna seen recently?
 | No matching thread | Agent sees no messages | Both sides must use exact same `--thread` value |
 | Message scope mismatch | Event `scope` is "mentions" but agent not in `mentions` array | Verify @mention matches agent name or tag |
 | Identity binding failed | Agent not in `instances` table | Check `HCOM_PROCESS_ID` env var propagation |
-
-## Codex Agent Gets stale_cleanup
-
-**Root cause:** Codex session binding happens on the first `codex-notify` hook event (agent-turn-complete), which takes 5-10 seconds. The hcom cleanup process runs every 30 seconds. If Codex does nothing within 30 seconds of launching, the placeholder instance is cleaned up as stale.
-
-**Technical details:**
-- Codex has only 1 hook (`codex-notify`) triggered on agent-turn-complete
-- Session binding happens via `rebind_instance_session()` in the codex hook handler
-- The cleanup function `cleanup_stale_placeholders()` purges instances with status_context="new" that have not bound within the timeout
-- Unlike Claude (which binds immediately on SessionStart), Codex binding is delayed
-
-**Fix:**
-```bash
-# After launching Codex, always wait for idle before sending messages
-launch_out=$(hcom 1 codex --tag eng --go --headless --hcom-prompt "..." 2>&1)
-track_launch "$launch_out"
-codex_name=$(echo "$launch_out" | grep '^Names: ' | sed 's/^Names: //' | tr -d ' ')
-
-# This blocks until Codex's session binds and it enters idle/listening state
-hcom events --wait 30 --idle "$codex_name" $name_arg >/dev/null 2>&1
-# NOW safe to send messages
-```
-
-**If Codex is already cleaned up:** You will see no instance in `hcom list`. The only fix is to relaunch.
 
 ## Messages Leaking Between Workflows
 
@@ -129,38 +105,9 @@ done
 
 ## Agent Cleanup on Error
 
-Without cleanup, orphan headless agents run indefinitely consuming resources:
-
-```bash
-LAUNCHED_NAMES=()
-track_launch() {
-  local names=$(echo "$1" | grep '^Names: ' | sed 's/^Names: //')
-  for n in $names; do LAUNCHED_NAMES+=("$n"); done
-}
-cleanup() {
-  for name in "${LAUNCHED_NAMES[@]}"; do
-    hcom kill "$name" --go 2>/dev/null || true
-  done
-}
-trap cleanup ERR
-
-# ... your script logic ...
-
-# At end, clear trap and clean up normally
-trap - ERR
-for name in "${LAUNCHED_NAMES[@]}"; do
-  hcom kill "$name" --go 2>/dev/null || true
-done
-```
+Without cleanup, orphan headless agents run indefinitely consuming resources. Always use `trap cleanup ERR INT TERM` and track launched names. See `script-template.md` for the full pattern.
 
 **Use `hcom kill` not `hcom stop`:** Kill sends SIGTERM and closes the terminal pane. Stop preserves the session for resume but leaves the pane open.
-
-**Kill escalation sequence:**
-1. Close terminal pane via preset command (if available)
-2. SIGTERM to process group (negative PID = killpg, kills entire subtree)
-3. Wait 5 seconds for graceful shutdown
-4. Escalate to SIGKILL if process is still alive
-5. Wait 2 more seconds, drain PTY to prevent deadlock
 
 ## Broadcast vs Mention Routing
 
@@ -180,16 +127,7 @@ hcom send @luna @nova -- "luna and nova see this" # Multiple mentions
 
 ## Heartbeat and Stale Detection
 
-Agents are marked stale (inactive) if their heartbeat is not updated:
-
-| Mode | Threshold | What updates heartbeat |
-|------|-----------|----------------------|
-| With TCP notify | 35 seconds | Hook fires, hcom command, delivery thread |
-| Without TCP notify | 10 seconds | Hook fires, hcom command |
-| Activity timeout | 5 minutes | Any status change |
-| Launch timeout | 30 seconds | Session binding event |
-
-**Wake grace period:** After system sleep/wake, hcom gives a 60-second grace period where heartbeat checks are suspended. This prevents mass stale detection after laptop lid close/open.
+Agents are marked stale (inactive) if their heartbeat is not updated within tool-dependent thresholds. After system sleep/wake, hcom gives a grace period where heartbeat checks are suspended to prevent mass stale detection after laptop lid close/open.
 
 ## Intent System Misuse
 
@@ -225,7 +163,3 @@ The bootstrap teaches agents: `request -> always respond`, `inform -> respond on
 **Agent terminal pane does not close on kill:**
 - Cause: Terminal preset close command failed or pane ID was not captured
 - Fix: Manually close the terminal tab/pane. Check `hcom config terminal` for preset.
-
-**Codex message injection fails silently:**
-- Cause: Gate conditions not met (prompt not empty, user activity, approval pending)
-- Fix: Wait for agent to be in "listening" status before sending

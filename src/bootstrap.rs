@@ -15,6 +15,21 @@ use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 // User scripts are discovered at runtime from ~/.hcom/scripts/.
 
 // MAIN BOOTSTRAP TEMPLATE
+//
+// `--name` is redundant for live agents (HCOM_PROCESS_ID resolves identity at
+// priority 4 in identity.rs), but mandatory for two reasons:
+//
+// 1. Explicit `--name` takes the error-propagating path in build_ctx_for_command
+//    (`?`), while env-only resolution takes the swallowing path (`.ok()`).  When
+//    an agent is stopped/killed/unbound it doesn't know — it just runs the next
+//    command.  With `--name`, that produces "Instance 'luna' not found. Run
+//    'hcom start --as luna'".  Without it, identity silently becomes None and
+//    the gate emits a generic error with a `<name>` placeholder the agent can't
+//    fill in — hcom can't distinguish it from a bare terminal.
+//
+// 2. Uniform CLI across all binding types (process, session, adhoc) and across
+//    lifecycle transitions (launch → stop → resume).  The underlying binding
+//    changes; the flags don't.
 
 const UNIVERSAL: &str = r#"[HCOM SESSION]
 You have access to the hcom communication tool.
@@ -84,6 +99,14 @@ const UVX_CMD_NOTICE: &str = r#"
 Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."#;
 
 // Tool-specific delivery
+//
+// "end your turn to receive" — a behavioral nudge, not a technical requirement.
+// Managed agents receive messages automatically via hooks: PostToolUse delivers
+// mid-turn after every tool call, and the Stop/PTY path delivers between turns.
+// Agents don't need to do anything to receive.  But without this instruction
+// they instinctively run `sleep` or `hcom listen` to "wait", burning a tool
+// call for no benefit.  "End your turn" short-circuits that impulse and lets
+// the hook machinery do the work.
 
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 

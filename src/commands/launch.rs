@@ -636,7 +636,7 @@ pub(crate) fn print_launch_feedback(
         .filter_map(|h| h.get("instance_name").and_then(|v| v.as_str()))
         .collect();
     if !instance_names.is_empty() {
-        println!("Names: {}", instance_names.join(", "));
+        println!("Names: {}", instance_names.join(" "));
     }
     println!("Batch id: {}", result.batch_id);
     println!("To block until ready or fail (30s timeout), run: hcom events launch");

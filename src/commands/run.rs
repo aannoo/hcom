@@ -453,7 +453,7 @@ Launch output includes "Names: <name>" — parse to track spawned agents:
   track_launch() {
     local output="$1"
     local names
-    names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs)
+    names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //')
     for n in $names; do LAUNCHED_NAMES+=("$n"); done
   }
   cleanup() {

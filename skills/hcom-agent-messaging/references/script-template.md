@@ -28,7 +28,7 @@ set -euo pipefail
 # without this, orphan headless agents run indefinitely.
 LAUNCHED_NAMES=()
 track_launch() {
-  # hcom launch prints "Names: luna" or "Names: luna, nemo, kira"
+  # hcom launch prints "Names: luna" or "Names: luna nemo kira"
   local names=$(echo "$1" | grep '^Names: ' | sed 's/^Names: //')
   for n in $names; do LAUNCHED_NAMES+=("$n"); done
 }
@@ -38,8 +38,8 @@ cleanup() {
     hcom kill "$name" --go 2>/dev/null || true
   done
 }
-# trap ensures cleanup runs on any error
-trap cleanup ERR
+# trap ensures cleanup runs on any error or signal
+trap cleanup ERR INT TERM
 
 # --- identity propagation ---
 # hcom injects --name before script args. MUST parse and forward it.
@@ -70,10 +70,6 @@ track_launch "$launch_out"
 worker=$(echo "$launch_out" | grep '^Names: ' | sed 's/^Names: //' | tr -d ' ')
 echo "worker: $worker"
 
-# --- for codex: wait for session binding ---
-# codex takes 5-10s to bind. skip this for claude.
-# hcom events --wait 30 --idle "$codex_name" $name_arg >/dev/null 2>&1
-
 # --- wait for completion signal ---
 # use hcom events --wait, NEVER sleep
 hcom events --wait 120 \
@@ -96,7 +92,7 @@ done
 | `--tag X` on every launch | enables `@X-` prefix routing (more reliable than raw names) |
 | `--thread` on every send/wait | isolates messages per workflow run |
 | `--intent` on every send | tells recipient whether to respond |
-| `trap cleanup ERR` | ensures orphan agents are killed on script failure |
+| `trap cleanup ERR INT TERM` | ensures orphan agents are killed on script failure or signal |
 | parse `--name` from args | hcom injects this — must forward to all hcom commands |
 | capture name from `Names:` | agent names are random 4-letter words, never hardcode |
 
@@ -137,10 +133,10 @@ if __name__ == "__main__":
 # launch 3 agents at once
 launch_out=$(hcom 3 claude --tag team --go --headless \
   --hcom-prompt "answer the question" 2>&1)
-# "Names: luna, nemo, kira" (comma-separated)
+# "Names: luna nemo kira" (space-separated)
 names=$(echo "$launch_out" | grep '^Names: ' | sed 's/^Names: //')
 for n in $names; do
-  LAUNCHED_NAMES+=("$(echo $n | tr -d ' ,') ")
+  LAUNCHED_NAMES+=("$n")
 done
 
 # with batch coordination
