@@ -920,6 +920,48 @@ impl HcomDb {
         }
     }
 
+    /// Returns true iff there is at least one unread message that names this
+    /// instance directly (`scope='mentions'` and the recipient is in the
+    /// `mentions` array). Broadcasts are ignored.
+    ///
+    /// Used to gate dormant subagent activation: a SubagentStart-allocated
+    /// row is in the broadcast recipient set, but we don't want a passing
+    /// broadcast to wake a subagent nobody actually addressed.
+    pub fn has_direct_unread(&self, name: &str) -> bool {
+        let last_event_id = match self.get_instance_status(name) {
+            Ok(Some(status)) => status.last_event_id,
+            _ => 0,
+        };
+        let mut stmt = match self.conn.prepare_cached(
+            "SELECT data FROM events
+             WHERE id > ? AND type = 'message'
+             ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let rows = match stmt.query_map(params![last_event_id], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        for data in rows.flatten() {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
+            let scope = json
+                .get("scope")
+                .and_then(|s| s.as_str())
+                .unwrap_or("broadcast");
+            if scope != "mentions" {
+                continue;
+            }
+            if Self::should_deliver_to(&json, name) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get unread messages for an instance
     ///
     /// Returns messages where:
@@ -5255,6 +5297,60 @@ mod tests {
 
         db.delete_process_bindings_for_instance("luna").unwrap();
         assert!(!db.has_process_binding_for_instance("luna"));
+
+        cleanup_test_db(db_path);
+    }
+
+    /// Regression: a broadcast must NOT count as direct unread for a dormant
+    /// subagent, otherwise SubagentStop wakes every dormant subagent on every
+    /// broadcast and the "no message in → no keep-alive" gate is broken.
+    #[test]
+    fn test_has_direct_unread_ignores_broadcasts() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, last_event_id) \
+                 VALUES ('luna_reviewer_1', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Broadcast to everyone — must be ignored.
+        db.log_event(
+            "message",
+            "sender",
+            &serde_json::json!({"scope": "broadcast", "from": "sender", "text": "hi all"}),
+        )
+        .unwrap();
+        assert!(!db.has_direct_unread("luna_reviewer_1"));
+
+        // Direct mention of a different subagent — also ignored.
+        db.log_event(
+            "message",
+            "sender",
+            &serde_json::json!({
+                "scope": "mentions",
+                "mentions": ["other"],
+                "from": "sender",
+                "text": "hey other",
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_direct_unread("luna_reviewer_1"));
+
+        // Direct mention of this subagent — must trigger.
+        db.log_event(
+            "message",
+            "sender",
+            &serde_json::json!({
+                "scope": "mentions",
+                "mentions": ["luna_reviewer_1"],
+                "from": "sender",
+                "text": "hey you",
+            }),
+        )
+        .unwrap();
+        assert!(db.has_direct_unread("luna_reviewer_1"));
 
         cleanup_test_db(db_path);
     }

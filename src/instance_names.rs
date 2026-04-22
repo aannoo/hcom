@@ -313,3 +313,233 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
 
     result
 }
+
+/// Sanitize agent_type for use in a structured subagent name:
+/// lowercase, keep `[a-z0-9_]`, collapse leading/trailing underscores,
+/// fall back to "task" if empty.
+pub fn sanitize_subagent_type(raw: &str) -> String {
+    let lowered: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = lowered.trim_matches('_');
+    if trimmed.is_empty() {
+        "task".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Parameters for allocating a structured subagent instance row.
+pub struct SubagentAllocation<'a> {
+    pub agent_id: &'a str,
+    pub agent_type: &'a str,
+    pub parent_name: &'a str,
+    pub parent_session_id: Option<&'a str>,
+    pub parent_tag: Option<&'a str>,
+    /// Initial value for the `status` column (e.g. `"active"` or `"inactive"`).
+    pub status: &'a str,
+    /// Optional `status_context` column value.
+    pub status_context: Option<&'a str>,
+}
+
+/// Allocate a structured subagent instance row `{parent}_{type}_{N}`.
+///
+/// If an instance row already exists for `agent_id`, returns its name without
+/// re-inserting (so SubagentStart can run before `hcom start --name` without
+/// creating duplicates, and vice versa). Otherwise computes the next free
+/// suffix, INSERTs the row with `SQLite UNIQUE(name)` as the collision guard,
+/// and retries once with `max_n + 2` on constraint violation.
+pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Result<String> {
+    // Return early if a row already exists for this agent_id.
+    let existing: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT name FROM instances WHERE agent_id = ?",
+            rusqlite::params![info.agent_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(name) = existing {
+        return Ok(name);
+    }
+
+    let sanitized = sanitize_subagent_type(info.agent_type);
+    let pattern = format!("{}_{}_", info.parent_name, sanitized);
+    let like_pattern = format!("{pattern}%");
+    let names: Vec<String> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT name FROM instances WHERE name LIKE ?")?;
+        stmt.query_map(rusqlite::params![like_pattern], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    let mut max_n: u32 = 0;
+    for name in &names {
+        if let Some(suffix) = name.strip_prefix(&pattern) {
+            if let Ok(n) = suffix.parse::<u32>() {
+                max_n = max_n.max(n);
+            }
+        }
+    }
+
+    let candidate = format!("{pattern}{}", max_n + 1);
+    let initial_event_id = db.get_last_event_id();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let now = crate::shared::time::now_epoch_f64();
+
+    let insert_sql = "INSERT INTO instances \
+         (name, session_id, parent_session_id, parent_name, tag, agent_id, \
+          created_at, last_event_id, directory, last_stop, status, status_context) \
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)";
+
+    let do_insert = |name: &str| -> rusqlite::Result<usize> {
+        db.conn().execute(
+            insert_sql,
+            rusqlite::params![
+                name,
+                info.parent_session_id,
+                info.parent_name,
+                info.parent_tag,
+                info.agent_id,
+                now,
+                initial_event_id,
+                cwd,
+                info.status,
+                info.status_context,
+            ],
+        )
+    };
+
+    match do_insert(&candidate) {
+        Ok(_) => Ok(candidate),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            let retry = format!("{pattern}{}", max_n + 2);
+            do_insert(&retry)
+                .map_err(|e| anyhow::anyhow!("Failed to create unique subagent name after retry: {e}"))?;
+            Ok(retry)
+        }
+        Err(e) => Err(anyhow::anyhow!("Failed to insert subagent instance: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod subagent_alloc_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_db() -> (TempDir, HcomDb) {
+        let tmp = TempDir::new().unwrap();
+        let db = HcomDb::open_raw(&tmp.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (tmp, db)
+    }
+
+    fn alloc<'a>(agent_id: &'a str, agent_type: &'a str) -> SubagentAllocation<'a> {
+        // parent_session_id=None to skip the FK to instances(session_id) — we
+        // don't insert a real parent row, and the FK isn't relevant to what
+        // these tests cover.
+        SubagentAllocation {
+            agent_id,
+            agent_type,
+            parent_name: "luna",
+            parent_session_id: None,
+            parent_tag: None,
+            status: "inactive",
+            status_context: Some("subagent:dormant"),
+        }
+    }
+
+    #[test]
+    fn sanitize_lowercases_and_substitutes() {
+        assert_eq!(sanitize_subagent_type("Code-Reviewer"), "code_reviewer");
+        assert_eq!(sanitize_subagent_type("MY.Agent/v2"), "my_agent_v2");
+    }
+
+    #[test]
+    fn sanitize_trims_underscore_runs() {
+        assert_eq!(sanitize_subagent_type("__weird__"), "weird");
+        assert_eq!(sanitize_subagent_type("--//.."), "task");
+        assert_eq!(sanitize_subagent_type(""), "task");
+    }
+
+    #[test]
+    fn allocate_assigns_sequential_suffixes_per_parent_and_type() {
+        let (_tmp, db) = setup_db();
+        let n1 = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        let n2 = allocate_subagent_instance(&db, &alloc("aid-2", "reviewer")).unwrap();
+        let n3 = allocate_subagent_instance(&db, &alloc("aid-3", "explorer")).unwrap();
+        assert_eq!(n1, "luna_reviewer_1");
+        assert_eq!(n2, "luna_reviewer_2");
+        assert_eq!(n3, "luna_explorer_1");
+    }
+
+    #[test]
+    fn allocate_is_idempotent_on_agent_id() {
+        let (_tmp, db) = setup_db();
+        let first = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        // Same agent_id, different type — must return the original row's name,
+        // not insert a new one.
+        let second = allocate_subagent_instance(&db, &alloc("aid-1", "explorer")).unwrap();
+        assert_eq!(first, second);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE agent_id = ?",
+                rusqlite::params!["aid-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn allocate_retries_on_name_collision() {
+        let (_tmp, db) = setup_db();
+        // Pre-seed `luna_reviewer_1` directly so the natural pick collides
+        // (max_n=0 → candidate=_1 already taken → retry with _2).
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_time, created_at, last_stop) \
+                 VALUES ('luna_reviewer_1', 'active', 0, 0.0, 0)",
+                [],
+            )
+            .unwrap();
+        // Wipe agent_id so the LIKE-scan finds the collider but the agent_id
+        // shortcut doesn't fire.
+        let name = allocate_subagent_instance(&db, &alloc("aid-x", "reviewer")).unwrap();
+        // The seeded row has no suffix-N parsable from agent_id lookup, but
+        // it does match the LIKE pattern and parses as N=1 → next is _2.
+        assert_eq!(name, "luna_reviewer_2");
+    }
+
+    #[test]
+    fn allocate_writes_status_and_context_columns() {
+        let (_tmp, db) = setup_db();
+        let name = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        let (status, ctx, parent): (String, String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context, parent_name FROM instances WHERE name = ?",
+                rusqlite::params![name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "inactive");
+        assert_eq!(ctx, "subagent:dormant");
+        assert_eq!(parent.as_deref(), Some("luna"));
+    }
+}

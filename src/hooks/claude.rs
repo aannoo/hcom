@@ -19,6 +19,7 @@ use crate::hooks::common;
 use crate::hooks::family;
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
+use crate::instance_names;
 use crate::instances;
 use crate::log;
 use crate::messages;
@@ -258,6 +259,12 @@ fn route_claude_hook(
                 .unwrap_or("");
             if !agent_id.is_empty() && !agent_type.is_empty() {
                 track_subagent(db, &session_id, agent_id, agent_type);
+                // Eagerly allocate an instance row so the subagent shows up
+                // in the TUI and is a valid `hcom send` target from birth —
+                // without injecting any hcom context into the subagent itself.
+                // The subagent stays dormant (name_announced=0) until either a
+                // message arrives at SubagentStop or it runs `hcom start`.
+                ensure_subagent_row(db, &session_id, agent_id, agent_type);
             }
             let output = subagent_start(&payload.raw);
             if let Some(out) = output {
@@ -1546,6 +1553,56 @@ fn subagent_start(raw: &Value) -> Option<Value> {
     }))
 }
 
+/// Allocate (or adopt) an `instances` row for this subagent at SubagentStart,
+/// so it's visible in the TUI and addressable by `hcom send` without any
+/// change to the subagent's own context. The row stays dormant
+/// (status_context=`subagent:dormant`, name_announced=0) until SubagentStop
+/// activates it or the subagent runs `hcom start --name <agent_id>`.
+///
+/// Idempotent: calls into `allocate_subagent_instance`, which returns the
+/// existing row's name if one already exists for this agent_id.
+fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, agent_type: &str) {
+    let parent_name = match db.get_session_binding(parent_session_id) {
+        Ok(Some(name)) => name,
+        _ => return,
+    };
+    let parent_data = match db.get_instance_full(&parent_name) {
+        Ok(Some(data)) => data,
+        _ => return,
+    };
+    let parent_tag = parent_data.tag.as_deref();
+
+    let alloc = instance_names::SubagentAllocation {
+        agent_id,
+        agent_type,
+        parent_name: &parent_name,
+        parent_session_id: Some(parent_session_id),
+        parent_tag,
+        status: ST_INACTIVE,
+        status_context: Some("subagent:dormant"),
+    };
+
+    match instance_names::allocate_subagent_instance(db, &alloc) {
+        Ok(name) => {
+            log::log_info(
+                "hooks",
+                "subagent.row.ensured",
+                &format!(
+                    "name={} parent={} agent_id={} type={}",
+                    name, parent_name, agent_id, agent_type
+                ),
+            );
+        }
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "subagent.row.alloc_failed",
+                &format!("agent_id={} err={}", agent_id, e),
+            );
+        }
+    }
+}
+
 /// SubagentStop: message polling using agent_id, cleanup on exit.
 ///
 /// Returns (exit_code, stdout). exit_code=2 means message delivered
@@ -1557,24 +1614,27 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
     };
 
     // Query subagent instance by agent_id
-    let row: Option<(String, String, Option<String>)> = db
+    let row: Option<(String, String, Option<String>, i64)> = db
         .conn()
         .query_row(
-            "SELECT name, transcript_path, parent_name FROM instances WHERE agent_id = ?",
+            "SELECT name, transcript_path, parent_name, name_announced \
+             FROM instances WHERE agent_id = ?",
             rusqlite::params![agent_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
                 ))
             },
         )
         .ok();
 
-    let Some((subagent_name, existing_transcript, parent_name)) = row else {
-        // No instance = subagent never ran hcom start
-        // Remove from parent's running_tasks to prevent stuck active state
+    let Some((subagent_name, existing_transcript, parent_name, name_announced)) = row else {
+        // No instance = SubagentStart never allocated one (shouldn't happen for
+        // in-ctx subagents, but kept as a defensive fallback). Clean up the
+        // parent's running_tasks entry so it doesn't wedge active.
         if let Ok(Some(parent)) = db.get_session_binding(session_id) {
             remove_subagent_from_parent(db, &parent, agent_id);
         }
@@ -1592,6 +1652,51 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
         }
     }
 
+    // Idle gate: a dormant subagent (never opted in via `hcom start`, never
+    // had a message delivered) only wakes for *direct* mentions. Broadcasts
+    // are visible to its row but are not enough to keep it alive — that
+    // would break the "no message in → no keep-alive" contract, since
+    // SubagentStart now puts every subagent in the broadcast recipient set.
+    let dormant = name_announced == 0;
+    let has_direct = dormant && db.has_direct_unread(&subagent_name);
+    if dormant && !has_direct {
+        lifecycle::set_status(
+            db,
+            &subagent_name,
+            ST_INACTIVE,
+            "exit:idle",
+            Default::default(),
+        );
+        if let Some(ref pn) = parent_name {
+            remove_subagent_from_parent(db, pn, agent_id);
+        }
+        common::stop_instance(db, &subagent_name, "subagent", "idle");
+        return (0, String::new());
+    }
+
+    // Activation: dormant + a direct mention pending. Build the bootstrap
+    // text now but DO NOT flip `name_announced` yet — only mark the row
+    // announced once `poll_messages` actually returns a delivery. Otherwise
+    // a transient poll failure (orphan stdin closed, row deleted mid-loop)
+    // would burn the one-shot bootstrap with nothing to show for it.
+    let activation_bootstrap = if dormant {
+        let parent_display = match parent_name.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                log::log_warn(
+                    "hooks",
+                    "subagent.activation.parent_missing",
+                    &format!("name={subagent_name} agent_id={agent_id}"),
+                );
+                ""
+            }
+        };
+        let bs = bootstrap::get_subagent_bootstrap(&subagent_name, parent_display);
+        if bs.is_empty() { None } else { Some(bs) }
+    } else {
+        None
+    };
+
     // Resolve timeout: parent override > global config
     let timeout = parent_name
         .as_ref()
@@ -1606,10 +1711,33 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
 
     let (exit_code, output, timed_out) = common::poll_messages(db, &subagent_name, timeout, false);
 
-    let stdout = output
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default())
-        .unwrap_or_default();
+    // On first-activation delivery, prepend the subagent bootstrap to the
+    // `reason` field so Claude injects both as a single user message on the
+    // subagent's next turn. We only mark `name_announced=true` here, after
+    // `poll_messages` confirmed a delivery — if it returned (0, None, _)
+    // the bootstrap is preserved for the next SubagentStop.
+    let stdout = match (&output, activation_bootstrap.as_deref()) {
+        (Some(Value::Object(obj)), Some(bs)) => {
+            let mut munged = obj.clone();
+            let existing_reason = munged
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let combined = if existing_reason.is_empty() {
+                bs.to_string()
+            } else {
+                format!("{bs}\n\n{existing_reason}")
+            };
+            munged.insert("reason".into(), Value::String(combined));
+            let mut updates = serde_json::Map::new();
+            updates.insert("name_announced".into(), serde_json::json!(true));
+            instances::update_instance_position(db, &subagent_name, &updates);
+            serde_json::to_string(&Value::Object(munged)).unwrap_or_default()
+        }
+        (Some(v), _) => serde_json::to_string(v).unwrap_or_default(),
+        (None, _) => String::new(),
+    };
 
     // exit_code=2: message delivered, subagent continues
     // exit_code=0: no message/timeout, cleanup

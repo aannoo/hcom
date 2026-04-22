@@ -453,6 +453,8 @@ pub fn get_status_description(status: &str, context: &str) -> String {
                 "inactive: stale".to_string()
             } else if let Some(reason) = context.strip_prefix("exit:") {
                 format!("inactive: {reason}")
+            } else if context == "subagent:dormant" {
+                "inactive: dormant subagent".to_string()
             } else if context == "unknown" {
                 "inactive: unknown".to_string()
             } else if context.is_empty() {

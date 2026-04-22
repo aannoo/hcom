@@ -225,148 +225,71 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
         return Ok(1);
     }
 
-    // Check if instance already exists by agent_id (reuse name)
-    let existing_name: Option<String> = db
+    // Resolve existing row (placeholder from SubagentStart, or a prior start).
+    // `name_announced` distinguishes "dormant placeholder being promoted now"
+    // from "same subagent called hcom start twice."
+    let existing: Option<(String, i64)> = db
         .conn()
         .query_row(
-            "SELECT name FROM instances WHERE agent_id = ?",
+            "SELECT name, name_announced FROM instances WHERE agent_id = ?",
             rusqlite::params![info.agent_id],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
         )
         .ok();
 
-    if let Some(name) = existing_name {
-        lifecycle::set_status(db, &name, ST_ACTIVE, "start", Default::default());
-        println!("hcom already started for {name}");
-        return Ok(0);
-    }
-
-    // Sanitize agent_type: keep only [a-z0-9_]
-    let sanitized_type: String = info
-        .agent_type
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let sanitized_type = sanitized_type.trim_matches('_');
-    let sanitized_type = if sanitized_type.is_empty() {
-        "task"
-    } else {
-        sanitized_type
+    let (subagent_name, was_announced) = match existing {
+        Some((name, announced)) => (name, announced != 0),
+        None => {
+            let alloc = instance_names::SubagentAllocation {
+                agent_id: &info.agent_id,
+                agent_type: &info.agent_type,
+                parent_name: &info.parent_name,
+                parent_session_id: info.parent_session_id.as_deref(),
+                parent_tag: info.parent_tag.as_deref(),
+                status: ST_ACTIVE,
+                status_context: Some("tool:start"),
+            };
+            let name = instance_names::allocate_subagent_instance(db, &alloc)?;
+            (name, false)
+        }
     };
 
-    // Compute next suffix: query max(n) for parent_type_% pattern
-    let pattern = format!("{}_{}_", info.parent_name, sanitized_type);
-    let like_pattern = format!("{}%", pattern);
-    let mut stmt = db
-        .conn()
-        .prepare("SELECT name FROM instances WHERE name LIKE ?")?;
-    let names: Vec<String> = stmt
-        .query_map(rusqlite::params![like_pattern], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    // Flip to active + emit life event so TUI/watchers see the state change.
+    lifecycle::set_status(db, &subagent_name, ST_ACTIVE, "tool:start", Default::default());
 
-    let mut max_n: u32 = 0;
-    for name in &names {
-        if let Some(suffix) = name.strip_prefix(&pattern) {
-            if let Ok(n) = suffix.parse::<u32>() {
-                max_n = max_n.max(n);
-            }
-        }
-    }
-
-    // pattern = "parent_type_", so subagent_name = "parent_type_N"
-    let subagent_name = format!("{}{}", pattern, max_n + 1);
-
-    let initial_event_id = db.get_last_event_id();
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let now = crate::shared::time::now_epoch_f64();
-
-    // Direct DB insert with agent_id and parent fields
-    let insert_result = db.conn().execute(
-        "INSERT INTO instances \
-         (name, session_id, parent_session_id, parent_name, tag, agent_id, \
-          created_at, last_event_id, directory, last_stop, status) \
-         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, 'active')",
-        rusqlite::params![
-            subagent_name,
-            info.parent_session_id,
-            info.parent_name,
-            info.parent_tag,
-            info.agent_id,
-            now,
-            initial_event_id,
-            cwd,
-        ],
-    );
-
-    // On name collision (constraint violation), retry once with next suffix.
-    // Other DB errors propagate immediately.
-    let subagent_name = match insert_result {
-        Ok(_) => subagent_name,
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            let retry_name = format!("{}{}", pattern, max_n + 2);
-            db.conn()
-                .execute(
-                    "INSERT INTO instances \
-                 (name, session_id, parent_session_id, parent_name, tag, agent_id, \
-                  created_at, last_event_id, directory, last_stop, status) \
-                 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, 'active')",
-                    rusqlite::params![
-                        retry_name,
-                        info.parent_session_id,
-                        info.parent_name,
-                        info.parent_tag,
-                        info.agent_id,
-                        now,
-                        initial_event_id,
-                        cwd,
-                    ],
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to create unique subagent name after retry: {e}")
-                })?;
-            retry_name
-        }
-        Err(e) => return Err(anyhow::anyhow!("Failed to insert subagent instance: {e}")),
-    };
-
-    // Capture launch context
+    // Capture launch context (process binding etc.)
     instance_binding::capture_and_store_launch_context(db, &subagent_name);
-
-    // Set active status (logs life event)
-    lifecycle::set_status(
-        db,
-        &subagent_name,
-        ST_ACTIVE,
-        "tool:start",
-        Default::default(),
-    );
 
     log_info(
         "lifecycle",
         "start.subagent",
         &format!(
-            "name={} parent={} agent_id={} agent_type={}",
-            subagent_name, info.parent_name, info.agent_id, info.agent_type
+            "name={} parent={} agent_id={} agent_type={} announced={}",
+            subagent_name, info.parent_name, info.agent_id, info.agent_type, was_announced
         ),
     );
 
-    // Print subagent bootstrap
+    // Second `hcom start --name <id>` from the same subagent: no bootstrap
+    // reprint. Just report and return.
+    if was_announced {
+        println!("hcom already started for {subagent_name}");
+        return Ok(0);
+    }
+
+    // First announcement: print bootstrap and mark the row announced so
+    // SubagentStop knows not to re-inject it on activation.
     let bootstrap = bootstrap::get_subagent_bootstrap(&subagent_name, &info.parent_name);
     if !bootstrap.is_empty() {
         println!("{bootstrap}");
     }
+    let mut updates = serde_json::Map::new();
+    updates.insert("name_announced".into(), serde_json::json!(true));
+    instances::update_instance_position(db, &subagent_name, &updates);
 
     Ok(0)
 }
