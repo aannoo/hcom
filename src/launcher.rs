@@ -299,6 +299,17 @@ fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     m
 }
 
+fn background_runner_env(
+    tool: &str,
+    env: &HashMap<String, String>,
+    instance_name: &str,
+) -> HashMap<String, String> {
+    let mut runner_env = env.clone();
+    runner_env.insert("HCOM_INSTANCE_NAME".to_string(), instance_name.to_string());
+    runner_env.extend(tool_extra_env(tool));
+    runner_env
+}
+
 /// Create a bash script that runs a tool via the hcom native PTY wrapper.
 ///
 /// The script sets up the environment and calls `hcom pty <tool> [args...]`.
@@ -540,16 +551,17 @@ fn launch_background_runner(
             .unwrap_or(0),
         rand::random::<u16>() % 9000 + 1000
     );
-    instance_env.insert("HCOM_BACKGROUND".to_string(), log_filename);
+    let mut runner_env = background_runner_env(tool, instance_env, instance_name);
+    runner_env.insert("HCOM_BACKGROUND".to_string(), log_filename);
     let script_file =
-        create_runner_script(tool, cwd, instance_name, instance_env, tool_args, false)?;
+        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, false)?;
     let command = format!(
         "bash {}",
         crate::tools::args_common::shell_quote(&script_file)
     );
     let (launch_result, effective_preset) = terminal::launch_terminal(
         &command,
-        instance_env,
+        &runner_env,
         Some(cwd),
         true,
         false,
@@ -1337,5 +1349,39 @@ mod tests {
         let args = vec!["--prompt".to_string(), "fix all tests".to_string()];
         let cmd = build_claude_command(&args);
         assert!(cmd.contains("'fix all tests'"));
+    }
+
+    #[test]
+    fn test_background_runner_env_includes_instance_name() {
+        let mut env = HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-123".to_string());
+
+        let runner_env = background_runner_env("codex", &env, "nita");
+
+        assert_eq!(
+            runner_env.get("HCOM_INSTANCE_NAME").map(String::as_str),
+            Some("nita")
+        );
+        assert_eq!(
+            runner_env.get("HCOM_PROCESS_ID").map(String::as_str),
+            Some("pid-123")
+        );
+        assert!(!runner_env.contains_key("HCOM_PTY_MODE"));
+    }
+
+    #[test]
+    fn test_background_runner_env_includes_claude_pty_mode() {
+        let env = HashMap::new();
+
+        let runner_env = background_runner_env("claude", &env, "hone");
+
+        assert_eq!(
+            runner_env.get("HCOM_INSTANCE_NAME").map(String::as_str),
+            Some("hone")
+        );
+        assert_eq!(
+            runner_env.get("HCOM_PTY_MODE").map(String::as_str),
+            Some("1")
+        );
     }
 }

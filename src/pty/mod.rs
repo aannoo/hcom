@@ -683,6 +683,14 @@ impl Proxy {
         // that reaches EOF (e.g. /dev/null in headless mode), to avoid busy-waiting.
         let mut poll_stdin = true;
 
+        // Whether to skip the inject listener in the next poll iteration.
+        // On macOS, a non-blocking TcpListener can keep reporting POLLIN via poll()
+        // after accept() drains the queue (kqueue quirk). When accept() returns
+        // WouldBlock, we exclude the listener from the next poll call so poll()
+        // can block on master_fd instead of spinning. It is re-included the
+        // iteration after, so at most one poll cycle of latency for new connections.
+        let mut listener_backoff = false;
+
         // For Claude in accept-edits mode, ready pattern may be hidden.
         // Start delivery after timeout if ready pattern not seen.
         use crate::tool::Tool;
@@ -740,8 +748,17 @@ impl Proxy {
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
             }
 
-            let inject_listener_idx = poll_fds.len();
-            poll_fds.push(PollFd::new(inject_listener_fd, PollFlags::POLLIN));
+            // Include the inject listener unless we're in backoff (macOS spurious POLLIN).
+            // Reset backoff here so it applies for exactly one iteration.
+            let include_listener = !listener_backoff;
+            listener_backoff = false;
+            let inject_listener_idx: Option<usize> = if include_listener {
+                let idx = poll_fds.len();
+                poll_fds.push(PollFd::new(inject_listener_fd, PollFlags::POLLIN));
+                Some(idx)
+            } else {
+                None
+            };
 
             // Add inject client fds
             let client_raw_fds: Vec<i32> = self.inject_server.client_raw_fds().collect();
@@ -793,7 +810,9 @@ impl Proxy {
                     }
                     continue;
                 }
-                Err(e) => bail!("poll failed: {}", e),
+                Err(e) => {
+                    bail!("poll failed: {}", e)
+                }
             }
 
             // Handle PTY output — drain all available data before writing to stdout.
@@ -926,6 +945,12 @@ impl Proxy {
             // Handle stdin (only if we're still polling it)
             if poll_stdin {
                 if let Some(revents) = poll_fds[1].revents() {
+                    if revents.contains(PollFlags::POLLNVAL) {
+                        // Some headless launch paths can inherit a stdin fd that poll()
+                        // reports as invalid instead of readable EOF. Drop it from the
+                        // poll set to avoid an immediate-return busy loop.
+                        poll_stdin = false;
+                    }
                     if revents.contains(PollFlags::POLLHUP) {
                         // Terminal disconnected - exit cleanly
                         break;
@@ -960,15 +985,28 @@ impl Proxy {
             }
 
             // Handle inject server accept
-            if let Some(revents) = poll_fds[inject_listener_idx].revents() {
-                if revents.contains(PollFlags::POLLIN) {
-                    self.inject_server.accept()?;
+            if let Some(idx) = inject_listener_idx {
+                if let Some(revents) = poll_fds[idx].revents() {
+                    if revents.contains(PollFlags::POLLIN) {
+                        // If accept() returns WouldBlock (false), skip the listener next
+                        // iteration to break the macOS spurious-POLLIN busy-loop.
+                        if !self.inject_server.accept()? {
+                            listener_backoff = true;
+                        }
+                    }
                 }
             }
 
             // Handle inject client data (process in reverse to handle removals)
+            // Clients are pushed immediately after the listener (or immediately after
+            // stdin when listener is in backoff), so their base index shifts by one
+            // depending on whether the listener is present this iteration.
+            let clients_base = inject_listener_idx.map_or_else(
+                || poll_fds.len() - client_raw_fds.len(),
+                |idx| idx + 1,
+            );
             for i in (0..client_raw_fds.len()).rev() {
-                let poll_idx = inject_listener_idx + 1 + i;
+                let poll_idx = clients_base + i;
                 if let Some(revents) = poll_fds[poll_idx].revents() {
                     if revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP) {
                         match self.inject_server.read_client(i)? {
