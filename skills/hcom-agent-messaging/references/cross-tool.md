@@ -2,14 +2,11 @@
 
 Verified behavior when mixing different AI coding tools via hcom.
 
-## Why Mix Tools?
+## Typical combos
 
-- **Claude Code**: Strong reasoning, planning, reviewing, and natural language. Full lifecycle hooks. Hook-based delivery.
-- **Codex**: Runs in sandbox (workspace-write, untrusted, or full-access modes). Better for executing untrusted code, running tests, file manipulation. Full lifecycle hooks when hcom-launched.
-- **Gemini CLI**: Strong reasoning with Google ecosystem integration. Full lifecycle hooks. Requires version >= 0.26.0.
-- **OpenCode**: TypeScript plugin-based integration. TCP notify for instant wake. Plugin handler endpoints.
-
-Typical combos: Claude designs/reviews + Codex implements, Claude plans + Gemini researches, multiple tools for diverse perspectives.
+- **worker + reviewer across tools** — one tool implements, another reviews. Catches blind spots from training-data overlap.
+- **sandboxed executor** — Codex runs tests or touches risky files; Claude or Gemini orchestrates from outside the sandbox.
+- **diverse answers, one judge** — fan out the same question to multiple tools, one agent reads all transcripts and picks.
 
 ## Per-Tool Technical Details
 
@@ -51,13 +48,3 @@ Typical combos: Claude designs/reviews + Codex implements, Claude plans + Gemini
 ## Working Patterns
 
 See `scripts/cross-tool-duo.sh` for Claude architect + Codex engineer, and `scripts/codex-worker.sh` for Codex coder + Claude reviewer. See `patterns.md` for all 6 tested patterns including Claude + Gemini mixed perspectives.
-
-## Cross-Tool Gotchas
-
-| Issue | Tool | Fix |
-|-------|------|-----|
-| Gemini hooks not working | Gemini | Requires version >= 0.26.0; check with `gemini --version` |
-| OpenCode plugin not found | OpenCode | Run `hcom hooks add opencode` to install plugin |
-| Cross-tool transcript reading | All | `hcom transcript @name --full --detailed` works across all tools |
-| Different bootstrap formats | Mixed | Claude gets subagent section; Codex gets developer_instructions; Gemini gets system prompt file |
-| Codex sandbox blocks hcom | Codex | Use `workspace` sandbox mode (default) which allows `~/.hcom` writes |

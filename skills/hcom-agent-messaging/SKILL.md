@@ -3,8 +3,7 @@ name: hcom-agent-messaging
 description: >
   Multi-agent communication for AI coding tools. Agents message, watch,
   and spawn each other across terminals. Use when setting up hcom,
-  troubleshooting delivery, writing multi-agent scripts, or coordinating
-  Claude Code, Gemini CLI, Codex, or OpenCode agents.
+  troubleshooting delivery, or writing multi-agent scripts.
 ---
 
 # hcom — multi-agent communication for AI coding tools
@@ -37,33 +36,29 @@ tell any agent:
 
 ## what agents can do
 
-| capability | command | behavior |
-|------------|---------|----------|
-| message each other | `hcom send @name -- "msg"` | delivers in under a second for all tools when hcom-launched |
-| read each other's transcripts | `hcom transcript @name --full` | includes tool I/O with `--detailed` |
-| view/inject into terminal screens | `hcom term inject name "text" --enter` | approves prompts, types commands |
-| query event history | `hcom events --sql "..." --last N` | file edits, commands, status, lifecycle |
-| subscribe to activity | `hcom events sub --idle name` | real-time notifications via system messages |
-| reactive messaging | `hcom events sub --idle name --on-hit "start the review"` | auto-sends message when sub fires |
-| spawn/fork/resume/kill agents | `hcom 1 claude --tag X --go --headless` | headless background agents for scripts |
-| resume by session or thread | `hcom r <UUID>` or `hcom r "thread name"` | recover any Claude/Codex/Gemini/OpenCode session |
-| build context bundles | `hcom send --title X --description Y --transcript 1-20:full --files a.py` | structured handoffs between agents |
-| collision detection | automatic | 2 agents edit same file within 30s, both notified |
-| cross-device messaging | `hcom send @name:DEVICE -- "msg"` | via MQTT relay with end-to-end encryption |
+**Message** each other in real-time, bundle context for handoffs.
 
-run `hcom <command> --help` for full command syntax and flags.
+**Observe** each other: transcripts, file edits, terminal screens, command history.
+
+**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
+
+**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator.
+
+run `hcom --help` for full command syntax and flags.
 
 ---
 
 ## tool support
 
-| tool | hooks | delivery | session binding | supported |
-|------|-------|----------|-----------------|-----------|
-| claude code (incl. subagents) | full lifecycle | automatic (hook output) | immediate on SessionStart | yes |
-| gemini cli (>= 0.26.0) | full lifecycle | automatic (hook output) | immediate on beforeagent | yes |
-| codex | full lifecycle (SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, Stop) | automatic (hook output) when hcom-launched | immediate on SessionStart | yes |
-| opencode | plugin handlers (start, status, read, stop) | plugin TCP endpoint | on plugin binding | yes |
-| any ai tool | manual | `hcom start` inside tool | on first command | yes |
+| tool | delivery | connect |
+|------|----------|---------|
+| claude code (incl. subagents) | automatic | `hcom claude` |
+| gemini cli (>= 0.26.0) | automatic | `hcom gemini` |
+| codex | automatic | `hcom codex` |
+| opencode | automatic | `hcom opencode` |
+| any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
+
+session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
 
 ---
 
@@ -80,7 +75,7 @@ if the user invokes this skill without arguments:
 
 | status output | meaning | action |
 |---------------|---------|--------|
-| command not found | not installed | install via curl or `cargo install hcom` |
+| command not found | not installed | install via `brew install aannoo/hcom/hcom`, the curl installer above, or `pip install hcom` |
 | `[~] claude` | tool exists, hooks not installed | `hcom hooks add` then restart |
 | `[✓] claude` | hooks installed | ready |
 | `[✗] claude` | tool not found | install the AI tool first |
