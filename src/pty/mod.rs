@@ -728,9 +728,20 @@ impl Proxy {
 
             let mut poll_fds = vec![
                 PollFd::new(master_fd, PollFlags::POLLIN),
-                PollFd::new(stdin_borrowed, if poll_stdin { PollFlags::POLLIN } else { PollFlags::empty() }),
-                PollFd::new(inject_listener_fd, PollFlags::POLLIN),
             ];
+
+            // Only include stdin in poll set while we're actively polling it.
+            // When stdin is a non-TTY (e.g. /dev/null in headless mode), we stop
+            // polling it to avoid busy-waiting — but we must fully remove it from
+            // the poll set, not just pass empty events, because some platforms
+            // (macOS) may still return immediately for a readable fd even with
+            // events=0.
+            if poll_stdin {
+                poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
+            }
+
+            let inject_listener_idx = poll_fds.len();
+            poll_fds.push(PollFd::new(inject_listener_fd, PollFlags::POLLIN));
 
             // Add inject client fds
             let client_raw_fds: Vec<i32> = self.inject_server.client_raw_fds().collect();
@@ -912,42 +923,44 @@ impl Proxy {
                 }
             }
 
-            // Handle stdin
-            if let Some(revents) = poll_fds[1].revents() {
-                if revents.contains(PollFlags::POLLHUP) {
-                    // Terminal disconnected - exit cleanly
-                    break;
-                }
-                if revents.contains(PollFlags::POLLIN) {
-                    match nix_read(&stdin_fd, &mut buf) {
-                        Ok(0) => {
-                            // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
-                            // When running headless, stdin may be /dev/null or a pipe,
-                            // which is always at EOF but does not mean the terminal is gone.
-                            if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) }).unwrap_or(false) {
-                                break;
+            // Handle stdin (only if we're still polling it)
+            if poll_stdin {
+                if let Some(revents) = poll_fds[1].revents() {
+                    if revents.contains(PollFlags::POLLHUP) {
+                        // Terminal disconnected - exit cleanly
+                        break;
+                    }
+                    if revents.contains(PollFlags::POLLIN) {
+                        match nix_read(&stdin_fd, &mut buf) {
+                            Ok(0) => {
+                                // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
+                                // When running headless, stdin may be /dev/null or a pipe,
+                                // which is always at EOF but does not mean the terminal is gone.
+                                if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) }).unwrap_or(false) {
+                                    break;
+                                }
+                                // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
+                                poll_stdin = false;
                             }
-                            // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
-                            poll_stdin = false;
-                        }
-                        Ok(n) => {
-                            self.last_user_input = Instant::now();
-                            self.screen.clear_approval();
-                            // Update delivery state for user activity
-                            if let Ok(mut state) = self.delivery_state.write() {
-                                state.last_user_input = Instant::now();
-                                state.approval = false;
+                            Ok(n) => {
+                                self.last_user_input = Instant::now();
+                                self.screen.clear_approval();
+                                // Update delivery state for user activity
+                                if let Ok(mut state) = self.delivery_state.write() {
+                                    state.last_user_input = Instant::now();
+                                    state.approval = false;
+                                }
+                                write_all(&self.pty_master, &buf[..n])?;
                             }
-                            write_all(&self.pty_master, &buf[..n])?;
+                            Err(Errno::EAGAIN) => {}
+                            Err(e) => bail!("read from stdin failed: {}", e),
                         }
-                        Err(Errno::EAGAIN) => {}
-                        Err(e) => bail!("read from stdin failed: {}", e),
                     }
                 }
             }
 
             // Handle inject server accept
-            if let Some(revents) = poll_fds[2].revents() {
+            if let Some(revents) = poll_fds[inject_listener_idx].revents() {
                 if revents.contains(PollFlags::POLLIN) {
                     self.inject_server.accept()?;
                 }
@@ -955,7 +968,7 @@ impl Proxy {
 
             // Handle inject client data (process in reverse to handle removals)
             for i in (0..client_raw_fds.len()).rev() {
-                let poll_idx = 3 + i;
+                let poll_idx = inject_listener_idx + 1 + i;
                 if let Some(revents) = poll_fds[poll_idx].revents() {
                     if revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP) {
                         match self.inject_server.read_client(i)? {
