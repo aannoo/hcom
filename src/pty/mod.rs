@@ -484,6 +484,8 @@ pub struct ProxyConfig {
     pub instance_name: Option<String>,
     /// Tool name (claude, gemini, codex)
     pub tool: String,
+    /// Extra environment variables to set in the child process
+    pub env_vars: Vec<(String, String)>,
 }
 
 impl Default for ProxyConfig {
@@ -492,6 +494,7 @@ impl Default for ProxyConfig {
             ready_pattern: b"? for shortcuts".to_vec(),
             instance_name: None,
             tool: "claude".to_string(),
+            env_vars: vec![],
         }
     }
 }
@@ -542,6 +545,7 @@ impl Proxy {
         let child = unsafe {
             Command::new(command)
                 .args(args)
+                .envs(config.env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .pre_exec(move || {
                     // Create new session
                     if libc::setsid() == -1 {
