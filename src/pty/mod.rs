@@ -950,12 +950,17 @@ impl Proxy {
                         // reports as invalid instead of readable EOF. Drop it from the
                         // poll set to avoid an immediate-return busy loop.
                         poll_stdin = false;
-                    }
-                    if revents.contains(PollFlags::POLLHUP) {
+                    } else if revents.contains(PollFlags::POLLHUP) {
                         // Terminal disconnected - exit cleanly
-                        break;
-                    }
-                    if revents.contains(PollFlags::POLLIN) {
+                        if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        // Non-TTY stdin (e.g. /dev/null or a closed pipe) is not a
+                        // terminal-disconnect signal for headless PTY launches.
+                        poll_stdin = false;
+                    } else if revents.contains(PollFlags::POLLIN) {
                         match nix_read(&stdin_fd, &mut buf) {
                             Ok(0) => {
                                 // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.

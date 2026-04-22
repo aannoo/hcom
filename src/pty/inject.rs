@@ -167,6 +167,8 @@ impl InjectServer {
 mod tests {
     use super::InjectServer;
     use std::net::TcpStream;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn accept_returns_false_when_queue_is_empty() {
@@ -181,7 +183,18 @@ mod tests {
         let mut server = InjectServer::new().unwrap();
         let _client = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
 
-        assert!(server.accept().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let accepted = loop {
+            if server.accept().unwrap() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(accepted);
         assert_eq!(server.client_raw_fds().count(), 1);
     }
 }
