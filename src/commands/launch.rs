@@ -127,13 +127,18 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         }
     }
 
-    // Merge env config args with CLI args
-    let (merged_args, background, use_pty) =
-        prepare_launch_execution(&tool, &tool_args, &hcom_config, headless);
-
     // System/initial prompt handling
     let system_prompt = hcom_flags.system_prompt;
     let initial_prompt = hcom_flags.initial_prompt;
+
+    // Merge env config args with CLI args
+    let (merged_args, background, use_pty) = prepare_launch_execution(
+        &tool,
+        &tool_args,
+        &hcom_config,
+        headless,
+        initial_prompt.as_deref(),
+    );
 
     validate_claude_headless_launch(&tool, background, &merged_args, initial_prompt.as_deref())?;
 
@@ -211,13 +216,27 @@ pub(crate) fn prepare_launch_execution(
     cli_args: &[String],
     config: &HcomConfig,
     headless: bool,
+    initial_prompt: Option<&str>,
 ) -> (Vec<String>, bool, bool) {
     let mut merged_args = merge_tool_args(tool, cli_args, config);
     let background = headless || is_background_from_args(tool, &merged_args);
     let use_pty = tool != "claude" || (!background && cfg!(unix));
 
     if tool == "claude" && background {
-        let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
+        // Claude-specific normalization: a headless launch with a prompt (positional
+        // or --hcom-prompt) must go through print mode. If the user asked for
+        // --headless without -p/--print, inject -p so add_background_defaults fires
+        // and the child runs with --output-format stream-json --verbose.
+        let mut spec = claude_args::resolve_claude_args(Some(&merged_args), None);
+        let has_cli_prompt = spec.positional_tokens.iter().any(|t| !t.trim().is_empty());
+        let has_hcom_prompt = initial_prompt.is_some_and(|p| !p.trim().is_empty());
+        if !spec.is_background && (has_cli_prompt || has_hcom_prompt) {
+            let mut with_print = Vec::with_capacity(merged_args.len() + 1);
+            with_print.push("-p".to_string());
+            with_print.extend(merged_args.iter().cloned());
+            merged_args = with_print;
+            spec = claude_args::resolve_claude_args(Some(&merged_args), None);
+        }
         let updated = claude_args::add_background_defaults(&spec);
         merged_args = updated.rebuild_tokens(true);
     }
@@ -859,13 +878,75 @@ mod tests {
     fn test_prepare_launch_execution_adds_claude_background_defaults() {
         let config = HcomConfig::default();
         let (args, background, use_pty) =
-            prepare_launch_execution("claude", &s(&["-p"]), &config, true);
+            prepare_launch_execution("claude", &s(&["-p"]), &config, true, None);
         assert!(background);
         assert!(!use_pty);
 
         let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
         assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
         assert!(spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_prepare_launch_execution_headless_with_hcom_prompt_injects_print() {
+        // `hcom claude --headless --hcom-prompt "..."` passed validation before this
+        // fix but launched without -p, so add_background_defaults never fired and the
+        // child ran as a detached plain `claude` without --output-format stream-json
+        // --verbose. Normalize by injecting -p when a prompt is present.
+        let config = HcomConfig::default();
+        let (args, background, use_pty) = prepare_launch_execution(
+            "claude",
+            &s(&[]),
+            &config,
+            true,
+            Some("say hi in hcom"),
+        );
+        assert!(background);
+        assert!(!use_pty);
+
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
+        assert!(spec.is_background, "-p should have been injected");
+        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
+        assert!(spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_prepare_launch_execution_headless_with_positional_prompt_injects_print() {
+        // `hcom claude --headless "task text"` — positional prompt, no -p yet.
+        let config = HcomConfig::default();
+        let (args, _background, _use_pty) =
+            prepare_launch_execution("claude", &s(&["task text"]), &config, true, None);
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
+        assert!(spec.is_background);
+        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
+        assert!(spec.has_flag(&["--verbose"], &[]));
+        // positional preserved
+        assert!(spec
+            .positional_tokens
+            .iter()
+            .any(|t| t == "task text"));
+    }
+
+    #[test]
+    fn test_prepare_launch_execution_headless_without_prompt_no_print_injection() {
+        // Bare `hcom claude --headless` stays as-is here — validation will reject it
+        // downstream in validate_claude_headless_launch. We don't want to silently
+        // promote it to print mode with no prompt.
+        let config = HcomConfig::default();
+        let (args, background, _use_pty) =
+            prepare_launch_execution("claude", &s(&[]), &config, true, None);
+        assert!(background);
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
+        assert!(!spec.is_background, "no prompt → no -p injection");
+    }
+
+    #[test]
+    fn test_prepare_launch_execution_headless_only_applies_to_claude() {
+        // --headless on other tools must not grow a -p; that flag is Claude-specific.
+        let config = HcomConfig::default();
+        let (args, _bg, _pty) =
+            prepare_launch_execution("codex", &s(&[]), &config, true, Some("task"));
+        assert!(!args.iter().any(|t| t == "-p"));
     }
 
     #[test]

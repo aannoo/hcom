@@ -680,6 +680,7 @@ fn prepare_remote_launch(
         &request.args,
         config,
         request.background,
+        request.initial_prompt.as_deref(),
     );
     PreparedRemoteLaunch {
         args,
