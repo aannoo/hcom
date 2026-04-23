@@ -196,7 +196,7 @@ Instructions:
     --hcom-system-prompt "$confessor_system" \
     --hcom-prompt "$confessor_prompt" \
     --resume "$session_id" --fork-session \
-    --headless \
+    --headless -p \
     ${target_dir:+-C "$target_dir"} 2>&1) || {
     echo "Error: Failed to launch confessor" >&2
     exit 1

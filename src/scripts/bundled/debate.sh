@@ -171,7 +171,14 @@ fi
 trap cleanup ERR INT TERM
 
 bg_flag=""
-[[ "$interactive" == "false" ]] && bg_flag="--headless"
+if [[ "$interactive" == "false" ]]; then
+  # claude: explicit -p so --headless goes through print mode
+  if [[ "$tool" == "claude" ]]; then
+    bg_flag="--headless -p"
+  else
+    bg_flag="--headless"
+  fi
+fi
 
 if [[ "$spawn" == "true" ]]; then
   # --- SPAWN MODE ---
