@@ -244,7 +244,7 @@ pub(crate) fn prepare_launch_execution(
     (merged_args, background, use_pty)
 }
 
-fn validate_claude_headless_launch(
+pub(crate) fn validate_claude_headless_launch(
     tool: &str,
     background: bool,
     merged_args: &[String],
