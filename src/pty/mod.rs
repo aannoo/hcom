@@ -769,11 +769,18 @@ impl Proxy {
 
             // Poll timeout: 5s when debug enabled (for periodic dumps), otherwise block
             // Delivery thread has its own timing via notify.wait(), doesn't need fast polling here
-            let poll_timeout = if self.screen.debug_enabled() {
+            let mut poll_timeout = if self.screen.debug_enabled() {
                 5000u16 // 5s for debug periodic dumps
             } else {
                 10000u16 // 10s, allows runtime debug flag check
             };
+            // During a one-iteration listener backoff (macOS spurious POLLIN workaround)
+            // the inject listener is excluded from the poll set. Cap the timeout short
+            // so an inject connection arriving while we're backed off doesn't wait the
+            // full 10s for the listener to re-enter the poll set on the next iteration.
+            if !include_listener {
+                poll_timeout = poll_timeout.min(100u16);
+            }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
                     // Timeout - still update delivery state for time-based checks
