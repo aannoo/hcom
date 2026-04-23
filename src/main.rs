@@ -126,6 +126,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             ready_pattern,
             instance_name,
             tool: tool_name,
+            env_vars: pty_child_env(),
         },
     )
     .context("Failed to spawn PTY")?;
@@ -136,6 +137,10 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     drop(proxy);
 
     std::process::exit(exit_code);
+}
+
+fn pty_child_env() -> Vec<(String, String)> {
+    vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
 }
 
 #[cfg(test)]
@@ -184,6 +189,14 @@ mod tests {
             Action::Pty {
                 args: args(&["claude", "--arg1", "--arg2"])
             }
+        );
+    }
+
+    #[test]
+    fn test_pty_child_env_marks_launched() {
+        assert_eq!(
+            super::pty_child_env(),
+            vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
         );
     }
 }

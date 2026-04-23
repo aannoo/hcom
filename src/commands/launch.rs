@@ -135,6 +135,8 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let system_prompt = hcom_flags.system_prompt;
     let initial_prompt = hcom_flags.initial_prompt;
 
+    validate_claude_headless_launch(&tool, background, &merged_args, initial_prompt.as_deref())?;
+
     // Open DB
     let db = HcomDb::open()?;
 
@@ -221,6 +223,29 @@ pub(crate) fn prepare_launch_execution(
     }
 
     (merged_args, background, use_pty)
+}
+
+fn validate_claude_headless_launch(
+    tool: &str,
+    background: bool,
+    merged_args: &[String],
+    initial_prompt: Option<&str>,
+) -> Result<()> {
+    if tool != "claude" || !background {
+        return Ok(());
+    }
+
+    let spec = claude_args::resolve_claude_args(Some(merged_args), None);
+    let has_cli_prompt = spec.positional_tokens.iter().any(|t| !t.trim().is_empty());
+    let has_hcom_prompt = initial_prompt.is_some_and(|p| !p.trim().is_empty());
+
+    if has_cli_prompt || has_hcom_prompt {
+        return Ok(());
+    }
+
+    bail!(
+        "Claude headless mode requires a prompt/task. Try `hcom claude --headless --hcom-prompt 'say hi in hcom'` or `hcom claude -p 'say hi in hcom'`."
+    )
 }
 
 pub(crate) fn launch_result_to_json(result: &LaunchResult) -> serde_json::Value {
@@ -841,6 +866,31 @@ mod tests {
         let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
         assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
         assert!(spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_validate_claude_headless_launch_requires_prompt() {
+        let err = validate_claude_headless_launch("claude", true, &[], None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Claude headless mode requires a prompt/task"));
+    }
+
+    #[test]
+    fn test_validate_claude_headless_launch_accepts_cli_prompt() {
+        assert!(validate_claude_headless_launch(
+            "claude",
+            true,
+            &s(&["-p", "say hi in hcom"]),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_claude_headless_launch_accepts_hcom_prompt() {
+        assert!(validate_claude_headless_launch("claude", true, &[], Some("say hi in hcom"))
+            .is_ok());
     }
 
     #[test]
