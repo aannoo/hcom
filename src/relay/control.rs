@@ -640,6 +640,7 @@ struct RemoteLaunchRequest {
     system_prompt: Option<String>,
     initial_prompt: Option<String>,
     background: bool,
+    pty: bool,
     terminal: Option<String>,
     cwd: Option<String>,
 }
@@ -659,6 +660,7 @@ impl RemoteLaunchRequest {
             system_prompt: optional_param(params, "system_prompt").map(ToString::to_string),
             initial_prompt: optional_param(params, "initial_prompt").map(ToString::to_string),
             background: bool_param(params, "background", false),
+            pty: bool_param(params, "pty", false),
             terminal: optional_param(params, "terminal").map(ToString::to_string),
             cwd: optional_param(params, "cwd").map(ToString::to_string),
         })
@@ -680,6 +682,7 @@ fn prepare_remote_launch(
         &request.args,
         config,
         request.background,
+        request.pty,
         request.initial_prompt.as_deref(),
     );
     PreparedRemoteLaunch {
@@ -723,6 +726,7 @@ fn handle_remote_launch(
     crate::commands::launch::validate_claude_headless_launch(
         &request.tool,
         prepared.background,
+        prepared.pty,
         &prepared.args,
         request.initial_prompt.as_deref(),
     )
@@ -1496,6 +1500,7 @@ mod tests {
         let err = crate::commands::launch::validate_claude_headless_launch(
             &request.tool,
             prepared.background,
+            prepared.pty,
             &prepared.args,
             request.initial_prompt.as_deref(),
         )

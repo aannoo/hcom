@@ -72,6 +72,43 @@ impl LaunchTool {
     }
 }
 
+/// How the child process is hosted. Computed from (tool, background, pty) at
+/// launch time so dispatch doesn't have to re-derive the combination.
+///
+/// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
+/// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
+///                        for gemini/codex/opencode; claude with `--pty`.
+/// - `NativePrint`:       background, direct claude spawn in print mode
+///                        (`-p --output-format stream-json --verbose`). Claude
+///                        only; one-shot, exits after the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchBackend {
+    InteractiveVisible,
+    HeadlessPty,
+    NativePrint,
+}
+
+impl LaunchBackend {
+    /// Resolve from the already-prepared (tool, background, pty) triple.
+    ///
+    /// `pty` here is the effective use-pty decision coming out of
+    /// `prepare_launch_execution` — for claude, that tracks the user's `--pty`
+    /// opt-in (plus the existing interactive default). For other tools it is
+    /// always true.
+    pub fn resolve(tool: &LaunchTool, background: bool, pty: bool) -> Self {
+        if !background {
+            return LaunchBackend::InteractiveVisible;
+        }
+        match tool {
+            LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
+            LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
+            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode => {
+                LaunchBackend::HeadlessPty
+            }
+        }
+    }
+}
+
 /// Launch parameters.
 #[derive(Clone)]
 pub struct LaunchParams {
@@ -631,6 +668,11 @@ fn launch_pty_or_background(
 pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     let normalized = LaunchTool::from_str(&params.tool, params.pty)?;
     let base_tool = normalized.base_tool();
+    let backend = LaunchBackend::resolve(
+        &normalized,
+        params.background,
+        normalized.uses_pty() || params.pty,
+    );
 
     // Validation
     if params.count == 0 {
@@ -641,9 +683,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             "Too many {} instances requested (max 100)",
             normalized.as_str()
         );
-    }
-    if params.background && normalized == LaunchTool::ClaudePty {
-        bail!("Claude PTY does not support headless/background mode");
     }
 
     // Ensure hooks are installed (strict: refuse to launch without hooks)
@@ -894,7 +933,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         )]),
                     );
 
-                    if params.background {
+                    // LaunchTool::Claude only resolves to NativePrint (background,
+                    // direct spawn in print mode) or InteractiveVisible — the
+                    // PTY-backed variants live in LaunchTool::ClaudePty below.
+                    if matches!(backend, LaunchBackend::NativePrint) {
                         let log_filename = format!(
                             "background_{}_{}.log",
                             std::time::SystemTime::now()
@@ -982,27 +1024,28 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             json!(params.args),
                         )]),
                     );
-                    let effective_run_here = will_run_in_current_terminal(
-                        params.count,
-                        false,
-                        params.run_here,
-                        terminal_mode,
-                        inside_ai_tool,
-                    );
-                    let ok = launch_pty(
-                        "claude",
-                        working_dir,
-                        &instance_env,
-                        &instance_name,
+                    // Same background/foreground split as gemini/codex/opencode:
+                    // foreground → visible PTY in a terminal; background → PTY
+                    // wrapper in a detached runner. The wrapper handles the TUI
+                    // the same way either way, which is what lets PTY-headless
+                    // claude keep a live session that accepts hcom inject.
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "claude",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
                         &params.args,
-                        effective_run_here,
-                        terminal_mode,
+                        &params,
                         inside_ai_tool,
-                    )?;
-                    if ok {
-                        handles.push(json!({"tool": "claude-pty", "instance_name": instance_name}));
-                    }
-                    Ok(ok)
+                    )
                 }
 
                 LaunchTool::Gemini => {
@@ -1297,6 +1340,57 @@ mod tests {
         assert!(LaunchTool::Gemini.uses_pty());
         assert!(LaunchTool::Codex.uses_pty());
         assert!(LaunchTool::OpenCode.uses_pty());
+    }
+
+    #[test]
+    fn test_launch_backend_resolve_interactive() {
+        // Any tool, !background → InteractiveVisible (visible terminal).
+        for tool in [
+            LaunchTool::Claude,
+            LaunchTool::ClaudePty,
+            LaunchTool::Gemini,
+            LaunchTool::Codex,
+            LaunchTool::OpenCode,
+        ] {
+            let pty = tool.uses_pty();
+            assert_eq!(
+                LaunchBackend::resolve(&tool, false, pty),
+                LaunchBackend::InteractiveVisible,
+                "{:?} should resolve to InteractiveVisible without background",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_launch_backend_resolve_claude_native_print() {
+        // claude + background + NO pty → NativePrint (detached -p stream-json).
+        assert_eq!(
+            LaunchBackend::resolve(&LaunchTool::Claude, true, false),
+            LaunchBackend::NativePrint
+        );
+    }
+
+    #[test]
+    fn test_launch_backend_resolve_claude_pty_headless() {
+        // claude --pty --headless → HeadlessPty (PTY wrapper, live TUI).
+        assert_eq!(
+            LaunchBackend::resolve(&LaunchTool::ClaudePty, true, true),
+            LaunchBackend::HeadlessPty
+        );
+    }
+
+    #[test]
+    fn test_launch_backend_resolve_other_tools_headless() {
+        // gemini/codex/opencode + --headless → HeadlessPty (unchanged from today).
+        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode] {
+            assert_eq!(
+                LaunchBackend::resolve(&tool, true, true),
+                LaunchBackend::HeadlessPty,
+                "{:?} --headless should be HeadlessPty",
+                tool
+            );
+        }
     }
 
     #[test]

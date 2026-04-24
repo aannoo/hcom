@@ -33,6 +33,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let tag = hcom_flags.tag;
     let terminal = hcom_flags.terminal;
     let headless = hcom_flags.headless;
+    let pty_requested = hcom_flags.pty;
     let remote_device = hcom_flags.device.clone();
     let dir_override = hcom_flags.dir.clone();
     let tag_for_output = tag.clone();
@@ -85,6 +86,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "tag": tag,
             "launcher": launcher_name,
             "background": headless,
+            "pty": pty_requested,
             "terminal": terminal,
             "cwd": remote_cwd,
             "initial_prompt": hcom_flags.initial_prompt,
@@ -137,10 +139,17 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         &tool_args,
         &hcom_config,
         headless,
+        pty_requested,
         initial_prompt.as_deref(),
     );
 
-    validate_claude_headless_launch(&tool, background, &merged_args, initial_prompt.as_deref())?;
+    validate_claude_headless_launch(
+        &tool,
+        background,
+        use_pty,
+        &merged_args,
+        initial_prompt.as_deref(),
+    )?;
 
     // Open DB
     let db = HcomDb::open()?;
@@ -216,17 +225,26 @@ pub(crate) fn prepare_launch_execution(
     cli_args: &[String],
     config: &HcomConfig,
     headless: bool,
+    pty_requested: bool,
     initial_prompt: Option<&str>,
 ) -> (Vec<String>, bool, bool) {
     let mut merged_args = merge_tool_args(tool, cli_args, config);
     let background = headless || is_background_from_args(tool, &merged_args);
-    let use_pty = tool != "claude" || (!background && cfg!(unix));
+    // --pty opt-in forces the PTY wrapper even in background/headless mode.
+    // For claude, this routes through the TUI-in-PTY path instead of
+    // detached print-mode, enabling a live background session that can
+    // receive hcom messages via the PTY inject path.
+    let use_pty = if tool == "claude" {
+        pty_requested || (!background && cfg!(unix))
+    } else {
+        true
+    };
 
-    if tool == "claude" && background {
-        // Claude-specific normalization: a headless launch with a prompt (positional
-        // or --hcom-prompt) must go through print mode. If the user asked for
-        // --headless without -p/--print, inject -p so add_background_defaults fires
-        // and the child runs with --output-format stream-json --verbose.
+    // Claude-specific print-mode normalization only applies when we are NOT
+    // routing through the PTY wrapper. PTY-hosted claude runs the interactive
+    // TUI — injecting -p would put it in one-shot print mode and defeat the
+    // whole point of keeping it alive for later hcom messages.
+    if tool == "claude" && background && !use_pty {
         let mut spec = claude_args::resolve_claude_args(Some(&merged_args), None);
         let has_cli_prompt = spec.positional_tokens.iter().any(|t| !t.trim().is_empty());
         let has_hcom_prompt = initial_prompt.is_some_and(|p| !p.trim().is_empty());
@@ -247,14 +265,38 @@ pub(crate) fn prepare_launch_execution(
 pub(crate) fn validate_claude_headless_launch(
     tool: &str,
     background: bool,
+    use_pty: bool,
     merged_args: &[String],
     initial_prompt: Option<&str>,
 ) -> Result<()> {
-    if tool != "claude" || !background {
+    if tool != "claude" {
         return Ok(());
     }
 
     let spec = claude_args::resolve_claude_args(Some(merged_args), None);
+
+    // --pty opts into a live PTY-backed TUI session. -p/--print is claude's
+    // one-shot print mode — it answers and exits. The two are mutually
+    // exclusive: a print-mode claude inside the PTY wrapper would end the
+    // session the moment it replied, defeating the whole point of --pty.
+    // Reject explicitly rather than stripping so the user notices.
+    if use_pty && spec.is_background {
+        bail!(
+            "Claude --pty conflicts with -p/--print: --pty hosts a live TUI session, -p is one-shot print mode that exits after replying. Use `--headless` alone for print mode, or `--headless --pty` (without -p) for a live session."
+        )
+    }
+
+    if !background {
+        return Ok(());
+    }
+    // PTY-backed headless claude hosts the live TUI in a hidden terminal; the
+    // session stays alive waiting for hcom inject, so a starting prompt is
+    // optional. The no-prompt form would be impossible to launch without this
+    // carve-out because the invariant below would reject it.
+    if use_pty {
+        return Ok(());
+    }
+
     let has_cli_prompt = spec.positional_tokens.iter().any(|t| !t.trim().is_empty());
     let has_hcom_prompt = initial_prompt.is_some_and(|p| !p.trim().is_empty());
 
@@ -263,7 +305,7 @@ pub(crate) fn validate_claude_headless_launch(
     }
 
     bail!(
-        "Claude headless mode requires a prompt/task. Try `hcom claude --headless --hcom-prompt 'say hi in hcom'` or `hcom claude -p 'say hi in hcom'`."
+        "Claude headless mode requires a prompt/task. Try `hcom claude --headless --hcom-prompt 'say hi in hcom'`, `hcom claude -p 'say hi in hcom'`, or `hcom claude --headless --pty` for a live session."
     )
 }
 
@@ -415,6 +457,7 @@ pub(crate) struct HcomLaunchFlags {
     pub terminal: Option<String>,
     pub device: Option<String>,
     pub headless: bool,
+    pub pty: bool,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
     pub run_here: Option<bool>,
@@ -588,6 +631,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             }
             "--headless" => {
                 flags.headless = true;
+                i += 1;
+            }
+            "--pty" => {
+                flags.pty = true;
                 i += 1;
             }
             "--hcom-system-prompt" if i + 1 < args.len() => {
@@ -878,7 +925,7 @@ mod tests {
     fn test_prepare_launch_execution_adds_claude_background_defaults() {
         let config = HcomConfig::default();
         let (args, background, use_pty) =
-            prepare_launch_execution("claude", &s(&["-p"]), &config, true, None);
+            prepare_launch_execution("claude", &s(&["-p"]), &config, true, false, None);
         assert!(background);
         assert!(!use_pty);
 
@@ -899,6 +946,7 @@ mod tests {
             &s(&[]),
             &config,
             true,
+            false,
             Some("say hi in hcom"),
         );
         assert!(background);
@@ -915,7 +963,7 @@ mod tests {
         // `hcom claude --headless "task text"` — positional prompt, no -p yet.
         let config = HcomConfig::default();
         let (args, _background, _use_pty) =
-            prepare_launch_execution("claude", &s(&["task text"]), &config, true, None);
+            prepare_launch_execution("claude", &s(&["task text"]), &config, true, false, None);
         let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
         assert!(spec.is_background);
         assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
@@ -934,7 +982,7 @@ mod tests {
         // promote it to print mode with no prompt.
         let config = HcomConfig::default();
         let (args, background, _use_pty) =
-            prepare_launch_execution("claude", &s(&[]), &config, true, None);
+            prepare_launch_execution("claude", &s(&[]), &config, true, false, None);
         assert!(background);
         let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
         assert!(!spec.is_background, "no prompt → no -p injection");
@@ -945,13 +993,51 @@ mod tests {
         // --headless on other tools must not grow a -p; that flag is Claude-specific.
         let config = HcomConfig::default();
         let (args, _bg, _pty) =
-            prepare_launch_execution("codex", &s(&[]), &config, true, Some("task"));
+            prepare_launch_execution("codex", &s(&[]), &config, true, false, Some("task"));
         assert!(!args.iter().any(|t| t == "-p"));
     }
 
     #[test]
+    fn test_prepare_launch_execution_claude_pty_headless_skips_print_injection() {
+        // `--pty --headless --hcom-prompt X`: the PTY wrapper hosts claude's TUI,
+        // so -p must NOT be injected. use_pty must be true even in background mode.
+        let config = HcomConfig::default();
+        let (args, background, use_pty) = prepare_launch_execution(
+            "claude",
+            &s(&[]),
+            &config,
+            true,
+            true,
+            Some("ping"),
+        );
+        assert!(background);
+        assert!(use_pty, "--pty opt-in must force PTY routing");
+
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
+        assert!(
+            !spec.is_background,
+            "PTY-hosted claude stays interactive; -p would kill the session"
+        );
+        assert!(!spec.has_flag(&["--output-format"], &["--output-format="]));
+        assert!(!spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_prepare_launch_execution_claude_pty_interactive_unchanged() {
+        // `--pty` on its own (no --headless) is the existing interactive claude-pty
+        // path; use_pty should stay true and nothing else should change.
+        let config = HcomConfig::default();
+        let (args, background, use_pty) =
+            prepare_launch_execution("claude", &s(&[]), &config, false, true, None);
+        assert!(!background);
+        assert!(use_pty);
+        assert!(args.is_empty());
+    }
+
+    #[test]
     fn test_validate_claude_headless_launch_requires_prompt() {
-        let err = validate_claude_headless_launch("claude", true, &[], None).unwrap_err();
+        let err =
+            validate_claude_headless_launch("claude", true, false, &[], None).unwrap_err();
         assert!(err
             .to_string()
             .contains("Claude headless mode requires a prompt/task"));
@@ -962,6 +1048,7 @@ mod tests {
         assert!(validate_claude_headless_launch(
             "claude",
             true,
+            false,
             &s(&["-p", "say hi in hcom"]),
             None
         )
@@ -970,8 +1057,59 @@ mod tests {
 
     #[test]
     fn test_validate_claude_headless_launch_accepts_hcom_prompt() {
-        assert!(validate_claude_headless_launch("claude", true, &[], Some("say hi in hcom"))
-            .is_ok());
+        assert!(validate_claude_headless_launch(
+            "claude",
+            true,
+            false,
+            &[],
+            Some("say hi in hcom")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_claude_headless_launch_pty_allows_no_prompt() {
+        // --pty --headless claude with no prompt is a valid live-session launch —
+        // the PTY wrapper keeps the TUI alive waiting for hcom inject.
+        assert!(validate_claude_headless_launch("claude", true, true, &[], None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_claude_pty_rejects_print_flag_headless() {
+        // `--headless --pty -p 'task'` would wrap a claude that's about to exit on
+        // its one-shot print reply. Explicit conflict with --pty's live-session
+        // semantics. Both local and remote paths share this validator.
+        let err = validate_claude_headless_launch(
+            "claude",
+            true,
+            true,
+            &s(&["-p", "task"]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--pty conflicts with -p/--print"));
+    }
+
+    #[test]
+    fn test_validate_claude_pty_rejects_print_flag_without_headless() {
+        // Same conflict if only --pty + -p are passed (no --headless). The spec is
+        // still background because -p is present, so is_background_from_args would
+        // have promoted use_pty to true regardless.
+        let err = validate_claude_headless_launch(
+            "claude",
+            true,
+            true,
+            &s(&["--print", "task"]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--pty conflicts with -p/--print"));
+    }
+
+    #[test]
+    fn test_validate_claude_pty_without_print_flag_ok() {
+        // Sanity: --pty without -p/--print stays allowed.
+        assert!(validate_claude_headless_launch("claude", true, true, &s(&["--model", "haiku"]), None).is_ok());
     }
 
     #[test]

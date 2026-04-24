@@ -918,6 +918,7 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
     ("--headless", "Run in background (no terminal window)"),
+    ("--pty", "Force PTY wrapper (claude: live headless session)"),
     ("--run-here", "Run in current terminal"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
