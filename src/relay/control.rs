@@ -680,6 +680,7 @@ fn prepare_remote_launch(
         &request.args,
         config,
         request.background,
+        request.initial_prompt.as_deref(),
     );
     PreparedRemoteLaunch {
         args,
@@ -714,6 +715,18 @@ fn handle_remote_launch(
 ) -> Result<Value, String> {
     let request = RemoteLaunchRequest::from_params(params)?;
     let prepared = prepare_remote_launch(&request, config);
+    // Enforce the same Claude headless invariant the local CLI path enforces
+    // (src/commands/launch.rs validate_claude_headless_launch). The local
+    // path short-circuits into dispatch_remote before local validation fires,
+    // so a bare `hcom claude --headless --device X` would otherwise bypass it
+    // and fall through to a detached plain-claude launch on the remote.
+    crate::commands::launch::validate_claude_headless_launch(
+        &request.tool,
+        prepared.background,
+        &prepared.args,
+        request.initial_prompt.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     let cwd = resolve_remote_cwd(request.cwd.as_deref())?;
 
     let result = launcher::launch(
@@ -1438,6 +1451,56 @@ mod tests {
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
         assert!(!prepared.pty);
+    }
+
+    #[test]
+    fn test_prepare_remote_launch_claude_headless_with_hcom_prompt_injects_print() {
+        // Remote claude --headless --hcom-prompt "..." must go through the same
+        // print-mode normalization as the local path.
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "claude",
+            "count": 1,
+            "args": [],
+            "background": true,
+            "initial_prompt": "say hi in hcom",
+        }))
+        .unwrap();
+        let prepared = prepare_remote_launch(&request, &HcomConfig::default());
+        assert!(prepared.background);
+        assert!(!prepared.pty);
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&prepared.args), None);
+        assert!(
+            spec.is_background,
+            "remote claude + --headless + --hcom-prompt must inject -p"
+        );
+        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
+        assert!(spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_remote_launch_rejects_bare_claude_headless() {
+        // Bare remote `claude --headless` with no prompt must be rejected, matching
+        // the local CLI path's validate_claude_headless_launch invariant. Without
+        // this, the remote handler would fall through to a detached plain-claude
+        // launch. (We only assert the prepared state + validator result here,
+        // without calling the full handle_remote_launch which needs a live DB.)
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "claude",
+            "count": 1,
+            "args": [],
+            "background": true,
+        }))
+        .unwrap();
+        let prepared = prepare_remote_launch(&request, &HcomConfig::default());
+        assert!(prepared.background);
+        let err = crate::commands::launch::validate_claude_headless_launch(
+            &request.tool,
+            prepared.background,
+            &prepared.args,
+            request.initial_prompt.as_deref(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires a prompt/task"));
     }
 
     #[test]

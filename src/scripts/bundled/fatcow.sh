@@ -149,11 +149,13 @@ ${ask_question}
 2. Send your answer: hcom send @${caller_name} -- <your answer>
 3. Stop yourself: run hcom stop"
 
-  # Resume
+  # Resume (claude: explicit -p so --headless goes through print mode)
+  claude_p_flag=""
+  [[ "$fatcow_tool" == "claude" ]] && claude_p_flag="-p"
   hcom 1 "$fatcow_tool" --go \
     --resume "$ask_name" \
     --hcom-prompt "$resume_prompt" \
-    --headless >/dev/null 2>&1 || {
+    --headless ${claude_p_flag} >/dev/null 2>&1 || {
     echo "Error: Resume failed" >&2
     exit 1
   }
@@ -270,7 +272,12 @@ ${ingest_section}
 
 Do NOT subscribe to events. Do NOT wait for questions. Summarize, then stop."
 
-  bg_flag="--headless"
+  # claude: explicit -p so --headless goes through print mode
+  if [[ "$tool" == "claude" ]]; then
+    bg_flag="--headless -p"
+  else
+    bg_flag="--headless"
+  fi
 
 else
   system_prompt='You are a fat cow - a dedicated codebase oracle.
@@ -326,7 +333,12 @@ You are a fat, lazy, knowledge-stuffed oracle. Eat all the files. Sit there. Ans
   if [[ "$interactive" == "true" ]]; then
     bg_flag=""
   else
-    bg_flag="--headless"
+    # claude: explicit -p so --headless goes through print mode
+    if [[ "$tool" == "claude" ]]; then
+      bg_flag="--headless -p"
+    else
+      bg_flag="--headless"
+    fi
   fi
 fi
 
