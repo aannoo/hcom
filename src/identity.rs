@@ -66,7 +66,7 @@ pub fn instance_not_found_error(name: &str) -> String {
 /// `HcomDb::was_subagent_name` and returns the same "session may have ended"
 /// text used for raw agent_ids instead.
 pub fn instance_not_found_error_for(db: &HcomDb, name: &str) -> String {
-    if looks_like_agent_id(name) || db.was_subagent_name(name) {
+    if looks_like_agent_id(name) || looks_like_uuid(name) || db.was_subagent_name(name) {
         return format!(
             "Instance '{name}' not found. Your session may have ended. Stop working and end your turn."
         );
