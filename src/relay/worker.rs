@@ -78,7 +78,7 @@ pub fn is_relay_worker_running() -> bool {
 ///   Some(pid,true) — pidfile present, PID is alive
 ///   Some(pid,false) — pidfile present, PID is dead (stale)
 pub fn observe_pid_file() -> Option<(u32, bool)> {
-    let content = std::fs::read_to_string(&pid_file_path()).ok()?;
+    let content = std::fs::read_to_string(pid_file_path()).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
     Some((pid, crate::pidtrack::is_alive(pid)))
 }

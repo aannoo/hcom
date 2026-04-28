@@ -153,7 +153,6 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
 /// - **OpenCode**: Similar to Gemini.
 ///   The OpenCode plugin just shows this one line and not the full message in TUI.
 ///   So preview gives more context than a minimal <hcom> trigger.
-
 fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
     let messages = db.get_unread_messages(name);
     if messages.is_empty() {

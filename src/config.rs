@@ -1589,8 +1589,10 @@ mod tests {
         // process's environment, so anything emitted here crosses a
         // process boundary. The PSK must stay file-only — verified by
         // checking that even a populated field is suppressed.
-        let mut config = HcomConfig::default();
-        config.relay_psk = "an-example-secret-value-xxxxxxxxxxxxxxxxxxxxxxxx".to_string();
+        let config = HcomConfig {
+            relay_psk: "an-example-secret-value-xxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+            ..Default::default()
+        };
         let dict = config.to_env_dict();
         assert!(!dict.contains_key("HCOM_RELAY_PSK"));
         for v in dict.values() {
@@ -1952,8 +1954,10 @@ active = "default"
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
-        let mut config = HcomConfig::default();
-        config.relay_psk = "super-secret-psk".to_string();
+        let config = HcomConfig {
+            relay_psk: "super-secret-psk".to_string(),
+            ..Default::default()
+        };
 
         save_toml_config(&config, None).unwrap();
 

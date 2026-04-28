@@ -197,7 +197,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 /// 4. Auto-detect from `process_id` (HCOM_PROCESS_ID)
 /// 5. `transcript_fallback` - transcript marker scan (hook extension point)
 /// 6. Error if no identity
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn resolve_identity_with_expectation(
     db: &HcomDb,
     name: Option<&str>,

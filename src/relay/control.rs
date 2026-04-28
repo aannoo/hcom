@@ -1375,10 +1375,12 @@ mod tests {
 
     #[test]
     fn test_build_rpc_control_payload_includes_request_id_and_params() {
-        let mut config = HcomConfig::default();
-        config.relay_id = "relay-1".to_string();
         let psk = [0x55u8; 32];
-        config.relay_psk = super::super::encode_psk(&psk);
+        let config = HcomConfig {
+            relay_id: "relay-1".to_string(),
+            relay_psk: super::super::encode_psk(&psk),
+            ..Default::default()
+        };
         let (topic, sealed) = build_rpc_control_payload(
             &config,
             "launch",
@@ -1580,11 +1582,13 @@ mod tests {
     #[test]
     fn test_handle_control_events_relay_off_disables_local_relay() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let mut config = HcomConfig::default();
-        config.relay = "mqtts://broker.emqx.io:8883".to_string();
-        config.relay_id = "relay-1".to_string();
-        config.relay_psk = super::super::encode_psk(&[0x22; 32]);
-        config.relay_enabled = true;
+        let config = HcomConfig {
+            relay: "mqtts://broker.emqx.io:8883".to_string(),
+            relay_id: "relay-1".to_string(),
+            relay_psk: super::super::encode_psk(&[0x22; 32]),
+            relay_enabled: true,
+            ..Default::default()
+        };
         crate::config::save_toml_config(&config, None).unwrap();
 
         let db = test_db();

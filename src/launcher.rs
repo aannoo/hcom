@@ -77,10 +77,10 @@ impl LaunchTool {
 ///
 /// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
 /// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///                        for gemini/codex/opencode; claude with `--pty`.
+///   for gemini/codex/opencode; claude with `--pty`.
 /// - `NativePrint`:       background, direct claude spawn in print mode
-///                        (`-p --output-format stream-json --verbose`). Claude
-///                        only; one-shot, exits after the prompt.
+///   (`-p --output-format stream-json --verbose`). Claude
+///   only; one-shot, exits after the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchBackend {
     InteractiveVisible,

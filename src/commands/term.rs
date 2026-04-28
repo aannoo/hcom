@@ -475,7 +475,7 @@ mod tests {
         // The remote fast-path in cmd_term must locate the `name:DEVICE`
         // positional even when flags (e.g. `--json`) precede it. Mirrors the
         // scan used at the top of cmd_term's term_screen branch.
-        fn first_positional<'a>(argv: &'a [String]) -> Option<&'a String> {
+        fn first_positional(argv: &[String]) -> Option<&String> {
             argv.iter().find(|arg| !arg.starts_with('-'))
         }
 

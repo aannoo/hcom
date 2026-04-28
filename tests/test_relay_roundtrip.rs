@@ -367,7 +367,7 @@ fn wait_for_ready_event_any(
                     continue;
                 }
                 let ev_name = ev["instance"].as_str().unwrap_or("");
-                if names.iter().any(|n| *n == ev_name) {
+                if names.contains(&ev_name) {
                     return id;
                 }
             }
