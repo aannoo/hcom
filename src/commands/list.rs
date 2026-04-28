@@ -535,7 +535,11 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
             if !data.status_detail.is_empty() {
                 let detail = if data.status_detail.len() > 60 {
-                    format!("{}...", &data.status_detail[..60])
+                    let end = (0..=60)
+                        .rev()
+                        .find(|&i| data.status_detail.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}...", &data.status_detail[..end])
                 } else {
                     data.status_detail.clone()
                 };
