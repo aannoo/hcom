@@ -980,10 +980,7 @@ fn events_wait(
         if let Some(ref server) = notify_server {
             server.set_nonblocking(true).ok();
         }
-        let _ = db.conn().execute(
-            "INSERT OR REPLACE INTO notify_endpoints (instance_name, kind, port) VALUES (?1, 'events_wait', ?2)",
-            rusqlite::params![name, port as i64],
-        );
+        let _ = db.upsert_notify_endpoint(name, "events_wait", port);
     }
 
     let start = Instant::now();
@@ -1071,11 +1068,8 @@ fn events_wait(
     };
 
     // Cleanup TCP notify endpoint
-    if let (Some(name), Some(port)) = (instance_name, notify_port) {
-        let _ = db.conn().execute(
-            "DELETE FROM notify_endpoints WHERE instance_name = ?1 AND kind = 'events_wait' AND port = ?2",
-            rusqlite::params![name, port as i64],
-        );
+    if let (Some(name), Some(_port)) = (instance_name, notify_port) {
+        let _ = db.delete_notify_endpoint(name, "events_wait");
     }
 
     result
