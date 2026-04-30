@@ -67,6 +67,14 @@ fn is_dash_border(line: &str) -> bool {
     trimmed.chars().count() >= 20 && trimmed.chars().all(|c| c == '─')
 }
 
+/// Check if a line is a Gemini half-block border (all ▀ or ▄ chars, at least 20 wide).
+/// v0.27+ renders the input box with ▄ above prompt and ▀ below; older builds had
+/// the inverse. Either is accepted.
+fn is_block_border(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.chars().count() >= 20 && trimmed.chars().all(|c| c == '▀' || c == '▄')
+}
+
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
@@ -420,7 +428,7 @@ impl ScreenTracker {
     ///
     /// Gemini uses a bordered input box. Three formats supported:
     /// - Old: `╭` corner with `│ >` prompt line
-    /// - New (2025+): `▀` top border with ` > ` prompt line and `▄` bottom border
+    /// - Block: half-block borders (`▀` or `▄`) above and below ` > ` prompt line
     /// - Dash: `─` top/bottom borders with ` > ` prompt line (expanded/newer format)
     ///
     /// Multi-line: when text wraps, continuation lines appear between prompt and
@@ -431,12 +439,14 @@ impl ScreenTracker {
         let lines = self.get_screen_lines();
         let num_lines = lines.len();
 
-        // Search bottom-to-top for input box top border
+        // Search bottom-to-top for input box top border. Gemini renders the box
+        // with half-block characters; either `▀` or `▄` may appear on the top
+        // border depending on the version (▄ in v0.27+, ▀ in some older builds),
+        // so accept either as a border row.
         for row_idx in (0..num_lines.saturating_sub(1)).rev() {
             let line = &lines[row_idx];
 
-            // New format (▀ border) or dash format (─ border)
-            let is_top_border = line.contains('▀') || is_dash_border(line);
+            let is_top_border = is_block_border(line) || is_dash_border(line);
 
             if is_top_border {
                 let next_line = &lines[row_idx + 1];
@@ -455,7 +465,7 @@ impl ScreenTracker {
                     // Collect continuation lines until bottom border
                     let mut text = first_line.to_string();
                     for cont in &lines[(row_idx + 2)..num_lines] {
-                        if cont.contains('▄') || is_dash_border(cont) {
+                        if is_block_border(cont) || is_dash_border(cont) {
                             break;
                         }
                         let trimmed = cont.trim();
@@ -886,6 +896,22 @@ mod tests {
         assert_eq!(
             t.get_gemini_input_text(),
             Some("first line second line".to_string())
+        );
+    }
+
+    #[test]
+    fn gemini_inverted_block_borders() {
+        // Gemini CLI v0.40+ renders ▄ above the prompt and ▀ below it
+        // (visually correct: ▄ fills bottom of its row → line above next row).
+        let top = "▄".repeat(80);
+        let bottom = "▀".repeat(80);
+        let mut t = make_tracker(24, 80, "Type your message");
+        t.process(format!("{}\r\n", top).as_bytes());
+        t.process(b" > injected text\r\n");
+        t.process(format!("{}\r\n", bottom).as_bytes());
+        assert_eq!(
+            t.get_gemini_input_text(),
+            Some("injected text".to_string())
         );
     }
 
