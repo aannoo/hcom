@@ -6,7 +6,7 @@ use super::codex_args::resolve_codex_args;
 
 /// Sandbox modes aligned with Codex TUI presets.
 ///
-/// - `workspace`: Default — --full-auto (workspace-write + on-request approvals)
+/// - `workspace`: Default — --sandbox workspace-write --ask-for-approval on-request
 /// - `untrusted`: Workspace writes, approval before untrusted commands
 /// - `danger-full-access`: Full Access — --dangerously-bypass-approvals-and-sandbox
 /// - `none`: Raw codex, user's own settings (hcom may not work)
@@ -20,7 +20,12 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
 
     match mode {
         "workspace" => {
-            let mut flags = vec!["--full-auto".to_string()];
+            let mut flags = vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "on-request".to_string(),
+            ];
             flags.extend(net);
             flags
         }
@@ -40,7 +45,12 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
         "none" => vec![],
         // Default to workspace
         _ => {
-            let mut flags = vec!["--full-auto".to_string()];
+            let mut flags = vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "on-request".to_string(),
+            ];
             flags.extend(net);
             flags
         }
@@ -63,7 +73,6 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
             "--sandbox",
             "-s",
             "--dangerously-bypass-approvals-and-sandbox",
-            "--full-auto",
         ],
         &["--sandbox=", "-s="],
     );
@@ -285,7 +294,10 @@ mod tests {
     #[test]
     fn test_sandbox_flags_workspace() {
         let flags = get_sandbox_flags("workspace");
-        assert!(flags.contains(&"--full-auto".to_string()));
+        assert!(flags.contains(&"--sandbox".to_string()));
+        assert!(flags.contains(&"workspace-write".to_string()));
+        assert!(flags.contains(&"--ask-for-approval".to_string()));
+        assert!(flags.contains(&"on-request".to_string()));
         assert!(flags.contains(&"sandbox_workspace_write.network_access=true".to_string()));
     }
 
@@ -316,15 +328,16 @@ mod tests {
     #[test]
     fn test_sandbox_flags_unknown_defaults_to_workspace() {
         let flags = get_sandbox_flags("bogus");
-        assert!(flags.contains(&"--full-auto".to_string()));
+        assert!(flags.contains(&"--sandbox".to_string()));
+        assert!(flags.contains(&"workspace-write".to_string()));
     }
 
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_adds_dir() {
         init_config();
-        // With --full-auto, sandbox is active → should add --add-dir
-        let tokens = s(&["--full-auto"]);
+        // With --sandbox workspace-write, sandbox is active → should add --add-dir
+        let tokens = s(&["--sandbox", "workspace-write"]);
         let result = ensure_hcom_writable(&tokens);
         assert_eq!(result[0], "--add-dir");
         assert!(result.len() > 2);
@@ -343,7 +356,12 @@ mod tests {
     fn test_ensure_hcom_writable_no_duplicate() {
         init_config();
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
-        let tokens = vec!["--full-auto".to_string(), "--add-dir".to_string(), hcom_dir];
+        let tokens = vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--add-dir".to_string(),
+            hcom_dir,
+        ];
         let result = ensure_hcom_writable(&tokens);
         let add_dir_count = result.iter().filter(|t| *t == "--add-dir").count();
         assert_eq!(add_dir_count, 1);
@@ -441,10 +459,11 @@ mod tests {
         let args = s(&[
             "resume",
             "--config=developer_instructions=OLD",
-            "--full-auto",
+            "--sandbox",
+            "workspace-write",
         ]);
         let result = strip_codex_developer_instructions(&args);
-        assert_eq!(result, s(&["resume", "--full-auto"]));
+        assert_eq!(result, s(&["resume", "--sandbox", "workspace-write"]));
     }
 
     #[test]
@@ -453,7 +472,8 @@ mod tests {
         init_config();
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-        assert!(result.contains(&"--full-auto".to_string()));
+        assert!(result.contains(&"--sandbox".to_string()));
+        assert!(result.contains(&"workspace-write".to_string()));
         assert!(result.contains(&"--add-dir".to_string()));
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
     }
@@ -462,7 +482,8 @@ mod tests {
     fn test_preprocess_codex_args_none_mode() {
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "none");
-        assert!(!result.contains(&"--full-auto".to_string()));
+        assert!(!result.contains(&"--sandbox".to_string()));
+        assert!(!result.contains(&"workspace-write".to_string()));
         assert!(!result.contains(&"--add-dir".to_string()));
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
     }

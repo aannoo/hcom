@@ -49,7 +49,6 @@ const CASE_SENSITIVE_BOOLEAN_FLAGS: &[&str] = &["-V"];
 
 const BOOLEAN_FLAGS: &[&str] = &[
     "--oss",
-    "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",
     "--search",
     "--no-alt-screen",
@@ -107,7 +106,6 @@ const SANDBOX_FLAGS: &[&str] = &[
     "-s",
     "-a",
     "--ask-for-approval",
-    "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",
 ];
 
@@ -504,15 +502,6 @@ pub fn validate_conflicts(spec: &CodexArgsSpec) -> Vec<String> {
         warnings.push("--json flag is only valid with 'exec' subcommand".to_string());
     }
 
-    if spec.has_flag(&["--full-auto"], &[])
-        && spec.has_flag(&["--dangerously-bypass-approvals-and-sandbox"], &[])
-    {
-        warnings.push(
-            "--full-auto and --dangerously-bypass-approvals-and-sandbox are redundant together"
-                .to_string(),
-        );
-    }
-
     warnings
 }
 
@@ -845,9 +834,9 @@ mod tests {
 
     #[test]
     fn test_parse_boolean_flags() {
-        let args = sv(&["--full-auto", "--oss"]);
+        let args = sv(&["--last", "--oss"]);
         let spec = parse_tokens(&args, SourceType::Cli);
-        assert!(spec.has_flag(&["--full-auto"], &[]));
+        assert!(spec.has_flag(&["--last"], &[]));
         assert!(spec.has_flag(&["--oss"], &[]));
     }
 
@@ -861,9 +850,9 @@ mod tests {
 
     #[test]
     fn test_parse_double_dash() {
-        let args = sv(&["--full-auto", "--", "--not-a-flag"]);
+        let args = sv(&["--oss", "--", "--not-a-flag"]);
         let spec = parse_tokens(&args, SourceType::Cli);
-        assert!(spec.has_flag(&["--full-auto"], &[]));
+        assert!(spec.has_flag(&["--oss"], &[]));
         assert_eq!(spec.positional_tokens, vec!["--not-a-flag"]);
     }
 
@@ -873,10 +862,10 @@ mod tests {
             &sv(&["--sandbox", "workspace-write", "-a", "untrusted"]),
             SourceType::Env,
         );
-        let cli_spec = parse_tokens(&sv(&["--full-auto"]), SourceType::Cli);
+        let cli_spec = parse_tokens(&sv(&["--dangerously-bypass-approvals-and-sandbox"]), SourceType::Cli);
         let merged = merge_codex_args(&env_spec, &cli_spec);
-        // CLI has --full-auto (sandbox flag), so ALL env sandbox flags stripped
-        assert!(merged.has_flag(&["--full-auto"], &[]));
+        // CLI has --dangerously-bypass-approvals-and-sandbox (sandbox flag), so ALL env sandbox flags stripped
+        assert!(merged.has_flag(&["--dangerously-bypass-approvals-and-sandbox"], &[]));
         assert!(!merged.has_flag(&["-a"], &[]));
     }
 
@@ -947,11 +936,20 @@ mod tests {
 
     #[test]
     fn test_resolve_from_env() {
-        let spec = resolve_codex_args(None, Some("--model gpt-4 --full-auto"));
+        let spec = resolve_codex_args(None, Some("--model gpt-4 --last"));
         assert_eq!(
             spec.get_flag_value("--model"),
             Some(FlagValue::Single("gpt-4".to_string()))
         );
-        assert!(spec.has_flag(&["--full-auto"], &[]));
+        assert!(spec.has_flag(&["--last"], &[]));
     }
+
+    #[test]
+    fn test_full_auto_removed() {
+        let args = sv(&["--full-auto"]);
+        let spec = parse_tokens(&args, SourceType::Cli);
+        assert!(spec.has_errors());
+        assert!(spec.errors[0].contains("unknown option '--full-auto'"));
+    }
+
 }

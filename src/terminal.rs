@@ -1816,7 +1816,8 @@ mod tests {
     fn test_sandbox_flags_in_get_sandbox_flags() {
         use crate::tools::codex_preprocessing::get_sandbox_flags;
         let flags = get_sandbox_flags("workspace");
-        assert!(flags.contains(&"--full-auto".to_string()));
+        assert!(flags.contains(&"--sandbox".to_string()));
+        assert!(flags.contains(&"workspace-write".to_string()));
     }
 
     #[test]
