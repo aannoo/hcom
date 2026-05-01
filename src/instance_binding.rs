@@ -1202,15 +1202,16 @@ mod tests {
 
     // ── --agent mode regression tests ────────────────────────────────────────
     //
-    // In `--agent` mode OpenCode skips `session.created` and fires `chat.message`
-    // first.  `bindIdentity()` is the only path that calls `opencode-start` and
-    // creates a `session_bindings` row.  The tests below verify the DB-level
-    // invariants that the plugin fix relies on.
+    // In `--agent` startup, hcom can observe an OpenCode process before the
+    // OpenCode session has been bound.  `bindIdentity()` is the path that calls
+    // `opencode-start` and creates a `session_bindings` row once a session ID is
+    // available.  The tests below verify the DB-level invariants that the plugin
+    // fix relies on.
 
     /// Regression: calling `bind_session_to_process` without a prior
-    /// `session.created` (the --agent path) must still create a `session_bindings`
-    /// row.  Before the fix, `HCOM_LAUNCHED` blocked `bindIdentity` and no row
-    /// was ever inserted.
+    /// `session.created` (the observed --agent startup gap) must still create a
+    /// `session_bindings` row.  Before the fix, `HCOM_LAUNCHED` blocked
+    /// `bindIdentity` and no row was inserted from later session-bearing events.
     #[test]
     fn test_agent_mode_bind_session_creates_session_binding() {
         crate::config::Config::init();
@@ -1228,7 +1229,7 @@ mod tests {
         db.save_instance_named("agent-alpha", &data).unwrap();
         db.set_process_binding("proc-agent-1", "", "agent-alpha").unwrap();
 
-        // The plugin now calls this on the first chat.message (--agent path).
+        // The plugin now calls this from later session-bearing plugin events.
         let result = bind_session_to_process(&db, "sess-agent-1", Some("proc-agent-1"));
         assert_eq!(result, Some("agent-alpha".to_string()));
 
@@ -1280,14 +1281,14 @@ mod tests {
     }
 
     /// Full sequence: `initialize_instance_in_position_file` (tool=opencode, no
-    /// session_id) followed by `bind_session_to_process` — mirrors what happens
-    /// in the --agent path after the fix.
+    /// session_id) followed by `bind_session_to_process` — mirrors the launcher
+    /// placeholder followed by a later OpenCode session binding.
     #[test]
     fn test_agent_mode_initialize_then_bind_session() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
 
-        // Step 1: launcher creates the placeholder row (no session_id in --agent mode).
+        // Step 1: launcher creates the placeholder row (no session_id yet).
         initialize_instance_in_position_file(
             &db,
             "agent-gamma",
@@ -1302,7 +1303,7 @@ mod tests {
         let before = db.get_instance_full("agent-gamma").unwrap().unwrap();
         assert!(before.session_id.is_none(), "session_id should be absent before binding");
 
-        // Step 2: plugin calls bind on the first chat.message.
+        // Step 2: plugin calls bind once an OpenCode session ID is available.
         let result = bind_session_to_process(&db, "sess-agent-3", Some("proc-agent-3"));
         assert_eq!(result, Some("agent-gamma".to_string()));
 

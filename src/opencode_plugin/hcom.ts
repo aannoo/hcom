@@ -292,8 +292,10 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
 
   async function bindIdentity(sid: string): Promise<void> {
     if (instanceName || bindingPromise) return
-    // No HCOM_LAUNCHED guard — allows binding even when OpenCode is launched
-    // via `hcom opencode --agent` (agent mode skips session.created events).
+    if (!process.env.HCOM_PROCESS_ID) return
+
+    // No HCOM_LAUNCHED guard: launched OpenCode instances can start with only
+    // a process/PTY binding and acquire an OpenCode session later.
     // Safe to call repeatedly: $.nothrow() catches failures and bindIdentity's
     // own early-return (instanceName || bindingPromise) handles duplicates.
     bindingPromise = (async () => {
@@ -456,11 +458,16 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (input.sessionID && !instanceName && !bindingPromise) {
           await bindIdentity(input.sessionID)
         }
-        // Guard: if bindIdentity was called but produced no binding (daemon absent,
-        // missing HCOM_PROCESS_ID, etc.), both instanceName and sessionId remain null.
-        // isBoundSession(null) short-circuits to true on double-null, which would
-        // silently mutate agent/model state. Emit WARN and skip instead.
-        if (!instanceName && !sessionId) {
+        // Guard: only mutate agent/model state when the message carries a session ID and
+        // binding has actually succeeded. `sessionId` may be populated from earlier
+        // events before bindIdentity completes successfully, so do not treat it as
+        // proof of a bound session here.
+        if (!input.sessionID) {
+          log("WARN", "plugin.chat_message_unbound", null, {
+            session_id: input.sessionID,
+            reason: "chat.message missing sessionID",
+          })
+        } else if (!instanceName) {
           log("WARN", "plugin.chat_message_unbound", null, {
             session_id: input.sessionID,
             reason: "no binding after bindIdentity attempt — hcom absent or daemon error",
