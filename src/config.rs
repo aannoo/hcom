@@ -434,7 +434,7 @@ impl HcomConfig {
             "codex_sandbox_mode" => {
                 // Normalize legacy value
                 self.codex_sandbox_mode = if value == "full-auto" {
-                    "danger-full-access".to_string()
+                    "workspace".to_string()
                 } else {
                     value.to_string()
                 };
@@ -1528,7 +1528,7 @@ mod tests {
     fn test_set_field_full_auto_normalization() {
         let mut config = HcomConfig::default();
         config.set_field("codex_sandbox_mode", "full-auto").unwrap();
-        assert_eq!(config.codex_sandbox_mode, "danger-full-access");
+        assert_eq!(config.codex_sandbox_mode, "workspace");
     }
 
     #[test]
@@ -1879,7 +1879,7 @@ auto_approve = false
             "full-auto".to_string(),
         );
         let config = HcomConfig::from_env_dict(&data).unwrap();
-        assert_eq!(config.codex_sandbox_mode, "danger-full-access");
+        assert_eq!(config.codex_sandbox_mode, "workspace");
     }
 
     #[test]
