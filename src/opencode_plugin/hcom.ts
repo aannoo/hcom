@@ -292,8 +292,10 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
 
   async function bindIdentity(sid: string): Promise<void> {
     if (instanceName || bindingPromise) return
-    if (process.env.HCOM_LAUNCHED !== "1") return
-
+    // No HCOM_LAUNCHED guard — allows binding even when OpenCode is launched
+    // via `hcom opencode --agent` (agent mode skips session.created events).
+    // Safe to call repeatedly: $.nothrow() catches failures and bindIdentity's
+    // own early-return (instanceName || bindingPromise) handles duplicates.
     bindingPromise = (async () => {
       try {
         // Start TCP notify server before binding so port is registered atomically
@@ -451,7 +453,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           sessionId = input.sessionID
         }
         if (bindingPromise) await bindingPromise
-        if (input.sessionID && !instanceName) {
+        if (input.sessionID && !instanceName && !bindingPromise) {
           await bindIdentity(input.sessionID)
         }
         if (isBoundSession(input.sessionID)) {
@@ -475,7 +477,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       try {
         if (!checkHcom()) return
         if (bindingPromise) await bindingPromise
-        if (!instanceName && sessionId) await bindIdentity(sessionId)
+        if (!instanceName && !bindingPromise && sessionId) {
+          await bindIdentity(sessionId)
+        }
         if (!instanceName || !sessionId) return
 
         // OpenCode transform mutations are prompt-local, not persisted to stored
