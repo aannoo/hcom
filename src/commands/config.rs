@@ -93,7 +93,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     ),
     (
         "HCOM_CODEX_SANDBOX_MODE",
-        "Codex sandbox mode (e.g., off)",
+        "Codex permission profile (workspace | untrusted | danger-full-access | none)",
         "string",
     ),
     (
@@ -274,6 +274,20 @@ pub fn config_set(key: &str, value: &str) -> Result<(), String> {
 
     // Map HCOM_KEY to field name, then to nested TOML path
     let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
+
+    if field_name == "codex_sandbox_mode" && !value.is_empty() {
+        let normalized = if value == "full-auto" {
+            "danger-full-access"
+        } else {
+            value
+        };
+        if !crate::config::VALID_SANDBOX_MODES.contains(&normalized) {
+            return Err(format!(
+                "codex_sandbox_mode must be one of: {}. Got '{value}'",
+                crate::config::VALID_SANDBOX_MODES.join(", ")
+            ));
+        }
+    }
 
     if let Some(dotted_path) = toml_path_for_key(&field_name) {
         set_nested_toml(&mut doc, dotted_path, value);
@@ -1327,6 +1341,31 @@ Example: hcom config codex_args \"--search\"
 Clear:   hcom config codex_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
+        ),
+
+        "HCOM_CODEX_SANDBOX_MODE" => Some(
+            "\
+HCOM_CODEX_SANDBOX_MODE - Permission flags hcom injects when launching codex
+
+Default: workspace
+
+Codex's default sandbox blocks the writes and Unix sockets hcom needs,
+so hcom injects flags on every codex launch to reshape it. This knob
+picks which set.
+
+Values:
+  workspace          Codex auto-runs; asks only when the model judges
+                     necessary.
+  untrusted          Codex prompts before every command that isn't a
+                     known-safe read. Effectively read-only unless you
+                     approve writes case-by-case.
+  danger-full-access No sandbox, no approvals.
+  none               Inject nothing. Codex uses your own config; DB
+                     writes fail unless your config allows ~/.hcom.
+
+Usage:
+  hcom config codex_sandbox_mode untrusted
+  hcom config codex_sandbox_mode \"\"        # Reset to default",
         ),
 
         "HCOM_RELAY" => Some(

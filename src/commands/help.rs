@@ -52,7 +52,10 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ("  --all", "Include archived sessions"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
-    ("  --remote-fetch --device ID", "One-shot fetch from remote device"),
+    (
+        "  --remote-fetch --device ID",
+        "One-shot fetch from remote device",
+    ),
 ];
 
 // events help continued after FILTER_HELP splice
@@ -81,7 +84,10 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
         "    --device ID",
         "Install/list sub on remote device (requires --for for create)",
     ),
-    ("  events unsub <id> [--device ID]", "Remove subscription (local or remote)"),
+    (
+        "  events unsub <id> [--device ID]",
+        "Remove subscription (local or remote)",
+    ),
     ("", ""),
     ("Examples:", ""),
     ("  events --cmd git --agent peso", ""),
@@ -422,7 +428,11 @@ const RESET_HELP: &[HelpEntry] = &[
     ("", "  export HCOM_DIR=\"$PWD/.hcom\""),
     (
         "",
-        "Hooks install under $PWD (.claude/.gemini/.codex) or ~/.config/opencode/, state in $HCOM_DIR",
+        "Hooks install under the parent of HCOM_DIR; state stays in HCOM_DIR.",
+    ),
+    (
+        "",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -689,10 +699,16 @@ const CODEX_SPEC: ToolHelpSpec = ToolHelpSpec {
             "Use a specific model",
         ),
     ],
-    extra_env: &[(
-        "HCOM_CODEX_SYSTEM_PROMPT",
-        "System prompt (env var or config)",
-    )],
+    extra_env: &[
+        (
+            "HCOM_CODEX_SYSTEM_PROMPT",
+            "System prompt (env var or config)",
+        ),
+        (
+            "HCOM_CODEX_SANDBOX_MODE",
+            "workspace | untrusted | danger-full-access | none",
+        ),
+    ],
     has_fork: true,
 };
 
@@ -931,7 +947,10 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
     for (flag, desc) in SHARED_LAUNCH_FLAGS {
         flags.push_str(&format!("  {:<34}{}\n", flag, desc));
     }
-    flags.push_str(&format!("  {:<34}{}", "--go", "Skip preview, run immediately"));
+    flags.push_str(&format!(
+        "  {:<34}{}",
+        "--go", "Skip preview, run immediately"
+    ));
     format!(
         "Usage:\n\
          \x20 {usage_line}\n\
