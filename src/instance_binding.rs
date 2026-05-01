@@ -1199,4 +1199,143 @@ mod tests {
 
         cleanup(path);
     }
+
+    // ── --agent mode regression tests ────────────────────────────────────────
+    //
+    // In `--agent` mode OpenCode skips `session.created` and fires `chat.message`
+    // first.  `bindIdentity()` is the only path that calls `opencode-start` and
+    // creates a `session_bindings` row.  The tests below verify the DB-level
+    // invariants that the plugin fix relies on.
+
+    /// Regression: calling `bind_session_to_process` without a prior
+    /// `session.created` (the --agent path) must still create a `session_bindings`
+    /// row.  Before the fix, `HCOM_LAUNCHED` blocked `bindIdentity` and no row
+    /// was ever inserted.
+    #[test]
+    fn test_agent_mode_bind_session_creates_session_binding() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        // Simulate: instance placeholder created by the launcher (no session_id yet,
+        // matching the state before session.created would fire in normal mode).
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("agent-alpha"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert("tool".into(), serde_json::json!("opencode"));
+        db.save_instance_named("agent-alpha", &data).unwrap();
+        db.set_process_binding("proc-agent-1", "", "agent-alpha").unwrap();
+
+        // The plugin now calls this on the first chat.message (--agent path).
+        let result = bind_session_to_process(&db, "sess-agent-1", Some("proc-agent-1"));
+        assert_eq!(result, Some("agent-alpha".to_string()));
+
+        // session_bindings row must exist (was missing before the fix).
+        let binding = db.get_session_binding("sess-agent-1").unwrap();
+        assert_eq!(binding, Some("agent-alpha".to_string()));
+
+        // Instance must carry the session_id.
+        let inst = db.get_instance_full("agent-alpha").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("sess-agent-1"));
+
+        cleanup(path);
+    }
+
+    /// `bind_session_to_process` called twice with the same session_id must be
+    /// idempotent: same name returned, no duplicate session_bindings rows.
+    #[test]
+    fn test_agent_mode_bind_session_idempotent() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("agent-beta"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert("tool".into(), serde_json::json!("opencode"));
+        db.save_instance_named("agent-beta", &data).unwrap();
+        db.set_process_binding("proc-agent-2", "", "agent-beta").unwrap();
+
+        let r1 = bind_session_to_process(&db, "sess-agent-2", Some("proc-agent-2"));
+        let r2 = bind_session_to_process(&db, "sess-agent-2", Some("proc-agent-2"));
+        assert_eq!(r1, Some("agent-beta".to_string()));
+        assert_eq!(r2, Some("agent-beta".to_string()));
+
+        // Exactly one session_bindings row.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE session_id = ?",
+                rusqlite::params!["sess-agent-2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "must have exactly one session_bindings row");
+
+        cleanup(path);
+    }
+
+    /// Full sequence: `initialize_instance_in_position_file` (tool=opencode, no
+    /// session_id) followed by `bind_session_to_process` — mirrors what happens
+    /// in the --agent path after the fix.
+    #[test]
+    fn test_agent_mode_initialize_then_bind_session() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // Step 1: launcher creates the placeholder row (no session_id in --agent mode).
+        initialize_instance_in_position_file(
+            &db,
+            "agent-gamma",
+            None,  // no session_id yet
+            None, None, None, None,
+            Some("opencode"),
+            false, None, None, None, None, None,
+        );
+        db.set_process_binding("proc-agent-3", "", "agent-gamma").unwrap();
+
+        // Row exists, no session yet.
+        let before = db.get_instance_full("agent-gamma").unwrap().unwrap();
+        assert!(before.session_id.is_none(), "session_id should be absent before binding");
+
+        // Step 2: plugin calls bind on the first chat.message.
+        let result = bind_session_to_process(&db, "sess-agent-3", Some("proc-agent-3"));
+        assert_eq!(result, Some("agent-gamma".to_string()));
+
+        // session_bindings row created.
+        assert_eq!(
+            db.get_session_binding("sess-agent-3").unwrap(),
+            Some("agent-gamma".to_string())
+        );
+
+        // Instance carries session_id.
+        let after = db.get_instance_full("agent-gamma").unwrap().unwrap();
+        assert_eq!(after.session_id.as_deref(), Some("sess-agent-3"));
+
+        cleanup(path);
+    }
+
+    /// When `HCOM_PROCESS_ID` is absent (no process binding), `bind_session_to_process`
+    /// with no process_id must return `None` and must NOT insert a phantom
+    /// `session_bindings` row — mirroring the daemon-absent / headless error path
+    /// where `opencode-start` returns `{"error": ...}`.
+    #[test]
+    fn test_agent_mode_no_process_id_no_session_binding() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // No instance, no process binding.
+        let result = bind_session_to_process(&db, "sess-agent-none", None);
+        assert!(result.is_none(), "must return None when no process binding exists");
+
+        // No phantom session_bindings row.
+        let binding = db.get_session_binding("sess-agent-none").unwrap();
+        assert!(binding.is_none(), "must not create a phantom session_bindings row");
+
+        cleanup(path);
+    }
 }
