@@ -11,7 +11,7 @@ use clap::Parser;
 
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::log::{log_error, log_info, log_warn};
-use crate::shared::dev_root_binary;
+use crate::shared::{HcomError, dev_root_binary};
 
 // ── Hook name registries ──────────────
 
@@ -97,6 +97,30 @@ fn is_command(name: &str) -> bool {
 
 fn is_launch_tool(name: &str) -> bool {
     LAUNCH_TOOLS.contains(&name)
+}
+
+fn maybe_external_send_name_hint(
+    cmd: &str,
+    explicit_name: Option<&str>,
+    has_from_flag: bool,
+    process_id: Option<&str>,
+    is_inside_ai_tool: bool,
+    err: &HcomError,
+) -> Option<String> {
+    let name = explicit_name?;
+    if cmd != "send"
+        || has_from_flag
+        || process_id.is_some()
+        || is_inside_ai_tool
+        || !matches!(err, HcomError::NotFound(_))
+    {
+        return None;
+    }
+
+    let hcom_cmd = crate::runtime_env::build_hcom_command();
+    Some(format!(
+        "{err}\nHint: If '{name}' is an external sender (cron/script/manual alert), use:\n  {hcom_cmd} send --from {name} ..."
+    ))
 }
 
 // ── Dispatch types ──────────────────────────────────────────────────────
@@ -736,6 +760,8 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let codex_thread_id = std::env::var("CODEX_THREAD_ID")
         .ok()
         .filter(|s| !s.is_empty());
+    let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
+    let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
         &db,
         Some(cmd),
@@ -746,14 +772,21 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     ) {
         Ok(ctx) => ctx,
         Err(e) => {
-            eprintln!("Error: {e}");
+            let msg = maybe_external_send_name_hint(
+                cmd,
+                flags.name.as_deref(),
+                has_from_flag,
+                process_id.as_deref(),
+                is_inside_ai,
+                &e,
+            )
+            .unwrap_or_else(|| e.to_string());
+            eprintln!("Error: {msg}");
             return 1;
         }
     };
 
     // Identity gating: block unregistered sessions from gated commands
-    let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
-    let is_inside_ai = crate::shared::is_inside_ai_tool();
     if let Err(e) = crate::cli_context::check_identity_gate(cmd, &ctx, has_from_flag, is_inside_ai)
     {
         eprintln!("Error: {e}");
@@ -1258,6 +1291,57 @@ mod tests {
             }
             _ => panic!("expected Hook, got {:?}", action),
         }
+    }
+
+    #[test]
+    fn send_not_found_gets_external_sender_hint_outside_ai() {
+        let err = HcomError::NotFound(
+            "Instance 'healthcheck' not found. Run 'hcom start --as healthcheck' to reclaim your identity.".into(),
+        );
+        let msg = maybe_external_send_name_hint(
+            "send",
+            Some("healthcheck"),
+            false,
+            None,
+            false,
+            &err,
+        )
+        .expect("expected hint");
+        assert!(msg.contains("Hint: If 'healthcheck' is an external sender"));
+        assert!(msg.contains("send --from healthcheck"));
+    }
+
+    #[test]
+    fn send_not_found_keeps_agent_recovery_path_inside_ai() {
+        let err = HcomError::NotFound(
+            "Instance 'luna' not found. Run 'hcom start --as luna' to reclaim your identity."
+                .into(),
+        );
+        let msg = maybe_external_send_name_hint(
+            "send",
+            Some("luna"),
+            false,
+            Some("pid-123"),
+            true,
+            &err,
+        );
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn non_not_found_name_errors_do_not_get_external_sender_hint() {
+        let err = HcomError::InvalidInput(
+            "Invalid instance name 'Invalid-Name!'. Use base name only (lowercase letters, numbers, underscore).".into(),
+        );
+        let msg = maybe_external_send_name_hint(
+            "send",
+            Some("Invalid-Name!"),
+            false,
+            None,
+            false,
+            &err,
+        );
+        assert!(msg.is_none());
     }
 
     // ── is_hook / is_command ────────────────────────────────────────────

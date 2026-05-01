@@ -263,6 +263,41 @@ fn generate_process_id() -> String {
     format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a, b, c, d, e)
 }
 
+fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "Diagnostic context:");
+    for (label, p) in paths {
+        let _ = writeln!(out, "  resolved {label}={}", p.display());
+    }
+    let _ = writeln!(
+        out,
+        "  HCOM_DIR={}",
+        std::env::var("HCOM_DIR").unwrap_or_else(|_| "<unset>".into())
+    );
+    let tool_env_var = match tool {
+        LaunchTool::Claude | LaunchTool::ClaudePty => Some("CLAUDE_CONFIG_DIR"),
+        LaunchTool::Gemini => Some("GEMINI_CLI_HOME"),
+        LaunchTool::Codex => Some("CODEX_HOME"),
+        LaunchTool::OpenCode => None,
+    };
+    if let Some(env_var) = tool_env_var {
+        let _ = writeln!(
+            out,
+            "  {env_var}={}",
+            std::env::var(env_var).unwrap_or_else(|_| "<unset>".into())
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  cwd={}",
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into())
+    );
+    out
+}
+
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
@@ -274,10 +309,21 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
                 return Ok(());
             }
-            if crate::hooks::claude::setup_claude_hooks(include_permissions) {
-                return Ok(());
+            if let Err(e) = crate::hooks::claude::try_setup_claude_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[(
+                        "settings_path",
+                        crate::hooks::claude::get_claude_settings_path(),
+                    )],
+                );
+                bail!(
+                    "Failed to setup Claude hooks: {e}\n\
+                     Run: hcom hooks add claude\n\
+                     {diag}"
+                );
             }
-            bail!("Failed to setup Claude hooks. Run: hcom hooks add claude");
+            Ok(())
         }
         LaunchTool::Gemini => {
             if !crate::hooks::gemini::is_gemini_version_supported() {
@@ -295,25 +341,48 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             if crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions) {
                 return Ok(());
             }
-            if crate::hooks::gemini::setup_gemini_hooks(include_permissions) {
-                return Ok(());
+            if let Err(e) = crate::hooks::gemini::try_setup_gemini_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[(
+                        "settings_path",
+                        crate::hooks::gemini::get_gemini_settings_path(),
+                    )],
+                );
+                bail!(
+                    "Failed to setup Gemini hooks: {e}\n\
+                     Run: hcom hooks add gemini\n\
+                     {diag}"
+                );
             }
-            bail!("Failed to setup Gemini hooks. Run: hcom hooks add gemini");
+            Ok(())
         }
         LaunchTool::Codex => {
             if crate::hooks::codex::verify_codex_hooks_installed(include_permissions) {
                 return Ok(());
             }
-            if crate::hooks::codex::setup_codex_hooks(include_permissions) {
-                return Ok(());
+            if let Err(e) = crate::hooks::codex::try_setup_codex_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[
+                        ("config_path", crate::hooks::codex::get_codex_config_path()),
+                        ("hooks_path", crate::hooks::codex::get_codex_hooks_path()),
+                    ],
+                );
+                bail!(
+                    "Failed to setup Codex hooks: {e}\n\
+                     Run: hcom hooks add codex\n\
+                     {diag}"
+                );
             }
-            bail!("Failed to setup Codex hooks. Run: hcom hooks add codex");
+            Ok(())
         }
         LaunchTool::OpenCode => {
             if crate::hooks::opencode::ensure_plugin_installed() {
                 return Ok(());
             }
-            bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode");
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
         }
     }
 }

@@ -32,8 +32,8 @@ fn is_in_path(name: &str) -> bool {
         .any(|dir| Path::new(dir).join(name).exists())
 }
 
-// Hook-installation checks delegate to the canonical `verify_*` functions in
-// `hooks::*` so `hcom status` and `hcom hooks status` never disagree.
+// Hook-installation checks delegate to the `verify_*` functions in `hooks::*`
+// so `hcom status` and `hcom hooks status` never disagree.
 
 fn check_claude_hooks() -> bool {
     crate::hooks::claude::verify_claude_hooks_installed(None, false)
@@ -387,7 +387,11 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         RelayHealth::Stale { age_s, pid } => {
             println!("relay:     stale ({:.0}s, PID {pid})", age_s);
         }
-        RelayHealth::Error { reason, detail, pid } => {
+        RelayHealth::Error {
+            reason,
+            detail,
+            pid,
+        } => {
             println!(
                 "relay:     error ({})",
                 reason.clone().label(detail.as_deref(), *pid)
@@ -414,7 +418,11 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             // Relay summary line above already prints "stale (Ns, PID p)" —
             // duplicating that as a worker line buys nothing, just clutters.
         }
-        RelayHealth::Error { reason, detail, pid } => match reason {
+        RelayHealth::Error {
+            reason,
+            detail,
+            pid,
+        } => match reason {
             RelayErrorReason::StalePidfile => {
                 let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                 println!("relay-worker: not running (stale pidfile, PID {pid_str})");

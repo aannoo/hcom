@@ -21,7 +21,11 @@ use super::common::SAFE_HCOM_COMMANDS;
 
 const HCOM_TRIGGER: &str = "<hcom>";
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
-    ("SessionStart", "codex-sessionstart", Some("startup|resume|clear")),
+    (
+        "SessionStart",
+        "codex-sessionstart",
+        Some("startup|resume|clear"),
+    ),
     ("UserPromptSubmit", "codex-userpromptsubmit", None),
     ("PreToolUse", "codex-pretooluse", Some("Bash")),
     ("PostToolUse", "codex-posttooluse", Some("Bash")),
@@ -192,12 +196,11 @@ fn update_codex_position(
 /// as separate visible lines ("warning:" + "hook context:"), causing
 /// double output for every delivered message.
 fn prepare_codex_delivery(db: &HcomDb, instance_name: &str) -> Option<HookResult> {
-    common::prepare_pending_messages(db, instance_name)
-        .map(|prepared| HookResult::Allow {
-            additional_context: Some(prepared.formatted),
-            system_message: None,
-            delivery_ack: Some(prepared.ack),
-        })
+    common::prepare_pending_messages(db, instance_name).map(|prepared| HookResult::Allow {
+        additional_context: Some(prepared.formatted),
+        system_message: None,
+        delivery_ack: Some(prepared.ack),
+    })
 }
 
 fn resolve_and_update_codex_instance(
@@ -285,7 +288,13 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         None => return hook_noop(),
     };
 
-    common::update_tool_status(db, &instance.name, "codex", &payload.tool_name, &payload.tool_input);
+    common::update_tool_status(
+        db,
+        &instance.name,
+        "codex",
+        &payload.tool_name,
+        &payload.tool_input,
+    );
     hook_noop()
 }
 
@@ -645,24 +654,36 @@ fn codex_feature_enabled(config_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn hooks_json_has_expected_hooks(hooks_path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(hooks_path) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
+fn verify_hooks_json_at(hooks_path: &Path) -> Result<(), VerifyFailReason> {
+    let content = std::fs::read_to_string(hooks_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            VerifyFailReason::HooksPathMissing(hooks_path.to_path_buf())
+        }
+        _ => VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()),
+    })?;
+    let json: Value = serde_json::from_str(&content)
+        .map_err(|_| VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()))?;
+    verify_hooks_json_value(&json)
+}
 
-    let Some(hooks_obj) = json.get("hooks").and_then(|v| v.as_object()) else {
-        return false;
-    };
+fn verify_hooks_json_value(json: &Value) -> Result<(), VerifyFailReason> {
+    let hooks_obj = json
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .ok_or(VerifyFailReason::HooksKeyMissing)?;
 
     // Check all expected hooks are present with correct matchers.
-    let all_present = CODEX_HOOK_COMMANDS.iter().all(|(event, command, matcher)| {
-        let Some(groups) = hooks_obj.get(*event).and_then(|v| v.as_array()) else {
-            return false;
+    for (event, command, matcher) in CODEX_HOOK_COMMANDS {
+        let groups = match hooks_obj.get(*event).and_then(|v| v.as_array()) {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => {
+                return Err(VerifyFailReason::HookEventMissing {
+                    event: (*event).to_string(),
+                });
+            }
         };
-        groups.iter().any(|group| {
+        let expected_command = build_codex_hook_command(command);
+        let any_matches = groups.iter().any(|group| {
             let matcher_ok = match matcher {
                 Some(expected) => group.get("matcher").and_then(|v| v.as_str()) == Some(*expected),
                 None => {
@@ -678,13 +699,16 @@ fn hooks_json_has_expected_hooks(hooks_path: &Path) -> bool {
                         hooks.iter().any(|hook| {
                             hook.get("type").and_then(|v| v.as_str()) == Some("command")
                                 && hook.get("command").and_then(|v| v.as_str())
-                                    == Some(build_codex_hook_command(command).as_str())
+                                    == Some(expected_command.as_str())
                         })
                     })
-        })
-    });
-    if !all_present {
-        return false;
+        });
+        if !any_matches {
+            return Err(VerifyFailReason::HookCommandMissing {
+                event: (*event).to_string(),
+                expected_command,
+            });
+        }
     }
 
     // Check no stale hcom hooks exist in groups with non-matching matchers.
@@ -693,35 +717,41 @@ fn hooks_json_has_expected_hooks(hooks_path: &Path) -> bool {
             continue;
         };
         for group in groups {
-            let has_hcom_command = group
-                .get("hooks")
-                .and_then(|v| v.as_array())
-                .is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(is_hcom_codex_command)
-                    })
-                });
+            let has_hcom_command =
+                group
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(is_hcom_codex_command)
+                        })
+                    });
             if !has_hcom_command {
                 continue;
             }
             // This group has an hcom command — it must match an expected entry.
             let group_matcher = group.get("matcher").and_then(|v| v.as_str());
-            let is_expected = CODEX_HOOK_COMMANDS.iter().any(|(exp_event, _, exp_matcher)| {
-                *exp_event == event.as_str()
-                    && match exp_matcher {
-                        Some(m) => group_matcher == Some(*m),
-                        None => group_matcher.is_none() || group_matcher == Some(""),
-                    }
-            });
+            let is_expected = CODEX_HOOK_COMMANDS
+                .iter()
+                .any(|(exp_event, _, exp_matcher)| {
+                    *exp_event == event.as_str()
+                        && match exp_matcher {
+                            Some(m) => group_matcher == Some(*m),
+                            None => group_matcher.is_none() || group_matcher == Some(""),
+                        }
+                });
             if !is_expected {
-                return false;
+                return Err(VerifyFailReason::StaleHcomHookEntry {
+                    event: event.clone(),
+                    matcher: group_matcher.map(|s| s.to_string()),
+                });
             }
         }
     }
 
-    true
+    Ok(())
 }
 
 fn build_codex_rules() -> String {
@@ -778,42 +808,107 @@ pub fn remove_codex_execpolicy() -> bool {
     }
 }
 
-/// Set up Codex native hooks in hooks.json and enable feature in config.toml.
-pub fn setup_codex_hooks(include_permissions: bool) -> bool {
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum VerifyFailReason {
+    #[error("Codex config.toml missing: {}", .0.display())]
+    ConfigPathMissing(PathBuf),
+    #[error("Codex hooks.json missing: {}", .0.display())]
+    HooksPathMissing(PathBuf),
+    #[error("Codex experimental hooks feature not enabled in {}", .0.display())]
+    CodexFeatureDisabled(PathBuf),
+    #[error("Codex hooks.json missing or not parseable as JSON: {}", .0.display())]
+    HooksUnreadable(PathBuf),
+    #[error("'hooks' key missing or not an object")]
+    HooksKeyMissing,
+    #[error("hook event '{event}' missing or empty")]
+    HookEventMissing { event: String },
+    #[error("hcom hook command not found under event '{event}' (expected: {expected_command})")]
+    HookCommandMissing {
+        event: String,
+        expected_command: String,
+    },
+    #[error("stale hcom hook entry in event '{event}' under unexpected matcher: {matcher:?}")]
+    StaleHcomHookEntry {
+        event: String,
+        matcher: Option<String>,
+    },
+    #[error("hcom.rules file missing: {}", .0.display())]
+    PermissionsRulesMissing(PathBuf),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error("failed to enable Codex experimental hooks feature in {}: {reason}", path.display())]
+    EnsureFeatureFailed { path: PathBuf, reason: String },
+    #[error("failed to read existing {}: {source}", path.display())]
+    HooksReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("JSON serialization failed: {0}")]
+    SerializationFailed(#[from] serde_json::Error),
+    #[error("failed to create parent dir {}: {source}", path.display())]
+    DirCreateFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("atomic write to {} failed: {source}", path.display())]
+    AtomicWriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("post-write verify failed for {}: {reason}", path.display())]
+    PostWriteVerifyFailed {
+        path: PathBuf,
+        #[source]
+        reason: VerifyFailReason,
+    },
+}
+
+pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError> {
     let config_path = get_codex_config_path();
     let hooks_path = get_codex_hooks_path();
 
-    let result: Result<(), String> = (|| {
-        ensure_codex_feature_enabled(&config_path)?;
+    ensure_codex_feature_enabled(&config_path).map_err(|e| SetupError::EnsureFeatureFailed {
+        path: config_path.clone(),
+        reason: e,
+    })?;
 
-        let mut hooks_json = if hooks_path.exists() {
-            serde_json::from_str::<Value>(
-                &std::fs::read_to_string(&hooks_path).map_err(|e| e.to_string())?,
-            )
+    let mut hooks_json = if hooks_path.exists() {
+        let content =
+            std::fs::read_to_string(&hooks_path).map_err(|source| SetupError::HooksReadFailed {
+                path: hooks_path.clone(),
+                source,
+            })?;
+        serde_json::from_str::<Value>(&content)
             .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }))
-        } else {
-            serde_json::json!({ "hooks": {} })
-        };
-        merge_hcom_hooks(&mut hooks_json);
+    } else {
+        serde_json::json!({ "hooks": {} })
+    };
+    merge_hcom_hooks(&mut hooks_json);
 
-        if let Some(parent) = hooks_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let content = serde_json::to_string_pretty(&hooks_json).map_err(|e| e.to_string())?;
-        if !paths::atomic_write(&hooks_path, &content) {
-            return Err("atomic_write failed".to_string());
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = result {
-        log::log_error(
-            "hooks",
-            "codex.setup_error",
-            &format!("Failed to setup Codex hooks: {}", e),
-        );
-        return false;
+    if let Some(parent) = hooks_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| SetupError::DirCreateFailed {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
+    let content =
+        serde_json::to_string_pretty(&hooks_json).map_err(SetupError::SerializationFailed)?;
+    paths::atomic_write_io(&hooks_path, &content).map_err(|source| {
+        SetupError::AtomicWriteFailed {
+            path: hooks_path.clone(),
+            source,
+        }
+    })?;
+
+    verify_hooks_json_at(&hooks_path).map_err(|reason| SetupError::PostWriteVerifyFailed {
+        path: hooks_path.clone(),
+        reason,
+    })?;
 
     let ep_ok = if include_permissions {
         setup_codex_execpolicy()
@@ -827,27 +922,37 @@ pub fn setup_codex_hooks(include_permissions: bool) -> bool {
             "hooks installed but execpolicy write failed; auto-approval will not work",
         );
     }
-    true
+    Ok(())
 }
 
-/// Verify that hcom hooks are correctly installed in Codex config.
+pub fn setup_codex_hooks(include_permissions: bool) -> bool {
+    try_setup_codex_hooks(include_permissions).is_ok()
+}
+
 pub fn verify_codex_hooks_installed(check_permissions: bool) -> bool {
+    verify_codex_hooks_inner(check_permissions).is_ok()
+}
+
+pub(crate) fn verify_codex_hooks_inner(check_permissions: bool) -> Result<(), VerifyFailReason> {
     let config_path = get_codex_config_path();
     let hooks_path = get_codex_hooks_path();
 
-    if !config_path.exists() || !hooks_path.exists() {
-        return false;
+    if !config_path.exists() {
+        return Err(VerifyFailReason::ConfigPathMissing(config_path));
     }
     if !codex_feature_enabled(&config_path) {
-        return false;
+        return Err(VerifyFailReason::CodexFeatureDisabled(config_path));
     }
-    if !hooks_json_has_expected_hooks(&hooks_path) {
-        return false;
+    // No exists() pre-check: verify_hooks_json_at converts NotFound to
+    // HooksPathMissing, avoiding a stat-then-open race.
+    verify_hooks_json_at(&hooks_path)?;
+    if check_permissions {
+        let rules_file = get_codex_rules_path().join("hcom.rules");
+        if !rules_file.exists() {
+            return Err(VerifyFailReason::PermissionsRulesMissing(rules_file));
+        }
     }
-    if check_permissions && !get_codex_rules_path().join("hcom.rules").exists() {
-        return false;
-    }
-    true
+    Ok(())
 }
 
 /// Remove hcom hooks from a single Codex hooks.json + execpolicy at the given base dir.

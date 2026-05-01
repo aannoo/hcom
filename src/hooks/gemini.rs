@@ -1046,18 +1046,86 @@ pub fn ensure_hooks_enabled() -> bool {
     crate::paths::atomic_write(&settings_path, &json_str)
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum VerifyFailReason {
+    #[error("settings.json missing, empty, or not parseable as JSON")]
+    SettingsUnreadableOrEmpty,
+    #[error("neither tools.enableHooks nor legacy enableHooks is true")]
+    EnableHooksMissing,
+    #[error("hooksConfig.enabled is not true")]
+    HooksConfigDisabled,
+    #[error("'hooks' key missing or not an object")]
+    HooksKeyMissing,
+    #[error("hook type '{0}' missing or empty")]
+    HookTypeMissing(String),
+    #[error("hcom hook command '{cmd_suffix}' not found under hook type '{hook_type}'")]
+    HookCommandMissing {
+        hook_type: String,
+        cmd_suffix: String,
+    },
+    #[error("hook type '{0}': hcom entry has 'type' != \"command\"")]
+    HookTypeFieldNotCommand(String),
+    #[error("hook type '{hook_type}' name mismatch: expected {expected:?}, got {actual:?}")]
+    HookNameMismatch {
+        hook_type: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("hook type '{hook_type}' matcher mismatch: expected {expected:?}, got {actual:?}")]
+    HookMatcherMismatch {
+        hook_type: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "hook type '{hook_type}' has no numeric 'timeout' field (canonical): expected a numeric timeout for a canonically-bounded hook"
+    )]
+    HookTimeoutMissing { hook_type: String },
+    #[error("duplicate hcom hook entry for hook type '{0}'")]
+    HookDuplicated(String),
+    #[error("policy file missing: {}", .0.display())]
+    PermissionsPolicyMissing(PathBuf),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error(
+        "Gemini CLI version {}.{}.{} is too old (need >= {}.{}.{})",
+        detected.0, detected.1, detected.2, required.0, required.1, required.2
+    )]
+    VersionUnsupported {
+        detected: (u32, u32, u32),
+        required: (u32, u32, u32),
+    },
+    #[error("JSON serialization failed: {0}")]
+    SerializationFailed(#[from] serde_json::Error),
+    #[error("atomic write to {} failed: {source}", path.display())]
+    AtomicWriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("post-write verify failed for {}: {reason}", path.display())]
+    PostWriteVerifyFailed {
+        path: PathBuf,
+        #[source]
+        reason: VerifyFailReason,
+    },
+}
+
 /// Set up hcom hooks in Gemini settings.json.
 ///
 /// - Removes existing hcom hooks first (clean slate)
 /// - Adds all hooks from GEMINI_HOOK_CONFIGS
 /// - Uses atomic write for safety
-///
-pub fn setup_gemini_hooks(include_permissions: bool) -> bool {
+pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupError> {
     // Guard: block only if version detected AND too old
-    let version = get_gemini_version();
-    if let Some(v) = version {
+    if let Some(v) = get_gemini_version() {
         if v < GEMINI_MIN_VERSION {
-            return false;
+            return Err(SetupError::VersionUnsupported {
+                detected: v,
+                required: GEMINI_MIN_VERSION,
+            });
         }
     }
 
@@ -1137,27 +1205,46 @@ pub fn setup_gemini_hooks(include_permissions: bool) -> bool {
         }
     }
 
-    let json_str = serde_json::to_string_pretty(&Value::Object(settings)).unwrap_or_default();
-    if !crate::paths::atomic_write(&settings_path, &json_str) {
-        return false;
-    }
+    let json_str = serde_json::to_string_pretty(&Value::Object(settings))
+        .map_err(SetupError::SerializationFailed)?;
 
-    verify_gemini_hooks_installed(include_permissions)
+    crate::paths::atomic_write_io(&settings_path, &json_str).map_err(|e| {
+        SetupError::AtomicWriteFailed {
+            path: settings_path.clone(),
+            source: e,
+        }
+    })?;
+
+    // Re-read from disk: catches truncation, FS-layer corruption, and
+    // concurrent overwrite by another process between rename and verify.
+    verify_hooks_at(&settings_path, include_permissions).map_err(|reason| {
+        SetupError::PostWriteVerifyFailed {
+            path: settings_path,
+            reason,
+        }
+    })?;
+
+    Ok(())
 }
 
-/// Verify that hcom hooks are correctly installed in Gemini settings.
-///
-/// Checks enableHooks, hooksConfig.enabled, all hook types present,
-/// correct command, and optionally permissions.
+pub fn setup_gemini_hooks(include_permissions: bool) -> bool {
+    try_setup_gemini_hooks(include_permissions).is_ok()
+}
+
+/// Lenient: ignores hook timeout fields entirely. Timeouts are user-tunable.
+/// Verify hcom hooks are installed in Gemini settings. Every hook must have a
+/// numeric `timeout` field — the value itself is not checked, so user edits
+/// still pass.
 pub fn verify_gemini_hooks_installed(check_permissions: bool) -> bool {
-    verify_hooks_at(&get_gemini_settings_path(), check_permissions)
+    verify_hooks_at(&get_gemini_settings_path(), check_permissions).is_ok()
 }
 
-fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
-    let settings = match load_gemini_settings(settings_path) {
-        Some(s) if !s.is_empty() => s,
-        _ => return false,
-    };
+fn verify_hooks_at(
+    settings_path: &Path,
+    check_permissions: bool,
+) -> Result<(), VerifyFailReason> {
+    let settings =
+        load_gemini_settings(settings_path).ok_or(VerifyFailReason::SettingsUnreadableOrEmpty)?;
 
     // Check tools.enableHooks or legacy enableHooks
     let enable_hooks = settings
@@ -1166,24 +1253,24 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
         .and_then(|v| v.as_bool())
         .or_else(|| settings.get("enableHooks").and_then(|v| v.as_bool()));
     if enable_hooks != Some(true) {
-        return false;
+        return Err(VerifyFailReason::EnableHooksMissing);
     }
 
     // Check hooksConfig.enabled
     if !is_hooks_enabled(&settings) {
-        return false;
+        return Err(VerifyFailReason::HooksConfigDisabled);
     }
 
     // Check all hook types
-    let hooks = match settings.get("hooks").and_then(|v| v.as_object()) {
-        Some(h) => h,
-        None => return false,
-    };
+    let hooks = settings
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .ok_or(VerifyFailReason::HooksKeyMissing)?;
 
-    for &(hook_type, expected_matcher, cmd_suffix, expected_timeout, _) in GEMINI_HOOK_CONFIGS {
+    for &(hook_type, expected_matcher, cmd_suffix, _expected_timeout, _) in GEMINI_HOOK_CONFIGS {
         let hook_matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
             Some(arr) if !arr.is_empty() => arr,
-            _ => return false,
+            _ => return Err(VerifyFailReason::HookTypeMissing(hook_type.to_string())),
         };
 
         let expected_name = format!("hcom-{}", hook_type.to_lowercase());
@@ -1207,26 +1294,45 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
             for hook in matcher_hooks {
                 if is_hcom_hook(hook) {
                     if found {
-                        return false; // Duplicate
+                        return Err(VerifyFailReason::HookDuplicated(hook_type.to_string()));
                     }
                     if actual_matcher != expected_matcher {
-                        return false;
+                        return Err(VerifyFailReason::HookMatcherMismatch {
+                            hook_type: hook_type.to_string(),
+                            expected: expected_matcher.to_string(),
+                            actual: actual_matcher.to_string(),
+                        });
                     }
                     if hook.get("type").and_then(|v| v.as_str()) != Some("command") {
-                        return false;
+                        return Err(VerifyFailReason::HookTypeFieldNotCommand(
+                            hook_type.to_string(),
+                        ));
                     }
-                    if hook.get("name").and_then(|v| v.as_str()) != Some(&expected_name) {
-                        return false;
+                    let actual_name = hook
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if actual_name != expected_name {
+                        return Err(VerifyFailReason::HookNameMismatch {
+                            hook_type: hook_type.to_string(),
+                            expected: expected_name.clone(),
+                            actual: actual_name,
+                        });
                     }
-                    if hook.get("timeout").and_then(|v| v.as_u64()) != Some(expected_timeout as u64)
-                    {
-                        return false;
+                    if hook.get("timeout").and_then(|v| v.as_u64()).is_none() {
+                        return Err(VerifyFailReason::HookTimeoutMissing {
+                            hook_type: hook_type.to_string(),
+                        });
                     }
                     let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
                     let has_hcom = command.contains("${HCOM}")
                         || command.to_ascii_lowercase().contains("hcom");
                     if !has_hcom || !command.contains(cmd_suffix) {
-                        return false;
+                        return Err(VerifyFailReason::HookCommandMissing {
+                            hook_type: hook_type.to_string(),
+                            cmd_suffix: cmd_suffix.to_string(),
+                        });
                     }
                     found = true;
                 }
@@ -1234,7 +1340,10 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
         }
 
         if !found {
-            return false;
+            return Err(VerifyFailReason::HookCommandMissing {
+                hook_type: hook_type.to_string(),
+                cmd_suffix: cmd_suffix.to_string(),
+            });
         }
     }
 
@@ -1242,11 +1351,11 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
     if check_permissions {
         let policy_file = get_gemini_policies_path().join("hcom.toml");
         if !policy_file.exists() {
-            return false;
+            return Err(VerifyFailReason::PermissionsPolicyMissing(policy_file));
         }
     }
 
-    true
+    Ok(())
 }
 
 /// Remove hcom hooks from Gemini settings (global + local).
@@ -1288,13 +1397,12 @@ pub fn remove_gemini_hooks() -> bool {
         Some(ref p) if *p != global_policies => remove_policy_from_path(p),
         _ => true,
     };
-    let local_policy_ok = if local_policies != global_policies
-        && Some(&local_policies) != env_policies.as_ref()
-    {
-        remove_policy_from_path(&local_policies)
-    } else {
-        true
-    };
+    let local_policy_ok =
+        if local_policies != global_policies && Some(&local_policies) != env_policies.as_ref() {
+            remove_policy_from_path(&local_policies)
+        } else {
+            true
+        };
 
     global_ok && env_ok && local_ok && global_policy_ok && env_policy_ok && local_policy_ok
 }
@@ -1855,7 +1963,7 @@ mod tests {
         // Remove hooks
         let remove_ok = remove_hooks_from_path(&settings_path);
         assert!(remove_ok);
-        let verify_after_remove = verify_hooks_at(&settings_path, false);
+        let verify_after_remove = verify_hooks_at(&settings_path, false).is_ok();
         assert!(!verify_after_remove, "verify should fail after remove");
 
         // Restore
@@ -2307,7 +2415,7 @@ mod tests {
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .unwrap();
-        assert!(!verify_hooks_at(&settings_path, false));
+        assert!(verify_hooks_at(&settings_path, false).is_err());
 
         // Set hooksConfig.enabled to false → verify should fail
         settings["hooksConfig"]["enabled"] = Value::Bool(false);
@@ -2316,7 +2424,7 @@ mod tests {
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .unwrap();
-        assert!(!verify_hooks_at(&settings_path, false));
+        assert!(verify_hooks_at(&settings_path, false).is_err());
 
         drop(_guard);
     }
@@ -2338,7 +2446,97 @@ mod tests {
         )
         .unwrap();
 
-        assert!(verify_hooks_at(&settings_path, false));
+        assert!(verify_hooks_at(&settings_path, false).is_ok());
+
+        drop(_guard);
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_accepts_timeout_value_edit() {
+        let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
+
+        assert!(setup_gemini_hooks(false));
+
+        let mut settings = read_json(&settings_path);
+        for &(hook_type, _, _, _, _) in GEMINI_HOOK_CONFIGS {
+            if let Some(arr) = settings["hooks"][hook_type].as_array_mut() {
+                for matcher_obj in arr {
+                    if let Some(hooks) = matcher_obj["hooks"].as_array_mut() {
+                        for hook in hooks {
+                            hook["timeout"] = serde_json::json!(10);
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(verify_gemini_hooks_installed(false));
+
+        drop(_guard);
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_catches_timeout_field_dropped() {
+        let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
+
+        assert!(setup_gemini_hooks(false));
+
+        let mut settings = read_json(&settings_path);
+        for &(hook_type, _, _, _, _) in GEMINI_HOOK_CONFIGS {
+            if let Some(arr) = settings["hooks"][hook_type].as_array_mut() {
+                for matcher_obj in arr {
+                    if let Some(hooks) = matcher_obj["hooks"].as_array_mut() {
+                        for hook in hooks {
+                            hook.as_object_mut().unwrap().remove("timeout");
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!verify_gemini_hooks_installed(false));
+
+        drop(_guard);
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_rejects_non_numeric_timeout() {
+        let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
+
+        assert!(setup_gemini_hooks(false));
+
+        let mut settings = read_json(&settings_path);
+        for &(hook_type, _, _, _, _) in GEMINI_HOOK_CONFIGS {
+            if let Some(arr) = settings["hooks"][hook_type].as_array_mut() {
+                for matcher_obj in arr {
+                    if let Some(hooks) = matcher_obj["hooks"].as_array_mut() {
+                        for hook in hooks {
+                            hook["timeout"] = serde_json::json!("5000");
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!verify_gemini_hooks_installed(false));
 
         drop(_guard);
     }

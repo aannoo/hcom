@@ -2135,8 +2135,7 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
                 let non_hcom_hooks: Vec<&Value> = hooks_field
                     .iter()
                     .filter(|hook| {
-                        let command =
-                            hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         !is_hcom_hook_command(command)
                     })
                     .collect();
@@ -2197,6 +2196,57 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
     removed_any
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum VerifyFailReason {
+    #[error("settings.json missing or not parseable as JSON")]
+    SettingsUnreadable,
+    #[error("'hooks' key missing or not an object")]
+    HooksKeyMissing,
+    #[error("hook type '{0}' missing or empty")]
+    HookTypeMissing(String),
+    #[error("hcom hook command '{cmd_suffix}' not found under hook type '{hook_type}'")]
+    HookCommandMissing {
+        hook_type: String,
+        cmd_suffix: String,
+    },
+    #[error("hook type '{hook_type}' matcher mismatch: expected {expected:?}, got {actual:?}")]
+    HookMatcherMismatch {
+        hook_type: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "hook type '{hook_type}' has no numeric 'timeout' field (canonical): expected a numeric timeout for a canonically-bounded hook"
+    )]
+    HookTimeoutMissing { hook_type: String },
+    #[error("duplicate hcom hook entry for hook type '{0}'")]
+    HookDuplicated(String),
+    #[error("HCOM env var not set in settings.json")]
+    HcomEnvMissing,
+    #[error("'permissions.allow' missing or not an array")]
+    PermissionsAllowMissing,
+    #[error("required permission pattern not present: {0}")]
+    PermissionMissing(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error("JSON serialization failed: {0}")]
+    SerializationFailed(#[from] serde_json::Error),
+    #[error("atomic write to {} failed: {source}", path.display())]
+    AtomicWriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("post-write verify failed for {}: {reason}", path.display())]
+    PostWriteVerifyFailed {
+        path: PathBuf,
+        #[source]
+        reason: VerifyFailReason,
+    },
+}
+
 /// Set up hcom hooks in Claude settings.json.
 ///
 /// - Removes existing hcom hooks first (clean slate)
@@ -2204,9 +2254,7 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
 /// - Sets HCOM environment variable
 /// - Optionally adds permission patterns
 /// - Uses atomic write for concurrent safety
-///
-/// Returns true on success.
-pub fn setup_claude_hooks(include_permissions: bool) -> bool {
+pub fn try_setup_claude_hooks(include_permissions: bool) -> Result<(), SetupError> {
     let settings_path = get_claude_settings_path();
     if let Some(parent) = settings_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -2305,45 +2353,60 @@ pub fn setup_claude_hooks(include_permissions: bool) -> bool {
         }
     }
 
-    // Write settings atomically
-    let json_str = match serde_json::to_string_pretty(&settings) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    let json_str =
+        serde_json::to_string_pretty(&settings).map_err(SetupError::SerializationFailed)?;
 
-    if !paths::atomic_write(&settings_path, &json_str) {
-        return false;
-    }
+    paths::atomic_write_io(&settings_path, &json_str).map_err(|e| {
+        SetupError::AtomicWriteFailed {
+            path: settings_path.clone(),
+            source: e,
+        }
+    })?;
 
-    // Quick verification
-    verify_claude_hooks_installed(Some(&settings_path), include_permissions)
+    // Re-read from disk: catches truncation, FS-layer corruption, and
+    // concurrent overwrite by another process between rename and verify.
+    verify_claude_hooks_inner(Some(&settings_path), include_permissions).map_err(|reason| {
+        SetupError::PostWriteVerifyFailed {
+            path: settings_path,
+            reason,
+        }
+    })?;
+
+    Ok(())
 }
 
-/// Verify that hcom hooks are correctly installed in Claude settings.
-///
-/// Checks all hook types exist with correct commands, timeouts, and matchers.
-/// Checks HCOM env var is set. Optionally checks permissions.
+pub fn setup_claude_hooks(include_permissions: bool) -> bool {
+    try_setup_claude_hooks(include_permissions).is_ok()
+}
+
+/// Verify hcom hooks are installed in Claude settings. Every hook that
+/// carries a timeout in `CLAUDE_HOOK_CONFIGS` must have a numeric `timeout`
+/// field — the value itself is not checked, so user edits still pass.
 pub fn verify_claude_hooks_installed(
     settings_path: Option<&Path>,
     check_permissions: bool,
 ) -> bool {
+    verify_claude_hooks_inner(settings_path, check_permissions).is_ok()
+}
+
+fn verify_claude_hooks_inner(
+    settings_path: Option<&Path>,
+    check_permissions: bool,
+) -> Result<(), VerifyFailReason> {
     let default_path = get_claude_settings_path();
     let path = settings_path.unwrap_or(&default_path);
 
-    let settings = match load_claude_settings(path) {
-        Some(s) => s,
-        None => return false,
-    };
+    let settings = load_claude_settings(path).ok_or(VerifyFailReason::SettingsUnreadable)?;
 
-    let hooks = match settings.get("hooks").and_then(|v| v.as_object()) {
-        Some(h) => h,
-        None => return false,
-    };
+    let hooks = settings
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .ok_or(VerifyFailReason::HooksKeyMissing)?;
 
     for &(hook_type, expected_matcher, cmd_suffix, expected_timeout) in CLAUDE_HOOK_CONFIGS {
         let hook_matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
             Some(a) if !a.is_empty() => a,
-            _ => return false,
+            _ => return Err(VerifyFailReason::HookTypeMissing(hook_type.to_string())),
         };
 
         let mut hcom_hook_found = false;
@@ -2363,23 +2426,27 @@ pub fn verify_claude_hooks_installed(
                     command.contains("${HCOM}") || command.to_lowercase().contains("hcom");
                 if has_hcom && command.contains(cmd_suffix) {
                     if hcom_hook_found {
-                        // Duplicate hcom hook
-                        return false;
+                        return Err(VerifyFailReason::HookDuplicated(hook_type.to_string()));
                     }
 
-                    // Verify timeout
-                    let actual_timeout = hook.get("timeout").and_then(|v| v.as_u64());
-                    if actual_timeout != expected_timeout {
-                        return false;
+                    if expected_timeout.is_some()
+                        && hook.get("timeout").and_then(|v| v.as_u64()).is_none()
+                    {
+                        return Err(VerifyFailReason::HookTimeoutMissing {
+                            hook_type: hook_type.to_string(),
+                        });
                     }
 
-                    // Verify matcher
                     let actual_matcher = matcher_obj
                         .get("matcher")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if actual_matcher != expected_matcher {
-                        return false;
+                        return Err(VerifyFailReason::HookMatcherMismatch {
+                            hook_type: hook_type.to_string(),
+                            expected: expected_matcher.to_string(),
+                            actual: actual_matcher.to_string(),
+                        });
                     }
 
                     hcom_hook_found = true;
@@ -2388,33 +2455,31 @@ pub fn verify_claude_hooks_installed(
         }
 
         if !hcom_hook_found {
-            return false;
+            return Err(VerifyFailReason::HookCommandMissing {
+                hook_type: hook_type.to_string(),
+                cmd_suffix: cmd_suffix.to_string(),
+            });
         }
     }
 
-    // Check HCOM env var
     if settings.get("env").and_then(|v| v.get("HCOM")).is_none() {
-        return false;
+        return Err(VerifyFailReason::HcomEnvMissing);
     }
 
-    // Check permissions
     if check_permissions {
         let allow = settings
             .get("permissions")
             .and_then(|v| v.get("allow"))
-            .and_then(|v| v.as_array());
-        let allow = match allow {
-            Some(a) => a,
-            None => return false,
-        };
+            .and_then(|v| v.as_array())
+            .ok_or(VerifyFailReason::PermissionsAllowMissing)?;
         for pattern in build_claude_permissions() {
             if !allow.iter().any(|p| p.as_str() == Some(&pattern)) {
-                return false;
+                return Err(VerifyFailReason::PermissionMissing(pattern));
             }
         }
     }
 
-    true
+    Ok(())
 }
 
 /// Remove hcom hooks from a specific settings path. Returns true on success.
@@ -2840,6 +2905,139 @@ mod tests {
         std::fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
 
         assert!(!verify_claude_hooks_installed(Some(&settings_path), false,));
+    }
+
+    fn write_settings_with_mutated_timeout(
+        settings_path: &Path,
+        new_timeout: Option<u64>,
+        include_permissions: bool,
+    ) {
+        let hook_cmd = "${HCOM}";
+        let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
+
+        for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
+            let mut hook_entry = serde_json::json!({
+                "type": "command",
+                "command": format!("{} {}", hook_cmd, cmd_suffix),
+            });
+            if timeout.is_some() {
+                if let Some(t) = new_timeout {
+                    hook_entry["timeout"] = serde_json::json!(t);
+                }
+            }
+            let mut hook_dict = serde_json::json!({"hooks": [hook_entry]});
+            if !matcher.is_empty() {
+                hook_dict["matcher"] = Value::String(matcher.to_string());
+            }
+            settings["hooks"][hook_type] = serde_json::json!([hook_dict]);
+        }
+
+        if include_permissions {
+            settings["permissions"] = serde_json::json!({"allow": build_claude_permissions()});
+        }
+
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let json_str = serde_json::to_string_pretty(&settings).unwrap();
+        std::fs::write(settings_path, &json_str).unwrap();
+    }
+
+    #[test]
+    fn test_verify_accepts_timeout_value_edit() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        // External edit: timeouts rewritten to 10 across all entries that
+        // originally carried a timeout. Numeric value edits stay accepted —
+        // only presence + numeric type are checked.
+        write_settings_with_mutated_timeout(&settings_path, Some(10), false);
+        assert!(verify_claude_hooks_installed(Some(&settings_path), false));
+    }
+
+    #[test]
+    fn test_verify_catches_timeout_field_dropped() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        write_settings_with_mutated_timeout(&settings_path, None, false);
+        assert!(!verify_claude_hooks_installed(Some(&settings_path), false));
+    }
+
+    #[test]
+    fn test_verify_rejects_non_numeric_timeout() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        write_settings_with_mutated_timeout(&settings_path, Some(86400), false);
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for &(hook_type, _, _, expected_timeout) in CLAUDE_HOOK_CONFIGS {
+            if expected_timeout.is_none() {
+                continue;
+            }
+            if let Some(arr) = settings["hooks"][hook_type].as_array_mut() {
+                for matcher_obj in arr {
+                    if let Some(hooks) = matcher_obj["hooks"].as_array_mut() {
+                        for hook in hooks {
+                            if hook.get("timeout").is_some() {
+                                hook["timeout"] = serde_json::json!("86400");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!verify_claude_hooks_installed(Some(&settings_path), false));
+    }
+
+    #[test]
+    fn test_verify_rejects_missing_env() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        write_settings_with_mutated_timeout(&settings_path, None, false);
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        settings.as_object_mut().unwrap().remove("env");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!verify_claude_hooks_installed(Some(&settings_path), false));
+    }
+
+    #[test]
+    fn test_verify_rejects_missing_command() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        write_settings_with_mutated_timeout(&settings_path, None, false);
+        // Strip the hcom command from one required hook (PostToolUse) to
+        // simulate a partial install / external removal.
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        if let Some(post) = settings["hooks"]["PostToolUse"].as_array_mut() {
+            post.clear();
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!verify_claude_hooks_installed(Some(&settings_path), false));
     }
 
     #[test]

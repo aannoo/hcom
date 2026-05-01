@@ -13,7 +13,9 @@ use crate::instances;
 #[cfg(test)]
 use crate::shared::SenderIdentity;
 use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
-use crate::shared::{CommandContext, ST_ACTIVE, ST_INACTIVE, SenderKind, status_fg, status_icon};
+use crate::shared::{
+    CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind, status_fg, status_icon,
+};
 
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
@@ -35,22 +37,19 @@ pub fn build_ctx_for_command(
     go: bool,
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
-) -> Result<CommandContext, String> {
+) -> Result<CommandContext, HcomError> {
     let identity = if let Some(name) = explicit_name {
         if cmd != Some("start") {
-            // Explicit --name: propagate errors
-            Some(
-                identity::resolve_identity(
-                    db,
-                    Some(name),
-                    None,
-                    None,
-                    process_id,
-                    codex_thread_id,
-                    None,
-                )
-                .map_err(|e| e.to_string())?,
-            )
+            // Explicit --name: propagate typed error so router can pattern-match.
+            Some(identity::resolve_identity(
+                db,
+                Some(name),
+                None,
+                None,
+                process_id,
+                codex_thread_id,
+                None,
+            )?)
         } else {
             None
         }

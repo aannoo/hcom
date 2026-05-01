@@ -261,7 +261,13 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
     };
 
     // Flip to active + emit life event so TUI/watchers see the state change.
-    lifecycle::set_status(db, &subagent_name, ST_ACTIVE, "tool:start", Default::default());
+    lifecycle::set_status(
+        db,
+        &subagent_name,
+        ST_ACTIVE,
+        "tool:start",
+        Default::default(),
+    );
 
     // Capture launch context (process binding etc.)
     instance_binding::capture_and_store_launch_context(db, &subagent_name);
