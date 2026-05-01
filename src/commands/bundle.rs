@@ -1538,7 +1538,10 @@ mod tests {
             .unwrap();
 
         let (path, tool, sid) = lookup_bundle_transcript_source(&db, "huno");
-        assert_eq!(path.as_deref(), Some(transcript_path.to_string_lossy().as_ref()));
+        assert_eq!(
+            path.as_deref(),
+            Some(transcript_path.to_string_lossy().as_ref())
+        );
         assert_eq!(tool, "claude");
         assert_eq!(sid.as_deref(), Some("sess-123"));
 

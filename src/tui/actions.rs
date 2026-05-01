@@ -86,10 +86,7 @@ impl App {
         // Edge-trigger the "relay connected" 5-second flash on not-Connected
         // → Connected. Tracks against the derived RelayHealth, not raw KV, so
         // the flash semantics match what the indicator actually shows.
-        let now_connected = matches!(
-            new_data.relay_health,
-            crate::relay::RelayHealth::Connected
-        );
+        let now_connected = matches!(new_data.relay_health, crate::relay::RelayHealth::Connected);
         if now_connected && !self.ui.last_relay_was_connected {
             self.ui.relay_text_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(5));

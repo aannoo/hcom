@@ -1239,10 +1239,7 @@ pub fn verify_gemini_hooks_installed(check_permissions: bool) -> bool {
     verify_hooks_at(&get_gemini_settings_path(), check_permissions).is_ok()
 }
 
-fn verify_hooks_at(
-    settings_path: &Path,
-    check_permissions: bool,
-) -> Result<(), VerifyFailReason> {
+fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> Result<(), VerifyFailReason> {
     let settings =
         load_gemini_settings(settings_path).ok_or(VerifyFailReason::SettingsUnreadableOrEmpty)?;
 

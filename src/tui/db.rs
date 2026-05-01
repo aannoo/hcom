@@ -1089,7 +1089,6 @@ fn read_relay_config_flags() -> (bool, bool) {
     (true, enabled)
 }
 
-
 /// Read a non-empty string value from the kv table. Returns None if missing or empty.
 fn kv_get(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row("SELECT value FROM kv WHERE key = ?", params![key], |row| {
@@ -1105,7 +1104,11 @@ fn kv_get(conn: &Connection, key: &str) -> Option<String> {
 /// locally rather than threading those types through every snapshot call.
 /// `configured` and `enabled` are passed in so the caller can read config.toml
 /// once per snapshot rather than us re-reading it here.
-fn load_relay_state(conn: &Connection, configured: bool, enabled: bool) -> crate::relay::RelayHealth {
+fn load_relay_state(
+    conn: &Connection,
+    configured: bool,
+    enabled: bool,
+) -> crate::relay::RelayHealth {
     let raw_status = kv_get(conn, "relay_status");
     let raw_error = kv_get(conn, "relay_last_error");
     let heartbeat_age_s = kv_get(conn, crate::relay::HEARTBEAT_KEY)

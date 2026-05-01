@@ -428,8 +428,9 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
             if err.code == rusqlite::ErrorCode::ConstraintViolation =>
         {
             let retry = format!("{pattern}{}", max_n + 2);
-            do_insert(&retry)
-                .map_err(|e| anyhow::anyhow!("Failed to create unique subagent name after retry: {e}"))?;
+            do_insert(&retry).map_err(|e| {
+                anyhow::anyhow!("Failed to create unique subagent name after retry: {e}")
+            })?;
             Ok(retry)
         }
         Err(e) => Err(anyhow::anyhow!("Failed to insert subagent instance: {e}")),

@@ -253,8 +253,7 @@ fn resolve_name_to_plan(
                     }
                     // Stale binding: fall through to events.
                 }
-                if let Ok(Some(instance_name)) =
-                    db.find_stopped_instance_by_session_id(&session_id)
+                if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id)
                 {
                     current = instance_name;
                     continue;
@@ -295,39 +294,47 @@ fn prepare_resume_plan_from_source(
 
     // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, display_name)
     // from either the DB (instance) or the on-disk transcript (adoption).
-    let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir, display_name) =
-        match source {
-            ResumeSource::Instance { name } => {
-                if !fork {
-                    if let Ok(Some(_)) = db.get_instance_full(name) {
-                        bail!("'{}' is still active — run hcom kill {} first", name, name);
-                    }
+    let (
+        tool,
+        session_id,
+        launch_args_str,
+        tag,
+        background,
+        last_event_id,
+        snapshot_dir,
+        display_name,
+    ) = match source {
+        ResumeSource::Instance { name } => {
+            if !fork {
+                if let Ok(Some(_)) = db.get_instance_full(name) {
+                    bail!("'{}' is still active — run hcom kill {} first", name, name);
                 }
-                let (tool, sid, largs, tag, bg, leid, snap) = if fork {
-                    load_instance_data(db, name)?
-                } else {
-                    load_stopped_snapshot(db, name)?
-                };
-                (tool, sid, largs, tag, bg, leid, snap, name.to_string())
             }
-            ResumeSource::Disk {
-                session_id,
+            let (tool, sid, largs, tag, bg, leid, snap) = if fork {
+                load_instance_data(db, name)?
+            } else {
+                load_stopped_snapshot(db, name)?
+            };
+            (tool, sid, largs, tag, bg, leid, snap, name.to_string())
+        }
+        ResumeSource::Disk {
+            session_id,
+            tool,
+            cwd_hint,
+        } => {
+            let display = session_id.clone();
+            (
                 tool,
-                cwd_hint,
-            } => {
-                let display = session_id.clone();
-                (
-                    tool,
-                    session_id,
-                    String::new(),
-                    String::new(),
-                    false,
-                    0,
-                    cwd_hint.unwrap_or_default(),
-                    display,
-                )
-            }
-        };
+                session_id,
+                String::new(),
+                String::new(),
+                false,
+                0,
+                cwd_hint.unwrap_or_default(),
+                display,
+            )
+        }
+    };
 
     if session_id.is_empty() {
         bail!(
@@ -1163,9 +1170,7 @@ fn is_session_id(s: &str) -> bool {
 /// Opencode session IDs are `ses_` followed by 26 hex+base62 chars
 /// (see opencode/packages/opencode/src/id/id.ts).
 fn is_opencode_session_id(s: &str) -> bool {
-    s.starts_with("ses_")
-        && s.len() >= 8
-        && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
+    s.starts_with("ses_") && s.len() >= 8 && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Locate opencode's data dir. Opencode itself follows XDG on every platform
@@ -1800,7 +1805,9 @@ mod tests {
                 when: "2026-02-01T00:00:00Z".to_string(),
             },
         ];
-        let err = resolve_one_match("Claude", "dup", multi).unwrap_err().to_string();
+        let err = resolve_one_match("Claude", "dup", multi)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("matches 2 Claude sessions"), "got: {err}");
         assert!(err.contains("sid-a") && err.contains("sid-b"), "got: {err}");
         assert!(err.contains("UUID directly"), "got: {err}");
@@ -1879,7 +1886,10 @@ mod tests {
 
         let err = res.unwrap_err().to_string();
         assert!(err.contains("matches 2 Claude sessions"), "got: {err}");
-        assert!(err.contains("sess-aaaa") && err.contains("sess-bbbb"), "got: {err}");
+        assert!(
+            err.contains("sess-aaaa") && err.contains("sess-bbbb"),
+            "got: {err}"
+        );
         std::fs::remove_dir_all(&cfg).ok();
     }
 
@@ -1923,7 +1933,10 @@ mod tests {
             err.contains("Session ses_nonexistentfakesession12345 not found"),
             "expected adoption error, got: {err}"
         );
-        assert!(err.contains("Opencode"), "error should mention opencode: {err}");
+        assert!(
+            err.contains("Opencode"),
+            "error should mention opencode: {err}"
+        );
     }
 
     #[test]

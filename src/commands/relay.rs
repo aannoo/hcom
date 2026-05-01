@@ -164,7 +164,11 @@ fn relay_status(db: &HcomDb) -> i32 {
         relay::RelayHealth::Waiting => {
             println!("Status:    {FG_YELLOW}waiting{RESET} (daemon may not be running)");
         }
-        relay::RelayHealth::Error { reason, detail, pid } => {
+        relay::RelayHealth::Error {
+            reason,
+            detail,
+            pid,
+        } => {
             println!(
                 "Status:    {FG_RED}error{RESET} — {}",
                 reason.clone().label(detail.as_deref(), *pid)

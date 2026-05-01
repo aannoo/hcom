@@ -134,8 +134,8 @@ impl MqttRelay {
         let psk = load_psk(config)?;
 
         let relay_id = config.relay_id.clone();
-        let device_uuid = read_device_uuid()
-            .ok_or_else(|| "failed to create device_id file".to_string())?;
+        let device_uuid =
+            read_device_uuid().ok_or_else(|| "failed to create device_id file".to_string())?;
         let client_id = format!("hcom-{}", super::device_id_prefix(&device_uuid));
 
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
@@ -358,10 +358,7 @@ impl MqttRelay {
                             log::log_warn(
                                 "relay",
                                 "relay.disconnected",
-                                &format!(
-                                    "{} (consecutive={})",
-                                    err_msg, consecutive_errors
-                                ),
+                                &format!("{} (consecutive={})", err_msg, consecutive_errors),
                             );
                         }
 
@@ -401,9 +398,8 @@ impl MqttRelay {
 
             if trigger_push {
                 let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
-                pending_push_at = Some(
-                    pending_push_at.map_or(next_push, |existing| existing.min(next_push)),
-                );
+                pending_push_at =
+                    Some(pending_push_at.map_or(next_push, |existing| existing.min(next_push)));
             }
 
             // Phase 2: if nothing was drained, do one blocking poll
@@ -416,9 +412,8 @@ impl MqttRelay {
                         if self.handle_event(event, &mut connected) {
                             let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
                             pending_push_at = Some(
-                                pending_push_at.map_or(next_push, |existing| {
-                                    existing.min(next_push)
-                                }),
+                                pending_push_at
+                                    .map_or(next_push, |existing| existing.min(next_push)),
                             );
                         }
                     }
@@ -431,10 +426,7 @@ impl MqttRelay {
                             log::log_warn(
                                 "relay",
                                 "relay.disconnected",
-                                &format!(
-                                    "{} (consecutive={})",
-                                    err_msg, consecutive_errors
-                                ),
+                                &format!("{} (consecutive={})", err_msg, consecutive_errors),
                             );
                         }
 

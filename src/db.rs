@@ -1723,10 +1723,7 @@ impl HcomDb {
     /// session_id. life.stopped events are the source of truth: they persist
     /// across the `session_bindings` cascade, so they're the right thing to
     /// consult when reclaiming hcom identity by UUID after stop/kill.
-    pub fn find_stopped_instance_by_session_id(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn find_stopped_instance_by_session_id(&self, session_id: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
                 "SELECT instance FROM events
@@ -4746,8 +4743,14 @@ mod tests {
             .ok();
         assert!(row.is_some(), "on-hit message should be logged");
         let (kind, text) = row.unwrap();
-        assert_eq!(kind, "instance", "caller 'luna' is an instance → sender_kind=instance");
-        assert_eq!(text, "starting review now", "on-hit text sent verbatim, no @-prefix");
+        assert_eq!(
+            kind, "instance",
+            "caller 'luna' is an instance → sender_kind=instance"
+        );
+        assert_eq!(
+            text, "starting review now",
+            "on-hit text sent verbatim, no @-prefix"
+        );
 
         cleanup_test_db(db_path);
     }
@@ -4808,12 +4811,24 @@ mod tests {
                 },
             )
             .ok();
-        assert!(row.is_some(), "on-hit message from bigboss should be logged");
+        assert!(
+            row.is_some(),
+            "on-hit message from bigboss should be logged"
+        );
         let (kind, scope, delivered) = row.unwrap();
-        assert_eq!(kind, "external", "non-instance caller → sender_kind=external");
+        assert_eq!(
+            kind, "external",
+            "non-instance caller → sender_kind=external"
+        );
         assert_eq!(scope, "mentions", "text contains @mention → mentions scope");
-        assert!(delivered.contains("dbadmin"), "delivered_to must include dbadmin");
-        assert!(!delivered.contains("bigboss"), "caller itself is not auto-mentioned");
+        assert!(
+            delivered.contains("dbadmin"),
+            "delivered_to must include dbadmin"
+        );
+        assert!(
+            !delivered.contains("bigboss"),
+            "caller itself is not auto-mentioned"
+        );
 
         cleanup_test_db(db_path);
     }
@@ -4988,7 +5003,10 @@ mod tests {
             .ok();
         assert!(row.is_some(), "on-hit message should still be logged");
         let (scope, delivered) = row.unwrap();
-        assert_eq!(scope, "mentions", "unmatched @ still produces mentions scope");
+        assert_eq!(
+            scope, "mentions",
+            "unmatched @ still produces mentions scope"
+        );
         assert_eq!(delivered, "[]", "nobody matched → empty delivered_to");
 
         cleanup_test_db(db_path);

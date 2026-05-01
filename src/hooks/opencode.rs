@@ -10,8 +10,8 @@ use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log::{log_error, log_info};
-use crate::shared::context::HcomContext;
 use crate::shared::ST_LISTENING;
+use crate::shared::context::HcomContext;
 
 use super::common;
 use super::common::finalize_session;

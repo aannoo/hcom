@@ -340,10 +340,7 @@ pub fn dispatch_remote_and_print(
 ) -> i32 {
     match dispatch_remote(db, device_short_id, target_name, action, params, timeout) {
         Ok(inner) => {
-            println!(
-                "{}",
-                inner[result_key].as_str().unwrap_or(fallback_msg)
-            );
+            println!("{}", inner[result_key].as_str().unwrap_or(fallback_msg));
             0
         }
         Err(e) => {
@@ -962,8 +959,9 @@ fn handle_remote_events(
     _config: &HcomConfig,
 ) -> Result<Value, String> {
     let filters: crate::core::filters::FilterMap = match params.get("filters") {
-        Some(v) if !v.is_null() => serde_json::from_value(v.clone())
-            .map_err(|e| format!("invalid filters param: {e}"))?,
+        Some(v) if !v.is_null() => {
+            serde_json::from_value(v.clone()).map_err(|e| format!("invalid filters param: {e}"))?
+        }
         _ => crate::core::filters::FilterMap::new(),
     };
     let sql = optional_param(params, "sql").map(|s| s.to_string());
@@ -1082,8 +1080,9 @@ fn handle_remote_sub_create(
     };
 
     let mut filters: crate::core::filters::FilterMap = match params.get("filters") {
-        Some(v) if !v.is_null() => serde_json::from_value(v.clone())
-            .map_err(|e| format!("invalid filters param: {e}"))?,
+        Some(v) if !v.is_null() => {
+            serde_json::from_value(v.clone()).map_err(|e| format!("invalid filters param: {e}"))?
+        }
         _ => crate::core::filters::FilterMap::new(),
     };
     // Resolve display/tag names against the remote (local-to-handler) instances table.
@@ -1634,7 +1633,10 @@ mod tests {
             err.starts_with("device WXYZ does not advertise remote action 'resume'"),
             "unexpected err: {err}"
         );
-        assert!(err.contains("hcom relay off"), "missing restart hint: {err}");
+        assert!(
+            err.contains("hcom relay off"),
+            "missing restart hint: {err}"
+        );
     }
 
     #[test]
@@ -1788,8 +1790,8 @@ mod tests {
     fn test_handle_remote_events_empty_filters_returns_all() {
         let db = test_db();
         seed_events(&db, 5);
-        let out = handle_remote_events(&db, &json!({}), "initiator", &HcomConfig::default())
-            .unwrap();
+        let out =
+            handle_remote_events(&db, &json!({}), "initiator", &HcomConfig::default()).unwrap();
         assert_eq!(out["count"].as_u64().unwrap(), 5);
         let events = out["events"].as_array().unwrap();
         assert_eq!(events.len(), 5);
@@ -1855,7 +1857,8 @@ mod tests {
         // Big payload per event so a few rows blow past the 96 KiB cap.
         let big = "x".repeat(8_000);
         for _ in 0..20 {
-            db.log_event("message", "luna", &json!({"blob": big})).unwrap();
+            db.log_event("message", "luna", &json!({"blob": big}))
+                .unwrap();
         }
         let input_count = 20usize;
         let out = handle_remote_events(
@@ -1867,9 +1870,15 @@ mod tests {
         .unwrap();
         assert_eq!(out["truncated"].as_bool(), Some(true));
         let returned = out["events"].as_array().unwrap().len();
-        assert!(returned < input_count, "expected truncation, got {returned}");
+        assert!(
+            returned < input_count,
+            "expected truncation, got {returned}"
+        );
         let envelope_len = serde_json::to_string(&out).unwrap().len();
-        assert!(envelope_len <= REMOTE_EVENTS_BYTE_CAP, "envelope {envelope_len} bytes exceeds cap");
+        assert!(
+            envelope_len <= REMOTE_EVENTS_BYTE_CAP,
+            "envelope {envelope_len} bytes exceeds cap"
+        );
     }
 
     #[test]

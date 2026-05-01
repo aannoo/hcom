@@ -204,9 +204,7 @@ impl TranscriptWatcher {
                 &format!("Failed to log file edit: {}", e),
             );
         }
-
     }
-
 }
 
 /// Run transcript watcher loop in a thread

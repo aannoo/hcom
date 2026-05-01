@@ -909,10 +909,7 @@ mod tests {
         t.process(format!("{}\r\n", top).as_bytes());
         t.process(b" > injected text\r\n");
         t.process(format!("{}\r\n", bottom).as_bytes());
-        assert_eq!(
-            t.get_gemini_input_text(),
-            Some("injected text".to_string())
-        );
+        assert_eq!(t.get_gemini_input_text(), Some("injected text".to_string()));
     }
 
     #[test]
@@ -1022,16 +1019,24 @@ mod tests {
         // *bottom-most* match (the real input box), not the first one.
         let mut t = make_tracker(30, 69, "? for shortcuts");
         // Stale output with ❯ between ─ lines
-        t.process("─────    Finished `dev` profile [unoptimized + debuginfo] target   ──\r\n".as_bytes());
+        t.process(
+            "─────    Finished `dev` profile [unoptimized + debuginfo] target   ──\r\n".as_bytes(),
+        );
         t.process("❯    (s) in 1.36s\r\n".as_bytes());
-        t.process(" ─   Stale entry added, SessionStart groups: 3───────────────────────\r\n".as_bytes());
+        t.process(
+            " ─   Stale entry added, SessionStart groups: 3───────────────────────\r\n".as_bytes(),
+        );
         // Some output in between
         t.process("Some other output\r\n".as_bytes());
         t.process("\r\n".as_bytes());
         // Real input box at the bottom
-        t.process("─────────────────────────────────────────────────────────────────────\r\n".as_bytes());
+        t.process(
+            "─────────────────────────────────────────────────────────────────────\r\n".as_bytes(),
+        );
         t.process("❯\r\n".as_bytes());
-        t.process("─────────────────────────────────────────────────────────────────────\r\n".as_bytes());
+        t.process(
+            "─────────────────────────────────────────────────────────────────────\r\n".as_bytes(),
+        );
         // Real prompt is empty — parser should find this, not the stale one
         assert_eq!(t.get_claude_input_text(), Some(String::new()));
     }

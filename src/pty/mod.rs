@@ -545,7 +545,12 @@ impl Proxy {
         let child = unsafe {
             Command::new(command)
                 .args(args)
-                .envs(config.env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .envs(
+                    config
+                        .env_vars
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str())),
+                )
                 .pre_exec(move || {
                     // Create new session
                     if libc::setsid() == -1 {
@@ -734,9 +739,7 @@ impl Proxy {
             let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_raw) };
             let inject_listener_fd = unsafe { BorrowedFd::borrow_raw(inject_listener_raw) };
 
-            let mut poll_fds = vec![
-                PollFd::new(master_fd, PollFlags::POLLIN),
-            ];
+            let mut poll_fds = vec![PollFd::new(master_fd, PollFlags::POLLIN)];
 
             // Only include stdin in poll set while we're actively polling it.
             // When stdin is a non-TTY (e.g. /dev/null in headless mode), we stop
@@ -973,7 +976,9 @@ impl Proxy {
                                 // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
                                 // When running headless, stdin may be /dev/null or a pipe,
                                 // which is always at EOF but does not mean the terminal is gone.
-                                if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) }).unwrap_or(false) {
+                                if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                                    .unwrap_or(false)
+                                {
                                     break;
                                 }
                                 // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
@@ -1013,10 +1018,8 @@ impl Proxy {
             // Clients are pushed immediately after the listener (or immediately after
             // stdin when listener is in backoff), so their base index shifts by one
             // depending on whether the listener is present this iteration.
-            let clients_base = inject_listener_idx.map_or_else(
-                || poll_fds.len() - client_raw_fds.len(),
-                |idx| idx + 1,
-            );
+            let clients_base = inject_listener_idx
+                .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
             for i in (0..client_raw_fds.len()).rev() {
                 let poll_idx = clients_base + i;
                 if let Some(revents) = poll_fds[poll_idx].revents() {

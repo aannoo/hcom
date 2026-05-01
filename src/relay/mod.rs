@@ -853,7 +853,9 @@ mod tests {
 
         let first = results[0].as_ref().expect("at least one must succeed");
         for (i, r) in results.iter().enumerate() {
-            let r = r.as_ref().unwrap_or_else(|| panic!("thread {i} returned None"));
+            let r = r
+                .as_ref()
+                .unwrap_or_else(|| panic!("thread {i} returned None"));
             assert_eq!(
                 r, first,
                 "thread {i} got divergent UUID — race not serialized"
@@ -918,7 +920,11 @@ mod tests {
             ..obs()
         };
         match derive_relay_health(&o) {
-            RelayHealth::Error { reason, detail, pid } => {
+            RelayHealth::Error {
+                reason,
+                detail,
+                pid,
+            } => {
                 assert_eq!(reason, RelayErrorReason::Reported);
                 assert_eq!(detail.as_deref(), Some("not authorized"));
                 assert_eq!(pid, Some(4242));
@@ -949,10 +955,7 @@ mod tests {
             heartbeat_age_s: None,
             ..obs()
         };
-        assert_eq!(
-            derive_relay_health(&o),
-            RelayHealth::Starting { pid: 111 }
-        );
+        assert_eq!(derive_relay_health(&o), RelayHealth::Starting { pid: 111 });
     }
 
     #[test]
@@ -1006,10 +1009,7 @@ mod tests {
             raw_status: None,
             ..obs()
         };
-        assert_eq!(
-            derive_relay_health(&o),
-            RelayHealth::Starting { pid: 444 }
-        );
+        assert_eq!(derive_relay_health(&o), RelayHealth::Starting { pid: 444 });
 
         // Also cover explicit "disconnected" sentinel in case any code path writes it.
         let o = RelayObservation {
@@ -1018,10 +1018,7 @@ mod tests {
             raw_status: Some("disconnected".into()),
             ..obs()
         };
-        assert_eq!(
-            derive_relay_health(&o),
-            RelayHealth::Starting { pid: 445 }
-        );
+        assert_eq!(derive_relay_health(&o), RelayHealth::Starting { pid: 445 });
     }
 
     #[test]
@@ -1118,7 +1115,10 @@ mod tests {
 
         clear_runtime_relay_kv(&db);
 
-        assert_eq!(safe_kv_get(&db, "relay_last_push_id").as_deref(), Some("12345"));
+        assert_eq!(
+            safe_kv_get(&db, "relay_last_push_id").as_deref(),
+            Some("12345")
+        );
         assert_eq!(
             safe_kv_get(&db, "relay_last_push").as_deref(),
             Some("1700000000.0")

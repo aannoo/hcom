@@ -442,15 +442,16 @@ pub(crate) fn create_filter_subscription(
     silent: bool,
     on_hit: Option<&str>,
 ) -> i32 {
-    let outcome = match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
-        Ok(o) => o,
-        Err(e) => {
-            if !silent {
-                eprintln!("Error: {e}");
+    let outcome =
+        match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
+            Ok(o) => o,
+            Err(e) => {
+                if !silent {
+                    eprintln!("Error: {e}");
+                }
+                return 1;
             }
-            return 1;
-        }
-    };
+        };
 
     match outcome {
         SubCreateOutcome::AlreadyExists { id } => {
@@ -531,7 +532,13 @@ pub(crate) fn build_and_insert_sql_subscription(
 }
 
 /// Create a raw SQL subscription.
-fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool, on_hit: Option<&str>) -> i32 {
+fn events_sub_sql(
+    db: &HcomDb,
+    sql_parts: &[String],
+    caller: &str,
+    once: bool,
+    on_hit: Option<&str>,
+) -> i32 {
     let outcome = match build_and_insert_sql_subscription(db, sql_parts, caller, once, on_hit) {
         Ok(o) => o,
         Err(e) => {
@@ -660,7 +667,14 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     // Filter-based subscription
     if !filters.is_empty() {
-        return events_sub_filter(db, &filters, &sql_parts, &caller, once, args.on_hit.as_deref());
+        return events_sub_filter(
+            db,
+            &filters,
+            &sql_parts,
+            &caller,
+            once,
+            args.on_hit.as_deref(),
+        );
     }
 
     // No filters and no SQL: show help
@@ -733,22 +747,23 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
     // Identity selection for the remote sub:
     //   --as NAME / -b → external caller (any name, not required to exist on remote)
     //   --for NAME     → existing remote instance caller
-    let (caller, caller_is_external) =
-        if args.from_bigboss || args.as_name.is_some() {
-            let name = args
-                .as_name
-                .clone()
-                .unwrap_or_else(|| crate::shared::constants::SENDER.to_string());
-            (name, true)
-        } else {
-            match args.for_agent.as_deref() {
-                Some(s) if !s.is_empty() => (s.to_string(), false),
-                _ => {
-                    eprintln!("Error: --for <name>, --as <name>, or -b is required when using --device");
-                    return 1;
-                }
+    let (caller, caller_is_external) = if args.from_bigboss || args.as_name.is_some() {
+        let name = args
+            .as_name
+            .clone()
+            .unwrap_or_else(|| crate::shared::constants::SENDER.to_string());
+        (name, true)
+    } else {
+        match args.for_agent.as_deref() {
+            Some(s) if !s.is_empty() => (s.to_string(), false),
+            _ => {
+                eprintln!(
+                    "Error: --for <name>, --as <name>, or -b is required when using --device"
+                );
+                return 1;
             }
-        };
+        }
+    };
 
     // Build filter map from CLI flags (no local name resolution — the remote side owns the namespace)
     let filters = args.filters.to_filter_map();
@@ -815,7 +830,10 @@ fn cmd_events_sub_remote_list(db: &HcomDb, device: &str) -> i32 {
     ) {
         Ok(result) => {
             let empty = Vec::new();
-            let subs = result.get("subs").and_then(|v| v.as_array()).unwrap_or(&empty);
+            let subs = result
+                .get("subs")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty);
             if subs.is_empty() {
                 println!("No active subscriptions on {device}");
                 return 0;
@@ -852,7 +870,10 @@ fn cmd_events_sub_remote_list(db: &HcomDb, device: &str) -> i32 {
                 } else {
                     let sql = sub.get("sql").and_then(|v| v.as_str()).unwrap_or("");
                     if sql.len() > 35 {
-                        let end = (0..=35).rev().find(|&i| sql.is_char_boundary(i)).unwrap_or(0);
+                        let end = (0..=35)
+                            .rev()
+                            .find(|&i| sql.is_char_boundary(i))
+                            .unwrap_or(0);
                         format!("{}...", &sql[..end])
                     } else {
                         sql.to_string()
@@ -1236,8 +1257,15 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
                     };
                     println!("{}", serde_json::to_string(&output).unwrap_or_default());
                 }
-                if result.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    println!("{}", json!({"truncated": true, "note": "response size capped"}));
+                if result
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "{}",
+                        json!({"truncated": true, "note": "response size capped"})
+                    );
                 }
                 return 0;
             }

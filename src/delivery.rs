@@ -149,7 +149,7 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
 ///   shows JSON to agent (no human-visible system message like Claude). Preview in
 ///   terminal gives human context since hook output is agent-only. BeforeAgent hook
 ///   still delivers full message to agent via additionalContext.
-/// 
+///
 /// - **OpenCode**: Similar to Gemini.
 ///   The OpenCode plugin just shows this one line and not the full message in TUI.
 ///   So preview gives more context than a minimal <hcom> trigger.

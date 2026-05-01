@@ -1298,15 +1298,9 @@ mod tests {
         let err = HcomError::NotFound(
             "Instance 'healthcheck' not found. Run 'hcom start --as healthcheck' to reclaim your identity.".into(),
         );
-        let msg = maybe_external_send_name_hint(
-            "send",
-            Some("healthcheck"),
-            false,
-            None,
-            false,
-            &err,
-        )
-        .expect("expected hint");
+        let msg =
+            maybe_external_send_name_hint("send", Some("healthcheck"), false, None, false, &err)
+                .expect("expected hint");
         assert!(msg.contains("Hint: If 'healthcheck' is an external sender"));
         assert!(msg.contains("send --from healthcheck"));
     }
@@ -1317,14 +1311,8 @@ mod tests {
             "Instance 'luna' not found. Run 'hcom start --as luna' to reclaim your identity."
                 .into(),
         );
-        let msg = maybe_external_send_name_hint(
-            "send",
-            Some("luna"),
-            false,
-            Some("pid-123"),
-            true,
-            &err,
-        );
+        let msg =
+            maybe_external_send_name_hint("send", Some("luna"), false, Some("pid-123"), true, &err);
         assert!(msg.is_none());
     }
 
@@ -1333,14 +1321,8 @@ mod tests {
         let err = HcomError::InvalidInput(
             "Invalid instance name 'Invalid-Name!'. Use base name only (lowercase letters, numbers, underscore).".into(),
         );
-        let msg = maybe_external_send_name_hint(
-            "send",
-            Some("Invalid-Name!"),
-            false,
-            None,
-            false,
-            &err,
-        );
+        let msg =
+            maybe_external_send_name_hint("send", Some("Invalid-Name!"), false, None, false, &err);
         assert!(msg.is_none());
     }
 

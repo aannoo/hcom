@@ -969,10 +969,7 @@ mod tests {
         assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
         assert!(spec.has_flag(&["--verbose"], &[]));
         // positional preserved
-        assert!(spec
-            .positional_tokens
-            .iter()
-            .any(|t| t == "task text"));
+        assert!(spec.positional_tokens.iter().any(|t| t == "task text"));
     }
 
     #[test]
@@ -1002,14 +999,8 @@ mod tests {
         // `--pty --headless --hcom-prompt X`: the PTY wrapper hosts claude's TUI,
         // so -p must NOT be injected. use_pty must be true even in background mode.
         let config = HcomConfig::default();
-        let (args, background, use_pty) = prepare_launch_execution(
-            "claude",
-            &s(&[]),
-            &config,
-            true,
-            true,
-            Some("ping"),
-        );
+        let (args, background, use_pty) =
+            prepare_launch_execution("claude", &s(&[]), &config, true, true, Some("ping"));
         assert!(background);
         assert!(use_pty, "--pty opt-in must force PTY routing");
 
@@ -1036,35 +1027,33 @@ mod tests {
 
     #[test]
     fn test_validate_claude_headless_launch_requires_prompt() {
-        let err =
-            validate_claude_headless_launch("claude", true, false, &[], None).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Claude headless mode requires a prompt/task"));
+        let err = validate_claude_headless_launch("claude", true, false, &[], None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Claude headless mode requires a prompt/task")
+        );
     }
 
     #[test]
     fn test_validate_claude_headless_launch_accepts_cli_prompt() {
-        assert!(validate_claude_headless_launch(
-            "claude",
-            true,
-            false,
-            &s(&["-p", "say hi in hcom"]),
-            None
-        )
-        .is_ok());
+        assert!(
+            validate_claude_headless_launch(
+                "claude",
+                true,
+                false,
+                &s(&["-p", "say hi in hcom"]),
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn test_validate_claude_headless_launch_accepts_hcom_prompt() {
-        assert!(validate_claude_headless_launch(
-            "claude",
-            true,
-            false,
-            &[],
-            Some("say hi in hcom")
-        )
-        .is_ok());
+        assert!(
+            validate_claude_headless_launch("claude", true, false, &[], Some("say hi in hcom"))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1079,14 +1068,8 @@ mod tests {
         // `--headless --pty -p 'task'` would wrap a claude that's about to exit on
         // its one-shot print reply. Explicit conflict with --pty's live-session
         // semantics. Both local and remote paths share this validator.
-        let err = validate_claude_headless_launch(
-            "claude",
-            true,
-            true,
-            &s(&["-p", "task"]),
-            None,
-        )
-        .unwrap_err();
+        let err = validate_claude_headless_launch("claude", true, true, &s(&["-p", "task"]), None)
+            .unwrap_err();
         assert!(err.to_string().contains("--pty conflicts with -p/--print"));
     }
 
@@ -1095,21 +1078,19 @@ mod tests {
         // Same conflict if only --pty + -p are passed (no --headless). The spec is
         // still background because -p is present, so is_background_from_args would
         // have promoted use_pty to true regardless.
-        let err = validate_claude_headless_launch(
-            "claude",
-            true,
-            true,
-            &s(&["--print", "task"]),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            validate_claude_headless_launch("claude", true, true, &s(&["--print", "task"]), None)
+                .unwrap_err();
         assert!(err.to_string().contains("--pty conflicts with -p/--print"));
     }
 
     #[test]
     fn test_validate_claude_pty_without_print_flag_ok() {
         // Sanity: --pty without -p/--print stays allowed.
-        assert!(validate_claude_headless_launch("claude", true, true, &s(&["--model", "haiku"]), None).is_ok());
+        assert!(
+            validate_claude_headless_launch("claude", true, true, &s(&["--model", "haiku"]), None)
+                .is_ok()
+        );
     }
 
     #[test]

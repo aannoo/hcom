@@ -81,9 +81,9 @@ fn open_envelope_for_handler(
 
     match crypto::open(ctx.psk, ctx.relay_id, ctx.topic, payload) {
         Ok(pt) => {
-            if let Err(e) =
-                ctx.replay_guard
-                    .record_nonce(sender_short, parsed.nonce, now_secs)
+            if let Err(e) = ctx
+                .replay_guard
+                .record_nonce(sender_short, parsed.nonce, now_secs)
             {
                 log::log_warn("relay", "relay.replay", &format!("{}", e));
                 return None;
@@ -189,10 +189,11 @@ pub fn handle_state_message(
     } else {
         None
     };
-    let opened = match open_envelope_for_handler(ctx, device_id, payload, allow_stale, retained_watermark) {
-        Some(p) => p,
-        None => return false,
-    };
+    let opened =
+        match open_envelope_for_handler(ctx, device_id, payload, allow_stale, retained_watermark) {
+            Some(p) => p,
+            None => return false,
+        };
 
     let data: Value = match serde_json::from_slice(&opened.plaintext) {
         Ok(v) => v,
