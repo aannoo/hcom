@@ -573,7 +573,11 @@ fn run_pty_test(tool: &str) {
     logln!(log, "  OK: Baseline event ID: {baseline_event}");
 
     let t1 = Instant::now();
-    send_msg(&format!("@{instance_name} delivery-test-1 do not reply"));
+    // Phrasing matters: gemini-2.5-flash-lite interprets human-style directives
+    // ("do not reply") as needing user confirmation and calls ask_user → approval
+    // gate, blocking the test forever. `[hcom heartbeat] ignore` reads as an
+    // automated signal and reliably returns to listening in 2-3s with no tool calls.
+    send_msg(&format!("@{instance_name} [hcom heartbeat] ignore"));
     logln!(log, "  OK: Message sent");
 
     // Wait for delivery event
@@ -714,7 +718,7 @@ fn run_pty_test(tool: &str) {
     let baseline_event2 = get_last_event_id(&base_name);
 
     send_msg(&format!(
-        "@{instance_name} delivery-test-2-should-block do not reply"
+        "@{instance_name} [hcom heartbeat-2 should-block] ignore"
     ));
     logln!(log, "  OK: Message sent (should be blocked)");
 
@@ -1038,8 +1042,40 @@ fn run_pty_test_opencode() {
         "\n[Phase 3] Testing plugin delivery (second message)..."
     );
 
+    // Wait for full quiescence before sending msg #2. The bootstrap path
+    // triggers a "piggyback turn": PTY inject delivers msg #1 inline but does
+    // NOT advance the read cursor. After the bootstrap turn ends and listening
+    // fires, the plugin's idle handler re-fetches unread → finds msg #1 → fires
+    // promptAsync → agent goes active again for ~6s until transform acks the
+    // cursor. If msg #2 arrives during that window it merges into the ongoing
+    // turn (no new active event fires), and the active poll below times out.
+    //
+    // Two co-conditions for true quiescence:
+    //   1. Latest event is status=listening (agent is idle right now).
+    //   2. `hcom opencode-read --check` is "false" (cursor caught up; plugin
+    //      won't re-trigger another piggyback). Listening alone is correlative
+    //      — if pendingAckId or deliveryInFlight ever got stuck, listening
+    //      could appear stable while the cursor was still behind.
+    poll_until(
+        || {
+            let evs = get_events(&base_name, 1, false);
+            let last = evs.last()?;
+            if last["data"]["status"].as_str() != Some("listening") {
+                return None;
+            }
+            let out = hcom(&format!("opencode-read --name {base_name} --check"));
+            if !out.status.success() {
+                return None;
+            }
+            let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if body == "false" { Some(()) } else { None }
+        },
+        "agent quiescent (listening AND read cursor caught up)",
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    );
+
     let baseline_event2 = get_last_event_id(&base_name);
-    thread::sleep(Duration::from_secs(2));
 
     let t2 = Instant::now();
     send_msg(&format!("@{instance_name} plugin-test-2 do not reply"));
