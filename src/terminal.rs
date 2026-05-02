@@ -836,6 +836,120 @@ fn get_macos_terminal_command() -> String {
     rewrite_macos_open_app_command("open -a Terminal {script}", "Terminal")
 }
 
+/// Escape a string for use inside a YAML double-quoted scalar.
+fn yaml_double_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Warp Stable's `~/.warp/launch_configurations/` dir.
+///
+/// Stable only for v1. Other channels (Preview/Dev/Local/Oss) own separate
+/// config dirs and URL schemes (`warppreview://` etc.), so a single `warp://`
+/// only ever reaches one channel. Add per-channel presets later if needed.
+fn warp_launch_config_dir(home: &Path) -> PathBuf {
+    home.join(".warp").join("launch_configurations")
+}
+
+/// Build YAML body for a one-pane Warp launch config that runs `bash <script>`.
+fn build_warp_launch_yaml(config_name: &str, cwd: &str, script: &str) -> String {
+    let exec_str = format!("bash {}", shell_quote(script));
+    format!(
+        "name: {name}\nwindows:\n  - tabs:\n      - layout:\n          cwd: {cwd}\n          commands:\n            - exec: {exec}\n",
+        name = yaml_double_quote(config_name),
+        cwd = yaml_double_quote(cwd),
+        exec = yaml_double_quote(&exec_str),
+    )
+}
+
+/// Resolve `cwd` to an absolute path Warp will accept for the pane's initial dir.
+///
+/// Warp's URL-based launch decouples the pane from the spawning process's
+/// working dir, so the pane cwd must be set explicitly. For relative or
+/// missing input, use the launcher's current_dir (the prefix the script's
+/// later `cd <cwd>` would resolve against) so a relative `cd .` or
+/// `cd subdir` lands where a non-Warp launch would. HOME is a last resort
+/// if current_dir() fails.
+fn resolve_warp_cwd(cwd: Option<&str>, home: &Path) -> String {
+    if let Some(c) = cwd {
+        if Path::new(c).is_absolute() {
+            return c.to_string();
+        }
+    }
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| home.to_string_lossy().to_string())
+}
+
+/// Delete hcom-*.yaml files older than `older_than` from a channel dir.
+///
+/// Sweep-on-write avoids races with Warp cold start (where `open warp://...`
+/// returns before Warp boots and reads the URL). Older configs should no
+/// longer be needed by Warp.
+const WARP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn sweep_stale_warp_configs(dir: &Path, older_than: std::time::Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("hcom-") || !name_str.ends_with(".yaml") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if now.duration_since(mtime).unwrap_or_default() > older_than {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Write a Warp launch_config YAML for `bash <script>` to Warp Stable's dir.
+///
+/// Warp has no CLI inject; the only way to launch a command is via
+/// `warp://launch/<config_name>` which reads a YAML from the channel-specific
+/// `launch_configurations/` dir. Returns the path written.
+fn write_warp_launch_config(process_id: &str, cwd: Option<&str>, script: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    write_warp_launch_config_at(Path::new(&home), process_id, cwd, script)
+}
+
+fn write_warp_launch_config_at(
+    home: &Path,
+    process_id: &str,
+    cwd: Option<&str>,
+    script: &str,
+) -> Result<PathBuf> {
+    let dir = warp_launch_config_dir(home);
+    fs::create_dir_all(&dir).context("Failed to create Warp launch_configurations dir")?;
+    sweep_stale_warp_configs(&dir, WARP_STALE_AFTER);
+
+    let config_name = format!("hcom-{}", process_id);
+    let resolved_cwd = resolve_warp_cwd(cwd, home);
+    let yaml = build_warp_launch_yaml(&config_name, &resolved_cwd, script);
+    let yaml_path = dir.join(format!("{}.yaml", config_name));
+    fs::write(&yaml_path, &yaml).context("Failed to write Warp launch config")?;
+    Ok(yaml_path)
+}
+
 /// Return a human-readable name for the platform's built-in fallback terminal
 /// (used when `terminal = "default"` and no terminal is detected from env).
 pub fn get_default_fallback_terminal_name() -> &'static str {
@@ -1238,6 +1352,31 @@ pub fn launch_terminal(
 
     let script_str = script_file.to_string_lossy().to_string();
 
+    if terminal_mode == "warp" {
+        let process_id = env
+            .get("HCOM_PROCESS_ID")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if process_id.is_empty() {
+            bail!("warp preset requires HCOM_PROCESS_ID to name the launch config");
+        }
+        write_warp_launch_config(process_id, cwd, &script_str)?;
+        let final_argv = vec![
+            "open".to_string(),
+            format!("warp://launch/hcom-{}", process_id),
+        ];
+        let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
+        write_terminal_id(env, &captured_id);
+        return if success {
+            Ok((LaunchResult::Success, terminal_mode))
+        } else {
+            Ok((
+                LaunchResult::Failed("Terminal process failed".to_string()),
+                terminal_mode,
+            ))
+        };
+    }
+
     if let Some(cmd_template) = custom_cmd {
         // Parse user-provided or preset command template
         let final_argv = parse_terminal_command(
@@ -1585,6 +1724,100 @@ mod tests {
         assert_eq!(info.pane_id, "pane-1");
         assert_eq!(info.process_id, "proc-1");
         assert_eq!(info.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn test_yaml_double_quote_escapes_backslash_and_quote() {
+        assert_eq!(yaml_double_quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(yaml_double_quote("a\\b"), "\"a\\\\b\"");
+        assert_eq!(yaml_double_quote("plain"), "\"plain\"");
+    }
+
+    #[test]
+    fn test_build_warp_launch_yaml_shape() {
+        let yaml = build_warp_launch_yaml("hcom-pid", "/some/dir", "/tmp/script.sh");
+        assert!(yaml.contains("name: \"hcom-pid\""));
+        assert!(yaml.contains("cwd: \"/some/dir\""));
+        assert!(yaml.contains("exec: \"bash /tmp/script.sh\""));
+    }
+
+    #[test]
+    fn test_warp_launch_config_dir_is_stable_channel() {
+        let dir = warp_launch_config_dir(Path::new("/h"));
+        assert_eq!(dir, Path::new("/h/.warp/launch_configurations"));
+    }
+
+    #[test]
+    fn test_write_warp_launch_config_writes_to_stable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let written = write_warp_launch_config_at(
+            tmp.path(),
+            "test-pid",
+            Some("/some/dir"),
+            "/tmp/script.sh",
+        )
+        .unwrap();
+        assert!(written.ends_with(".warp/launch_configurations/hcom-test-pid.yaml"));
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert!(content.contains("name: \"hcom-test-pid\""));
+        assert!(content.contains("exec: \"bash /tmp/script.sh\""));
+        assert!(content.contains("cwd: \"/some/dir\""));
+    }
+
+    #[test]
+    fn test_resolve_warp_cwd_keeps_absolute() {
+        let home = Path::new("/h");
+        assert_eq!(resolve_warp_cwd(Some("/abs/path"), home), "/abs/path");
+    }
+
+    #[test]
+    fn test_resolve_warp_cwd_uses_current_dir_for_relative_or_missing() {
+        let home = Path::new("/h");
+        let cwd_str = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        // Must match the prefix the script's later `cd <cwd>` resolves against.
+        assert_eq!(resolve_warp_cwd(Some("subdir"), home), cwd_str);
+        assert_eq!(resolve_warp_cwd(Some("./rel"), home), cwd_str);
+        assert_eq!(resolve_warp_cwd(Some("."), home), cwd_str);
+        assert_eq!(resolve_warp_cwd(None, home), cwd_str);
+    }
+
+    #[test]
+    fn test_sweep_stale_warp_configs_only_removes_hcom_prefixed_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let target = dir.join("hcom-old.yaml");
+        let other = dir.join("user-config.yaml");
+        let unrelated = dir.join("hcom-old.txt");
+        std::fs::write(&target, "x").unwrap();
+        std::fs::write(&other, "x").unwrap();
+        std::fs::write(&unrelated, "x").unwrap();
+
+        sweep_stale_warp_configs(dir, std::time::Duration::from_secs(0));
+
+        assert!(!target.exists(), "hcom-*.yaml should be swept");
+        assert!(other.exists(), "non-hcom-prefixed yaml should remain");
+        assert!(unrelated.exists(), "non-yaml extension should remain");
+    }
+
+    #[test]
+    fn test_sweep_stale_warp_configs_keeps_fresh_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let fresh = dir.join("hcom-new.yaml");
+        std::fs::write(&fresh, "x").unwrap();
+
+        sweep_stale_warp_configs(dir, std::time::Duration::from_secs(3600));
+
+        assert!(fresh.exists(), "fresh file should remain");
+    }
+
+    #[test]
+    fn test_warp_preset_registered() {
+        let preset = crate::shared::terminal_presets::get_terminal_preset("warp").unwrap();
+        assert_eq!(preset.app_name, Some("Warp"));
+        assert_eq!(preset.binary, None);
+        assert!(preset.open.contains("warp://launch/hcom-{process_id}"));
+        assert_eq!(preset.platforms, &["Darwin"]);
     }
 
     #[test]

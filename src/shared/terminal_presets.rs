@@ -40,7 +40,6 @@ const fn p(
 const DL: &[&str] = &["Darwin", "Linux"];
 const DLW: &[&str] = &["Darwin", "Linux", "Windows"];
 
-/// All 26 terminal presets.
 pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = LazyLock::new(|| {
     vec![
         // macOS native
@@ -142,6 +141,17 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 None,
                 None,
                 DLW,
+            ),
+        ),
+        (
+            "warp",
+            p(
+                None,
+                Some("Warp"),
+                "open warp://launch/hcom-{process_id}",
+                None,
+                None,
+                &["Darwin"],
             ),
         ),
         // Tab utilities
@@ -367,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_terminal_presets_count() {
-        assert_eq!(TERMINAL_PRESETS.len(), 26);
+        assert_eq!(TERMINAL_PRESETS.len(), 27);
     }
 
     #[test]

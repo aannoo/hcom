@@ -233,7 +233,9 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
         } else {
             String::new()
         }
-    } else if !preset_name.is_empty() {
+    } else if !preset_name.is_empty()
+        && crate::config::get_merged_preset(preset_name).is_some_and(|p| p.close.is_some())
+    {
         format!(" (pane close failed for {})", preset_name)
     } else {
         String::new()
