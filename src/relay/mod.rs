@@ -652,38 +652,6 @@ pub fn trigger_push() {
     }
 }
 
-/// Wait for relay data. Returns true if new remote events arrived in DB.
-/// Detects new events by the `:` in instance name (relay-imported events use
-/// namespaced names like `luna:ABCD`). Breaks if relay import naming changes.
-pub fn relay_wait(timeout_secs: f64) -> bool {
-    let db = match HcomDb::open() {
-        Ok(db) => db,
-        Err(_) => return false,
-    };
-
-    let before: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM events WHERE instance LIKE '%:%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    std::thread::sleep(std::time::Duration::from_secs_f64(timeout_secs.min(1.0)));
-
-    let after: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM events WHERE instance LIKE '%:%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    after > before
-}
-
 /// Set relay status in DB KV with PID ownership guard.
 ///
 /// `is_worker` should be true for daemon relay threads, false for CLI callers.

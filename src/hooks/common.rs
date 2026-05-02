@@ -451,14 +451,6 @@ fn poll_loop(
             return Ok((0, None, false));
         }
 
-        // Sync remote events via relay (short poll, doesn't block long)
-        if crate::relay::is_relay_enabled(&crate::config::load_config_snapshot().core) {
-            let remaining = (timeout - start.elapsed()).as_secs_f64();
-            if remaining > 0.0 {
-                crate::relay::relay_wait(remaining.min(25.0));
-            }
-        }
-
         // Poll for messages BEFORE select to catch transition gap
         let raw_messages = db.get_unread_messages(instance_name);
         if !raw_messages.is_empty() {
@@ -486,15 +478,11 @@ fn poll_loop(
         }
         let remaining = timeout - elapsed;
 
-        // TCP select for notifications (or fallback poll)
-        // - With relay: relay_wait() did long-poll, short TCP check (1s)
-        // - Local-only with TCP: select wakes on notification (30s)
-        // - Local-only no TCP: must poll frequently (100ms)
-        let relay_active =
-            crate::relay::is_relay_enabled(&crate::config::load_config_snapshot().core);
-        let wait_time = if relay_active {
-            Duration::from_secs(remaining.as_secs().min(1))
-        } else if notify_server.is_some() {
+        // TCP select for notifications (or fallback poll). Relay imports
+        // (pull.rs) call notify_all_instances after every batch, so the TCP
+        // wake fires as soon as remote events land — no separate relay
+        // polling needed.
+        let wait_time = if notify_server.is_some() {
             Duration::from_secs(remaining.as_secs().min(30))
         } else {
             Duration::from_millis(remaining.as_millis().min(100) as u64)

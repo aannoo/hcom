@@ -408,20 +408,10 @@ fn listen_loop(
             continue;
         }
 
-        // Sync remote events via relay before waiting
-        let relay_enabled =
-            crate::relay::is_relay_enabled(&crate::config::load_config_snapshot().core);
-        if relay_enabled {
-            crate::relay::relay_wait(remaining.min(25.0));
-        }
-
-        // TCP select for local notifications
-        // - With relay: relay_wait() did long-poll, short TCP check (1s)
-        // - Local-only with TCP: select wakes on notification (30s)
-        // - Local-only no TCP: must poll frequently (100ms)
-        let wait_time = if relay_enabled {
-            remaining.min(1.0)
-        } else if notify_server.is_some() {
+        // TCP select for local notifications. Relay imports (pull.rs) call
+        // notify_all_instances after every batch, so the TCP wake fires as
+        // soon as remote events land — no separate relay polling needed.
+        let wait_time = if notify_server.is_some() {
             remaining.min(30.0)
         } else {
             remaining.min(0.1)
@@ -666,23 +656,15 @@ fn filter_listen_loop(
         if remaining <= 0.0 {
             continue;
         }
-        // Sync remote events via relay before waiting
-        if crate::relay::is_relay_enabled(&crate::config::load_config_snapshot().core) {
-            crate::relay::relay_wait(remaining.min(25.0));
-        }
 
-        // TCP select for local notifications
-        // - With relay: relay_wait() did long-poll, short TCP check (1s)
-        // - Local-only with TCP: select wakes on notification (30s)
-        // - Local-only no TCP: must poll frequently (100ms)
-        let wait_time =
-            if crate::relay::is_relay_enabled(&crate::config::load_config_snapshot().core) {
-                remaining.min(1.0)
-            } else if notify_server.is_some() {
-                remaining.min(30.0)
-            } else {
-                remaining.min(0.1)
-            };
+        // TCP select for local notifications. Relay imports (pull.rs) call
+        // notify_all_instances after every batch, so the TCP wake fires as
+        // soon as remote events land — no separate relay polling needed.
+        let wait_time = if notify_server.is_some() {
+            remaining.min(30.0)
+        } else {
+            remaining.min(0.1)
+        };
 
         if let Some(server) = notify_server {
             server.wait(Duration::from_secs_f64(wait_time));

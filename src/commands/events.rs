@@ -990,18 +990,22 @@ fn events_wait(
         }
     }
 
-    // Setup TCP notify server for instant wake
-    let notify_server = TcpListener::bind("127.0.0.1:0").ok();
-    let notify_port = notify_server
-        .as_ref()
-        .and_then(|s| s.local_addr().ok())
-        .map(|a| a.port());
-
-    if let (Some(name), Some(port)) = (instance_name, notify_port) {
-        if let Some(ref server) = notify_server {
-            server.set_nonblocking(true).ok();
+    // Setup TCP notify server for instant wake — only useful when we can
+    // register a port for `notify_all_instances` to poke. Anonymous waits
+    // (no instance_name) skip the listener and fall through to a short poll.
+    let mut notify_server: Option<TcpListener> = None;
+    let mut notify_port: Option<u16> = None;
+    if let Some(name) = instance_name {
+        if let Ok(server) = TcpListener::bind("127.0.0.1:0") {
+            if let Ok(addr) = server.local_addr() {
+                let port = addr.port();
+                server.set_nonblocking(true).ok();
+                if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
+                    notify_server = Some(server);
+                    notify_port = Some(port);
+                }
+            }
         }
-        let _ = db.upsert_notify_endpoint(name, "events_wait", port);
     }
 
     let start = Instant::now();
@@ -1065,12 +1069,6 @@ fn events_wait(
             break 1;
         }
 
-        // Short relay poll for remote events before TCP wait
-        if crate::relay::is_relay_enabled(&crate::config::load_config_snapshot().core) {
-            crate::relay::relay_wait((remaining as f64).min(2.0));
-            continue; // Re-check for events after relay sync
-        }
-
         if let Some(ref server) = notify_server {
             // Use poll-based wait (500ms intervals since TcpListener is non-blocking)
             let wait_time = std::cmp::min(remaining, 5);
@@ -1084,6 +1082,8 @@ fn events_wait(
                 std::thread::sleep(Duration::from_millis(200));
             }
         } else {
+            // No registered listener (anonymous wait or bind failed) — nothing
+            // can TCP-wake us, so re-check the events query on a short tick.
             std::thread::sleep(Duration::from_millis(500));
         }
     };
