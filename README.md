@@ -1,12 +1,12 @@
 # hcom
 
-[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
+[![CI](https://github.com/Solar2004/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/Solar2004/hcom/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Solar2004/hcom)](https://github.com/Solar2004/hcom/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Solar2004/hcom/blob/main/LICENSE)
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, and OpenCode without changing how you use them.
+`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, and Kilo Code without changing how you use them.
 
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
@@ -19,14 +19,14 @@ https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 ## Install
 
 ```bash
-brew install aannoo/hcom/hcom
+brew install Solar2004/hcom/hcom
 ```
 
 <details><summary>Other install options</summary>
 
 ```bash
 # Shell installer for macOS, Linux, Android (Termux), and WSL
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
+curl -fsSL https://github.com/Solar2004/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
 ```bash
@@ -43,7 +43,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode
+hcom claude   # codex / gemini / opencode / kilo
 ```
 
 Terminal 2:
@@ -103,6 +103,28 @@ Agents can subscribe to events and react instantly. Collision detection is on by
 Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
 
 Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
+
+### Antigravity (VS Code fork) extension
+
+[Antigravity](https://github.com/antigravity-ai) is Google's VS Code fork with an
+AI agent (Jetski). hcom includes a VS Code extension that bridges hcom agents
+with Antigravity's chat panel:
+
+```bash
+# Install the extension into Antigravity
+hcom hooks add antigravity
+
+# Restart Antigravity to activate
+```
+
+Once installed:
+- hcom messages arrive in Antigravity's chat panel automatically
+- Type `@hcom list` in Antigravity chat to see active agents
+- Type `@hcom @name message` to send messages to hcom agents
+- Status bar shows connection status, click for details
+
+The extension (~13KB) is compiled and embedded in the hcom binary — no npm
+or TypeScript needed on the user's machine.
 
 ---
 
@@ -216,6 +238,8 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Gemini CLI | automatic | `hcom gemini` |
 | Codex CLI | automatic | `hcom codex` |
 | OpenCode | automatic | `hcom opencode` |
+| Kilo Code | automatic | `hcom kilo` |
+| Cline | automatic | `hcom cline` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -248,7 +272,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|opencode   # launch N agents
+hcom [N] claude|gemini|codex|opencode|kilo|cline   # launch N agents
 hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane
@@ -311,7 +335,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` | Default args passed to the tool |
 
 ### Scope
 
@@ -369,7 +393,7 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 ```bash
 # Prerequisites: Rust 1.86+
 
-git clone https://github.com/aannoo/hcom.git
+git clone https://github.com/Solar2004/hcom.git
 cd hcom
 cargo build
 cargo test
@@ -397,6 +421,35 @@ For concurrent worktrees, scope each to its own DB:
 
 ```bash
 HCOM_DIR=$PWD/.hcom HCOM_DEV_ROOT=$PWD hcom claude
+```
+
+### Testing a fork alongside the original
+
+To test a custom fork (e.g., with kilo support) without replacing your installed `hcom`:
+
+```bash
+# 1. Clone your fork
+git clone https://github.com/Solar2004/hcom.git ~/hcom-kilo
+cd ~/hcom-kilo
+cargo build
+
+# 2. Use dev_root to point at the fork build
+hcom config dev_root $(pwd)
+hcom status          # now runs your fork
+
+# 3. Revert to original anytime
+hcom config dev_root --unset
+```
+
+Or use a symlink swap:
+
+```bash
+# Point to your fork build
+ln -sf ~/hcom-kilo/target/debug/hcom ~/.cargo/bin/hcom-kilo
+
+# Run either
+hcom          # original installed version
+hcom-kilo     # your fork
 ```
 
 </details>

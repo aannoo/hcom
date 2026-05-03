@@ -325,7 +325,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: true
-          repository: "aannoo/homebrew-hcom"
+          repository: "Solar2004/homebrew-hcom"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       # So we have access to the formula
       - name: Fetch homebrew formulae

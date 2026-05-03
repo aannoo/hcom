@@ -493,6 +493,7 @@ fn start_rebind(
         Some(tool),
         false, // background
         None,  // tag
+        None,  // project
         None,  // wait_timeout
         None,  // subagent_timeout
         None,  // hints
@@ -751,6 +752,7 @@ fn start_bare(
         Some(tool),
         false, // background
         None,  // tag
+        None,  // project
         None,  // wait_timeout
         None,  // subagent_timeout
         None,  // hints

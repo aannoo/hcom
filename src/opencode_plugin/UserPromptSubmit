@@ -1,0 +1,18 @@
+#!/bin/sh
+# UserPromptSubmit hook — called by Cline when the user submits a prompt
+# Reads: taskId from stdin JSON
+# Calls: hcom cline-read --check → --format if messages pending
+# Returns: formatted messages as contextModification (cancel:false if none)
+
+set -eu
+_I=$(cat) || exit 0
+_T=$(echo "$_I" | sed -n 's/.*"taskId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+[ -z "$_T" ] && { echo '{"cancel":false}'; exit 0; }
+_C="${XDG_CACHE_HOME:-$HOME/.cache}/hcom/cline"
+_N=$(cat "$_C/$_T.name" 2>/dev/null) || { echo '{"cancel":false}'; exit 0; }
+_CK=$(hcom cline-read --check --name "$_N" 2>/dev/null) || { echo '{"cancel":false}'; exit 0; }
+[ "$_CK" = "true" ] || { echo '{"cancel":false}'; exit 0; }
+_M=$(hcom cline-read --format --name "$_N" 2>/dev/null) || { echo '{"cancel":false}'; exit 0; }
+[ -z "$_M" ] && { echo '{"cancel":false}'; exit 0; }
+_E=$(printf '%s' "$_M" | awk '{gsub(/\\/,"\\\\");gsub(/"/,"\\\"");printf "%s",$0}')
+printf '{"cancel":false,"contextModification":"%s","errorMessage":""}\n' "$_E"

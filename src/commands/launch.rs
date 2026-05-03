@@ -30,7 +30,8 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         bail!("Too many agents requested (max {}).", max_count);
     }
 
-    let tag = hcom_flags.tag;
+    let tag = hcom_flags.tag.clone();
+    let project = hcom_flags.project.clone();
     let terminal = hcom_flags.terminal;
     let headless = hcom_flags.headless;
     let pty_requested = hcom_flags.pty;
@@ -84,7 +85,9 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "count": count,
             "args": tool_args,
             "tag": tag,
+            "project": hcom_flags.project,
             "launcher": launcher_name,
+            "name": hcom_flags.name,
             "background": headless,
             "pty": pty_requested,
             "terminal": terminal,
@@ -177,6 +180,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             count,
             args: merged_args,
             tag,
+            project,
             system_prompt,
             initial_prompt,
             pty: use_pty,
@@ -198,7 +202,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launcher: Some(launcher_name.clone()),
             run_here: hcom_flags.run_here,
             batch_id: hcom_flags.batch_id,
-            name: None, // --name is caller identity, not instance name
+            name: hcom_flags.name.clone(),
             skip_validation: false,
             terminal,
             append_reply_handoff: true,
@@ -407,6 +411,10 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "gemini" => &preview.config.gemini_args,
             "codex" => &preview.config.codex_args,
             "opencode" => &preview.config.opencode_args,
+            "kilo" => &preview.config.kilo_args,
+            "kilocode" => &preview.config.kilo_args,
+            "cline" => &preview.config.cline_args,
+            "clinecode" => &preview.config.cline_args,
             _ => "",
         }
     } else {
@@ -454,6 +462,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct HcomLaunchFlags {
     pub tag: Option<String>,
+    pub project: Option<String>,
     pub terminal: Option<String>,
     pub device: Option<String>,
     pub headless: bool,
@@ -463,6 +472,7 @@ pub(crate) struct HcomLaunchFlags {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -555,7 +565,7 @@ pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConf
             let merged = codex_args::merge_codex_args(&env_spec, &cli_spec);
             merged.rebuild_tokens(true, true)
         }
-        _ => cli_args.to_vec(), // opencode: pass through
+        _ => cli_args.to_vec(), // opencode, kilo, cline: pass through
     }
 }
 
@@ -597,6 +607,11 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--project=") {
+            flags.project = Some(args[i][10..].to_string());
+            i += 1;
+            continue;
+        }
         if args[i].starts_with("--terminal=") {
             flags.terminal = Some(args[i][11..].to_string());
             i += 1;
@@ -615,6 +630,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
         match args[i].as_str() {
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--project" if i + 1 < args.len() => {
+                flags.project = Some(args[i + 1].clone());
                 i += 2;
             }
             "--terminal" if i + 1 < args.len() => {
@@ -660,6 +679,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             "--no-run-here" => {
                 flags.run_here = Some(false);
                 i += 1;
+            }
+            "--agent-name" if i + 1 < args.len() => {
+                flags.name = Some(args[i + 1].clone());
+                i += 2;
             }
             "--name" if i + 1 < args.len() => {
                 i += 2;

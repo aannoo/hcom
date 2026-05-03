@@ -82,6 +82,7 @@ impl Config {
 const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("terminal", "terminal.active"),
     ("tag", "launch.tag"),
+    ("project", "launch.project"),
     ("hints", "launch.hints"),
     ("notes", "launch.notes"),
     ("subagent_timeout", "launch.subagent_timeout"),
@@ -93,6 +94,8 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("codex_sandbox_mode", "launch.codex.sandbox_mode"),
     ("codex_system_prompt", "launch.codex.system_prompt"),
     ("opencode_args", "launch.opencode.args"),
+    ("kilo_args", "launch.kilo.args"),
+    ("cline_args", "launch.cline.args"),
     ("relay", "relay.url"),
     ("relay_id", "relay.id"),
     ("relay_token", "relay.token"),
@@ -111,6 +114,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("hints", "HCOM_HINTS"),
     ("notes", "HCOM_NOTES"),
     ("tag", "HCOM_TAG"),
+    ("project", "HCOM_PROJECT"),
     ("claude_args", "HCOM_CLAUDE_ARGS"),
     ("gemini_args", "HCOM_GEMINI_ARGS"),
     ("codex_args", "HCOM_CODEX_ARGS"),
@@ -118,6 +122,8 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT"),
     ("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT"),
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
+    ("kilo_args", "HCOM_KILO_ARGS"),
+    ("cline_args", "HCOM_CLINE_ARGS"),
     ("relay", "HCOM_RELAY"),
     ("relay_id", "HCOM_RELAY_ID"),
     ("relay_token", "HCOM_RELAY_TOKEN"),
@@ -219,10 +225,13 @@ pub struct HcomConfig {
     pub hints: String,
     pub notes: String,
     pub tag: String,
+    pub project: String,
     pub claude_args: String,
     pub gemini_args: String,
     pub codex_args: String,
     pub opencode_args: String,
+    pub kilo_args: String,
+    pub cline_args: String,
     pub codex_sandbox_mode: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
@@ -245,10 +254,13 @@ impl Default for HcomConfig {
             hints: String::new(),
             notes: String::new(),
             tag: String::new(),
+            project: String::new(),
             claude_args: String::new(),
             gemini_args: String::new(),
             codex_args: String::new(),
             opencode_args: String::new(),
+            kilo_args: String::new(),
+            cline_args: String::new(),
             codex_sandbox_mode: "workspace".to_string(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
@@ -331,12 +343,22 @@ impl HcomConfig {
             );
         }
 
+        // Validate project (alphanumeric + hyphens only)
+        if !self.project.is_empty() && !RE_TAG.is_match(&self.project) {
+            errors.insert(
+                "project".into(),
+                "project can only contain letters, numbers, and hyphens".into(),
+            );
+        }
+
         // Validate shell-quoted args fields
         for (field, value) in [
             ("claude_args", &self.claude_args),
             ("gemini_args", &self.gemini_args),
             ("codex_args", &self.codex_args),
             ("opencode_args", &self.opencode_args),
+            ("kilo_args", &self.kilo_args),
+            ("cline_args", &self.cline_args),
         ] {
             if !value.is_empty() {
                 if let Err(e) = shell_words::split(value) {
@@ -391,10 +413,13 @@ impl HcomConfig {
             "hints" => Some(self.hints.clone()),
             "notes" => Some(self.notes.clone()),
             "tag" => Some(self.tag.clone()),
+            "project" => Some(self.project.clone()),
             "claude_args" => Some(self.claude_args.clone()),
             "gemini_args" => Some(self.gemini_args.clone()),
             "codex_args" => Some(self.codex_args.clone()),
             "opencode_args" => Some(self.opencode_args.clone()),
+            "kilo_args" => Some(self.kilo_args.clone()),
+            "cline_args" => Some(self.cline_args.clone()),
             "codex_sandbox_mode" => Some(self.codex_sandbox_mode.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
@@ -427,10 +452,13 @@ impl HcomConfig {
             "hints" => self.hints = value.to_string(),
             "notes" => self.notes = value.to_string(),
             "tag" => self.tag = value.to_string(),
+            "project" => self.project = value.to_string(),
             "claude_args" => self.claude_args = value.to_string(),
             "gemini_args" => self.gemini_args = value.to_string(),
             "codex_args" => self.codex_args = value.to_string(),
             "opencode_args" => self.opencode_args = value.to_string(),
+            "kilo_args" => self.kilo_args = value.to_string(),
+            "cline_args" => self.cline_args = value.to_string(),
             "codex_sandbox_mode" => {
                 // Normalize legacy value
                 self.codex_sandbox_mode = if value == "full-auto" {
@@ -541,10 +569,13 @@ impl HcomConfig {
             "hints",
             "notes",
             "tag",
+            "project",
             "claude_args",
             "gemini_args",
             "codex_args",
             "opencode_args",
+            "kilo_args",
+            "cline_args",
             "codex_sandbox_mode",
             "gemini_system_prompt",
             "codex_system_prompt",
@@ -874,6 +905,7 @@ enabled = true
 
 [launch]
 tag = ""
+project = ""
 hints = ""
 notes = ""
 subagent_timeout = 30
@@ -892,6 +924,12 @@ sandbox_mode = "workspace"
 system_prompt = ""
 
 [launch.opencode]
+args = ""
+
+[launch.kilo]
+args = ""
+
+[launch.cline]
 args = ""
 
 [preferences]

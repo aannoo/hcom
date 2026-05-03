@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "hcom"
-version = "0.7.14"
+version = "0.7.16"
 dependencies = [
  "anyhow",
  "base64",
