@@ -16,7 +16,7 @@ pub struct HooksArgs {
 }
 
 /// Valid tool names for hooks management.
-const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "kilocode", "cline", "clinecode"];
+const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "kilocode", "cline", "clinecode", "antigravity"];
 
 /// Get hook installation status for each tool.
 fn get_tool_status() -> Vec<(&'static str, bool, String)> {
@@ -46,6 +46,10 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
         .to_string();
 
     let cline_installed = crate::hooks::cline::verify_cline_plugin_installed();
+    let (antigravity_installed, antigravity_path) = {
+        let (ok, path) = crate::hooks::antigravity::get_extension_status();
+        (ok, path)
+    };
 
     vec![
         ("claude", claude_installed, claude_path),
@@ -55,6 +59,7 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
         ("kilocode", kilocode_installed, kilocode_path),
         ("cline", cline_installed, String::new()),
         ("clinecode", cline_installed, String::new()),
+        ("antigravity", antigravity_installed, antigravity_path),
     ]
 }
 
@@ -91,7 +96,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, antigravity, all");
         return 1;
     };
 
@@ -113,6 +118,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
             "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
             "kilocode" => crate::hooks::kilo::verify_kilocode_plugin_installed(),
             "cline" | "clinecode" => crate::hooks::cline::verify_cline_plugin_installed(),
+            "antigravity" => crate::hooks::antigravity::verify_extension_installed(),
             _ => false,
         };
         if already {
@@ -145,6 +151,11 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
             "cline" | "clinecode" => match crate::hooks::cline::install_cline_plugin() {
                 Ok(true) => AddResult::Added,
                 Ok(false) => AddResult::Failed(None),
+                Err(e) => AddResult::Failed(Some(e.to_string())),
+            },
+            "antigravity" => match crate::hooks::antigravity::install_extension() {
+                Ok(true) => AddResult::Added,
+                Ok(false) => AddResult::Already,
                 Err(e) => AddResult::Failed(Some(e.to_string())),
             },
             _ => AddResult::Failed(None),
@@ -190,6 +201,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 "kilocode" => "KiloCode",
                 "cline" => "Cline",
                 "clinecode" => "ClineCode",
+                "antigravity" => "Antigravity",
                 other => other,
             };
             println!("Restart {tool_name} to activate hooks.");
@@ -210,7 +222,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, antigravity, all");
         return 1;
     };
 
@@ -249,6 +261,14 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
                 Ok(()) => true,
                 Err(e) => {
                     eprintln!("Failed to remove {tool} hooks: {e}");
+                    fail_count += 1;
+                    continue;
+                }
+            },
+            "antigravity" => match crate::hooks::antigravity::remove_extension() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Failed to remove antigravity extension: {e}");
                     fail_count += 1;
                     continue;
                 }
