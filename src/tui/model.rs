@@ -135,6 +135,7 @@ pub struct Agent {
     pub has_tcp: bool,
     pub directory: String,
     pub tag: String,
+    pub project: String,
     pub unread: usize,
     pub last_event_id: Option<u64>,
     pub device_name: Option<String>,
@@ -359,6 +360,7 @@ pub enum OverlayKind {
     Search,
     Command,
     Tag,
+    Project,
 }
 
 pub struct Overlay {
@@ -488,6 +490,7 @@ pub enum LaunchField {
     Tool,
     Count,
     Tag,
+    Project,
     Headless,
     Terminal,
 }
@@ -497,6 +500,7 @@ pub struct LaunchState {
     pub count: u8,
     pub options_cursor: Option<LaunchField>,
     pub tag: String,
+    pub project: String,
     pub headless: bool,
     pub terminal: usize,
     pub terminal_presets: Vec<String>,
@@ -525,6 +529,7 @@ impl LaunchState {
             count: 1,
             options_cursor: None,
             tag: defaults.tag,
+            project: defaults.project,
             headless: false,
             terminal: terminal_idx,
             terminal_presets: presets,
@@ -537,10 +542,10 @@ impl LaunchState {
     /// Height of the inline panel.
     pub fn panel_height(&self) -> u16 {
         if self.tool == Tool::Claude {
-            // sep + tool + count + tag + headless + terminal
+            // tool + count + tag + project + headless + terminal
             6
         } else {
-            // sep + tool + count + tag + terminal
+            // tool + count + tag + project + terminal
             5
         }
     }
@@ -552,6 +557,7 @@ impl LaunchState {
                 LaunchField::Tool,
                 LaunchField::Count,
                 LaunchField::Tag,
+                LaunchField::Project,
                 LaunchField::Headless,
                 LaunchField::Terminal,
             ]
@@ -560,6 +566,7 @@ impl LaunchState {
                 LaunchField::Tool,
                 LaunchField::Count,
                 LaunchField::Tag,
+                LaunchField::Project,
                 LaunchField::Terminal,
             ]
         }
@@ -615,7 +622,7 @@ impl LaunchState {
         self.auto_edit_text_field();
     }
 
-    /// Auto-enter editing mode when landing on a text field (Tag).
+    /// Auto-enter editing mode when landing on a text field (Tag, Project).
     fn auto_edit_text_field(&mut self) {
         if self.is_text_field() && self.editing.is_none() {
             self.start_editing();
@@ -663,7 +670,10 @@ impl LaunchState {
     }
 
     pub fn is_text_field(&self) -> bool {
-        matches!(self.options_cursor, Some(LaunchField::Tag))
+        matches!(
+            self.options_cursor,
+            Some(LaunchField::Tag) | Some(LaunchField::Project)
+        )
     }
 
     pub fn start_editing(&mut self) {
@@ -695,20 +705,25 @@ impl LaunchState {
     }
 
     pub fn edit_cursor_left(&mut self) {
-        if let Some(LaunchField::Tag) = self.editing {
-            cursor_left(&self.tag, &mut self.edit_cursor);
+        match self.editing {
+            Some(LaunchField::Tag) => cursor_left(&self.tag, &mut self.edit_cursor),
+            Some(LaunchField::Project) => cursor_left(&self.project, &mut self.edit_cursor),
+            _ => {}
         }
     }
 
     pub fn edit_cursor_right(&mut self) {
-        if let Some(LaunchField::Tag) = self.editing {
-            cursor_right(&self.tag, &mut self.edit_cursor);
+        match self.editing {
+            Some(LaunchField::Tag) => cursor_right(&self.tag, &mut self.edit_cursor),
+            Some(LaunchField::Project) => cursor_right(&self.project, &mut self.edit_cursor),
+            _ => {}
         }
     }
 
     pub fn field_value(&self, field: LaunchField) -> &str {
         match field {
             LaunchField::Tag => &self.tag,
+            LaunchField::Project => &self.project,
             _ => "",
         }
     }
@@ -716,31 +731,44 @@ impl LaunchState {
     pub fn field_value_mut(&mut self, field: LaunchField) -> Option<&mut String> {
         match field {
             LaunchField::Tag => Some(&mut self.tag),
+            LaunchField::Project => Some(&mut self.project),
             _ => None,
         }
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if let Some(LaunchField::Tag) = self.editing {
-            insert_at(&mut self.tag, &mut self.edit_cursor, c);
+        match self.editing {
+            Some(LaunchField::Tag) => insert_at(&mut self.tag, &mut self.edit_cursor, c),
+            Some(LaunchField::Project) => insert_at(&mut self.project, &mut self.edit_cursor, c),
+            _ => {}
         }
     }
 
     pub fn delete_char(&mut self) {
-        if let Some(LaunchField::Tag) = self.editing {
-            delete_back(&mut self.tag, &mut self.edit_cursor);
+        match self.editing {
+            Some(LaunchField::Tag) => delete_back(&mut self.tag, &mut self.edit_cursor),
+            Some(LaunchField::Project) => delete_back(&mut self.project, &mut self.edit_cursor),
+            _ => {}
         }
     }
 
     pub fn delete_word(&mut self) {
-        if let Some(LaunchField::Tag) = self.editing {
-            delete_word_back(&mut self.tag, &mut self.edit_cursor);
+        match self.editing {
+            Some(LaunchField::Tag) => delete_word_back(&mut self.tag, &mut self.edit_cursor),
+            Some(LaunchField::Project) => delete_word_back(&mut self.project, &mut self.edit_cursor),
+            _ => {}
         }
     }
 
     pub fn delete_to_start(&mut self) {
-        if let Some(LaunchField::Tag) = self.editing {
-            crate::tui::model::delete_to_start(&mut self.tag, &mut self.edit_cursor);
+        match self.editing {
+            Some(LaunchField::Tag) => {
+                crate::tui::model::delete_to_start(&mut self.tag, &mut self.edit_cursor);
+            }
+            Some(LaunchField::Project) => {
+                crate::tui::model::delete_to_start(&mut self.project, &mut self.edit_cursor);
+            }
+            _ => {}
         }
     }
 }
@@ -827,6 +855,7 @@ mod tests {
             has_tcp: true,
             directory: String::new(),
             tag: String::new(),
+            project: String::new(),
             unread: 0,
             last_event_id: None,
             device_name: None,
@@ -1256,6 +1285,7 @@ mod tests {
             count: 1,
             options_cursor: None,
             tag: String::new(),
+            project: String::new(),
             headless: false,
             terminal: 0,
             terminal_presets: vec!["default".into(), "kitty".into()],

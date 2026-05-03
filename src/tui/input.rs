@@ -415,7 +415,6 @@ impl App {
             KeyCode::Char('t') => {
                 let names = self.resolve_targets();
                 if !names.is_empty() {
-                    // Pre-fill with common tag if all targets share one
                     let tags: std::collections::HashSet<&str> = names
                         .iter()
                         .filter_map(|n| self.data.agents.iter().find(|a| a.name == *n))
@@ -427,6 +426,22 @@ impl App {
                         String::new()
                     };
                     self.ui.overlay = Some(Overlay::with(OverlayKind::Tag, names, common_tag));
+                }
+            }
+            KeyCode::Char('p') => {
+                let names = self.resolve_targets();
+                if !names.is_empty() {
+                    let projects: std::collections::HashSet<&str> = names
+                        .iter()
+                        .filter_map(|n| self.data.agents.iter().find(|a| a.name == *n))
+                        .map(|a| a.project.as_str())
+                        .collect();
+                    let common_project = if projects.len() == 1 {
+                        projects.into_iter().next().unwrap().to_string()
+                    } else {
+                        String::new()
+                    };
+                    self.ui.overlay = Some(Overlay::with(OverlayKind::Project, names, common_project));
                 }
             }
 
@@ -729,6 +744,30 @@ impl App {
                             format!("Tagging {}", targets[0])
                         } else {
                             format!("Tagging {} agents", targets.len())
+                        };
+                        self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
+                    }
+                }
+            }
+            OverlayKind::Project => {
+                let project = overlay.input.trim().to_string();
+                let targets = overlay.targets;
+                if !targets.is_empty() {
+                    for name in &targets {
+                        if let Err(e) = self.enqueue_rpc(RpcOp::Project {
+                            name: name.clone(),
+                            project: project.clone(),
+                        }) {
+                            self.ui.flash =
+                                Some(Flash::new(format!("Project set failed: {}", e), Theme::flash_err()));
+                            break;
+                        }
+                    }
+                    if self.ui.flash.is_none() {
+                        let label = if targets.len() == 1 {
+                            format!("Setting project for {}", targets[0])
+                        } else {
+                            format!("Setting project for {} agents", targets.len())
                         };
                         self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
                     }
@@ -1041,6 +1080,7 @@ impl App {
                 let tool = self.ui.launch.tool;
                 let count = self.ui.launch.count;
                 let tag = self.ui.launch.tag.clone();
+                let project = self.ui.launch.project.clone();
                 let headless = self.ui.launch.headless;
                 let terminal = self
                     .ui
@@ -1055,6 +1095,7 @@ impl App {
                     tool,
                     count,
                     tag,
+                    project,
                     headless,
                     terminal: terminal.into(),
                     prompt,
