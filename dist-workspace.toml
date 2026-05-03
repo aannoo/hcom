@@ -25,7 +25,7 @@ github-build-setup = "../build-setup.yml"
 # Custom permissions for reusable workflow jobs
 github-custom-job-permissions = { "publish-pypi" = { id-token = "write", contents = "write" } }
 # A GitHub repo to push Homebrew formulas to
-tap = "aannoo/homebrew-hcom"
+tap = "Solar2004/homebrew-hcom"
 # Whether dist should create a Github Release or use an existing draft
 create-release = true
 # Path that installers should place binaries in

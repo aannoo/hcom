@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "hcom"
-version = "0.7.14"
+version = "0.7.16"
 description = "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode."
 readme = "README.md"
 license = "MIT"
-authors = [{name = "aannoo"}]
+authors = [{name = "Solar2004"}]
 keywords = ["claude", "claude-code", "gemini", "codex", "opencode", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
 dependencies = []
 classifiers = [
@@ -24,10 +24,13 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aannoo/hcom"
-Repository = "https://github.com/aannoo/hcom"
-Issues = "https://github.com/aannoo/hcom/issues"
-Documentation = "https://github.com/aannoo/hcom#readme"
+Homepage = "https://github.com/Solar2004/hcom"
+
+Repository = "https://github.com/Solar2004/hcom"
+
+Issues = "https://github.com/Solar2004/hcom/issues"
+
+Documentation = "https://github.com/Solar2004/hcom#readme"
 
 [tool.maturin]
 bindings = "bin"

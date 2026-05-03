@@ -25,10 +25,15 @@ pub enum RpcOp {
         name: String,
         tag: String,
     },
+    Project {
+        name: String,
+        project: String,
+    },
     Launch {
         tool: Tool,
         count: u8,
         tag: String,
+        project: String,
         headless: bool,
         terminal: String,
         prompt: String,
@@ -129,6 +134,14 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             tag.clone(),
         ]),
 
+        RpcOp::Project { name, project } => commands::run_native(&[
+            "config".into(),
+            "-i".into(),
+            name.clone(),
+            "project".into(),
+            project.clone(),
+        ]),
+
         RpcOp::RelayToggle { enable } => {
             let flag = if *enable { "on" } else { "off" };
             commands::run_native(&["relay".into(), flag.into()])
@@ -157,11 +170,12 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             tool,
             count,
             tag,
+            project,
             headless,
             terminal,
             prompt,
         } => {
-            let argv = build_launch_argv(*tool, *count, tag, *headless, terminal, prompt);
+            let argv = build_launch_argv(*tool, *count, tag, project, *headless, terminal, prompt);
             commands::run_native(&argv)
         }
     }

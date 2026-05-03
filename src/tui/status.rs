@@ -163,6 +163,7 @@ mod tests {
             has_tcp: true,
             directory: String::new(),
             tag: String::new(),
+            project: String::new(),
             unread: 0,
             device_name: None,
             sync_age: None,

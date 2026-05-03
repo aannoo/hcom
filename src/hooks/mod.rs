@@ -1,11 +1,14 @@
 //! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode).
 
+pub mod antigravity;
 pub mod claude;
 pub mod claude_args;
+pub mod cline;
 pub mod codex;
 pub mod common;
 pub mod family;
 pub mod gemini;
+pub mod kilo;
 pub mod opencode;
 pub mod utils;
 
