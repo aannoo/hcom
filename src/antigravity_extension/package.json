@@ -1,0 +1,70 @@
+{
+  "name": "hcom-bridge",
+  "displayName": "hcom Bridge",
+  "description": "Bidirectional bridge between hcom agents and Antigravity's Jetski agent",
+  "version": "0.1.0",
+  "publisher": "hcom",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.68.0"
+  },
+  "categories": [
+    "Chat",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "hcom.hcom",
+        "name": "hcom",
+        "fullName": "hcom Agents",
+        "description": "Send messages to hcom agents and list active agents",
+        "isSticky": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "hcom.listAgents",
+        "title": "hcom: List active agents"
+      },
+      {
+        "command": "hcom.sendMessage",
+        "title": "hcom: Send message to agent"
+      },
+      {
+        "command": "hcom.showStatus",
+        "title": "hcom: Show connection status"
+      }
+    ],
+    "configuration": {
+      "title": "hcom Bridge",
+      "properties": {
+        "hcom.bridge.binaryPath": {
+          "type": "string",
+          "default": "hcom",
+          "description": "Path to the hcom binary. Defaults to 'hcom' in PATH."
+        },
+        "hcom.bridge.project": {
+          "type": "string",
+          "default": "",
+          "description": "hcom project to scope messages to."
+        },
+        "hcom.bridge.autoSendToJetski": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically forward incoming hcom messages to the Jetski agent panel."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@types/node": "^25.6.0",
+    "@types/vscode": "^1.118.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,15 @@
+#!/bin/sh
+# TaskComplete hook — called by Cline when a task completes
+# Reads: taskId from stdin JSON
+# Calls: hcom cline-stop --name <name> --reason=complete
+# Returns: cancel:false on success or error
+
+set -eu
+_I=$(cat) || exit 0
+_T=$(echo "$_I" | sed -n 's/.*"taskId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+[ -z "$_T" ] && { echo '{"cancel":false}'; exit 0; }
+_C="${XDG_CACHE_HOME:-$HOME/.cache}/hcom/cline"
+_N=$(cat "$_C/$_T.name" 2>/dev/null) || { echo '{"cancel":false}'; exit 0; }
+hcom cline-stop --name "$_N" --reason=complete 2>/dev/null || :
+rm -f "$_C/$_T.name" 2>/dev/null || :
+echo '{"cancel":false}'

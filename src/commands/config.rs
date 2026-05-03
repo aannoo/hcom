@@ -157,6 +157,7 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
         "subagent_timeout",
         "Instance-specific subagent timeout in seconds",
     ),
+    ("project", "Instance-scoped project isolation filter"),
 ];
 
 // ── Flag Parsing ─────────────────────────────────────────────────────────
@@ -540,6 +541,7 @@ fn config_instance(
                 Some(value) => serde_json::json!({"value": value}),
                 None => serde_json::json!({"value": serde_json::Value::Null}),
             },
+            "project" => serde_json::json!({"value": instance.project}),
             _ => serde_json::json!({"value": ""}),
         };
         println!(
@@ -650,6 +652,17 @@ fn config_instance(
                 }
             }
         }
+        "project" => {
+            let _ = db.conn().execute(
+                "UPDATE instances SET project = ? WHERE name = ?",
+                rusqlite::params![value, inst_name],
+            );
+            println!(
+                "{}",
+                render_config_instance_set_feedback(inst_name, "project", value)
+            );
+            instance_lifecycle::notify_all_instances(db);
+        }
         _ => {
             eprintln!("Error: Unknown key '{key}'");
             return 1;
@@ -687,10 +700,12 @@ pub fn render_config_instance_get(value: &Value, key: Option<&str>, json_mode: b
                 .and_then(|v| v.as_i64())
                 .map(|t| format!("{t}s"))
                 .unwrap_or_else(|| "(default)".to_string());
+            let project = value.get("project").and_then(|v| v.as_str()).unwrap_or("");
             format!(
-                "Agent: {display}\n  tag: {}\n  timeout: {timeout}s\n  hints: {}\n  subagent_timeout: {subagent_timeout}",
+                "Agent: {display}\n  tag: {}\n  timeout: {timeout}s\n  hints: {}\n  subagent_timeout: {subagent_timeout}\n  project: {}",
                 if tag.is_empty() { "(none)" } else { tag },
                 if hints.is_empty() { "(none)" } else { hints },
+                if project.is_empty() { "(none)" } else { project },
             )
         }
         Some(_) => value
@@ -734,6 +749,13 @@ pub fn render_config_instance_set_feedback(instance_name: &str, key: &str, value
                 format!("Set subagent_timeout for {instance_name}: {value}s")
             }
         }
+        "project" => {
+            if value.is_empty() {
+                format!("Cleared project for {instance_name}")
+            } else {
+                format!("Set project for {instance_name}: {value}")
+            }
+        }
         _ => format!("Updated {key} for {instance_name}"),
     }
 }
@@ -757,6 +779,7 @@ fn build_instance_config_json(
         "timeout": instance.wait_timeout,
         "hints": instance.hints.as_deref().filter(|s| !s.is_empty()),
         "subagent_timeout": instance.subagent_timeout,
+        "project": instance.project,
     })
 }
 
@@ -784,6 +807,7 @@ pub fn config_instance_get(
             Some(value) => serde_json::json!({"value": value}),
             None => serde_json::json!({"value": serde_json::Value::Null}),
         },
+        Some("project") => serde_json::json!({"value": instance.project}),
         Some(other) => return Err(format!("Unknown instance config key '{}'", other)),
     })
 }
@@ -864,6 +888,14 @@ pub fn config_instance_set(
                 updates.insert("subagent_timeout".into(), serde_json::json!(secs));
             }
             instances::update_instance_position(db, inst_name, &updates);
+        }
+        "project" => {
+            db.conn()
+                .execute(
+                    "UPDATE instances SET project = ? WHERE name = ?",
+                    rusqlite::params![value, inst_name],
+                )
+                .map_err(|e| e.to_string())?;
         }
         other => return Err(format!("Unknown instance config key '{}'", other)),
     }
@@ -2308,7 +2340,7 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            "Agent: team-luna\n  tag: team\n  timeout: 120s\n  hints: ship it\n  subagent_timeout: 45s"
+            "Agent: team-luna\n  tag: team\n  timeout: 120s\n  hints: ship it\n  subagent_timeout: 45s\n  project: (none)"
         );
     }
 
@@ -2327,7 +2359,7 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            "Agent: luna\n  tag: (none)\n  timeout: 86400s\n  hints: (none)\n  subagent_timeout: (default)"
+            "Agent: luna\n  tag: (none)\n  timeout: 86400s\n  hints: (none)\n  subagent_timeout: (default)\n  project: (none)"
         );
     }
 

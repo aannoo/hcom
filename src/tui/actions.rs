@@ -179,6 +179,20 @@ impl App {
                 }
                 other => self.ui.flash = Some(rpc_error_flash("Tag failed", other)),
             },
+            RpcOp::Project { name, project } => match result.result {
+                Ok(resp) if resp.ok() => {
+                    if let Some(agent) = self.data.agents.iter_mut().find(|a| a.name == name) {
+                        agent.project = project.clone();
+                    }
+                    self.ui.flash = if project.is_empty() {
+                        Some(Flash::new("Project cleared".into(), Theme::flash_info()))
+                    } else {
+                        Some(Flash::new(format!("Project set to {}", project), Theme::flash_ok()))
+                    };
+                    self.reload_data();
+                }
+                other => self.ui.flash = Some(rpc_error_flash("Project set failed", other)),
+            },
             RpcOp::Launch { tool, count, .. } => match result.result {
                 Ok(resp) if resp.ok() => {
                     self.ui.flash = Some(Flash::new(

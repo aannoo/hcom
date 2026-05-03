@@ -708,7 +708,7 @@ impl Proxy {
 
         let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
             Ok(Tool::Claude) | Ok(Tool::Codex) => Duration::from_secs(5), // Ready pattern unreliable (Claude: accept-edits, Codex: narrow terminals)
-            Ok(Tool::OpenCode) => Duration::from_secs(5), // Empty ready_pattern fires immediately; 5s fallback
+            Ok(Tool::OpenCode) | Ok(Tool::Cline) => Duration::from_secs(5), // Empty ready_pattern fires immediately; 5s fallback
             _ => Duration::from_secs(60),                 // Gemini: ready pattern always visible
         };
 

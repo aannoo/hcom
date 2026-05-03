@@ -313,6 +313,18 @@ impl ToolConfig {
         }
     }
 
+    /// Get config for KiloCode (fork of OpenCode — same plugin-based delivery).
+    pub fn kilocode() -> Self {
+        Self {
+            tool: "kilocode".to_string(),
+            require_idle: false,
+            require_ready_prompt: false,
+            require_prompt_empty: false,
+            block_on_user_activity: false,
+            block_on_approval: false,
+        }
+    }
+
     /// Get config by tool.
     pub fn for_tool(tool: crate::tool::Tool) -> Self {
         match tool {
@@ -320,6 +332,8 @@ impl ToolConfig {
             crate::tool::Tool::Gemini => Self::gemini(),
             crate::tool::Tool::Codex => Self::codex(),
             crate::tool::Tool::OpenCode => Self::opencode(),
+            crate::tool::Tool::Kilo => Self::kilocode(),
+            crate::tool::Tool::Cline => Self::opencode(),
             crate::tool::Tool::Adhoc => Self::claude(),
         }
     }
@@ -597,7 +611,7 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(Tool::from_str(&config.tool), Ok(Tool::OpenCode)) {
+    if matches!(Tool::from_str(&config.tool), Ok(Tool::OpenCode) | Ok(Tool::Kilo) | Ok(Tool::Cline)) {
         log_info(
             "native",
             "delivery.opencode_mode",

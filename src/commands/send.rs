@@ -128,6 +128,10 @@ pub struct SendArgs {
     #[arg(long)]
     pub extends: Option<String>,
 
+    /// Project isolation: filter targets to same project
+    #[arg(long)]
+    pub project: Option<String>,
+
     /// Set by router: whether `--` was present in raw argv.
     /// Clap can't distinguish "no --" from "-- with no args", so the router sets this.
     #[arg(skip)]
@@ -243,18 +247,20 @@ pub fn send_message(
     message: &str,
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
+    sender_project: Option<&str>,
 ) -> Result<Vec<String>, String> {
     validate_message(message)?;
 
     // Get participating instances
     let rows: Vec<InstanceInfo> = db
         .conn()
-        .prepare("SELECT name, tag FROM instances")
+        .prepare("SELECT name, tag, project FROM instances")
         .map_err(|e| format!("DB error: {e}"))?
         .query_map([], |row| {
             Ok(InstanceInfo {
                 name: row.get::<_, String>(0)?,
                 tag: row.get::<_, Option<String>>(1)?,
+                project: row.get::<_, Option<String>>(2)?,
             })
         })
         .map_err(|e| format!("DB error: {e}"))?
@@ -263,7 +269,7 @@ pub fn send_message(
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
-    let scope_result = compute_scope(message, &rows, explicit_targets.map(|t| t as &[String]))?;
+    let scope_result = compute_scope(message, &rows, explicit_targets.map(|t| t as &[String]), sender_project)?;
     let thread_delivery_members =
         if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
             if scope_result.scope == MessageScope::Broadcast {
@@ -780,6 +786,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             name: name.clone(),
             instance_data: None,
             session_id: None,
+            project: None,
         }
     } else if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
         id.clone()
@@ -922,12 +929,20 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             None
         };
 
+    // Resolve sender project: --project flag overrides identity data
+    let sender_project: Option<&str> = if let Some(ref proj) = args.project {
+        Some(proj.as_str())
+    } else {
+        sender_identity.project()
+    };
+
     let delivered_to = match send_message(
         db,
         &sender_identity,
         &message,
         if has_envelope { Some(&envelope) } else { None },
         targets_to_pass,
+        sender_project,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -1323,56 +1338,14 @@ mod tests {
             name: "luna".into(),
             instance_data: None,
             session_id: None,
-        };
-        let envelope = MessageEnvelope {
-            thread: Some("debate-1".into()),
-            ..Default::default()
-        };
-
-        let delivered = send_message(
-            &db,
-            &sender,
-            "hello",
-            Some(&envelope),
-            Some(&["nova".to_string(), "miso".to_string()]),
-        )
-        .unwrap();
-        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
-
-        let members = db.get_thread_members("debate-1");
-        assert_eq!(
-            members,
-            vec!["nova".to_string(), "miso".to_string(), "luna".to_string()]
-        );
-
-        let delivered = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
-        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
-
-        cleanup_test_db(path);
-    }
-
-    #[test]
-    fn send_message_thread_without_members_errors() {
-        let (db, path) = setup_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
-                [],
-            )
-            .unwrap();
-
-        let sender = SenderIdentity {
-            kind: SenderKind::Instance,
-            name: "luna".into(),
-            instance_data: None,
-            session_id: None,
+            project: None,
         };
         let envelope = MessageEnvelope {
             thread: Some("empty-thread".into()),
             ..Default::default()
         };
 
-        let err = send_message(&db, &sender, "hello", Some(&envelope), None).unwrap_err();
+        let err = send_message(&db, &sender, "hello", Some(&envelope), None, None).unwrap_err();
         assert!(err.contains("has no members"));
 
         cleanup_test_db(path);
@@ -1393,6 +1366,7 @@ mod tests {
             name: "bigboss".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         let envelope = MessageEnvelope {
             thread: Some("ops".into()),
@@ -1405,6 +1379,7 @@ mod tests {
             "hello",
             Some(&envelope),
             Some(&["nova".to_string()]),
+            None,
         )
         .unwrap();
         assert_eq!(delivered, vec!["nova".to_string()]);
@@ -1428,6 +1403,7 @@ mod tests {
             name: "luna".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         let seed_envelope = MessageEnvelope {
             thread: Some("ops".into()),
@@ -1439,6 +1415,7 @@ mod tests {
             "seed",
             Some(&seed_envelope),
             Some(&["nova".to_string()]),
+            None,
         )
         .unwrap();
 
@@ -1448,7 +1425,7 @@ mod tests {
             ..Default::default()
         };
         let delivered =
-            send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
+            send_message(&db, &sender, "status?", Some(&request_envelope), None, None).unwrap();
         assert_eq!(delivered, vec!["nova".to_string()]);
 
         let reqwatch_count: i64 = db

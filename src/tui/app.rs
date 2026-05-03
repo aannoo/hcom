@@ -76,6 +76,7 @@ impl App {
                 overlay: None,
                 pending_eject_cmd: false,
                 term_width: 80,
+                project_filter: None,
             },
         }
     }
@@ -368,6 +369,7 @@ mod tests {
             has_tcp: true,
             directory: String::new(),
             tag: String::new(),
+            project: String::new(),
             unread: 0,
             last_event_id: None,
             device_name: None,
@@ -416,6 +418,7 @@ mod tests {
                     count: 1,
                     options_cursor: None,
                     tag: String::new(),
+                    project: String::new(),
                     headless: false,
                     terminal: 0,
                     terminal_presets: vec!["default".into()],
@@ -449,6 +452,7 @@ mod tests {
                 overlay: None,
                 pending_eject_cmd: false,
                 term_width: 80,
+                project_filter: None,
             },
             ejector: Ejector::new(),
             source: Box::new(NullSource),

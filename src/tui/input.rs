@@ -415,7 +415,6 @@ impl App {
             KeyCode::Char('t') => {
                 let names = self.resolve_targets();
                 if !names.is_empty() {
-                    // Pre-fill with common tag if all targets share one
                     let tags: std::collections::HashSet<&str> = names
                         .iter()
                         .filter_map(|n| self.data.agents.iter().find(|a| a.name == *n))
@@ -427,6 +426,22 @@ impl App {
                         String::new()
                     };
                     self.ui.overlay = Some(Overlay::with(OverlayKind::Tag, names, common_tag));
+                }
+            }
+            KeyCode::Char('p') => {
+                let names = self.resolve_targets();
+                if !names.is_empty() {
+                    let projects: std::collections::HashSet<&str> = names
+                        .iter()
+                        .filter_map(|n| self.data.agents.iter().find(|a| a.name == *n))
+                        .map(|a| a.project.as_str())
+                        .collect();
+                    let common_project = if projects.len() == 1 {
+                        projects.into_iter().next().unwrap().to_string()
+                    } else {
+                        String::new()
+                    };
+                    self.ui.overlay = Some(Overlay::with(OverlayKind::Project, names, common_project));
                 }
             }
 
@@ -450,6 +465,14 @@ impl App {
                 self.ui.mode = InputMode::Compose;
                 self.ui.input.clear();
                 self.ui.input_cursor = 0;
+            }
+
+            KeyCode::Char('F') => {
+                let current = self.ui.project_filter.clone().unwrap_or_default();
+                let cursor = current.len();
+                self.ui.overlay = Some(Overlay::new(OverlayKind::ProjectFilter));
+                self.ui.overlay.as_mut().unwrap().input = current;
+                self.ui.overlay.as_mut().unwrap().cursor = cursor;
             }
 
             // OVERLAYS
@@ -734,6 +757,37 @@ impl App {
                     }
                 }
             }
+            OverlayKind::ProjectFilter => {
+                self.ui.project_filter = if overlay.input.trim().is_empty() {
+                    None
+                } else {
+                    Some(overlay.input.trim().to_string())
+                };
+            }
+            OverlayKind::Project => {
+                let project = overlay.input.trim().to_string();
+                let targets = overlay.targets;
+                if !targets.is_empty() {
+                    for name in &targets {
+                        if let Err(e) = self.enqueue_rpc(RpcOp::Project {
+                            name: name.clone(),
+                            project: project.clone(),
+                        }) {
+                            self.ui.flash =
+                                Some(Flash::new(format!("Project set failed: {}", e), Theme::flash_err()));
+                            break;
+                        }
+                    }
+                    if self.ui.flash.is_none() {
+                        let label = if targets.len() == 1 {
+                            format!("Setting project for {}", targets[0])
+                        } else {
+                            format!("Setting project for {} agents", targets.len())
+                        };
+                        self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
+                    }
+                }
+            }
         }
     }
 
@@ -750,6 +804,8 @@ impl App {
             if had_search {
                 self.ui.trigger_inline_replay();
             }
+        } else if overlay.kind == OverlayKind::ProjectFilter {
+            self.ui.project_filter = None;
         }
     }
 
@@ -1016,10 +1072,10 @@ impl App {
                 self.ui.mode = InputMode::Navigate;
             }
 
-            KeyCode::Left if self.ui.input.is_empty() => {
+            KeyCode::Left => {
                 self.ui.launch.tool = self.ui.launch.tool.prev();
             }
-            KeyCode::Right if self.ui.input.is_empty() => {
+            KeyCode::Right => {
                 self.ui.launch.tool = self.ui.launch.tool.next();
             }
 
@@ -1034,13 +1090,12 @@ impl App {
 
             KeyCode::Home => self.ui.input_cursor = 0,
             KeyCode::End => self.ui.input_cursor = self.ui.input.len(),
-            KeyCode::Left => cursor_left(&self.ui.input, &mut self.ui.input_cursor),
-            KeyCode::Right => cursor_right(&self.ui.input, &mut self.ui.input_cursor),
 
             KeyCode::Enter => {
                 let tool = self.ui.launch.tool;
                 let count = self.ui.launch.count;
                 let tag = self.ui.launch.tag.clone();
+                let project = self.ui.launch.project.clone();
                 let headless = self.ui.launch.headless;
                 let terminal = self
                     .ui
@@ -1055,6 +1110,7 @@ impl App {
                     tool,
                     count,
                     tag,
+                    project,
                     headless,
                     terminal: terminal.into(),
                     prompt,
