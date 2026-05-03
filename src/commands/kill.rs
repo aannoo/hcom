@@ -236,6 +236,9 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
     } else if !preset_name.is_empty()
         && crate::config::get_merged_preset(preset_name).is_some_and(|p| p.close.is_some())
     {
+        if crate::terminal::is_zellij_preset(preset_name) {
+            return " (zellij pane close unconfirmed)".to_string();
+        }
         format!(" (pane close failed for {})", preset_name)
     } else {
         String::new()
@@ -305,6 +308,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             &orphan.process_id,
             &orphan.kitty_listen_on,
             &orphan.terminal_id,
+            &orphan.zellij_session_name,
         );
         let names = orphan.names.join(", ");
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
@@ -411,6 +415,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             &orphan.process_id,
             &orphan.kitty_listen_on,
             &orphan.terminal_id,
+            &orphan.zellij_session_name,
         );
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
         match result {
@@ -473,6 +478,7 @@ fn kill_single(
                     &orphan.process_id,
                     &orphan.kitty_listen_on,
                     &orphan.terminal_id,
+                    &orphan.zellij_session_name,
                 );
                 let pane_info =
                     pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
@@ -572,7 +578,7 @@ fn kill_instance(
 ) -> (terminal::KillResult, bool, String, String) {
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
-        let (result, pane_closed) = terminal::kill_process(pid, "", "", "", "", "");
+        let (result, pane_closed) = terminal::kill_process(pid, "", "", "", "", "", "");
         let result = normalize_kill_result(name, pid, result);
         log_info(
             "kill",
@@ -597,6 +603,7 @@ fn kill_instance(
         &ti.process_id,
         &ti.kitty_listen_on,
         &ti.terminal_id,
+        &ti.zellij_session_name,
     );
     let result = normalize_kill_result(name, pid, result);
 

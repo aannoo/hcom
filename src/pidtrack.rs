@@ -28,6 +28,8 @@ pub struct PidEntry {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kitty_listen_on: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub zellij_session_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notify_port: u16,
@@ -53,6 +55,7 @@ pub struct OrphanProcess {
     pub pane_id: String,
     pub terminal_id: String,
     pub kitty_listen_on: String,
+    pub zellij_session_name: String,
     pub session_id: String,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -71,6 +74,7 @@ impl From<(u32, &PidEntry)> for OrphanProcess {
             pane_id: entry.pane_id.clone(),
             terminal_id: entry.terminal_id.clone(),
             kitty_listen_on: entry.kitty_listen_on.clone(),
+            zellij_session_name: entry.zellij_session_name.clone(),
             session_id: entry.session_id.clone(),
             notify_port: entry.notify_port,
             inject_port: entry.inject_port,
@@ -125,6 +129,7 @@ pub struct PidRecord<'a> {
     pub pane_id: &'a str,
     pub terminal_id: &'a str,
     pub kitty_listen_on: &'a str,
+    pub zellij_session_name: &'a str,
     pub session_id: &'a str,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -151,6 +156,7 @@ impl<'a> PidRecord<'a> {
             pane_id: "",
             terminal_id: "",
             kitty_listen_on: "",
+            zellij_session_name: "",
             session_id: "",
             notify_port: 0,
             inject_port: 0,
@@ -172,6 +178,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         pane_id,
         terminal_id,
         kitty_listen_on,
+        zellij_session_name,
         session_id,
         notify_port,
         inject_port,
@@ -201,6 +208,9 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !kitty_listen_on.is_empty() && entry.kitty_listen_on.is_empty() {
             entry.kitty_listen_on = kitty_listen_on.to_string();
         }
+        if !zellij_session_name.is_empty() && entry.zellij_session_name.is_empty() {
+            entry.zellij_session_name = zellij_session_name.to_string();
+        }
         if !session_id.is_empty() && entry.session_id.is_empty() {
             entry.session_id = session_id.to_string();
         }
@@ -226,6 +236,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 pane_id: pane_id.to_string(),
                 terminal_id: terminal_id.to_string(),
                 kitty_listen_on: kitty_listen_on.to_string(),
+                zellij_session_name: zellij_session_name.to_string(),
                 session_id: session_id.to_string(),
                 notify_port: *notify_port,
                 inject_port: *inject_port,
@@ -357,6 +368,12 @@ pub fn recover_single_orphan_to_db(
             serde_json::json!(orphan.kitty_listen_on),
         );
     }
+    if !orphan.zellij_session_name.is_empty() {
+        launch_context.insert(
+            "env".into(),
+            serde_json::json!({ "ZELLIJ_SESSION_NAME": orphan.zellij_session_name }),
+        );
+    }
     if !launch_context.is_empty() {
         updates.insert(
             "launch_context".into(),
@@ -438,6 +455,7 @@ mod tests {
             pane_id: "pane-1",
             terminal_id: "term-1",
             kitty_listen_on: "/tmp/kitty.sock",
+            zellij_session_name: "wise-kangaroo",
             session_id: "sess-1",
             notify_port: 8080,
             inject_port: 8081,
@@ -454,6 +472,7 @@ mod tests {
         assert_eq!(entry.pane_id, "pane-1");
         assert_eq!(entry.terminal_id, "term-1");
         assert_eq!(entry.kitty_listen_on, "/tmp/kitty.sock");
+        assert_eq!(entry.zellij_session_name, "wise-kangaroo");
         assert_eq!(entry.session_id, "sess-1");
         assert_eq!(entry.notify_port, 8080);
         assert_eq!(entry.inject_port, 8081);
@@ -477,6 +496,7 @@ mod tests {
         record_pid(&PidRecord {
             process_id: "pid-1",
             terminal_preset: "kitty",
+            zellij_session_name: "wise-kangaroo",
             notify_port: 8080,
             ..rec(dir.path(), 12345, "claude", "luna")
         });
@@ -485,6 +505,7 @@ mod tests {
         let entry = data.get("12345").unwrap();
         assert_eq!(entry.process_id, "pid-1");
         assert_eq!(entry.terminal_preset, "kitty");
+        assert_eq!(entry.zellij_session_name, "wise-kangaroo");
         assert_eq!(entry.notify_port, 8080);
     }
 
@@ -592,6 +613,7 @@ mod tests {
             pane_id: String::new(),
             terminal_id: String::new(),
             kitty_listen_on: String::new(),
+            zellij_session_name: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,

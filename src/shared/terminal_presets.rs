@@ -232,7 +232,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 Some("zellij"),
                 None,
                 "zellij action new-pane -- bash {script}",
-                None,
+                Some("zellij action close-pane --pane-id {pane_id}"),
                 Some("ZELLIJ_PANE_ID"),
                 DL,
             ),

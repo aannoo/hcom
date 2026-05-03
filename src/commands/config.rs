@@ -1520,6 +1520,7 @@ pub fn terminal_help_text(show_current: bool) -> String {
         ("wezterm", "auto tab/split/window"),
         ("tmux", "detached sessions"),
         ("cmux", "workspaces"),
+        ("zellij", "panes"),
     ];
     const MANAGED_VARIANTS: &[(&str, &[&str])] = &[
         ("kitty", &["kitty-window", "kitty-tab", "kitty-split"]),
@@ -2167,6 +2168,24 @@ mod tests {
 
         assert!(managed.contains("cmux"));
         assert!(!other.contains("cmux"));
+    }
+
+    #[test]
+    fn test_terminal_help_text_lists_close_capable_zellij_as_managed() {
+        crate::config::Config::reset();
+        crate::config::Config::init();
+        let help = terminal_help_text(false);
+        let managed = help
+            .split("Other (opens window only):")
+            .next()
+            .expect("managed section should exist");
+        let other = help
+            .split("Other (opens window only):")
+            .nth(1)
+            .expect("other section should exist");
+
+        assert!(managed.contains("zellij"));
+        assert!(!other.contains("zellij"));
     }
 
     #[test]

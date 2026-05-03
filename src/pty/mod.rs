@@ -419,7 +419,12 @@ fn build_early_launch_context() -> String {
     }
 
     // Capture pane_id from terminal env vars for same-window launches.
-    let pane_id_vars: &[&str] = &["WEZTERM_PANE", "TMUX_PANE", "KITTY_WINDOW_ID"];
+    let pane_id_vars: &[&str] = &[
+        "WEZTERM_PANE",
+        "TMUX_PANE",
+        "KITTY_WINDOW_ID",
+        "ZELLIJ_PANE_ID",
+    ];
     for &var in pane_id_vars {
         if let Ok(val) = std::env::var(var) {
             if !val.is_empty() {

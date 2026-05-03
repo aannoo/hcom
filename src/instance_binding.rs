@@ -211,6 +211,11 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
                 if let Ok(content) = std::fs::read_to_string(&id_file) {
                     let terminal_id = content.trim().to_string();
                     if !terminal_id.is_empty() {
+                        if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij") {
+                            if let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id) {
+                                ctx.insert("pane_id".into(), serde_json::json!(pane_id));
+                            }
+                        }
                         ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
                     }
                 }
@@ -220,6 +225,13 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     }
 
     ctx
+}
+
+fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
+    terminal_id
+        .strip_prefix("terminal_")
+        .filter(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+        .map(|suffix| suffix.to_string())
 }
 
 /// Bind session_id to canonical instance for process_id.

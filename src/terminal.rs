@@ -37,6 +37,7 @@ pub struct TerminalInfo {
     pub process_id: String,
     pub kitty_listen_on: String,
     pub terminal_id: String,
+    pub zellij_session_name: String,
 }
 
 /// Result from launch_terminal.
@@ -73,7 +74,6 @@ const TERMINAL_CONTEXT_VARS: &[&str] = &[
     "CMUX_SURFACE_ID",
     "TMUX_PANE",
     "ZELLIJ_PANE_ID",
-    "ZELLIJ_SESSION_NAME",
     // GPU/rich terminals
     "KITTY_WINDOW_ID",
     "KITTY_PID",
@@ -734,6 +734,13 @@ pub fn create_bash_script(
 ///
 /// Strips AI tool markers, hcom identity vars, and terminal context vars.
 fn get_launcher_env() -> HashMap<String, String> {
+    get_launcher_env_from(std::env::vars())
+}
+
+fn get_launcher_env_from<I>(vars: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     let mut strip: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for v in TOOL_MARKER_VARS {
         strip.insert(v);
@@ -746,7 +753,7 @@ fn get_launcher_env() -> HashMap<String, String> {
     }
     strip.insert("HCOM_LAUNCHED_PRESET");
 
-    std::env::vars()
+    vars.into_iter()
         .filter(|(k, _)| !strip.contains(k.as_str()))
         .collect()
 }
@@ -1067,6 +1074,69 @@ fn maybe_append_ai_tool_launch_hint(
     format!("{message}\n{hint}")
 }
 
+fn zellij_action_stderr_failure(argv: &[String], stderr: &str) -> Option<String> {
+    if argv.first().map(|s| s.as_str()) != Some("zellij") {
+        return None;
+    }
+
+    let stderr = stderr.trim();
+    if stderr.contains("Please specify the session name to send actions to") {
+        return Some(stderr.to_string());
+    }
+
+    None
+}
+
+pub fn is_zellij_preset(preset_name: &str) -> bool {
+    if preset_name == "zellij" {
+        return true;
+    }
+
+    crate::config::get_merged_preset(preset_name).is_some_and(|preset| {
+        preset.binary.as_deref() == Some("zellij")
+            || preset.open.starts_with("zellij ")
+            || preset
+                .close
+                .as_deref()
+                .is_some_and(|close| close.starts_with("zellij "))
+    })
+}
+
+fn validate_terminal_launch_output(
+    argv: &[String],
+    output: &std::process::Output,
+    inside_ai_tool: bool,
+) -> Result<()> {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        let msg = format!(
+            "Terminal launch failed (exit code {})",
+            output.status.code().unwrap_or(-1)
+        );
+        let full_msg = if stderr.is_empty() {
+            msg
+        } else {
+            format!("{}: {}", msg, stderr)
+        };
+        bail!(maybe_append_ai_tool_launch_hint(
+            full_msg,
+            argv,
+            inside_ai_tool
+        ));
+    }
+
+    if let Some(msg) = zellij_action_stderr_failure(argv, &stderr) {
+        bail!(maybe_append_ai_tool_launch_hint(
+            format!("Terminal launch failed: {msg}"),
+            argv,
+            inside_ai_tool
+        ));
+    }
+
+    Ok(())
+}
+
 fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool, String)> {
     let launcher_env = get_launcher_env();
     let env_vec: Vec<(String, String)> = launcher_env.into_iter().collect();
@@ -1102,23 +1172,7 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
             .unwrap_or("")
             .to_string();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let msg = format!(
-                "Terminal launch failed (exit code {})",
-                output.status.code().unwrap_or(-1)
-            );
-            let full_msg = if stderr.is_empty() {
-                msg
-            } else {
-                format!("{}: {}", msg, stderr)
-            };
-            bail!(maybe_append_ai_tool_launch_hint(
-                full_msg,
-                argv,
-                inside_ai_tool
-            ));
-        }
+        validate_terminal_launch_output(argv, &output, inside_ai_tool)?;
 
         Ok((true, captured))
     } else {
@@ -1130,14 +1184,7 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
             .output()
             .context("Failed to run terminal launcher")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            bail!(
-                "Terminal launch failed (exit code {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr
-            );
-        }
+        validate_terminal_launch_output(argv, &output, inside_ai_tool)?;
 
         let captured = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -1354,10 +1401,7 @@ pub fn launch_terminal(
     let script_str = script_file.to_string_lossy().to_string();
 
     if terminal_mode == "warp" {
-        let process_id = env
-            .get("HCOM_PROCESS_ID")
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let process_id = env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or("");
         if process_id.is_empty() {
             bail!("warp preset requires HCOM_PROCESS_ID to name the launch config");
         }
@@ -1479,6 +1523,7 @@ pub fn close_terminal_pane(
     process_id: &str,
     kitty_listen_on: &str,
     terminal_id: &str,
+    zellij_session_name: &str,
 ) -> bool {
     let merged = match crate::config::get_merged_preset(preset_name) {
         Some(p) => p,
@@ -1515,6 +1560,26 @@ pub fn close_terminal_pane(
     close_cmd = close_cmd.replace("{process_id}", process_id);
     close_cmd = close_cmd.replace("{id}", terminal_id);
 
+    let is_zellij = is_zellij_preset(preset_name);
+
+    let zellij_before_close = if is_zellij {
+        match zellij_terminal_pane_exists(zellij_session_name, effective_pane_id) {
+            Some(true) => Some(true),
+            Some(false) => return false,
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if is_zellij && !zellij_session_name.is_empty() && close_cmd.starts_with("zellij action ") {
+        close_cmd = format!(
+            "zellij --session {}{}",
+            shell_quote(zellij_session_name),
+            &close_cmd["zellij".len()..]
+        );
+    }
+
     // Resolve binary path via app bundle fallback
     if let Some(ref binary) = merged.binary {
         let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
@@ -1546,15 +1611,54 @@ pub fn close_terminal_pane(
         );
     }
 
-    // Execute
-    Command::new("sh")
+    let output = Command::new("sh")
         .args(["-c", &close_cmd])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    if is_zellij {
+        return zellij_before_close == Some(true)
+            && zellij_terminal_pane_exists(zellij_session_name, effective_pane_id) == Some(false);
+    }
+
+    true
+}
+
+fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool> {
+    let pane_num = pane_id
+        .strip_prefix("terminal_")
+        .unwrap_or(pane_id)
+        .parse::<i64>()
+        .ok()?;
+
+    let mut command = Command::new("zellij");
+    if !session_name.is_empty() {
+        command.args(["--session", session_name]);
+    }
+    let output = command
+        .args(["action", "list-panes", "--json", "--all"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let panes = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+    let panes = panes.as_array()?;
+    Some(panes.iter().any(|pane| {
+        pane.get("is_plugin").and_then(|v| v.as_bool()) == Some(false)
+            && pane.get("id").and_then(|v| v.as_i64()) == Some(pane_num)
+    }))
 }
 
 /// Close terminal pane (if applicable) then SIGTERM the process group.
@@ -1565,6 +1669,7 @@ pub fn kill_process(
     process_id: &str,
     kitty_listen_on: &str,
     terminal_id: &str,
+    zellij_session_name: &str,
 ) -> (KillResult, bool) {
     let pane_closed = if !preset_name.is_empty() {
         close_terminal_pane(
@@ -1574,6 +1679,7 @@ pub fn kill_process(
             process_id,
             kitty_listen_on,
             terminal_id,
+            zellij_session_name,
         )
     } else {
         false
@@ -1634,6 +1740,11 @@ pub fn resolve_terminal_info(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if is_zellij_preset(&info.preset_name) {
+                if let Some(pane_id) = zellij_pane_id_from_terminal_id(&info.terminal_id) {
+                    info.pane_id = pane_id;
+                }
+            }
             // Kitty socket from launch context or env snapshot
             let lc_env = lc.get("env").and_then(|v| v.as_object());
             info.kitty_listen_on = lc
@@ -1641,6 +1752,10 @@ pub fn resolve_terminal_info(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
+                .unwrap_or("")
+                .to_string();
+            info.zellij_session_name = lc_env
+                .and_then(|e| e.get("ZELLIJ_SESSION_NAME").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_string();
         }
@@ -1661,10 +1776,18 @@ pub fn resolve_terminal_info_from_launch_context(launch_context_json: &str) -> T
     resolve_terminal_info(None, Some(launch_context_json))
 }
 
+fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
+    terminal_id
+        .strip_prefix("terminal_")
+        .filter(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+        .map(|suffix| suffix.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn test_shell_quote_empty() {
@@ -1728,6 +1851,67 @@ mod tests {
     }
 
     #[test]
+    fn test_launcher_env_preserves_zellij_session_but_strips_pane() {
+        let env = get_launcher_env_from(vec![
+            (
+                "ZELLIJ_SESSION_NAME".to_string(),
+                "wise-kangaroo".to_string(),
+            ),
+            ("ZELLIJ_PANE_ID".to_string(), "18".to_string()),
+            ("HCOM_LAUNCHED_PRESET".to_string(), "zellij".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+        ]);
+
+        assert_eq!(
+            env.get("ZELLIJ_SESSION_NAME").map(String::as_str),
+            Some("wise-kangaroo")
+        );
+        assert!(!env.contains_key("ZELLIJ_PANE_ID"));
+        assert!(!env.contains_key("HCOM_LAUNCHED_PRESET"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn test_zellij_session_ambiguity_stderr_fails_launch_even_with_exit_zero() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: b"Please specify the session name to send actions to. The following sessions are active:\n".to_vec(),
+        };
+
+        let err = validate_terminal_launch_output(
+            &[
+                "zellij".to_string(),
+                "action".to_string(),
+                "new-pane".to_string(),
+            ],
+            &output,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Terminal launch failed"));
+        assert!(err.contains("Please specify the session name"));
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_prefers_zellij_terminal_id_over_env_pane_id() {
+        let info = resolve_terminal_info(
+            Some("zellij"),
+            Some(r#"{"pane_id":"18","terminal_id":"terminal_6","process_id":"proc-1"}"#),
+        );
+
+        assert_eq!(info.pane_id, "6");
+        assert_eq!(info.terminal_id, "terminal_6");
+    }
+
+    #[test]
+    fn test_is_zellij_preset_does_not_match_name_prefix_only() {
+        assert!(!is_zellij_preset("zellijish"));
+    }
+
+    #[test]
     fn test_yaml_double_quote_escapes_backslash_and_quote() {
         assert_eq!(yaml_double_quote("a\"b"), "\"a\\\"b\"");
         assert_eq!(yaml_double_quote("a\\b"), "\"a\\\\b\"");
@@ -1774,7 +1958,10 @@ mod tests {
     #[test]
     fn test_resolve_warp_cwd_uses_current_dir_for_relative_or_missing() {
         let home = Path::new("/h");
-        let cwd_str = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        let cwd_str = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         // Must match the prefix the script's later `cd <cwd>` resolves against.
         assert_eq!(resolve_warp_cwd(Some("subdir"), home), cwd_str);
         assert_eq!(resolve_warp_cwd(Some("./rel"), home), cwd_str);

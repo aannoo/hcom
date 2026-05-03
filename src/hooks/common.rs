@@ -1004,6 +1004,7 @@ fn stop_instance_inner(
                 let mut proc_id = ti.process_id;
                 let terminal_id = ti.terminal_id;
                 let kitty_listen_on = ti.kitty_listen_on;
+                let zellij_session_name = ti.zellij_session_name;
                 // Fallback: process_bindings table
                 if proc_id.is_empty() {
                     if let Ok(mut stmt) = db
@@ -1048,6 +1049,7 @@ fn stop_instance_inner(
                     pane_id: &pane_id,
                     terminal_id: &terminal_id,
                     kitty_listen_on: &kitty_listen_on,
+                    zellij_session_name: &zellij_session_name,
                     session_id: instance_data.session_id.as_deref().unwrap_or(""),
                     notify_port,
                     inject_port,
