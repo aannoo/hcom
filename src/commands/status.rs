@@ -59,6 +59,14 @@ fn check_kilocode_hooks() -> bool {
     crate::hooks::kilo::verify_kilocode_plugin_installed()
 }
 
+fn check_cline_hooks() -> bool {
+    crate::hooks::cline::verify_cline_plugin_installed()
+}
+
+fn check_clinecode_hooks() -> bool {
+    crate::hooks::cline::verify_cline_plugin_installed()
+}
+
 // ── Status Collection ────────────────────────────────────────────────────
 
 struct ToolStatus {
@@ -110,6 +118,16 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
             name: "KiloCode",
             installed: is_in_path("kilocode"),
             hooks: check_kilocode_hooks(),
+        },
+        ToolStatus {
+            name: "Cline",
+            installed: is_in_path("cline"),
+            hooks: check_cline_hooks(),
+        },
+        ToolStatus {
+            name: "ClineCode",
+            installed: is_in_path("clinecode"),
+            hooks: check_clinecode_hooks(),
         },
     ]
 }
@@ -265,6 +283,14 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 "kilocode": {
                     "installed": tools[5].installed,
                     "hooks": tools[5].hooks,
+                },
+                "cline": {
+                    "installed": tools[6].installed,
+                    "hooks": tools[6].hooks,
+                },
+                "clinecode": {
+                    "installed": tools[7].installed,
+                    "hooks": tools[7].hooks,
                 },
             },
             "terminal": {

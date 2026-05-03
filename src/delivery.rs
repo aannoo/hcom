@@ -333,6 +333,7 @@ impl ToolConfig {
             crate::tool::Tool::Codex => Self::codex(),
             crate::tool::Tool::OpenCode => Self::opencode(),
             crate::tool::Tool::Kilo => Self::kilocode(),
+            crate::tool::Tool::Cline => Self::opencode(),
             crate::tool::Tool::Adhoc => Self::claude(),
         }
     }
@@ -610,7 +611,7 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(Tool::from_str(&config.tool), Ok(Tool::OpenCode) | Ok(Tool::Kilo)) {
+    if matches!(Tool::from_str(&config.tool), Ok(Tool::OpenCode) | Ok(Tool::Kilo) | Ok(Tool::Cline)) {
         log_info(
             "native",
             "delivery.opencode_mode",
