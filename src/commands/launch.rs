@@ -85,6 +85,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "args": tool_args,
             "tag": tag,
             "launcher": launcher_name,
+            "name": hcom_flags.name,
             "background": headless,
             "pty": pty_requested,
             "terminal": terminal,
@@ -198,7 +199,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launcher: Some(launcher_name.clone()),
             run_here: hcom_flags.run_here,
             batch_id: hcom_flags.batch_id,
-            name: None, // --name is caller identity, not instance name
+            name: hcom_flags.name.clone(),
             skip_validation: false,
             terminal,
             append_reply_handoff: true,
@@ -465,6 +466,7 @@ pub(crate) struct HcomLaunchFlags {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -662,6 +664,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             "--no-run-here" => {
                 flags.run_here = Some(false);
                 i += 1;
+            }
+            "--agent-name" if i + 1 < args.len() => {
+                flags.name = Some(args[i + 1].clone());
+                i += 2;
             }
             "--name" if i + 1 < args.len() => {
                 i += 2;
