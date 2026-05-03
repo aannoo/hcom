@@ -426,14 +426,12 @@ fn render_inline(frame: &mut Frame, app: &mut App, area: Rect) {
     let input_height = compose_input_height(app, true, area.width);
 
     // Layout: topline + status + sep + agents + [launch] + input + footer
-    let chrome = 1 + 1 + 1 + input_height + 1 + launch_height;
-    let agent_height = area.height.saturating_sub(chrome);
-
+    // Use Fill(1) for agents so launch/input always get their full height
     let mut constraints = vec![
-        Constraint::Length(1),            // top line
-        Constraint::Length(1),            // status bar
-        Constraint::Length(1),            // separator
-        Constraint::Length(agent_height), // agents (fills remaining)
+        Constraint::Length(1),     // top line
+        Constraint::Length(1),     // status bar
+        Constraint::Length(1),     // separator
+        Constraint::Fill(1),       // agents (takes remaining space)
     ];
     if launch_height > 0 {
         constraints.push(Constraint::Length(launch_height));
@@ -506,7 +504,7 @@ fn render_vertical(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut outer = vec![
         Constraint::Length(1), // status bar
         Constraint::Length(1), // blank
-        Constraint::Min(3),    // body (agents left | messages right)
+        Constraint::Fill(1),   // body (agents left | messages right)
     ];
     if launch_height > 0 {
         outer.push(Constraint::Length(launch_height));
@@ -1160,6 +1158,8 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(" message  ", hl),
                         Span::styled("t", hk),
                         Span::styled(" tag  ", hl),
+                        Span::styled("p", hk),
+                        Span::styled(" project  ", hl),
                         Span::styled("f", hk),
                         Span::styled(" fork  ", hl),
                         Span::styled("k", hk),
@@ -1646,6 +1646,8 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
         Line::from(vec![key("enter/space"), desc("select + filter scrollback")]),
         Line::from(vec![key("a"), desc("select all")]),
         Line::from(vec![key("b"), desc("broadcast to all")]),
+        Line::from(vec![key("p"), desc("set project on agent")]),
+        Line::from(vec![key("F"), desc("filter agents by project")]),
         Line::from(vec![key("\\"), desc("toggle view")]),
         Line::from(vec![key("ctrl+r"), desc("relay settings")]),
         Line::from(vec![key("ctrl+s"), desc("all stopped agents")]),

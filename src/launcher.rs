@@ -907,11 +907,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.args.push(full_prompt);
             }
             LaunchTool::Cline => {
-                // Cline: --prompt flag (same as opencode)
-                params.args.push("--prompt".to_string());
-                params.args.push(full_prompt);
+                // Cline: prompt as positional arg after --tui
+                if !full_prompt.is_empty() {
+                    params.args.push(full_prompt);
+                }
             }
         }
+    }
+
+    // Cline always needs --tui flag regardless of prompt
+    if normalized == LaunchTool::Cline && !params.args.contains(&"--tui".to_string()) {
+        params.args.push("--tui".to_string());
     }
     let batch_id = params
         .batch_id
@@ -1127,9 +1133,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                 Ok(true)
                             }
                             _ => Ok(false),
-                        }
-                    }
-                }
+            }
+        }
+    }
 
                 LaunchTool::ClaudePty => {
                     instances::update_instance_position(

@@ -15,7 +15,7 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "main": "./dist/extension.js",
+  "main": "./extension.js",
   "contributes": {
     "chatParticipants": [
       {

@@ -464,6 +464,17 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
             return (0, String::new());
         }
         let deliver = common::limit_delivery_messages(&messages);
+        // Auto-ack: advance cursor so same messages aren't re-delivered
+        let last_id = deliver
+            .iter()
+            .filter_map(|m| m.get("event_id").and_then(|v| v.as_i64()))
+            .max()
+            .unwrap_or(0);
+        if last_id > 0 {
+            let mut updates = serde_json::Map::new();
+            updates.insert("last_event_id".into(), serde_json::json!(last_id));
+            instances::update_instance_position(db, &name, &updates);
+        }
         let formatted = common::format_messages_json_for_instance(db, &deliver, &name);
         return (0, formatted);
     }

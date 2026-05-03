@@ -547,10 +547,10 @@ impl LaunchState {
     /// Height of the inline panel.
     pub fn panel_height(&self) -> u16 {
         if self.tool == Tool::Claude {
-            // tool + count + tag + project + headless + terminal
+            // separator + tool+count + tag + project + headless + terminal
             6
         } else {
-            // tool + count + tag + project + terminal
+            // separator + tool+count + tag + project + terminal
             5
         }
     }

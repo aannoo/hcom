@@ -1,15 +1,32 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import { HcomClient } from './hcomClient';
 
 /// <reference path="./antigravity.d.ts" />
+
+/** Write a log line to ~/.hcom/extensions/hcom-bridge.log */
+function logToFile(level: string, msg: string): void {
+    try {
+        const home = process.env.HOME || process.env.USERPROFILE || '';
+        const logDir = path.join(home, '.hcom', 'extensions');
+        fs.mkdirSync(logDir, { recursive: true });
+        const ts = new Date().toISOString();
+        fs.appendFileSync(path.join(logDir, 'hcom-bridge.log'), `[${ts}] [${level}] [jetski] ${msg}\n`);
+    } catch { /* ignore */ }
+}
 
 export class JetskiBridge implements vscode.Disposable {
     private hcomClient: HcomClient;
     private statusBarItem: vscode.StatusBarItem;
     private disposables: vscode.Disposable[] = [];
+    private _agentName: string | null = null;
+    private _conversationStarted = false;
+    private _msgCount = 0;
 
-    constructor(hcomClient: HcomClient) {
+    constructor(hcomClient: HcomClient, agentName: string | null, private _projectName: string = '') {
         this.hcomClient = hcomClient;
+        this._agentName = agentName;
         this.statusBarItem = vscode.window.createStatusBarItem(
             vscode.StatusBarAlignment.Left, 100
         );
@@ -81,10 +98,14 @@ export class JetskiBridge implements vscode.Disposable {
             vscode.commands.registerCommand('hcom.showStatus', () => {
                 const running = this.hcomClient.isRunning;
                 const status = running ? 'Connected' : 'Disconnected';
+                const httpPort = vscode.workspace.getConfiguration('antigravityBridge').get<number>('httpPort', 5000);
+                const hasAutomation = running; // we'll detect this at runtime
                 vscode.window.showInformationMessage(
                     `hcom Bridge: ${status}\n\n` +
+                    `Agent: ${this._agentName || '(none)'}\n` +
                     `Binary: ${vscode.workspace.getConfiguration('hcom.bridge').get('binaryPath', 'hcom')}\n` +
-                    `Project: ${vscode.workspace.getConfiguration('hcom.bridge').get('project', '(none)')}`
+                    `Project: ${vscode.workspace.getConfiguration('hcom.bridge').get('project', '(none)')}\n` +
+                    `Automation API: http://localhost:${httpPort}`
                 );
             })
         );
@@ -149,45 +170,66 @@ export class JetskiBridge implements vscode.Disposable {
     private forwardToJetski(sender: string, text: string): void {
         const config = vscode.workspace.getConfiguration('hcom.bridge');
         const autoSend = config.get<boolean>('autoSendToJetski', true);
-        if (!autoSend) return;
+        if (!autoSend) { logToFile('INFO', `autoSend disabled`); return; }
+        this.sendToAgentPanel(sender, text);
+    }
 
-        const ext = this.getAntigravityExt();
-        if (!ext) {
-            this.updateStatusBar('no antigravity API');
-            return;
-        }
-
+    /** Use native Antigravity commands to send messages to the agent panel. */
+    private async sendToAgentPanel(sender: string, text: string): Promise<void> {
+        logToFile('INFO', `sending msg from ${sender} to agent panel`);
         try {
-            const message = `**[hcom] @${sender}**\n\n${text}`;
-            ext.sendToAgentPanel({ message, autoSend: true });
-        } catch {
+            if (!this._conversationStarted) {
+                try {
+                    await vscode.commands.executeCommand('antigravity.startNewConversation');
+                    this._conversationStarted = true;
+                    logToFile('INFO', 'new conversation started');
+                    await new Promise(r => setTimeout(r, 2000));
+                } catch (e) {
+                    logToFile('WARN', `startNewConversation failed: ${e}`);
+                }
+            }
+
+            this._msgCount++;
+            const withInstructions = this._msgCount === 1 || this._msgCount % 15 === 0;
+
+            const agentName = this._agentName || 'antigravity';
+            const instructions = withInstructions
+                ? `You are connected to hcom as "${agentName}".\n\
+Respond using terminal: hcom send @${sender} --name ${agentName} -- "your response"\n\n` : '';
+
+            await vscode.commands.executeCommand(
+                'antigravity.sendPromptToAgentPanel',
+                `${instructions}**[hcom message from @${sender}]**\n\n${text}`
+            );
+            logToFile('INFO', `msg #${this._msgCount} sent${withInstructions ? ' + instructions' : ''}`);
+            this.updateStatusBar(`sent to antigravity agent`);
+        } catch (e) {
+            logToFile('ERROR', `send to agent panel failed: ${e}`);
             this.updateStatusBar('send failed');
         }
     }
 
-    private getAntigravityExt(): typeof antigravityExtensibility | undefined {
-        try {
-            const win = vscode.window as { antigravityExtensibility?: typeof antigravityExtensibility };
-            if (win.antigravityExtensibility && typeof win.antigravityExtensibility.sendToAgentPanel === 'function') {
-                return win.antigravityExtensibility;
-            }
-        } catch { }
-        return undefined;
-    }
-
-    private updateStatusBar(status: string): void {
+    /** Update the status bar display. Public so extension.ts can show registration state. */
+    updateStatusBar(status: string): void {
         const icons: Record<string, string> = {
             'active': '$(broadcast)',
             'listening': '$(broadcast)',
             'connected': '$(broadcast)',
+            'registered': '$(broadcast)',
             'connecting': '$(sync~spin)',
             'reconnecting': '$(sync~spin)',
+            'reconnecting in 3s': '$(sync~spin)',
+            'registering': '$(sync~spin)',
             'error': '$(error)',
+            'no antigravity API': '$(warning)',
             'exited': '$(debug-disconnect)',
             'initializing': '$(loading~spin)',
+            'no agent': '$(debug-disconnect)',
         };
         const icon = Object.entries(icons).find(([k]) => status.startsWith(k))?.[1] || '$(question)';
-        this.statusBarItem.text = `${icon} hcom`;
+        const label = this._agentName ? ` ${this._agentName}` : '';
+        this.statusBarItem.text = `${icon} hcom${label}`;
+        this.statusBarItem.tooltip = `hcom Bridge — ${status}${this._agentName ? `\nAgent: ${this._agentName}` : ''}`;
         this.statusBarItem.backgroundColor = status.includes('error') || status.startsWith('exited')
             ? new vscode.ThemeColor('statusBarItem.errorBackground')
             : undefined;

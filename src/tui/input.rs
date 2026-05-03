@@ -1072,10 +1072,10 @@ impl App {
                 self.ui.mode = InputMode::Navigate;
             }
 
-            KeyCode::Left if self.ui.input.is_empty() => {
+            KeyCode::Left => {
                 self.ui.launch.tool = self.ui.launch.tool.prev();
             }
-            KeyCode::Right if self.ui.input.is_empty() => {
+            KeyCode::Right => {
                 self.ui.launch.tool = self.ui.launch.tool.next();
             }
 
@@ -1090,8 +1090,6 @@ impl App {
 
             KeyCode::Home => self.ui.input_cursor = 0,
             KeyCode::End => self.ui.input_cursor = self.ui.input.len(),
-            KeyCode::Left => cursor_left(&self.ui.input, &mut self.ui.input_cursor),
-            KeyCode::Right => cursor_right(&self.ui.input, &mut self.ui.input_cursor),
 
             KeyCode::Enter => {
                 let tool = self.ui.launch.tool;
