@@ -54,10 +54,10 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "message text" 
+- Message: send @name(s) [--project X] [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "message text" 
   Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
-- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
+- See who's active: list [-v] [--json] [--names] [--project X] [--format '{{name}} {{status}}']
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
@@ -65,7 +65,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - Per-agent system prompts: create `~/.hcom/agents/<name>.md` with the role prompt for any agent (self or spawned)
   Then `hcom list -v` confirms if file loaded. Re-injected on every session compaction.
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode|kilo> [--tag labelOrGroup] [--agent-name customName] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <claude|gemini|codex|opencode|kilo> [--project X] [--tag labelOrGroup] [--agent-name customName] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Example: `hcom 1 claude --agent-name mybot` -> named agent, load ~/.hcom/agents/mybot.md as system prompt
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
@@ -91,6 +91,9 @@ This is session context, not a task for immediate action."#;
 
 const TAG_NOTICE: &str = r#"
 You are tagged "{tag}". Message your group: send @{tag}- -- msg"#;
+
+const PROJECT_NOTICE: &str = r#"
+You are in project "{project}". You can only see and message other agents in the same project."#;
 
 const RELAY_NOTICE: &str = r#"
 Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in."#;
@@ -179,9 +182,9 @@ Response rules:
 hcom message → respond via hcom send
 
 Commands:
-  {hcom_cmd} send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+  {hcom_cmd} send @name(s) [--project X] [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
   Example: {hcom_cmd} send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
-  {hcom_cmd} list --name {subagent_name}
+  {hcom_cmd} list [--project X] --name {subagent_name}
   {hcom_cmd} events --name {subagent_name}
   {hcom_cmd} <cmd> --help --name {subagent_name}
 
@@ -288,6 +291,7 @@ struct BootstrapContext {
     instance_name: String,
     display_name: String,
     tag: String,
+    project: String,
     relay_enabled: bool,
     hcom_cmd: String,
     is_launched: bool,
@@ -330,12 +334,21 @@ fn build_context(
         .unwrap_or(tag)
         .to_string();
 
+    // Project from instance data
+    let project = instance_data
+        .as_ref()
+        .and_then(|d| d.project.as_deref())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("")
+        .to_string();
+
     let is_headless = headless || background_name.is_some();
 
     BootstrapContext {
         instance_name: instance_name.to_string(),
         display_name,
         tag: effective_tag,
+        project,
         relay_enabled,
         hcom_cmd: crate::runtime_env::build_hcom_command(),
         is_launched,
@@ -355,6 +368,7 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{instance_name}", &ctx.instance_name)
         .replace("{SENDER}", SENDER)
         .replace("{tag}", &ctx.tag)
+        .replace("{project}", &ctx.project)
         .replace("{hcom_cmd}", &ctx.hcom_cmd)
         .replace("{active_instances}", &ctx.active_instances)
         .replace("{scripts}", &ctx.scripts)
@@ -408,6 +422,9 @@ pub fn get_bootstrap(
     // Conditional sections
     if !ctx.tag.is_empty() {
         parts.push(TAG_NOTICE);
+    }
+    if !ctx.project.is_empty() {
+        parts.push(PROJECT_NOTICE);
     }
     if ctx.relay_enabled {
         parts.push(RELAY_NOTICE);
