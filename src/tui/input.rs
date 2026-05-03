@@ -467,6 +467,14 @@ impl App {
                 self.ui.input_cursor = 0;
             }
 
+            KeyCode::Char('F') => {
+                let current = self.ui.project_filter.clone().unwrap_or_default();
+                let cursor = current.len();
+                self.ui.overlay = Some(Overlay::new(OverlayKind::ProjectFilter));
+                self.ui.overlay.as_mut().unwrap().input = current;
+                self.ui.overlay.as_mut().unwrap().cursor = cursor;
+            }
+
             // OVERLAYS
             KeyCode::Char('/') => {
                 self.ui.overlay = Some(Overlay::new(OverlayKind::Search));
@@ -749,6 +757,13 @@ impl App {
                     }
                 }
             }
+            OverlayKind::ProjectFilter => {
+                self.ui.project_filter = if overlay.input.trim().is_empty() {
+                    None
+                } else {
+                    Some(overlay.input.trim().to_string())
+                };
+            }
             OverlayKind::Project => {
                 let project = overlay.input.trim().to_string();
                 let targets = overlay.targets;
@@ -789,6 +804,8 @@ impl App {
             if had_search {
                 self.ui.trigger_inline_replay();
             }
+        } else if overlay.kind == OverlayKind::ProjectFilter {
+            self.ui.project_filter = None;
         }
     }
 

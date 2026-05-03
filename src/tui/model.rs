@@ -365,6 +365,7 @@ pub enum OverlayKind {
     Command,
     Tag,
     Project,
+    ProjectFilter,
 }
 
 pub struct Overlay {

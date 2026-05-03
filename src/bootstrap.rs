@@ -209,9 +209,6 @@ fn get_active_instances(db: &HcomDb, exclude_name: &str) -> String {
         Err(_) => return String::new(),
     };
 
-    let now = crate::shared::time::now_epoch_f64();
-    let cutoff = now - 60.0;
-
     // Collect names grouped by tool, preserving insertion order via BTreeMap
     let mut by_tool: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut count = 0;
@@ -224,8 +221,8 @@ fn get_active_instances(db: &HcomDb, exclude_name: &str) -> String {
             continue;
         }
 
-        let status_time = inst.status_time as f64;
-        if inst.status == ST_ACTIVE || inst.status == ST_LISTENING || status_time >= cutoff {
+        let cs = crate::instance_lifecycle::get_instance_status(inst, db);
+        if cs.status == ST_ACTIVE || cs.status == ST_LISTENING {
             let tool = if inst.tool.is_empty() {
                 "claude"
             } else {

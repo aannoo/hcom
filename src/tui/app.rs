@@ -76,6 +76,7 @@ impl App {
                 overlay: None,
                 pending_eject_cmd: false,
                 term_width: 80,
+                project_filter: None,
             },
         }
     }
@@ -451,6 +452,7 @@ mod tests {
                 overlay: None,
                 pending_eject_cmd: false,
                 term_width: 80,
+                project_filter: None,
             },
             ejector: Ejector::new(),
             source: Box::new(NullSource),
