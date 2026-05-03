@@ -24,6 +24,14 @@ static DANGEROUS_CHARS_WITH_AT: LazyLock<Regex> =
 /// Commands that require a resolved identity to operate.
 const REQUIRE_IDENTITY: &[&str] = &["send", "listen"];
 
+/// Extract project from instance data JSON.
+fn extract_project(data: &serde_json::Value) -> Option<String> {
+    data.get("project")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Check if value looks like a UUID (agent_id format).
 pub fn looks_like_uuid(value: &str) -> bool {
     UUID_PATTERN.is_match(value)
@@ -137,7 +145,8 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
-            instance_data: Some(data),
+            instance_data: Some(data.clone()),
+            project: extract_project(&data),
         });
     }
 
@@ -160,7 +169,8 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
-                instance_data: Some(data),
+                instance_data: Some(data.clone()),
+                project: extract_project(&data),
             });
         }
     }
@@ -215,6 +225,7 @@ fn resolve_identity_with_expectation(
             name: sender.to_string(),
             instance_data: None,
             session_id: None,
+            project: None,
         });
     }
 
@@ -242,7 +253,8 @@ fn resolve_identity_with_expectation(
                                 kind: SenderKind::Instance,
                                 name: inst_name,
                                 session_id: Some(sid.to_string()),
-                                instance_data: Some(d),
+                                instance_data: Some(d.clone()),
+                                project: extract_project(&d),
                             });
                         }
                         None => {
@@ -336,7 +348,8 @@ fn resolve_identity_with_expectation(
                                 kind: SenderKind::Instance,
                                 name: final_name,
                                 session_id: sid,
-                                instance_data: Some(final_data),
+                                instance_data: Some(final_data.clone()),
+                                project: extract_project(&final_data),
                             });
                         }
                         None => {
@@ -699,6 +712,7 @@ mod tests {
                 name: "nova".to_string(),
                 instance_data: None,
                 session_id: Some("sess-2".to_string()),
+                project: None,
             })
         };
 

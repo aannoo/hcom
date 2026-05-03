@@ -11,6 +11,8 @@ pub struct SenderIdentity {
     pub instance_data: Option<serde_json::Value>,
     /// Claude session ID for transcript binding.
     pub session_id: Option<String>,
+    /// Project isolation group (None = no isolation).
+    pub project: Option<String>,
 }
 
 /// Sender identity kind — determines routing rules.
@@ -47,6 +49,12 @@ impl SenderIdentity {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     }
+
+    /// Project name for isolation filtering.
+    /// Returns None if the instance has no project (broadcast to all).
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref().filter(|p| !p.is_empty())
+    }
 }
 
 /// Resolved identity context for a single CLI invocation.
@@ -71,6 +79,7 @@ mod tests {
             name: "luna".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert!(!instance.broadcasts());
 
@@ -79,6 +88,7 @@ mod tests {
             name: "user".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert!(external.broadcasts());
 
@@ -87,6 +97,7 @@ mod tests {
             name: "hcom".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert!(system.broadcasts());
     }
@@ -98,6 +109,7 @@ mod tests {
             name: "luna".into(),
             instance_data: Some(serde_json::json!({"session_id": "sess-123"})),
             session_id: None,
+            project: None,
         };
         assert_eq!(parent.group_id(), Some("sess-123"));
 
@@ -109,6 +121,7 @@ mod tests {
                 "parent_session_id": "parent-sess"
             })),
             session_id: None,
+            project: None,
         };
         assert_eq!(subagent.group_id(), Some("parent-sess"));
 
@@ -117,6 +130,7 @@ mod tests {
             name: "luna".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert_eq!(no_data.group_id(), None);
 
@@ -125,7 +139,38 @@ mod tests {
             name: "luna".into(),
             instance_data: Some(serde_json::json!({})),
             session_id: None,
+            project: None,
         };
         assert_eq!(empty.group_id(), None);
+    }
+
+    #[test]
+    fn test_sender_identity_project() {
+        let no_project = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+            project: None,
+        };
+        assert_eq!(no_project.project(), None);
+
+        let empty_project = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+            project: Some(String::new()),
+        };
+        assert_eq!(empty_project.project(), None);
+
+        let with_project = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+            project: Some("myproj".into()),
+        };
+        assert_eq!(with_project.project(), Some("myproj"));
     }
 }

@@ -670,6 +670,7 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "claude"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
@@ -700,6 +701,7 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "codex"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
@@ -721,13 +723,15 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "codex"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
-        set_hookless_command_status(&db, "send", &ctx);
+        // listen is in skip list — should not change status
+        set_hookless_command_status(&db, "listen", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(data.status, ST_ACTIVE);
-        assert_eq!(data.status_context, "tool:send");
+        // Status should remain the original (active from INSERT)
+        assert_eq!(data.status, "active");
     }
 
     #[test]
@@ -741,6 +745,7 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "adhoc"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
@@ -761,6 +766,7 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "claude"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
@@ -787,6 +793,7 @@ mod tests {
                 name: "sub1".into(),
                 instance_data: Some(serde_json::json!({"tool": "claude", "parent_name": "luna"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
@@ -927,6 +934,7 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "codex"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };
@@ -943,6 +951,7 @@ mod tests {
                 name: "luna".into(),
                 instance_data: Some(serde_json::json!({"tool": "claude"})),
                 session_id: None,
+                project: None,
             }),
             go: false,
         };

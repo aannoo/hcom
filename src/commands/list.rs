@@ -47,6 +47,9 @@ pub struct ListArgs {
     /// Limit results (with --stopped)
     #[arg(long)]
     pub last: Option<usize>,
+    /// Filter by project (show only agents in this project)
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Get unread message count for a single instance.
@@ -209,6 +212,26 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             eprintln!("Error: {e}");
             return 1;
         }
+    };
+
+    // Filter by project if --project provided
+    let sorted_instances: Vec<InstanceRow> = if let Some(ref proj) = args.project {
+        let proj = proj.trim();
+        if proj.is_empty() {
+            sorted_instances
+        } else {
+            sorted_instances
+                .into_iter()
+                .filter(|inst| {
+                    inst.project
+                        .as_deref()
+                        .map(|p| p == proj)
+                        .unwrap_or(true)
+                })
+                .collect()
+        }
+    } else {
+        sorted_instances
     };
 
     let unread_counts = get_unread_counts_batch(db, &sorted_instances);

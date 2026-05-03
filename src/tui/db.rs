@@ -1424,7 +1424,8 @@ mod tests {
                 timestamp TEXT NOT NULL
             );
             CREATE TABLE instances (
-                name TEXT PRIMARY KEY
+                name TEXT PRIMARY KEY,
+                project TEXT DEFAULT ''
             );
             ",
         )
@@ -1583,7 +1584,8 @@ mod tests {
                 tcp_mode INTEGER,
                 directory TEXT,
                 tag TEXT,
-                last_event_id INTEGER,
+                 project TEXT DEFAULT '',
+                 last_event_id INTEGER,
                 origin_device_id TEXT,
                 pid INTEGER,
                 session_id TEXT,
