@@ -104,6 +104,28 @@ Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't
 
 Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
+### Antigravity (VS Code fork) extension
+
+[Antigravity](https://github.com/antigravity-ai) is Google's VS Code fork with an
+AI agent (Jetski). hcom includes a VS Code extension that bridges hcom agents
+with Antigravity's chat panel:
+
+```bash
+# Install the extension into Antigravity
+hcom hooks add antigravity
+
+# Restart Antigravity to activate
+```
+
+Once installed:
+- hcom messages arrive in Antigravity's chat panel automatically
+- Type `@hcom list` in Antigravity chat to see active agents
+- Type `@hcom @name message` to send messages to hcom agents
+- Status bar shows connection status, click for details
+
+The extension (~13KB) is compiled and embedded in the hcom binary — no npm
+or TypeScript needed on the user's machine.
+
 ---
 
 ## Terminal
@@ -217,6 +239,7 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Codex CLI | automatic | `hcom codex` |
 | OpenCode | automatic | `hcom opencode` |
 | Kilo Code | automatic | `hcom kilo` |
+| Cline | automatic | `hcom cline` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -249,7 +272,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|opencode|kilo   # launch N agents
+hcom [N] claude|gemini|codex|opencode|kilo|cline   # launch N agents
 hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane
