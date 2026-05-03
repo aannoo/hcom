@@ -21,7 +21,7 @@ use crate::instances;
 use crate::paths;
 use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
 use crate::terminal;
-use crate::tools::{codex_preprocessing, opencode_preprocessing};
+use crate::tools::{codex_preprocessing, kilo_preprocessing, opencode_preprocessing};
 
 /// Canonical tool types for launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub enum LaunchTool {
     Gemini,
     Codex,
     OpenCode,
+    Kilo,
 }
 
 impl LaunchTool {
@@ -42,6 +43,7 @@ impl LaunchTool {
             "gemini" => Ok(LaunchTool::Gemini),
             "codex" => Ok(LaunchTool::Codex),
             "opencode" => Ok(LaunchTool::OpenCode),
+            "kilocode" | "kilo" => Ok(LaunchTool::Kilo),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -53,6 +55,7 @@ impl LaunchTool {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Kilo => "kilo",
         }
     }
 
@@ -63,6 +66,7 @@ impl LaunchTool {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Kilo => "kilo",
         }
     }
 
@@ -102,7 +106,7 @@ impl LaunchBackend {
         match tool {
             LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
             LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode => {
+            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode | LaunchTool::Kilo => {
                 LaunchBackend::HeadlessPty
             }
         }
@@ -280,6 +284,7 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
         LaunchTool::Gemini => Some("GEMINI_CLI_HOME"),
         LaunchTool::Codex => Some("CODEX_HOME"),
         LaunchTool::OpenCode => None,
+        LaunchTool::Kilo => None,
     };
     if let Some(env_var) = tool_env_var {
         let _ = writeln!(
@@ -383,6 +388,13 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
+        }
+        LaunchTool::Kilo => {
+            if crate::hooks::kilo::ensure_plugin_installed() {
+                return Ok(());
+            }
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup Kilo plugin. Run: hcom hooks add kilo\n{diag}");
         }
     }
 }
@@ -867,6 +879,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.args.push("--prompt".to_string());
                 params.args.push(full_prompt);
             }
+            LaunchTool::Kilo => {
+                // Kilo: --prompt flag (same as opencode)
+                params.args.push("--prompt".to_string());
+                params.args.push(full_prompt);
+            }
         }
     }
     let batch_id = params
@@ -977,6 +994,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Kilo => "kilo",
         };
         if !is_tool_installed(tool_binary) {
             eprintln!("Error: '{}' is not installed or not in PATH", tool_binary);
@@ -1250,6 +1268,40 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+
+                LaunchTool::Kilo => {
+                    kilo_preprocessing::preprocess_kilo_env(
+                        &mut instance_env,
+                        &instance_name,
+                    );
+
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(params.args),
+                        )]),
+                    );
+
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "kilo",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -1350,6 +1402,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
             errs
         }
         LaunchTool::OpenCode => Vec::new(),
+        LaunchTool::Kilo => Vec::new(),
     }
 }
 
@@ -1385,6 +1438,10 @@ mod tests {
             LaunchTool::from_str("opencode", false).unwrap(),
             LaunchTool::OpenCode
         );
+        assert_eq!(
+            LaunchTool::from_str("kilo", false).unwrap(),
+            LaunchTool::Kilo
+        );
         assert!(LaunchTool::from_str("unknown", false).is_err());
     }
 
@@ -1409,6 +1466,7 @@ mod tests {
         assert!(LaunchTool::Gemini.uses_pty());
         assert!(LaunchTool::Codex.uses_pty());
         assert!(LaunchTool::OpenCode.uses_pty());
+        assert!(LaunchTool::Kilo.uses_pty());
     }
 
     #[test]
@@ -1420,6 +1478,7 @@ mod tests {
             LaunchTool::Gemini,
             LaunchTool::Codex,
             LaunchTool::OpenCode,
+            LaunchTool::Kilo,
         ] {
             let pty = tool.uses_pty();
             assert_eq!(
@@ -1451,8 +1510,8 @@ mod tests {
 
     #[test]
     fn test_launch_backend_resolve_other_tools_headless() {
-        // gemini/codex/opencode + --headless → HeadlessPty (unchanged from today).
-        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode] {
+        // gemini/codex/opencode/kilo + --headless → HeadlessPty (unchanged from today).
+        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode, LaunchTool::Kilo] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true, true),
                 LaunchBackend::HeadlessPty,

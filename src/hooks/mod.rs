@@ -6,6 +6,7 @@ pub mod codex;
 pub mod common;
 pub mod family;
 pub mod gemini;
+pub mod kilo;
 pub mod opencode;
 pub mod utils;
 
