@@ -11,7 +11,7 @@ description: >
 AI agents running in separate terminals are isolated. hcom connects them via hooks and a shared database so they can message, watch, and spawn each other in real-time.
 
 ```bash
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
+curl -fsSL https://github.com/Solar2004/hcom/releases/latest/download/hcom-installer.sh | sh
 hcom claude       # or: hcom gemini, hcom codex, hcom opencode
 hcom              # TUI dashboard
 ```
@@ -68,14 +68,14 @@ if the user invokes this skill without arguments:
 
 1. run `hcom status` — if "command not found", install first:
    ```bash
-   curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
+   curl -fsSL https://github.com/Solar2004/hcom/releases/latest/download/hcom-installer.sh | sh
    ```
 2. run `hcom hooks add` to install hooks for all detected tools
 3. restart the AI tool for hooks to activate
 
 | status output | meaning | action |
 |---------------|---------|--------|
-| command not found | not installed | install via `brew install aannoo/hcom/hcom`, the curl installer above, or `pip install hcom` |
+| command not found | not installed | install via `brew install Solar2004/hcom/hcom`, the curl installer above, or `pip install hcom` |
 | `[~] claude` | tool exists, hooks not installed | `hcom hooks add` then restart |
 | `[✓] claude` | hooks installed | ready |
 | `[✗] claude` | tool not found | install the AI tool first |
@@ -184,4 +184,4 @@ hcom --help              # all commands
 hcom <command> --help    # command details
 ```
 
-github: https://github.com/aannoo/hcom
+github: https://github.com/Solar2004/hcom

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-NEW_URL="https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh"
+NEW_URL="https://github.com/Solar2004/hcom/releases/latest/download/hcom-installer.sh"
 
 cat <<EOF
 install.sh has moved and this compatibility shim will be removed in a future release.

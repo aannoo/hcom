@@ -1,12 +1,12 @@
 [package]
 name = "hcom"
-version = "0.7.14"
+version = "0.7.15"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, Codex, and OpenCode so agents can message, watch, and spawn each other across terminals"
 license = "MIT"
-homepage = "https://github.com/aannoo/hcom"
-repository = "https://github.com/aannoo/hcom"
+homepage = "https://github.com/Solar2004/hcom"
+repository = "https://github.com/Solar2004/hcom"
 rust-version = "1.86"
 
 [[bin]]

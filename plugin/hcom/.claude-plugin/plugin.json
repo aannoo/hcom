@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "description": "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode.",
   "author": {
-    "name": "aannoo"
+    "name": "Solar2004"
   },
-  "homepage": "https://github.com/aannoo/hcom",
-  "repository": "https://github.com/aannoo/hcom",
+  "homepage": "https://github.com/Solar2004/hcom",
+  "repository": "https://github.com/Solar2004/hcom",
   "license": "MIT",
   "keywords": ["hcom", "multi-agent", "communication", "claude", "gemini", "codex", "opencode"]
 }

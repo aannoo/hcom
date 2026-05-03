@@ -42,4 +42,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="$(printf '%s' "$PLAN" | jq -r '.announcement_tag')"
-          gh release upload "$TAG" -R aannoo/hcom android-dist/*.whl --clobber
+          gh release upload "$TAG" -R Solar2004/hcom android-dist/*.whl --clobber
