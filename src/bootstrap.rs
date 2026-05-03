@@ -438,6 +438,14 @@ pub fn get_bootstrap(
         result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
     }
 
+    // Agent prompt from ~/.hcom/agents/<name>.md
+    if let Some(agent_prompt) = crate::agent_prompts::load_agent_prompt(instance_name) {
+        result.push_str(&format!(
+            "\n\n## AGENT PROMPT\n\n{}\n",
+            agent_prompt
+        ));
+    }
+
     // Rewrite hcom references if using alternate command
     if ctx.hcom_cmd != "hcom" {
         let sentinel = "__HCOM_CMD__";

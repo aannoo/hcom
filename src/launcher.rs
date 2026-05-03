@@ -773,6 +773,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
     }
 
+    // Ensure agents dir exists for per-agent prompts
+    crate::agent_prompts::ensure_agents_dir().ok();
+
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized)?;
 
