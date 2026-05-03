@@ -1521,6 +1521,7 @@ pub fn terminal_help_text(show_current: bool) -> String {
         ("tmux", "detached sessions"),
         ("cmux", "workspaces"),
         ("zellij", "panes"),
+        ("waveterm", "blocks"),
     ];
     const MANAGED_VARIANTS: &[(&str, &[&str])] = &[
         ("kitty", &["kitty-window", "kitty-tab", "kitty-split"]),
@@ -2186,6 +2187,24 @@ mod tests {
 
         assert!(managed.contains("zellij"));
         assert!(!other.contains("zellij"));
+    }
+
+    #[test]
+    fn test_terminal_help_text_lists_close_capable_waveterm_as_managed() {
+        crate::config::Config::reset();
+        crate::config::Config::init();
+        let help = terminal_help_text(false);
+        let managed = help
+            .split("Other (opens window only):")
+            .next()
+            .expect("managed section should exist");
+        let other = help
+            .split("Other (opens window only):")
+            .nth(1)
+            .expect("other section should exist");
+
+        assert!(managed.contains("waveterm"));
+        assert!(!other.contains("waveterm"));
     }
 
     #[test]

@@ -1197,6 +1197,7 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
 
 /// Write captured terminal ID to temp file for child to read.
 fn write_terminal_id(env: &HashMap<String, String>, captured_id: &str) {
+    let captured_id = normalize_captured_terminal_id(captured_id);
     if captured_id.is_empty() {
         return;
     }
@@ -1207,6 +1208,19 @@ fn write_terminal_id(env: &HashMap<String, String>, captured_id: &str) {
     let ids_dir = paths::hcom_path(&[".tmp", "terminal_ids"]);
     fs::create_dir_all(&ids_dir).ok();
     fs::write(ids_dir.join(process_id), captured_id).ok();
+}
+
+fn normalize_captured_terminal_id(captured_id: &str) -> String {
+    let captured_id = captured_id.trim();
+    let Some((_, block_ref)) = captured_id.rsplit_once("block:") else {
+        return captured_id.to_string();
+    };
+    let block_id = block_ref.split_whitespace().next().unwrap_or("");
+    if block_id.is_empty() {
+        captured_id.to_string()
+    } else {
+        format!("block:{block_id}")
+    }
 }
 
 /// Launch terminal with command.
@@ -2225,6 +2239,22 @@ mod tests {
             argv,
             vec!["tmux", "split", "-t", "abc-123", "--", "/tmp/test.sh"]
         );
+    }
+
+    #[test]
+    fn test_waveterm_preset_uses_run_separator() {
+        let cmd = resolve_terminal_preset("waveterm").unwrap();
+        let argv = parse_terminal_command(&cmd, "/tmp/test.sh", "abc-123").unwrap();
+        assert_eq!(argv, vec!["wsh", "run", "--", "bash", "/tmp/test.sh"]);
+    }
+
+    #[test]
+    fn test_normalize_waveterm_run_block_stdout() {
+        assert_eq!(
+            normalize_captured_terminal_id("run block created: block:abc123\n"),
+            "block:abc123"
+        );
+        assert_eq!(normalize_captured_terminal_id("terminal_6"), "terminal_6");
     }
 
     #[test]

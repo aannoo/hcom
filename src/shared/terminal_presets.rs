@@ -242,8 +242,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wsh"),
                 None,
-                "wsh run bash {script}",
-                None,
+                "wsh run -- bash {script}",
+                Some("wsh deleteblock -b {pane_id}"),
                 Some("WAVETERM_BLOCKID"),
                 DL,
             ),

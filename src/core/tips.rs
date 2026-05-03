@@ -113,6 +113,7 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
         || ctx.terminal_mode.starts_with("wezterm-")
         || ctx.terminal_mode.starts_with("tmux")
         || ctx.terminal_mode.starts_with("zellij")
+        || ctx.terminal_mode == "waveterm"
         || {
             // Check user-defined presets in config.toml for close command
             let config_path = crate::paths::config_toml_path();
