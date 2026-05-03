@@ -83,6 +83,7 @@ fn tool_prefix_str(tool: Tool) -> &'static str {
         Tool::Codex => "cod ",
         Tool::OpenCode => "opc ",
         Tool::Kilo => "kil ",
+        Tool::Cline => "cli ",
         Tool::Adhoc => "ah  ",
     }
 }

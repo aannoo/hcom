@@ -94,6 +94,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("codex_system_prompt", "launch.codex.system_prompt"),
     ("opencode_args", "launch.opencode.args"),
     ("kilo_args", "launch.kilo.args"),
+    ("cline_args", "launch.cline.args"),
     ("relay", "relay.url"),
     ("relay_id", "relay.id"),
     ("relay_token", "relay.token"),
@@ -120,6 +121,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT"),
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
     ("kilo_args", "HCOM_KILO_ARGS"),
+    ("cline_args", "HCOM_CLINE_ARGS"),
     ("relay", "HCOM_RELAY"),
     ("relay_id", "HCOM_RELAY_ID"),
     ("relay_token", "HCOM_RELAY_TOKEN"),
@@ -226,6 +228,7 @@ pub struct HcomConfig {
     pub codex_args: String,
     pub opencode_args: String,
     pub kilo_args: String,
+    pub cline_args: String,
     pub codex_sandbox_mode: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
@@ -253,6 +256,7 @@ impl Default for HcomConfig {
             codex_args: String::new(),
             opencode_args: String::new(),
             kilo_args: String::new(),
+            cline_args: String::new(),
             codex_sandbox_mode: "workspace".to_string(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
@@ -342,6 +346,7 @@ impl HcomConfig {
             ("codex_args", &self.codex_args),
             ("opencode_args", &self.opencode_args),
             ("kilo_args", &self.kilo_args),
+            ("cline_args", &self.cline_args),
         ] {
             if !value.is_empty() {
                 if let Err(e) = shell_words::split(value) {
@@ -401,6 +406,7 @@ impl HcomConfig {
             "codex_args" => Some(self.codex_args.clone()),
             "opencode_args" => Some(self.opencode_args.clone()),
             "kilo_args" => Some(self.kilo_args.clone()),
+            "cline_args" => Some(self.cline_args.clone()),
             "codex_sandbox_mode" => Some(self.codex_sandbox_mode.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
@@ -438,6 +444,7 @@ impl HcomConfig {
             "codex_args" => self.codex_args = value.to_string(),
             "opencode_args" => self.opencode_args = value.to_string(),
             "kilo_args" => self.kilo_args = value.to_string(),
+            "cline_args" => self.cline_args = value.to_string(),
             "codex_sandbox_mode" => {
                 // Normalize legacy value
                 self.codex_sandbox_mode = if value == "full-auto" {
@@ -553,6 +560,7 @@ impl HcomConfig {
             "codex_args",
             "opencode_args",
             "kilo_args",
+            "cline_args",
             "codex_sandbox_mode",
             "gemini_system_prompt",
             "codex_system_prompt",
@@ -903,6 +911,9 @@ system_prompt = ""
 args = ""
 
 [launch.kilo]
+args = ""
+
+[launch.cline]
 args = ""
 
 [preferences]

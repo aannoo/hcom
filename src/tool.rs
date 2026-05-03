@@ -45,6 +45,13 @@ const KILO_HOOKS: &[&str] = &[
     "kilocode-stop",
 ];
 
+const CLINE_HOOKS: &[&str] = &[
+    "cline-start",
+    "cline-status",
+    "cline-read",
+    "cline-stop",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Claude,
@@ -52,6 +59,7 @@ pub enum Tool {
     Codex,
     OpenCode,
     Kilo,
+    Cline,
     Adhoc,
 }
 
@@ -63,6 +71,7 @@ impl Tool {
             Tool::Gemini => b"Type your message",
             Tool::OpenCode => b"ctrl+p commands",
             Tool::Kilo => b"ctrl+p commands",
+            Tool::Cline => b"ctrl+p commands",
             Tool::Adhoc => b"",
         }
     }
@@ -74,6 +83,7 @@ impl Tool {
             Tool::Codex => "codex",
             Tool::OpenCode => "opencode",
             Tool::Kilo => "kilo",
+            Tool::Cline => "cline",
             Tool::Adhoc => "adhoc",
         }
     }
@@ -85,6 +95,7 @@ impl Tool {
             Tool::Codex => CODEX_HOOKS,
             Tool::OpenCode => OPENCODE_HOOKS,
             Tool::Kilo => KILO_HOOKS,
+            Tool::Cline => CLINE_HOOKS,
             Tool::Adhoc => &[],
         }
     }
@@ -94,7 +105,7 @@ impl Tool {
     }
 
     pub fn from_hook_name(name: &str) -> Option<Self> {
-        [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo]
+        [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline]
             .into_iter()
             .find(|tool| tool.owns_hook(name))
     }
@@ -114,6 +125,7 @@ impl FromStr for Tool {
             "codex" => Ok(Tool::Codex),
             "opencode" => Ok(Tool::OpenCode),
             "kilo" | "kilocode" => Ok(Tool::Kilo),
+            "cline" | "clinecode" => Ok(Tool::Cline),
             "adhoc" => Ok(Tool::Adhoc),
             _ => Err(format!("Unknown tool: {}", s)),
         }
@@ -140,7 +152,7 @@ mod tests {
     #[test]
     fn hook_names_are_disjoint() {
         let mut owners = HashMap::new();
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo] {
+        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline] {
             for hook in tool.hooks() {
                 assert_eq!(
                     owners.insert(*hook, tool),
@@ -156,5 +168,10 @@ mod tests {
     fn kilocode_parses_to_kilo() {
         assert_eq!("kilocode".parse::<Tool>().unwrap(), Tool::Kilo);
         assert_eq!("kilo".parse::<Tool>().unwrap(), Tool::Kilo);
+    }
+
+    #[test]
+    fn cline_parses() {
+        assert_eq!("cline".parse::<Tool>().unwrap(), Tool::Cline);
     }
 }

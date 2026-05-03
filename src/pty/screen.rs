@@ -345,6 +345,7 @@ impl ScreenTracker {
             Ok(Tool::Codex) => self.get_codex_input_text(),
             Ok(Tool::OpenCode) => None, // OpenCode: plugin handles delivery, no PTY input detection needed
             Ok(Tool::Kilo) => None, // Kilo: plugin handles delivery, same as OpenCode
+            Ok(Tool::Cline) => None, // Cline: plugin handles delivery, same as OpenCode
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }

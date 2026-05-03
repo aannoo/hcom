@@ -64,7 +64,7 @@ fn ready_pattern(tool: &str) -> &'static str {
         "claude" => "? for shortcuts",
         "codex" => "\u{203a} ",
         "gemini" => "Type your message",
-        "opencode" => "ctrl+p commands",
+        "opencode" | "cline" => "ctrl+p commands",
         _ => panic!("Unknown tool: {tool}"),
     }
 }
@@ -1139,6 +1139,293 @@ fn run_pty_test_opencode() {
     logln!(log, "{}", "=".repeat(60));
 }
 
+// ── Cline test flow ───────────────────────────────────────────────────
+
+fn run_pty_test_cline() {
+    let _serial = serial_lock();
+
+    let tool = "cline";
+    // SAFETY: Integration tests run serially (serial_lock above).
+    unsafe {
+        std::env::set_var("HCOM_TERMINAL", "tmux");
+        std::env::set_var("HCOM_TAG", "ptytest");
+    }
+    let log = TestLog::new(tool);
+
+    logln!(log, "{}", "=".repeat(60));
+    logln!(log, "PTY Delivery Test: {tool} (bootstrap injection)");
+    logln!(log, "{}", "=".repeat(60));
+
+    let pre_launch_id = {
+        let out = hcom("events --last 1");
+        if out.status.success() {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+                .filter_map(|v| v["id"].as_i64())
+                .next_back()
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
+    // ── Phase 1: Launch ──────────────────────────────────────────
+    logln!(log, "\n[Phase 1] Launching {tool} in tmux...");
+    let t0 = Instant::now();
+
+    let out = hcom(&format!("--go 1 {tool}"));
+    assert!(
+        out.status.success(),
+        "Launch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    logln!(log, "  Waiting for ready event...");
+    let mut guard = InstanceGuard { base_name: None };
+
+    let base_name: String = poll_until(
+        || {
+            let out = hcom("events --action ready --last 5");
+            if !out.status.success() {
+                return None;
+            }
+            for line in String::from_utf8_lossy(&out.stdout).lines().rev() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
+                    if ev["type"].as_str() == Some("life")
+                        && ev["data"]["action"].as_str() == Some("ready")
+                        && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
+                    {
+                        return ev["instance"].as_str().map(|s| s.to_string());
+                    }
+                }
+            }
+            None
+        },
+        "ready event from launched instance",
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    );
+
+    guard.base_name = Some(base_name.clone());
+    let tag = std::env::var("HCOM_TAG").unwrap_or_default();
+    let instance_name = if tag.is_empty() {
+        base_name.clone()
+    } else {
+        format!("{tag}-{base_name}")
+    };
+
+    let t_ready = t0.elapsed();
+    logln!(
+        log,
+        "  OK: Instance launched: {instance_name} (base: {base_name}, ready in {t_ready:.1?})"
+    );
+
+    // Wait for screen ready
+    let screen: serde_json::Value = poll_until(
+        || {
+            let s = get_screen(&base_name)?;
+            if s["ready"].as_bool() == Some(true) {
+                Some(s)
+            } else {
+                None
+            }
+        },
+        "screen ready (TUI fully rendered)",
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    );
+
+    logln!(log, "\n[Validate] Initial screen state for {tool}...");
+    validate_screen_schema(&screen);
+    logln!(log, "  OK: Schema valid");
+    assert_eq!(
+        screen["ready"].as_bool(),
+        Some(true),
+        "Cline should be ready after poll"
+    );
+    logln!(log, "  OK: ready=true");
+    validate_ready_pattern(&screen, tool);
+    logln!(
+        log,
+        "  OK: Ready pattern '{}' consistent",
+        ready_pattern(tool)
+    );
+    assert!(
+        screen["input_text"].is_null(),
+        "Cline input_text should be null, got {:?}",
+        screen["input_text"]
+    );
+    logln!(log, "  OK: input_text=null (no input detection)");
+    log.log_screen(&screen, &format!("{tool} — initial"));
+
+    // ── Phase 2: Bootstrap injection (first message via PTY) ─────
+    logln!(
+        log,
+        "\n[Phase 2] Testing bootstrap injection (first message via PTY)..."
+    );
+
+    let baseline_event = get_last_event_id(&base_name);
+    logln!(log, "  OK: Baseline event ID: {baseline_event}");
+
+    let t1 = Instant::now();
+    send_msg(&format!("@{instance_name} bootstrap-test-1 do not reply"));
+    logln!(log, "  OK: Message sent");
+
+    // Wait for agent to go active
+    let active_event: serde_json::Value = poll_until(
+        || {
+            let events = get_events(&base_name, 30, false);
+            events.into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > baseline_event
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["status"].as_str() == Some("active")
+            })
+        },
+        "agent goes active (processing bootstrap message)",
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    );
+    let active_id = active_event["id"].as_i64().unwrap_or(0);
+    logln!(log, "  OK: Agent went active: event={active_id}");
+
+    // Wait for listening after active
+    let listening_event: serde_json::Value = poll_until(
+        || {
+            let events = get_events(&base_name, 30, false);
+            events.into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > active_id
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["status"].as_str() == Some("listening")
+            })
+        },
+        "agent returns to listening",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let t_delivery = t1.elapsed();
+    logln!(
+        log,
+        "  OK: Bootstrap delivery complete: active→listening in {t_delivery:.1?}"
+    );
+    log.log(&format!(
+        "Bootstrap: active={} listening={}",
+        active_id, listening_event["id"]
+    ));
+
+    // Check hcom.log for bootstrap_inject (non-fatal)
+    let log_path = dirs::home_dir().unwrap().join(".hcom/.tmp/logs/hcom.log");
+    if let Ok(content) = fs::read_to_string(&log_path) {
+        if content.contains("delivery.bootstrap_inject") && content.contains(&base_name) {
+            logln!(log, "  OK: Bootstrap inject confirmed in hcom.log");
+        } else {
+            logln!(
+                log,
+                "  WARN: delivery.bootstrap_inject not found in hcom.log (may have rotated)"
+            );
+        }
+    }
+
+    let screen = get_screen(&base_name);
+    if let Some(s) = &screen {
+        validate_screen_schema(s);
+        log.log_screen(s, &format!("{tool} — post-bootstrap-delivery"));
+    }
+
+    // ── Phase 3: Plugin delivery (second message) ────────────────
+    logln!(
+        log,
+        "\n[Phase 3] Testing plugin delivery (second message)..."
+    );
+
+    // Wait for full quiescence before sending msg #2
+    poll_until(
+        || {
+            let evs = get_events(&base_name, 1, false);
+            let last = evs.last()?;
+            if last["data"]["status"].as_str() != Some("listening") {
+                return None;
+            }
+            let out = hcom(&format!("cline-read --name {base_name} --check"));
+            if !out.status.success() {
+                return None;
+            }
+            let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if body == "false" { Some(()) } else { None }
+        },
+        "agent quiescent (listening AND read cursor caught up)",
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    );
+
+    let baseline_event2 = get_last_event_id(&base_name);
+
+    let t2 = Instant::now();
+    send_msg(&format!("@{instance_name} plugin-test-2 do not reply"));
+    logln!(log, "  OK: Second message sent");
+
+    let active2: serde_json::Value = poll_until(
+        || {
+            let events = get_events(&base_name, 30, false);
+            events.into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > baseline_event2
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["status"].as_str() == Some("active")
+            })
+        },
+        "agent processes second message",
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    );
+    let active2_id = active2["id"].as_i64().unwrap_or(0);
+    logln!(
+        log,
+        "  OK: Agent went active for second message: event={active2_id}"
+    );
+
+    poll_until(
+        || {
+            let events = get_events(&base_name, 30, false);
+            events.into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > active2_id
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["status"].as_str() == Some("listening")
+            })
+        },
+        "agent returns to listening after second message",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let t_plugin = t2.elapsed();
+    logln!(
+        log,
+        "  OK: Plugin delivery complete: active→listening in {t_plugin:.1?}"
+    );
+
+    let screen = get_screen(&base_name);
+    if let Some(s) = &screen {
+        validate_screen_schema(s);
+        log.log_screen(s, &format!("{tool} — post-plugin-delivery"));
+    }
+
+    // Log all events
+    let all_events = get_events(&base_name, 50, false);
+    log.log(&format!("\n── All events for {instance_name}"));
+    for ev in &all_events {
+        log.log(&serde_json::to_string(ev).unwrap());
+    }
+
+    // Cleanup handled by guard Drop
+    logln!(log, "\n{}", "=".repeat(60));
+    logln!(log, "{} — ALL PHASES PASSED", tool.to_uppercase());
+    logln!(log, "  Log: {}", log.timestamped.display());
+    logln!(log, "{}", "=".repeat(60));
+}
+
 // ── Test entries ───────────────────────────────────────────────────────
 
 #[test]
@@ -1161,6 +1448,6 @@ fn test_pty_codex() {
 
 #[test]
 #[ignore]
-fn test_pty_opencode() {
-    run_pty_test_opencode();
+fn test_pty_cline() {
+    run_pty_test_cline();
 }

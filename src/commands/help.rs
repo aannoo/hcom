@@ -176,7 +176,7 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [KILOCODE]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [KILOCODE] [CLINE] [CLINECODE]  hcom-launched (PTY + hooks)",
     ),
     (
         "",
@@ -432,7 +432,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .kilocode",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .kilocode, .cline, .clinecode",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -466,7 +466,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / cline_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -530,7 +530,7 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("  --limit N", "Max results (default: 20)"),
     (
         "  --agent TYPE",
-        "Filter: claude | gemini | codex | opencode | kilo | kilocode",
+        "Filter: claude | gemini | codex | opencode | kilo | kilocode | cline | clinecode",
     ),
     (
         "  --exclude-self",
@@ -598,11 +598,11 @@ const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks status", "Same as above"),
     (
         "hooks add [tool]",
-        "Add hooks (claude | gemini | codex | opencode | kilo | kilocode | all)",
+        "Add hooks (claude | gemini | codex | opencode | kilo | kilocode | cline | clinecode | all)",
     ),
     (
         "hooks remove [tool]",
-        "Remove hooks (claude | gemini | codex | opencode | all)",
+        "Remove hooks (claude | gemini | codex | opencode | kilocode | cline | clinecode | all)",
     ),
     ("", ""),
     (
@@ -739,6 +739,22 @@ const KILOCODE_SPEC: ToolHelpSpec = ToolHelpSpec {
     has_fork: true,
 };
 
+const CLINE_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "cline",
+    label: "Cline",
+    unique_examples: &[],
+    extra_env: &[],
+    has_fork: true,
+};
+
+const CLINECODE_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "clinecode",
+    label: "ClineCode",
+    unique_examples: &[],
+    extra_env: &[],
+    has_fork: true,
+};
+
 fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
     match name {
         "claude" => Some(&CLAUDE_SPEC),
@@ -747,6 +763,8 @@ fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
         "opencode" => Some(&OPENCODE_SPEC),
         "kilo" => Some(&KILO_SPEC),
         "kilocode" => Some(&KILOCODE_SPEC),
+        "cline" => Some(&CLINE_SPEC),
+        "clinecode" => Some(&CLINECODE_SPEC),
         _ => None,
     }
 }
@@ -908,6 +926,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "opencode",
     "kilo",
     "kilocode",
+    "cline",
+    "clinecode",
 ];
 
 /// Get the top-level help text as a String.
@@ -922,7 +942,7 @@ Usage:\n\
 Launch:\n\
   hcom [N] claude|gemini|codex|opencode|kilo|kilocode [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode)\n\
+  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode/cline/clinecode)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
@@ -1140,6 +1160,8 @@ mod tests {
             "opencode",
             "kilo",
             "kilocode",
+            "cline",
+            "clinecode",
         ];
         for cmd in commands {
             let help = get_command_help(cmd);
@@ -1191,8 +1213,8 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode)"
-        ));
+assert!(help.contains(
+    "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode/cline/clinecode)"
+));
     }
 }

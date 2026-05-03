@@ -2,6 +2,7 @@
 
 pub mod claude;
 pub mod claude_args;
+pub mod cline;
 pub mod codex;
 pub mod common;
 pub mod family;

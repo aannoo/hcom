@@ -21,7 +21,7 @@ use crate::instances;
 use crate::paths;
 use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
 use crate::terminal;
-use crate::tools::{codex_preprocessing, kilo_preprocessing, opencode_preprocessing};
+use crate::tools::{codex_preprocessing, cline_preprocessing, kilo_preprocessing, opencode_preprocessing};
 
 /// Canonical tool types for launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub enum LaunchTool {
     Codex,
     OpenCode,
     Kilo,
+    Cline,
 }
 
 impl LaunchTool {
@@ -44,6 +45,7 @@ impl LaunchTool {
             "codex" => Ok(LaunchTool::Codex),
             "opencode" => Ok(LaunchTool::OpenCode),
             "kilocode" | "kilo" => Ok(LaunchTool::Kilo),
+            "cline" => Ok(LaunchTool::Cline),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -56,6 +58,7 @@ impl LaunchTool {
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
             LaunchTool::Kilo => "kilo",
+            LaunchTool::Cline => "cline",
         }
     }
 
@@ -67,6 +70,7 @@ impl LaunchTool {
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
             LaunchTool::Kilo => "kilo",
+            LaunchTool::Cline => "cline",
         }
     }
 
@@ -106,7 +110,7 @@ impl LaunchBackend {
         match tool {
             LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
             LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode | LaunchTool::Kilo => {
+            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Cline => {
                 LaunchBackend::HeadlessPty
             }
         }
@@ -285,6 +289,7 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
         LaunchTool::Codex => Some("CODEX_HOME"),
         LaunchTool::OpenCode => None,
         LaunchTool::Kilo => None,
+        LaunchTool::Cline => None,
     };
     if let Some(env_var) = tool_env_var {
         let _ = writeln!(
@@ -395,6 +400,13 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup Kilo plugin. Run: hcom hooks add kilo\n{diag}");
+        }
+        LaunchTool::Cline => {
+            if crate::hooks::cline::ensure_plugin_installed() {
+                return Ok(());
+            }
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup Cline plugin. Run: hcom hooks add cline\n{diag}");
         }
     }
 }
@@ -884,6 +896,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.args.push("--prompt".to_string());
                 params.args.push(full_prompt);
             }
+            LaunchTool::Cline => {
+                // Cline: --prompt flag (same as opencode)
+                params.args.push("--prompt".to_string());
+                params.args.push(full_prompt);
+            }
         }
     }
     let batch_id = params
@@ -995,6 +1012,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
             LaunchTool::Kilo => "kilo",
+            LaunchTool::Cline => "cline",
         };
         if !is_tool_installed(tool_binary) {
             eprintln!("Error: '{}' is not installed or not in PATH", tool_binary);
@@ -1302,6 +1320,40 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+
+                LaunchTool::Cline => {
+                    cline_preprocessing::preprocess_cline_env(
+                        &mut instance_env,
+                        &instance_name,
+                    );
+
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(params.args),
+                        )]),
+                    );
+
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "cline",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -1403,6 +1455,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
         }
         LaunchTool::OpenCode => Vec::new(),
         LaunchTool::Kilo => Vec::new(),
+        LaunchTool::Cline => Vec::new(),
     }
 }
 
@@ -1441,6 +1494,10 @@ mod tests {
         assert_eq!(
             LaunchTool::from_str("kilo", false).unwrap(),
             LaunchTool::Kilo
+        );
+        assert_eq!(
+            LaunchTool::from_str("cline", false).unwrap(),
+            LaunchTool::Cline
         );
         assert!(LaunchTool::from_str("unknown", false).is_err());
     }
