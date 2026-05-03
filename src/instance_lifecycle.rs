@@ -753,6 +753,105 @@ fn cleanup_stale_remote_instances(db: &HcomDb) {
     }
 }
 
+/// Detect and clean up instances whose processes died (e.g. system reboot).
+///
+/// After a reboot, hcom instances with PIDs in the DB are stale — their
+/// processes no longer exist. This function finds them, saves a stopped
+/// snapshot for resume, and removes the dead row. Hook-based agents without
+/// tracked PIDs are handled by the existing heartbeat staleness detection
+/// the next time `hcom list` runs.
+///
+/// Returns the number of instances marked dead.
+pub fn mark_dead_instances(db: &HcomDb) -> i32 {
+    let Ok(instances) = db.iter_instances_full() else {
+        return 0;
+    };
+    let mut marked = 0;
+
+    for inst in &instances {
+        if inst.status == ST_INACTIVE || inst.status == ST_LAUNCHING {
+            continue;
+        }
+
+        let is_remote = inst.origin_device_id.as_deref().is_some_and(|v| !v.is_empty());
+        if is_remote {
+            continue;
+        }
+
+        let pid = match inst.pid {
+            Some(p) if p > 0 => p as u32,
+            _ => continue,
+        };
+
+        if crate::pidtrack::is_alive(pid) {
+            continue;
+        }
+
+        let snapshot = serde_json::json!({
+            "name": inst.name,
+            "transcript_path": inst.transcript_path,
+            "session_id": inst.session_id,
+            "tool": inst.tool,
+            "directory": inst.directory,
+            "parent_name": inst.parent_name,
+            "tag": inst.tag,
+            "wait_timeout": inst.wait_timeout,
+            "subagent_timeout": inst.subagent_timeout,
+            "hints": inst.hints,
+            "pid": inst.pid,
+            "created_at": inst.created_at,
+            "background": inst.background,
+            "agent_id": inst.agent_id,
+            "launch_args": inst.launch_args,
+            "origin_device_id": inst.origin_device_id,
+            "background_log_file": inst.background_log_file,
+            "last_event_id": inst.last_event_id,
+        });
+
+        if let Some(ref session_id) = inst.session_id {
+            let _ = db.conn().execute(
+                "DELETE FROM session_bindings WHERE session_id = ?",
+                rusqlite::params![session_id],
+            );
+            let _ = db.conn().execute(
+                "DELETE FROM process_bindings WHERE session_id = ?",
+                rusqlite::params![session_id],
+            );
+        }
+
+        let _ = db.conn().execute(
+            "DELETE FROM process_bindings WHERE instance_name = ?",
+            rusqlite::params![inst.name],
+        );
+        let _ = db.delete_notify_endpoints(&inst.name);
+        let _ = db.cleanup_subscriptions(&inst.name);
+
+        if db
+            .log_life_event(
+                &inst.name,
+                "stopped",
+                "system",
+                "exit:reboot",
+                Some(snapshot),
+            )
+            .is_ok()
+        {
+            let _ = db.delete_instance(&inst.name);
+            marked += 1;
+            crate::log::log_info(
+                "lifecycle",
+                "mark_dead",
+                &format!(
+                    "instance={} pid={} tool={} project={:?}",
+                    inst.name, pid, inst.tool, inst.project
+                ),
+            );
+        }
+    }
+
+    marked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

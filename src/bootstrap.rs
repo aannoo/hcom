@@ -776,6 +776,7 @@ mod tests {
             instance_name: "luna".to_string(),
             display_name: "p0c-luna".to_string(),
             tag: "p0c".to_string(),
+            project: String::new(),
             relay_enabled: false,
             hcom_cmd: "hcom".to_string(),
             is_launched: true,
