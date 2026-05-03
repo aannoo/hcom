@@ -39,6 +39,12 @@ pub static TOOL_NAME_MAPPINGS: LazyLock<
     codex.insert("file", vec!["apply_patch"]);
     m.insert("codex", codex);
 
+    let mut kilo = HashMap::new();
+    kilo.insert("bash", vec!["Bash", "execute_command", "shell"]);
+    kilo.insert("file", vec!["Write", "Edit"]);
+    kilo.insert("delegate", vec!["Task", "Agent"]);
+    m.insert("kilocode", kilo);
+
     m
 });
 
