@@ -89,6 +89,8 @@ fn input_prefix_str(app: &App) -> &'static str {
             OverlayKind::Search => "SEARCH / ",
             OverlayKind::Command => "CMD ! ",
             OverlayKind::Tag => "TAG # ",
+            OverlayKind::Project => "PRJ ! ",
+            OverlayKind::ProjectFilter => "FILTER @ ",
         };
     }
     match app.ui.mode {
@@ -103,6 +105,8 @@ fn mode_input_bg(app: &App) -> ratatui::style::Color {
             OverlayKind::Search => palette::MODE_SEARCH,
             OverlayKind::Command => palette::MODE_CMD,
             OverlayKind::Tag => palette::MODE_TAG,
+            OverlayKind::Project => palette::MODE_TAG,
+            OverlayKind::ProjectFilter => palette::MODE_SEARCH,
         };
     }
     match app.ui.mode {
@@ -422,14 +426,12 @@ fn render_inline(frame: &mut Frame, app: &mut App, area: Rect) {
     let input_height = compose_input_height(app, true, area.width);
 
     // Layout: topline + status + sep + agents + [launch] + input + footer
-    let chrome = 1 + 1 + 1 + input_height + 1 + launch_height;
-    let agent_height = area.height.saturating_sub(chrome);
-
+    // Use Fill(1) for agents so launch/input always get their full height
     let mut constraints = vec![
-        Constraint::Length(1),            // top line
-        Constraint::Length(1),            // status bar
-        Constraint::Length(1),            // separator
-        Constraint::Length(agent_height), // agents (fills remaining)
+        Constraint::Length(1),     // top line
+        Constraint::Length(1),     // status bar
+        Constraint::Length(1),     // separator
+        Constraint::Fill(1),       // agents (takes remaining space)
     ];
     if launch_height > 0 {
         constraints.push(Constraint::Length(launch_height));
@@ -502,7 +504,7 @@ fn render_vertical(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut outer = vec![
         Constraint::Length(1), // status bar
         Constraint::Length(1), // blank
-        Constraint::Min(3),    // body (agents left | messages right)
+        Constraint::Fill(1),   // body (agents left | messages right)
     ];
     if launch_height > 0 {
         outer.push(Constraint::Length(launch_height));
@@ -1094,11 +1096,15 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                     OverlayKind::Search => ("SEARCH ", Style::default().fg(palette::YELLOW)),
                     OverlayKind::Command => ("CMD ", Style::default().fg(palette::MAGENTA)),
                     OverlayKind::Tag => ("TAG ", Style::default().fg(palette::TEAL)),
+                    OverlayKind::Project => ("PRJ ", Style::default().fg(palette::TEAL)),
+                    OverlayKind::ProjectFilter => ("FILTER ", Style::default().fg(palette::CYAN)),
                 };
                 let prefix_char = match overlay.kind {
                     OverlayKind::Search => "/ ",
                     OverlayKind::Command => "! ",
                     OverlayKind::Tag => "# ",
+                    OverlayKind::Project => "! ",
+                    OverlayKind::ProjectFilter => "@ ",
                 };
                 Line::from(vec![
                     Span::raw("  "),
@@ -1152,6 +1158,8 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(" message  ", hl),
                         Span::styled("t", hk),
                         Span::styled(" tag  ", hl),
+                        Span::styled("p", hk),
+                        Span::styled(" project  ", hl),
                         Span::styled("f", hk),
                         Span::styled(" fork  ", hl),
                         Span::styled("k", hk),
@@ -1305,6 +1313,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                         OverlayKind::Search => " keep ",
                         OverlayKind::Command => " run ",
                         OverlayKind::Tag => " set ",
+                        OverlayKind::Project => " set ",
+                        OverlayKind::ProjectFilter => " filter ",
                     };
                     vec![
                         Span::raw("  "),
@@ -1636,6 +1646,8 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
         Line::from(vec![key("enter/space"), desc("select + filter scrollback")]),
         Line::from(vec![key("a"), desc("select all")]),
         Line::from(vec![key("b"), desc("broadcast to all")]),
+        Line::from(vec![key("p"), desc("set project on agent")]),
+        Line::from(vec![key("F"), desc("filter agents by project")]),
         Line::from(vec![key("\\"), desc("toggle view")]),
         Line::from(vec![key("ctrl+r"), desc("relay settings")]),
         Line::from(vec![key("ctrl+s"), desc("all stopped agents")]),

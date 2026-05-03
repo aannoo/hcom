@@ -21,16 +21,22 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
-     ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
-     UPDATE instances
-     SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
-     WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+         ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
+         UPDATE instances
+         SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
+         WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+    ),
+    (
+        18,
+        "ALTER TABLE instances ADD COLUMN project TEXT DEFAULT '';",
+    ),
+];
 
 use crate::core::filters::FILE_WRITE_CONTEXTS;
 use crate::shared::constants::{MENTION_PATTERN, ST_LISTENING, thread_membership_sub_id};
@@ -86,6 +92,7 @@ pub struct InstanceRow {
     pub parent_name: Option<String>,
     pub agent_id: Option<String>,
     pub tag: Option<String>,
+    pub project: Option<String>,
     pub last_event_id: i64,
     pub last_stop: i64,
     pub status: String,
@@ -131,6 +138,9 @@ impl InstanceRow {
                 .filter(|s| !s.is_empty()),
             tag: row
                 .get::<_, Option<String>>("tag")?
+                .filter(|s| !s.is_empty()),
+            project: row
+                .get::<_, Option<String>>("project")?
                 .filter(|s| !s.is_empty()),
             last_event_id: row.get::<_, Option<i64>>("last_event_id")?.unwrap_or(0),
             last_stop: row.get::<_, Option<i64>>("last_stop")?.unwrap_or(0),
@@ -356,6 +366,7 @@ impl HcomDb {
                 parent_session_id TEXT,
                 parent_name TEXT,
                 tag TEXT,
+                project TEXT DEFAULT '',
                 last_event_id INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'active',
                 status_time INTEGER DEFAULT 0,
@@ -662,6 +673,7 @@ impl HcomDb {
                     .collect();
                 let required = [
                     "tool",
+                    "project",
                     "terminal_preset_requested",
                     "terminal_preset_effective",
                 ];
@@ -2870,7 +2882,7 @@ impl HcomDb {
     /// Get instance by name. Returns full row as JSON or None.
     /// Column list for instance SELECT queries. Must match instance_row_to_json index order.
     const INSTANCE_COLUMNS: &str =
-        "name, session_id, parent_session_id, parent_name, tag, last_event_id,
+        "name, session_id, parent_session_id, parent_name, tag, project, last_event_id,
          status, status_time, status_context, status_detail, last_stop, directory,
          created_at, transcript_path, tcp_mode, wait_timeout, background,
          background_log_file, name_announced, agent_id, running_tasks,
@@ -2886,32 +2898,33 @@ impl HcomDb {
             "parent_session_id": row.get::<_, Option<String>>(2).unwrap_or(None),
             "parent_name": row.get::<_, Option<String>>(3).unwrap_or(None),
             "tag": row.get::<_, Option<String>>(4).unwrap_or(None),
-            "last_event_id": row.get::<_, i64>(5).unwrap_or(0),
-            "status": row.get::<_, String>(6).unwrap_or_default(),
-            "status_time": row.get::<_, i64>(7).unwrap_or(0),
-            "status_context": row.get::<_, String>(8).unwrap_or_default(),
-            "status_detail": row.get::<_, String>(9).unwrap_or_default(),
-            "last_stop": row.get::<_, i64>(10).unwrap_or(0),
-            "directory": row.get::<_, Option<String>>(11).unwrap_or(None),
-            "created_at": row.get::<_, f64>(12).unwrap_or(0.0),
-            "transcript_path": row.get::<_, String>(13).unwrap_or_default(),
-            "tcp_mode": row.get::<_, i64>(14).unwrap_or(0),
-            "wait_timeout": row.get::<_, i64>(15).unwrap_or(86400),
-            "background": row.get::<_, i64>(16).unwrap_or(0),
-            "background_log_file": row.get::<_, String>(17).unwrap_or_default(),
-            "name_announced": row.get::<_, i64>(18).unwrap_or(0),
-            "agent_id": row.get::<_, Option<String>>(19).unwrap_or(None),
-            "running_tasks": row.get::<_, String>(20).unwrap_or_default(),
-            "origin_device_id": row.get::<_, String>(21).unwrap_or_default(),
-            "hints": row.get::<_, String>(22).unwrap_or_default(),
-            "subagent_timeout": row.get::<_, Option<i64>>(23).unwrap_or(None),
-            "tool": row.get::<_, String>(24).unwrap_or_default(),
-            "launch_args": row.get::<_, String>(25).unwrap_or_default(),
-            "terminal_preset_requested": row.get::<_, String>(26).unwrap_or_default(),
-            "terminal_preset_effective": row.get::<_, String>(27).unwrap_or_default(),
-            "idle_since": row.get::<_, String>(28).unwrap_or_default(),
-            "pid": row.get::<_, Option<i64>>(29).unwrap_or(None),
-            "launch_context": row.get::<_, String>(30).unwrap_or_default(),
+            "project": row.get::<_, Option<String>>(5).unwrap_or(None),
+            "last_event_id": row.get::<_, i64>(6).unwrap_or(0),
+            "status": row.get::<_, String>(7).unwrap_or_default(),
+            "status_time": row.get::<_, i64>(8).unwrap_or(0),
+            "status_context": row.get::<_, String>(9).unwrap_or_default(),
+            "status_detail": row.get::<_, String>(10).unwrap_or_default(),
+            "last_stop": row.get::<_, i64>(11).unwrap_or(0),
+            "directory": row.get::<_, Option<String>>(12).unwrap_or(None),
+            "created_at": row.get::<_, f64>(13).unwrap_or(0.0),
+            "transcript_path": row.get::<_, String>(14).unwrap_or_default(),
+            "tcp_mode": row.get::<_, i64>(15).unwrap_or(0),
+            "wait_timeout": row.get::<_, i64>(16).unwrap_or(86400),
+            "background": row.get::<_, i64>(17).unwrap_or(0),
+            "background_log_file": row.get::<_, String>(18).unwrap_or_default(),
+            "name_announced": row.get::<_, i64>(19).unwrap_or(0),
+            "agent_id": row.get::<_, Option<String>>(20).unwrap_or(None),
+            "running_tasks": row.get::<_, String>(21).unwrap_or_default(),
+            "origin_device_id": row.get::<_, String>(22).unwrap_or_default(),
+            "hints": row.get::<_, String>(23).unwrap_or_default(),
+            "subagent_timeout": row.get::<_, Option<i64>>(24).unwrap_or(None),
+            "tool": row.get::<_, String>(25).unwrap_or_default(),
+            "launch_args": row.get::<_, String>(26).unwrap_or_default(),
+            "terminal_preset_requested": row.get::<_, String>(27).unwrap_or_default(),
+            "terminal_preset_effective": row.get::<_, String>(28).unwrap_or_default(),
+            "idle_since": row.get::<_, String>(29).unwrap_or_default(),
+            "pid": row.get::<_, Option<i64>>(30).unwrap_or(None),
+            "launch_context": row.get::<_, String>(31).unwrap_or_default(),
         }))
     }
 
@@ -3188,6 +3201,7 @@ impl HcomDb {
             "parent_name",
             "agent_id",
             "tag",
+            "project",
             "last_event_id",
             "last_stop",
             "status",
@@ -3287,8 +3301,9 @@ mod tests {
                 tool TEXT,
                 directory TEXT,
                 parent_name TEXT,
-                tag TEXT,
-                wait_timeout INTEGER,
+             tag TEXT,
+                 project TEXT DEFAULT '',
+                 wait_timeout INTEGER,
                 subagent_timeout INTEGER,
                 hints TEXT,
                 pid INTEGER,
@@ -3734,7 +3749,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_schema_migrates_v16_to_v17_in_place() {
+    fn test_ensure_schema_migrates_v17_to_v18_in_place() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(2500);
 
@@ -3754,12 +3769,14 @@ mod tests {
                      name TEXT PRIMARY KEY,
                      tool TEXT DEFAULT 'claude',
                      created_at REAL NOT NULL,
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
                      launch_context TEXT DEFAULT ''
                  );
                  CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
                  CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
                  CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
-                 PRAGMA user_version = 16;",
+                 PRAGMA user_version = 17;",
             )
             .unwrap();
             conn.execute(
@@ -3783,15 +3800,15 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        let preset: String = db
+        let project: String = db
             .conn
             .query_row(
-                "SELECT terminal_preset_effective FROM instances WHERE name = ?",
+                "SELECT project FROM instances WHERE name = ?",
                 params!["luna"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(preset, "ghostty-tab");
+        assert_eq!(project, "");
         let launch_context: String = db
             .conn
             .query_row(
@@ -3855,8 +3872,8 @@ mod tests {
         cleanup_test_db(db_path);
     }
 
-    /// Regression test for issue #16: init_db() stamped user_version=17 without
-    /// actually adding the terminal_preset_* columns. ensure_schema must repair
+    /// Regression test for issue #16: init_db() stamped user_version=18 without
+    /// actually adding the `project` column. ensure_schema must repair
     /// this via migration instead of archiving (which would lose data).
     #[test]
     fn test_ensure_schema_repairs_stamped_but_not_migrated_db() {
@@ -3871,9 +3888,9 @@ mod tests {
             test_id
         ));
 
-        // Simulate the bug: create a v16-style DB but stamp it as v17
+        // Simulate the bug: create a v17-style DB but stamp it as v18
         // (this is what init_db() did — CREATE IF NOT EXISTS is a no-op on
-        // existing tables, then it unconditionally set user_version = 17)
+        // existing tables, then it unconditionally set user_version = 18)
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -3904,6 +3921,8 @@ mod tests {
                      hints TEXT DEFAULT '',
                      subagent_timeout INTEGER,
                      tool TEXT DEFAULT 'claude',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
                      launch_args TEXT DEFAULT '',
                      idle_since TEXT DEFAULT '',
                      pid INTEGER DEFAULT NULL,
@@ -3913,7 +3932,7 @@ mod tests {
                  CREATE TABLE notify_endpoints (instance TEXT NOT NULL, kind TEXT NOT NULL, port INTEGER NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(instance, kind));
                  CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
                  CREATE TABLE process_bindings (process_id TEXT PRIMARY KEY, session_id TEXT, instance_name TEXT, updated_at REAL NOT NULL);
-                 PRAGMA user_version = 17;",
+                 PRAGMA user_version = 18;",
             )
             .unwrap();
             // Insert test data that should survive the repair
@@ -3935,8 +3954,8 @@ mod tests {
                 .filter_map(|r| r.ok())
                 .collect();
             assert!(
-                !cols.contains(&"terminal_preset_requested".to_string()),
-                "column should be missing before repair"
+                !cols.contains(&"project".to_string()),
+                "project column should be missing before repair"
             );
         }
 
@@ -3960,12 +3979,8 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(
-            cols.contains(&"terminal_preset_requested".to_string()),
-            "terminal_preset_requested column should exist after repair"
-        );
-        assert!(
-            cols.contains(&"terminal_preset_effective".to_string()),
-            "terminal_preset_effective column should exist after repair"
+            cols.contains(&"project".to_string()),
+            "project column should exist after repair"
         );
 
         // Test data should have survived (not archived)

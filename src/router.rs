@@ -43,7 +43,7 @@ const COMMANDS: &[&str] = &[
 ];
 
 /// Tools that support launch commands (hcom [N] <tool>)
-const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "f", "r"];
+const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "kilocode", "kilo", "cline", "f", "r"];
 
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
@@ -92,6 +92,8 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             String::new(),
         ),
         Tool::OpenCode => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
+        Tool::Kilo => crate::hooks::kilo::dispatch_kilo_hook(hook, args),
+        Tool::Cline => crate::hooks::cline::dispatch_cline_hook(hook, args),
         Tool::Adhoc => unreachable!("adhoc has no hooks"),
     }
 }
@@ -1294,13 +1296,16 @@ mod tests {
         assert!(is_hook("gemini-beforeagent"));
         assert!(is_hook("codex-sessionstart"));
         assert!(is_hook("opencode-start"));
+        assert!(is_hook("kilocode-start"));
+        assert!(is_hook("cline-start"));
+        assert!(is_hook("cline-stop"));
         assert!(!is_hook("send"));
         assert!(!is_hook("unknown"));
     }
 
     #[test]
     fn hooks_do_not_collide_with_commands_or_launch_tools() {
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
+        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline] {
             for hook in tool.hooks() {
                 assert!(!COMMANDS.contains(hook), "{hook} collides with command");
                 assert!(

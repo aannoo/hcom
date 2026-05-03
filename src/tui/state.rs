@@ -95,6 +95,8 @@ pub struct UiState {
     pub pending_eject_cmd: bool,
     /// Terminal width, updated each render frame. Used by input handlers for wrap calculations.
     pub term_width: u16,
+    /// Filter agents by project name. None = show all.
+    pub project_filter: Option<String>,
 }
 
 impl UiState {

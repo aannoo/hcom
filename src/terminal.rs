@@ -403,6 +403,7 @@ pub fn which_bin(name: &str) -> Option<String> {
                 home.join(".claude").join("bin").join("claude"),
             ],
             "opencode" => &[home.join(".opencode").join("bin").join("opencode")],
+            "kilocode" => &[home.join(".kilocode").join("bin").join("kilocode")],
             _ => &[],
         };
         for fallback in fallbacks {
@@ -619,8 +620,12 @@ pub fn create_bash_script(
 ) -> Result<()> {
     let tool_name = tool_name.unwrap_or_else(|| {
         let cmd_lower = command_str.to_lowercase();
-        if cmd_lower.contains("opencode") {
+        if cmd_lower.contains("kilocode") {
+            "KiloCode"
+        } else if cmd_lower.contains("opencode") {
             "OpenCode"
+        } else if cmd_lower.contains("kilo") {
+            "Kilo"
         } else if cmd_lower.contains("gemini") {
             "Gemini"
         } else if cmd_lower.contains("codex") {
