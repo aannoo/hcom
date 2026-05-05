@@ -754,6 +754,23 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
     }
 
+    // HCOM_DIR placement: refuse if it sits under a tool-protected metadata
+    // directory. codex hard-denies apply_patch into these via
+    // FileSystemSandboxPolicy with no approval path; claude/gemini gate them
+    // behind permission prompts on every hcom write. Either way the user gets
+    // a broken session — fail fast at launch with a clear message instead.
+    let hcom_dir_path = paths::hcom_dir();
+    if let Some(protected) = paths::protected_hcom_dir_component(&hcom_dir_path) {
+        bail!(
+            "HCOM_DIR ({}) sits under a protected directory component '{}'.\n\
+             AI tools (codex/claude/gemini) deny writes under .git/.codex/.claude/.agents,\n\
+             which would block hcom DB writes from the launched agent.\n\
+             Set HCOM_DIR to a path outside these directories.",
+            hcom_dir_path.display(),
+            protected
+        );
+    }
+
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized)?;
 

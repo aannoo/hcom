@@ -52,6 +52,32 @@ pub fn resolve_hcom_dir_from_env(env: &HashMap<String, String>, cwd: &Path) -> (
     (resolved, hcom_dir.is_some())
 }
 
+/// Directory components that some AI tools (codex, claude, gemini) treat as
+/// protected metadata under any writable root. Placing HCOM_DIR beneath one of
+/// these means the parent tool's sandbox/permission layer will block writes to
+/// the hcom DB, with no escalation path for codex apply_patch.
+///
+/// - `.git`: codex (apply_patch hard-deny via FileSystemSandboxPolicy), claude
+///   (DANGEROUS_DIRECTORIES auto-edit gate), gemini (GOVERNANCE_FILES).
+/// - `.codex`, `.agents`: codex protected metadata.
+/// - `.claude`: claude DANGEROUS_DIRECTORIES.
+const PROTECTED_HCOM_DIR_COMPONENTS: &[&str] = &[".git", ".codex", ".claude", ".agents"];
+
+/// If `path` sits at or beneath a protected metadata component, return that
+/// component name. Component-wise match — `.gitfoo` and `dot.git` do not trigger.
+pub fn protected_hcom_dir_component(path: &Path) -> Option<&'static str> {
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            for protected in PROTECTED_HCOM_DIR_COMPONENTS {
+                if name == std::ffi::OsStr::new(*protected) {
+                    return Some(*protected);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Get the hcom base directory.
 ///
 /// Uses centralized Config (HCOM_DIR env var or ~/.hcom fallback).
@@ -269,6 +295,39 @@ mod tests {
         let (path, overridden) = resolve_hcom_dir_from_env(&env, Path::new("/worktree"));
         assert_eq!(path, PathBuf::from("/home/test/custom/.hcom"));
         assert!(overridden);
+    }
+
+    #[test]
+    fn test_protected_hcom_dir_component() {
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/proj/.git/hcom")),
+            Some(".git")
+        );
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/.codex/hcom")),
+            Some(".codex")
+        );
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/.claude/.hcom")),
+            Some(".claude")
+        );
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/.agents/.hcom")),
+            Some(".agents")
+        );
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/.hcom")),
+            None
+        );
+        // Component-wise match: '.gitfoo' must not trigger.
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/.gitfoo/.hcom")),
+            None
+        );
+        assert_eq!(
+            protected_hcom_dir_component(Path::new("/home/u/proj/.hcom/sub")),
+            None
+        );
     }
 
     #[test]
