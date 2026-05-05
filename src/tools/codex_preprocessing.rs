@@ -80,19 +80,42 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
     }
 
     let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+    let quoted_hcom_dir = serde_json::to_string(&hcom_dir).unwrap_or_else(|_| format!("\"{}\"", hcom_dir));
+    let config_val = format!("sandbox_workspace_write.writable_roots=[{}]", quoted_hcom_dir);
 
     // Check if --add-dir with hcom path already exists
-    for (i, token) in spec.clean_tokens.iter().enumerate() {
-        if token == "--add-dir"
-            && i + 1 < spec.clean_tokens.len()
-            && spec.clean_tokens[i + 1] == hcom_dir
-        {
-            return tokens.to_vec(); // Already present
-        }
+    let has_add_dir = if let Some(val) = spec.get_flag_value("--add-dir") {
+        val.as_list().contains(&hcom_dir.as_str())
+    } else {
+        false
+    };
+
+    // Check if the config override already exists
+    let has_config = if let Some(val) = spec.get_flag_value("-c") {
+        val.as_list().contains(&config_val.as_str())
+    } else {
+        false
+    };
+
+    if has_add_dir && has_config {
+        return tokens.to_vec(); // Both already present
     }
 
-    // Prepend --add-dir at the beginning
-    let mut result = vec!["--add-dir".to_string(), hcom_dir];
+    let mut result = Vec::new();
+
+    if !has_add_dir {
+        result.push("--add-dir".to_string());
+        result.push(hcom_dir.clone());
+    }
+
+    if !has_config {
+        // ALSO inject -c sandbox_workspace_write.writable_roots=["<hcom_dir>"] as a
+        // workaround for Codex sandbox profile resolution issues where --add-dir
+        // is sometimes dropped.
+        result.push("-c".to_string());
+        result.push(config_val);
+    }
+
     result.extend(tokens.iter().cloned());
     result
 }
@@ -357,10 +380,49 @@ mod tests {
     fn test_ensure_hcom_writable_no_duplicate() {
         init_config();
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        // If only --add-dir is already present, it should not duplicate that flag.
+        // The config override may still be injected.
         let tokens = vec!["--full-auto".to_string(), "--add-dir".to_string(), hcom_dir];
         let result = ensure_hcom_writable(&tokens);
         let add_dir_count = result.iter().filter(|t| *t == "--add-dir").count();
         assert_eq!(add_dir_count, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_avoids_duplicate_config() {
+        init_config();
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        let config_val = format!("sandbox_workspace_write.writable_roots=[\"{}\"]", hcom_dir);
+        // If both are present, should return original tokens
+        let tokens = vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--add-dir".to_string(),
+            hcom_dir,
+            "-c".to_string(),
+            config_val,
+        ];
+        let result = ensure_hcom_writable(&tokens);
+        assert_eq!(result, tokens);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_adds_config_override() {
+        init_config();
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        let tokens = s(&["--sandbox", "workspace-write"]);
+        let result = ensure_hcom_writable(&tokens);
+        
+        // Should contain --add-dir <hcom_dir>
+        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(result.contains(&hcom_dir));
+        
+        // Should ALSO contain -c sandbox_workspace_write.writable_roots=["<hcom_dir>"]
+        let config_val = format!("sandbox_workspace_write.writable_roots=[\"{}\"]", hcom_dir);
+        assert!(result.contains(&"-c".to_string()));
+        assert!(result.contains(&config_val));
     }
 
     #[test]
