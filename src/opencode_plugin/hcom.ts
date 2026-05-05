@@ -292,8 +292,12 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
 
   async function bindIdentity(sid: string): Promise<void> {
     if (instanceName || bindingPromise) return
-    if (process.env.HCOM_LAUNCHED !== "1") return
+    if (!process.env.HCOM_PROCESS_ID) return
 
+    // No HCOM_LAUNCHED guard: launched OpenCode instances can start with only
+    // a process/PTY binding and acquire an OpenCode session later.
+    // Safe to call repeatedly: $.nothrow() catches failures and bindIdentity's
+    // own early-return (instanceName || bindingPromise) handles duplicates.
     bindingPromise = (async () => {
       try {
         // Start TCP notify server before binding so port is registered atomically
@@ -451,10 +455,24 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           sessionId = input.sessionID
         }
         if (bindingPromise) await bindingPromise
-        if (input.sessionID && !instanceName) {
+        if (input.sessionID && !instanceName && !bindingPromise) {
           await bindIdentity(input.sessionID)
         }
-        if (isBoundSession(input.sessionID)) {
+        // Guard: only mutate agent/model state when the message carries a session ID and
+        // binding has actually succeeded. `sessionId` may be populated from earlier
+        // events before bindIdentity completes successfully, so do not treat it as
+        // proof of a bound session here.
+        if (!input.sessionID) {
+          log("WARN", "plugin.chat_message_unbound", null, {
+            session_id: input.sessionID,
+            reason: "chat.message missing sessionID",
+          })
+        } else if (!instanceName) {
+          log("WARN", "plugin.chat_message_unbound", null, {
+            session_id: input.sessionID,
+            reason: "no binding after bindIdentity attempt — hcom absent or daemon error",
+          })
+        } else if (isBoundSession(input.sessionID)) {
           if (input.agent) currentAgent = input.agent
           const resolvedModel = normalizePromptModel(input.model)
           if (resolvedModel) currentModel = resolvedModel
@@ -475,7 +493,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       try {
         if (!checkHcom()) return
         if (bindingPromise) await bindingPromise
-        if (!instanceName && sessionId) await bindIdentity(sessionId)
+        if (!instanceName && !bindingPromise && sessionId) {
+          await bindIdentity(sessionId)
+        }
         if (!instanceName || !sessionId) return
 
         // OpenCode transform mutations are prompt-local, not persisted to stored
