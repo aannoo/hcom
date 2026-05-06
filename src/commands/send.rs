@@ -3,6 +3,7 @@
 use std::io::{IsTerminal, Read as IoRead};
 
 use crate::db::HcomDb;
+use crate::db::subscriptions::create_request_watches;
 use crate::identity;
 use crate::instance_lifecycle;
 use crate::instances;
@@ -447,36 +448,6 @@ fn get_intent_from_event(db: &HcomDb, event_id: i64) -> Option<String> {
         )
         .ok()
         .flatten()
-}
-
-/// Create request-watch subscriptions for each recipient.
-fn create_request_watches(db: &HcomDb, sender: &str, request_event_id: i64, recipients: &[String]) {
-    let last_id = db.get_last_event_id();
-    let now = crate::shared::time::now_epoch_f64();
-
-    for recipient in recipients {
-        let sub_id = format!("reqwatch-{request_event_id}-{recipient}");
-        let sub_key = format!("events_sub:{sub_id}");
-
-        let sql = "(type='status' AND instance=? AND status_val='listening') OR (type='life' AND instance=? AND life_action='stopped')";
-
-        let sub_data = serde_json::json!({
-            "id": sub_id,
-            "caller": sender,
-            "sql": sql,
-            "params": [recipient, recipient],
-            "filters": {
-                "request_watch": true,
-                "request_id": request_event_id,
-                "target": recipient,
-            },
-            "once": true,
-            "last_id": last_id,
-            "created": now,
-        });
-
-        let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-    }
 }
 
 /// Resolve message from one of 5 source modes.

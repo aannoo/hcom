@@ -1104,22 +1104,22 @@ fn handle_remote_sub_create(
 
     let on_hit = params.get("on_hit").and_then(|v| v.as_str());
     let outcome = if filters.is_empty() {
-        crate::commands::events::build_and_insert_sql_subscription(
+        crate::db::subscriptions::build_and_insert_sql_subscription(
             db, &sql_parts, &caller, once, on_hit,
         )?
     } else {
-        crate::commands::events::build_and_insert_filter_subscription(
+        crate::db::subscriptions::create_filter_subscription(
             db, &filters, &sql_parts, &caller, once, on_hit,
         )?
     };
 
     match outcome {
-        crate::commands::events::SubCreateOutcome::Created { id, .. } => Ok(json!({
+        crate::db::subscriptions::SubCreateOutcome::Created { id, .. } => Ok(json!({
             "id": id,
             "caller": caller,
             "already_existed": false,
         })),
-        crate::commands::events::SubCreateOutcome::AlreadyExists { id } => Ok(json!({
+        crate::db::subscriptions::SubCreateOutcome::AlreadyExists { id } => Ok(json!({
             "id": id,
             "caller": caller,
             "already_existed": true,

@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::core::filters::{
-    EventFilterArgs, FILE_WRITE_CONTEXTS, build_sql_from_flags, resolve_filter_names,
-};
+use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::core::launch_status::wait_for_launch;
 use crate::db::HcomDb;
+use crate::db::subscriptions::{
+    SubCreateOutcome, build_and_insert_sql_subscription, create_filter_subscription,
+};
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom events`.
@@ -327,215 +328,37 @@ fn events_sub_filter(
     once: bool,
     on_hit: Option<&str>,
 ) -> i32 {
-    create_filter_subscription(db, filters, sql_parts, caller, once, false, on_hit)
-}
-
-/// Determine sender_kind for a sub caller at creation time.
-/// Stored on the sub so on-hit provenance stays stable across caller lifecycle.
-fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
-    let exists: bool = db
-        .conn()
-        .query_row(
-            "SELECT 1 FROM instances WHERE name = ?",
-            rusqlite::params![caller],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if exists { "instance" } else { "external" }
-}
-
-fn collision_self_relevance_sql(caller: &str) -> String {
-    let caller_escaped = caller.replace('\'', "''");
-    format!(
-        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30))",
-        ctx = FILE_WRITE_CONTEXTS
-    )
-}
-
-/// Outcome of a subscription insert attempt.
-pub(crate) enum SubCreateOutcome {
-    Created { id: String, final_sql: String },
-    AlreadyExists { id: String },
-}
-
-/// Build and insert a filter-based subscription row into `kv`.
-/// No printing — callers format output as appropriate.
-pub(crate) fn build_and_insert_filter_subscription(
-    db: &HcomDb,
-    filters: &HashMap<String, Vec<String>>,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    on_hit: Option<&str>,
-) -> Result<SubCreateOutcome, String> {
-    // Build SQL from filters
-    let mut sql = match build_sql_from_flags(filters) {
-        Ok(s) if !s.is_empty() => s,
-        Ok(_) => return Err("No valid filters provided".to_string()),
-        Err(e) => return Err(format!("Filter error: {e}")),
-    };
-
-    // Validate and combine user-provided SQL parts
-    if !sql_parts.is_empty() {
-        let manual_sql = sql_parts.join(" ").replace("\\!", "!");
-        if let Err(e) = db.conn().execute(
-            &format!("SELECT 1 FROM events_v WHERE ({manual_sql}) LIMIT 0"),
-            [],
-        ) {
-            return Err(format!("Invalid SQL: {e}"));
+    let outcome = match create_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
         }
-        sql = format!("({sql}) AND ({manual_sql})");
-    }
-
-    // Collision self-relevance filtering
-    if filters.contains_key("collision") {
-        let self_relevance = collision_self_relevance_sql(caller);
-        sql = format!("({sql}) AND {self_relevance}");
-    }
-
-    // Generate subscription ID from SHA256 hash
-    let id_source = format!(
-        "{}:{}:{}:{}:{}",
-        caller,
-        serde_json::to_string(filters).unwrap_or_default(),
-        sql,
-        once,
-        on_hit.unwrap_or(""),
-    );
-    let hash = sha256_hash(&id_source);
-    let sub_id = format!("sub-{}", &hash[..8]);
-    let sub_key = format!("events_sub:{sub_id}");
-
-    // Check duplicate
-    if db.kv_get(&sub_key).ok().flatten().is_some() {
-        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
-    }
-
-    let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
-
-    let mut sub_data = json!({
-        "id": sub_id,
-        "caller": caller,
-        "filters": filters,
-        "sql": sql,
-        "created": now,
-        "last_id": last_id,
-        "once": once,
-    });
-    if let Some(text) = on_hit {
-        sub_data["on_hit_text"] = json!(text);
-        // Capture caller_kind at creation so on-hit provenance stays stable
-        // even if the caller instance stops before the sub fires.
-        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
-    }
-
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    Ok(SubCreateOutcome::Created {
-        id: sub_id,
-        final_sql: sql,
-    })
-}
-
-/// Core subscription creation logic. When `silent` is true, suppresses all stdout output.
-/// Used by both the CLI `events sub` command and `auto_subscribe_defaults`.
-pub(crate) fn create_filter_subscription(
-    db: &HcomDb,
-    filters: &HashMap<String, Vec<String>>,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    silent: bool,
-    on_hit: Option<&str>,
-) -> i32 {
-    let outcome =
-        match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
-            Ok(o) => o,
-            Err(e) => {
-                if !silent {
-                    eprintln!("Error: {e}");
-                }
-                return 1;
-            }
-        };
+    };
 
     match outcome {
         SubCreateOutcome::AlreadyExists { id } => {
-            if !silent {
-                println!("Subscription {id} already exists");
-            }
+            println!("Subscription {id} already exists");
         }
         SubCreateOutcome::Created { id, final_sql } => {
-            if !silent {
-                println!("Subscription {id} created");
+            println!("Subscription {id} created");
 
-                if let Ok(count) = db.conn().query_row(
-                    &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
-                    [],
-                    |row| row.get::<_, i64>(0),
-                ) {
-                    if count > 0 {
-                        println!("  historical matches: {count} events");
-                        println!("  You will be notified on the next matching event(s)");
-                    }
+            if let Ok(count) = db.conn().query_row(
+                &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
+                [],
+                |row| row.get::<_, i64>(0),
+            ) {
+                if count > 0 {
+                    println!("  historical matches: {count} events");
+                    println!("  You will be notified on the next matching event(s)");
                 }
-
-                maybe_show_tip(db, caller, "sub:created");
             }
+
+            maybe_show_tip(db, caller, "sub:created");
         }
     }
 
     0
-}
-
-/// Build and insert a raw-SQL subscription row into `kv`. No printing.
-pub(crate) fn build_and_insert_sql_subscription(
-    db: &HcomDb,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    on_hit: Option<&str>,
-) -> Result<SubCreateOutcome, String> {
-    let sql = sql_parts.join(" ").replace("\\!", "!");
-
-    if let Err(e) = db
-        .conn()
-        .execute(&format!("SELECT 1 FROM events_v WHERE ({sql}) LIMIT 0"), [])
-    {
-        return Err(format!("Invalid SQL: {e}"));
-    }
-
-    let hash = sha256_hash(&format!("{caller}{sql}{once}{}", on_hit.unwrap_or("")));
-    let sub_id = format!("sub-{}", &hash[..8]);
-    let sub_key = format!("events_sub:{sub_id}");
-
-    if db.kv_get(&sub_key).ok().flatten().is_some() {
-        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
-    }
-
-    let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
-
-    let mut sub_data = json!({
-        "id": sub_id,
-        "sql": sql,
-        "caller": caller,
-        "once": once,
-        "last_id": last_id,
-        "created": now,
-    });
-    if let Some(text) = on_hit {
-        sub_data["on_hit_text"] = json!(text);
-        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
-    }
-
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    Ok(SubCreateOutcome::Created {
-        id: sub_id,
-        final_sql: sql,
-    })
 }
 
 /// Create a raw SQL subscription.
@@ -1120,15 +943,6 @@ fn parse_event_row(row: &rusqlite::Row) -> Result<Value, rusqlite::Error> {
     }))
 }
 
-/// SHA-256 hex hash
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Build <hcom> XML message preview for unread notification.
 fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
     let messages = db.get_unread_messages(instance_name);
@@ -1543,27 +1357,6 @@ mod tests {
         let data = result.get("data").unwrap();
 
         assert!(data.get("mentions").is_some());
-    }
-
-    #[test]
-    fn test_sha256_hash() {
-        let h1 = sha256_hash("test input");
-        let h2 = sha256_hash("test input");
-        let h3 = sha256_hash("different input");
-        assert_eq!(h1, h2); // deterministic
-        assert_ne!(h1, h3); // different inputs
-        assert_eq!(h1.len(), 64); // full SHA-256 hex
-        // Verify known SHA-256 hash
-        assert_eq!(&h1[..8], "9dfe6f15");
-    }
-
-    #[test]
-    fn test_collision_self_relevance_matches_filter_constants() {
-        let sql = collision_self_relevance_sql("luna");
-        assert!(sql.contains(FILE_WRITE_CONTEXTS));
-        assert!(sql.contains("< 30"));
-        assert!(!sql.contains("tool:edit_file"));
-        assert!(!sql.contains("< 20"));
     }
 
     #[test]

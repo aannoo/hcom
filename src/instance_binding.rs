@@ -731,13 +731,12 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
                     .or_default()
                     .push(val.to_string());
             }
-            let _ = crate::commands::events::create_filter_subscription(
+            let _ = crate::db::subscriptions::create_filter_subscription(
                 db,
                 &filters,
                 &[],
                 instance_name,
                 false,
-                true,
                 None,
             );
         }
@@ -1188,16 +1187,15 @@ mod tests {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("collision".to_string(), vec!["1".to_string()]);
 
-        let result = crate::commands::events::create_filter_subscription(
+        let result = crate::db::subscriptions::create_filter_subscription(
             &db,
             &filters,
             &[],
             "test-agent",
             false,
-            true,
             None,
         );
-        assert_eq!(result, 0, "subscription creation should succeed");
+        assert!(result.is_ok(), "subscription creation should succeed");
 
         let rows: Vec<String> = db
             .conn()

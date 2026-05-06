@@ -32,7 +32,6 @@ pub use constants::{
     status_bg,
     status_fg,
     status_icon,
-    thread_membership_sub_id,
 };
 pub use context::HcomContext;
 pub use errors::{CLIError, HcomError, HookError};

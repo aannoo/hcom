@@ -663,7 +663,7 @@ fn get_tip_text(tip_key: &str) -> Option<&'static str> {
 }
 
 fn get_thread_tip_text(instance_name: &str, thread: &str) -> String {
-    let sub_id = crate::shared::thread_membership_sub_id(thread, instance_name);
+    let sub_id = crate::db::subscriptions::thread_membership_sub_id(thread, instance_name);
     format!(
         "[tip] You joined thread {thread}. To leave: hcom events unsub {sub_id} (find your sub-id with: hcom events sub list)"
     )

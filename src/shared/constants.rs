@@ -43,17 +43,6 @@ pub fn extract_mentions(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Stable subscription ID for automatic thread membership rows.
-pub fn thread_membership_sub_id(thread: &str, member: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(format!("thread-member:{thread}:{member}").as_bytes());
-    let hash = hasher.finalize();
-    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sub-{}", &hex[..8])
-}
-
 /// Binding marker for vanilla sessions: [hcom:<name>].
 pub static BIND_MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[hcom:([a-z0-9_]+)\]").unwrap());
