@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use crate::db::HcomDb;
-use crate::instances::get_full_name;
+use crate::identity::get_full_name;
 use crate::paths;
 use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 

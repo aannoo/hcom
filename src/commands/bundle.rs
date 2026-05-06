@@ -757,7 +757,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
     let json_mode = args.json;
     let compact = args.compact;
     let for_agent = args.for_agent.as_deref().map(|name| {
-        crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+        crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
     });
     let last_transcript = args.last_transcript;
     let last_events = args.last_events;

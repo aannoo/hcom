@@ -356,7 +356,7 @@ pub(crate) fn resolve_launcher_name(
         .name
         .as_deref()
         .map(|name| {
-            crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+            crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
         })
         .or_else(|| flags.name.clone())
         .unwrap_or_else(|| {

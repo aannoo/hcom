@@ -78,7 +78,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let instance_name = flags
         .name
         .as_deref()
-        .map(|name| instances::resolve_display_name(&db, name).unwrap_or_else(|| name.to_string()));
+        .map(|name| identity::resolve_display_name(&db, name).unwrap_or_else(|| name.to_string()));
 
     // BLOCK DURING ACTIVE TASKS: prevents subagents from corrupting parent/sibling instances.
     // When a subagent runs --as or bare start, process_id resolves to the parent which has
@@ -409,7 +409,7 @@ fn start_rebind(
     let hcom_dir = paths::hcom_dir();
 
     // Resolve the target name
-    let target_name = instances::resolve_display_name_or_stopped(db, rebind_target)
+    let target_name = identity::resolve_display_name_or_stopped(db, rebind_target)
         .unwrap_or_else(|| rebind_target.to_string());
 
     // Guard: refuse to reclaim a subagent slot. Subagents share their parent's
@@ -661,7 +661,7 @@ fn start_bare(
     explicit_name: Option<&str>,
 ) -> Result<i32> {
     let explicit_name = explicit_name
-        .map(|name| instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
+        .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
 
     // Skip vanilla detection if --name is provided with an existing instance

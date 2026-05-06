@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use crate::db::HcomDb;
 use crate::hooks::common::stop_instance;
 use crate::identity;
-use crate::instances;
 use crate::log::log_info;
 use crate::paths;
 use crate::pidtrack;
@@ -457,7 +456,7 @@ fn kill_single(
     initiator: &str,
 ) -> Result<i32> {
     // Resolve display name
-    let name = instances::resolve_display_name(db, target).unwrap_or_else(|| target.to_string());
+    let name = identity::resolve_display_name(db, target).unwrap_or_else(|| target.to_string());
 
     let inst = match db.get_instance_full(&name)? {
         Some(inst) => inst,

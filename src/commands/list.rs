@@ -8,11 +8,12 @@ use std::collections::HashMap;
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
+use crate::identity::{get_full_name, resolve_display_name};
 use crate::instance_lifecycle::{
     RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
     get_instance_status,
 };
-use crate::instances::{get_full_name, is_remote_instance, resolve_display_name};
+use crate::instances::is_remote_instance;
 use crate::shared::{CommandContext, SENDER, ST_LISTENING, shorten_path_max, status_icon};
 
 /// Parsed arguments for `hcom list`.
@@ -647,7 +648,7 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
     let limit = if show_all { 10000 } else { last_n };
 
     let (query, param) = if let Some(name) = filter_name {
-        let name = crate::instances::resolve_display_name_or_stopped(db, name)
+        let name = crate::identity::resolve_display_name_or_stopped(db, name)
             .unwrap_or_else(|| name.to_string());
         // Fix: fetch up to 10000 events for named instance (was LIMIT 1)
         (

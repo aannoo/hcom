@@ -21,7 +21,7 @@ pub struct TermArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
-use crate::instances::resolve_display_name;
+use crate::identity::resolve_display_name;
 use crate::paths::hcom_dir;
 use crate::shared::CommandContext;
 

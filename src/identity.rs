@@ -3,7 +3,7 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-use crate::db::HcomDb;
+use crate::db::{HcomDb, InstanceRow};
 use crate::shared::{HcomError, SenderIdentity, SenderKind};
 
 /// UUID pattern for agent_id detection.
@@ -104,6 +104,95 @@ pub fn validate_name_input(name: &str, max_length: usize, allow_at: bool) -> Res
     Ok(())
 }
 
+/// Get full display name: "{tag}-{name}" if tag exists, else just "{name}".
+pub fn get_full_name(data: &InstanceRow) -> String {
+    match &data.tag {
+        Some(tag) if !tag.is_empty() => format!("{}-{}", tag, data.name),
+        _ => data.name.clone(),
+    }
+}
+
+/// Get display name for a base name by loading instance data.
+pub fn get_display_name(db: &HcomDb, base_name: &str) -> String {
+    match db.get_instance_full(base_name) {
+        Ok(Some(data)) => get_full_name(&data),
+        _ => base_name.to_string(),
+    }
+}
+
+/// Resolve base name or tag-name (e.g., "team-luna") to base name.
+/// Handles multi-hyphen tags like "vc-p0-p1-parallel-vani" -> tag="vc-p0-p1-parallel", name="vani".
+pub fn resolve_display_name(db: &HcomDb, input_name: &str) -> Option<String> {
+    if let Ok(Some(_)) = db.get_instance_full(input_name) {
+        return Some(input_name.to_string());
+    }
+
+    for (i, _) in input_name.match_indices('-') {
+        let tag = &input_name[..i];
+        let name = &input_name[i + 1..];
+        if name.is_empty() {
+            continue;
+        }
+        if let Ok(Some(data)) = db.get_instance_full(name) {
+            if data.tag.as_deref() == Some(tag) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve base name or tag-name using live instances first, then stopped snapshots.
+pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<String> {
+    if let Some(name) = resolve_display_name(db, input_name) {
+        return Some(name);
+    }
+
+    if db
+        .conn()
+        .query_row(
+            "SELECT instance FROM events
+             WHERE type = 'life'
+               AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'
+             LIMIT 1",
+            rusqlite::params![input_name],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .is_some()
+    {
+        return Some(input_name.to_string());
+    }
+
+    for (i, _) in input_name.match_indices('-') {
+        let tag = &input_name[..i];
+        let name = &input_name[i + 1..];
+        if name.is_empty() {
+            continue;
+        }
+        if db
+            .conn()
+            .query_row(
+                "SELECT instance FROM events
+                 WHERE type = 'life'
+                   AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND json_extract(data, '$.snapshot.tag') = ?2
+                 LIMIT 1",
+                rusqlite::params![name, tag],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .is_some()
+        {
+            return Some(name.to_string());
+        }
+    }
+
+    None
+}
+
 /// Resolve `--name NAME` with strict instance lookup.
 ///
 /// Resolution order:
@@ -116,7 +205,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     // Reject invalid base names, but allow tag-name format (e.g. "team-luna")
     if !looks_like_uuid(name) && !is_valid_base_name(name) {
         // Try tag-name resolution before rejecting
-        match crate::instances::resolve_display_name(db, name) {
+        match resolve_display_name(db, name) {
             Some(base) => resolved_name = base,
             None => return Err(HcomError::InvalidInput(base_name_error(name))),
         }
@@ -838,5 +927,87 @@ mod tests {
 
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("thread-same"));
+    }
+
+    // ── Display-name resolution tests ──────────────────────────────────
+
+    fn default_instance() -> InstanceRow {
+        InstanceRow {
+            name: String::new(),
+            session_id: None,
+            parent_session_id: None,
+            parent_name: None,
+            agent_id: None,
+            tag: None,
+            last_event_id: 0,
+            last_stop: 0,
+            status: String::from("inactive"),
+            status_time: 0,
+            status_context: String::new(),
+            status_detail: String::new(),
+            directory: String::new(),
+            created_at: 0.0,
+            transcript_path: String::new(),
+            tool: "claude".into(),
+            background: 0,
+            background_log_file: String::new(),
+            tcp_mode: 0,
+            wait_timeout: None,
+            subagent_timeout: None,
+            hints: None,
+            origin_device_id: None,
+            pid: None,
+            launch_args: None,
+            terminal_preset_requested: None,
+            terminal_preset_effective: None,
+            launch_context: None,
+            name_announced: 0,
+            running_tasks: None,
+            idle_since: None,
+        }
+    }
+
+    #[test]
+    fn test_get_full_name() {
+        let plain = InstanceRow {
+            name: "luna".into(),
+            tag: None,
+            ..default_instance()
+        };
+        assert_eq!(get_full_name(&plain), "luna");
+
+        let tagged = InstanceRow {
+            name: "luna".into(),
+            tag: Some("team".into()),
+            ..default_instance()
+        };
+        assert_eq!(get_full_name(&tagged), "team-luna");
+    }
+
+    #[test]
+    fn test_resolve_display_name_or_stopped_tagged_snapshot() {
+        let (db, _dir) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', 'luna', ?1)",
+                rusqlite::params![
+                    serde_json::json!({
+                        "action": "stopped",
+                        "snapshot": {"tag": "team"}
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_display_name_or_stopped(&db, "team-luna").as_deref(),
+            Some("luna")
+        );
+        assert_eq!(
+            resolve_display_name_or_stopped(&db, "luna").as_deref(),
+            Some("luna")
+        );
     }
 }

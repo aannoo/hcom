@@ -225,7 +225,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
-            let display = instances::get_display_name(db, name);
+            let display = identity::get_display_name(db, name);
             parts.push(format!("{icon} {display}"));
         } else {
             parts.push(format!("◌ {name}"));
@@ -1005,11 +1005,11 @@ fn format_messages_for_hook(
     messages: &[&crate::db::Message],
     instance_name: &str,
 ) -> String {
-    let recipient_display = instances::get_display_name(db, instance_name);
+    let recipient_display = identity::get_display_name(db, instance_name);
 
     if messages.len() == 1 {
         let msg = messages[0];
-        let sender_display = instances::get_display_name(db, &msg.from);
+        let sender_display = identity::get_display_name(db, &msg.from);
         let prefix =
             cli_context_build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
         format!(
@@ -1020,7 +1020,7 @@ fn format_messages_for_hook(
         let parts: Vec<String> = messages
             .iter()
             .map(|msg| {
-                let sender_display = instances::get_display_name(db, &msg.from);
+                let sender_display = identity::get_display_name(db, &msg.from);
                 let prefix = cli_context_build_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),

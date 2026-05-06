@@ -260,7 +260,7 @@ pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32
     if let Some(ctx) = ctx {
         if let Some(ref name) = ctx.explicit_name {
             let canonical =
-                crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.clone());
+                crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.clone());
             argv = vec!["--name".to_string(), canonical]
                 .into_iter()
                 .chain(argv)

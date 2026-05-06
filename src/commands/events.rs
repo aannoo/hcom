@@ -446,7 +446,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     let once = args.once;
     let target_instance = args.for_agent.as_deref().map(|name| {
-        crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+        crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
     });
     let sql_parts: Vec<String> = args.rest.clone();
 
@@ -952,10 +952,10 @@ fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
     }
 
     // Build simple "sender → you" format
-    let display_name = crate::instances::get_display_name(db, instance_name);
+    let display_name = crate::identity::get_display_name(db, instance_name);
     let senders: Vec<String> = messages
         .iter()
-        .map(|m| crate::instances::get_display_name(db, &m.from))
+        .map(|m| crate::identity::get_display_name(db, &m.from))
         .collect();
 
     // Deduplicate senders preserving order

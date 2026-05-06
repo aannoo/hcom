@@ -151,7 +151,7 @@ pub fn resolve_filter_names(filters: &mut FilterMap, db: &crate::db::HcomDb) {
         let resolved: Vec<String> = names
             .iter()
             .map(|name| {
-                crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.clone())
+                crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.clone())
             })
             .collect();
         *names = resolved;

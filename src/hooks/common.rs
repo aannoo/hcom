@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::bootstrap;
 use crate::db::{HcomDb, InstanceRow, Message};
+use crate::identity;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
@@ -244,7 +245,7 @@ pub(crate) fn prepare_delivery_batch(
         .first()
         .and_then(|m| m.get("from").and_then(|v| v.as_str()))
         .unwrap_or("unknown");
-    let sender_display = instances::get_display_name(db, sender);
+    let sender_display = identity::get_display_name(db, sender);
     let msg_ts = deliver
         .last()
         .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
@@ -313,7 +314,7 @@ fn prepare_raw_messages(
         .first()
         .and_then(|m| m.get("from").and_then(|v| v.as_str()))
         .unwrap_or("unknown");
-    let sender_display = instances::get_display_name(db, sender);
+    let sender_display = identity::get_display_name(db, sender);
     let last_id = deliver
         .last()
         .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
@@ -1430,7 +1431,7 @@ mod tests {
         assert_eq!(cursor, expected_last_id);
 
         let instance = db.get_instance_full("nova").unwrap().unwrap();
-        let delivered_name = crate::instances::get_display_name(&db, "luna");
+        let delivered_name = crate::identity::get_display_name(&db, "luna");
 
         assert_eq!(instance.status, ST_ACTIVE);
         assert_eq!(instance.status_context, format!("deliver:{delivered_name}"));

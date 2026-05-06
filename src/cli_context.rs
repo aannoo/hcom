@@ -231,7 +231,7 @@ pub fn maybe_deliver_pending_messages(
         .last()
         .and_then(|m| m.timestamp.as_deref())
         .unwrap_or("");
-    let sender_display = instances::get_display_name(db, &messages[0].from);
+    let sender_display = identity::get_display_name(db, &messages[0].from);
     let context = format!("deliver:{sender_display}");
 
     let status = if tool == "codex" {
@@ -270,7 +270,7 @@ pub fn format_messages_human(
         return String::new();
     }
 
-    let recipient_display = instances::get_display_name(db, instance_name);
+    let recipient_display = identity::get_display_name(db, instance_name);
     let mut parts = Vec::new();
 
     for msg in messages {
@@ -287,7 +287,7 @@ pub fn format_messages_human(
         let prefix = build_message_prefix(intent, thread, event_id, msg);
 
         // Sender display name with status
-        let sender_display = instances::get_display_name(db, from);
+        let sender_display = identity::get_display_name(db, from);
         let sender_status = db
             .get_instance_full(from)
             .ok()
@@ -385,7 +385,7 @@ fn format_hook_messages_simple(
         return String::new();
     }
 
-    let recipient_display = instances::get_display_name(db, instance_name);
+    let recipient_display = identity::get_display_name(db, instance_name);
 
     if messages.len() == 1 {
         let msg = &messages[0];
@@ -399,7 +399,7 @@ fn format_hook_messages_simple(
         let event_id = msg.get("event_id").and_then(|v| v.as_i64());
 
         let prefix = build_message_prefix(intent, thread, event_id, msg);
-        let sender_display = instances::get_display_name(db, from);
+        let sender_display = identity::get_display_name(db, from);
 
         let others = msg
             .get("delivered_to")
@@ -428,7 +428,7 @@ fn format_hook_messages_simple(
                 let event_id = msg.get("event_id").and_then(|v| v.as_i64());
 
                 let prefix = build_message_prefix(intent, thread, event_id, msg);
-                let sender_display = instances::get_display_name(db, from);
+                let sender_display = identity::get_display_name(db, from);
 
                 let others = msg
                     .get("delivered_to")
@@ -461,7 +461,7 @@ fn format_hook_messages_simple_from_msgs(
         return String::new();
     }
 
-    let recipient_display = instances::get_display_name(db, instance_name);
+    let recipient_display = identity::get_display_name(db, instance_name);
 
     if messages.len() == 1 {
         let msg = &messages[0];
@@ -471,7 +471,7 @@ fn format_hook_messages_simple_from_msgs(
             msg.event_id,
             &serde_json::json!({}),
         );
-        let sender_display = instances::get_display_name(db, &msg.from);
+        let sender_display = identity::get_display_name(db, &msg.from);
 
         let others = msg
             .delivered_to
@@ -496,7 +496,7 @@ fn format_hook_messages_simple_from_msgs(
                     msg.event_id,
                     &serde_json::json!({}),
                 );
-                let sender_display = instances::get_display_name(db, &msg.from);
+                let sender_display = identity::get_display_name(db, &msg.from);
 
                 let others = msg
                     .delivered_to

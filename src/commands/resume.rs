@@ -95,7 +95,7 @@ pub fn do_resume(
     flags: &GlobalFlags,
 ) -> Result<i32> {
     let db = HcomDb::open()?;
-    let name = crate::instances::resolve_display_name_or_stopped(&db, name)
+    let name = crate::identity::resolve_display_name_or_stopped(&db, name)
         .unwrap_or_else(|| name.to_string());
     let hcom_config = load_hcom_config();
     let ctx = crate::shared::HcomContext::from_os();
@@ -211,7 +211,7 @@ fn resolve_name_to_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<(String, PreparedResume)> {
-    let mut current = crate::instances::resolve_display_name_or_stopped(db, name)
+    let mut current = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
 
     // A loop over reclaim hops (binding → events → redirect to instance name).

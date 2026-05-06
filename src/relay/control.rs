@@ -1057,7 +1057,7 @@ fn handle_remote_sub_create(
     let caller = if caller_is_external {
         caller_input.to_string()
     } else {
-        crate::instances::resolve_display_name(db, caller_input)
+        crate::identity::resolve_display_name(db, caller_input)
             .or_else(|| {
                 db.conn()
                     .query_row(

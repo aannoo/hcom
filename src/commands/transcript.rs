@@ -407,7 +407,7 @@ fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
 /// Uses resolve_display_name_or_stopped (which already handles prefix matching)
 /// to check if the instance exists without a transcript.
 fn no_transcript_error(db: &HcomDb, name: &str) -> String {
-    if let Some(resolved) = crate::instances::resolve_display_name_or_stopped(db, name) {
+    if let Some(resolved) = crate::identity::resolve_display_name_or_stopped(db, name) {
         format!(
             "Agent '{}' has no transcript yet — no messages have been exchanged",
             resolved
@@ -2590,7 +2590,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
 
     if let Some(ref name) = args.name {
         let stripped = name.strip_prefix('@').unwrap_or(name);
-        let resolved = crate::instances::resolve_display_name_or_stopped(db, stripped)
+        let resolved = crate::identity::resolve_display_name_or_stopped(db, stripped)
             .unwrap_or_else(|| stripped.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
             return crate::relay::control::dispatch_remote_and_print(
@@ -2954,7 +2954,7 @@ fn resolve_instance_transcript(
     db: &HcomDb,
     name: &str,
 ) -> Option<(String, String, String, Option<String>)> {
-    let name = crate::instances::resolve_display_name_or_stopped(db, name)
+    let name = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
 
     // Direct match

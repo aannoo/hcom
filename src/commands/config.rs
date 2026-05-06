@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
+use crate::identity;
 use crate::instances;
 use crate::shared::CommandContext;
 
@@ -457,8 +458,7 @@ fn config_instance(
             return 1;
         }
     } else {
-        instances::resolve_display_name(db, instance_arg)
-            .unwrap_or_else(|| instance_arg.to_string())
+        identity::resolve_display_name(db, instance_arg).unwrap_or_else(|| instance_arg.to_string())
     };
 
     // Verify instance exists
@@ -494,7 +494,7 @@ fn config_instance(
 
     // No key: show instance settings
     if args.is_empty() {
-        let full_name = crate::instances::get_full_name(&instance);
+        let full_name = crate::identity::get_full_name(&instance);
         let config = build_instance_config_json(&instance, &full_name);
         println!("{}", render_config_instance_get(&config, None, json_mode));
         return 0;
@@ -764,7 +764,7 @@ pub fn config_instance_get(
     instance_arg: &str,
     key: Option<&str>,
 ) -> Result<Value, String> {
-    let name = instances::resolve_display_name(db, instance_arg)
+    let name = identity::resolve_display_name(db, instance_arg)
         .unwrap_or_else(|| instance_arg.to_string());
     let instance = db
         .get_instance_full(&name)
@@ -773,7 +773,7 @@ pub fn config_instance_get(
 
     Ok(match key {
         None => {
-            let full_name = crate::instances::get_full_name(&instance);
+            let full_name = crate::identity::get_full_name(&instance);
             build_instance_config_json(&instance, &full_name)
         }
         Some("tag") => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
@@ -793,7 +793,7 @@ pub fn config_instance_set(
     key: &str,
     value: &str,
 ) -> Result<Value, String> {
-    let name = instances::resolve_display_name(db, instance_arg)
+    let name = identity::resolve_display_name(db, instance_arg)
         .unwrap_or_else(|| instance_arg.to_string());
     let instance = db
         .get_instance_full(&name)
@@ -906,8 +906,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     // Instance config mode
     if let Some(ref inst) = instance_name {
-        let resolved =
-            instances::resolve_display_name(db, inst).unwrap_or_else(|| inst.to_string());
+        let resolved = identity::resolve_display_name(db, inst).unwrap_or_else(|| inst.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
             let action = if argv.len() >= 2 {
                 crate::relay::control::rpc_action::CONFIG_SET
