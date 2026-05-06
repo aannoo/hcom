@@ -1,6 +1,6 @@
 //! Shared hook functions — deliver, poll, bind, bootstrap, finalize.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -356,7 +356,7 @@ pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>
 /// Main PTY path bypasses this (HCOM_PTY_MODE=1, PTY wrapper handles injection).
 ///
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
-/// Senders call notify_instance() which connects to wake the select().
+/// Senders call `crate::notify::wake` (kind=`hook`) to wake the select().
 ///
 /// Returns (exit_code, hook_output_json, timed_out).
 /// - exit_code: 0 for timeout/no-participant, 2 for message delivery
@@ -479,8 +479,8 @@ fn poll_loop(
         let remaining = timeout - elapsed;
 
         // TCP select for notifications (or fallback poll). Relay imports
-        // (pull.rs) call notify_all_instances after every batch, so the TCP
-        // wake fires as soon as remote events land — no separate relay
+        // (pull.rs) call `crate::notify::wake_all` after every batch, so the
+        // TCP wake fires as soon as remote events land — no separate relay
         // polling needed.
         let wait_time = if notify_server.is_some() {
             Duration::from_secs(remaining.as_secs().min(30))
@@ -907,9 +907,9 @@ pub fn get_pending_instances(db: &HcomDb) -> Vec<String> {
 
 /// Wake an instance's hook poll loop via TCP connection.
 ///
-/// Best-effort: opens DB, finds hook notify endpoint, sends brief TCP connect.
-/// This is the hook-side counterpart to instances::notify_instance which
-/// handles PTY-side notification.
+/// Best-effort: opens DB, finds hook wake endpoint, sends brief TCP connect.
+/// Wraps `crate::notify::wake` with kind=`hook` for the hook poll path —
+/// PTY/listen wakes go through `crate::notify::wake` directly.
 ///
 pub fn notify_hook_instance(instance_name: &str) {
     if let Ok(db) = HcomDb::open() {
@@ -919,7 +919,7 @@ pub fn notify_hook_instance(instance_name: &str) {
 
 /// Wake hook poll loop with an existing DB handle.
 pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
-    lifecycle::notify_instance_endpoints(db, instance_name, &["hook"]);
+    crate::notify::wake(db, instance_name, &[crate::notify::WakeKind::Hook]);
 }
 
 /// Stop instance: log snapshot, clean bindings, delete row.
@@ -1067,15 +1067,9 @@ fn stop_instance_inner(
         }
     }
 
-    // Capture notify ports BEFORE cleanup deletes them
-    let notify_ports: Vec<i64> = db
-        .conn()
-        .prepare("SELECT port FROM notify_endpoints WHERE instance = ?")
-        .and_then(|mut stmt| {
-            stmt.query_map(params![instance_name], |row| row.get::<_, i64>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    // Capture wake ports BEFORE cleanup deletes them; we'll fire wakes after
+    // delete so any remaining listeners see the row is gone.
+    let wake_ports = crate::notify::snapshot_wake_ports(db, instance_name);
 
     // Prepare snapshot before delete (preserves data for transcript access)
     // Use Option values directly so None serializes as JSON null
@@ -1160,14 +1154,7 @@ fn stop_instance_inner(
     }
 
     // Notify remaining listeners AFTER delete (so they see the row is gone)
-    for port in notify_ports {
-        if port > 0 && port <= 65535 {
-            let addr = format!("127.0.0.1:{}", port);
-            if let Ok(addr) = addr.parse() {
-                let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
-            }
-        }
-    }
+    crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
 
     // Trigger relay push (best-effort)
     let prefix = crate::runtime_env::get_hcom_prefix();

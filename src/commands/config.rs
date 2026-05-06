@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
-use crate::instance_lifecycle;
 use crate::instances;
 use crate::shared::CommandContext;
 
@@ -571,7 +570,7 @@ fn config_instance(
                 render_config_instance_set_feedback(inst_name, "tag", tag)
             );
             // Notify for display update
-            instance_lifecycle::notify_all_instances(db);
+            crate::notify::wake_all(db);
         }
         "timeout" => {
             if value.is_empty() || value.eq_ignore_ascii_case("default") {
@@ -868,7 +867,7 @@ pub fn config_instance_set(
         other => return Err(format!("Unknown instance config key '{}'", other)),
     }
 
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
     Ok(serde_json::json!({"instance": inst_name, "field": key, "value": value}))
 }
 

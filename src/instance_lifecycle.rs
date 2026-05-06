@@ -1,6 +1,5 @@
-//! Instance lifecycle state machine, launch failure handling, and notification helpers.
+//! Instance lifecycle state machine and launch failure handling.
 
-use anyhow::Result;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -515,7 +514,7 @@ pub fn set_status(
     crate::instances::update_instance_position(db, instance_name, &updates);
 
     if status_changed {
-        let _ = notify_instance_with_db(db, instance_name);
+        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
     if is_new {
@@ -563,85 +562,6 @@ pub fn set_status(
         data["msg_ts"] = serde_json::json!(msg_ts);
     }
     let _ = db.log_event("status", instance_name, &data);
-}
-
-/// Wake an instance by connecting to its registered notify endpoints.
-pub fn notify_instance_endpoints(db: &HcomDb, instance_name: &str, kinds: &[&str]) {
-    use std::net::TcpStream;
-
-    let ports: Vec<i64> = if kinds.is_empty() {
-        db.conn()
-            .prepare("SELECT port FROM notify_endpoints WHERE instance = ?")
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![instance_name], |row| row.get::<_, i64>(0))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default()
-    } else {
-        let placeholders: String = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT port FROM notify_endpoints WHERE instance = ? AND kind IN ({placeholders})",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(instance_name.to_string())];
-        for kind in kinds {
-            params.push(Box::new(kind.to_string()));
-        }
-        db.conn()
-            .prepare(&sql)
-            .and_then(|mut stmt| {
-                stmt.query_map(
-                    rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default()
-    };
-
-    for port in ports {
-        if port > 0 && port <= 65535 {
-            let addr = format!("127.0.0.1:{port}");
-            if let Ok(addr) = addr.parse() {
-                let _ = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100));
-            }
-        }
-    }
-}
-
-pub fn notify_instance_with_db(db: &HcomDb, instance_name: &str) -> Result<()> {
-    notify_instance_endpoints(db, instance_name, &["pty", "listen", "listen_filter"]);
-    Ok(())
-}
-
-/// Notify all instances via their TCP notify ports to wake delivery loops.
-pub fn notify_all_instances(db: &HcomDb) {
-    use std::net::TcpStream;
-
-    let Ok(mut stmt) = db
-        .conn()
-        .prepare("SELECT DISTINCT port FROM notify_endpoints WHERE port > 0")
-    else {
-        return;
-    };
-
-    let ports: Vec<i64> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for port in ports {
-        if port > 0 && port <= 65535 {
-            let addr = format!("127.0.0.1:{port}");
-            let _ = TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                std::time::Duration::from_millis(50),
-            );
-        }
-    }
 }
 
 /// Delete placeholder instances that have been launching too long.

@@ -5,7 +5,6 @@ use std::io::{IsTerminal, Read as IoRead};
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instance_lifecycle;
 use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
@@ -399,7 +398,7 @@ pub fn send_message(
     }
 
     // Notify all instances (wake delivery loops)
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
 
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();

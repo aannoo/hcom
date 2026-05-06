@@ -530,7 +530,7 @@ fn start_rebind(
             }
         }
 
-        let _ = lifecycle::notify_instance_with_db(db, &target_name);
+        crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
     // Print bootstrap

@@ -30,7 +30,11 @@ fn flag_path() -> PathBuf {
     hcom_dir().join(".tmp").join("pty_debug_on")
 }
 
-/// Look up inject port for an instance from notify_endpoints table.
+/// Look up inject port for an instance.
+///
+/// The inject port is a bidirectional RPC server (input bytes / `\x00SCREEN\n`
+/// query) — it shares the `notify_endpoints` table with wake endpoints but
+/// uses a different protocol. See `crate::notify::WakeKind` for the wake kinds.
 fn get_inject_port(db: &HcomDb, instance_name: &str) -> Option<i32> {
     db.conn()
         .query_row(
@@ -41,7 +45,11 @@ fn get_inject_port(db: &HcomDb, instance_name: &str) -> Option<i32> {
         .ok()
 }
 
-/// Get all instances that have inject ports registered.
+/// Get all instances that have an inject port registered.
+///
+/// Returns `(instance_name, inject_port)` pairs. An inject port means the
+/// instance is running a PTY screen-query RPC server (registered by the PTY
+/// manager); having one is the queryable-via-`hcom term` signal.
 fn get_pty_instances(db: &HcomDb) -> Vec<(String, i32)> {
     let mut stmt = match db
         .conn()

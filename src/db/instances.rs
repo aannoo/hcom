@@ -798,6 +798,42 @@ impl HcomDb {
             _ => Box::new(val.to_string()),
         }
     }
+
+    /// Check if instance is idle (safe for PTY injection).
+    /// Returns true only when status is "listening" AND detail is not "cmd:listen".
+    /// The "cmd:listen" detail is set by `hcom listen` as its first operation,
+    /// ensuring the gate blocks before any async setup (endpoint registration, etc.).
+    pub fn is_idle(&self, name: &str) -> bool {
+        match self.get_instance_status(name) {
+            Ok(Some(s)) => s.status == ST_LISTENING && s.detail != "cmd:listen",
+            _ => false,
+        }
+    }
+
+    /// Update heartbeat timestamp and re-assert tcp_mode to prove instance is alive.
+    ///
+    /// Sets both last_stop (heartbeat) and tcp_mode=true atomically.
+    /// Re-asserting tcp_mode on every heartbeat self-heals after DB resets,
+    /// instance re-creation, or any state loss — the delivery thread is the
+    /// source of truth for whether TCP delivery is active.
+    pub fn update_heartbeat(&self, name: &str) -> Result<()> {
+        let now = now_epoch_i64();
+
+        self.conn.execute(
+            "UPDATE instances SET last_stop = ?, tcp_mode = 1 WHERE name = ?",
+            params![now, name],
+        )?;
+        Ok(())
+    }
+
+    /// Update instance position with tcp_mode flag
+    pub fn update_tcp_mode(&self, name: &str, tcp_mode: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET tcp_mode = ? WHERE name = ?",
+            params![tcp_mode as i32, name],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

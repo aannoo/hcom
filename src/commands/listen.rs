@@ -409,8 +409,8 @@ fn listen_loop(
         }
 
         // TCP select for local notifications. Relay imports (pull.rs) call
-        // notify_all_instances after every batch, so the TCP wake fires as
-        // soon as remote events land — no separate relay polling needed.
+        // `crate::notify::wake_all` after every batch, so the TCP wake fires
+        // as soon as remote events land — no separate relay polling needed.
         let wait_time = if notify_server.is_some() {
             remaining.min(30.0)
         } else {
@@ -658,8 +658,8 @@ fn filter_listen_loop(
         }
 
         // TCP select for local notifications. Relay imports (pull.rs) call
-        // notify_all_instances after every batch, so the TCP wake fires as
-        // soon as remote events land — no separate relay polling needed.
+        // `crate::notify::wake_all` after every batch, so the TCP wake fires
+        // as soon as remote events land — no separate relay polling needed.
         let wait_time = if notify_server.is_some() {
             remaining.min(30.0)
         } else {

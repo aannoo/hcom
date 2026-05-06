@@ -9,7 +9,6 @@ use rusqlite::params;
 use serde_json::Value;
 
 use crate::db::HcomDb;
-use crate::instance_lifecycle;
 use crate::log;
 
 use super::crypto;
@@ -512,8 +511,7 @@ pub fn handle_state_message(
     );
 
     // Wake local TCP instances so they see new messages immediately.
-    //
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
 
     should_push
 }

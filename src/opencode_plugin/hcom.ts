@@ -257,7 +257,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   }
 
   // TCP notify server: instant wake when hcom messages arrive.
-  // notify_all_instances() TCP-connects to this port on every send.
+  // `crate::notify::wake_all` TCP-connects to this port on every send.
   function startNotifyServer(): number | null {
     if (notifyServer) return notifyServer.port
     try {

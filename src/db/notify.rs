@@ -1,11 +1,21 @@
-//! Notify endpoint and liveness helpers.
+//! Notify endpoint registry helpers.
+//!
+//! Owns the `notify_endpoints` table — `(instance, kind, port)` rows that map
+//! an instance to TCP ports the rest of the system can poke. Two protocol
+//! families share this table:
+//!
+//! - **Wake endpoints** (kinds: `pty`, `hook`, `listen`, `listen_filter`,
+//!   `events_wait`, `plugin`) — connect-and-close wakes a poll loop in the
+//!   target process. See `crate::notify::WakeKind`.
+//! - **Inject endpoint** (kind: `inject`) — bidirectional RPC for PTY input
+//!   and screen queries. Lives in the same table for historical reasons; the
+//!   protocol is unrelated to wake.
 
 use anyhow::Result;
 use rusqlite::params;
 
 use super::HcomDb;
-use crate::shared::constants::ST_LISTENING;
-use crate::shared::time::{now_epoch_f64, now_epoch_i64};
+use crate::shared::time::now_epoch_f64;
 
 impl HcomDb {
     /// Register notify endpoint for PTY wake-ups
@@ -18,42 +28,6 @@ impl HcomDb {
     /// Register inject port for screen queries
     pub fn register_inject_port(&self, name: &str, port: u16) -> Result<()> {
         self.upsert_notify_endpoint(name, "inject", port)
-    }
-
-    /// Check if instance is idle (safe for PTY injection).
-    /// Returns true only when status is "listening" AND detail is not "cmd:listen".
-    /// The "cmd:listen" detail is set by `hcom listen` as its first operation,
-    /// ensuring the gate blocks before any async setup (endpoint registration, etc.).
-    pub fn is_idle(&self, name: &str) -> bool {
-        match self.get_instance_status(name) {
-            Ok(Some(s)) => s.status == ST_LISTENING && s.detail != "cmd:listen",
-            _ => false,
-        }
-    }
-
-    /// Update heartbeat timestamp and re-assert tcp_mode to prove instance is alive.
-    ///
-    /// Sets both last_stop (heartbeat) and tcp_mode=true atomically.
-    /// Re-asserting tcp_mode on every heartbeat self-heals after DB resets,
-    /// instance re-creation, or any state loss — the delivery thread is the
-    /// source of truth for whether TCP delivery is active.
-    pub fn update_heartbeat(&self, name: &str) -> Result<()> {
-        let now = now_epoch_i64();
-
-        self.conn.execute(
-            "UPDATE instances SET last_stop = ?, tcp_mode = 1 WHERE name = ?",
-            params![now, name],
-        )?;
-        Ok(())
-    }
-
-    /// Update instance position with tcp_mode flag
-    pub fn update_tcp_mode(&self, name: &str, tcp_mode: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE instances SET tcp_mode = ? WHERE name = ?",
-            params![tcp_mode as i32, name],
-        )?;
-        Ok(())
     }
 
     /// Delete notify endpoints for an instance

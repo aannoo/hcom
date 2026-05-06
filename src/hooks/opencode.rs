@@ -95,12 +95,13 @@ fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
     }
 }
 
-/// Send TCP wake to ALL of an instance's notify endpoints.
+/// Send TCP wake to ALL of an instance's wake endpoints.
 ///
 /// Used by status handler when instance becomes listening.
-/// Queries all kinds (pty, hook, plugin) and sends a brief TCP connect to each.
+/// Wakes every registered wake kind (pty, hook, plugin, listen variants,
+/// events_wait). The inject endpoint is excluded — it speaks RPC, not wake.
 fn notify_all_endpoints(db: &HcomDb, instance_name: &str) {
-    lifecycle::notify_instance_endpoints(db, instance_name, &[]);
+    crate::notify::wake(db, instance_name, &[]);
 }
 
 /// Get path to OpenCode's SQLite database.
@@ -221,8 +222,9 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     }
 
     // Initialize last_event_id BEFORE set_status() — set_status triggers
-    // notify_instance() which TCP-wakes the plugin's deliverPendingToIdle().
-    // If last_event_id is still 0, ALL historical events get delivered.
+    // `crate::notify::wake` which TCP-wakes the plugin's
+    // deliverPendingToIdle(). If last_event_id is still 0, ALL historical
+    // events get delivered.
     if let Ok(Some(existing)) = db.get_instance_full(&instance_name) {
         if existing.last_event_id == 0 {
             let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")

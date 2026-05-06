@@ -821,8 +821,9 @@ fn events_wait(
     }
 
     // Setup TCP notify server for instant wake — only useful when we can
-    // register a port for `notify_all_instances` to poke. Anonymous waits
-    // (no instance_name) skip the listener and fall through to a short poll.
+    // register an `events_wait` wake endpoint for `crate::notify::wake_all`
+    // to poke. Anonymous waits (no instance_name) skip the listener and
+    // fall through to a short poll.
     let mut notify_server: Option<TcpListener> = None;
     let mut notify_port: Option<u16> = None;
     if let Some(name) = instance_name {
