@@ -1312,7 +1312,7 @@ impl Proxy {
             let watcher_running = self.running.clone();
             let watcher_name = instance_name.clone();
             std::thread::spawn(move || {
-                crate::transcript::run_transcript_watcher(
+                crate::hooks::codex_file_edits::run_transcript_watcher(
                     watcher_running,
                     watcher_name,
                     Duration::from_secs(5),

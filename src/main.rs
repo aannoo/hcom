@@ -32,7 +32,7 @@ pub mod shared;
 pub mod terminal;
 mod tool;
 pub mod tools;
-mod transcript;
+pub mod transcript;
 mod tui;
 mod update;
 

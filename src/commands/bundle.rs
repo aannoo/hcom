@@ -14,7 +14,7 @@ use crate::db::HcomDb;
 use crate::shared::{CommandContext, SenderKind};
 
 // Re-use transcript parsing for bundle prepare/cat (C5 fix)
-use super::transcript::{TranscriptQuery, format_exchanges_pub, get_exchanges_pub};
+use crate::transcript::{TranscriptQuery, format_exchanges_pub, get_exchanges_pub};
 
 fn file_operations_query() -> String {
     format!(
