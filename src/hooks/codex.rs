@@ -669,17 +669,33 @@ fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
     }
 
     *CODEX_HOOKS_FEATURE_KEY_CACHE.get_or_init(|| {
-        std::process::Command::new("codex")
+        let output = match std::process::Command::new("codex")
             .arg("--version")
             .output()
-            .ok()
-            .and_then(|output| {
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                parse_codex_cli_version(&text)
-            })
-            .map(codex_hooks_feature_key_for_version)
-            .unwrap_or(CodexHooksFeatureKey::Hooks)
+        {
+            Ok(o) => o,
+            Err(e) => {
+                crate::log::log_warn(
+                    "hooks",
+                    "codex.version_failed",
+                    &format!("could not run codex --version: {e}"),
+                );
+                return CodexHooksFeatureKey::Hooks;
+            }
+        };
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        match parse_codex_cli_version(&text) {
+            Some(version) => codex_hooks_feature_key_for_version(version),
+            None => {
+                crate::log::log_warn(
+                    "hooks",
+                    "codex.version_unparseable",
+                    &format!("could not parse version from codex --version output"),
+                );
+                CodexHooksFeatureKey::Hooks
+            }
+        }
     })
 }
 
@@ -1028,11 +1044,11 @@ pub fn verify_codex_hooks_installed(check_permissions: bool) -> bool {
 pub(crate) fn verify_codex_hooks_inner(check_permissions: bool) -> Result<(), VerifyFailReason> {
     let config_path = get_codex_config_path();
     let hooks_path = get_codex_hooks_path();
-    let feature_key = detect_codex_hooks_feature_key();
 
     if !config_path.exists() {
         return Err(VerifyFailReason::ConfigPathMissing(config_path));
     }
+    let feature_key = detect_codex_hooks_feature_key();
     if !codex_feature_enabled(&config_path, feature_key) {
         return Err(VerifyFailReason::CodexFeatureDisabled(config_path));
     }
