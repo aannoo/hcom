@@ -20,6 +20,7 @@ pub mod test_helpers {
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
+        saved_test_codex_cli_version: Option<String>,
     }
 
     impl Default for EnvGuard {
@@ -33,6 +34,7 @@ pub mod test_helpers {
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
+                saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
             }
         }
     }
@@ -47,6 +49,10 @@ pub mod test_helpers {
                 match &self.saved_home {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
+                }
+                match &self.saved_test_codex_cli_version {
+                    Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
+                    None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
                 }
             }
             crate::config::Config::reset();
@@ -65,6 +71,7 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();
         crate::config::Config::init();

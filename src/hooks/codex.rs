@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
@@ -32,7 +33,30 @@ const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("Stop", "codex-stop", None),
 ];
 const HCOM_TOOL_NAMES: &[&str] = &["claude", "gemini", "codex", "opencode"];
+const CODEX_HOOKS_FEATURE_RENAME_VERSION: (u64, u64, u64) = (0, 129, 0);
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexHooksFeatureKey {
+    CodexHooks,
+    Hooks,
+}
+
+impl CodexHooksFeatureKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexHooks => "codex_hooks",
+            Self::Hooks => "hooks",
+        }
+    }
+
+    fn alternate(self) -> &'static str {
+        match self {
+            Self::CodexHooks => "hooks",
+            Self::Hooks => "codex_hooks",
+        }
+    }
+}
 
 fn hook_noop() -> HookResult {
     HookResult::Allow {
@@ -611,7 +635,58 @@ fn remove_hcom_hooks_from_json(existing: &mut Value) {
     }
 }
 
-fn ensure_codex_feature_enabled(config_path: &Path) -> Result<(), String> {
+fn parse_codex_cli_version(output: &str) -> Option<(u64, u64, u64)> {
+    output
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find_map(|token| {
+            let mut parts = token.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next()?.parse().ok()?;
+            Some((major, minor, patch))
+        })
+}
+
+fn codex_hooks_feature_key_for_version(version: (u64, u64, u64)) -> CodexHooksFeatureKey {
+    if version >= CODEX_HOOKS_FEATURE_RENAME_VERSION {
+        CodexHooksFeatureKey::Hooks
+    } else {
+        CodexHooksFeatureKey::CodexHooks
+    }
+}
+
+/// Cached result of `detect_codex_hooks_feature_key`.  Tests bypass the
+/// cache when `HCOM_TEST_CODEX_CLI_VERSION` is set so that changing the
+/// env var mid-process produces the expected value.
+static CODEX_HOOKS_FEATURE_KEY_CACHE: OnceLock<CodexHooksFeatureKey> = OnceLock::new();
+
+fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
+    #[cfg(test)]
+    if let Ok(version) = std::env::var("HCOM_TEST_CODEX_CLI_VERSION") {
+        return parse_codex_cli_version(&version)
+            .map(codex_hooks_feature_key_for_version)
+            .unwrap_or(CodexHooksFeatureKey::Hooks);
+    }
+
+    *CODEX_HOOKS_FEATURE_KEY_CACHE.get_or_init(|| {
+        std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|output| {
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                parse_codex_cli_version(&text)
+            })
+            .map(codex_hooks_feature_key_for_version)
+            .unwrap_or(CodexHooksFeatureKey::Hooks)
+    })
+}
+
+fn ensure_codex_feature_enabled(
+    config_path: &Path,
+    feature_key: CodexHooksFeatureKey,
+) -> Result<(), String> {
     let mut doc: DocumentMut = if config_path.exists() {
         std::fs::read_to_string(config_path)
             .map_err(|e| e.to_string())?
@@ -624,7 +699,15 @@ fn ensure_codex_feature_enabled(config_path: &Path) -> Result<(), String> {
     if !doc.contains_table("features") {
         doc["features"] = Item::Table(toml_edit::Table::new());
     }
-    doc["features"]["codex_hooks"] = value(true);
+    // Codex renamed the feature flag from codex_hooks to hooks in 0.129.0.
+    // Always clean the deprecated codex_hooks key if present; never remove
+    // hooks — it's the shared flag for all Codex hooks, not just hcom's.
+    if let Some(features) = doc.get_mut("features") {
+        if let Some(table) = features.as_table_like_mut() {
+            table.remove("codex_hooks");
+        }
+    }
+    doc["features"][feature_key.as_str()] = value(true);
     // Remove the old hcom-owned codex-notify form only; leave unrelated notify untouched.
     let is_hcom_notify = doc.get("notify").is_some_and(is_hcom_legacy_notify);
     if is_hcom_notify {
@@ -641,15 +724,21 @@ fn ensure_codex_feature_enabled(config_path: &Path) -> Result<(), String> {
     }
 }
 
-fn codex_feature_enabled(config_path: &Path) -> bool {
+fn codex_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) -> bool {
     let Ok(content) = std::fs::read_to_string(config_path) else {
         return false;
     };
     let Ok(doc) = content.parse::<DocumentMut>() else {
         return false;
     };
+    // Check the version-selected key first, fall back to the alternate
+    // so that a config written by an older (or newer) hcom still passes
+    // verification until the next setup call canonicalizes it.
     doc.get("features")
-        .and_then(|item| item.get("codex_hooks"))
+        .and_then(|item| {
+            item.get(feature_key.as_str())
+                .or_else(|| item.get(feature_key.alternate()))
+        })
         .and_then(|item| item.as_bool())
         .unwrap_or(false)
 }
@@ -871,10 +960,13 @@ pub enum SetupError {
 pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError> {
     let config_path = get_codex_config_path();
     let hooks_path = get_codex_hooks_path();
+    let feature_key = detect_codex_hooks_feature_key();
 
-    ensure_codex_feature_enabled(&config_path).map_err(|e| SetupError::EnsureFeatureFailed {
-        path: config_path.clone(),
-        reason: e,
+    ensure_codex_feature_enabled(&config_path, feature_key).map_err(|e| {
+        SetupError::EnsureFeatureFailed {
+            path: config_path.clone(),
+            reason: e,
+        }
     })?;
 
     let mut hooks_json = if hooks_path.exists() {
@@ -936,11 +1028,12 @@ pub fn verify_codex_hooks_installed(check_permissions: bool) -> bool {
 pub(crate) fn verify_codex_hooks_inner(check_permissions: bool) -> Result<(), VerifyFailReason> {
     let config_path = get_codex_config_path();
     let hooks_path = get_codex_hooks_path();
+    let feature_key = detect_codex_hooks_feature_key();
 
     if !config_path.exists() {
         return Err(VerifyFailReason::ConfigPathMissing(config_path));
     }
-    if !codex_feature_enabled(&config_path) {
+    if !codex_feature_enabled(&config_path, feature_key) {
         return Err(VerifyFailReason::CodexFeatureDisabled(config_path));
     }
     // No exists() pre-check: verify_hooks_json_at converts NotFound to
@@ -976,6 +1069,28 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
                 }
             }
             Err(_) => ok = false,
+        }
+    }
+
+    // Strip deprecated codex_hooks from config.toml. Leave hooks alone
+    // (shared flag for all Codex hooks, not just hcom's).
+    let config_path = base.join("config.toml");
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut doc) = content.parse::<DocumentMut>() {
+                let had_codex_hooks = doc
+                    .get("features")
+                    .and_then(|f| f.get("codex_hooks"))
+                    .is_some();
+                if had_codex_hooks {
+                    if let Some(features) = doc.get_mut("features") {
+                        if let Some(table) = features.as_table_like_mut() {
+                            table.remove("codex_hooks");
+                        }
+                    }
+                    ok &= paths::atomic_write(&config_path, &doc.to_string());
+                }
+            }
         }
     }
 
@@ -1092,7 +1207,7 @@ mod tests {
         let config_content = std::fs::read_to_string(config_path).unwrap();
 
         assert!(hooks_content.contains("codex-sessionstart"));
-        assert!(config_content.contains("codex_hooks = true"));
+        assert!(config_content.contains("hooks = true"));
         assert!(!config_content.contains("codex-notify"));
 
         assert!(remove_codex_hooks());
@@ -1182,7 +1297,7 @@ mod tests {
         let config_path = get_codex_config_path();
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
+        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
         std::fs::write(
             &hooks_path,
             serde_json::json!({
@@ -1230,10 +1345,7 @@ mod tests {
             content.contains("some-other-notify-tool"),
             "unrelated notify was removed"
         );
-        assert!(
-            content.contains("codex_hooks = true"),
-            "feature flag not set"
-        );
+        assert!(content.contains("hooks = true"), "feature flag not set");
     }
 
     #[test]
@@ -1250,10 +1362,7 @@ mod tests {
             content.contains("other-tool codex-notify"),
             "non-hcom notify mentioning codex-notify was removed"
         );
-        assert!(
-            content.contains("codex_hooks = true"),
-            "feature flag not set"
-        );
+        assert!(content.contains("hooks = true"), "feature flag not set");
     }
 
     #[test]
@@ -1274,10 +1383,7 @@ mod tests {
             !content.contains("notify"),
             "hcom notify key was not removed"
         );
-        assert!(
-            content.contains("codex_hooks = true"),
-            "feature flag not set"
-        );
+        assert!(content.contains("hooks = true"), "feature flag not set");
     }
 
     #[test]
@@ -1289,14 +1395,14 @@ mod tests {
         let config_path = get_codex_config_path();
         let before = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            before.contains("codex_hooks = true"),
+            before.contains("hooks = true"),
             "setup did not enable feature flag"
         );
 
         assert!(remove_codex_hooks());
         let after = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            after.contains("codex_hooks = true"),
+            after.contains("hooks = true"),
             "feature flag should be preserved"
         );
     }
@@ -1330,5 +1436,96 @@ mod tests {
     fn test_remove_codex_noop_when_no_hooks_json() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
         assert!(remove_codex_hooks());
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_feature_enabled_with_fallback() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
+
+        // Both keys resolve because the selected key is checked first,
+        // then the alternate acts as a fallback.
+        assert!(codex_feature_enabled(
+            &config_path,
+            CodexHooksFeatureKey::CodexHooks
+        ));
+        assert!(codex_feature_enabled(
+            &config_path,
+            CodexHooksFeatureKey::Hooks
+        ));
+
+        // Reverse: only hooks key present.
+        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
+        assert!(codex_feature_enabled(
+            &config_path,
+            CodexHooksFeatureKey::Hooks
+        ));
+        assert!(codex_feature_enabled(
+            &config_path,
+            CodexHooksFeatureKey::CodexHooks
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_feature_upgrade_cleans_stale_codex_hooks() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        // Seed config with the deprecated key, simulating an old hcom install.
+        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
+
+        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("hooks = true"), "upgrade should set hooks");
+        assert!(
+            !content.contains("codex_hooks"),
+            "upgrade should remove stale codex_hooks"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_feature_downgrade_uses_codex_hooks() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
+
+        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::CodexHooks).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let doc = content.parse::<DocumentMut>().unwrap();
+        let features = doc.get("features").unwrap();
+        assert!(
+            features.get("codex_hooks").and_then(|v| v.as_bool()) == Some(true),
+            "old Codex should use codex_hooks"
+        );
+        // hooks is the shared flag for all Codex hooks — not just hcom's.
+        // hcom must not delete it even when writing for an older Codex.
+        assert!(
+            features.get("hooks").and_then(|v| v.as_bool()) == Some(true),
+            "shared hooks flag should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_codex_hooks_feature_key_version_gate() {
+        assert_eq!(
+            codex_hooks_feature_key_for_version((0, 128, 0)),
+            CodexHooksFeatureKey::CodexHooks
+        );
+        assert_eq!(
+            codex_hooks_feature_key_for_version((0, 129, 0)),
+            CodexHooksFeatureKey::Hooks
+        );
+        assert_eq!(
+            parse_codex_cli_version("codex-cli 0.129.0"),
+            Some((0, 129, 0))
+        );
     }
 }
