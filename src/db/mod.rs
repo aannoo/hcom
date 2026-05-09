@@ -35,16 +35,22 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
-     ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
-     UPDATE instances
-     SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
-     WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+         ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
+         UPDATE instances
+         SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
+         WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+    ),
+    (
+        18,
+        "ALTER TABLE instances ADD COLUMN project TEXT DEFAULT '';",
+    ),
+];
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -221,6 +227,7 @@ impl HcomDb {
                 parent_session_id TEXT,
                 parent_name TEXT,
                 tag TEXT,
+                project TEXT DEFAULT '',
                 last_event_id INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'active',
                 status_time INTEGER DEFAULT 0,
@@ -527,6 +534,7 @@ impl HcomDb {
                     .collect();
                 let required = [
                     "tool",
+                    "project",
                     "terminal_preset_requested",
                     "terminal_preset_effective",
                 ];
@@ -803,6 +811,7 @@ pub(super) mod tests {
                 directory TEXT,
                 parent_name TEXT,
                 tag TEXT,
+                project TEXT DEFAULT '',
                 wait_timeout INTEGER,
                 subagent_timeout INTEGER,
                 hints TEXT,
@@ -1145,6 +1154,66 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn test_ensure_schema_migrates_v17_to_v18_in_place() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2600);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_migrate_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     created_at REAL NOT NULL,
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
+                     launch_context TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 17;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", "claude", 1.0f64],
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let project: String = db
+            .conn
+            .query_row(
+                "SELECT project FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn test_ensure_schema_column_guard() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(3000);
@@ -1210,9 +1279,9 @@ pub(super) mod tests {
             test_id
         ));
 
-        // Simulate the bug: create a v16-style DB but stamp it as v17
+        // Simulate the bug: create a v17-style DB but stamp it as v18
         // (this is what init_db() did — CREATE IF NOT EXISTS is a no-op on
-        // existing tables, then it unconditionally set user_version = 17)
+        // existing tables, then it unconditionally set user_version = 18)
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -1244,6 +1313,8 @@ pub(super) mod tests {
                      subagent_timeout INTEGER,
                      tool TEXT DEFAULT 'claude',
                      launch_args TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
                      idle_since TEXT DEFAULT '',
                      pid INTEGER DEFAULT NULL,
                      launch_context TEXT DEFAULT ''
@@ -1252,7 +1323,7 @@ pub(super) mod tests {
                  CREATE TABLE notify_endpoints (instance TEXT NOT NULL, kind TEXT NOT NULL, port INTEGER NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(instance, kind));
                  CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
                  CREATE TABLE process_bindings (process_id TEXT PRIMARY KEY, session_id TEXT, instance_name TEXT, updated_at REAL NOT NULL);
-                 PRAGMA user_version = 17;",
+                 PRAGMA user_version = 18;",
             )
             .unwrap();
             // Insert test data that should survive the repair
@@ -1263,7 +1334,7 @@ pub(super) mod tests {
             .unwrap();
         }
 
-        // Verify columns are missing before repair
+        // Verify project column is missing before repair
         {
             let conn = Connection::open(&db_path).unwrap();
             let cols: Vec<String> = conn
@@ -1274,8 +1345,8 @@ pub(super) mod tests {
                 .filter_map(|r| r.ok())
                 .collect();
             assert!(
-                !cols.contains(&"terminal_preset_requested".to_string()),
-                "column should be missing before repair"
+                !cols.contains(&"project".to_string()),
+                "project column should be missing before repair"
             );
         }
 
@@ -1299,24 +1370,16 @@ pub(super) mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(
-            cols.contains(&"terminal_preset_requested".to_string()),
-            "terminal_preset_requested column should exist after repair"
-        );
-        assert!(
-            cols.contains(&"terminal_preset_effective".to_string()),
-            "terminal_preset_effective column should exist after repair"
+            cols.contains(&"project".to_string()),
+            "project column should exist after repair"
         );
 
         // Test data should have survived (not archived)
-        let name: String = db
+        let count: i64 = db
             .conn
-            .query_row(
-                "SELECT name FROM instances WHERE name = 'luna'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(name, "luna");
+        assert_eq!(count, 1, "data should not have been archived");
 
         cleanup_test_db(db_path);
     }

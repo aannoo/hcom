@@ -1176,7 +1176,7 @@ mod tests {
         // should point users at the right form instead of just listing 30 names.
         let instances = vec![info("zeli:ZOME", None), info("luna", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), None).unwrap_err();
         assert!(err.contains("@zeli"), "got: {err}");
         assert!(err.contains("Did you mean: @zeli:ZOME"), "got: {err}");
     }
@@ -1185,7 +1185,7 @@ mod tests {
     fn test_compute_scope_no_suggestion_when_no_remote_match() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), None).unwrap_err();
         assert!(!err.contains("Did you mean"), "got: {err}");
     }
 

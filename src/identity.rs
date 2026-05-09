@@ -953,6 +953,7 @@ mod tests {
             parent_name: None,
             agent_id: None,
             tag: None,
+            project: None,
             last_event_id: 0,
             last_stop: 0,
             status: String::from("inactive"),

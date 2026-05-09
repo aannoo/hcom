@@ -33,6 +33,9 @@ impl HcomDb {
         if from == receiver {
             return false;
         }
+        if let Some(delivered) = json.get("delivered_to").and_then(|v| v.as_array()) {
+            return delivered.iter().any(|v| v.as_str() == Some(receiver));
+        }
         let scope = json
             .get("scope")
             .and_then(|s| s.as_str())
