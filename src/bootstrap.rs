@@ -62,9 +62,12 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
+- Per-agent system prompts: create `~/.hcom/agents/<name>.md` with the role prompt for any agent (self or spawned)
+  Then `hcom list -v` confirms if file loaded. Re-injected on every session compaction.
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <claude|gemini|codex|opencode> [--tag labelOrGroup] [--agent-name customName] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
+  Example: `hcom 1 claude --agent-name mybot` -> named agent, load ~/.hcom/agents/mybot.md as system prompt
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   background, set prompt, system, forward args: <claude|gemini|codex|opencode> --help
 - Run workflows: run <script> [args] [--help]
@@ -181,6 +184,12 @@ Commands:
   {hcom_cmd} list --name {subagent_name}
   {hcom_cmd} events --name {subagent_name}
   {hcom_cmd} <cmd> --help --name {subagent_name}
+
+Agent prompts:
+  - When spawning sub-agents use `--agent-name <name>` to name them
+  - Write role prompt: `echo "role instructions" > ~/.hcom/agents/<name>.md`
+  - The sub-agent reads this file on startup and every session compaction
+  - Create the file before or right after spawning
 
 Rules:
 - Task via hcom → ack, work, report
@@ -436,6 +445,14 @@ pub fn get_bootstrap(
     // User notes (appended after render to avoid brace issues in user text)
     if !ctx.notes.is_empty() {
         result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
+    }
+
+    // Agent prompt from ~/.hcom/agents/<name>.md
+    if let Some(agent_prompt) = crate::agent_prompts::load_agent_prompt(instance_name) {
+        result.push_str(&format!(
+            "\n\n## AGENT PROMPT\n\n{}\n",
+            agent_prompt
+        ));
     }
 
     // Rewrite hcom references if using alternate command

@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
-import { appendFileSync } from "fs"
+import { appendFileSync, readFileSync, existsSync } from "fs"
 import { homedir } from "os"
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
@@ -524,6 +524,16 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           `You are connected to hcom as "${instanceName}". ` +
           `Use --name ${instanceName} for all hcom commands.`
         )
+
+        const agentPromptPath = `${HCOM_DIR}/agents/${instanceName}.md`
+        if (existsSync(agentPromptPath)) {
+          const agentPrompt = readFileSync(agentPromptPath, "utf-8").trim()
+          if (agentPrompt) {
+            output.context.push(`## AGENT PROMPT\n\n${agentPrompt}`)
+            log("INFO", "plugin.agent_prompt_injected", instanceName, { path: agentPromptPath })
+          }
+        }
+
         log("INFO", "plugin.compaction_reset", instanceName)
       } catch (e) {
         log("ERROR", "plugin.compaction_error", instanceName, { error: String(e) })
