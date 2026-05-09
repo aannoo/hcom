@@ -108,7 +108,7 @@ Without hooks, any other AI tool can join by running `hcom start`. Any process c
 
 ## Terminal
 
-Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, and **cmux** also support closing panes from `hcom kill`.
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux** also support closing panes from `hcom kill`.
 
 To configure a custom terminal open/close setup, tell an agent to run:
 
@@ -279,7 +279,7 @@ hcom events --wait <filters>         # Block until match for scripting
 hcom update                         # update hcom version
 ```
 
-`hcom --help` for all commands.
+`hcom run docs --cli` for all commands.
 
 </details>
 
