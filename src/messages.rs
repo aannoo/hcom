@@ -170,6 +170,44 @@ pub fn format_recipients(delivered_to: &[String], max_show: usize) -> String {
     }
 }
 
+/// Build the "unknown @mention" error string with a "Did you mean" hint when
+/// an unmatched target (without `:`) has the same base name as a remote agent.
+///
+/// Without this hint, users hit `@zeli` → "non-existent" even though `zeli:ZOME`
+/// is right there in the available list and only takes a colon-suffix to reach.
+fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String {
+    let unmatched_display: Vec<String> = unmatched.iter().map(|t| format!("@{}", t)).collect();
+
+    let mut suggestions: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for target in unmatched {
+        if target.contains(':') {
+            continue;
+        }
+        let target_lower = target.to_lowercase();
+        for fn_ in full_names {
+            if let Some((prefix, _device)) = fn_.split_once(':') {
+                if prefix.to_lowercase() == target_lower && seen.insert(fn_.clone()) {
+                    suggestions.push(format!("@{}", fn_));
+                }
+            }
+        }
+    }
+
+    let mut msg = format!(
+        "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}",
+        unmatched_display.join(", "),
+    );
+    if !suggestions.is_empty() {
+        msg.push_str(&format!("\nDid you mean: {}?", suggestions.join(", ")));
+    }
+    msg.push_str(&format!(
+        "\nAvailable: {}",
+        format_recipients(full_names, 30)
+    ));
+    msg
+}
+
 /// Match a target against instance names with base-name fallback.
 ///
 /// Tries prefix match on full display name ({tag}-{name}) first.
@@ -281,14 +319,7 @@ pub fn compute_scope(
             }
 
             if !unmatched.is_empty() {
-                let display = format_recipients(&full_names, 30);
-                let unmatched_display: Vec<String> =
-                    unmatched.iter().map(|t| format!("@{}", t)).collect();
-                return Err(format!(
-                    "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}\nAvailable: {}",
-                    unmatched_display.join(", "),
-                    display,
-                ));
+                return Err(build_unmatched_error(&unmatched, &full_names));
             }
 
             // Deduplicate preserving order
@@ -362,14 +393,7 @@ pub fn compute_scope(
                     ));
                 }
 
-                let display = format_recipients(&full_names, 30);
-                let unmatched_display: Vec<String> =
-                    unmatched.iter().map(|m| format!("@{}", m)).collect();
-                return Err(format!(
-                    "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}\nAvailable: {}",
-                    unmatched_display.join(", "),
-                    display,
-                ));
+                return Err(build_unmatched_error(&unmatched, &full_names));
             }
 
             let unique = dedup_preserving_order(&matched_base_names);
@@ -1121,6 +1145,25 @@ mod tests {
         let result = compute_scope("hello", &instances, Some(&targets));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-existent or stopped"));
+    }
+
+    #[test]
+    fn test_compute_scope_suggests_remote_match() {
+        // Bare `@zeli` shouldn't silently match remote `zeli:ZOME`, but the error
+        // should point users at the right form instead of just listing 30 names.
+        let instances = vec![info("zeli:ZOME", None), info("luna", None)];
+        let targets = vec!["zeli".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        assert!(err.contains("@zeli"), "got: {err}");
+        assert!(err.contains("Did you mean: @zeli:ZOME"), "got: {err}");
+    }
+
+    #[test]
+    fn test_compute_scope_no_suggestion_when_no_remote_match() {
+        let instances = vec![info("luna", None), info("nova", None)];
+        let targets = vec!["zeli".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        assert!(!err.contains("Did you mean"), "got: {err}");
     }
 
     #[test]
