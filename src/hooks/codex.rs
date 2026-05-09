@@ -1088,28 +1088,6 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
         }
     }
 
-    // Strip deprecated codex_hooks from config.toml. Leave hooks alone
-    // (shared flag for all Codex hooks, not just hcom's).
-    let config_path = base.join("config.toml");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut doc) = content.parse::<DocumentMut>() {
-                let had_codex_hooks = doc
-                    .get("features")
-                    .and_then(|f| f.get("codex_hooks"))
-                    .is_some();
-                if had_codex_hooks {
-                    if let Some(features) = doc.get_mut("features") {
-                        if let Some(table) = features.as_table_like_mut() {
-                            table.remove("codex_hooks");
-                        }
-                    }
-                    ok &= paths::atomic_write(&config_path, &doc.to_string());
-                }
-            }
-        }
-    }
-
     if rules_file.exists() {
         ok &= std::fs::remove_file(&rules_file).is_ok();
     }
