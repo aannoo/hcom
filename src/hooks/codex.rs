@@ -691,7 +691,7 @@ fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
                 crate::log::log_warn(
                     "hooks",
                     "codex.version_unparseable",
-                    &format!("could not parse version from codex --version output"),
+                    "could not parse version from codex --version output",
                 );
                 CodexHooksFeatureKey::Hooks
             }

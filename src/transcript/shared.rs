@@ -420,7 +420,12 @@ pub(crate) fn read_file_lossy(path: &Path) -> Result<String, String> {
 // ── Formatting (Exchange → String) ───────────────────────────────────────
 
 /// Format exchanges for display.
-pub fn format_exchanges(exchanges: &[Exchange], _instance: &str, full: bool, detailed: bool) -> String {
+pub fn format_exchanges(
+    exchanges: &[Exchange],
+    _instance: &str,
+    full: bool,
+    detailed: bool,
+) -> String {
     let mut lines = Vec::new();
 
     for ex in exchanges {

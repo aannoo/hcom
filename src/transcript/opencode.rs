@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::shared::{
-    Exchange, ToolUse, finalize_action_text, normalize_tool_name, truncate_str,
-};
+use super::shared::{Exchange, ToolUse, finalize_action_text, normalize_tool_name, truncate_str};
 use crate::log::log_warn;
 
 #[derive(Debug, Clone)]

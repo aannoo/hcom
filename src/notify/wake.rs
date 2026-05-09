@@ -227,7 +227,8 @@ mod tests {
         let wake_port = wake_probe.local_addr().unwrap().port();
         let inject_port = inject_probe.local_addr().unwrap().port();
 
-        db.upsert_notify_endpoint("inst", "hook", wake_port).unwrap();
+        db.upsert_notify_endpoint("inst", "hook", wake_port)
+            .unwrap();
         db.upsert_notify_endpoint("inst", "inject", inject_port)
             .unwrap();
 
@@ -256,7 +257,8 @@ mod tests {
         let hook_port = hook_probe.local_addr().unwrap().port();
         let pty_port = pty_probe.local_addr().unwrap().port();
 
-        db.upsert_notify_endpoint("inst", "hook", hook_port).unwrap();
+        db.upsert_notify_endpoint("inst", "hook", hook_port)
+            .unwrap();
         db.upsert_notify_endpoint("inst", "pty", pty_port).unwrap();
 
         wake(&db, "inst", &[WakeKind::Hook]);

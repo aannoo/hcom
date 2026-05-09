@@ -5,9 +5,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, collapse_codex_duplicate_exchanges, dedup_sorted_capped, extract_content_text,
-    extract_edit_info, extract_text_content, finalize_action_text, has_user_text, is_error_result,
-    normalize_tool_name, read_file_lossy, truncate_str,
+    Exchange, ToolUse, collapse_codex_duplicate_exchanges, dedup_sorted_capped,
+    extract_content_text, extract_edit_info, extract_text_content, finalize_action_text,
+    has_user_text, is_error_result, normalize_tool_name, read_file_lossy, truncate_str,
 };
 
 /// Parse Claude JSONL transcript.
