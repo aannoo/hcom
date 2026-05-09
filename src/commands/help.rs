@@ -176,7 +176,7 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [KILOCODE] [CLINE] [CLINECODE]  hcom-launched (PTY + hooks)",
     ),
     (
         "",
@@ -432,7 +432,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .kilocode, .cline, .clinecode",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -466,7 +466,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / cline_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -530,7 +530,7 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("  --limit N", "Max results (default: 20)"),
     (
         "  --agent TYPE",
-        "Filter: claude | gemini | codex | opencode",
+        "Filter: claude | gemini | codex | opencode | kilo | kilocode | cline | clinecode",
     ),
     (
         "  --exclude-self",
@@ -598,11 +598,11 @@ const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks status", "Same as above"),
     (
         "hooks add [tool]",
-        "Add hooks (claude | gemini | codex | opencode | all)",
+        "Add hooks (claude | gemini | codex | opencode | kilo | kilocode | cline | clinecode | all)",
     ),
     (
         "hooks remove [tool]",
-        "Remove hooks (claude | gemini | codex | opencode | all)",
+        "Remove hooks (claude | gemini | codex | opencode | kilocode | cline | clinecode | all)",
     ),
     ("", ""),
     (
@@ -723,12 +723,48 @@ const OPENCODE_SPEC: ToolHelpSpec = ToolHelpSpec {
     has_fork: true,
 };
 
+const KILO_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "kilo",
+    label: "Kilo",
+    unique_examples: &[],
+    extra_env: &[],
+    has_fork: true,
+};
+
+const KILOCODE_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "kilocode",
+    label: "KiloCode",
+    unique_examples: &[],
+    extra_env: &[],
+    has_fork: true,
+};
+
+const CLINE_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "cline",
+    label: "Cline",
+    unique_examples: &[],
+    extra_env: &[],
+    has_fork: true,
+};
+
+const CLINECODE_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "clinecode",
+    label: "ClineCode",
+    unique_examples: &[],
+    extra_env: &[],
+    has_fork: true,
+};
+
 fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
     match name {
         "claude" => Some(&CLAUDE_SPEC),
         "gemini" => Some(&GEMINI_SPEC),
         "codex" => Some(&CODEX_SPEC),
         "opencode" => Some(&OPENCODE_SPEC),
+        "kilo" => Some(&KILO_SPEC),
+        "kilocode" => Some(&KILOCODE_SPEC),
+        "cline" => Some(&CLINE_SPEC),
+        "clinecode" => Some(&CLINECODE_SPEC),
         _ => None,
     }
 }
@@ -888,6 +924,10 @@ pub const COMMAND_NAMES: &[&str] = &[
     "gemini",
     "codex",
     "opencode",
+    "kilo",
+    "kilocode",
+    "cline",
+    "clinecode",
 ];
 
 /// Get the top-level help text as a String.
@@ -900,9 +940,9 @@ Usage:\n\
   hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] claude|gemini|codex|opencode [flags] [tool-args]\n\
+  hcom [N] claude|gemini|codex|opencode|kilo|kilocode [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session (claude/codex/opencode)\n\
+  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode/cline/clinecode)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
@@ -997,7 +1037,7 @@ pub fn get_command_help(name: &str) -> String {
         return resume_fork_help(
             "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
             "Creates a new agent that continues from the forked session.\n\
-             Supported tools: claude, codex, opencode. (gemini does not fork.)\n\
+             Supported tools: claude, codex, opencode, kilo, kilocode. (gemini does not fork.)\n\
              Remote fork (`:<device>`) requires --dir to pin the target cwd.",
             "hcom r <target>                   Resume a stopped agent",
         );
@@ -1118,6 +1158,10 @@ mod tests {
             "gemini",
             "codex",
             "opencode",
+            "kilo",
+            "kilocode",
+            "cline",
+            "clinecode",
         ];
         for cmd in commands {
             let help = get_command_help(cmd);
@@ -1169,8 +1213,8 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode)"
-        ));
+assert!(help.contains(
+    "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode/cline/clinecode)"
+));
     }
 }

@@ -6,6 +6,8 @@
 
 pub mod args_common;
 pub mod codex_args;
+pub mod cline_preprocessing;
 pub mod codex_preprocessing;
 pub mod gemini_args;
+pub mod kilo_preprocessing;
 pub mod opencode_preprocessing;
