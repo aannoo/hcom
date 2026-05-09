@@ -16,7 +16,7 @@ pub struct HooksArgs {
 }
 
 /// Valid tool names for hooks management.
-const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode"];
+const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity"];
 
 /// Get hook installation status for each tool.
 fn get_tool_status() -> Vec<(&'static str, bool, String)> {
@@ -40,11 +40,17 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
         .to_string_lossy()
         .to_string();
 
+    let (antigravity_installed, antigravity_path) = {
+        let (ok, path) = crate::hooks::antigravity::get_extension_status();
+        (ok, path)
+    };
+
     vec![
         ("claude", claude_installed, claude_path),
         ("gemini", gemini_installed, gemini_path),
         ("codex", codex_installed, codex_path),
         ("opencode", opencode_installed, opencode_path),
+        ("antigravity", antigravity_installed, antigravity_path),
     ]
 }
 
@@ -81,7 +87,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, all");
         return 1;
     };
 
@@ -104,6 +110,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                     && crate::hooks::codex::codex_current_feature_enabled()
             }
             "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
+            "antigravity" => crate::hooks::antigravity::verify_extension_installed(),
             _ => false,
         };
         if already {
@@ -126,6 +133,11 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
             "opencode" => match crate::hooks::opencode::install_opencode_plugin() {
                 Ok(true) => AddResult::Added,
                 Ok(false) => AddResult::Failed(None),
+                Err(e) => AddResult::Failed(Some(e.to_string())),
+            },
+            "antigravity" => match crate::hooks::antigravity::install_extension() {
+                Ok(true) => AddResult::Added,
+                Ok(false) => AddResult::Already,
                 Err(e) => AddResult::Failed(Some(e.to_string())),
             },
             _ => AddResult::Failed(None),
@@ -168,6 +180,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 "gemini" => "Gemini CLI",
                 "codex" => "Codex",
                 "opencode" => "OpenCode",
+                "antigravity" => "Antigravity",
                 other => other,
             };
             println!("Restart {tool_name} to activate hooks.");
@@ -188,7 +201,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, all");
         return 1;
     };
 
@@ -211,6 +224,14 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
                 Ok(()) => true,
                 Err(e) => {
                     eprintln!("Failed to remove {tool} hooks: {e}");
+                    fail_count += 1;
+                    continue;
+                }
+            },
+            "antigravity" => match crate::hooks::antigravity::remove_extension() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Failed to remove antigravity extension: {e}");
                     fail_count += 1;
                     continue;
                 }
@@ -251,11 +272,11 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
             "hcom hooks - Manage tool hooks for hcom integration\n\n\
              Hooks enable automatic message delivery and status tracking. Without hooks,\n\
              you can still use hcom in ad-hoc mode (run hcom start in any ai tool).\n\n\
-             Usage:\n  \
-             hcom hooks                  Show hook status for all tools\n  \
-             hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|all)\n  \
-             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|all)\n\n\
+              Usage:\n  \
+              hcom hooks                  Show hook status for all tools\n  \
+              hcom hooks status           Same as above\n  \
+              hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|antigravity|all)\n  \
+              hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|antigravity|all)\n\n\
              Examples:\n  \
              hcom hooks add claude       Add Claude Code hooks only\n  \
              hcom hooks add              Auto-detect tool or add all\n  \

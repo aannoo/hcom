@@ -1,5 +1,6 @@
 //! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode).
 
+pub mod antigravity;
 pub mod claude;
 pub mod claude_args;
 pub mod codex;
