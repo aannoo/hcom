@@ -89,6 +89,9 @@ fn tool_prefix_str(tool: Tool) -> &'static str {
 fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
+    // Apply project filter
+    let filter_project = app.ui.project_filter.as_deref().filter(|p| !p.is_empty());
+
     // Show tool prefix only when agents use different tools
     let all_agents: Vec<&Agent> = app
         .data
@@ -99,6 +102,14 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
         .collect();
     let tools: std::collections::HashSet<&str> = all_agents.iter().map(|a| a.tool.name()).collect();
     let multi_tool = tools.len() > 1;
+
+    // Filter agents by project
+    let filtered: Vec<&Agent> = app
+        .data
+        .agents
+        .iter()
+        .filter(|a| filter_project.map_or(true, |proj| a.project == proj))
+        .collect();
 
     // Compute max display name width for alignment (min 4 to avoid cramping)
     let name_width = all_agents
@@ -143,13 +154,24 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     let live_max = max_visible.saturating_sub(section_reserve).max(1);
 
     // Compute scroll window centered on cursor (live agents only)
-    let live_cursor = if app.ui.cursor < app.data.agents.len() {
+    let total_filtered = filtered.len();
+    let live_cursor = if app.ui.cursor < total_filtered {
         app.ui.cursor
     } else {
-        app.data.agents.len().saturating_sub(1)
+        total_filtered.saturating_sub(1)
     };
-    let scroll = compute_scroll(live_cursor, app.data.agents.len(), live_max);
-    let end = (scroll + live_max).min(app.data.agents.len());
+    let scroll = compute_scroll(live_cursor, total_filtered, live_max);
+    let end = (scroll + live_max).min(total_filtered);
+
+    // Project filter badge
+    if let Some(proj) = filter_project {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("@ ", Style::default().fg(palette::CYAN)),
+            Span::styled(proj.to_string(), Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" ({}/{})", total_filtered, app.data.agents.len()), Theme::dim()),
+        ]));
+    }
 
     // Scroll-up indicator
     if scroll > 0 {
@@ -160,7 +182,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     }
 
     for i in scroll..end {
-        let agent = &app.data.agents[i];
+        let agent = filtered[i];
         let is_cursor = app.ui.cursor == i;
         let is_selected = app.ui.selected.contains(&agent.name);
 
@@ -183,10 +205,10 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     }
 
     // Scroll-down indicator
-    let remaining = app.data.agents.len().saturating_sub(end);
+    let remaining = total_filtered.saturating_sub(end);
     if remaining > 0 && lines.len() < max_visible {
         lines.push(Line::from(Span::styled(
-            format!("  ↓ {} more", remaining),
+            format!("  \u{2193} {} more", remaining),
             Theme::dim(),
         )));
     }
@@ -729,8 +751,16 @@ struct TabEntry {
 fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
     let mut tabs: Vec<TabEntry> = Vec::new();
 
+    let filter_project = app.ui.project_filter.as_deref().filter(|p| !p.is_empty());
+
     // Live agents
-    for (i, agent) in app.data.agents.iter().enumerate() {
+    let filtered: Vec<&Agent> = app
+        .data
+        .agents
+        .iter()
+        .filter(|a| filter_project.map_or(true, |proj| a.project == proj))
+        .collect();
+    for (i, agent) in filtered.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
         let is_selected = app.ui.selected.contains(&agent.name);
         let icon = agent_icon(agent, app.ui.tick);
@@ -746,7 +776,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
     }
 
     // Section headers + items (remote, orphans)
-    let mut offset = app.data.agents.len();
+    let mut offset = filtered.len();
 
     if !app.data.remote_agents.is_empty() {
         let is_cursor = app.ui.cursor == offset;
@@ -1032,11 +1062,21 @@ fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, 
     append_right_aligned(&mut left, right, w);
     lines.push(Line::from(left));
 
-    // Line 2: directory · [headless]/[terminal] · pid · session · unread
+    // Line 2: project · tag · directory · [headless]/[terminal] · pid · session · unread
     let mut info: Vec<Span<'static>> = vec![
         Span::raw("  "),
-        Span::styled(shorten_dir(&agent.directory), Theme::dim()),
     ];
+    if !agent.project.is_empty() {
+        info.push(Span::styled("@", Style::default().fg(palette::CYAN)));
+        info.push(Span::styled(agent.project.clone(), Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)));
+        info.push(Span::styled(" ", Theme::dim()));
+    }
+    if !agent.tag.is_empty() {
+        info.push(Span::styled("#", Style::default().fg(palette::TEAL)));
+        info.push(Span::styled(agent.tag.clone(), Style::default().fg(palette::TEAL)));
+        info.push(Span::styled(" ", Theme::dim()));
+    }
+    info.push(Span::styled(shorten_dir(&agent.directory), Theme::dim()));
     if agent.headless {
         info.push(Span::styled(" \u{00b7} ", Theme::separator()));
         info.push(Span::styled("[headless]", Theme::dim()));

@@ -116,6 +116,7 @@ pub struct LaunchParams {
     pub count: usize,
     pub args: Vec<String>,
     pub tag: Option<String>,
+    pub project: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
     pub pty: bool,
@@ -138,6 +139,7 @@ impl Default for LaunchParams {
             count: 1,
             args: Vec::new(),
             tag: None,
+            project: None,
             system_prompt: None,
             initial_prompt: None,
             pty: false,
@@ -805,6 +807,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         default
     };
 
+    // Project env var
+    if let Some(ref project) = params.project {
+        base_env.insert("HCOM_PROJECT".to_string(), project.clone());
+    }
+
     // Explicit name validation
     if let Some(ref name) = params.name {
         if params.count > 1 {
@@ -978,6 +985,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 } else {
                     Some(effective_tag.as_str())
                 },
+                params.project.as_deref(),
                 None,              // wait_timeout
                 None,              // subagent_timeout
                 None,              // hints

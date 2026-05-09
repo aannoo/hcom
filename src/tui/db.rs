@@ -261,7 +261,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
     let mut stmt = match conn.prepare(
         "SELECT name, tool, status, status_context, status_detail,
                 created_at, status_time, last_stop, tcp_mode,
-                directory, tag, last_event_id, origin_device_id,
+                directory, tag, project, last_event_id, origin_device_id,
                 pid, session_id, background, terminal_preset_effective
          FROM instances ORDER BY created_at DESC",
     ) {
@@ -282,12 +282,13 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             row.get::<_, Option<i64>>(8)?,     // tcp_mode
             row.get::<_, Option<String>>(9)?,  // directory
             row.get::<_, Option<String>>(10)?, // tag
-            row.get::<_, Option<i64>>(11)?,    // last_event_id
-            row.get::<_, Option<String>>(12)?, // origin_device_id
-            row.get::<_, Option<i64>>(13)?,    // pid
-            row.get::<_, Option<String>>(14)?, // session_id
-            row.get::<_, Option<i64>>(15)?,    // background (headless)
-            row.get::<_, Option<String>>(16)?, // terminal_preset_effective
+            row.get::<_, Option<String>>(11)?, // project
+            row.get::<_, Option<i64>>(12)?,    // last_event_id
+            row.get::<_, Option<String>>(13)?, // origin_device_id
+            row.get::<_, Option<i64>>(14)?,    // pid
+            row.get::<_, Option<String>>(15)?, // session_id
+            row.get::<_, Option<i64>>(16)?,    // background (headless)
+            row.get::<_, Option<String>>(17)?, // terminal_preset_effective
         ))
     }) {
         Ok(r) => r,
@@ -314,6 +315,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             tcp_mode,
             directory,
             tag,
+            project,
             last_event_id,
             origin_device_id,
             pid,
@@ -381,6 +383,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             has_tcp,
             directory,
             tag: tag.unwrap_or_default(),
+            project: project.unwrap_or_default(),
             unread: 0, // computed separately
             last_event_id: last_event_id.map(|id| id as u64),
             device_name,
@@ -597,6 +600,7 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
         let tool_s = json_str(&snapshot, "tool", "claude");
         let directory = json_str(&snapshot, "directory", "");
         let tag = json_str(&snapshot, "tag", "");
+        let project = json_str(&snapshot, "project", "");
         let created_at = snapshot
             .get("created_at")
             .and_then(|v| {
@@ -617,6 +621,7 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
             has_tcp: false,
             directory: directory.to_string(),
             tag: tag.to_string(),
+            project: project.to_string(),
             unread: 0,
             last_event_id: None,
             device_name: None,
@@ -1148,6 +1153,7 @@ fn parse_iso_to_epoch(ts: &str) -> f64 {
 pub struct LaunchDefaults {
     pub terminal: String,
     pub tag: String,
+    pub project: String,
 }
 
 impl Default for LaunchDefaults {
@@ -1155,6 +1161,7 @@ impl Default for LaunchDefaults {
         Self {
             terminal: "default".into(),
             tag: String::new(),
+            project: String::new(),
         }
     }
 }
@@ -1192,7 +1199,15 @@ pub fn read_launch_defaults() -> LaunchDefaults {
         .unwrap_or("")
         .to_string();
 
-    LaunchDefaults { terminal, tag }
+    let project = table
+        .get("launch")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("project"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    LaunchDefaults { terminal, tag, project }
 }
 
 // ── Dynamic terminal preset detection ────────────────────────────
@@ -1423,7 +1438,8 @@ mod tests {
                 timestamp TEXT NOT NULL
             );
             CREATE TABLE instances (
-                name TEXT PRIMARY KEY
+                name TEXT PRIMARY KEY,
+                project TEXT DEFAULT ''
             );
             ",
         )
@@ -1444,6 +1460,7 @@ mod tests {
             has_tcp: false,
             directory: String::new(),
             tag: String::new(),
+            project: String::new(),
             unread: 0,
             last_event_id: Some(last_event_id),
             device_name: None,
@@ -1582,7 +1599,8 @@ mod tests {
                 tcp_mode INTEGER,
                 directory TEXT,
                 tag TEXT,
-                last_event_id INTEGER,
+                 project TEXT DEFAULT '',
+                 last_event_id INTEGER,
                 origin_device_id TEXT,
                 pid INTEGER,
                 session_id TEXT,

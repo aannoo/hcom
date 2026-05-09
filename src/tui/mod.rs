@@ -318,6 +318,7 @@ pub mod test_helpers {
             has_tcp: true,
             directory: "/tmp".into(),
             tag: String::new(),
+            project: String::new(),
             unread: 0,
             last_event_id: None,
             device_name: None,
