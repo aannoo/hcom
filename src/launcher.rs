@@ -358,7 +358,9 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             Ok(())
         }
         LaunchTool::Codex => {
-            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions) {
+            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
+                && crate::hooks::codex::codex_current_feature_enabled()
+            {
                 return Ok(());
             }
             if let Err(e) = crate::hooks::codex::try_setup_codex_hooks(include_permissions) {

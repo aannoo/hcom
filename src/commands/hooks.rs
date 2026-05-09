@@ -99,7 +99,10 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions)
             }
             "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions),
-            "codex" => crate::hooks::codex::verify_codex_hooks_installed(include_permissions),
+            "codex" => {
+                crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
+                    && crate::hooks::codex::codex_current_feature_enabled()
+            }
             "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
             _ => false,
         };

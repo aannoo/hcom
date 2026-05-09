@@ -740,7 +740,24 @@ fn ensure_codex_feature_enabled(
     }
 }
 
+fn codex_selected_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) -> bool {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return false;
+    };
+    doc.get("features")
+        .and_then(|item| item.get(feature_key.as_str()))
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false)
+}
+
 fn codex_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) -> bool {
+    if codex_selected_feature_enabled(config_path, feature_key) {
+        return true;
+    }
+
     let Ok(content) = std::fs::read_to_string(config_path) else {
         return false;
     };
@@ -751,12 +768,16 @@ fn codex_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) 
     // so that a config written by an older (or newer) hcom still passes
     // verification until the next setup call canonicalizes it.
     doc.get("features")
-        .and_then(|item| {
-            item.get(feature_key.as_str())
-                .or_else(|| item.get(feature_key.alternate()))
-        })
+        .and_then(|item| item.get(feature_key.alternate()))
         .and_then(|item| item.as_bool())
         .unwrap_or(false)
+}
+
+/// Whether Codex config already uses the feature flag key expected by the
+/// installed Codex CLI. Verification accepts either key for compatibility, but
+/// launch setup uses this to self-heal stale `codex_hooks` configs.
+pub(crate) fn codex_current_feature_enabled() -> bool {
+    codex_selected_feature_enabled(&get_codex_config_path(), detect_codex_hooks_feature_key())
 }
 
 fn verify_hooks_json_at(hooks_path: &Path) -> Result<(), VerifyFailReason> {
@@ -1480,6 +1501,24 @@ mod tests {
             !content.contains("codex_hooks"),
             "upgrade should remove stale codex_hooks"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_current_feature_enabled_requires_selected_key() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
+
+        assert!(codex_feature_enabled(
+            &config_path,
+            CodexHooksFeatureKey::Hooks
+        ));
+        assert!(!codex_current_feature_enabled());
+
+        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
+        assert!(codex_current_feature_enabled());
     }
 
     #[test]

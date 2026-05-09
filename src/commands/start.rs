@@ -676,7 +676,10 @@ fn start_bare(
             let hooks_installed = match vanilla_tool {
                 "claude" => crate::hooks::claude::verify_claude_hooks_installed(None, false),
                 "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(false),
-                "codex" => crate::hooks::codex::verify_codex_hooks_installed(false),
+                "codex" => {
+                    crate::hooks::codex::verify_codex_hooks_installed(false)
+                        && crate::hooks::codex::codex_current_feature_enabled()
+                }
                 _ => true,
             };
             if !hooks_installed {
