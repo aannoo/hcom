@@ -1342,6 +1342,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE instances (
                      name text,
+                     project TEXT DEFAULT '',
                      transcript_path text,
                      session_id text
                  );

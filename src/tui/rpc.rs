@@ -61,6 +61,7 @@ pub fn build_launch_argv(
     tool: Tool,
     count: u8,
     tag: &str,
+    project: &str,
     headless: bool,
     terminal: &str,
     prompt: &str,
@@ -72,6 +73,9 @@ pub fn build_launch_argv(
     ];
     if !tag.is_empty() {
         argv.extend(["--tag".into(), tag.into()]);
+    }
+    if !project.is_empty() {
+        argv.extend(["--project".into(), project.into()]);
     }
     if !terminal.is_empty() {
         argv.extend(["--terminal".into(), terminal.into()]);
@@ -155,12 +159,14 @@ mod tests {
 
     #[test]
     fn launch_argv_numeric_count_first() {
-        let argv = build_launch_argv(Tool::Claude, 2, "review", true, "kitty", "hello");
+        let argv = build_launch_argv(Tool::Claude, 2, "review", "myproject", true, "kitty", "hello");
         assert_eq!(argv[0], "2");
         assert_eq!(argv[1], "claude");
         assert!(argv.contains(&"--no-run-here".into()));
         assert!(argv.contains(&"--tag".into()));
         assert!(argv.contains(&"review".into()));
+        assert!(argv.contains(&"--project".into()));
+        assert!(argv.contains(&"myproject".into()));
         assert!(argv.contains(&"--terminal".into()));
         assert!(argv.contains(&"kitty".into()));
         assert!(argv.contains(&"-p".into()));
@@ -169,7 +175,7 @@ mod tests {
 
     #[test]
     fn launch_argv_always_includes_no_run_here() {
-        let argv = build_launch_argv(Tool::Gemini, 1, "", false, "default", "");
+        let argv = build_launch_argv(Tool::Gemini, 1, "", "", false, "default", "");
         assert_eq!(
             argv,
             vec!["1", "gemini", "--no-run-here", "--terminal", "default"]
@@ -178,7 +184,7 @@ mod tests {
 
     #[test]
     fn launch_argv_gemini_prompt_uses_dash_i() {
-        let argv = build_launch_argv(Tool::Gemini, 1, "", false, "kitty", "fix the bug");
+        let argv = build_launch_argv(Tool::Gemini, 1, "", "", false, "kitty", "fix the bug");
         assert_eq!(
             argv,
             vec![
@@ -195,7 +201,7 @@ mod tests {
 
     #[test]
     fn launch_argv_codex_prompt_is_positional() {
-        let argv = build_launch_argv(Tool::Codex, 1, "", false, "tmux", "do task");
+        let argv = build_launch_argv(Tool::Codex, 1, "", "", false, "tmux", "do task");
         assert_eq!(
             argv,
             vec![

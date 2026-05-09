@@ -13,9 +13,9 @@ pub fn render_launch_inline(frame: &mut Frame, area: Rect, app: &App) {
     let w = area.width;
     let mut lines: Vec<Line> = vec![
         separator_line(w, Some("launch")),
-        field_row("Tool", ls.tool.name(), LaunchField::Tool, ls, w),
-        field_row("Count", &ls.count.to_string(), LaunchField::Count, ls, w),
+        field_row_dual("Tool", ls.tool.name(), LaunchField::Tool, "Cnt", &ls.count.to_string(), LaunchField::Count, ls, w),
         field_row_text("Tag", &ls.tag, LaunchField::Tag, ls, w),
+        field_row_text("Project", &ls.project, LaunchField::Project, ls, w),
     ];
 
     if ls.tool == Tool::Claude {
@@ -51,7 +51,7 @@ fn separator_line(width: u16, label: Option<&str>) -> Line<'static> {
 
         Line::from(vec![
             Span::raw(" ".repeat(margin)),
-            Span::styled(prefix.to_string(), Theme::separator()),
+            Span::styled(prefix, Theme::separator()),
             Span::styled(label_str, Theme::launch_active()),
             Span::styled(fill, Theme::separator()),
         ])
@@ -62,6 +62,56 @@ fn separator_line(width: u16, label: Option<&str>) -> Line<'static> {
             Span::styled(fill, Theme::separator()),
         ])
     }
+}
+
+/// Dual selector field with two values side by side on one line.
+fn field_row_dual(
+    label1: &str, value1: &str, field1: LaunchField,
+    label2: &str, value2: &str, field2: LaunchField,
+    ls: &LaunchState, width: u16,
+) -> Line<'static> {
+    let sel = ls.options_cursor == Some(field1) || ls.options_cursor == Some(field2);
+    let (cursor, cursor_style) = cursor_span(sel);
+
+    let left = field_inline(label1, value1, field1, ls);
+    let right = field_inline(label2, value2, field2, ls);
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let gap = (width as usize).saturating_sub(left_w + 4 + 4); // 4 = margin+cursor, 4 = spacing
+
+    let mut spans: Vec<Span> = vec![
+        Span::raw("  "),
+        Span::styled(cursor, cursor_style),
+    ];
+    spans.extend(left);
+    spans.push(Span::raw(" ".repeat(gap.saturating_sub(2))));
+    spans.push(Span::raw(" "));
+    spans.extend(right);
+
+    Line::from(super::fit_spans(spans, width as usize))
+}
+
+/// Compact inline field part (no margin, no cursor).
+fn field_inline(label: &str, value: &str, field: LaunchField, ls: &LaunchState) -> Vec<Span<'static>> {
+    let sel = ls.options_cursor == Some(field);
+    let arrow = if sel {
+        Theme::launch_arrow()
+    } else {
+        Style::default().fg(palette::FG_DARK)
+    };
+    let val_style = if sel {
+        Theme::launch_active()
+    } else {
+        Style::default().fg(palette::FG)
+    };
+    vec![
+        Span::styled(
+            format!("{:<w$}", label, w = 4),
+            if sel { Theme::launch_active() } else { Theme::dim() },
+        ),
+        Span::styled("\u{25c2}", arrow),
+        Span::styled(value.to_string(), val_style),
+        Span::styled("\u{25b8}", arrow),
+    ]
 }
 
 /// Selector field with ◂ value ▸ arrows.

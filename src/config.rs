@@ -82,6 +82,7 @@ impl Config {
 const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("terminal", "terminal.active"),
     ("tag", "launch.tag"),
+    ("project", "launch.project"),
     ("hints", "launch.hints"),
     ("notes", "launch.notes"),
     ("subagent_timeout", "launch.subagent_timeout"),
@@ -111,6 +112,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("hints", "HCOM_HINTS"),
     ("notes", "HCOM_NOTES"),
     ("tag", "HCOM_TAG"),
+    ("project", "HCOM_PROJECT"),
     ("claude_args", "HCOM_CLAUDE_ARGS"),
     ("gemini_args", "HCOM_GEMINI_ARGS"),
     ("codex_args", "HCOM_CODEX_ARGS"),
@@ -219,6 +221,7 @@ pub struct HcomConfig {
     pub hints: String,
     pub notes: String,
     pub tag: String,
+    pub project: String,
     pub claude_args: String,
     pub gemini_args: String,
     pub codex_args: String,
@@ -245,6 +248,7 @@ impl Default for HcomConfig {
             hints: String::new(),
             notes: String::new(),
             tag: String::new(),
+            project: String::new(),
             claude_args: String::new(),
             gemini_args: String::new(),
             codex_args: String::new(),
@@ -331,6 +335,14 @@ impl HcomConfig {
             );
         }
 
+        // Validate project (alphanumeric + hyphens only)
+        if !self.project.is_empty() && !RE_TAG.is_match(&self.project) {
+            errors.insert(
+                "project".into(),
+                "project can only contain letters, numbers, and hyphens".into(),
+            );
+        }
+
         // Validate shell-quoted args fields
         for (field, value) in [
             ("claude_args", &self.claude_args),
@@ -391,6 +403,7 @@ impl HcomConfig {
             "hints" => Some(self.hints.clone()),
             "notes" => Some(self.notes.clone()),
             "tag" => Some(self.tag.clone()),
+            "project" => Some(self.project.clone()),
             "claude_args" => Some(self.claude_args.clone()),
             "gemini_args" => Some(self.gemini_args.clone()),
             "codex_args" => Some(self.codex_args.clone()),
@@ -427,6 +440,7 @@ impl HcomConfig {
             "hints" => self.hints = value.to_string(),
             "notes" => self.notes = value.to_string(),
             "tag" => self.tag = value.to_string(),
+            "project" => self.project = value.to_string(),
             "claude_args" => self.claude_args = value.to_string(),
             "gemini_args" => self.gemini_args = value.to_string(),
             "codex_args" => self.codex_args = value.to_string(),
@@ -541,6 +555,7 @@ impl HcomConfig {
             "hints",
             "notes",
             "tag",
+            "project",
             "claude_args",
             "gemini_args",
             "codex_args",
@@ -874,6 +889,7 @@ enabled = true
 
 [launch]
 tag = ""
+project = ""
 hints = ""
 notes = ""
 subagent_timeout = 30

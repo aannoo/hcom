@@ -450,6 +450,7 @@ pub fn initialize_instance_in_position_file(
     tool: Option<&str>,
     background: bool,
     tag: Option<&str>,
+    project: Option<&str>,
     wait_timeout: Option<i64>,
     subagent_timeout: Option<i64>,
     hints: Option<&str>,
@@ -487,6 +488,9 @@ pub fn initialize_instance_in_position_file(
             }
             if let Some(t) = tag {
                 updates.insert("tag".into(), serde_json::json!(t));
+            }
+            if let Some(p) = project {
+                updates.insert("project".into(), serde_json::json!(p));
             }
             if background {
                 updates.insert("background".into(), serde_json::json!(1));
@@ -563,6 +567,11 @@ pub fn initialize_instance_in_position_file(
                 }
             }
 
+            data.insert("project".into(), serde_json::Value::Null);
+            if let Some(p) = project {
+                data.insert("project".into(), serde_json::json!(p));
+            }
+
             if let Some(wt) = wait_timeout {
                 data.insert("wait_timeout".into(), serde_json::json!(wt));
             }
@@ -637,6 +646,7 @@ pub fn create_orphaned_pty_identity(
         None,
         Some(tool),
         false,
+        None,
         None,
         None,
         None,
@@ -779,8 +789,9 @@ mod tests {
                  session_id TEXT UNIQUE,
                  parent_session_id TEXT,
                  parent_name TEXT,
-                 tag TEXT,
-                 last_event_id INTEGER DEFAULT 0,
+                  tag TEXT,
+                  project TEXT DEFAULT '',
+                  last_event_id INTEGER DEFAULT 0,
                  status TEXT DEFAULT 'active',
                  status_time INTEGER DEFAULT 0,
                  status_context TEXT DEFAULT '',

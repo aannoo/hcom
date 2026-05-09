@@ -31,6 +31,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     }
 
     let tag = hcom_flags.tag;
+    let project = hcom_flags.project.clone();
     let terminal = hcom_flags.terminal;
     let headless = hcom_flags.headless;
     let pty_requested = hcom_flags.pty;
@@ -177,6 +178,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             count,
             args: merged_args,
             tag,
+            project,
             system_prompt,
             initial_prompt,
             pty: use_pty,
@@ -454,6 +456,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct HcomLaunchFlags {
     pub tag: Option<String>,
+    pub project: Option<String>,
     pub terminal: Option<String>,
     pub device: Option<String>,
     pub headless: bool,
@@ -597,6 +600,11 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--project=") {
+            flags.project = Some(args[i][10..].to_string());
+            i += 1;
+            continue;
+        }
         if args[i].starts_with("--terminal=") {
             flags.terminal = Some(args[i][11..].to_string());
             i += 1;
@@ -615,6 +623,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
         match args[i].as_str() {
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--project" if i + 1 < args.len() => {
+                flags.project = Some(args[i + 1].clone());
                 i += 2;
             }
             "--terminal" if i + 1 < args.len() => {

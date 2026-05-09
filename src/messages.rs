@@ -108,6 +108,7 @@ pub struct ReadReceipt {
 pub struct InstanceInfo {
     pub name: String,
     pub tag: Option<String>,
+    pub project: Option<String>,
 }
 
 impl InstanceInfo {
@@ -288,7 +289,28 @@ pub fn compute_scope(
     message: &str,
     enabled_instances: &[InstanceInfo],
     explicit_targets: Option<&[String]>,
+    sender_project: Option<&str>,
 ) -> Result<ScopeResult, String> {
+    // Filter instances by project isolation
+    let enabled_instances: Vec<&InstanceInfo> = if let Some(proj) = sender_project {
+        let proj = proj.trim();
+        if proj.is_empty() {
+            enabled_instances.iter().collect()
+        } else {
+            enabled_instances
+                .iter()
+                .filter(|inst| {
+                    inst.project
+                        .as_deref()
+                        .map(|p| p == proj)
+                        .unwrap_or(true) // include instances with no project
+                })
+                .collect()
+        }
+    } else {
+        enabled_instances.iter().collect()
+    };
+
     // Build full name lookup: {full_name: base_name}
     let mut full_to_base: HashMap<String, String> = HashMap::new();
     let mut full_names: Vec<String> = Vec::new();
@@ -1102,13 +1124,14 @@ mod tests {
         InstanceInfo {
             name: name.to_string(),
             tag: tag.map(|t| t.to_string()),
+            project: None,
         }
     }
 
     #[test]
     fn test_compute_scope_broadcast() {
         let instances = vec![info("luna", None), info("nova", None)];
-        let result = compute_scope("hello everyone", &instances, None).unwrap();
+        let result = compute_scope("hello everyone", &instances, None, None).unwrap();
         assert_eq!(result.scope, MessageScope::Broadcast);
         assert!(result.mentions.is_empty());
     }
@@ -1116,7 +1139,7 @@ mod tests {
     #[test]
     fn test_compute_scope_mention_in_text() {
         let instances = vec![info("luna", None), info("nova", None)];
-        let result = compute_scope("hey @luna fix this", &instances, None).unwrap();
+        let result = compute_scope("hey @luna fix this", &instances, None, None).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert_eq!(result.mentions, vec!["luna"]);
     }
@@ -1125,7 +1148,7 @@ mod tests {
     fn test_compute_scope_explicit_targets() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["luna".to_string()];
-        let result = compute_scope("fix this", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("fix this", &instances, Some(&targets), None).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert_eq!(result.mentions, vec!["luna"]);
     }
@@ -1134,7 +1157,7 @@ mod tests {
     fn test_compute_scope_explicit_empty_broadcast() {
         let instances = vec![info("luna", None)];
         let targets: Vec<String> = vec![];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), None).unwrap();
         assert_eq!(result.scope, MessageScope::Broadcast);
     }
 
@@ -1142,7 +1165,7 @@ mod tests {
     fn test_compute_scope_unknown_target_fails() {
         let instances = vec![info("luna", None)];
         let targets = vec!["nonexistent".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets));
+        let result = compute_scope("hello", &instances, Some(&targets), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-existent or stopped"));
     }
@@ -1153,7 +1176,7 @@ mod tests {
         // should point users at the right form instead of just listing 30 names.
         let instances = vec![info("zeli:ZOME", None), info("luna", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), None).unwrap_err();
         assert!(err.contains("@zeli"), "got: {err}");
         assert!(err.contains("Did you mean: @zeli:ZOME"), "got: {err}");
     }
@@ -1162,21 +1185,21 @@ mod tests {
     fn test_compute_scope_no_suggestion_when_no_remote_match() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), None).unwrap_err();
         assert!(!err.contains("Did you mean"), "got: {err}");
     }
 
     #[test]
     fn test_compute_scope_unknown_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("hey @nonexistent fix this", &instances, None);
+        let result = compute_scope("hey @nonexistent fix this", &instances, None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_compute_scope_system_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("hey @[hcom-events]", &instances, None);
+        let result = compute_scope("hey @[hcom-events]", &instances, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("System notifications"));
     }
@@ -1184,7 +1207,7 @@ mod tests {
     #[test]
     fn test_compute_scope_literal_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("use @mention to target", &instances, None);
+        let result = compute_scope("use @mention to target", &instances, None, None);
         assert!(result.is_err());
         assert!(
             result
@@ -1197,7 +1220,7 @@ mod tests {
     fn test_compute_scope_tagged_instances() {
         let instances = vec![info("luna", Some("api")), info("nova", Some("api"))];
         let targets = vec!["api-".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), None).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert!(result.mentions.contains(&"luna".to_string()));
         assert!(result.mentions.contains(&"nova".to_string()));
@@ -1208,7 +1231,7 @@ mod tests {
         let instances = vec![info("luna", Some("api"))];
         // Both api-luna and luna resolve to the same instance
         let targets = vec!["api-luna".to_string(), "luna".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), None).unwrap();
         assert_eq!(result.mentions.len(), 1);
         assert_eq!(result.mentions[0], "luna");
     }

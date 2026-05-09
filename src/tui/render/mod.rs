@@ -89,6 +89,8 @@ fn input_prefix_str(app: &App) -> &'static str {
             OverlayKind::Search => "SEARCH / ",
             OverlayKind::Command => "CMD ! ",
             OverlayKind::Tag => "TAG # ",
+            OverlayKind::Project => "PRJ ! ",
+            OverlayKind::ProjectFilter => "FILTER @ ",
         };
     }
     match app.ui.mode {
@@ -103,6 +105,8 @@ fn mode_input_bg(app: &App) -> ratatui::style::Color {
             OverlayKind::Search => palette::MODE_SEARCH,
             OverlayKind::Command => palette::MODE_CMD,
             OverlayKind::Tag => palette::MODE_TAG,
+            OverlayKind::Project => palette::MODE_TAG,
+            OverlayKind::ProjectFilter => palette::MODE_SEARCH,
         };
     }
     match app.ui.mode {
@@ -1094,11 +1098,15 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                     OverlayKind::Search => ("SEARCH ", Style::default().fg(palette::YELLOW)),
                     OverlayKind::Command => ("CMD ", Style::default().fg(palette::MAGENTA)),
                     OverlayKind::Tag => ("TAG ", Style::default().fg(palette::TEAL)),
+                    OverlayKind::Project => ("PRJ ", Style::default().fg(palette::TEAL)),
+                    OverlayKind::ProjectFilter => ("FILTER ", Style::default().fg(palette::CYAN)),
                 };
                 let prefix_char = match overlay.kind {
                     OverlayKind::Search => "/ ",
                     OverlayKind::Command => "! ",
                     OverlayKind::Tag => "# ",
+                    OverlayKind::Project => "! ",
+                    OverlayKind::ProjectFilter => "@ ",
                 };
                 Line::from(vec![
                     Span::raw("  "),
@@ -1305,6 +1313,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                         OverlayKind::Search => " keep ",
                         OverlayKind::Command => " run ",
                         OverlayKind::Tag => " set ",
+                        OverlayKind::Project => " set ",
+                        OverlayKind::ProjectFilter => " filter ",
                     };
                     vec![
                         Span::raw("  "),

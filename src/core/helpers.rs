@@ -136,6 +136,7 @@ mod tests {
             name: "luna".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert_eq!(get_bundle_instance_name(&id), "luna");
     }
@@ -147,6 +148,7 @@ mod tests {
             name: "user".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert_eq!(get_bundle_instance_name(&id), "ext_user");
     }
@@ -158,6 +160,7 @@ mod tests {
             name: "hcom".into(),
             instance_data: None,
             session_id: None,
+            project: None,
         };
         assert_eq!(get_bundle_instance_name(&id), "sys_hcom");
     }

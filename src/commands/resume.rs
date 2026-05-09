@@ -521,6 +521,7 @@ fn prepare_resume_plan_from_source(
             count: 1,
             args: merged_args,
             tag: launch_tag,
+            project: None,
             system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
             pty: use_pty,
