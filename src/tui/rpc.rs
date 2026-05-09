@@ -89,7 +89,7 @@ pub fn build_launch_argv(
                 // gemini uses -i for initial prompt; headless not supported
                 argv.extend(["-i".into(), prompt.into()]);
             }
-            Tool::OpenCode => {
+            Tool::OpenCode | Tool::Kilo => {
                 argv.extend(["--prompt".into(), prompt.into()]);
             }
             Tool::Adhoc => {}

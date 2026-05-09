@@ -6,7 +6,7 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, and OpenCode without changing how you use them.
+`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, and Kilo Code without changing how you use them.
 
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
@@ -43,7 +43,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode
+hcom claude   # codex / gemini / opencode / kilo
 ```
 
 Terminal 2:
@@ -216,6 +216,7 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Gemini CLI | automatic | `hcom gemini` |
 | Codex CLI | automatic | `hcom codex` |
 | OpenCode | automatic | `hcom opencode` |
+| Kilo Code | automatic | `hcom kilo` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -248,7 +249,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|opencode   # launch N agents
+hcom [N] claude|gemini|codex|opencode|kilo   # launch N agents
 hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane
@@ -311,7 +312,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` | Default args passed to the tool |
 
 ### Scope
 
@@ -397,6 +398,35 @@ For concurrent worktrees, scope each to its own DB:
 
 ```bash
 HCOM_DIR=$PWD/.hcom HCOM_DEV_ROOT=$PWD hcom claude
+```
+
+### Testing a fork alongside the original
+
+To test a custom fork (e.g., with kilo support) without replacing your installed `hcom`:
+
+```bash
+# 1. Clone your fork
+git clone https://github.com/Solar2004/hcom.git ~/hcom-kilo
+cd ~/hcom-kilo
+cargo build
+
+# 2. Use dev_root to point at the fork build
+hcom config dev_root $(pwd)
+hcom status          # now runs your fork
+
+# 3. Revert to original anytime
+hcom config dev_root --unset
+```
+
+Or use a symlink swap:
+
+```bash
+# Point to your fork build
+ln -sf ~/hcom-kilo/target/debug/hcom ~/.cargo/bin/hcom-kilo
+
+# Run either
+hcom          # original installed version
+hcom-kilo     # your fork
 ```
 
 </details>

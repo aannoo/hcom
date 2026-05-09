@@ -7,6 +7,7 @@ pub mod codex_file_edits;
 pub mod common;
 pub mod family;
 pub mod gemini;
+pub mod kilo;
 pub mod opencode;
 pub mod utils;
 

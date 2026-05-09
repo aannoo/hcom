@@ -16,7 +16,7 @@ pub struct HooksArgs {
 }
 
 /// Valid tool names for hooks management.
-const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode"];
+const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "kilocode"];
 
 /// Get hook installation status for each tool.
 fn get_tool_status() -> Vec<(&'static str, bool, String)> {
@@ -40,11 +40,17 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
         .to_string_lossy()
         .to_string();
 
+    let kilocode_installed = crate::hooks::kilo::verify_kilocode_plugin_installed();
+    let kilocode_path = crate::hooks::kilo::get_kilocode_plugin_path()
+        .to_string_lossy()
+        .to_string();
+
     vec![
         ("claude", claude_installed, claude_path),
         ("gemini", gemini_installed, gemini_path),
         ("codex", codex_installed, codex_path),
         ("opencode", opencode_installed, opencode_path),
+        ("kilocode", kilocode_installed, kilocode_path),
     ]
 }
 
@@ -81,7 +87,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, all");
         return 1;
     };
 
@@ -104,6 +110,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                     && crate::hooks::codex::codex_current_feature_enabled()
             }
             "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
+            "kilocode" => crate::hooks::kilo::verify_kilocode_plugin_installed(),
             _ => false,
         };
         if already {
@@ -124,6 +131,11 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 Err(e) => AddResult::Failed(Some(e.to_string())),
             },
             "opencode" => match crate::hooks::opencode::install_opencode_plugin() {
+                Ok(true) => AddResult::Added,
+                Ok(false) => AddResult::Failed(None),
+                Err(e) => AddResult::Failed(Some(e.to_string())),
+            },
+            "kilocode" => match crate::hooks::kilo::install_kilocode_plugin() {
                 Ok(true) => AddResult::Added,
                 Ok(false) => AddResult::Failed(None),
                 Err(e) => AddResult::Failed(Some(e.to_string())),
@@ -168,6 +180,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 "gemini" => "Gemini CLI",
                 "codex" => "Codex",
                 "opencode" => "OpenCode",
+                "kilocode" => "KiloCode",
                 other => other,
             };
             println!("Restart {tool_name} to activate hooks.");
@@ -188,7 +201,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, all");
         return 1;
     };
 
@@ -208,6 +221,14 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
             "gemini" => crate::hooks::gemini::remove_gemini_hooks(),
             "codex" => crate::hooks::codex::remove_codex_hooks(),
             "opencode" => match crate::hooks::opencode::remove_opencode_plugin() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Failed to remove {tool} hooks: {e}");
+                    fail_count += 1;
+                    continue;
+                }
+            },
+            "kilocode" => match crate::hooks::kilo::remove_kilocode_plugin() {
                 Ok(()) => true,
                 Err(e) => {
                     eprintln!("Failed to remove {tool} hooks: {e}");
@@ -254,8 +275,8 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
              Usage:\n  \
              hcom hooks                  Show hook status for all tools\n  \
              hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|all)\n  \
-             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|all)\n\n\
+               hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|kilocode|all)\n  \
+               hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|kilocode|all)\n\n\
              Examples:\n  \
              hcom hooks add claude       Add Claude Code hooks only\n  \
              hcom hooks add              Auto-detect tool or add all\n  \
@@ -289,7 +310,7 @@ mod tests {
         // (unless running inside one, which is fine — it'll detect it)
         let tool = detect_current_tool();
         assert!(
-            ["claude", "gemini", "codex", "opencode", "adhoc"].contains(&tool),
+            ["claude", "gemini", "codex", "opencode", "kilocode", "adhoc"].contains(&tool),
             "unexpected tool: {tool}"
         );
     }

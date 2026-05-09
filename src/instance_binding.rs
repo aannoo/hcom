@@ -694,7 +694,7 @@ pub fn resolve_instance_from_binding(
 /// Auto-subscribe instance to default event subscriptions from config.
 /// Called during instance creation.
 fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
-    if !matches!(tool, "claude" | "gemini" | "codex" | "opencode") {
+    if !matches!(tool, "claude" | "gemini" | "codex" | "opencode" | "kilocode") {
         return;
     }
 

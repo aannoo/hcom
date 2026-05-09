@@ -872,7 +872,7 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
             let subcmd = if fork { "fork" } else { "resume" };
             vec![subcmd.to_string(), session_id.to_string()]
         }
-        "opencode" => {
+        "opencode" | "kilocode" => {
             let mut args = vec!["--session".to_string(), session_id.to_string()];
             if fork {
                 args.push("--fork".to_string());
@@ -908,7 +908,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             let merged = codex_args::merge_codex_args(&orig_spec, &resume_spec);
             merged.rebuild_tokens(true, true)
         }
-        "opencode" => merge_opencode_args(original, resume),
+        "opencode" | "kilocode" => merge_opencode_args(original, resume),
         _ => {
             // For unknown tools: resume args only.
             resume.to_vec()
@@ -1229,6 +1229,28 @@ fn lookup_opencode_session(session_id: &str) -> Option<String> {
     .ok()
 }
 
+fn lookup_kilocode_session(session_id: &str) -> Option<String> {
+    let kilocode_data = opencode_data_dir().map(|d| {
+        let parent = d.parent()?;
+        Some(parent.join("kilocode"))
+    })??;
+    let db_path = kilocode_data.join("kilocode.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT directory FROM session WHERE id = ?1",
+        rusqlite::params![session_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
 /// Resolve a session ID to the owning tool and (optionally) a pre-recovered
 /// working directory.
 ///
@@ -1237,10 +1259,13 @@ fn lookup_opencode_session(session_id: &str) -> Option<String> {
 /// - Opencode: returns `(tool="opencode", None)` — opencode stores sessions
 ///   in SQLite; CWD comes from a separate DB query, not a transcript file.
 fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
-    // 1. Opencode: prefix-scoped, query the SQLite DB directly.
+    // 1. Opencode/KiloCode: prefix-scoped, query the SQLite DB directly.
     if is_opencode_session_id(session_id) {
         if lookup_opencode_session(session_id).is_some() {
             return Some(("opencode".to_string(), None));
+        }
+        if lookup_kilocode_session(session_id).is_some() {
+            return Some(("kilocode".to_string(), None));
         }
         return None;
     }
@@ -1377,12 +1402,20 @@ fn build_adopt_plan(
         let opencode_db = opencode_data_dir()
             .map(|d| d.join("opencode.db").display().to_string())
             .unwrap_or_else(|| "(no data dir)".to_string());
+        let kilocode_db = opencode_data_dir()
+            .and_then(|d| {
+                let parent = d.parent()?;
+                Some(parent.join("kilocode/kilocode.db").display().to_string())
+            })
+            .unwrap_or_else(|| "(no data dir)".to_string());
         if is_opencode_session_id(session_id) {
             anyhow::anyhow!(
                 "Session {sid} not found. Searched:\n  \
-                 - Opencode: {opencode_db} (table 'session')",
+                 - Opencode: {opencode_db} (table 'session')\n  \
+                 - KiloCode: {kilocode_db} (table 'session')",
                 sid = session_id,
                 opencode_db = opencode_db,
+                kilocode_db = kilocode_db,
             )
         } else {
             let claude_projects = claude_config_dir().join("projects");
@@ -1407,6 +1440,8 @@ fn build_adopt_plan(
     } else {
         let raw = if tool == "opencode" {
             lookup_opencode_session(session_id)
+        } else if tool == "kilocode" {
+            lookup_kilocode_session(session_id)
         } else if let Some(ref path) = transcript_path {
             extract_cwd_from_transcript(path, &tool)
         } else {
