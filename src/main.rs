@@ -60,6 +60,21 @@ fn main() -> Result<()> {
         log::log_error("native", "panic", &format!("{} at {}", message, location));
     }));
 
+    // Detect and clean up instances whose processes died (e.g. system reboot).
+    // Runs after config init so logging is available, before dispatch so the
+    // TUI/CLI see accurate state. Only operates when there is a DB to check.
+    // Best-effort: failures are logged and don't block startup.
+    if let Ok(db) = crate::db::HcomDb::open() {
+        let count = instance_lifecycle::mark_dead_instances(&db);
+        if count > 0 {
+            log::log_info(
+                "startup",
+                "mark_dead",
+                &format!("marked {} dead instance(s) from previous session", count),
+            );
+        }
+    }
+
     // Dispatch via router (replaces manual MainAction matching)
     router::dispatch()
 }
