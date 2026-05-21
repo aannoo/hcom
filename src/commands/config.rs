@@ -1546,32 +1546,32 @@ pub fn terminal_help_text(show_current: bool) -> String {
     // Check binary availability
     let is_available = |preset_name: &str| -> bool {
         let preset = TERMINAL_PRESETS.iter().find(|(n, _)| *n == preset_name);
-        #[allow(unused_variables)]
-        if let Some((name, p)) = preset {
-            if let Some(bin) = p.binary
-                && crate::terminal::which_bin(bin).is_some()
-            {
-                return true;
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let app = p.app_name.unwrap_or(name);
-                // Handle preset names that already end in .app
-                let bundle = if app.ends_with(".app") {
-                    app.to_string()
-                } else {
-                    format!("{app}.app")
-                };
-                for dir in [
-                    "/Applications",
-                    "/Applications/Utilities",
-                    "/System/Applications",
-                    "/System/Applications/Utilities",
-                ] {
-                    let path = format!("{dir}/{bundle}");
-                    if std::path::Path::new(&path).exists() {
-                        return true;
-                    }
+        let Some((_name, p)) = preset else {
+            return false;
+        };
+        if p.binary
+            .is_some_and(|bin| crate::terminal::which_bin(bin).is_some())
+        {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let app = p.app_name.unwrap_or(_name);
+            // Handle preset names that already end in .app
+            let bundle = if app.ends_with(".app") {
+                app.to_string()
+            } else {
+                format!("{app}.app")
+            };
+            for dir in [
+                "/Applications",
+                "/Applications/Utilities",
+                "/System/Applications",
+                "/System/Applications/Utilities",
+            ] {
+                let path = format!("{dir}/{bundle}");
+                if std::path::Path::new(&path).exists() {
+                    return true;
                 }
             }
         }
