@@ -668,6 +668,46 @@ fn remove_hcom_hooks_from_json(existing: &mut Value) {
     }
 }
 
+/// Returns true if `hook` is a legacy hcom Codex entry written in the old
+/// `"type":"cmd"` / `"cmd"` format used before Codex 0.129.
+fn is_legacy_hcom_codex_cmd_entry(hook: &Value) -> bool {
+    hook.get("type").and_then(|v| v.as_str()) == Some("cmd")
+        && hook.get("cmd").and_then(|v| v.as_str()).is_some_and(|cmd| {
+            CODEX_HOOK_COMMANDS
+                .iter()
+                .any(|(_, suffix, _)| cmd.ends_with(suffix))
+        })
+}
+
+/// Remove legacy `"cmd"`-keyed hcom hook entries, leaving user-owned hooks intact.
+/// Only called when Codex >= CODEX_HOOKS_FEATURE_RENAME_VERSION, which is when
+/// the current `"command"`-keyed format is known to be supported.
+fn remove_legacy_hcom_cmd_hooks_from_json(existing: &mut Value) {
+    let Some(hooks_obj) = existing.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    for (_, groups) in hooks_obj.iter_mut() {
+        let Some(groups_arr) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups_arr.iter_mut() {
+            if let Some(hooks_arr) = group.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                hooks_arr.retain(|h| !is_legacy_hcom_codex_cmd_entry(h));
+            }
+        }
+        groups_arr.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty())
+        });
+    }
+    hooks_obj.retain(|_, groups| groups.as_array().is_some_and(|arr| !arr.is_empty()));
+    if hooks_obj.is_empty() {
+        existing.as_object_mut().unwrap().remove("hooks");
+    }
+}
+
 fn codex_hook_event_state_label(event: &str) -> &'static str {
     match event {
         "PreToolUse" => "pre_tool_use",
@@ -1570,12 +1610,12 @@ fn verify_hooks_json_value(json: &Value) -> Result<(), VerifyFailReason> {
             "type": "command",
             "command": expected_command,
         });
+        // Mirror merge_hcom_hooks: for None-matcher events only match groups
+        // with no "matcher" key, not groups with "matcher":"" (which may belong
+        // to other tools such as context-mode).
         let matching_group = groups.iter().find(|group| match matcher {
             Some(expected) => group.get("matcher").and_then(|v| v.as_str()) == Some(*expected),
-            None => {
-                group.get("matcher").is_none()
-                    || group.get("matcher").and_then(|v| v.as_str()) == Some("")
-            }
+            None => group.get("matcher").and_then(|v| v.as_str()).is_none(),
         });
         let Some(group) = matching_group else {
             return Err(VerifyFailReason::HookCommandMissing {
@@ -1640,7 +1680,7 @@ fn verify_hooks_json_value(json: &Value) -> Result<(), VerifyFailReason> {
                     *exp_event == event.as_str()
                         && match exp_matcher {
                             Some(m) => group_matcher == Some(*m),
-                            None => group_matcher.is_none() || group_matcher == Some(""),
+                            None => group_matcher.is_none(),
                         }
                 });
             if !is_expected {
@@ -1811,6 +1851,11 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
     } else {
         serde_json::json!({ "hooks": {} })
     };
+    // Strip legacy "cmd"-keyed hcom entries written by pre-0.129 installs.
+    // Only safe once Codex supports the current "command"-keyed format.
+    if feature_key == CodexHooksFeatureKey::Hooks {
+        remove_legacy_hcom_cmd_hooks_from_json(&mut hooks_json);
+    }
     let old_hcom_hook_keys = hcom_hook_state_keys_from_hooks_json(&hooks_json, &hooks_path);
     merge_hcom_hooks(&mut hooks_json);
 
@@ -2643,6 +2688,93 @@ mod tests {
         assert_eq!(
             parse_codex_cli_version("codex-cli 0.129.0"),
             Some((0, 129, 0))
+        );
+    }
+
+    // ── regression: legacy "cmd"-format cleanup ─────────────────────────────
+
+    /// Old hcom versions wrote hooks as {"type":"cmd","cmd":"hcom codex-..."}.
+    /// On Codex >= 0.129 (CODEX_HOOKS_FEATURE_RENAME_VERSION), try_setup_codex_hooks
+    /// must remove those stale entries and replace them with the current format.
+    ///
+    /// FAILS before the fix: remove_legacy_hcom_cmd_hooks_from_json is defined
+    /// but not yet called from try_setup_codex_hooks.
+    #[test]
+    #[serial]
+    fn test_legacy_cmd_hooks_cleaned_on_new_codex() {
+        // isolated_test_env sets HCOM_TEST_CODEX_CLI_VERSION = "codex-cli 0.129.0"
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "hooks": [{"type": "cmd", "cmd": "hcom codex-userpromptsubmit"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(try_setup_codex_hooks(false).is_ok());
+        let content = std::fs::read_to_string(&hooks_path).unwrap();
+        assert!(
+            !content.contains("\"type\": \"cmd\""),
+            "legacy cmd-keyed entry must be removed on Codex >= 0.129"
+        );
+        assert!(
+            content.contains("\"command\""),
+            "current command-keyed entry must be present after cleanup"
+        );
+    }
+
+    // ── regression: context-mode "matcher":"" groups must not block verify ──
+
+    /// context-mode writes groups with "matcher":"" for None-matcher events
+    /// (UserPromptSubmit, Stop).  Those groups appear before hcom's no-matcher
+    /// groups in the file.  verify_hooks_json_value must not pick the wrong
+    /// group and report HookCommandMissing.
+    #[test]
+    #[serial]
+    fn test_context_mode_empty_matcher_does_not_block_verify() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        // Seed with context-mode "matcher":"" groups appearing FIRST for both
+        // None-matcher events, matching the live ~/.codex/hooks.json layout.
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "matcher": "",
+                        "hooks": [{"type": "command", "command": "context-mode hook codex userpromptsubmit"}]
+                    }],
+                    "Stop": [{
+                        "matcher": "",
+                        "hooks": [{"type": "command", "command": "context-mode hook codex stop"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            try_setup_codex_hooks(false).is_ok(),
+            "setup must succeed even when another tool owns a \"matcher\":\"\" group for the same event"
+        );
+        let content = std::fs::read_to_string(&hooks_path).unwrap();
+        assert!(
+            content.contains("context-mode hook codex userpromptsubmit"),
+            "third-party hook must be preserved"
+        );
+        assert!(
+            content.contains("codex-userpromptsubmit"),
+            "hcom hook must be present"
         );
     }
 }
