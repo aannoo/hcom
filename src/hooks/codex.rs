@@ -679,7 +679,7 @@ fn is_legacy_hcom_codex_cmd_entry(hook: &Value) -> bool {
         })
 }
 
-/// Remove legacy `"cmd"`-keyed hcom hook entries, leaving user-owned hooks intact.
+/// Remove recognized legacy `"cmd"`-keyed hcom hook entries.
 /// Only called when Codex >= CODEX_HOOKS_FEATURE_RENAME_VERSION, which is when
 /// the current `"command"`-keyed format is known to be supported.
 fn remove_legacy_hcom_cmd_hooks_from_json(existing: &mut Value) {
@@ -2721,12 +2721,21 @@ mod tests {
 
         assert!(try_setup_codex_hooks(false).is_ok());
         let content = std::fs::read_to_string(&hooks_path).unwrap();
+        let hooks_json: Value = serde_json::from_str(&content).unwrap();
+        let user_prompt_hooks = hooks_json["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
         assert!(
-            !content.contains("\"type\": \"cmd\""),
+            !user_prompt_hooks
+                .iter()
+                .any(|hook| hook["type"] == "cmd" && hook.get("cmd").is_some()),
             "legacy cmd-keyed entry must be removed on Codex >= 0.129"
         );
         assert!(
-            content.contains("\"command\""),
+            user_prompt_hooks.iter().any(|hook| {
+                hook["type"] == "command"
+                    && hook["command"] == build_codex_hook_command("codex-userpromptsubmit")
+            }),
             "current command-keyed entry must be present after cleanup"
         );
     }
