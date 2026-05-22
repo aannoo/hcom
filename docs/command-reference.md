@@ -33,6 +33,8 @@ Launch flags:
 
 Resume/fork targets can be names, stopped names, session UUIDs, or thread names. Remote fork requires `--dir` so the target device knows where to run.
 
+Codex tool args are passed through hcom's Codex parser before launch. hcom recognizes Codex's hidden `--yolo` flag as a boolean sandbox override, equivalent in precedence to `--dangerously-bypass-approvals-and-sandbox`, so `hcom codex --yolo` does not also inherit the configured workspace sandbox mode.
+
 ## Messaging
 
 ```bash

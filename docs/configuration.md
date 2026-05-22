@@ -91,6 +91,7 @@ hcom validates:
 - terminal preset names and custom terminal commands.
 - shell-quoted tool args.
 - Codex sandbox mode: `workspace`, `untrusted`, `danger-full-access`, or `none`.
+- Codex launch args: hidden Codex `--yolo` is accepted and treated as a sandbox override.
 - `auto_subscribe`: comma-separated alphanumeric/underscore preset names.
 
 ## Terminal Presets

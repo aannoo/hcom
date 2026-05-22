@@ -61,6 +61,7 @@ const CASE_SENSITIVE_BOOLEAN_FLAGS: &[&str] = &["-V"];
 const BOOLEAN_FLAGS: &[&str] = &[
     "--oss",
     "--full-auto",
+    "--yolo",
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-bypass-hook-trust",
     "--search",
@@ -115,6 +116,7 @@ const SANDBOX_FLAGS: &[&str] = &[
     "-a",
     "--ask-for-approval",
     "--full-auto",
+    "--yolo",
     "--dangerously-bypass-approvals-and-sandbox",
 ];
 
@@ -846,11 +848,26 @@ mod tests {
 
     #[test]
     fn test_parse_boolean_flags() {
-        let args = sv(&["--full-auto", "--oss", "--dangerously-bypass-hook-trust"]);
+        let args = sv(&[
+            "--full-auto",
+            "--yolo",
+            "--oss",
+            "--dangerously-bypass-hook-trust",
+        ]);
         let spec = parse_tokens(&args, SourceType::Cli);
         assert!(spec.has_flag(&["--full-auto"], &[]));
+        assert!(spec.has_flag(&["--yolo"], &[]));
         assert!(spec.has_flag(&["--oss"], &[]));
         assert!(spec.has_flag(&["--dangerously-bypass-hook-trust"], &[]));
+    }
+
+    #[test]
+    fn test_parse_yolo_hidden_alias() {
+        let args = sv(&["--yolo", "-m", "gpt-5"]);
+        let spec = parse_tokens(&args, SourceType::Cli);
+        assert!(!spec.has_errors(), "{:?}", spec.errors);
+        assert!(spec.has_flag(&["--yolo"], &[]));
+        assert_eq!(spec.clean_tokens, args);
     }
 
     #[test]
@@ -880,6 +897,22 @@ mod tests {
         // CLI has --full-auto (sandbox flag), so ALL env sandbox flags stripped
         assert!(merged.has_flag(&["--full-auto"], &[]));
         assert!(!merged.has_flag(&["-a"], &[]));
+    }
+
+    #[test]
+    fn test_merge_yolo_overrides_sandbox_group() {
+        let env_spec = parse_tokens(
+            &sv(&["--sandbox", "workspace-write", "-a", "untrusted"]),
+            SourceType::Env,
+        );
+        let cli_spec = parse_tokens(&sv(&["--yolo"]), SourceType::Cli);
+        let merged = merge_codex_args(&env_spec, &cli_spec);
+
+        assert!(merged.has_flag(&["--yolo"], &[]));
+        assert!(!merged.has_flag(&["--sandbox"], &["--sandbox="]));
+        assert!(!merged.has_flag(&["-a"], &[]));
+        assert!(!merged.clean_tokens.contains(&"workspace-write".to_string()));
+        assert!(!merged.clean_tokens.contains(&"untrusted".to_string()));
     }
 
     #[test]

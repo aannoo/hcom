@@ -32,3 +32,13 @@ The handoff requested DeepWiki-driven docs, and the user clarified that public G
 Created project `AGENTS.md`, `CLAUDE.md`, `PROJECT_INDEX.json`, `docs/`, and `coordination/deepwiki-public-hcom-sourcepack.md`. Added Codex MCP server `deepwiki` in `~/.codex/config.toml` with `default_tools_approval_mode = "approve"`. Updated Codex-visible DeepWiki skill guidance to distinguish hosted public DeepWiki from `deepwiki-local`.
 ### Impact
 Future Codex and Claude sessions in this repo have explicit DeepWiki MCP boundaries. Public repo doc work should cite `mcp__deepwiki__`; private/local filesystem analysis should cite `mcp__deepwiki_local__`.
+
+## 2026-05-22 — Codex --yolo launch arg support
+### What
+Added hcom parser/preprocessing support for Codex's hidden `--yolo` launch flag.
+### Why
+`codex --yolo --version` accepts the flag locally, but `hcom codex --yolo` was rejected by hcom's Codex argument allowlist before launch.
+### How
+Added `--yolo` as a Codex boolean flag and sandbox-group override in `src/tools/codex_args.rs`; updated Codex preprocessing to treat it as sandbox-active for hcom writability handling; added regression tests and documentation notes.
+### Impact
+`hcom codex --yolo` should pass validation and override configured Codex sandbox mode the same way other user-provided sandbox/approval overrides do. Source-level tests still require installing Rust/Cargo in this environment.
