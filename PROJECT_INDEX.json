@@ -1,5 +1,5 @@
 {
-  "indexed_at": "2026-05-22T12:48:31.732811",
+  "indexed_at": "2026-05-22T13:47:55.827173",
   "root": ".",
   "project_structure": {
     "type": "tree",
@@ -166,6 +166,7 @@
     "docs/development.md": {
       "sections": [
         "Development",
+        "Rust Toolchain",
         "Commands",
         "Project Layout",
         "Adding a Command",
@@ -225,8 +226,7 @@
         "Bundles",
         "Terminal",
         "Config",
-        "Hooks",
-        "Relay"
+        "Hooks"
       ],
       "architecture_hints": []
     },
@@ -1217,5 +1217,5 @@
       "os"
     ]
   },
-  "staleness_check": 1778863711.797789
+  "staleness_check": 1778867275.919472
 }

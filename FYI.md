@@ -42,3 +42,13 @@ Added hcom parser/preprocessing support for Codex's hidden `--yolo` launch flag.
 Added `--yolo` as a Codex boolean flag and sandbox-group override in `src/tools/codex_args.rs`; updated Codex preprocessing to treat it as sandbox-active for hcom writability handling; added regression tests and documentation notes.
 ### Impact
 `hcom codex --yolo` should pass validation and override configured Codex sandbox mode the same way other user-provided sandbox/approval overrides do. Source-level tests still require installing Rust/Cargo in this environment.
+
+## 2026-05-22 — Rust toolchain installed and offline-verified
+### What
+Verified a Rust/Cargo setup suitable for building and testing hcom from source.
+### Why
+The Codex `--yolo` parser fix needed source-level Rust tests, and the user wanted the install audited with supply-chain risk in mind.
+### How
+Confirmed `rustup` was installed from Ubuntu `noble-updates/security` (`1.26.0-5ubuntu0.1`) and that distro `cargo`/`rustc` packages were not installed. Verified `/usr/bin/cargo` and `/usr/bin/rustc` are rustup shims, active stable toolchain is `rustc 1.95.0`, and `clippy`/`rustfmt` are present. Ran `cargo metadata --locked --offline --no-deps`, `cargo fmt --check`, `cargo test --locked --offline`, and `cargo clippy --all-targets --locked --offline -- -D warnings`.
+### Impact
+hcom can now be built and tested locally. Full offline locked tests and clippy pass; broader builds should continue to prefer `--locked` and `--offline` after dependencies are cached.

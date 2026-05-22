@@ -2,6 +2,28 @@
 
 hcom is a Rust binary crate with Python packaging through `maturin`.
 
+## Rust Toolchain
+
+This repo requires Rust 1.88 or newer and uses `rust-toolchain.toml` to request stable Rust with `clippy` and `rustfmt`.
+
+Preferred local setup on Ubuntu:
+
+```bash
+apt-cache policy rustup
+sudo apt update
+sudo apt install rustup
+rustup default stable
+rustup component add clippy rustfmt
+```
+
+Supply-chain guardrails:
+
+- Prefer distro-signed `apt install rustup` over `curl | sh` bootstrap installs.
+- Do not install distro `cargo` or `rustc` packages for this repo; let rustup provide the active toolchain.
+- Verify shims and active binaries with `command -v rustup cargo rustc`, `rustup which cargo`, and `rustup which rustc`.
+- Use `cargo fetch --locked`, then `cargo test --locked --offline` when possible.
+- Avoid `cargo install` for ad-hoc tools unless the crate, version, and source are reviewed first.
+
 ## Commands
 
 ```bash
@@ -9,6 +31,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo run -- <command>
+```
+
+For supply-chain-sensitive validation after dependencies are already cached:
+
+```bash
+cargo metadata --locked --offline --no-deps --format-version=1
+cargo test --locked --offline
 ```
 
 The GitHub CI workflow runs format, clippy, and tests on push and pull request.
