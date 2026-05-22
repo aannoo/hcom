@@ -1,0 +1,1221 @@
+{
+  "indexed_at": "2026-05-22T12:48:31.732811",
+  "root": ".",
+  "project_structure": {
+    "type": "tree",
+    "root": ".",
+    "tree": [
+      ".",
+      "\u251c\u2500\u2500 coordination/",
+      "\u251c\u2500\u2500 docs/",
+      "\u251c\u2500\u2500 logs/ (4 files)",
+      "\u251c\u2500\u2500 plugin/ (1 files)",
+      "\u2502   \u2514\u2500\u2500 hcom/ (1 files)",
+      "\u2502       \u2514\u2500\u2500 skills/ (6 files)",
+      "\u2502           \u2514\u2500\u2500 hcom-agent-messaging/ (6 files)",
+      "\u2502               \u2514\u2500\u2500 references/ (6 files)",
+      "\u2502                   \u2514\u2500\u2500 scripts/ (6 files)",
+      "\u251c\u2500\u2500 skills/ (6 files)",
+      "\u2502   \u2514\u2500\u2500 hcom-agent-messaging/ (6 files)",
+      "\u2502       \u2514\u2500\u2500 references/ (6 files)",
+      "\u2502           \u2514\u2500\u2500 scripts/ (6 files)",
+      "\u251c\u2500\u2500 src/ (134 files)",
+      "\u2502   \u251c\u2500\u2500 commands/ (26 files)",
+      "\u2502   \u251c\u2500\u2500 core/ (7 files)",
+      "\u2502   \u251c\u2500\u2500 db/ (7 files)",
+      "\u2502   \u251c\u2500\u2500 hooks/ (10 files)",
+      "\u2502   \u251c\u2500\u2500 notify/ (3 files)",
+      "\u2502   \u251c\u2500\u2500 opencode_plugin/ (1 files)",
+      "\u2502   \u251c\u2500\u2500 pty/ (4 files)",
+      "\u2502   \u251c\u2500\u2500 relay/ (10 files)",
+      "\u2502   \u251c\u2500\u2500 scripts/ (3 files)",
+      "\u2502   \u2502   \u2514\u2500\u2500 bundled/ (3 files)",
+      "\u2502   \u251c\u2500\u2500 shared/ (9 files)",
+      "\u2502   \u251c\u2500\u2500 tools/ (6 files)",
+      "\u2502   \u251c\u2500\u2500 transcript/ (6 files)",
+      "\u2502   \u2514\u2500\u2500 tui/ (21 files)",
+      "\u2502       \u251c\u2500\u2500 inline/ (2 files)",
+      "\u2502       \u251c\u2500\u2500 input/ (1 files)",
+      "\u2502       \u2514\u2500\u2500 render/ (5 files)",
+      "\u251c\u2500\u2500 tests/ (5 files)",
+      "\u2502   \u2514\u2500\u2500 support/ (1 files)",
+      "\u251c\u2500\u2500 Cargo.toml",
+      "\u251c\u2500\u2500 pyproject.toml",
+      "\u2514\u2500\u2500 README.md"
+    ]
+  },
+  "documentation_map": {
+    "README.md": {
+      "sections": [
+        "hcom",
+        "Fork Note",
+        "Install",
+        "macOS, Linux, WSL, Android/Termux",
+        "Python tool install",
+        "Source build",
+        "Quickstart",
+        "What hcom Provides",
+        "Mental Model",
+        "Supported Tools"
+      ],
+      "architecture_hints": []
+    },
+    "HANDOFF.md": {
+      "sections": [
+        "HANDOFF \u2014 hcom (fork)",
+        "WHAT THIS PROJECT IS",
+        "IMMEDIATE NEXT ACTION",
+        "MAIN TASK \u2014 DeepWiki doc/skill refinement",
+        "DeepWiki TOC seed (from `read_wiki_structure aannoo/hcom`, 2026-05-22)",
+        "CURRENT STATE",
+        "CRITICAL RULES (put in project CLAUDE.md)",
+        "RELATED WORKSTREAM",
+        "HCOM GROUP",
+        "SESSION-SUCCESSION NOTE"
+      ],
+      "architecture_hints": []
+    },
+    "AGENTS.md": {
+      "sections": [
+        "hcom Fork Instructions",
+        "Project Purpose",
+        "Commands",
+        "Architecture",
+        "Runtime Ownership",
+        "Skills And MCP Usage",
+        "Git Rules",
+        "Safety Constraints",
+        "Documentation Notes"
+      ],
+      "architecture_hints": []
+    },
+    "FYI.md": {
+      "sections": [
+        "FYI \u2014 hcom (fork)",
+        "2026-05-22 \u2014 Fork cloned into ~/MCPs/",
+        "What",
+        "Why",
+        "How",
+        "Impact",
+        "Build caveat",
+        "Related",
+        "2026-05-22 \u2014 Codex setup docs and hosted DeepWiki doc source",
+        "What"
+      ],
+      "architecture_hints": []
+    },
+    "CLAUDE.md": {
+      "sections": [
+        "hcom Fork Claude Notes",
+        "Project Purpose",
+        "DeepWiki MCP Boundary",
+        "Runtime Boundaries",
+        "Verification"
+      ],
+      "architecture_hints": []
+    },
+    "coordination/deepwiki-public-hcom-sourcepack.md": {
+      "sections": [
+        "Public DeepWiki Source Pack: aannoo/hcom",
+        "Public MCP Calls Made",
+        "Public Wiki TOC"
+      ],
+      "architecture_hints": []
+    },
+    "docs/multi-agent-workflows.md": {
+      "sections": [
+        "Multi-Agent Workflows",
+        "Messaging Rules",
+        "Observation",
+        "Subscriptions",
+        "Bundled Handoffs",
+        "Common Topologies",
+        "Workflow Scripts"
+      ],
+      "architecture_hints": []
+    },
+    "docs/architecture.md": {
+      "sections": [
+        "Architecture",
+        "Main Modules",
+        "CLI Routing",
+        "Data Model",
+        "Identity and Binding",
+        "Lifecycle",
+        "Message Delivery",
+        "PTY Integration",
+        "Hooks",
+        "Relay"
+      ],
+      "architecture_hints": []
+    },
+    "docs/configuration.md": {
+      "sections": [
+        "Configuration",
+        "HCOM_DIR",
+        "Files and Directories",
+        "Precedence",
+        "Config Keys",
+        "Validation",
+        "Terminal Presets",
+        "Per-Agent Config",
+        "Reset Behavior"
+      ],
+      "architecture_hints": []
+    },
+    "docs/development.md": {
+      "sections": [
+        "Development",
+        "Commands",
+        "Project Layout",
+        "Adding a Command",
+        "Adding Hook Behavior",
+        "Adding Terminal Support",
+        "Adding Relay Behavior",
+        "Packaging",
+        "Documentation Source Discipline"
+      ],
+      "architecture_hints": []
+    },
+    "docs/deepwiki-mcp-usage.md": {
+      "sections": [
+        "DeepWiki MCP Usage",
+        "Hosted Public DeepWiki MCP",
+        "DeepWiki Local",
+        "Evidence Pattern"
+      ],
+      "architecture_hints": []
+    },
+    "docs/relay.md": {
+      "sections": [
+        "Relay",
+        "Setup",
+        "What Syncs",
+        "Token and Broker Model",
+        "Encryption",
+        "Replay Guard",
+        "Trust Model",
+        "Limitations",
+        "Incident Response"
+      ],
+      "architecture_hints": []
+    },
+    "docs/hook-system.md": {
+      "sections": [
+        "Hook System",
+        "Commands",
+        "Config Locations",
+        "Hook Gate",
+        "Session Binding",
+        "Hook Events",
+        "Delivery",
+        "Safe Auto-Approved Commands",
+        "Claude Subagents",
+        "Failure Behavior"
+      ],
+      "architecture_hints": []
+    },
+    "docs/command-reference.md": {
+      "sections": [
+        "Command Reference",
+        "Launch and Lifecycle",
+        "Messaging",
+        "Events and Listen",
+        "Transcript",
+        "Bundles",
+        "Terminal",
+        "Config",
+        "Hooks",
+        "Relay"
+      ],
+      "architecture_hints": []
+    },
+    "skills/hcom-agent-messaging/SKILL.md": {
+      "sections": [
+        "hcom Agent Messaging",
+        "First Checks",
+        "or",
+        "Public DeepWiki Boundary",
+        "Core Model",
+        "Common Commands",
+        "Messaging",
+        "Observing Other Agents",
+        "Bundles",
+        "Workflow Patterns"
+      ],
+      "architecture_hints": []
+    },
+    "skills/hcom-agent-messaging/references/patterns.md": {
+      "sections": [
+        "Tested Multi-Agent Patterns",
+        "Pattern 1: Basic Two-Agent Messaging",
+        "Worker does task, sends result to reviewer",
+        "Reviewer acks worker, sends DONE to orchestrator",
+        "Orchestrator waits for DONE",
+        "Pattern 2: Worker-Reviewer Feedback Loop",
+        "Worker: does task, sends ROUND N DONE, listens for FIX/APPROVED",
+        "Reviewer: checks each round, sends APPROVED or FIX",
+        "Orchestrator waits for FINAL (after APPROVED)",
+        "Pattern 3: Ensemble Consensus (N Agents + Judge)"
+      ],
+      "architecture_hints": []
+    },
+    "skills/hcom-agent-messaging/references/script-template.md": {
+      "sections": [
+        "hcom script template \u2014 annotated reference",
+        "file location and discovery",
+        "full template with commentary",
+        "brief description shown in hcom run list.",
+        "--- agent tracking ---",
+        "every script must track launched agents for cleanup.",
+        "without this, orphan headless agents run indefinitely.",
+        "trap ensures cleanup runs on any error or signal",
+        "--- identity propagation ---",
+        "hcom injects --name before script args. MUST parse and forward it."
+      ],
+      "architecture_hints": []
+    },
+    "skills/hcom-agent-messaging/references/cross-tool.md": {
+      "sections": [
+        "Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode",
+        "Typical combos",
+        "Per-Tool Technical Details",
+        "Claude Code",
+        "Codex",
+        "Gemini CLI",
+        "OpenCode",
+        "Working Patterns"
+      ],
+      "architecture_hints": [
+        "scripts/cross-tool-duo.sh"
+      ]
+    },
+    "skills/hcom-agent-messaging/references/gotchas.md": {
+      "sections": [
+        "hcom Script Gotchas",
+        "Script Hangs Forever",
+        "WRONG - hangs waiting for user confirmation",
+        "RIGHT",
+        "Agent Not Receiving Messages",
+        "Messages Leaking Between Workflows",
+        "All messages in this workflow use --thread",
+        "SQL LIKE Matching Behavior",
+        "Case-sensitive match (use GLOB instead of LIKE)",
+        "Match exact word boundary"
+      ],
+      "architecture_hints": []
+    }
+  },
+  "directory_purposes": {
+    "src": "Source code root directory",
+    "tests": "Test files and test utilities",
+    "docs": "Project documentation",
+    "src/tui": "Data models and schemas",
+    "skills/hcom-agent-messaging/references/scripts": "Build and utility scripts"
+  },
+  "stats": {
+    "total_files": 154,
+    "total_directories": 36,
+    "fully_parsed": {
+      "typescript": 1,
+      "shell": 9
+    },
+    "listed_only": {
+      "json": 8,
+      "shell": 1,
+      "rs": 135
+    },
+    "markdown_files": 19
+  },
+  "files": {
+    "gemini-extension.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "install.sh": {
+      "language": "shell",
+      "parsed": false
+    },
+    "PROJECT_INDEX.json": {
+      "language": "json",
+      "parsed": false
+    },
+    ".claude-plugin/marketplace.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "src/delivery.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/instance_lifecycle.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/scripts.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/bootstrap.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/messages.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/paths.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/cli_context.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/instances.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/runtime_env.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/log.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/update.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/config.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Configuration"
+    },
+    "src/main.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Application entry point"
+    },
+    "src/pidtrack.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/instance_names.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tool.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/router.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Route definitions"
+    },
+    "src/launcher.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/terminal.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/instance_binding.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/identity.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "tests/test_pty_delivery.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Test file"
+    },
+    "tests/test_relay_roundtrip.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Test file"
+    },
+    "tests/parser_help_drift.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "tests/cli_smoke.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "logs/pre_tool_use.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "logs/stop.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "logs/subagent_stop.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "logs/chat.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "src/relay/replay.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/token.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/broker.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/crypto.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/push.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/pull.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/worker.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/client.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/relay/control.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/notify.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/subscriptions.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/instances.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/kv.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/sessions.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/db/events.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/opencode_plugin/hcom.ts": {
+      "language": "typescript",
+      "parsed": true,
+      "imports": [
+        "fs",
+        "os"
+      ],
+      "functions": {
+        "parseCliArgValue": {
+          "signature": "(...flags: string[]): string | null",
+          "called_by": [
+            "parseCliModelArg"
+          ]
+        },
+        "parseCliModelArg": {
+          "calls": [
+            "parseCliArgValue"
+          ],
+          "signature": "()"
+        },
+        "normalizePromptModel": {
+          "signature": "(model: unknown)",
+          "called_by": [
+            "bindIdentity"
+          ]
+        },
+        "log": {
+          "signature": "(level: \"DEBUG\" | \"INFO\" | \"WARN\" | \"ERROR\", event: string, instance?: string | null, extra?: Record<string, unknown>,)",
+          "called_by": [
+            "checkHcom",
+            "ignoreForeignSession",
+            "deliverPendingToIdle",
+            "reconcile",
+            "startNotifyServer",
+            "bindIdentity"
+          ]
+        },
+        "checkHcom": {
+          "calls": [
+            "log"
+          ],
+          "signature": "(): boolean"
+        },
+        "isBoundSession": {
+          "signature": "(candidateSessionId?: string | null): boolean",
+          "called_by": [
+            "ignoreForeignSession"
+          ]
+        },
+        "ignoreForeignSession": {
+          "calls": [
+            "isBoundSession",
+            "log"
+          ],
+          "signature": "(event: string, candidateSessionId?: string | null): boolean",
+          "called_by": [
+            "deliverPendingToIdle"
+          ]
+        },
+        "formatMessagesForInjection": {
+          "signature": "(messages: any[], recipientName: string): string",
+          "called_by": [
+            "deliverPendingToIdle"
+          ]
+        },
+        "deliverPendingToIdle": {
+          "calls": [
+            "formatMessagesForInjection",
+            "ignoreForeignSession",
+            "log"
+          ],
+          "signature": "async (sid: string): Promise<boolean>",
+          "called_by": [
+            "startNotifyServer"
+          ]
+        },
+        "reconcile": {
+          "calls": [
+            "log"
+          ],
+          "signature": "async (): Promise<void>",
+          "called_by": [
+            "startReconcileTimer"
+          ]
+        },
+        "startReconcileTimer": {
+          "calls": [
+            "reconcile",
+            "stopReconcileTimer"
+          ],
+          "signature": "(): void"
+        },
+        "stopReconcileTimer": {
+          "signature": "(): void",
+          "called_by": [
+            "startReconcileTimer"
+          ]
+        },
+        "startNotifyServer": {
+          "calls": [
+            "close",
+            "data",
+            "deliverPendingToIdle",
+            "error",
+            "listen",
+            "log"
+          ],
+          "signature": "(): number | null",
+          "called_by": [
+            "bindIdentity"
+          ]
+        },
+        "stopNotifyServer": {
+          "signature": "(): void",
+          "called_by": [
+            "bindIdentity"
+          ]
+        },
+        "bindIdentity": {
+          "calls": [
+            "log",
+            "normalizePromptModel",
+            "startNotifyServer",
+            "stopNotifyServer"
+          ],
+          "signature": "async (sid: string): Promise<void>"
+        },
+        "HcomPlugin": "async ({ client, $ })"
+      },
+      "classes": {},
+      "constants": {
+        "HCOM_DIR": "value"
+      },
+      "variables": [
+        "i",
+        "token",
+        "raw",
+        "slash",
+        "providerID",
+        "modelID",
+        "entry",
+        "hcomChecked",
+        "hcomAvailable",
+        "reconcileInFlight",
+        "deliveryInFlight",
+        "permissionPending",
+        "parts",
+        "prefix",
+        "msgResult",
+        "maxId",
+        "formatted",
+        "promptAsyncResult",
+        "statusResult",
+        "current",
+        "isIdle",
+        "hcomStatus",
+        "notifyPort",
+        "result",
+        "json",
+        "boundModel",
+        "eventSessionId",
+        "createdSessionId",
+        "statusType",
+        "filePath",
+        "resolvedModel",
+        "messages",
+        "msgCount",
+        "userMsgCount",
+        "firstUserMsg",
+        "ackId"
+      ],
+      "call_graph": {}
+    },
+    "src/transcript/codex.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/transcript/claude.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/transcript/shared.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/transcript/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/transcript/opencode.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/transcript/gemini.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tools/opencode_preprocessing.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tools/args_common.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tools/gemini_args.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tools/codex_preprocessing.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tools/codex_args.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tools/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/pty/screen.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/pty/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/pty/inject.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/pty/terminal.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/launch_status.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/detail_levels.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/bundles.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/filters.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/tips.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/core/helpers.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Utility functions"
+    },
+    "src/notify/wake.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/notify/server.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/notify/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/reset_ops.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/start.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/status.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/listen.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/daemon.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/archive.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/bundle.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/reset.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/kill.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/stop.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/relay.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/update.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/transcript.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/config.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Configuration"
+    },
+    "src/commands/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/fork.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/hooks.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/reset_preview.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/run.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/list.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/resume.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/send.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/term.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/events.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/launch.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/commands/help.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/codex_file_edits.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/codex.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/claude_args.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/family.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/claude.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/utils.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Utility functions"
+    },
+    "src/hooks/opencode.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/common.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/hooks/gemini.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/status.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/db.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/input.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/commands.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/actions.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/rpc.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/state.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/rpc_async.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/theme.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/data.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/app.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Application entry point"
+    },
+    "src/tui/model.rs": {
+      "language": "rs",
+      "parsed": false,
+      "purpose": "Data model"
+    },
+    "src/shared/time.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/terminal_presets.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/platform.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/errors.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/ansi.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/identity.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/constants.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/shared/context.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/scripts/bundled/debate.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "cleanup": "()",
+        "track_launch": "()",
+        "usage": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES",
+        "PRO_SYSTEM",
+        "CON_SYSTEM",
+        "JUDGE_SYSTEM",
+        "IFS"
+      ],
+      "call_graph": {}
+    },
+    "src/scripts/bundled/confess.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "cleanup": "()",
+        "track_launch": {
+          "doc": "Extract instance names from hcom launch output, append to LAUNCHED_NAMES",
+          "signature": "()"
+        },
+        "usage": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES",
+        "CONFESSION_SCHEMA",
+        "SEAL"
+      ],
+      "call_graph": {}
+    },
+    "src/scripts/bundled/fatcow.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "usage": "()",
+        "resolve_caller": {
+          "doc": "--- Helper: resolve caller name ---",
+          "signature": "()"
+        },
+        "is_active": {
+          "doc": "--- Helper: check if instance is active ---",
+          "signature": "()"
+        }
+      },
+      "call_graph": {}
+    },
+    "src/tui/input/compose.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/inline/eject.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/inline/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/render/messages.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/render/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/render/text.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/render/agents.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "src/tui/render/launch.rs": {
+      "language": "rs",
+      "parsed": false
+    },
+    "skills/hcom-agent-messaging/references/scripts/basic-messaging.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "track_launch": "()",
+        "cleanup": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES"
+      ],
+      "call_graph": {}
+    },
+    "skills/hcom-agent-messaging/references/scripts/cascade-pipeline.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "track_launch": "()",
+        "cleanup": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES"
+      ],
+      "call_graph": {}
+    },
+    "skills/hcom-agent-messaging/references/scripts/review-loop.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "track_launch": "()",
+        "cleanup": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES"
+      ],
+      "call_graph": {}
+    },
+    "skills/hcom-agent-messaging/references/scripts/codex-worker.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "track_launch": "()",
+        "cleanup": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES"
+      ],
+      "call_graph": {}
+    },
+    "skills/hcom-agent-messaging/references/scripts/cross-tool-duo.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "track_launch": "()",
+        "cleanup": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES"
+      ],
+      "call_graph": {}
+    },
+    "skills/hcom-agent-messaging/references/scripts/ensemble-consensus.sh": {
+      "language": "shell",
+      "parsed": true,
+      "functions": {
+        "track_launch": "()",
+        "cleanup": "()"
+      },
+      "variables": [
+        "LAUNCHED_NAMES"
+      ],
+      "call_graph": {}
+    },
+    "plugin/hcom/.claude-plugin/plugin.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "tests/support/mod.rs": {
+      "language": "rs",
+      "parsed": false
+    }
+  },
+  "dependency_graph": {
+    "src/opencode_plugin/hcom.ts": [
+      "fs",
+      "os"
+    ]
+  },
+  "staleness_check": 1778863711.797789
+}

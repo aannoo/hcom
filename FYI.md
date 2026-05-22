@@ -22,3 +22,13 @@ hcom source is now local and modifiable. It is a **Rust** project (single binary
 If we later modify hcom's Rust source, rebuilding needs the Rust toolchain (`cargo`/`rustc`) — **not currently installed**. Doc/skill-only changes (the planned work) need no build.
 ### Related
 (setup commit — see git log)
+
+## 2026-05-22 — Codex setup docs and hosted DeepWiki doc source
+### What
+Added Codex project setup docs/index, installed hosted public DeepWiki MCP for Codex, and rewrote hcom README/docs/skill guidance using hosted public DeepWiki MCP source material plus local help/source verification.
+### Why
+The handoff requested DeepWiki-driven docs, and the user clarified that public GitHub repo work must use hosted DeepWiki MCP (`https://mcp.deepwiki.com/mcp`), not DeepWiki Local.
+### How
+Created project `AGENTS.md`, `CLAUDE.md`, `PROJECT_INDEX.json`, `docs/`, and `coordination/deepwiki-public-hcom-sourcepack.md`. Added Codex MCP server `deepwiki` in `~/.codex/config.toml` with `default_tools_approval_mode = "approve"`. Updated Codex-visible DeepWiki skill guidance to distinguish hosted public DeepWiki from `deepwiki-local`.
+### Impact
+Future Codex and Claude sessions in this repo have explicit DeepWiki MCP boundaries. Public repo doc work should cite `mcp__deepwiki__`; private/local filesystem analysis should cite `mcp__deepwiki_local__`.

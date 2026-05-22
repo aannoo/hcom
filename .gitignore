@@ -1,2 +1,7 @@
 /target/
 /bin/
+/.claude-index-backups/
+/logs/
+
+.claude-index-backups/
+.PROJECT_INDEX.lock

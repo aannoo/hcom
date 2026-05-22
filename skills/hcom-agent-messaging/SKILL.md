@@ -1,187 +1,254 @@
 ---
 name: hcom-agent-messaging
 description: >
-  Multi-agent communication for AI coding tools. Agents message, watch,
-  and spawn each other across terminals. Use when setting up hcom,
-  troubleshooting delivery, or writing multi-agent scripts.
+  Multi-agent communication with hcom. Use when agents need to message, watch,
+  launch, fork, resume, script, or coordinate Claude Code, Codex, Gemini CLI,
+  OpenCode, or ad-hoc tools across terminals or relay devices.
 ---
 
-# hcom — multi-agent communication for AI coding tools
+# hcom Agent Messaging
 
-AI agents running in separate terminals are isolated. hcom connects them via hooks and a shared database so they can message, watch, and spawn each other in real-time.
+Use `hcom` when work spans multiple AI sessions, terminals, or devices. hcom gives agents names, message delivery, event history, transcripts, bundles, subscriptions, workflow scripts, and launch/fork/resume controls.
+
+## First Checks
 
 ```bash
+hcom status
+hcom list
+hcom --help
+```
+
+If `hcom` is unavailable, install it:
+
+```bash
+brew install aannoo/hcom/hcom
+# or
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode
-hcom              # TUI dashboard
 ```
 
----
-
-## what humans can do
-
-tell any agent:
-
-> send a message to claude
-
-> when codex goes idle send it the next task
-
-> watch gemini's file edits, review each and send feedback if any bugs
-
-> fork yourself to investigate the bug and report back
-
-> find which agent worked on terminal_id code, resume them and ask why it sucks
-
----
-
-## what agents can do
-
-**Message** each other in real-time, bundle context for handoffs.
-
-**Observe** each other: transcripts, file edits, terminal screens, command history.
-
-**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
-
-**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator.
-
-run `hcom --help` for full command syntax and flags.
-
----
-
-## tool support
-
-| tool | delivery | connect |
-|------|----------|---------|
-| claude code (incl. subagents) | automatic | `hcom claude` |
-| gemini cli (>= 0.26.0) | automatic | `hcom gemini` |
-| codex | automatic | `hcom codex` |
-| opencode | automatic | `hcom opencode` |
-| any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
-
-session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
-
----
-
-## setup
-
-if the user invokes this skill without arguments:
-
-1. run `hcom status` — if "command not found", install first:
-   ```bash
-   curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-   ```
-2. run `hcom hooks add` to install hooks for all detected tools
-3. restart the AI tool for hooks to activate
-
-| status output | meaning | action |
-|---------------|---------|--------|
-| command not found | not installed | install via `brew install aannoo/hcom/hcom`, the curl installer above, or `pip install hcom` |
-| `[~] claude` | tool exists, hooks not installed | `hcom hooks add` then restart |
-| `[✓] claude` | hooks installed | ready |
-| `[✗] claude` | tool not found | install the AI tool first |
-
----
-
-## troubleshooting
-
-### "hcom not working"
+If hooks are missing:
 
 ```bash
-hcom status          # check installation
-hcom hooks status    # check hooks specifically
-hcom relay status    # check cross-device relay
+hcom hooks add all
+hcom hooks status
 ```
 
-hooks missing? `hcom hooks add` then restart tool.
+Restart the affected AI tool after adding hooks.
 
-still broken?
-```bash
-hcom reset all && hcom hooks add
-# close all ai tool windows
-hcom claude          # fresh start
-```
-
-### "messages not arriving"
-
-| symptom | diagnosis | fix |
-|---------|-----------|-----|
-| agent not in `hcom list` | agent stopped or never bound | relaunch or wait for binding |
-| message sent but not delivered | check `hcom events --last 5` | verify @mention matches agent name/tag |
-| wrong agent receives message | @mention ambiguity | use `@tag-` prefix for reliable routing |
-| messages leaking between workflows | no thread isolation | always use `--thread` |
-
-### intent system
-
-agents follow these rules from their bootstrap:
-- `--intent request` -> agent always responds
-- `--intent inform` -> agent responds only if useful
-- `--intent ack` -> agent does not respond
-
-### sandbox / permission issues
+Inside a sandbox that cannot write to `~/.hcom`:
 
 ```bash
-export HCOM_DIR="$PWD/.hcom"     # project-local mode
-hcom hooks add                   # installs to project dir
+export HCOM_DIR="$PWD/.hcom"
+hcom start
 ```
 
----
+## Public DeepWiki Boundary
 
-## workflow scripting
+When using DeepWiki to understand public `aannoo/hcom`, use hosted public DeepWiki MCP (`mcp__deepwiki__`, `https://mcp.deepwiki.com/mcp`), not DeepWiki Local.
 
-place scripts in `~/.hcom/scripts/` as `.sh` or `.py`. run with `hcom run <name> "task"`. see `references/script-template.md` for the full annotated template, or run `hcom run docs --scripts` inside an agent.
+Use DeepWiki Local (`mcp__deepwiki_local__`) only for private/local filesystem analysis or explicit local DeepWiki tasks.
 
-### key rules
+## Core Model
 
-- **never use `sleep`** — use `hcom events --wait` or `hcom listen`
-- **never hardcode agent names** — parse from `grep '^Names: '` in launch output
-- **always use `--thread`** — without it, messages leak across workflows
-- **always use `trap cleanup ERR INT TERM`** — orphan headless agents run indefinitely
-- **always use `hcom kill` for cleanup** (not `stop`) — kill also closes the terminal pane
-- **always forward `--name`** — hcom injects it, scripts must propagate it
-- **always use `--go`** on launch/kill — without it, scripts hang on confirmation prompt
+- Instance: named hcom participant.
+- Session: tool session bound to an instance.
+- Event: immutable message/status/lifecycle record.
+- Message: event with sender, text, mentions, intent, thread, reply, and optional bundle.
+- Bundle: structured references to events, files, and transcript ranges.
+- Relay peer: remote trusted device, shown as `name:DEVICE`.
 
-### agent topologies
+## Common Commands
 
-| topology | agents | pattern |
-|----------|--------|---------|
-| worker-reviewer | 2 | worker sends result, reviewer reads transcript, sends APPROVED/FIX |
-| pipeline | N sequential | each stage reads previous via `hcom transcript`, signals via thread |
-| ensemble | N+1 (judge) | N agents answer independently, judge reads all via `hcom events --sql` |
-| hub-spoke | 1+N | coordinator broadcasts to `@tag-`, workers report back |
-| reactive | N | `hcom events sub` triggers agent actions on file edits/status changes |
+| Task | Command |
+|---|---|
+| Open dashboard | `hcom` |
+| Launch agents | `hcom claude`, `hcom 2 codex`, `hcom 1 gemini --tag audit --headless` |
+| Join manually | `hcom start`, `hcom start --as <name>` |
+| List agents | `hcom list`, `hcom list --json`, `hcom list --names` |
+| Message | `hcom send @name -- text` |
+| Wait | `hcom listen`, `hcom listen 30`, `hcom listen --idle name` |
+| Query events | `hcom events --last 20`, `hcom events --agent name` |
+| Subscribe | `hcom events sub --idle name`, `hcom events sub --file '*.py' --once` |
+| Read transcript | `hcom transcript name --last 20`, `hcom transcript name 7-12 --full` |
+| View terminal | `hcom term name --json` |
+| Inject terminal text | `hcom term inject name "text" --enter` |
+| Prepare bundle | `hcom bundle prepare` |
+| Expand bundle | `hcom bundle show <id>`, `hcom bundle cat <id>` |
+| Resume/fork | `hcom r name`, `hcom f name` |
+| Kill | `hcom kill name`, `hcom kill tag:tag`, `hcom kill all` |
+| Relay | `hcom relay new`, `hcom relay connect <token>`, `hcom relay status` |
+| Scripts | `hcom run`, `hcom run docs --scripts`, `hcom run <script>` |
 
----
-
-## files
-
-| what | location |
-|------|----------|
-| database | `~/.hcom/hcom.db` |
-| config | `~/.hcom/config.toml` |
-| logs | `~/.hcom/.tmp/logs/` |
-| user scripts | `~/.hcom/scripts/` |
-
-with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
-
----
-
-## reference files
-
-| file | when to read |
-|------|-------------|
-| `references/patterns.md` | writing multi-agent scripts — 6 tested patterns with full code and real event JSON |
-| `references/cross-tool.md` | claude + codex + gemini + opencode collaboration details and per-tool quirks |
-| `references/gotchas.md` | debugging scripts — timing, message delivery, intent system, cleanup |
-| `references/script-template.md` | writing a new script from scratch — full template with commentary |
-| `references/scripts/` | 6 tested, working example scripts |
-
----
-
-## more info
+## Messaging
 
 ```bash
-hcom --help              # all commands
-hcom <command> --help    # command details
+hcom send @luna -- Hello
+hcom send @luna @nova --intent request -- Can you review this?
+hcom send @audit- --thread audit-1 -- Start independent review
+hcom send @luna --reply-to 42 --intent ack -- Fixed
+hcom send @luna:BOXE -- Remote message
 ```
 
-github: https://github.com/aannoo/hcom
+Target rules:
+
+- `@luna`: base name; can match tag-prefixed names.
+- `@audit-`: all with tag prefix.
+- `@audit-luna`: exact full display name.
+- `@luna:BOXE`: remote relay target.
+- underscore blocks prefix matching.
+
+Intent rules:
+
+- `request`: always respond.
+- `inform`: respond only if useful.
+- `ack`: do not respond; must include `--reply-to`.
+
+Thread rule:
+
+- Seed a thread with recipients once, then use `--thread <name>` to keep later messages scoped.
+
+## Observing Other Agents
+
+Use hcom evidence instead of asking agents to paste context:
+
+```bash
+hcom transcript @worker --last 20
+hcom transcript @worker 8-14 --full
+hcom events --agent worker --last 20
+hcom events --file '*.rs' --last 10
+hcom term worker --json
+```
+
+## Bundles
+
+Create handoffs without dumping large content into the message:
+
+```bash
+hcom send @reviewer \
+  --title "Review worker result" \
+  --description "Files, event range, and transcript for review" \
+  --events 120-135 \
+  --files src/main.rs,tests/cli_smoke.rs \
+  --transcript 8-14:normal \
+  --intent request \
+  -- Please review this bundle.
+```
+
+Recipients can inspect:
+
+```bash
+hcom bundle show <id>
+hcom bundle cat <id>
+hcom bundle chain <id>
+```
+
+Transcript detail levels: `normal`, `full`, `detailed`.
+
+## Workflow Patterns
+
+| Pattern | Shape | Use |
+|---|---|---|
+| Worker-reviewer | one worker, one reviewer | implementation plus review loop |
+| Pipeline | planner -> executor -> reviewer | sequential staged work |
+| Ensemble | many workers, one judge | independent opinions plus synthesis |
+| Hub-spoke | coordinator plus workers | split work, collect reports |
+| Reactive | subscriptions plus handlers | act on idle/blocked/file/command events |
+
+## Script Rules
+
+Read `references/script-template.md` before writing a new script. Existing examples are in `references/scripts/`.
+
+Mandatory script practices:
+
+- Parse and forward `--name`.
+- Capture launched names from `Names: ...`.
+- Use unique `--thread` values.
+- Wait for `active` or `listening` before sending work.
+- Use `trap cleanup ERR INT TERM`.
+- Use `hcom kill`, not only `stop`, for spawned workers.
+- Use `--go` in unattended launch/kill commands.
+- Use `hcom listen` or `hcom events --wait`; do not use arbitrary `sleep`.
+
+Minimal shell skeleton:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+name_flag=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name) name_flag="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+name_arg=()
+[[ -n "$name_flag" ]] && name_arg=(--name "$name_flag")
+
+thread="workflow-$(date +%s)"
+launched=()
+
+cleanup() {
+  for name in "${launched[@]}"; do
+    hcom kill "$name" --go >/dev/null 2>&1 || true
+  done
+}
+trap cleanup ERR INT TERM
+
+out=$(hcom 1 codex --tag worker --headless --go 2>&1)
+names=$(printf '%s\n' "$out" | grep '^Names: ' | sed 's/^Names: //')
+for n in $names; do launched+=("$n"); done
+
+hcom send @worker- "${name_arg[@]}" --thread "$thread" --intent request -- "Do the task"
+```
+
+## Relay Rules
+
+Relay is for one trusted operator's devices.
+
+```bash
+hcom relay new
+hcom relay connect <token>
+hcom relay status
+```
+
+Security notes:
+
+- Payloads use XChaCha20-Poly1305.
+- Token includes relay ID, broker URL, and raw PSK.
+- Relay membership is full trust.
+- No per-device read-only roles.
+- Leaked PSK means create a new relay group.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| command missing | `hcom status`, install hcom |
+| hooks inactive | `hcom hooks status`, then `hcom hooks add <tool>` and restart |
+| target not found | `hcom list`, use exact full name or remote suffix |
+| message not delivered | `hcom events --last 20`, check mentions/thread/intent |
+| sandbox write failure | set `HCOM_DIR="$PWD/.hcom"` |
+| stale runtime state | inspect `hcom archive` before `hcom reset` |
+| relay confusion | `hcom relay status`, check device suffix and token trust |
+
+## Reference Files
+
+| File | Use |
+|---|---|
+| `references/patterns.md` | workflow topologies and examples |
+| `references/cross-tool.md` | Claude, Codex, Gemini, OpenCode quirks |
+| `references/gotchas.md` | timing, delivery, cleanup, intent issues |
+| `references/script-template.md` | annotated script template |
+| `references/scripts/` | tested example scripts |
+
+Project docs in this fork:
+
+- `docs/architecture.md`
+- `docs/command-reference.md`
+- `docs/configuration.md`
+- `docs/hook-system.md`
+- `docs/multi-agent-workflows.md`
+- `docs/relay.md`
+- `docs/development.md`
