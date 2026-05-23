@@ -39,6 +39,19 @@ pub static TOOL_NAME_MAPPINGS: LazyLock<
     codex.insert("file", vec!["apply_patch"]);
     m.insert("codex", codex);
 
+    let mut antigravity = HashMap::new();
+    antigravity.insert("bash", vec!["run_command"]);
+    antigravity.insert(
+        "file",
+        vec![
+            "write_to_file",
+            "replace_file_content",
+            "multi_replace_file_content",
+        ],
+    );
+    antigravity.insert("delegate", vec!["invoke_subagent"]);
+    m.insert("antigravity", antigravity);
+
     m
 });
 
@@ -58,11 +71,13 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
             return match *category {
                 "bash" => tool_input
                     .get("command")
+                    .or_else(|| tool_input.get("CommandLine"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
                 "file" => tool_input
                     .get("file_path")
+                    .or_else(|| tool_input.get("TargetFile"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
@@ -166,6 +181,16 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_name_mappings_antigravity() {
+        let mappings = TOOL_NAME_MAPPINGS.get("antigravity").unwrap();
+        assert!(mappings["bash"].contains(&"run_command"));
+        assert!(mappings["file"].contains(&"write_to_file"));
+        assert!(mappings["file"].contains(&"replace_file_content"));
+        assert!(mappings["file"].contains(&"multi_replace_file_content"));
+        assert!(mappings["delegate"].contains(&"invoke_subagent"));
+    }
+
+    #[test]
     fn test_extract_tool_detail_bash() {
         let input = serde_json::json!({"command": "ls -la"});
         assert_eq!(extract_tool_detail("claude", "Bash", &input), "ls -la");
@@ -176,6 +201,24 @@ mod tests {
         assert_eq!(
             extract_tool_detail("codex", "execute_command", &input),
             "ls -la"
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_detail_antigravity_bash() {
+        let input = serde_json::json!({"CommandLine": "ls -la"});
+        assert_eq!(
+            extract_tool_detail("antigravity", "run_command", &input),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_detail_antigravity_file() {
+        let input = serde_json::json!({"TargetFile": "/src/main.rs"});
+        assert_eq!(
+            extract_tool_detail("antigravity", "write_to_file", &input),
+            "/src/main.rs"
         );
     }
 
