@@ -13,7 +13,7 @@ use crate::launcher::{self, LaunchParams};
 use crate::log;
 
 use super::{
-    control_topic, crypto, device_short_id, is_relay_enabled, load_psk, read_device_uuid,
+    control_topic, crypto, device_short_id_for_db, is_relay_enabled, load_psk, read_device_uuid,
     safe_kv_get, safe_kv_set,
 };
 
@@ -21,6 +21,7 @@ use super::{
 /// the AEAD-sealed bytes; the underlying JSON layout is unchanged from the
 /// pre-encryption format so callers don't have to know about the cipher.
 fn build_control_payload(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -45,7 +46,7 @@ fn build_control_payload(
     };
 
     let device_id = read_device_uuid()?;
-    let short_id = device_short_id(&device_id);
+    let short_id = device_short_id_for_db(db, &device_id);
     let now = crate::shared::time::now_epoch_f64();
     let mut control_data = json!({
         "action": action,
@@ -75,6 +76,7 @@ fn build_control_payload(
 }
 
 pub fn build_rpc_control_payload(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -82,6 +84,7 @@ pub fn build_rpc_control_payload(
     params: &serde_json::Value,
 ) -> Option<(String, Vec<u8>)> {
     build_control_payload(
+        db,
         config,
         action,
         target_device_short_id,
@@ -91,6 +94,7 @@ pub fn build_rpc_control_payload(
 }
 
 fn send_control_via_ephemeral(
+    db: &HcomDb,
     config: &HcomConfig,
     client: &super::client::EphemeralClient,
     action: &str,
@@ -98,11 +102,17 @@ fn send_control_via_ephemeral(
     request_id: Option<&str>,
     params: &serde_json::Value,
 ) -> bool {
-    let (topic, payload_bytes) =
-        match build_control_payload(config, action, target_device_short_id, request_id, params) {
-            Some(v) => v,
-            None => return false,
-        };
+    let (topic, payload_bytes) = match build_control_payload(
+        db,
+        config,
+        action,
+        target_device_short_id,
+        request_id,
+        params,
+    ) {
+        Some(v) => v,
+        None => return false,
+    };
 
     let result = client.publish_and_wait(
         &topic,
@@ -143,6 +153,7 @@ fn send_control_via_ephemeral(
 
 /// Send an RPC control command using an ephemeral client.
 pub fn send_rpc_control_ephemeral(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -155,6 +166,7 @@ pub fn send_rpc_control_ephemeral(
     };
 
     let result = send_control_via_ephemeral(
+        db,
         config,
         &ephemeral,
         action,
@@ -168,6 +180,7 @@ pub fn send_rpc_control_ephemeral(
 }
 
 pub fn send_one_way_control_ephemeral(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -179,6 +192,7 @@ pub fn send_one_way_control_ephemeral(
     };
 
     let result = send_control_via_ephemeral(
+        db,
         config,
         &ephemeral,
         action,
@@ -247,7 +261,14 @@ pub fn send_rpc_request_and_wait_with_db(
     }
     ensure_remote_action_supported(db, target_device_short_id, action, target_name)?;
     let request_id = uuid::Uuid::new_v4().to_string();
-    if !send_rpc_control_ephemeral(config, action, target_device_short_id, &request_id, params) {
+    if !send_rpc_control_ephemeral(
+        db,
+        config,
+        action,
+        target_device_short_id,
+        &request_id,
+        params,
+    ) {
         return Err(format!("failed to send {} request", action));
     }
     wait_for_rpc_result_with_db(db, &request_id, timeout)
@@ -1380,7 +1401,9 @@ mod tests {
             relay_psk: super::super::encode_psk(&psk),
             ..Default::default()
         };
+        let db = test_db();
         let (topic, sealed) = build_rpc_control_payload(
+            &db,
             &config,
             "launch",
             "WXYZ",

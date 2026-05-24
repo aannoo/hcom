@@ -54,8 +54,8 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "message text" 
-  Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
+- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "plain text"
+  Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]

@@ -109,8 +109,8 @@ pub fn update_instance_position(
 mod tests {
     use super::*;
     use crate::instance_names::{
-        allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name, is_too_similar,
-        name_pool, score_name,
+        CVCV_SPACE, allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name,
+        is_too_similar, name_pool, score_name,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -184,8 +184,26 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let alive = taken.clone();
-        let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 900.0).unwrap();
+        let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 30.0).unwrap();
         assert!(!taken.contains(&name));
+    }
+
+    #[test]
+    fn test_allocate_name_avoids_alive_first_letter() {
+        // Forces the deterministic greedy tier (attempts=0 skips weighted
+        // sampling) so the spread penalty's effect on adjusted ordering can
+        // be asserted without RNG.
+        let alive: HashSet<String> = [
+            "luna", "lola", "lara", "lana", "lena", "lina", "lori", "loki",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let name = allocate_name(&|n| alive.contains(n), &alive, 0, 1200, 30.0).unwrap();
+        assert!(
+            !name.starts_with('l'),
+            "greedy pick under spread penalty should avoid `l`, got {name}"
+        );
     }
 
     #[test]
@@ -200,6 +218,17 @@ mod tests {
         let n1 = hash_to_name("device-123", 0);
         let n2 = hash_to_name("device-123", 1);
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn test_hash_to_name_probing_covers_full_cvcv_space() {
+        // Walking attempts 0..CVCV_SPACE must visit every distinct CVCV
+        // output exactly once — relay collision probing relies on this so
+        // fallback only triggers when every slot is genuinely taken.
+        let outputs: HashSet<String> = (0..CVCV_SPACE)
+            .map(|a| hash_to_name("device-123", a as u32))
+            .collect();
+        assert_eq!(outputs.len(), CVCV_SPACE);
     }
 
     #[test]
@@ -256,6 +285,58 @@ mod tests {
         assert!(!alive_names.contains("vera"));
         assert!(taken_names.contains("luna"));
         assert!(taken_names.contains("vera"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_collect_taken_names_ignores_placeholder_stops() {
+        let (db, path) = setup_test_db();
+        for (name, placeholder) in [("vera", true), ("zara", false)] {
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data)
+                     VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', ?1, ?2)",
+                    rusqlite::params![
+                        name,
+                        serde_json::json!({
+                            "action": "stopped",
+                            "placeholder": placeholder
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let (_, taken_names) = collect_taken_names(&db).unwrap();
+        assert!(!taken_names.contains("vera"));
+        assert!(taken_names.contains("zara"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_save_instance_reservation_does_not_replace_existing_row() {
+        let (db, path) = setup_test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(0.0));
+
+        db.save_instance_reservation("luna", &data).unwrap();
+
+        let mut replacement = serde_json::Map::new();
+        replacement.insert("status".into(), serde_json::json!("listening"));
+        assert!(db.save_instance_reservation("luna", &replacement).is_err());
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "pending"
+        );
 
         cleanup(path);
     }

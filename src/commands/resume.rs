@@ -38,6 +38,7 @@ struct PreparedResume {
     launch: LaunchParams,
     last_event_id: i64,
     session_id: String,
+    tracked_fork_identity: Option<TrackedForkIdentity>,
 }
 
 struct ResumeOutputContext {
@@ -48,6 +49,24 @@ struct ResumeOutputContext {
     background: bool,
     run_here: Option<bool>,
     launcher_name: String,
+}
+
+struct TrackedForkIdentity {
+    parent_name: String,
+    effective_tag: Option<String>,
+    custom_initial_prompt: Option<String>,
+    custom_system_prompt: Option<String>,
+}
+
+struct ResumePromptInput<'a> {
+    tool: &'a str,
+    display_name: &'a str,
+    fork: bool,
+    is_adoption: bool,
+    child_name: Option<&'a str>,
+    effective_tag: Option<&'a str>,
+    custom_system_prompt: Option<&'a str>,
+    custom_initial_prompt: Option<&'a str>,
 }
 
 /// Run the resume command. `argv` is the full argv[1..].
@@ -418,83 +437,33 @@ fn prepare_resume_plan_from_source(
         resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_for_output = launcher_name.clone();
 
-    // Pre-allocate a fork child name only for tracked-instance forks, since the
-    // identity-reset prompts reference it. For adoption-fork there is no prior
-    // hcom identity in the transcript, so the SessionStart hook handles naming.
+    // Choose a preview child name only for tracked-instance forks, since the
+    // identity-reset prompts reference it. Actual launch reserves a fresh name
+    // under the shared flock in execute_prepared_resume_result.
     let fork_child_name = if fork && !is_adoption {
-        let (alive_names, taken_names) = crate::instance_names::collect_taken_names(db)?;
-        let candidate = crate::instance_names::allocate_name(
-            &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
-            &alive_names,
-            200,
-            1200,
-            900.0,
-        )?;
-        Some(candidate)
+        Some(crate::instance_names::allocate_unreserved_name(db)?)
     } else {
         None
     };
     let effective_tag = launch_flags.tag.clone().or(inherited_tag.clone());
 
-    // Codex fork identity-reset: only for tracked-instance forks. Adoption-fork
-    // transcripts have no prior hcom identity to override.
-    let fork_initial_prompt = if fork && tool == "codex" && !is_adoption {
-        let child_name = fork_child_name
-            .as_deref()
-            .expect("fork child name should be generated");
-        let child_display = effective_tag
-            .as_deref()
-            .map(|tag| format!("{tag}-{child_name}"))
-            .unwrap_or_else(|| child_name.to_string());
-        let parent = display_name.as_str();
-        let identity_reset = format!(
-            "You are a fork of {parent}, but your new hcom identity is now {child_display}.\n\
-             Your hcom name is {child_name}.\n\
-             Do not use {parent}'s hcom identity anymore, even if it appears in inherited thread history.\n\
-             Use [hcom:{child_name}] in your first response only.\n\
-             Use `hcom ... --name {child_name}` for all hcom commands.\n\
-             If asked about your identity, answer exactly: {child_display}"
-        );
-        Some(match launch_flags.initial_prompt.as_deref() {
-            Some(user_prompt) if !user_prompt.trim().is_empty() => {
-                format!("{identity_reset}\n\n{user_prompt}")
-            }
-            _ => identity_reset,
-        })
-    } else {
-        launch_flags.initial_prompt.clone()
-    };
+    let (effective_system_prompt, fork_initial_prompt, append_reply_handoff) =
+        build_resume_prompts(ResumePromptInput {
+            tool: &tool,
+            display_name: &display_name,
+            fork,
+            is_adoption,
+            child_name: fork_child_name.as_deref(),
+            effective_tag: effective_tag.as_deref(),
+            custom_system_prompt: launch_flags.system_prompt.as_deref(),
+            custom_initial_prompt: launch_flags.initial_prompt.as_deref(),
+        });
     let output_tag = effective_tag.clone();
     let launch_tag = effective_tag.clone();
 
-    // System prompt:
-    // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
-    // - Adoption: None — the SessionStart hook issues the normal fresh-launch
-    //   bootstrap under the auto-allocated name. The transcript has no prior hcom
-    //   context to override.
-    let base_system_prompt = if is_adoption {
-        None
-    } else {
-        Some(resume_system_prompt(
-            &tool,
-            &display_name,
-            fork,
-            fork_child_name.as_deref(),
-        ))
-    };
-    let effective_system_prompt = match (base_system_prompt, launch_flags.system_prompt.as_deref())
-    {
-        (Some(base), Some(custom)) if !custom.trim().is_empty() => {
-            Some(format!("{base}\n\n{custom}"))
-        }
-        (Some(base), _) => Some(base),
-        (None, Some(custom)) if !custom.trim().is_empty() => Some(custom.to_string()),
-        (None, _) => None,
-    };
-
     // Instance name for LaunchParams:
     // - Adoption: None (launcher allocates; SessionStart hook binds via session_bindings)
-    // - Tracked fork: pre-allocated fork_child_name
+    // - Tracked fork: preview-only fork_child_name; execute swaps in a reserved name
     // - Tracked resume: preserve existing hcom name
     let launch_name = if is_adoption {
         None
@@ -502,6 +471,16 @@ fn prepare_resume_plan_from_source(
         fork_child_name.clone()
     } else {
         Some(display_name.clone())
+    };
+    let tracked_fork_identity = if fork && !is_adoption {
+        Some(TrackedForkIdentity {
+            parent_name: display_name.clone(),
+            effective_tag: effective_tag.clone(),
+            custom_initial_prompt: launch_flags.initial_prompt.clone(),
+            custom_system_prompt: launch_flags.system_prompt.clone(),
+        })
+    } else {
+        None
     };
 
     Ok(PreparedResume {
@@ -534,10 +513,11 @@ fn prepare_resume_plan_from_source(
             // Codex tracked-instance fork uses initial_prompt for an identity
             // reset; don't dilute it with a reply-handoff suffix. Adoption-fork
             // has no identity-reset prompt, so normal handoff rules apply.
-            append_reply_handoff: !(fork && tool == "codex" && !is_adoption),
+            append_reply_handoff,
         },
         last_event_id,
         session_id,
+        tracked_fork_identity,
     })
 }
 
@@ -583,7 +563,8 @@ fn execute_prepared_resume_result(
     fork: bool,
     plan: &PreparedResume,
 ) -> Result<LaunchResult> {
-    let result = launcher::launch(db, plan.launch.clone())?;
+    let launch = prepare_launch_for_execution(db, plan)?;
+    let result = launcher::launch(db, launch.clone())?;
 
     if !fork && plan.last_event_id > 0 {
         crate::instances::update_instance_position(
@@ -605,7 +586,7 @@ fn execute_prepared_resume_result(
         // launcher::launch to current max) — no zero-cursor window to
         // protect against.
         let current_max = db.get_last_event_id();
-        if let Some(ref child_name) = plan.launch.name {
+        if let Some(ref child_name) = launch.name {
             crate::instances::update_instance_position(
                 db,
                 child_name,
@@ -614,6 +595,31 @@ fn execute_prepared_resume_result(
         }
     }
     Ok(result)
+}
+
+fn prepare_launch_for_execution(db: &HcomDb, plan: &PreparedResume) -> Result<LaunchParams> {
+    let mut launch = plan.launch.clone();
+    let Some(identity) = &plan.tracked_fork_identity else {
+        return Ok(launch);
+    };
+
+    let reserved_child_name = crate::instance_names::reserve_generated_name(db)?;
+    let (system_prompt, initial_prompt, append_reply_handoff) =
+        build_resume_prompts(ResumePromptInput {
+            tool: &launch.tool,
+            display_name: &identity.parent_name,
+            fork: true,
+            is_adoption: false,
+            child_name: Some(&reserved_child_name),
+            effective_tag: identity.effective_tag.as_deref(),
+            custom_system_prompt: identity.custom_system_prompt.as_deref(),
+            custom_initial_prompt: identity.custom_initial_prompt.as_deref(),
+        });
+    launch.name = Some(reserved_child_name);
+    launch.system_prompt = system_prompt;
+    launch.initial_prompt = initial_prompt;
+    launch.append_reply_handoff = append_reply_handoff;
+    Ok(launch)
 }
 
 fn build_remote_resume_output(
@@ -718,6 +724,66 @@ fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
         bail!("Gemini does not support session forking (hcom f)");
     }
     Ok(())
+}
+
+fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option<String>, bool) {
+    let ResumePromptInput {
+        tool,
+        display_name,
+        fork,
+        is_adoption,
+        child_name,
+        effective_tag,
+        custom_system_prompt,
+        custom_initial_prompt,
+    } = input;
+
+    // Codex tracked-instance fork identity reset belongs in the initial prompt.
+    // Adoption-fork has no prior hcom identity, so normal bootstrap handles it.
+    let initial_prompt = if fork && tool == "codex" && !is_adoption {
+        let child_name = child_name.expect("tracked fork child name should be available");
+        let child_display = effective_tag
+            .map(|tag| format!("{tag}-{child_name}"))
+            .unwrap_or_else(|| child_name.to_string());
+        let identity_reset = format!(
+            "You are a fork of {display_name}, but your new hcom identity is now {child_display}.\n\
+             Your hcom name is {child_name}.\n\
+             Do not use {display_name}'s hcom identity anymore, even if it appears in inherited thread history.\n\
+             Use [hcom:{child_name}] in your first response only.\n\
+             Use `hcom ... --name {child_name}` for all hcom commands.\n\
+             If asked about your identity, answer exactly: {child_display}"
+        );
+        Some(match custom_initial_prompt {
+            Some(user_prompt) if !user_prompt.trim().is_empty() => {
+                format!("{identity_reset}\n\n{user_prompt}")
+            }
+            _ => identity_reset,
+        })
+    } else {
+        custom_initial_prompt.map(ToString::to_string)
+    };
+
+    // System prompt:
+    // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
+    // - Adoption: None — SessionStart issues the normal fresh-launch bootstrap.
+    let base_system_prompt = if is_adoption {
+        None
+    } else {
+        Some(resume_system_prompt(tool, display_name, fork, child_name))
+    };
+    let system_prompt = match (base_system_prompt, custom_system_prompt) {
+        (Some(base), Some(custom)) if !custom.trim().is_empty() => {
+            Some(format!("{base}\n\n{custom}"))
+        }
+        (Some(base), _) => Some(base),
+        (None, Some(custom)) if !custom.trim().is_empty() => Some(custom.to_string()),
+        (None, _) => None,
+    };
+
+    // Codex tracked-instance fork uses initial_prompt for an identity reset;
+    // don't dilute it with a reply-handoff suffix. Adoption-fork has no reset.
+    let append_reply_handoff = !(fork && tool == "codex" && !is_adoption);
+    (system_prompt, initial_prompt, append_reply_handoff)
 }
 
 fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&str>) -> String {
@@ -1692,6 +1758,42 @@ mod tests {
             ..Default::default()
         };
         assert!(should_preview_resume(&flags, &[]));
+    }
+
+    #[test]
+    fn test_tracked_fork_plan_does_not_reserve_until_execution() {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("session-123"));
+        data.insert("tool".into(), json!("codex"));
+        data.insert("status".into(), json!("listening"));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("luna", &data).unwrap();
+
+        let before_count = db.iter_instances_full().unwrap().len();
+        let plan = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        let preview_name = plan
+            .launch
+            .name
+            .as_ref()
+            .expect("tracked fork should have preview name")
+            .clone();
+
+        assert_eq!(db.iter_instances_full().unwrap().len(), before_count);
+        assert!(db.get_instance_full(&preview_name).unwrap().is_none());
+        assert!(plan.tracked_fork_identity.is_some());
+
+        let launch = prepare_launch_for_execution(&db, &plan).unwrap();
+        let reserved_name = launch.name.as_ref().expect("reserved name");
+        assert!(db.get_instance_full(reserved_name).unwrap().is_some());
+        assert_eq!(db.iter_instances_full().unwrap().len(), before_count + 1);
+        assert!(
+            launch
+                .initial_prompt
+                .as_deref()
+                .unwrap_or("")
+                .contains(&format!("[hcom:{reserved_name}]"))
+        );
     }
 
     #[test]

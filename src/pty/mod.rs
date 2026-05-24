@@ -564,7 +564,9 @@ impl Proxy {
                     // Set controlling terminal
                     #[cfg(target_os = "linux")]
                     let tiocsctty = libc::TIOCSCTTY;
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(target_os = "android")]
+                    let tiocsctty = libc::TIOCSCTTY as libc::c_int;
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
                     let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
                     if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
                         return Err(io::Error::last_os_error());

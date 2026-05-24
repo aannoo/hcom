@@ -206,9 +206,62 @@ fn read_nonempty(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Get device short ID — FNV-1a hash to CVCV word, uppercased.
+const RELAY_SHORT_PREFIX: &str = "relay_short_";
+const RELAY_UUID_SHORT_PREFIX: &str = "relay_uuid_short_";
+
+fn relay_short_key(short_id: &str) -> String {
+    format!("{RELAY_SHORT_PREFIX}{short_id}")
+}
+
+fn relay_uuid_short_key(device_uuid: &str) -> String {
+    format!("{RELAY_UUID_SHORT_PREFIX}{device_uuid}")
+}
+
+/// Hash a device UUID to a 4-letter uppercase CVCV short ID.
 pub fn device_short_id(device_uuid: &str) -> String {
     instance_names::hash_to_name(device_uuid, 0).to_uppercase()
+}
+
+/// Get or persist the collision-resistant short ID for a device UUID.
+///
+/// Existing mappings win first. Otherwise the natural hash is used if free,
+/// then linear probing walks the CVCV space; only when every CVCV slot is
+/// already taken by a different UUID does the fallback prefix kick in.
+pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
+    let uuid_key = relay_uuid_short_key(device_uuid);
+    if let Some(short_id) = safe_kv_get(db, &uuid_key) {
+        let short_key = relay_short_key(&short_id);
+        match safe_kv_get(db, &short_key) {
+            Some(owner) if owner != device_uuid => {}
+            _ => {
+                safe_kv_set(db, &short_key, Some(device_uuid));
+                return short_id;
+            }
+        }
+    }
+
+    // Probing with attempt = 0..CVCV_SPACE visits every CVCV output exactly
+    // once (attempt 0 is the natural hash), so the fallback only triggers
+    // when all 5625 slots are owned by different UUIDs.
+    for attempt in 0..instance_names::CVCV_SPACE {
+        let short_id = instance_names::hash_to_name(device_uuid, attempt as u32).to_uppercase();
+        match safe_kv_get(db, &relay_short_key(&short_id)) {
+            Some(owner) if owner != device_uuid => continue,
+            _ => {
+                remember_device_short_id(db, device_uuid, &short_id);
+                return short_id;
+            }
+        }
+    }
+
+    let fallback = device_id_prefix(device_uuid).to_uppercase();
+    remember_device_short_id(db, device_uuid, &fallback);
+    fallback
+}
+
+pub(crate) fn remember_device_short_id(db: &HcomDb, device_uuid: &str, short_id: &str) {
+    safe_kv_set(db, &relay_uuid_short_key(device_uuid), Some(short_id));
+    safe_kv_set(db, &relay_short_key(short_id), Some(device_uuid));
 }
 
 /// Add device short ID suffix to a name (e.g., "luna" → "luna:XABC").
@@ -257,6 +310,7 @@ pub fn is_worker_heartbeat_fresh(db: &HcomDb) -> bool {
 pub fn clear_relay_device_state(db: &HcomDb) {
     let prefixes = [
         "relay_short_",
+        "relay_uuid_short_",
         "relay_caps_",
         "relay_events_",
         "relay_reset_",
@@ -732,12 +786,74 @@ mod tests {
         assert_eq!(wildcard_topic("relay-123"), "relay-123/+");
     }
 
+    fn is_cvcv_upper(s: &str) -> bool {
+        const C: &[u8] = b"BDFGHKLMNPRSTVZ";
+        const V: &[u8] = b"AEIOU";
+        let b = s.as_bytes();
+        b.len() == 4
+            && C.contains(&b[0])
+            && V.contains(&b[1])
+            && C.contains(&b[2])
+            && V.contains(&b[3])
+    }
+
     #[test]
     fn test_device_short_id() {
-        // Uses hash_to_name (FNV-1a → CVCV word),
-        assert_eq!(device_short_id("abcd-1234-efgh"), "VUNO");
-        assert_eq!(device_short_id("12345678"), "MOVA");
-        assert_eq!(device_short_id("device-123"), "REVA");
+        // FNV-1a → CVCV word, uppercased. Deterministic, valid format, and
+        // different inputs typically produce different outputs.
+        for uuid in ["abcd-1234-efgh", "12345678", "device-123"] {
+            let s = device_short_id(uuid);
+            assert!(is_cvcv_upper(&s), "{s} is not 4-letter uppercase CVCV");
+            assert_eq!(device_short_id(uuid), s, "not deterministic");
+        }
+    }
+
+    #[test]
+    fn test_device_short_id_for_db_persists_natural_hash() {
+        let db = test_db();
+        let natural = device_short_id("device-123");
+        let short_id = device_short_id_for_db(&db, "device-123");
+
+        assert_eq!(short_id, natural);
+        assert_eq!(
+            safe_kv_get(&db, "relay_uuid_short_device-123").as_deref(),
+            Some(natural.as_str())
+        );
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_short_{natural}")).as_deref(),
+            Some("device-123")
+        );
+    }
+
+    #[test]
+    fn test_device_short_id_for_db_probes_on_collision() {
+        let db = test_db();
+        let mut collision = None;
+        let mut seen = std::collections::HashMap::new();
+        for i in 0..20_000 {
+            let uuid = format!("device-{i}");
+            let short = device_short_id(&uuid);
+            if let Some(first) = seen.insert(short.clone(), uuid.clone()) {
+                collision = Some((first, uuid, short));
+                break;
+            }
+        }
+        let (first, second, legacy_short) =
+            collision.expect("expected a legacy short-id collision");
+
+        assert_eq!(device_short_id_for_db(&db, &first), legacy_short);
+        let second_short = device_short_id_for_db(&db, &second);
+
+        assert_ne!(second_short, legacy_short);
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_uuid_short_{second}")).as_deref(),
+            Some(second_short.as_str())
+        );
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_short_{second_short}")).as_deref(),
+            Some(second.as_str())
+        );
+        assert_eq!(device_short_id_for_db(&db, &first), legacy_short);
     }
 
     #[test]

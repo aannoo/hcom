@@ -929,7 +929,16 @@ pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
 /// Handles: snapshot capture, session/process/notify/subscription cleanup,
 /// life event logging, and instance deletion.
 pub fn stop_instance(db: &HcomDb, instance_name: &str, initiated_by: &str, reason: &str) {
-    stop_instance_inner(db, instance_name, initiated_by, reason, 0);
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0);
+}
+
+pub(crate) fn stop_placeholder_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+) {
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0);
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -941,6 +950,7 @@ fn stop_instance_inner(
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
+    placeholder: bool,
     depth: u32,
 ) {
     if depth >= MAX_STOP_DEPTH {
@@ -1113,7 +1123,14 @@ fn stop_instance_inner(
             })
             .unwrap_or_default();
         for sub_name in subagents {
-            stop_instance_inner(db, &sub_name, initiated_by, "parent_stopped", depth + 1);
+            stop_instance_inner(
+                db,
+                &sub_name,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+            );
         }
     }
 
@@ -1128,13 +1145,16 @@ fn stop_instance_inner(
     let _ = db.cleanup_subscriptions(instance_name);
 
     // Log life event with snapshot BEFORE delete
-    if let Err(e) = db.log_life_event(
-        instance_name,
-        "stopped",
-        initiated_by,
-        reason,
-        Some(snapshot),
-    ) {
+    let mut event_data = serde_json::json!({
+        "action": "stopped",
+        "by": initiated_by,
+        "reason": reason,
+        "snapshot": snapshot,
+    });
+    if placeholder {
+        event_data["placeholder"] = serde_json::json!(true);
+    }
+    if let Err(e) = db.log_event("life", instance_name, &event_data) {
         log::log_warn(
             "hooks",
             "finalize.life_event_failed",

@@ -571,7 +571,12 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "stale_cleanup");
+                crate::hooks::common::stop_placeholder_instance(
+                    db,
+                    &data.name,
+                    "system",
+                    "stale_cleanup",
+                );
                 deleted += 1;
             }
         }
@@ -975,6 +980,18 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_placeholders(&db);
         assert_eq!(deleted, 1);
         assert!(db.get_instance_full("stale").unwrap().is_none());
+        let placeholder: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(json_extract(data, '$.placeholder'), 0)
+                 FROM events
+                 WHERE type = 'life' AND instance = 'stale'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(placeholder, 1);
 
         cleanup(path);
     }

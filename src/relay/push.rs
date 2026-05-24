@@ -12,12 +12,12 @@ use crate::db::HcomDb;
 use crate::log;
 
 use super::crypto;
-use super::{device_short_id, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
+use super::{device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
 
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
 pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
-    let short_id = device_short_id(device_uuid);
+    let short_id = device_short_id_for_db(db, device_uuid);
 
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,

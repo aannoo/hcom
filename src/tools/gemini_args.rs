@@ -66,6 +66,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--admin-policy",
     "-e",
     "--extensions",
+    "--session-file",
     "--session-id",
     "--delete-session",
     "--include-directories",
@@ -848,6 +849,8 @@ mod tests {
             "--policy",
             "policy.json",
             "--admin-policy=admin.json",
+            "--session-file",
+            "session.json",
             "--session-id",
             "550e8400-e29b-41d4-a716-446655440000",
             "--worktree",
@@ -860,6 +863,10 @@ mod tests {
         assert!(spec.positional_tokens.is_empty());
         assert!(spec.has_flag(&["--skip-trust"], &[]));
         assert!(spec.has_flag(&["--acp"], &[]));
+        assert_eq!(
+            spec.get_flag_value("--session-file"),
+            Some(FlagValue::Single("session.json".to_string()))
+        );
         assert_eq!(
             spec.get_flag_value("--session-id"),
             Some(FlagValue::Single(
