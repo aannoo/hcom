@@ -1,5 +1,5 @@
 {
-  "indexed_at": "2026-05-22T13:47:55.827173",
+  "indexed_at": "2026-05-23T22:06:10.340947",
   "root": ".",
   "project_structure": {
     "type": "tree",
@@ -8,7 +8,7 @@
       ".",
       "\u251c\u2500\u2500 coordination/",
       "\u251c\u2500\u2500 docs/",
-      "\u251c\u2500\u2500 logs/ (4 files)",
+      "\u251c\u2500\u2500 logs/ (5 files)",
       "\u251c\u2500\u2500 plugin/ (1 files)",
       "\u2502   \u2514\u2500\u2500 hcom/ (1 files)",
       "\u2502       \u2514\u2500\u2500 skills/ (6 files)",
@@ -65,13 +65,9 @@
         "HANDOFF \u2014 hcom (fork)",
         "WHAT THIS PROJECT IS",
         "IMMEDIATE NEXT ACTION",
-        "MAIN TASK \u2014 DeepWiki doc/skill refinement",
-        "DeepWiki TOC seed (from `read_wiki_structure aannoo/hcom`, 2026-05-22)",
         "CURRENT STATE",
-        "CRITICAL RULES (put in project CLAUDE.md)",
-        "RELATED WORKSTREAM",
-        "HCOM GROUP",
-        "SESSION-SUCCESSION NOTE"
+        "CRITICAL BEHAVIOR RULES (project-specific)",
+        "KEY FILES FOR CONTEXT"
       ],
       "architecture_hints": []
     },
@@ -314,18 +310,18 @@
     "skills/hcom-agent-messaging/references/scripts": "Build and utility scripts"
   },
   "stats": {
-    "total_files": 154,
+    "total_files": 155,
     "total_directories": 36,
     "fully_parsed": {
       "typescript": 1,
       "shell": 9
     },
     "listed_only": {
-      "json": 8,
+      "json": 9,
       "shell": 1,
       "rs": 135
     },
-    "markdown_files": 19
+    "markdown_files": 21
   },
   "files": {
     "gemini-extension.json": {
@@ -454,6 +450,10 @@
       "parsed": false
     },
     "logs/stop.json": {
+      "language": "json",
+      "parsed": false
+    },
+    "logs/notification.json": {
       "language": "json",
       "parsed": false
     },
@@ -1217,5 +1217,5 @@
       "os"
     ]
   },
-  "staleness_check": 1778867275.919472
+  "staleness_check": 1778983570.445276
 }
