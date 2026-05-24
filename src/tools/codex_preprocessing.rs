@@ -77,6 +77,7 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
             "-s",
             "--dangerously-bypass-approvals-and-sandbox",
             "--full-auto",
+            "--yolo",
         ],
         &["--sandbox=", "-s="],
     );
@@ -489,6 +490,16 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_treats_yolo_as_sandbox_active() {
+        init_config();
+        let tokens = s(&["--yolo"]);
+        let result = ensure_hcom_writable(&tokens);
+        assert_eq!(result[0], "--add-dir");
+        assert!(result.contains(&"--yolo".to_string()));
+    }
+
+    #[test]
     fn test_ensure_hcom_writable_skips_no_sandbox() {
         // No sandbox flags → mode="none" → skip (doesn't use paths)
         let tokens = s(&["-m", "o3"]);
@@ -769,6 +780,20 @@ mod tests {
         assert!(!result.contains(&"workspace-write".to_string()));
         assert!(result.contains(&"--add-dir".to_string()));
         assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_preprocess_yolo_overrides_hcom_default_sandbox() {
+        init_config();
+        let args = s(&["--yolo", "-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
+
+        assert!(result.contains(&"--yolo".to_string()));
+        assert!(!result.contains(&"--sandbox".to_string()));
+        assert!(!result.contains(&"workspace-write".to_string()));
+        assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(result.contains(&"--add-dir".to_string()));
     }
 
     #[test]
