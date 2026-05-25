@@ -2,11 +2,13 @@
 
 pub mod claude;
 pub mod claude_args;
+pub mod cline;
 pub mod codex;
 pub mod codex_file_edits;
 pub mod common;
 pub mod family;
 pub mod gemini;
+pub mod kilo;
 pub mod opencode;
 pub mod utils;
 

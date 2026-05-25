@@ -1,8 +1,3 @@
-//! Tool enum for type-safe tool identification across hcom.
-//!
-//! Centralizes tool-specific configuration (ready patterns, etc) to avoid
-//! scattered string comparisons and magic values.
-
 use std::str::FromStr;
 
 const CLAUDE_HOOKS: &[&str] = &[
@@ -43,73 +38,78 @@ const OPENCODE_HOOKS: &[&str] = &[
     "opencode-stop",
 ];
 
-/// Supported AI coding tools
+const KILO_HOOKS: &[&str] = &[
+    "kilocode-start",
+    "kilocode-status",
+    "kilocode-read",
+    "kilocode-stop",
+];
+
+const CLINE_HOOKS: &[&str] = &[
+    "cline-start",
+    "cline-status",
+    "cline-read",
+    "cline-stop",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Claude,
     Gemini,
     Codex,
     OpenCode,
+    Kilo,
+    Cline,
     Adhoc,
 }
 
 impl Tool {
-    /// Get the ready pattern bytes for this tool
-    ///
-    /// Ready pattern appears when the tool's TUI has loaded. Used for delivery
-    /// thread startup detection (not gating — gate config is in delivery.rs).
     pub fn ready_pattern(&self) -> &'static [u8] {
         match self {
             Tool::Claude => b"? for shortcuts",
-            // Codex's responsive footer drops "? for shortcuts" in narrow terminals.
-            // Use the › prompt character instead — always visible when TUI is loaded.
             Tool::Codex => "\u{203A} ".as_bytes(),
             Tool::Gemini => b"Type your message",
-            // OpenCode: bottom status bar — appears when TUI is fully rendered.
-            // Gates delivery thread startup so PTY bootstrap inject doesn't fire
-            // into a blank screen before the input box exists.
             Tool::OpenCode => b"ctrl+p commands",
+            Tool::Kilo => b"ctrl+p commands",
+            Tool::Cline => b"ctrl+p commands",
             Tool::Adhoc => b"",
         }
     }
 
-    /// Get the tool name as a string (lowercase)
-    ///
-    /// Use this for DB storage, CLI output, and external interfaces.
     pub fn as_str(&self) -> &'static str {
         match self {
             Tool::Claude => "claude",
             Tool::Gemini => "gemini",
             Tool::Codex => "codex",
             Tool::OpenCode => "opencode",
+            Tool::Kilo => "kilo",
+            Tool::Cline => "cline",
             Tool::Adhoc => "adhoc",
         }
     }
 
-    /// Hook command names owned by this tool.
     pub fn hooks(&self) -> &'static [&'static str] {
         match self {
             Tool::Claude => CLAUDE_HOOKS,
             Tool::Gemini => GEMINI_HOOKS,
             Tool::Codex => CODEX_HOOKS,
             Tool::OpenCode => OPENCODE_HOOKS,
+            Tool::Kilo => KILO_HOOKS,
+            Tool::Cline => CLINE_HOOKS,
             Tool::Adhoc => &[],
         }
     }
 
-    /// Return true if this tool owns the hook command name.
     pub fn owns_hook(&self, name: &str) -> bool {
         self.hooks().contains(&name)
     }
 
-    /// Resolve the tool that owns a hook command name.
     pub fn from_hook_name(name: &str) -> Option<Self> {
-        [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode]
+        [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline]
             .into_iter()
             .find(|tool| tool.owns_hook(name))
     }
 
-    /// Return true if any supported tool owns the hook command name.
     pub fn is_hook_name(name: &str) -> bool {
         Self::from_hook_name(name).is_some()
     }
@@ -124,6 +124,8 @@ impl FromStr for Tool {
             "gemini" => Ok(Tool::Gemini),
             "codex" => Ok(Tool::Codex),
             "opencode" => Ok(Tool::OpenCode),
+            "kilo" | "kilocode" => Ok(Tool::Kilo),
+            "cline" | "clinecode" => Ok(Tool::Cline),
             "adhoc" => Ok(Tool::Adhoc),
             _ => Err(format!("Unknown tool: {}", s)),
         }
@@ -150,7 +152,7 @@ mod tests {
     #[test]
     fn hook_names_are_disjoint() {
         let mut owners = HashMap::new();
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
+        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline] {
             for hook in tool.hooks() {
                 assert_eq!(
                     owners.insert(*hook, tool),
@@ -160,5 +162,16 @@ mod tests {
                 assert_eq!(Tool::from_hook_name(hook), Some(tool));
             }
         }
+    }
+
+    #[test]
+    fn kilocode_parses_to_kilo() {
+        assert_eq!("kilocode".parse::<Tool>().unwrap(), Tool::Kilo);
+        assert_eq!("kilo".parse::<Tool>().unwrap(), Tool::Kilo);
+    }
+
+    #[test]
+    fn cline_parses() {
+        assert_eq!("cline".parse::<Tool>().unwrap(), Tool::Cline);
     }
 }

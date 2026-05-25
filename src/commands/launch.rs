@@ -407,6 +407,10 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "gemini" => &preview.config.gemini_args,
             "codex" => &preview.config.codex_args,
             "opencode" => &preview.config.opencode_args,
+            "kilo" => &preview.config.kilo_args,
+            "kilocode" => &preview.config.kilo_args,
+            "cline" => &preview.config.cline_args,
+            "clinecode" => &preview.config.cline_args,
             _ => "",
         }
     } else {
@@ -555,7 +559,7 @@ pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConf
             let merged = codex_args::merge_codex_args(&env_spec, &cli_spec);
             merged.rebuild_tokens(true, true)
         }
-        _ => cli_args.to_vec(), // opencode: pass through
+        _ => cli_args.to_vec(), // opencode, kilo, cline: pass through
     }
 }
 

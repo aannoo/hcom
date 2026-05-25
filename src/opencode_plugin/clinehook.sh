@@ -1,0 +1,19 @@
+#!/bin/sh
+# TaskStart hook — called by Cline when a new task begins
+# Reads: taskId from stdin JSON
+# Calls: hcom cline-start --session-id <taskId>
+# Returns: bootstrap text as contextModification (or cancel:false on error)
+
+set -eu
+_I=$(cat) || exit 0
+_T=$(echo "$_I" | sed -n 's/.*"taskId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+[ -z "$_T" ] && { echo '{"cancel":false}'; exit 0; }
+_R=$(hcom cline-start --session-id "$_T" 2>/dev/null) || { echo '{"cancel":false}'; exit 0; }
+_N=$(echo "$_R" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+[ -n "$_N" ] && mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/hcom/cline" 2>/dev/null \
+    && echo "$_N" > "${XDG_CACHE_HOME:-$HOME/.cache}/hcom/cline/$_T.name"
+_B=$(echo "$_R" | sed -n 's/.*"bootstrap"[[:space:]]*:[[:space:]]*"\(.*\)"[[:space:]]*,[[:space:]]*"/\1/p')
+[ -z "$_B" ] && _B=$(echo "$_R" | sed -n 's/.*"bootstrap"[[:space:]]*:[[:space:]]*"\(.*\)"[[:space:]]*}$/\1/p')
+[ -z "$_B" ] && { echo '{"cancel":false}'; exit 0; }
+_E=$(printf '%s' "$_B" | awk '{gsub(/\\/,"\\\\");gsub(/"/,"\\\"");printf "%s",$0}')
+printf '{"cancel":false,"contextModification":"%s","errorMessage":""}\n' "$_E"

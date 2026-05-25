@@ -149,6 +149,8 @@ pub fn detect_current_tool_from_env() -> &'static str {
         "codex"
     } else if is_eq("OPENCODE", "1") {
         "opencode"
+    } else if is_eq("KILOCODE", "1") {
+        "kilocode"
     } else {
         "adhoc"
     }

@@ -239,6 +239,8 @@ fn parse_tool(s: &str) -> Tool {
         "gemini" => Tool::Gemini,
         "codex" => Tool::Codex,
         "opencode" => Tool::OpenCode,
+        "kilocode" => Tool::Kilo,
+        "clinecode" | "cline" => Tool::Cline,
         _ => Tool::Adhoc,
     }
 }
