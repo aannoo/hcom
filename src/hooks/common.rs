@@ -177,6 +177,69 @@ pub struct PreparedDelivery {
     pub ack: super::DeliveryAck,
 }
 
+/// Options for [`assemble_gemini_family_lifecycle_outputs`].
+pub(crate) struct GeminiFamilyLifecycleOpts {
+    /// BeforeAgent only: return wake-only context when agy has no pending messages.
+    pub allow_wake_no_pending: bool,
+}
+
+/// Combined lifecycle hook text + optional deferred ack / early wake-only return.
+pub(crate) struct GeminiFamilyLifecycleOutput {
+    pub parts: Vec<String>,
+    pub delivery_ack: Option<super::DeliveryAck>,
+    pub early_wake_context: Option<String>,
+}
+
+/// Shared beforeagent/aftertool output assembly for Gemini and Antigravity.
+pub(crate) fn assemble_gemini_family_lifecycle_outputs(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    instance: &InstanceRow,
+    is_agy: bool,
+    opts: GeminiFamilyLifecycleOpts,
+) -> GeminiFamilyLifecycleOutput {
+    let instance_name = &instance.name;
+    let mut parts: Vec<String> = Vec::new();
+    let mut delivery_ack = None;
+
+    if is_agy {
+        if let Some(prepared) = prepare_pending_messages(db, instance_name) {
+            parts.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
+            parts.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        } else if opts.allow_wake_no_pending && instance.name_announced != 0 {
+            return GeminiFamilyLifecycleOutput {
+                parts: vec![],
+                delivery_ack: None,
+                early_wake_context: Some(bootstrap::ANTIGRAVITY_WAKE_NO_PENDING.to_string()),
+            };
+        }
+        if let Some(bootstrap) =
+            inject_bootstrap_once(db, ctx, instance_name, instance, &instance.tool)
+        {
+            parts.push(bootstrap);
+        }
+    } else {
+        if let Some(bootstrap) =
+            inject_bootstrap_once(db, ctx, instance_name, instance, &instance.tool)
+        {
+            parts.push(bootstrap);
+        }
+        if let Some(prepared) = prepare_pending_messages(db, instance_name) {
+            parts.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        } else {
+            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        }
+    }
+
+    GeminiFamilyLifecycleOutput {
+        parts,
+        delivery_ack,
+        early_wake_context: None,
+    }
+}
+
 pub(crate) fn limit_delivery_messages(messages: &[Value]) -> Vec<Value> {
     if messages.len() > MAX_MESSAGES_PER_DELIVERY {
         messages[..MAX_MESSAGES_PER_DELIVERY].to_vec()

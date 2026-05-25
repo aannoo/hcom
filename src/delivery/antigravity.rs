@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::db::HcomDb;
 use crate::log::{log_info, log_warn};
@@ -19,6 +19,28 @@ use super::{
 };
 
 const WAKE_ENTER_DELAY: Duration = Duration::from_millis(200);
+/// Re-inject preview wake if pending remains at the same cursor (hook never acked).
+const STALE_WAKE_RETRY: Duration = Duration::from_secs(90);
+
+/// Whether to clear wake dedup and allow another PTY preview inject.
+pub(crate) fn antigravity_should_retry_wake(
+    pending: bool,
+    wake_cursor: Option<i64>,
+    current_cursor: i64,
+    wake_age: Option<Duration>,
+    retry_after: Duration,
+) -> bool {
+    if !pending {
+        return false;
+    }
+    let Some(sent_at) = wake_cursor else {
+        return false;
+    };
+    if current_cursor != sent_at {
+        return false;
+    }
+    wake_age.is_some_and(|age| age >= retry_after)
+}
 
 /// Run hook-primary delivery for Antigravity (minimal PTY wake loop).
 #[allow(clippy::too_many_arguments)]
@@ -45,6 +67,7 @@ pub(crate) fn run_antigravity_delivery_loop(
     let mut current_status = "listening".to_string();
     // Cursor at last wake inject; cleared when cursor advances or pending drains.
     let mut wake_sent_at_cursor: Option<i64> = None;
+    let mut wake_sent_at: Option<Instant> = None;
 
     while running.load(Ordering::Acquire) {
         refresh_binding(db, process_id, current_name, &shared_name);
@@ -59,15 +82,35 @@ pub(crate) fn run_antigravity_delivery_loop(
         db.reconnect_if_stale();
 
         let cursor = db.get_cursor(current_name);
-        if !db.has_pending(current_name) {
+        let pending = db.has_pending(current_name);
+        if !pending {
             wake_sent_at_cursor = None;
+            wake_sent_at = None;
         } else if let Some(sent_at) = wake_sent_at_cursor
             && cursor > sent_at
         {
             wake_sent_at_cursor = None;
+            wake_sent_at = None;
+        } else if antigravity_should_retry_wake(
+            pending,
+            wake_sent_at_cursor,
+            cursor,
+            wake_sent_at.map(|t| t.elapsed()),
+            STALE_WAKE_RETRY,
+        ) {
+            log_info(
+                "native",
+                "delivery.antigravity_wake_retry",
+                &format!(
+                    "Re-wake for {} at cursor={} after stale pending",
+                    current_name, cursor
+                ),
+            );
+            wake_sent_at_cursor = None;
+            wake_sent_at = None;
         }
 
-        if db.has_pending(current_name) && wake_sent_at_cursor.is_none() {
+        if pending && wake_sent_at_cursor.is_none() {
             let is_idle = if config.require_idle {
                 db.is_idle(current_name)
             } else {
@@ -82,6 +125,7 @@ pub(crate) fn run_antigravity_delivery_loop(
                     std::thread::sleep(WAKE_ENTER_DELAY);
                     if inject_enter(state.inject_port) {
                         wake_sent_at_cursor = Some(cursor);
+                        wake_sent_at = Some(Instant::now());
                         log_info(
                             "native",
                             "delivery.antigravity_wake",
@@ -175,6 +219,56 @@ pub(crate) fn cleanup_antigravity_pty_exit(
         && let Err(e) = db.delete_process_binding(process_id)
     {
         log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_antigravity_should_retry_wake_when_stale() {
+        assert!(antigravity_should_retry_wake(
+            true,
+            Some(5),
+            5,
+            Some(Duration::from_secs(90)),
+            Duration::from_secs(90),
+        ));
+    }
+
+    #[test]
+    fn test_antigravity_should_not_retry_when_cursor_advanced() {
+        assert!(!antigravity_should_retry_wake(
+            true,
+            Some(5),
+            6,
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(90),
+        ));
+    }
+
+    #[test]
+    fn test_antigravity_should_not_retry_when_too_soon() {
+        assert!(!antigravity_should_retry_wake(
+            true,
+            Some(5),
+            5,
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(90),
+        ));
+    }
+
+    #[test]
+    fn test_antigravity_should_not_retry_without_pending() {
+        assert!(!antigravity_should_retry_wake(
+            false,
+            Some(5),
+            5,
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(90),
+        ));
     }
 }
 

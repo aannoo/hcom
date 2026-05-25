@@ -441,6 +441,9 @@ fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     if tool == "claude" {
         m.insert("HCOM_PTY_MODE".to_string(), "1".to_string());
     }
+    if tool == "antigravity" {
+        m.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
+    }
     m
 }
 
@@ -1327,6 +1330,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     );
                     let bootstrap_path = write_system_prompt_file(&bootstrap, "gemini");
                     instance_env.insert("GEMINI_SYSTEM_MD".to_string(), bootstrap_path);
+                    instance_env.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
 
                     instances::update_instance_position(
                         db,
@@ -1664,6 +1668,15 @@ mod tests {
         );
         assert_eq!(
             runner_env.get("HCOM_PTY_MODE").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn test_background_runner_env_antigravity_sets_agent() {
+        let runner_env = background_runner_env("antigravity", &HashMap::new(), "nabe");
+        assert_eq!(
+            runner_env.get("ANTIGRAVITY_AGENT").map(String::as_str),
             Some("1")
         );
     }

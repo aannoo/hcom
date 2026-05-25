@@ -27,6 +27,7 @@ mod instances;
 mod kv;
 mod notify;
 mod sessions;
+pub(crate) mod reqwatch_policy;
 pub(crate) mod subscriptions;
 
 pub use events::Message;

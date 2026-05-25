@@ -178,11 +178,7 @@ pub(crate) fn build_and_insert_sql_subscription(
     })
 }
 
-/// After agy reports `listening`, wait before "idle without reply" (seconds).
-///
-/// Per idle spell only — reset when the target goes `active`/`blocked` again (tool/deliver).
-/// A few seconds is enough for `hcom send` after turn-end; stopped still fires immediately.
-pub(crate) const AGY_REQWATCH_IDLE_GRACE_SEC: f64 = 10.0;
+pub(crate) use super::reqwatch_policy::AGY_REQWATCH_IDLE_GRACE_SEC;
 
 fn instance_tool(db: &HcomDb, name: &str) -> String {
     db.conn()
@@ -572,33 +568,28 @@ pub(crate) fn process_logged_event(
                     .get("target_tool")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if target_tool == "antigravity" {
-                    let is_listening = event_type == "status"
-                        && data.get("status").and_then(|v| v.as_str()) == Some("listening");
-                    let is_stopped = event_type == "life"
-                        && data.get("action").and_then(|v| v.as_str()) == Some("stopped");
-
-                    if is_listening {
-                        let now = crate::shared::time::now_epoch_f64();
-                        let grace_until = sub.get("idle_grace_until").and_then(|v| v.as_f64());
-                        let defer = match grace_until {
-                            None => true,
-                            Some(until) if now < until => true,
-                            Some(_) => false,
-                        };
-                        if defer {
-                            let mut sub_mut = sub.clone();
-                            sub_mut["last_id"] = serde_json::json!(event_id);
-                            if grace_until.is_none() {
-                                sub_mut["idle_grace_until"] =
-                                    serde_json::json!(now + AGY_REQWATCH_IDLE_GRACE_SEC);
-                            }
-                            kv_store_sub(db, key, &sub_mut);
-                            continue;
+                let now = crate::shared::time::now_epoch_f64();
+                match super::reqwatch_policy::reqwatch_notify_decision(
+                    target_tool,
+                    event_type,
+                    data,
+                    &sub,
+                    now,
+                ) {
+                    super::reqwatch_policy::ReqwatchNotifyDecision::Skip => continue,
+                    super::reqwatch_policy::ReqwatchNotifyDecision::Defer {
+                        set_grace_if_absent,
+                    } => {
+                        let mut sub_mut = sub.clone();
+                        sub_mut["last_id"] = serde_json::json!(event_id);
+                        if set_grace_if_absent {
+                            sub_mut["idle_grace_until"] =
+                                serde_json::json!(now + AGY_REQWATCH_IDLE_GRACE_SEC);
                         }
-                    } else if !is_stopped {
+                        kv_store_sub(db, key, &sub_mut);
                         continue;
                     }
+                    super::reqwatch_policy::ReqwatchNotifyDecision::Proceed => {}
                 }
             }
         }

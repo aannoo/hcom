@@ -19,7 +19,7 @@ use crate::instances;
 use crate::log;
 use crate::shared::constants::BIND_MARKER_RE;
 use crate::shared::context::HcomContext;
-use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
+use crate::shared::{ST_BLOCKED, ST_LISTENING};
 
 /// Derive Gemini CLI transcript path from session_id.
 ///
@@ -359,50 +359,34 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
 
     try_capture_transcript_path(db, instance_name, payload);
 
-    let mut outputs: Vec<String> = Vec::new();
-    let mut delivery_ack = None;
     let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    let assembled = common::assemble_gemini_family_lifecycle_outputs(
+        db,
+        ctx,
+        &instance,
+        is_agy,
+        common::GeminiFamilyLifecycleOpts {
+            allow_wake_no_pending: true,
+        },
+    );
 
-    if is_agy {
-        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-            outputs.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
-            outputs.push(prepared.formatted);
-            delivery_ack = Some(prepared.ack);
-        } else if instance.name_announced != 0 {
-            return HookResult::Allow {
-                additional_context: Some(bootstrap::ANTIGRAVITY_WAKE_NO_PENDING.to_string()),
-                system_message: None,
-                delivery_ack: None,
-            };
-        }
-        if let Some(bootstrap) =
-            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
-        {
-            outputs.push(bootstrap);
-        }
-    } else {
-        if let Some(bootstrap) =
-            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
-        {
-            outputs.push(bootstrap);
-        }
-        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-            outputs.push(prepared.formatted);
-            delivery_ack = Some(prepared.ack);
-        } else {
-            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-        }
+    if let Some(wake_only) = assembled.early_wake_context {
+        return HookResult::Allow {
+            additional_context: Some(wake_only),
+            system_message: None,
+            delivery_ack: None,
+        };
     }
 
-    if outputs.is_empty() {
+    if assembled.parts.is_empty() {
         return hook_noop();
     }
 
-    let combined = outputs.join("\n\n---\n\n");
+    let combined = assembled.parts.join("\n\n---\n\n");
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
-        delivery_ack,
+        delivery_ack: assembled.delivery_ack,
     }
 }
 
@@ -460,43 +444,26 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
         None => return hook_noop(),
     };
 
-    let instance_name = &instance.name;
-    let mut outputs: Vec<String> = Vec::new();
-    let mut delivery_ack = None;
     let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    let assembled = common::assemble_gemini_family_lifecycle_outputs(
+        db,
+        ctx,
+        &instance,
+        is_agy,
+        common::GeminiFamilyLifecycleOpts {
+            allow_wake_no_pending: false,
+        },
+    );
 
-    if is_agy {
-        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-            outputs.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
-            outputs.push(prepared.formatted);
-            delivery_ack = Some(prepared.ack);
-        }
-        if let Some(bootstrap) =
-            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
-        {
-            outputs.push(bootstrap);
-        }
-    } else {
-        if let Some(bootstrap) =
-            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
-        {
-            outputs.push(bootstrap);
-        }
-        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-            outputs.push(prepared.formatted);
-            delivery_ack = Some(prepared.ack);
-        }
-    }
-
-    if outputs.is_empty() {
+    if assembled.parts.is_empty() {
         return hook_noop();
     }
 
-    let combined = outputs.join("\n\n---\n\n");
+    let combined = assembled.parts.join("\n\n---\n\n");
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
-        delivery_ack,
+        delivery_ack: assembled.delivery_ack,
     }
 }
 
@@ -629,6 +596,22 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
     }
 }
 
+/// Whether stdin/context should route through Antigravity payload parsing.
+///
+/// Order: `ANTIGRAVITY_AGENT` env → exclude `GEMINI_CLI` gemini → `toolCall` schema fallback.
+pub(crate) fn detect_antigravity_payload(ctx: &HcomContext, stdin_json: &Value) -> (bool, bool) {
+    if ctx.is_antigravity {
+        return (true, false);
+    }
+    if ctx.is_gemini {
+        return (false, false);
+    }
+    if stdin_json.get("toolCall").is_some() {
+        return (true, true);
+    }
+    (false, false)
+}
+
 /// Main entry point for Gemini hooks — called by router.
 ///
 /// Reads stdin JSON, builds HookPayload + HcomContext, dispatches to handler.
@@ -646,9 +629,17 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         Err(_) => Value::Object(Default::default()),
     };
 
-    // Detect antigravity payload (nested toolCall schema)
-    let is_agy =
-        ctx.is_antigravity || (stdin_json.get("conversationId").is_some() && !ctx.is_gemini);
+    let (is_agy, agy_fallback) = detect_antigravity_payload(&ctx, &stdin_json);
+    if agy_fallback {
+        static AGY_FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+        AGY_FALLBACK_LOGGED.call_once(|| {
+            log::log_warn(
+                "hooks",
+                "gemini.agy_detect_fallback",
+                "Antigravity payload detected via toolCall without ANTIGRAVITY_AGENT; set env at launch",
+            );
+        });
+    }
 
     let payload = if is_agy {
         HookPayload::from_antigravity(stdin_json, hook_name)
@@ -1793,6 +1784,63 @@ mod tests {
     fn test_get_handler_unknown() {
         assert!(get_handler("gemini-unknown").is_none());
         assert!(get_handler("sessionstart").is_none());
+    }
+
+    #[test]
+    fn test_detect_antigravity_via_env() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [
+            ("ANTIGRAVITY_AGENT", "1"),
+            ("HOME", "/home/test"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"sessionId": "abc"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_detect_gemini_session_without_tool_call() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [
+            ("GEMINI_CLI", "1"),
+            ("HOME", "/home/test"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"sessionId": "abc", "conversationId": "legacy"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(!is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_detect_antigravity_tool_call_fallback() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({
+            "conversationId": "6f000787",
+            "toolCall": {"name": "run_command", "args": {}}
+        });
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(fallback);
     }
 
     #[test]
