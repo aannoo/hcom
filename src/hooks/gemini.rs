@@ -866,16 +866,8 @@ fn build_all_permission_patterns() -> Vec<String> {
     patterns
 }
 
-/// Resolve the Gemini config directory.
-///
-/// Priority: GEMINI_CLI_HOME env var (+ .gemini suffix) → tool_config_root()/.gemini
 fn gemini_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join(".gemini");
-    }
-    crate::runtime_env::tool_config_root().join(".gemini")
+    crate::runtime_env::gemini_family_config_dir()
 }
 
 /// Get path to Gemini policies directory.
@@ -1791,13 +1783,10 @@ mod tests {
         use std::collections::HashMap;
         use std::path::PathBuf;
 
-        let env: HashMap<String, String> = [
-            ("ANTIGRAVITY_AGENT", "1"),
-            ("HOME", "/home/test"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let env: HashMap<String, String> = [("ANTIGRAVITY_AGENT", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
         let stdin = serde_json::json!({"sessionId": "abc"});
         let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
@@ -1810,13 +1799,10 @@ mod tests {
         use std::collections::HashMap;
         use std::path::PathBuf;
 
-        let env: HashMap<String, String> = [
-            ("GEMINI_CLI", "1"),
-            ("HOME", "/home/test"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let env: HashMap<String, String> = [("GEMINI_CLI", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
         let stdin = serde_json::json!({"sessionId": "abc", "conversationId": "legacy"});
         let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);

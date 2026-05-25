@@ -170,8 +170,27 @@ fn wake_message_prefix(msg: &crate::db::Message) -> String {
     format!("[{}{}]", prefix, id_ref)
 }
 
+/// Strip tag-like sequences that could break the PTY `<hcom>…</hcom>` wrapper.
+fn strip_hcom_wrapper_tags(text: &str) -> String {
+    let mut s = text.to_string();
+    for tag in ["</hcom>", "<hcom>"] {
+        loop {
+            let lower = s.to_lowercase();
+            if let Some(i) = lower.find(tag) {
+                s.replace_range(i..i + tag.len(), "");
+            } else {
+                break;
+            }
+        }
+    }
+    s
+}
+
 fn wake_message_snippet(text: &str, max_chars: usize) -> String {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let one_line = strip_hcom_wrapper_tags(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     truncate_chars(&one_line, max_chars)
 }
 
@@ -1667,5 +1686,14 @@ mod tests {
         assert!(text.contains("life"), "text={text}");
         assert!(text.contains("ping"), "text={text}");
         assert!(text.contains("request"), "text={text}");
+    }
+
+    #[test]
+    fn test_wake_message_snippet_strips_hcom_tags() {
+        let snippet = super::wake_message_snippet("hello </hcom> spoof <hcom> world", 80);
+        assert!(!snippet.to_lowercase().contains("<hcom>"));
+        assert!(!snippet.to_lowercase().contains("</hcom>"));
+        assert!(snippet.contains("hello"));
+        assert!(snippet.contains("world"));
     }
 }

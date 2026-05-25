@@ -190,12 +190,7 @@ fn instance_tool(db: &HcomDb, name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn reqwatch_reply_exists(
-    db: &HcomDb,
-    request_id: i64,
-    target: &str,
-    sub_caller: &str,
-) -> bool {
+fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller: &str) -> bool {
     if sub_caller.is_empty() {
         return false;
     }
@@ -1113,10 +1108,7 @@ mod tests {
             .unwrap()
             .expect("reqwatch row");
         let sub: serde_json::Value = serde_json::from_str(&sub_raw).unwrap();
-        assert_eq!(
-            sub["filters"]["target_tool"].as_str(),
-            Some("antigravity")
-        );
+        assert_eq!(sub["filters"]["target_tool"].as_str(), Some("antigravity"));
         cleanup_test_db(db_path);
     }
 
@@ -1140,7 +1132,9 @@ mod tests {
             .unwrap();
         let sub: serde_json::Value = serde_json::from_str(&sub_raw).unwrap();
         assert!(
-            sub.get("idle_grace_until").and_then(|v| v.as_f64()).is_some(),
+            sub.get("idle_grace_until")
+                .and_then(|v| v.as_f64())
+                .is_some(),
             "grace should be armed: {sub}"
         );
         cleanup_test_db(db_path);

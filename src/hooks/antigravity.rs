@@ -49,22 +49,12 @@ pub enum SetupError {
     },
 }
 
-/// Helper to get the Gemini configuration directory.
-pub fn gemini_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join(".gemini");
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".gemini"))
-        .unwrap_or_else(|| PathBuf::from(".gemini"))
-}
-
 /// Resolve the path to the Antigravity `hooks.json` file.
 /// Under the split-config design, this resides at `~/.gemini/config/hooks.json`.
 pub fn get_antigravity_hooks_path() -> PathBuf {
-    gemini_config_dir().join("config").join("hooks.json")
+    crate::runtime_env::gemini_family_config_dir()
+        .join("config")
+        .join("hooks.json")
 }
 
 /// Shell wrapper for a single hcom hook subcommand (`gemini-beforeagent`, etc.).
@@ -73,11 +63,22 @@ fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str) -> String {
     format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {subcmd} || exit 0'")
 }
 
+/// Substring present in sessionstart + Stop lockfile shell (verify tests).
+pub(crate) const AGY_SESSION_LOCK_MARK: &str = "agy-session-";
+
 /// PreInvocation sessionstart: once per agy process via lockfile; DB binding is authoritative.
 fn hook_sessionstart_cmd(hcom_cmd: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
     format!(
-        "sh -c 'if [ ! -f /tmp/agy-session-$PPID.lock ]; then touch /tmp/agy-session-$PPID.lock && command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-sessionstart || exit 0; fi'"
+        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; if [ -n \"$parent_pid\" ] && [ ! -f \"$lock\" ]; then touch \"$lock\" && command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-sessionstart || exit 0; fi'",
+        AGY_SESSION_LOCK_MARK
+    )
+}
+
+fn hook_lockfile_cleanup_cmd() -> String {
+    format!(
+        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; [ -n \"$parent_pid\" ] && rm -f \"$lock\" || true'",
+        AGY_SESSION_LOCK_MARK
     )
 }
 
@@ -143,7 +144,7 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
             {
                 "name": "hcom-lockfile-cleanup",
                 "type": "command",
-                "command": "rm -f /tmp/agy-session-$PPID.lock",
+                "command": hook_lockfile_cleanup_cmd(),
                 "timeout": 5000,
                 "description": "Clean up session lockfile"
             }
@@ -291,7 +292,8 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
                 ));
             }
             if !command.contains("gemini-sessionstart")
-                || !command.contains("agy-session-$PPID.lock")
+                || !command.contains(AGY_SESSION_LOCK_MARK)
+                || !command.contains("parent_pid=")
             {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "PreInvocation".to_string(),
@@ -433,10 +435,10 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
             if found_lockfile_cleanup {
                 return Err(VerifyFailReason::HookDuplicated("Stop".to_string()));
             }
-            if !command.contains("agy-session-$PPID.lock") {
+            if !command.contains(AGY_SESSION_LOCK_MARK) || !command.contains("parent_pid=") {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "Stop".to_string(),
-                    cmd_suffix: "agy-session-$PPID.lock".to_string(),
+                    cmd_suffix: "agy-session lockfile cleanup".to_string(),
                 });
             }
             found_lockfile_cleanup = true;
@@ -457,7 +459,7 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     if !found_lockfile_cleanup {
         return Err(VerifyFailReason::HookCommandMissing {
             event: "Stop".to_string(),
-            cmd_suffix: "agy-session-$PPID.lock".to_string(),
+            cmd_suffix: "agy-session lockfile cleanup".to_string(),
         });
     }
 

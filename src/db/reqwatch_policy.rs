@@ -30,10 +30,10 @@ pub(crate) fn reqwatch_notify_decision(
         return ReqwatchNotifyDecision::Proceed;
     }
 
-    let is_listening = event_type == "status"
-        && data.get("status").and_then(|v| v.as_str()) == Some("listening");
-    let is_stopped = event_type == "life"
-        && data.get("action").and_then(|v| v.as_str()) == Some("stopped");
+    let is_listening =
+        event_type == "status" && data.get("status").and_then(|v| v.as_str()) == Some("listening");
+    let is_stopped =
+        event_type == "life" && data.get("action").and_then(|v| v.as_str()) == Some("stopped");
 
     if is_listening {
         let grace_until = sub.get("idle_grace_until").and_then(|v| v.as_f64());

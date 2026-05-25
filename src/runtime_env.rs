@@ -39,6 +39,16 @@ pub(crate) fn build_hcom_command() -> String {
     get_hcom_prefix().join(" ")
 }
 
+/// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).
+pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
+        && !dir.is_empty()
+    {
+        return std::path::PathBuf::from(dir).join(".gemini");
+    }
+    tool_config_root().join(".gemini")
+}
+
 /// Set terminal title via escape codes written to /dev/tty.
 pub(crate) fn set_terminal_title(instance_name: &str) {
     let title = format!("hcom: {}", instance_name);

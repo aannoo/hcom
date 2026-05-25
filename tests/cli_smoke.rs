@@ -367,6 +367,8 @@ fn unknown_command_errors() {
 #[test]
 fn antigravity_e2e_hook_dispatch() {
     let h = Hcom::new();
+    let transcript = tempfile::NamedTempFile::new().expect("temp transcript");
+    let transcript_path = transcript.path().to_string_lossy().to_string();
 
     // Spawn hcom start with HCOM_PROCESS_ID to register a process binding
     let mut start_cmd = h.cmd();
@@ -380,7 +382,7 @@ fn antigravity_e2e_hook_dispatch() {
     // This will bind the session_id "sess-agy-1" to the active instance.
     let session_start_payload = serde_json::json!({
         "conversationId": "sess-agy-1",
-        "transcriptPath": "/tmp/transcript.jsonl",
+        "transcriptPath": transcript_path,
     });
 
     use std::io::Write;
@@ -425,7 +427,7 @@ fn antigravity_e2e_hook_dispatch() {
     // Since the session is bound, it should resolve the instance and execute successfully.
     let before_tool_payload = serde_json::json!({
         "conversationId": "sess-agy-1",
-        "transcriptPath": "/tmp/transcript.jsonl",
+        "transcriptPath": transcript_path,
         "toolCall": {
             "name": "run_command",
             "args": { "CommandLine": "echo hello", "Cwd": "/tmp" }
@@ -480,7 +482,7 @@ fn antigravity_e2e_hook_dispatch() {
 
     let after_tool_payload = serde_json::json!({
         "conversationId": "sess-agy-1",
-        "transcriptPath": "/tmp/transcript.jsonl",
+        "transcriptPath": transcript_path,
         "toolCall": {
             "name": "run_command",
             "args": { "CommandLine": "echo done", "Cwd": "/tmp" }
