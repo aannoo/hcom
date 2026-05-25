@@ -13,8 +13,6 @@ use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LAUNCHING, ST_LISTENI
 pub struct StatusUpdate<'a> {
     pub detail: &'a str,
     pub msg_ts: &'a str,
-    pub launcher_override: Option<&'a str>,
-    pub batch_id_override: Option<&'a str>,
 }
 
 /// Max time between instance creation and session binding before launch is considered failed.
@@ -297,6 +295,10 @@ pub(crate) fn get_or_finalize_launch_failure_detail(
     finalize_launch_failure_detail(db, data, None)
 }
 
+pub(crate) fn get_launch_blocker_detail(data: &InstanceRow) -> Option<String> {
+    extract_launch_failure_detail(data)
+}
+
 pub(crate) fn finalize_launch_failure_detail(
     db: &HcomDb,
     data: &InstanceRow,
@@ -314,6 +316,18 @@ pub(crate) fn finalize_launch_failure_detail(
         } else {
             None
         };
+    }
+
+    if fallback_detail.is_none() {
+        let created_at = data.created_at as i64;
+        let age = if created_at > 0 {
+            now_epoch_i64() - created_at
+        } else {
+            0
+        };
+        if age < LAUNCH_PLACEHOLDER_TIMEOUT {
+            return None;
+        }
     }
 
     let detail = extract_launch_failure_detail(data)
@@ -470,29 +484,15 @@ pub fn set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) {
-    let StatusUpdate {
-        detail,
-        msg_ts,
-        launcher_override,
-        batch_id_override,
-    } = upd;
+    let StatusUpdate { detail, msg_ts } = upd;
 
-    let (current_data, db_error) = match db.get_instance_full(instance_name) {
-        Ok(data) => (data, false),
+    let current_data = match db.get_instance_full(instance_name) {
+        Ok(data) => data,
         Err(e) => {
             eprintln!("[hcom] warn: set_status DB read failed for {instance_name}: {e}");
-            (None, true)
+            None
         }
     };
-    let is_new = if db_error {
-        false
-    } else {
-        current_data
-            .as_ref()
-            .map(|d| d.status_context == "new")
-            .unwrap_or(true)
-    };
-
     let now = now_epoch_i64();
     let mut updates = serde_json::Map::new();
     updates.insert("status".into(), serde_json::json!(status));
@@ -511,37 +511,6 @@ pub fn set_status(
 
     if status_changed {
         crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
-    }
-
-    if is_new {
-        let launcher = launcher_override
-            .map(ToString::to_string)
-            .or_else(|| std::env::var("HCOM_LAUNCHED_BY").ok())
-            .unwrap_or_else(|| "unknown".to_string());
-        let batch_id = batch_id_override
-            .map(ToString::to_string)
-            .or_else(|| std::env::var("HCOM_LAUNCH_BATCH_ID").ok());
-
-        let mut event_data = serde_json::json!({
-            "action": "ready",
-            "by": launcher,
-            "status": status,
-            "context": context,
-        });
-        if let Some(ref bid) = batch_id {
-            event_data["batch_id"] = serde_json::json!(bid);
-        }
-
-        if let Err(e) = db.log_event("life", instance_name, &event_data) {
-            crate::log::log_error("core", "db.error", &format!("ready event: {e}"));
-        }
-
-        if launcher != "unknown"
-            && let Some(ref bid) = batch_id
-            && let Err(e) = db.check_batch_completion(&launcher, bid)
-        {
-            crate::log::log_error("core", "db.error", &format!("batch notification: {e}"));
-        }
     }
 
     let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
@@ -815,6 +784,36 @@ mod tests {
             stored.status_detail,
             "process exited before startup completed (exit code 1)"
         );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_finalize_launch_failure_detail_leaves_fresh_placeholder_launching() {
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("test"));
+        row.insert("status".into(), serde_json::json!(ST_INACTIVE));
+        row.insert("status_context".into(), serde_json::json!("new"));
+        row.insert("created_at".into(), serde_json::json!(now as f64));
+        row.insert("status_time".into(), serde_json::json!(0));
+        row.insert("tool".into(), serde_json::json!("codex"));
+        db.save_instance_named("test", &row).unwrap();
+
+        let data = InstanceRow {
+            name: "test".into(),
+            status: ST_INACTIVE.into(),
+            status_context: "new".into(),
+            created_at: now as f64,
+            ..default_instance()
+        };
+
+        let detail = finalize_launch_failure_detail(&db, &data, None);
+        assert_eq!(detail, None);
+
+        let stored = db.get_instance_full("test").unwrap().unwrap();
+        assert_eq!(stored.status_context, "new");
         cleanup(path);
     }
 

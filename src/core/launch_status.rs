@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::db::HcomDb;
 use crate::instance_lifecycle;
 use rusqlite::params;
+use std::collections::HashSet;
 
 /// Result of a launch wait operation.
 #[derive(Debug, Clone)]
@@ -16,7 +17,11 @@ pub struct LaunchResult {
     pub status: LaunchStatus,
     pub expected: Option<i64>,
     pub ready: Option<i64>,
+    pub failed: Option<i64>,
+    pub blocked: Option<i64>,
     pub instances: Vec<String>,
+    pub failures: Vec<String>,
+    pub blockers: Vec<String>,
     pub launcher: Option<String>,
     pub timestamp: Option<String>,
     pub batch_id: Option<String>,
@@ -28,6 +33,7 @@ pub struct LaunchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchStatus {
     Ready,
+    Blocked,
     Timeout,
     Error,
     NoLaunches,
@@ -37,6 +43,7 @@ impl LaunchStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             LaunchStatus::Ready => "ready",
+            LaunchStatus::Blocked => "blocked",
             LaunchStatus::Timeout => "timeout",
             LaunchStatus::Error => "error",
             LaunchStatus::NoLaunches => "no_launches",
@@ -48,7 +55,11 @@ impl LaunchStatus {
 struct LaunchData {
     expected: i64,
     ready: i64,
+    failed: i64,
+    blocked: i64,
     instances: Vec<String>,
+    failures: Vec<String>,
+    blockers: Vec<String>,
     launcher: String,
     timestamp: String,
     batch_id: Option<String>,
@@ -74,6 +85,166 @@ fn get_ready_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>) {
         };
     let count = instances.len() as i64;
     (count, instances)
+}
+
+fn get_failed_for_batch(
+    db: &HcomDb,
+    batch_id: &str,
+    launcher: &str,
+    batch_event_id: i64,
+    ready_instances: &[String],
+) -> (i64, Vec<String>) {
+    let mut seen = HashSet::new();
+    let mut failures = launch_failed_events_for_batch(db, batch_id, &mut seen);
+    let ready: HashSet<&str> = ready_instances.iter().map(String::as_str).collect();
+
+    for name in get_batch_instance_names(db, batch_id) {
+        if seen.contains(&name) {
+            continue;
+        }
+
+        if let Ok(Some(inst)) = db.get_instance_full(&name)
+            && let Some(detail) =
+                instance_lifecycle::get_or_finalize_launch_failure_detail(db, &inst)
+        {
+            // Back-fill the batch-scoped life event from this CLI process
+            // after row finalization. After this, the failure is visible
+            // to event-stream consumers and subsequent polls find it via
+            // launch_failed_events_for_batch instead of re-scanning the row.
+            emit_row_finalized_event(db, &name, launcher, batch_id, &detail);
+            seen.insert(name.clone());
+            failures.push(format!("{name}: {detail}"));
+            continue;
+        }
+
+        if ready.contains(name.as_str()) {
+            continue;
+        }
+
+        if let Some(detail) = stopped_detail_for_instance(db, &name, batch_event_id) {
+            seen.insert(name.clone());
+            failures.push(format!("{name}: {detail}"));
+        }
+    }
+
+    let count = failures.len() as i64;
+    (count, failures)
+}
+
+/// Emit a batch-scoped `launch_failed` life event from a non-child process
+/// (e.g. `wait_for_launch` running in a user CLI). Matches the shape used by
+/// `HcomDb::emit_launch_failed_event` (which can't be used here because it
+/// reads `HCOM_LAUNCHED_BY`/`HCOM_LAUNCH_BATCH_ID` from env vars that are not
+/// set in this context).
+fn emit_row_finalized_event(db: &HcomDb, name: &str, launcher: &str, batch_id: &str, detail: &str) {
+    let event_data = serde_json::json!({
+        "action": "launch_failed",
+        "by": launcher,
+        "status": "inactive",
+        "context": "launch_failed",
+        "reason": "row_finalized",
+        "detail": detail,
+        "batch_id": batch_id,
+    });
+    let _ = db.log_event("life", name, &event_data);
+}
+
+fn get_blocked_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>) {
+    let conn = db.conn();
+    let mut stmt = match conn.prepare(
+        "SELECT instance, json_extract(data, '$.detail') FROM events \
+         WHERE type = 'life' \
+         AND json_extract(data, '$.action') = 'launch_blocked' \
+         AND json_extract(data, '$.batch_id') = ?",
+    ) {
+        Ok(s) => s,
+        Err(_) => return (0, vec![]),
+    };
+    let blockers: Vec<String> = match stmt.query_map(params![batch_id], |row| {
+        let name: String = row.get(0)?;
+        let detail: Option<String> = row.get(1).ok();
+        Ok(format!(
+            "{}: {}",
+            name,
+            detail.unwrap_or_else(|| "launch blocked".to_string())
+        ))
+    }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => vec![],
+    };
+    let count = blockers.len() as i64;
+    (count, blockers)
+}
+
+fn launch_failed_events_for_batch(
+    db: &HcomDb,
+    batch_id: &str,
+    seen: &mut HashSet<String>,
+) -> Vec<String> {
+    let conn = db.conn();
+    let mut stmt = match conn.prepare(
+        "SELECT instance, json_extract(data, '$.reason'), json_extract(data, '$.detail') FROM events \
+         WHERE type = 'life' \
+         AND json_extract(data, '$.action') = 'launch_failed' \
+         AND json_extract(data, '$.batch_id') = ?",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    match stmt.query_map(rusqlite::params![batch_id], |row| {
+        let name: String = row.get(0)?;
+        let reason: Option<String> = row.get(1).ok();
+        let detail: Option<String> = row.get(2).ok();
+        let text = detail
+            .filter(|s| !s.is_empty())
+            .or(reason.filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "launch failed".to_string());
+        Ok(format!("{name}: {text}"))
+    }) {
+        Ok(rows) => rows
+            .filter_map(|r| r.ok())
+            .filter(|failure| {
+                let Some((name, _)) = failure.split_once(": ") else {
+                    return true;
+                };
+                seen.insert(name.to_string())
+            })
+            .collect(),
+        Err(_) => vec![],
+    }
+}
+
+fn stopped_detail_for_instance(db: &HcomDb, name: &str, batch_event_id: i64) -> Option<String> {
+    // Filter by monotonic event id instead of a string timestamp — format-
+    // agnostic and not coupled to RFC3339 remaining lexicographically
+    // sortable.
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events \
+             WHERE type = 'life' \
+               AND instance = ?1 \
+               AND json_extract(data, '$.action') = 'stopped' \
+               AND id >= ?2 \
+             ORDER BY id ASC LIMIT 1",
+        )
+        .ok()?;
+
+    stmt.query_row(params![name, batch_event_id], |row| {
+        let by: Option<String> = row.get(0).ok();
+        let reason: Option<String> = row.get(1).ok();
+        let mut detail = "launch stopped before it remained ready".to_string();
+        if let Some(reason) = reason.filter(|s| !s.is_empty()) {
+            detail.push_str(": ");
+            detail.push_str(&reason);
+        }
+        if let Some(by) = by.filter(|s| !s.is_empty()) {
+            detail.push_str(" by ");
+            detail.push_str(&by);
+        }
+        Ok(detail)
+    })
+    .ok()
 }
 
 fn get_batch_instance_names(db: &HcomDb, batch_id: &str) -> Vec<String> {
@@ -121,6 +292,7 @@ fn get_batch_failure_details_for_ids(db: &HcomDb, batch_ids: &[String]) -> Vec<S
             };
             if let Some(detail) =
                 instance_lifecycle::get_or_finalize_launch_failure_detail(db, &inst)
+                    .or_else(|| instance_lifecycle::get_launch_blocker_detail(&inst))
             {
                 details.push(format!("{}: {}", name, detail));
             }
@@ -134,15 +306,25 @@ fn get_batch_failure_details_for_ids(db: &HcomDb, batch_ids: &[String]) -> Vec<S
 fn aggregate_batches(batches: &[BatchInfo], launcher: &str) -> LaunchData {
     let total_expected: i64 = batches.iter().map(|b| b.expected).sum();
     let total_ready: i64 = batches.iter().map(|b| b.ready).sum();
+    let total_failed: i64 = batches.iter().map(|b| b.failed).sum();
+    let total_blocked: i64 = batches.iter().map(|b| b.blocked).sum();
     let mut all_instances = Vec::new();
+    let mut all_failures = Vec::new();
+    let mut all_blockers = Vec::new();
     for b in batches {
         all_instances.extend(b.instances.clone());
+        all_failures.extend(b.failures.clone());
+        all_blockers.extend(b.blockers.clone());
     }
     let batch_ids: Vec<String> = batches.iter().map(|b| b.batch_id.clone()).collect();
     LaunchData {
         expected: total_expected,
         ready: total_ready,
+        failed: total_failed,
+        blocked: total_blocked,
         instances: all_instances,
+        failures: all_failures,
+        blockers: all_blockers,
         launcher: launcher.to_string(),
         timestamp: batches
             .first()
@@ -159,7 +341,11 @@ struct BatchInfo {
     launcher: String,
     expected: i64,
     ready: i64,
+    failed: i64,
+    blocked: i64,
     instances: Vec<String>,
+    failures: Vec<String>,
+    blockers: Vec<String>,
     timestamp: String,
 }
 
@@ -175,7 +361,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
 
     let (sql, params): (String, Vec<String>) = if let Some(name) = launcher {
         (
-            "SELECT timestamp, instance as launcher, \
+            "SELECT id, timestamp, instance as launcher, \
                     json_extract(data, '$.batch_id') as batch_id, \
                     json_extract(data, '$.launched') as expected \
              FROM events \
@@ -188,7 +374,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
         )
     } else {
         (
-            "SELECT timestamp, instance as launcher, \
+            "SELECT id, timestamp, instance as launcher, \
                     json_extract(data, '$.batch_id') as batch_id, \
                     json_extract(data, '$.launched') as expected \
              FROM events \
@@ -201,13 +387,14 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
     };
 
     let mut stmt = conn.prepare(&sql).ok()?;
-    let launches: Vec<(String, String, String, i64)> = if params.is_empty() {
+    let launches: Vec<(i64, String, String, String, i64)> = if params.is_empty() {
         stmt.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4).unwrap_or(0),
             ))
         })
         .ok()?
@@ -216,10 +403,11 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
     } else {
         stmt.query_map(rusqlite::params![params[0]], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4).unwrap_or(0),
             ))
         })
         .ok()?
@@ -233,14 +421,21 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
 
     // Build batch info with ready counts
     let mut batches: Vec<BatchInfo> = Vec::new();
-    for (ts, lnchr, batch_id, expected) in &launches {
+    for (batch_event_id, ts, lnchr, batch_id, expected) in &launches {
         let (ready_count, ready_instances) = get_ready_for_batch(db, batch_id);
+        let (failed_count, failures) =
+            get_failed_for_batch(db, batch_id, lnchr, *batch_event_id, &ready_instances);
+        let (blocked_count, blockers) = get_blocked_for_batch(db, batch_id);
         batches.push(BatchInfo {
             batch_id: batch_id.clone(),
             launcher: lnchr.clone(),
             expected: *expected,
             ready: ready_count,
+            failed: failed_count,
+            blocked: blocked_count,
             instances: ready_instances,
+            failures,
+            blockers,
             timestamp: ts.clone(),
         });
     }
@@ -264,7 +459,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
     // Priority 1: pending batches (ready < expected) that are recent
     let pending: Vec<&BatchInfo> = batches
         .iter()
-        .filter(|b| b.ready < b.expected && ts_epoch(&b.timestamp) > cutoff)
+        .filter(|b| b.ready + b.failed + b.blocked < b.expected && ts_epoch(&b.timestamp) > cutoff)
         .collect();
     if !pending.is_empty() {
         let owned: Vec<BatchInfo> = pending
@@ -274,7 +469,11 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
                 launcher: b.launcher.clone(),
                 expected: b.expected,
                 ready: b.ready,
+                failed: b.failed,
+                blocked: b.blocked,
                 instances: b.instances.clone(),
+                failures: b.failures.clone(),
+                blockers: b.blockers.clone(),
                 timestamp: b.timestamp.clone(),
             })
             .collect();
@@ -294,7 +493,11 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
                 launcher: b.launcher.clone(),
                 expected: b.expected,
                 ready: b.ready,
+                failed: b.failed,
+                blocked: b.blocked,
                 instances: b.instances.clone(),
+                failures: b.failures.clone(),
+                blockers: b.blockers.clone(),
                 timestamp: b.timestamp.clone(),
             })
             .collect();
@@ -306,7 +509,11 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
     Some(LaunchData {
         expected: first.expected,
         ready: first.ready,
+        failed: first.failed,
+        blocked: first.blocked,
         instances: first.instances.clone(),
+        failures: first.failures.clone(),
+        blockers: first.blockers.clone(),
         launcher: effective_launcher,
         timestamp: first.timestamp.clone(),
         batch_id: Some(first.batch_id.clone()),
@@ -324,7 +531,8 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
     // Get aggregated launch info for this batch_id prefix
     let mut stmt = conn
         .prepare(
-            "SELECT MIN(timestamp) as timestamp, \
+            "SELECT MIN(id) as batch_event_id, \
+                MIN(timestamp) as timestamp, \
                 instance as launcher, \
                 json_extract(data, '$.batch_id') as batch_id, \
                 SUM(json_extract(data, '$.launched')) as expected \
@@ -337,25 +545,38 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
         .ok()?;
 
     let like_pattern = format!("{}%", batch_id);
-    let row: Option<(String, String, String, i64)> = stmt
+    let row: Option<(i64, String, String, String, i64)> = stmt
         .query_row(rusqlite::params![like_pattern], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4).unwrap_or(0),
             ))
         })
         .ok();
 
-    let (timestamp, launcher, resolved_batch_id, expected) = row?;
+    let (batch_event_id, timestamp, launcher, resolved_batch_id, expected) = row?;
 
     let (ready_count, ready_instances) = get_ready_for_batch(db, &resolved_batch_id);
+    let (failed_count, failures) = get_failed_for_batch(
+        db,
+        &resolved_batch_id,
+        &launcher,
+        batch_event_id,
+        &ready_instances,
+    );
+    let (blocked_count, blockers) = get_blocked_for_batch(db, &resolved_batch_id);
 
     Some(LaunchData {
         expected,
         ready: ready_count,
+        failed: failed_count,
+        blocked: blocked_count,
         instances: ready_instances,
+        failures,
+        blockers,
         launcher,
         timestamp,
         batch_id: Some(resolved_batch_id),
@@ -402,7 +623,11 @@ pub fn wait_for_launch(
                 status: LaunchStatus::NoLaunches,
                 expected: None,
                 ready: None,
+                failed: None,
+                blocked: None,
                 instances: vec![],
+                failures: vec![],
+                blockers: vec![],
                 launcher: None,
                 timestamp: None,
                 batch_id: None,
@@ -417,7 +642,11 @@ pub fn wait_for_launch(
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
-    while status_data.ready < status_data.expected && start.elapsed() < timeout {
+    while status_data.failed == 0
+        && status_data.blocked == 0
+        && status_data.ready < status_data.expected
+        && start.elapsed() < timeout
+    {
         thread::sleep(Duration::from_millis(500));
 
         match fetch(db) {
@@ -427,7 +656,11 @@ pub fn wait_for_launch(
                     status: LaunchStatus::Error,
                     expected: None,
                     ready: None,
+                    failed: None,
+                    blocked: None,
                     instances: vec![],
+                    failures: vec![],
+                    blockers: vec![],
                     launcher: None,
                     timestamp: None,
                     batch_id: None,
@@ -439,9 +672,38 @@ pub fn wait_for_launch(
         }
     }
 
-    let is_timeout = status_data.ready < status_data.expected;
+    let has_failure = status_data.failed > 0;
+    let has_blocked = status_data.blocked > 0;
+    let is_timeout =
+        status_data.ready + status_data.failed + status_data.blocked < status_data.expected;
 
-    let hint = if is_timeout {
+    let hint = if has_failure {
+        let mut hint = format!(
+            "Launch failed: {}/{} ready, {} failed (batch: {}).",
+            status_data.ready,
+            status_data.expected,
+            status_data.failed,
+            status_data.batch_id.as_deref().unwrap_or("?")
+        );
+        if !status_data.failures.is_empty() {
+            hint.push_str(" Failed instances: ");
+            hint.push_str(&status_data.failures.join("; "));
+        }
+        Some(hint)
+    } else if has_blocked {
+        let mut hint = format!(
+            "Launch blocked: {}/{} ready, {} blocked (batch: {}).",
+            status_data.ready,
+            status_data.expected,
+            status_data.blocked,
+            status_data.batch_id.as_deref().unwrap_or("?")
+        );
+        if !status_data.blockers.is_empty() {
+            hint.push_str(" Blocked instances: ");
+            hint.push_str(&status_data.blockers.join("; "));
+        }
+        Some(hint)
+    } else if is_timeout {
         let batch_ids: Vec<String> = if let Some(ref batches) = status_data.batches {
             batches.clone()
         } else if let Some(ref batch_id) = status_data.batch_id {
@@ -466,14 +728,22 @@ pub fn wait_for_launch(
     };
 
     LaunchResult {
-        status: if is_timeout {
+        status: if has_failure {
+            LaunchStatus::Error
+        } else if has_blocked {
+            LaunchStatus::Blocked
+        } else if is_timeout {
             LaunchStatus::Timeout
         } else {
             LaunchStatus::Ready
         },
         expected: Some(status_data.expected),
         ready: Some(status_data.ready),
+        failed: Some(status_data.failed),
+        blocked: Some(status_data.blocked),
         instances: status_data.instances,
+        failures: status_data.failures,
+        blockers: status_data.blockers,
         launcher: Some(status_data.launcher),
         timestamp: Some(status_data.timestamp),
         batch_id: status_data.batch_id,
@@ -498,8 +768,20 @@ impl LaunchResult {
         if let Some(ready) = self.ready {
             obj.insert("ready".into(), serde_json::json!(ready));
         }
+        if let Some(failed) = self.failed {
+            obj.insert("failed".into(), serde_json::json!(failed));
+        }
+        if let Some(blocked) = self.blocked {
+            obj.insert("blocked".into(), serde_json::json!(blocked));
+        }
         if !self.instances.is_empty() {
             obj.insert("instances".into(), serde_json::json!(self.instances));
+        }
+        if !self.failures.is_empty() {
+            obj.insert("failures".into(), serde_json::json!(self.failures));
+        }
+        if !self.blockers.is_empty() {
+            obj.insert("blockers".into(), serde_json::json!(self.blockers));
         }
         if let Some(ref launcher) = self.launcher {
             obj.insert("launcher".into(), serde_json::json!(launcher));
@@ -515,6 +797,8 @@ impl LaunchResult {
         }
         if let Some(ref hint) = self.hint {
             obj.insert("hint".into(), serde_json::json!(hint));
+        }
+        if self.status == LaunchStatus::Timeout {
             obj.insert("timed_out".into(), serde_json::json!(true));
         }
         if let Some(ref msg) = self.message {
@@ -540,6 +824,7 @@ mod tests {
     #[test]
     fn test_launch_status_as_str() {
         assert_eq!(LaunchStatus::Ready.as_str(), "ready");
+        assert_eq!(LaunchStatus::Blocked.as_str(), "blocked");
         assert_eq!(LaunchStatus::Timeout.as_str(), "timeout");
         assert_eq!(LaunchStatus::Error.as_str(), "error");
         assert_eq!(LaunchStatus::NoLaunches.as_str(), "no_launches");
@@ -551,7 +836,11 @@ mod tests {
             status: LaunchStatus::NoLaunches,
             expected: None,
             ready: None,
+            failed: None,
+            blocked: None,
             instances: vec![],
+            failures: vec![],
+            blockers: vec![],
             launcher: None,
             timestamp: None,
             batch_id: None,
@@ -570,7 +859,11 @@ mod tests {
             status: LaunchStatus::Ready,
             expected: Some(3),
             ready: Some(3),
+            failed: Some(0),
+            blocked: Some(0),
             instances: vec!["luna".into(), "nova".into(), "peso".into()],
+            failures: vec![],
+            blockers: vec![],
             launcher: Some("bigboss".into()),
             timestamp: Some("2024-01-01T00:00:00Z".into()),
             batch_id: Some("batch-123".into()),
@@ -591,7 +884,11 @@ mod tests {
             status: LaunchStatus::Timeout,
             expected: Some(3),
             ready: Some(1),
+            failed: Some(0),
+            blocked: Some(0),
             instances: vec!["luna".into()],
+            failures: vec![],
+            blockers: vec![],
             launcher: Some("bigboss".into()),
             timestamp: Some("2024-01-01T00:00:00Z".into()),
             batch_id: Some("batch-123".into()),
@@ -603,6 +900,242 @@ mod tests {
         assert_eq!(json["status"], "timeout");
         assert_eq!(json["timed_out"], true);
         assert!(json["hint"].as_str().unwrap().contains("Launch failed"));
+    }
+
+    #[test]
+    fn test_wait_for_launch_returns_error_on_launch_failed_event() {
+        let (db, _dir) = make_test_db();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-fail",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "mari",
+            &serde_json::json!({
+                "action": "launch_failed",
+                "batch_id": "batch-fail",
+                "reason": "ready_never_observed",
+                "detail": "readiness was never observed"
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-fail"), 1);
+        assert_eq!(result.status, LaunchStatus::Error);
+        assert_eq!(result.ready, Some(0));
+        assert_eq!(result.failed, Some(1));
+        assert_eq!(
+            result.failures,
+            vec!["mari: readiness was never observed".to_string()]
+        );
+        let json = result.to_json();
+        assert_eq!(json["status"], "error");
+        assert!(json.get("timed_out").is_none());
+    }
+
+    #[test]
+    fn test_wait_for_launch_counts_status_context_launch_failed() {
+        let (db, _dir) = make_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("inactive"));
+        data.insert("status_context".into(), serde_json::json!("launch_failed"));
+        data.insert(
+            "status_detail".into(),
+            serde_json::json!("tool startup failed"),
+        );
+        data.insert(
+            "created_at".into(),
+            serde_json::json!(crate::shared::time::now_epoch_i64()),
+        );
+        db.save_instance_named("mari", &data).unwrap();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-row-fail",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-row-fail"), 1);
+        assert_eq!(result.status, LaunchStatus::Error);
+        assert_eq!(result.ready, Some(0));
+        assert_eq!(result.failed, Some(1));
+        assert_eq!(
+            result.failures,
+            vec!["mari: tool startup failed".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_wait_for_launch_returns_blocked_on_launch_blocked_event() {
+        let (db, _dir) = make_test_db();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-blocked",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "mari",
+            &serde_json::json!({
+                "action": "launch_blocked",
+                "batch_id": "batch-blocked",
+                "detail": "launch blocked: run hcom term mari"
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-blocked"), 1);
+        assert_eq!(result.status, LaunchStatus::Blocked);
+        assert_eq!(result.ready, Some(0));
+        assert_eq!(result.failed, Some(0));
+        assert_eq!(result.blocked, Some(1));
+        assert_eq!(
+            result.blockers,
+            vec!["mari: launch blocked: run hcom term mari".to_string()]
+        );
+        let json = result.to_json();
+        assert_eq!(json["status"], "blocked");
+        assert_eq!(json["blocked"], 1);
+    }
+
+    #[test]
+    fn test_wait_for_launch_ignores_stopped_after_ready() {
+        let (db, _dir) = make_test_db();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-stopped",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "mari",
+            &serde_json::json!({
+                "action": "ready",
+                "batch_id": "batch-stopped",
+                "status": "listening",
+                "context": "ready_observed"
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "mari",
+            &serde_json::json!({
+                "action": "stopped",
+                "by": "pty",
+                "reason": "closed"
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-stopped"), 1);
+        assert_eq!(result.status, LaunchStatus::Ready);
+        assert_eq!(result.ready, Some(1));
+        assert_eq!(result.failed, Some(0));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_wait_for_launch_counts_stopped_before_ready_as_failed() {
+        let (db, _dir) = make_test_db();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-stopped-before-ready",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "mari",
+            &serde_json::json!({
+                "action": "stopped",
+                "by": "pty",
+                "reason": "closed"
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-stopped-before-ready"), 1);
+        assert_eq!(result.status, LaunchStatus::Error);
+        assert_eq!(result.ready, Some(0));
+        assert_eq!(result.failed, Some(1));
+        assert_eq!(
+            result.failures,
+            vec!["mari: launch stopped before it remained ready: closed by pty".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_wait_for_launch_does_not_finalize_fresh_placeholder() {
+        let (db, _dir) = make_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("inactive"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert(
+            "created_at".into(),
+            serde_json::json!(crate::shared::time::now_epoch_i64()),
+        );
+        data.insert("status_time".into(), serde_json::json!(0));
+        data.insert("tool".into(), serde_json::json!("claude"));
+        db.save_instance_named("mari", &data).unwrap();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-fresh-placeholder",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-fresh-placeholder"), 1);
+        assert_eq!(result.status, LaunchStatus::Timeout);
+        assert_eq!(result.ready, Some(0));
+        assert_eq!(result.failed, Some(0));
+        assert!(result.failures.is_empty());
+
+        let stored = db.get_instance_full("mari").unwrap().unwrap();
+        assert_eq!(stored.status_context, "new");
     }
 
     #[test]
@@ -650,7 +1183,11 @@ mod tests {
         data.insert("status_context".into(), serde_json::json!("new"));
         data.insert(
             "created_at".into(),
-            serde_json::json!(crate::shared::time::now_epoch_i64()),
+            serde_json::json!(
+                crate::shared::time::now_epoch_i64()
+                    - crate::instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT
+                    - 1
+            ),
         );
         data.insert("tool".into(), serde_json::json!("codex"));
         data.insert(

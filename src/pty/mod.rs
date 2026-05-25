@@ -516,6 +516,10 @@ pub struct Proxy {
     user_activity_cooldown_ms: u64,
     /// Shared delivery state (for delivery thread)
     delivery_state: Arc<RwLock<ScreenState>>,
+    /// True while launch outcome is still Pending. Cleared by the delivery
+    /// loop once it observes a terminal outcome so this proxy can stop
+    /// computing launch-only signals (e.g. `visible_tail`).
+    launch_phase_active: Arc<AtomicBool>,
     /// Running flag for delivery thread
     running: Arc<AtomicBool>,
     /// Last resize time for debouncing (fix #3)
@@ -653,6 +657,7 @@ impl Proxy {
             last_user_input: Instant::now(),
             user_activity_cooldown_ms,
             delivery_state: Arc::new(RwLock::new(ScreenState::default())),
+            launch_phase_active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
             last_resize: None,
             delivery_handle: None,
@@ -1140,22 +1145,17 @@ impl Proxy {
 
         let exit_code = exit_code_from_status(exit_status);
         let fallback = format!("process exited before startup completed (exit code {exit_code})");
-        let Some(detail) = crate::instance_lifecycle::finalize_launch_failure_detail(
+        // finalize emits the launch_failed life event itself (which carries
+        // both the event log entry and the launcher-side batch notification),
+        // so the early-exit path only needs to clean up its own bookkeeping.
+        if crate::instance_lifecycle::finalize_launch_failure_detail(
             &db,
             &instance,
             Some(&fallback),
-        ) else {
-            return;
-        };
-
-        let launcher = std::env::var("HCOM_LAUNCHED_BY").ok();
-        let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
-        if let (Some(launcher), Some(batch_id)) = (launcher, batch_id)
-            && !launcher.is_empty()
-            && launcher != "unknown"
-            && !batch_id.is_empty()
+        )
+        .is_none()
         {
-            let _ = db.notify_batch_failure(&launcher, &batch_id, instance_name, &detail);
+            return;
         }
 
         if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID")
@@ -1270,6 +1270,13 @@ impl Proxy {
             let input_text = self.screen.get_input_box_text(&self.config.tool);
             state.prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
             state.input_text = input_text;
+            // visible_tail is only consumed by the launch-blocked heuristic;
+            // skip the screen walk + allocation once launch phase is over.
+            state.visible_tail = if self.launch_phase_active.load(Ordering::Acquire) {
+                self.screen.visible_tail(5, 500)
+            } else {
+                None
+            };
             state.last_output = self.screen.last_output_instant();
             state.cols = self.screen.cols();
         }
@@ -1303,6 +1310,7 @@ impl Proxy {
 
         let running = self.running.clone();
         let delivery_state = self.delivery_state.clone();
+        let launch_phase_active = self.launch_phase_active.clone();
         let inject_port = self.inject_server.port();
         let tool = self.config.tool.clone();
         let user_activity_cooldown_ms = self.user_activity_cooldown_ms;
@@ -1379,6 +1387,7 @@ impl Proxy {
             // Create delivery state wrapper
             let state = DeliveryState {
                 screen: delivery_state,
+                launch_phase_active,
                 inject_port,
                 user_activity_cooldown_ms,
             };

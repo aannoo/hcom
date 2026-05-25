@@ -357,6 +357,28 @@ impl ScreenTracker {
         screen.rows(0, cols).collect()
     }
 
+    /// Return a compact tail of visible screen content for launch-blocked diagnostics.
+    pub fn visible_tail(&self, max_lines: usize, max_chars: usize) -> Option<String> {
+        let mut lines: Vec<String> = self
+            .get_screen_lines()
+            .into_iter()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        if lines.len() > max_lines {
+            lines = lines.split_off(lines.len() - max_lines);
+        }
+        let mut text = lines.join("\n");
+        if text.chars().count() > max_chars {
+            text = text.chars().take(max_chars).collect::<String>();
+            text.push_str("...");
+        }
+        Some(text)
+    }
+
     /// Extract Claude input box text.
     ///
     /// Detection based on Claude Code TUI layout:

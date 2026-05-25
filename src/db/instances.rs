@@ -169,17 +169,7 @@ impl HcomDb {
     }
 
     /// Set instance status in the live `instances` row.
-    ///
-    /// Side effect: the first call after instance creation (`status_context == "new"`)
-    /// emits a `life` event with `action: "ready"` and may trigger batch-completion
-    /// notification. For transient TUI-only context, use `set_gate_status()` instead.
     pub fn set_status(&self, name: &str, status: &str, context: &str) -> Result<()> {
-        // Check if this is first status update (status_context="new" → ready event)
-        let is_new = self
-            .get_status(name)?
-            .map(|(_, ctx)| ctx == "new")
-            .unwrap_or(false);
-
         let now = now_epoch_i64();
 
         // Update last_stop heartbeat when entering listening state
@@ -193,11 +183,6 @@ impl HcomDb {
                 "UPDATE instances SET status = ?, status_context = ?, status_time = ? WHERE name = ?",
                 params![status, context, now, name],
             )?;
-        }
-
-        // Emit ready event and batch notification on first status update
-        if is_new && let Err(e) = self.emit_ready_event(name, status, context) {
-            crate::log::log_error("db", "set_status.emit_ready_event", &format!("{e}"));
         }
 
         Ok(())
@@ -964,6 +949,36 @@ mod tests {
             err.to_string().contains("instances"),
             "expected missing instances table error, got: {err:#}"
         );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_set_status_does_not_emit_launch_ready() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, status, status_context) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["luna", "codex", 1.0f64, "inactive", "new"],
+            )
+            .unwrap();
+
+        db.set_status("luna", "listening", "start").unwrap();
+
+        let (status, context) = db.get_status("luna").unwrap().unwrap();
+        assert_eq!(status, "listening");
+        assert_eq!(context, "start");
+
+        let ready_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_count, 0);
+
         cleanup_test_db(db_path);
     }
 

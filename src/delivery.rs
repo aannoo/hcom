@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::db::HcomDb;
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
-use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
+use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
 /// Safely truncate a string to at most `max_chars` characters.
 /// Unlike byte slicing `&s[..n]`, this won't panic on multi-byte UTF-8.
@@ -479,6 +479,11 @@ pub struct ToolConfig {
     pub block_on_user_activity: bool,
     /// Block if approval prompt detected
     pub block_on_approval: bool,
+    /// Whether the launch-readiness gate (separate from the delivery gate)
+    /// requires the on-screen ready pattern. Decoupled from
+    /// `require_ready_prompt` so tools can disable runtime delivery gates and
+    /// still demand the ready pattern at launch time (opencode).
+    pub launch_requires_ready: bool,
 }
 
 impl ToolConfig {
@@ -495,6 +500,7 @@ impl ToolConfig {
             require_prompt_empty: true,
             block_on_user_activity: true,
             block_on_approval: true,
+            launch_requires_ready: false,
         }
     }
 
@@ -515,6 +521,7 @@ impl ToolConfig {
             require_prompt_empty: false,
             block_on_user_activity: true,
             block_on_approval: true,
+            launch_requires_ready: true,
         }
     }
 
@@ -534,6 +541,7 @@ impl ToolConfig {
             require_prompt_empty: true,
             block_on_user_activity: true,
             block_on_approval: true,
+            launch_requires_ready: false,
         }
     }
 
@@ -541,8 +549,9 @@ impl ToolConfig {
     ///
     /// OpenCode delivery is handled by the TypeScript plugin after session bootstrap.
     /// PTY injects the first message to bootstrap the session, then the plugin takes over.
-    /// All gate checks disabled since the bootstrap inject is gated on the ready pattern
-    /// (`ctrl+p commands`) in tool.rs, and subsequent delivery is plugin-controlled.
+    /// Runtime delivery gates stay disabled because bootstrap inject is separately gated
+    /// on the ready pattern (`ctrl+p commands`) in tool.rs, and subsequent delivery is
+    /// plugin-controlled. Launch readiness still requires that ready pattern below.
     pub fn opencode() -> Self {
         Self {
             tool: "opencode".to_string(),
@@ -551,6 +560,10 @@ impl ToolConfig {
             require_prompt_empty: false,
             block_on_user_activity: false,
             block_on_approval: false,
+            // Runtime delivery gates are off, but the launch-readiness check
+            // still waits for the `ctrl+p commands` ready pattern so the
+            // bootstrap inject lands on a usable TUI.
+            launch_requires_ready: true,
         }
     }
 
@@ -565,6 +578,7 @@ impl ToolConfig {
             require_prompt_empty: false,
             block_on_user_activity: false,
             block_on_approval: true,
+            launch_requires_ready: true,
         }
     }
 
@@ -590,8 +604,31 @@ pub struct GateResult {
 /// Shared state for delivery thread
 pub struct DeliveryState {
     pub screen: Arc<std::sync::RwLock<ScreenState>>,
+    /// True while the launch outcome is still Pending. Cleared once any
+    /// terminal outcome (ready/failed/blocked) fires, so the PTY proxy can
+    /// stop computing launch-only signals (e.g. `visible_tail`).
+    pub launch_phase_active: Arc<AtomicBool>,
     pub inject_port: u16,
     pub user_activity_cooldown_ms: u64,
+}
+
+/// Terminal state of a single launch from the PTY delivery loop's perspective.
+///
+/// At most one terminal outcome (Ready/Failed/Blocked) is ever recorded per
+/// loop. The Pending → terminal transition gates `maybe_emit_launch_blocked`
+/// and the PTY-side `visible_tail` computation via `launch_phase_active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchOutcome {
+    Pending,
+    Ready,
+    Failed,
+    Blocked,
+}
+
+impl LaunchOutcome {
+    fn is_pending(&self) -> bool {
+        matches!(self, LaunchOutcome::Pending)
+    }
 }
 
 /// Screen state snapshot for gate checks
@@ -601,6 +638,7 @@ pub struct ScreenState {
     pub approval: bool,
     pub prompt_empty: bool,
     pub input_text: Option<String>,
+    pub visible_tail: Option<String>,
     pub last_user_input: Instant,
     /// Timestamp of last output (for stability-based recovery)
     pub last_output: Instant,
@@ -615,6 +653,7 @@ impl Default for ScreenState {
             approval: false,
             prompt_empty: false,
             input_text: None,
+            visible_tail: None,
             last_user_input: Instant::now(),
             last_output: Instant::now(),
             cols: 80,
@@ -692,6 +731,154 @@ pub(crate) fn evaluate_gate(
         safe: true,
         reason: "ok",
     }
+}
+
+fn launch_ready_observed(config: &ToolConfig, state: &DeliveryState) -> bool {
+    let screen = state.screen.read().unwrap();
+    if config.block_on_approval && screen.approval {
+        return false;
+    }
+    if config.launch_requires_ready && !screen.ready {
+        return false;
+    }
+    if config.require_prompt_empty && !screen.prompt_empty {
+        return false;
+    }
+    true
+}
+
+/// Mark launch phase complete: clears the shared flag so the PTY proxy can
+/// stop publishing launch-only signals.
+fn mark_launch_phase_complete(
+    state: &DeliveryState,
+    outcome: &mut LaunchOutcome,
+    next: LaunchOutcome,
+) {
+    *outcome = next;
+    state.launch_phase_active.store(false, Ordering::Release);
+}
+
+fn emit_launch_ready_once(
+    db: &HcomDb,
+    state: &DeliveryState,
+    current_name: &str,
+    outcome: &mut LaunchOutcome,
+) {
+    if !outcome.is_pending() {
+        return;
+    }
+    if let Err(e) = db.set_status(current_name, ST_LISTENING, "ready_observed") {
+        log_warn(
+            "native",
+            "delivery.launch_ready_status_fail",
+            &format!("Failed to mark launch ready for {}: {}", current_name, e),
+        );
+        return;
+    }
+    if let Err(e) = db.emit_ready_event(current_name, ST_LISTENING, "ready_observed") {
+        log_warn(
+            "native",
+            "delivery.launch_ready_event_fail",
+            &format!("Failed to emit launch ready for {}: {}", current_name, e),
+        );
+        return;
+    }
+    mark_launch_phase_complete(state, outcome, LaunchOutcome::Ready);
+}
+
+fn emit_launch_failed_if_needed(
+    db: &HcomDb,
+    state: &DeliveryState,
+    current_name: &str,
+    outcome: &mut LaunchOutcome,
+    reason: &str,
+) {
+    if !outcome.is_pending() || std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1") {
+        return;
+    }
+    let detail = "launch failed: readiness was never observed before the PTY delivery loop exited";
+    if let Err(e) =
+        db.emit_launch_failed_event(current_name, ST_INACTIVE, "launch_failed", reason, detail)
+    {
+        log_warn(
+            "native",
+            "delivery.launch_failed_event_fail",
+            &format!("Failed to emit launch_failed for {}: {}", current_name, e),
+        );
+    }
+    mark_launch_phase_complete(state, outcome, LaunchOutcome::Failed);
+}
+
+fn emit_launch_blocked_once(
+    db: &HcomDb,
+    state: &DeliveryState,
+    current_name: &str,
+    outcome: &mut LaunchOutcome,
+    detail: &str,
+) {
+    if !outcome.is_pending() || std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1") {
+        return;
+    }
+
+    if let Err(e) = db.set_status(current_name, ST_BLOCKED, "launch_blocked") {
+        log_warn(
+            "native",
+            "delivery.launch_blocked_status_fail",
+            &format!(
+                "Failed to set launch_blocked status for {}: {}",
+                current_name, e
+            ),
+        );
+        return;
+    }
+
+    if let Err(e) = db.emit_launch_blocked_event(
+        current_name,
+        ST_BLOCKED,
+        "launch_blocked",
+        "screen_settled_not_ready",
+        detail,
+    ) {
+        log_warn(
+            "native",
+            "delivery.launch_blocked_event_fail",
+            &format!("Failed to emit launch_blocked for {}: {}", current_name, e),
+        );
+    }
+    mark_launch_phase_complete(state, outcome, LaunchOutcome::Blocked);
+}
+
+fn maybe_emit_launch_blocked(
+    db: &HcomDb,
+    state: &DeliveryState,
+    current_name: &str,
+    current_status: &str,
+    outcome: &mut LaunchOutcome,
+) {
+    const SETTLE_THRESHOLD: Duration = Duration::from_millis(1500);
+
+    if !outcome.is_pending() || current_status == ST_ACTIVE {
+        return;
+    }
+
+    let screen = state.screen.read().unwrap();
+    if screen.last_output.elapsed() < SETTLE_THRESHOLD {
+        return;
+    }
+    let Some(tail) = screen
+        .visible_tail
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return;
+    };
+
+    let detail = format!(
+        "launch blocked: screen settled before readiness; run `hcom term {}`\n{}",
+        current_name, tail
+    );
+    drop(screen);
+    emit_launch_blocked_once(db, state, current_name, outcome, &detail);
 }
 
 /// Inject text to PTY via TCP (text only, no Enter).
@@ -816,7 +1003,11 @@ pub fn run_delivery_loop(
         ),
     );
 
-    // Set initial listening status AFTER resolving authoritative name
+    let mut launch_outcome = LaunchOutcome::Pending;
+
+    // Set initial listening status AFTER resolving authoritative name. This is
+    // runtime state only; launch readiness is emitted explicitly below after
+    // the delivery loop observes a usable screen state.
     if let Err(e) = db.set_status(&current_name, "listening", "start") {
         log_error(
             "native",
@@ -883,6 +1074,19 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
+            if launch_outcome.is_pending() {
+                if launch_ready_observed(config, state) {
+                    emit_launch_ready_once(db, state, &current_name, &mut launch_outcome);
+                } else {
+                    maybe_emit_launch_blocked(
+                        db,
+                        state,
+                        &current_name,
+                        &current_status,
+                        &mut launch_outcome,
+                    );
+                }
+            }
 
             // Wait for notify or timeout
             notify.wait(IDLE_WAIT);
@@ -987,6 +1191,19 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
+            if launch_outcome.is_pending() {
+                if launch_ready_observed(config, state) {
+                    emit_launch_ready_once(db, state, &current_name, &mut launch_outcome);
+                } else {
+                    maybe_emit_launch_blocked(
+                        db,
+                        state,
+                        &current_name,
+                        &current_status,
+                        &mut launch_outcome,
+                    );
+                }
+            }
 
             match delivery_state {
                 State::Idle => {
@@ -1621,6 +1838,14 @@ pub fn run_delivery_loop(
         &format!("Cleaning up instance {}", current_name),
     );
 
+    emit_launch_failed_if_needed(
+        db,
+        state,
+        &current_name,
+        &mut launch_outcome,
+        "ready_never_observed",
+    );
+
     let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
 
     if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
@@ -1726,6 +1951,7 @@ mod tests {
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
         DeliveryState {
             screen: Arc::new(std::sync::RwLock::new(screen)),
+            launch_phase_active: Arc::new(AtomicBool::new(true)),
             inject_port: 0,
             user_activity_cooldown_ms: cooldown_ms,
         }
@@ -1738,6 +1964,7 @@ mod tests {
             approval: false,
             prompt_empty: true,
             input_text: None,
+            visible_tail: None,
             last_user_input: Instant::now() - Duration::from_secs(10),
             last_output: Instant::now() - Duration::from_secs(10),
             cols: 80,
@@ -1825,6 +2052,29 @@ mod tests {
         let result = evaluate_gate(&config, &state, true);
         assert!(!result.safe);
         assert_eq!(result.reason, "prompt_has_text");
+    }
+
+    #[test]
+    fn launch_ready_observed_follows_tool_gate_shape() {
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = true;
+
+        let state = make_state(screen.clone(), 500);
+        assert!(launch_ready_observed(&ToolConfig::codex(), &state));
+        assert!(launch_ready_observed(&ToolConfig::claude(), &state));
+        assert!(!launch_ready_observed(&ToolConfig::opencode(), &state));
+
+        let state = make_state(screen.clone(), 500);
+        assert!(!launch_ready_observed(&ToolConfig::gemini(), &state));
+
+        screen.ready = true;
+        let state = make_state(screen.clone(), 500);
+        assert!(launch_ready_observed(&ToolConfig::opencode(), &state));
+
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+        assert!(!launch_ready_observed(&ToolConfig::codex(), &state));
     }
 
     #[test]

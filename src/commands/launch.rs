@@ -5,6 +5,7 @@
 //! parsers, then delegates to `launcher::launch()`.
 
 use crate::config::HcomConfig;
+use crate::core::launch_status::{self, LaunchStatus};
 use crate::core::tips::{self, LaunchTipsContext};
 use crate::db::HcomDb;
 use crate::hooks::claude_args;
@@ -16,6 +17,9 @@ use crate::shared::HcomContext;
 use crate::tools::{codex_args, gemini_args};
 use anyhow::{Result, bail};
 use serde_json::json;
+use std::time::Instant;
+
+const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 10;
 
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
@@ -121,6 +125,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     background: remote_output.background,
                     run_here: remote_output.run_here,
                     hcom_config: &hcom_config,
+                    inline_readiness_wait_secs: None,
                 };
                 print_launch_feedback(&db, &launch_result, &output)?;
                 return Ok(0);
@@ -168,6 +173,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         background,
         run_here: hcom_flags.run_here,
         hcom_config: &hcom_config,
+        inline_readiness_wait_secs: if ctx.is_inside_ai_tool() && count == 1 {
+            Some(INLINE_SINGLE_LAUNCH_WAIT_SECS)
+        } else {
+            None
+        },
     };
 
     let result = launcher::launch(
@@ -206,6 +216,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     )?;
 
     print_launch_feedback(&db, &result, &output)?;
+    let readiness_state = output
+        .inline_readiness_wait_secs
+        .filter(|_| result.launched == 1)
+        .map(|secs| print_inline_launch_readiness(&db, &result, secs));
 
     // Log summary
     log_info(
@@ -217,7 +231,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         ),
     );
 
-    Ok(if result.failed == 0 { 0 } else { 1 })
+    Ok(match readiness_state {
+        Some(InlineLaunchReadiness::Failed) => 1,
+        Some(InlineLaunchReadiness::Launching) | Some(InlineLaunchReadiness::Blocked) => 2,
+        _ if result.failed == 0 => 0,
+        _ => 1,
+    })
 }
 
 pub(crate) fn prepare_launch_execution(
@@ -687,6 +706,7 @@ pub(crate) struct LaunchOutputContext<'a> {
     pub background: bool,
     pub run_here: Option<bool>,
     pub hcom_config: &'a HcomConfig,
+    pub inline_readiness_wait_secs: Option<u64>,
 }
 
 pub(crate) fn print_launch_feedback(
@@ -730,7 +750,9 @@ pub(crate) fn print_launch_feedback(
         println!("Names: {}", instance_names.join(" "));
     }
     println!("Batch id: {}", result.batch_id);
-    println!("To block until ready or fail (30s timeout), run: hcom events launch");
+    if ctx.inline_readiness_wait_secs.is_none() {
+        println!("To block until ready or fail (30s timeout), run: hcom events launch");
+    }
 
     let launcher_participating = db
         .get_instance_full(ctx.launcher_name)
@@ -756,6 +778,100 @@ pub(crate) fn print_launch_feedback(
         },
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineLaunchReadiness {
+    Ready,
+    Failed,
+    Blocked,
+    Launching,
+}
+
+fn print_inline_launch_readiness(
+    db: &HcomDb,
+    result: &LaunchResult,
+    timeout_secs: u64,
+) -> InlineLaunchReadiness {
+    println!("Waiting up to {timeout_secs}s for launch readiness...");
+    let start = Instant::now();
+    let wait = launch_status::wait_for_launch(db, None, Some(&result.batch_id), timeout_secs);
+    let elapsed_secs = start.elapsed().as_secs_f64();
+
+    let (state, details) = match wait.status {
+        LaunchStatus::Ready => (InlineLaunchReadiness::Ready, Vec::new()),
+        LaunchStatus::Error => (InlineLaunchReadiness::Failed, wait.failures),
+        LaunchStatus::Blocked => (InlineLaunchReadiness::Blocked, wait.blockers),
+        LaunchStatus::Timeout | LaunchStatus::NoLaunches => {
+            (InlineLaunchReadiness::Launching, Vec::new())
+        }
+    };
+
+    println!(
+        "{}",
+        format_inline_launch_readiness(state, result, &wait.instances, elapsed_secs, &details)
+    );
+    state
+}
+
+fn instance_names_from_launch_result(result: &LaunchResult) -> Vec<String> {
+    result
+        .handles
+        .iter()
+        .filter_map(|h| {
+            h.get("instance_name")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn format_inline_launch_readiness(
+    state: InlineLaunchReadiness,
+    result: &LaunchResult,
+    ready_instances: &[String],
+    elapsed_secs: f64,
+    failures: &[String],
+) -> String {
+    let names = instance_names_from_launch_result(result);
+    let target = if names.is_empty() {
+        "agent".to_string()
+    } else {
+        names.join(" ")
+    };
+    let progress = format!("{}/{} ready", ready_instances.len(), result.launched);
+    let elapsed = format!("{elapsed_secs:.1}s");
+
+    match state {
+        InlineLaunchReadiness::Ready => {
+            let ready = if ready_instances.is_empty() {
+                target
+            } else {
+                ready_instances.join(" ")
+            };
+            format!("Launch ready: {ready} ({progress}, {elapsed}).")
+        }
+        InlineLaunchReadiness::Failed => {
+            let detail = if failures.is_empty() {
+                "no failure detail available".to_string()
+            } else {
+                failures.join("; ")
+            };
+            format!("Launch failed: {detail} (batch: {}).", result.batch_id)
+        }
+        InlineLaunchReadiness::Blocked => {
+            let detail = if failures.is_empty() {
+                "human attention needed".to_string()
+            } else {
+                failures.join("; ")
+            };
+            format!("Launch blocked: {detail} (batch: {}).", result.batch_id)
+        }
+        InlineLaunchReadiness::Launching => format!(
+            "Still launching after {elapsed}: {target} ({progress}, batch: {}). Check `hcom list -v` or `hcom events launch {} --timeout 30`.",
+            result.batch_id, result.batch_id
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1110,6 +1226,82 @@ mod tests {
         assert_eq!(parsed.batch_id, "batch-1");
         assert_eq!(parsed.launched, 1);
         assert!(parsed.background);
+    }
+
+    #[test]
+    fn test_format_inline_launch_readiness_ready() {
+        let result = LaunchResult {
+            tool: "codex".to_string(),
+            batch_id: "batch-1".to_string(),
+            launched: 1,
+            failed: 0,
+            background: false,
+            log_files: Vec::new(),
+            handles: vec![serde_json::json!({"instance_name": "luna"})],
+            errors: Vec::new(),
+        };
+
+        let line = format_inline_launch_readiness(
+            InlineLaunchReadiness::Ready,
+            &result,
+            &["luna".to_string()],
+            2.2,
+            &[],
+        );
+
+        assert_eq!(line, "Launch ready: luna (1/1 ready, 2.2s).");
+    }
+
+    #[test]
+    fn test_format_inline_launch_readiness_launching_has_followup_command() {
+        let result = LaunchResult {
+            tool: "gemini".to_string(),
+            batch_id: "batch-2".to_string(),
+            launched: 1,
+            failed: 0,
+            background: false,
+            log_files: Vec::new(),
+            handles: vec![serde_json::json!({"instance_name": "mari"})],
+            errors: Vec::new(),
+        };
+
+        let line = format_inline_launch_readiness(
+            InlineLaunchReadiness::Launching,
+            &result,
+            &[],
+            10.0,
+            &[],
+        );
+
+        assert!(line.contains("Still launching after 10.0s: mari (0/1 ready"));
+        assert!(line.contains("hcom events launch batch-2 --timeout 30"));
+    }
+
+    #[test]
+    fn test_format_inline_launch_readiness_failed_includes_detail() {
+        let result = LaunchResult {
+            tool: "claude".to_string(),
+            batch_id: "batch-3".to_string(),
+            launched: 1,
+            failed: 0,
+            background: true,
+            log_files: Vec::new(),
+            handles: vec![serde_json::json!({"instance_name": "nola"})],
+            errors: Vec::new(),
+        };
+
+        let line = format_inline_launch_readiness(
+            InlineLaunchReadiness::Failed,
+            &result,
+            &[],
+            0.5,
+            &["nola: executable not found".to_string()],
+        );
+
+        assert_eq!(
+            line,
+            "Launch failed: nola: executable not found (batch: batch-3)."
+        );
     }
 
     #[test]

@@ -823,6 +823,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
     }
 
+    // For Codex: probe CODEX_HOME writability synchronously. Sandboxed parent
+    // codex would otherwise spawn a child that hangs on the readonly-state-DB
+    // repair prompt. Failing here lets the parent's sandbox-escalation flow
+    // surface the denial to the user.
+    if matches!(normalized, LaunchTool::Codex) {
+        crate::tools::codex_preprocessing::ensure_codex_home_writable()?;
+    }
+
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized)?;
 

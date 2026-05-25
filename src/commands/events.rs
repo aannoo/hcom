@@ -522,7 +522,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
              \x20 --type TYPE                       message | status | life\n\
              \x20 --status VAL                      listening | active | blocked\n\
              \x20 --context PATTERN                 tool:Bash | deliver:X (supports * wildcard)\n\
-             \x20 --action VAL                      created | started | ready | stopped | batch_launched\n\
+             \x20 --action VAL                      created | started | ready | stopped | batch_launched | launch_failed | launch_blocked\n\
              \x20 --cmd PATTERN                     Shell command (contains, ^prefix, =exact)\n\
              \x20 --file PATH                       File write (*.py for glob, file.py for contains)\n\
              \x20 --collision                        Two agents edit same file within 30s\n\
@@ -750,6 +750,14 @@ fn cmd_events_unsub_remote(db: &HcomDb, device: &str, sub_id: &str) -> i32 {
 }
 
 /// Handle `hcom events launch [batch_id] [--timeout N]`.
+///
+/// Exit codes:
+/// - `0` — batch reached `ready`
+/// - `1` — batch reported `error` or no launches were found (`no_launches`)
+/// - `2` — wait timed out (`timeout`) or batch is `blocked` on user attention
+///
+/// Callers that just want "did it succeed" should check `== 0`. Callers that
+/// distinguish "still in progress" from "broken" should branch on `2` vs `1`.
 fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option<&str>) -> i32 {
     let timeout = args.timeout;
 
@@ -773,10 +781,10 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
         serde_json::to_string(&result_json).unwrap_or_default()
     );
 
-    if result_json.get("status").and_then(|v| v.as_str()) == Some("ready") {
-        0
-    } else {
-        1
+    match result_json.get("status").and_then(|v| v.as_str()) {
+        Some("ready") => 0,
+        Some("timeout") | Some("blocked") => 2,
+        _ => 1,
     }
 }
 

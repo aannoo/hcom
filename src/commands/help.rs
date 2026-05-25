@@ -19,7 +19,7 @@ const FILTER_HELP: &[HelpEntry] = &[
     ),
     (
         "  --action VAL",
-        "created | started | ready | stopped | batch_launched",
+        "created | started | ready | stopped | batch_launched | launch_failed | launch_blocked",
     ),
     (
         "  --cmd PATTERN",
@@ -64,6 +64,17 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ("Shortcuts:", ""),
     ("  --idle NAME", "--agent NAME --status listening"),
     ("  --blocked NAME", "--agent NAME --status blocked"),
+    ("", ""),
+    ("Wait for a launch batch:", ""),
+    (
+        "  events launch [batch_id]",
+        "Block until batch reaches a terminal state (JSON LaunchResult)",
+    ),
+    ("    --timeout SEC", "Max seconds to wait (default: 30)"),
+    (
+        "",
+        "  Exit codes: 0 ready, 1 error/no_launches, 2 timeout/blocked",
+    ),
     ("", ""),
     (
         "Subscribe (next matching event delivered as messages from [hcom-events]):",
@@ -115,7 +126,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ),
     (
         "  life_action",
-        "created, started, ready, stopped, batch_launched",
+        "created, started, ready, stopped, batch_launched, launch_failed, launch_blocked",
     ),
     ("", ""),
     (
@@ -824,6 +835,13 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     }
 
     // Footer
+    lines.push(String::new());
+    lines.push("Exit codes:".to_string());
+    lines.push("    0  Ready (or process spawned with no inline readiness wait)".to_string());
+    lines.push("    1  Spawn error, or one or more instances reported launch_failed".to_string());
+    lines.push(
+        "    2  Still launching after readiness wait, or blocked on user attention".to_string(),
+    );
     lines.push(String::new());
     lines.push(format!("  Run \"{} --help\" for {} options.", t, t));
     lines.push("  Run \"hcom config terminal --info\" for terminal presets.".to_string());

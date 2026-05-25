@@ -1,6 +1,9 @@
 //! Codex launch preprocessing — sandbox flags, DB access, bootstrap injection.
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
+
+use anyhow::{Result, bail};
 
 use crate::paths;
 
@@ -144,6 +147,71 @@ fn codex_supports_bypass_hook_trust() -> bool {
         parse_codex_cli_version(&text)
             .is_some_and(|version| version >= BYPASS_HOOK_TRUST_MIN_VERSION)
     })
+}
+
+/// Resolve `CODEX_HOME` the same way Codex itself does: env var if set and
+/// non-empty, otherwise `~/.codex`.
+fn resolve_codex_home() -> Option<(PathBuf, bool)> {
+    if let Ok(val) = std::env::var("CODEX_HOME")
+        && !val.is_empty()
+    {
+        return Some((PathBuf::from(val), true));
+    }
+    dirs::home_dir().map(|h| (h.join(".codex"), false))
+}
+
+/// Probe whether `CODEX_HOME` is writable before launching codex.
+///
+/// When hcom is invoked from inside a sandboxed parent codex (e.g.
+/// `--sandbox workspace-write`), seatbelt/landlock is inherited by the entire
+/// process chain. The child codex then fails to init its state DB
+/// (SQLITE_READONLY) and hangs on an interactive "Repair Codex local data
+/// now? [y/N]:" prompt with no human to answer.
+///
+/// Catching this synchronously and exiting non-zero with a permission-denied
+/// message lets the parent codex's existing sandbox-escalation flow ("approve
+/// to run unsandboxed?") trigger naturally on the failed shell command,
+/// instead of leaving a brick agent behind.
+pub fn ensure_codex_home_writable() -> Result<()> {
+    let Some((codex_home, explicit_env)) = resolve_codex_home() else {
+        return Ok(());
+    };
+    let probe_dir = if codex_home.exists() {
+        codex_home.as_path()
+    } else if explicit_env {
+        return Ok(());
+    } else {
+        let Some(parent) = codex_home.ancestors().find(|p| p.exists()) else {
+            return Ok(());
+        };
+        parent
+    };
+    let probe = probe_dir.join(".hcom_writable_probe");
+    match std::fs::write(&probe, b"") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => {
+            use std::io::ErrorKind;
+            let denied = matches!(
+                e.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            );
+            if !denied {
+                return Ok(());
+            }
+            bail!(
+                "Operation not permitted: cannot write to CODEX_HOME ({}): {}\n\
+                 The current process is running inside a sandbox that denies writes \
+                 to the codex state directory. If this hcom command was invoked by \
+                 a sandboxed agent (e.g. codex --sandbox workspace-write), approve \
+                 it to run unsandboxed and retry.",
+                codex_home.display(),
+                e
+            );
+        }
+    }
 }
 
 /// Add Codex's runtime hook-trust bypass when supported.
@@ -421,6 +489,12 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, original }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -516,6 +590,45 @@ mod tests {
         let result = ensure_hcom_writable(&tokens);
         let add_dir_count = result.iter().filter(|t| *t == "--add-dir").count();
         assert_eq!(add_dir_count, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_codex_home_writable_probes_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+
+        ensure_codex_home_writable().unwrap();
+
+        assert!(!dir.path().join(".hcom_writable_probe").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_codex_home_writable_skips_missing_explicit_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("missing-codex-home");
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
+
+        ensure_codex_home_writable().unwrap();
+
+        assert!(!codex_home.exists());
+        assert!(!dir.path().join(".hcom_writable_probe").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_codex_home_writable_probes_parent_when_default_home_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let _codex_home_guard = EnvGuard::remove("CODEX_HOME");
+        let _home_guard = EnvGuard::set("HOME", home.to_string_lossy().as_ref());
+
+        ensure_codex_home_writable().unwrap();
+
+        assert!(!home.join(".codex").exists());
+        assert!(!home.join(".hcom_writable_probe").exists());
     }
 
     #[test]

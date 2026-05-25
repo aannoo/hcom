@@ -169,6 +169,7 @@ pub fn do_resume(
             background: remote_output.background,
             run_here: remote_output.run_here,
             hcom_config: &hcom_config,
+            inline_readiness_wait_secs: None,
         };
         print_launch_feedback(&db, &launch_result, &output)?;
         return Ok(0);
@@ -542,6 +543,7 @@ fn execute_prepared_resume(
             background: plan.output.background,
             run_here: plan.output.run_here,
             hcom_config,
+            inline_readiness_wait_secs: None,
         };
         print_launch_feedback(db, &result, &output)?;
         log_info(

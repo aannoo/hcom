@@ -205,32 +205,97 @@ impl HcomDb {
         messages
     }
 
-    /// Emit "ready" life event and check for batch completion notification.
-    ///
-    /// Called on first status update (when status_context was "new").
-    pub(super) fn emit_ready_event(&self, name: &str, status: &str, context: &str) -> Result<()> {
+    /// Build the shared envelope every launch-lifecycle life event uses
+    /// (`{action, by, status, context, [reason], [detail], [batch_id]}`) and
+    /// write it to the events table. Returns `(launcher, batch_id)` so the
+    /// caller can decide whether to push a follow-up notification.
+    fn emit_launch_lifecycle_event(
+        &self,
+        name: &str,
+        action: &str,
+        status: &str,
+        context: &str,
+        reason: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
         let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
         let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
 
         let mut event_data = serde_json::json!({
-            "action": "ready",
-            "by": launcher,
+            "action": action,
+            "by": &launcher,
             "status": status,
             "context": context,
         });
+        if let Some(reason) = reason.filter(|s| !s.is_empty()) {
+            event_data["reason"] = serde_json::Value::String(reason.to_string());
+        }
+        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+            event_data["detail"] = serde_json::Value::String(detail.to_string());
+        }
         if let Some(ref bid) = batch_id {
             event_data["batch_id"] = serde_json::Value::String(bid.clone());
         }
 
         self.log_event_with_ts("life", name, &event_data, None)?;
+        Ok((launcher, batch_id))
+    }
 
-        // Check batch completion and send launcher notification
+    /// Emit "ready" life event and check for batch completion notification.
+    ///
+    /// Called on first status update (when status_context was "new").
+    pub(crate) fn emit_ready_event(&self, name: &str, status: &str, context: &str) -> Result<()> {
+        let (launcher, batch_id) =
+            self.emit_launch_lifecycle_event(name, "ready", status, context, None, None)?;
         if launcher != "unknown"
             && let Some(ref bid) = batch_id
         {
             self.check_batch_completion(&launcher, bid)?;
         }
+        Ok(())
+    }
 
+    pub(crate) fn emit_launch_failed_event(
+        &self,
+        name: &str,
+        status: &str,
+        context: &str,
+        reason: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let (launcher, batch_id) = self.emit_launch_lifecycle_event(
+            name,
+            "launch_failed",
+            status,
+            context,
+            Some(reason),
+            Some(detail),
+        )?;
+        if launcher != "unknown"
+            && let Some(ref bid) = batch_id
+        {
+            let notify_detail = if detail.is_empty() { reason } else { detail };
+            self.notify_batch_failure(&launcher, bid, name, notify_detail)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn emit_launch_blocked_event(
+        &self,
+        name: &str,
+        status: &str,
+        context: &str,
+        reason: &str,
+        detail: &str,
+    ) -> Result<()> {
+        self.emit_launch_lifecycle_event(
+            name,
+            "launch_blocked",
+            status,
+            context,
+            Some(reason),
+            Some(detail),
+        )?;
         Ok(())
     }
 
