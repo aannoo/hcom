@@ -106,9 +106,10 @@ impl LaunchBackend {
         match tool {
             LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
             LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode | LaunchTool::Antigravity => {
-                LaunchBackend::HeadlessPty
-            }
+            LaunchTool::Gemini
+            | LaunchTool::Codex
+            | LaunchTool::OpenCode
+            | LaunchTool::Antigravity => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -404,7 +405,9 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
                 return Ok(());
             }
-            if let Err(e) = crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions) {
+            if let Err(e) =
+                crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
+            {
                 let diag = install_diag_context(
                     tool,
                     &[(
@@ -1548,7 +1551,12 @@ mod tests {
     #[test]
     fn test_launch_backend_resolve_other_tools_headless() {
         // gemini/codex/opencode + --headless → HeadlessPty (unchanged from today).
-        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode, LaunchTool::Antigravity] {
+        for tool in [
+            LaunchTool::Gemini,
+            LaunchTool::Codex,
+            LaunchTool::OpenCode,
+            LaunchTool::Antigravity,
+        ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true, true),
                 LaunchBackend::HeadlessPty,

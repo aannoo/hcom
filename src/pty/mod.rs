@@ -713,7 +713,9 @@ impl Proxy {
         use std::str::FromStr;
 
         let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
-            Ok(Tool::Claude) | Ok(Tool::Codex) => Duration::from_secs(5), // Ready pattern unreliable (Claude: accept-edits, Codex: narrow terminals)
+            Ok(Tool::Claude) | Ok(Tool::Codex) | Ok(Tool::Antigravity) => {
+                Duration::from_secs(5) // ? for shortcuts footer (Claude/Codex/agy)
+            }
             Ok(Tool::OpenCode) => Duration::from_secs(5), // Empty ready_pattern fires immediately; 5s fallback
             _ => Duration::from_secs(60),                 // Gemini: ready pattern always visible
         };

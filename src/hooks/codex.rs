@@ -43,7 +43,14 @@ const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("PostToolUse", "codex-posttooluse", Some("Bash")),
     ("Stop", "codex-stop", None),
 ];
-const HCOM_TOOL_NAMES: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity", "agy"];
+const HCOM_TOOL_NAMES: &[&str] = &[
+    "claude",
+    "gemini",
+    "codex",
+    "opencode",
+    "antigravity",
+    "agy",
+];
 const CODEX_HOOKS_FEATURE_RENAME_VERSION: (u64, u64, u64) = (0, 129, 0);
 const CODEX_HOOK_TRUST_MIN_VERSION: (u64, u64, u64) = (0, 131, 0);
 const HCOM_CODEX_CLI_VERSION_KEY: &str = "hcom_codex_cli_version";

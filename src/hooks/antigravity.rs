@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyFailReason {
@@ -10,10 +10,7 @@ pub enum VerifyFailReason {
     #[error("hook event '{0}' missing or empty")]
     HookEventMissing(String),
     #[error("hcom hook command '{cmd_suffix}' not found under event '{event}'")]
-    HookCommandMissing {
-        event: String,
-        cmd_suffix: String,
-    },
+    HookCommandMissing { event: String, cmd_suffix: String },
     #[error("event '{0}': hcom entry has 'type' != \"command\"")]
     HookTypeFieldNotCommand(String),
     #[error("event '{event}' name mismatch: expected {expected:?}, got {actual:?}")]
@@ -180,11 +177,9 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
         }
     })?;
 
-    verify_hooks_at(&hooks_path).map_err(|reason| {
-        SetupError::PostWriteVerifyFailed {
-            path: hooks_path,
-            reason,
-        }
+    verify_hooks_at(&hooks_path).map_err(|reason| SetupError::PostWriteVerifyFailed {
+        path: hooks_path,
+        reason,
     })?;
 
     Ok(())
@@ -233,39 +228,58 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     if !path.exists() {
         return Err(VerifyFailReason::SettingsUnreadableOrEmpty);
     }
-    let content = std::fs::read_to_string(path).map_err(|_| VerifyFailReason::SettingsUnreadableOrEmpty)?;
-    let val: Value = serde_json::from_str(&content).map_err(|_| VerifyFailReason::SettingsUnreadableOrEmpty)?;
-    let root = val.as_object().ok_or(VerifyFailReason::SettingsUnreadableOrEmpty)?;
+    let content =
+        std::fs::read_to_string(path).map_err(|_| VerifyFailReason::SettingsUnreadableOrEmpty)?;
+    let val: Value =
+        serde_json::from_str(&content).map_err(|_| VerifyFailReason::SettingsUnreadableOrEmpty)?;
+    let root = val
+        .as_object()
+        .ok_or(VerifyFailReason::SettingsUnreadableOrEmpty)?;
 
-    let lifecycle = root.get("hcom-lifecycle")
+    let lifecycle = root
+        .get("hcom-lifecycle")
         .and_then(|v| v.as_object())
         .ok_or(VerifyFailReason::HcomLifecycleKeyMissing)?;
 
     // Check PreInvocation
-    let pre_invocation = lifecycle.get("PreInvocation")
+    let pre_invocation = lifecycle
+        .get("PreInvocation")
         .and_then(|v| v.as_array())
         .ok_or_else(|| VerifyFailReason::HookEventMissing("PreInvocation".to_string()))?;
 
     let mut found_sessionstart = false;
     let mut found_beforeagent = false;
     for hook in pre_invocation {
-        let hook_obj = hook.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PreInvocation".to_string()))?;
+        let hook_obj = hook.as_object().ok_or_else(|| {
+            VerifyFailReason::HookTypeFieldNotCommand("PreInvocation".to_string())
+        })?;
         let name = hook_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let command = hook_obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let command = hook_obj
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let hook_type = hook_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        
+
         if hook_type != "command" {
-            return Err(VerifyFailReason::HookTypeFieldNotCommand("PreInvocation".to_string()));
+            return Err(VerifyFailReason::HookTypeFieldNotCommand(
+                "PreInvocation".to_string(),
+            ));
         }
         if hook_obj.get("timeout").and_then(|v| v.as_u64()).is_none() {
-            return Err(VerifyFailReason::HookTimeoutMissing { event: "PreInvocation".to_string() });
+            return Err(VerifyFailReason::HookTimeoutMissing {
+                event: "PreInvocation".to_string(),
+            });
         }
 
         if name == "hcom-sessionstart" {
             if found_sessionstart {
-                return Err(VerifyFailReason::HookDuplicated("PreInvocation".to_string()));
+                return Err(VerifyFailReason::HookDuplicated(
+                    "PreInvocation".to_string(),
+                ));
             }
-            if !command.contains("gemini-sessionstart") || !command.contains("agy-session-$PPID.lock") {
+            if !command.contains("gemini-sessionstart")
+                || !command.contains("agy-session-$PPID.lock")
+            {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "PreInvocation".to_string(),
                     cmd_suffix: "gemini-sessionstart".to_string(),
@@ -274,7 +288,9 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
             found_sessionstart = true;
         } else if name == "hcom-beforeagent" {
             if found_beforeagent {
-                return Err(VerifyFailReason::HookDuplicated("PreInvocation".to_string()));
+                return Err(VerifyFailReason::HookDuplicated(
+                    "PreInvocation".to_string(),
+                ));
             }
             if !command.contains("gemini-beforeagent") {
                 return Err(VerifyFailReason::HookCommandMissing {
@@ -299,26 +315,38 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     }
 
     // Check PostInvocation
-    let post_invocation = lifecycle.get("PostInvocation")
+    let post_invocation = lifecycle
+        .get("PostInvocation")
         .and_then(|v| v.as_array())
         .ok_or_else(|| VerifyFailReason::HookEventMissing("PostInvocation".to_string()))?;
     let mut found_afteragent = false;
     for hook in post_invocation {
-        let hook_obj = hook.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PostInvocation".to_string()))?;
+        let hook_obj = hook.as_object().ok_or_else(|| {
+            VerifyFailReason::HookTypeFieldNotCommand("PostInvocation".to_string())
+        })?;
         let name = hook_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let command = hook_obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let command = hook_obj
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let hook_type = hook_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         if hook_type != "command" {
-            return Err(VerifyFailReason::HookTypeFieldNotCommand("PostInvocation".to_string()));
+            return Err(VerifyFailReason::HookTypeFieldNotCommand(
+                "PostInvocation".to_string(),
+            ));
         }
         if hook_obj.get("timeout").and_then(|v| v.as_u64()).is_none() {
-            return Err(VerifyFailReason::HookTimeoutMissing { event: "PostInvocation".to_string() });
+            return Err(VerifyFailReason::HookTimeoutMissing {
+                event: "PostInvocation".to_string(),
+            });
         }
 
         if name == "hcom-afteragent" {
             if found_afteragent {
-                return Err(VerifyFailReason::HookDuplicated("PostInvocation".to_string()));
+                return Err(VerifyFailReason::HookDuplicated(
+                    "PostInvocation".to_string(),
+                ));
             }
             if !command.contains("gemini-afteragent") {
                 return Err(VerifyFailReason::HookCommandMissing {
@@ -337,23 +365,33 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     }
 
     // Check Stop
-    let stop = lifecycle.get("Stop")
+    let stop = lifecycle
+        .get("Stop")
         .and_then(|v| v.as_array())
         .ok_or_else(|| VerifyFailReason::HookEventMissing("Stop".to_string()))?;
     let mut found_partner_teardown = false;
     let mut found_sessionend = false;
     let mut found_lockfile_cleanup = false;
     for hook in stop {
-        let hook_obj = hook.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("Stop".to_string()))?;
+        let hook_obj = hook
+            .as_object()
+            .ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("Stop".to_string()))?;
         let name = hook_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let command = hook_obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let command = hook_obj
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let hook_type = hook_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         if hook_type != "command" {
-            return Err(VerifyFailReason::HookTypeFieldNotCommand("Stop".to_string()));
+            return Err(VerifyFailReason::HookTypeFieldNotCommand(
+                "Stop".to_string(),
+            ));
         }
         if hook_obj.get("timeout").and_then(|v| v.as_u64()).is_none() {
-            return Err(VerifyFailReason::HookTimeoutMissing { event: "Stop".to_string() });
+            return Err(VerifyFailReason::HookTimeoutMissing {
+                event: "Stop".to_string(),
+            });
         }
 
         if name == "hcom-partner-teardown" {
@@ -411,13 +449,19 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     }
 
     // Check PreToolUse
-    let pre_tool_use = lifecycle.get("PreToolUse")
+    let pre_tool_use = lifecycle
+        .get("PreToolUse")
         .and_then(|v| v.as_array())
         .ok_or_else(|| VerifyFailReason::HookEventMissing("PreToolUse".to_string()))?;
     let mut found_beforetool = false;
     for matcher_val in pre_tool_use {
-        let matcher_obj = matcher_val.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string()))?;
-        let matcher_pattern = matcher_obj.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
+        let matcher_obj = matcher_val
+            .as_object()
+            .ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string()))?;
+        let matcher_pattern = matcher_obj
+            .get("matcher")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if matcher_pattern != ".*" {
             return Err(VerifyFailReason::HookMatcherMismatch {
                 event: "PreToolUse".to_string(),
@@ -425,18 +469,30 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
                 actual: matcher_pattern.to_string(),
             });
         }
-        let hooks_arr = matcher_obj.get("hooks").and_then(|v| v.as_array()).ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string()))?;
+        let hooks_arr = matcher_obj
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string()))?;
         for hook in hooks_arr {
-            let hook_obj = hook.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string()))?;
+            let hook_obj = hook.as_object().ok_or_else(|| {
+                VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string())
+            })?;
             let name = hook_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let command = hook_obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let command = hook_obj
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let hook_type = hook_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if hook_type != "command" {
-                return Err(VerifyFailReason::HookTypeFieldNotCommand("PreToolUse".to_string()));
+                return Err(VerifyFailReason::HookTypeFieldNotCommand(
+                    "PreToolUse".to_string(),
+                ));
             }
             if hook_obj.get("timeout").and_then(|v| v.as_u64()).is_none() {
-                return Err(VerifyFailReason::HookTimeoutMissing { event: "PreToolUse".to_string() });
+                return Err(VerifyFailReason::HookTimeoutMissing {
+                    event: "PreToolUse".to_string(),
+                });
             }
 
             if name == "hcom-beforetool" {
@@ -461,13 +517,19 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     }
 
     // Check PostToolUse
-    let post_tool_use = lifecycle.get("PostToolUse")
+    let post_tool_use = lifecycle
+        .get("PostToolUse")
         .and_then(|v| v.as_array())
         .ok_or_else(|| VerifyFailReason::HookEventMissing("PostToolUse".to_string()))?;
     let mut found_aftertool = false;
     for matcher_val in post_tool_use {
-        let matcher_obj = matcher_val.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string()))?;
-        let matcher_pattern = matcher_obj.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
+        let matcher_obj = matcher_val
+            .as_object()
+            .ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string()))?;
+        let matcher_pattern = matcher_obj
+            .get("matcher")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if matcher_pattern != ".*" {
             return Err(VerifyFailReason::HookMatcherMismatch {
                 event: "PostToolUse".to_string(),
@@ -475,18 +537,30 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
                 actual: matcher_pattern.to_string(),
             });
         }
-        let hooks_arr = matcher_obj.get("hooks").and_then(|v| v.as_array()).ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string()))?;
+        let hooks_arr = matcher_obj
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string()))?;
         for hook in hooks_arr {
-            let hook_obj = hook.as_object().ok_or_else(|| VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string()))?;
+            let hook_obj = hook.as_object().ok_or_else(|| {
+                VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string())
+            })?;
             let name = hook_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let command = hook_obj.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let command = hook_obj
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let hook_type = hook_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if hook_type != "command" {
-                return Err(VerifyFailReason::HookTypeFieldNotCommand("PostToolUse".to_string()));
+                return Err(VerifyFailReason::HookTypeFieldNotCommand(
+                    "PostToolUse".to_string(),
+                ));
             }
             if hook_obj.get("timeout").and_then(|v| v.as_u64()).is_none() {
-                return Err(VerifyFailReason::HookTimeoutMissing { event: "PostToolUse".to_string() });
+                return Err(VerifyFailReason::HookTimeoutMissing {
+                    event: "PostToolUse".to_string(),
+                });
             }
 
             if name == "hcom-aftertool" {
@@ -565,7 +639,11 @@ mod tests {
                 ]
             }
         });
-        std::fs::write(&hooks_path, serde_json::to_string_pretty(&pre_existing).unwrap()).unwrap();
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&pre_existing).unwrap(),
+        )
+        .unwrap();
 
         // Setup antigravity hooks
         try_setup_antigravity_hooks(false).unwrap();
@@ -575,7 +653,10 @@ mod tests {
         let root: Value = serde_json::from_str(&content).unwrap();
 
         assert!(root.get("hcom-lifecycle").is_some());
-        assert_eq!(root["guard-shell"]["PreToolUse"][0]["hooks"][0]["name"], "guard-shell");
+        assert_eq!(
+            root["guard-shell"]["PreToolUse"][0]["hooks"][0]["name"],
+            "guard-shell"
+        );
     }
 
     #[test]
@@ -615,7 +696,11 @@ mod tests {
                 "PreToolUse": []
             }
         });
-        std::fs::write(&hooks_path, serde_json::to_string_pretty(&pre_existing).unwrap()).unwrap();
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&pre_existing).unwrap(),
+        )
+        .unwrap();
 
         try_setup_antigravity_hooks(false).unwrap();
         assert!(remove_antigravity_hooks());

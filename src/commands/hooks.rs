@@ -41,7 +41,8 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
         .to_string_lossy()
         .to_string();
 
-    let antigravity_installed = crate::hooks::antigravity::verify_antigravity_hooks_installed(false);
+    let antigravity_installed =
+        crate::hooks::antigravity::verify_antigravity_hooks_installed(false);
     let antigravity_path = crate::hooks::antigravity::get_antigravity_hooks_path()
         .to_string_lossy()
         .to_string();
@@ -111,7 +112,9 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                     && crate::hooks::codex::codex_current_feature_enabled()
             }
             "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
-            "antigravity" => crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions),
+            "antigravity" => {
+                crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
+            }
             _ => false,
         };
         if already {
@@ -136,10 +139,12 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 Ok(false) => AddResult::Failed(None),
                 Err(e) => AddResult::Failed(Some(e.to_string())),
             },
-            "antigravity" => match crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions) {
-                Ok(()) => AddResult::Added,
-                Err(e) => AddResult::Failed(Some(e.to_string())),
-            },
+            "antigravity" => {
+                match crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions) {
+                    Ok(()) => AddResult::Added,
+                    Err(e) => AddResult::Failed(Some(e.to_string())),
+                }
+            }
             _ => AddResult::Failed(None),
         };
         results.push((tool, outcome));
@@ -303,7 +308,15 @@ mod tests {
         // (unless running inside one, which is fine — it'll detect it)
         let tool = detect_current_tool();
         assert!(
-            ["claude", "gemini", "codex", "opencode", "antigravity", "adhoc"].contains(&tool),
+            [
+                "claude",
+                "gemini",
+                "codex",
+                "opencode",
+                "antigravity",
+                "adhoc"
+            ]
+            .contains(&tool),
             "unexpected tool: {tool}"
         );
     }

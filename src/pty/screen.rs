@@ -344,7 +344,7 @@ impl ScreenTracker {
             Ok(Tool::Gemini) => self.get_gemini_input_text(),
             Ok(Tool::Codex) => self.get_codex_input_text(),
             Ok(Tool::OpenCode) => None, // OpenCode: plugin handles delivery, no PTY input detection needed
-            Ok(Tool::Antigravity) => Some(String::new()),
+            Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -551,6 +551,42 @@ impl ScreenTracker {
         None // Prompt not found
     }
 
+    /// Extract Antigravity (`agy`) input text.
+    ///
+    /// The agy TUI uses a `>` prompt (with or without a trailing space). Only the
+    /// bottommost prompt line is considered; scrollback may contain older `> …` lines.
+    fn get_antigravity_input_text(&self) -> Option<String> {
+        let lines = self.get_screen_lines();
+
+        if let Some((row_idx, text)) = lines.iter().enumerate().rev().find_map(|(row_idx, line)| {
+            let trimmed = line.trim_start();
+            let after = trimmed.strip_prefix('>')?.trim_start();
+            Some((row_idx, trim_with_nbsp(after)))
+        }) {
+            if text.is_empty() {
+                return Some(String::new());
+            }
+
+            return match self.is_dim_after_prompt(row_idx as u16, ">") {
+                Some(true) => Some(String::new()),
+                Some(false) => Some(text.to_string()),
+                None => {
+                    if self.is_ready() {
+                        Some(String::new())
+                    } else {
+                        Some(text.to_string())
+                    }
+                }
+            };
+        }
+
+        if self.is_ready() {
+            return Some(String::new());
+        }
+
+        None
+    }
+
     /// Check and perform periodic dump if 5 seconds elapsed
     /// Returns true if dump was performed
     pub fn check_periodic_dump(&mut self, tool: &str, inject_port: u16, label: &str) -> bool {
@@ -611,22 +647,29 @@ impl ScreenTracker {
                     Ok(Tool::Claude) => Some("❯"),
                     Ok(Tool::Codex) => Some("›"),
                     Ok(Tool::Gemini) => Some(">"),
-                    Ok(Tool::Antigravity) => None,
+                    Ok(Tool::Antigravity) => Some(">"),
                     _ => None,
                 };
                 if let Some(pc) = prompt_char {
-                    let should_dump = match pc {
-                        ">" => trimmed.contains("│ >"),
+                    let should_dump = match (Tool::from_str(tool), pc) {
+                        (Ok(Tool::Gemini), ">") => trimmed.contains("│ >"),
+                        (Ok(Tool::Antigravity), ">") => trimmed.starts_with("> "),
                         _ => trimmed.contains(pc),
                     };
                     if should_dump {
                         let row = i as u16;
-                        let mut attrs_info = format!("       Cell attrs: [{}] ", pc);
+                        let prompt_marker = if matches!(Tool::from_str(tool), Ok(Tool::Antigravity))
+                        {
+                            "> "
+                        } else {
+                            pc
+                        };
+                        let mut attrs_info = format!("       Cell attrs: [{}] ", prompt_marker);
                         let mut found_prompt = false;
                         for col in 0..cols {
                             if let Some(cell) = screen.cell(row, col) {
                                 let contents = cell.contents();
-                                if contents == pc {
+                                if contents == pc || (prompt_marker == "> " && contents == ">") {
                                     found_prompt = true;
                                     continue;
                                 }
@@ -949,6 +992,67 @@ mod tests {
         t.process(b" >   Type your message or @path/to/file\r\n");
         t.process(format!("{}\r\n", border).as_bytes());
         assert_eq!(t.get_gemini_input_text(), Some(String::new()));
+    }
+
+    // ---- Antigravity input extraction ----
+
+    #[test]
+    fn antigravity_extracts_text_after_prompt() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> hello agy\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("hello agy".to_string())
+        );
+        assert_eq!(
+            t.get_input_box_text("antigravity"),
+            Some("hello agy".to_string())
+        );
+    }
+
+    #[test]
+    fn antigravity_prompt_without_trailing_space() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(">\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_dim_placeholder_with_ready_returns_empty() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"> ");
+        data.extend_from_slice(b"\x1b[2mType your message\x1b[0m");
+        data.extend_from_slice(b"\r\n? for shortcuts\r\n");
+        t.process(&data);
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_empty_prompt_with_ready() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> \r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_injected_text_with_ready_footer() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> <hcom>test</hcom>\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("<hcom>test</hcom>".to_string())
+        );
+    }
+
+    #[test]
+    fn antigravity_uses_bottommost_prompt_only() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> <hcom>old message</hcom>\r\n".as_bytes());
+        t.process("some agent output\r\n".as_bytes());
+        t.process("> \r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
     }
 
     // ---- Claude input extraction ----

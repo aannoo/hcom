@@ -1186,6 +1186,93 @@ fn stop_instance_inner(
     }
 }
 
+/// Soft session end for Antigravity: keep `instances` row for `hcom r` / @mention resume path.
+///
+/// Clears session/process bindings and logs a stopped life event with snapshot,
+/// but does not delete the instance row (PTY cleanup skips `delete_instance` when inactive).
+pub fn soft_finalize_session(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+) {
+    log::log_info(
+        "hooks",
+        "sessionend.soft",
+        &format!("instance={} reason={}", instance_name, reason),
+    );
+
+    lifecycle::set_status(
+        db,
+        instance_name,
+        ST_INACTIVE,
+        &format!("exit:{}", reason),
+        Default::default(),
+    );
+
+    if let Some(updates) = updates {
+        instances::update_instance_position(db, instance_name, updates);
+    }
+
+    let instance_data = match db.get_instance_full(instance_name) {
+        Ok(Some(data)) => data,
+        _ => return,
+    };
+
+    let snapshot = serde_json::json!({
+        "name": instance_name,
+        "transcript_path": instance_data.transcript_path,
+        "session_id": instance_data.session_id,
+        "tool": instance_data.tool,
+        "directory": instance_data.directory,
+        "parent_name": instance_data.parent_name,
+        "tag": instance_data.tag,
+        "wait_timeout": instance_data.wait_timeout,
+        "subagent_timeout": instance_data.subagent_timeout,
+        "hints": instance_data.hints,
+        "pid": instance_data.pid,
+        "created_at": instance_data.created_at,
+        "background": instance_data.background,
+        "agent_id": instance_data.agent_id,
+        "launch_args": instance_data.launch_args,
+        "origin_device_id": instance_data.origin_device_id,
+        "background_log_file": instance_data.background_log_file,
+        "last_event_id": instance_data.last_event_id,
+    });
+
+    if let Some(ref session_id) = instance_data.session_id {
+        let _ = db.conn().execute(
+            "DELETE FROM session_bindings WHERE session_id = ?",
+            params![session_id],
+        );
+        let _ = db.conn().execute(
+            "DELETE FROM process_bindings WHERE session_id = ?",
+            params![session_id],
+        );
+    }
+
+    let _ = db.delete_notify_endpoints(instance_name);
+    let _ = db.conn().execute(
+        "DELETE FROM process_bindings WHERE instance_name = ?",
+        params![instance_name],
+    );
+    let _ = db.cleanup_subscriptions(instance_name);
+
+    if let Err(e) = db.log_life_event(
+        instance_name,
+        "stopped",
+        "session",
+        &format!("exit:{}", reason),
+        Some(snapshot),
+    ) {
+        log::log_warn(
+            "hooks",
+            "sessionend.soft.life_event_failed",
+            &format!("log_life_event failed for {instance_name}: {e}"),
+        );
+    }
+}
+
 /// Set inactive status, persist updates, and stop instance.
 ///
 /// Common to Claude and Gemini SessionEnd handlers. Catches all errors
@@ -1815,6 +1902,42 @@ mod tests {
             db.get_session_binding("sess-fresh").unwrap(),
             None,
             "fresh session must not get bound via stale marker"
+        );
+    }
+
+    #[test]
+    fn soft_finalize_session_keeps_instance_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id)
+                 VALUES ('vine', 'listening', ?1, 'antigravity', 'sess-soft-1')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-soft-1', 'vine', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        soft_finalize_session(&db, "vine", "unknown", None);
+
+        assert!(db.get_instance_full("vine").unwrap().is_some());
+        let status = db.get_status("vine").unwrap().map(|(s, _)| s);
+        assert_eq!(status.as_deref(), Some(ST_INACTIVE));
+        assert_eq!(db.get_session_binding("sess-soft-1").unwrap(), None);
+        assert_eq!(
+            db.find_stopped_instance_by_session_id("sess-soft-1")
+                .unwrap()
+                .as_deref(),
+            Some("vine")
         );
     }
 }

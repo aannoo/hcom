@@ -71,7 +71,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         eprintln!();
         eprintln!("Usage: hcom pty <tool> [args...]");
         eprintln!();
-        eprintln!("Tools: claude, gemini, codex");
+        eprintln!("Tools: claude, gemini, codex, opencode, antigravity (agy)");
         eprintln!();
         eprintln!("The PTY wrapper provides:");
         eprintln!("  - Text injection via TCP port (INJECT_PORT)");
@@ -99,7 +99,11 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     let instance_name = config::Config::get().instance_name;
 
     // Resolve tool to full path (PATH may be minimal in launched environments)
-    let tool_exe = if tool_str == "antigravity" { "agy" } else { tool_str };
+    let tool_exe = if tool_str == "antigravity" {
+        "agy"
+    } else {
+        tool_str
+    };
     let resolved = terminal::which_bin(tool_exe).unwrap_or_else(|| tool_exe.to_string());
 
     // On Termux, some wrapped tools need a launcher override instead of direct exec.

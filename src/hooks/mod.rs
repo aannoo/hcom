@@ -1,5 +1,6 @@
 //! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode).
 
+pub mod antigravity;
 pub mod claude;
 pub mod claude_args;
 pub mod codex;
@@ -8,7 +9,6 @@ pub mod common;
 pub mod family;
 pub mod gemini;
 pub mod opencode;
-pub mod antigravity;
 pub mod utils;
 
 use serde_json::Value;
@@ -228,19 +228,22 @@ impl HookPayload {
     ///   { "conversationId", "transcriptPath", "stepIdx",
     ///     "toolCall": { "name", "args": { ... } },
     ///     "workspacePaths", "artifactDirectoryPath" }
-    pub fn from_antigravity(raw: Value) -> Self {
+    pub fn from_antigravity(raw: Value, hook_name: &str) -> Self {
         let tool_call = raw.get("toolCall").cloned().unwrap_or_default();
-        let tool_name = tool_call.get("name")
+        let tool_name = tool_call
+            .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let tool_input = tool_call.get("args").cloned()
+        let tool_input = tool_call
+            .get("args")
+            .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
 
         Self {
             session_id: Self::opt_str_field(&raw, &["conversationId"]),
             transcript_path: Self::opt_str_field(&raw, &["transcriptPath"]),
-            hook_name: String::new(), // set by caller (dispatch_gemini_hook)
+            hook_name: hook_name.to_string(),
             tool: "antigravity".to_string(),
             tool_name,
             tool_input,
@@ -388,19 +391,24 @@ mod tests {
                 "args": { "CommandLine": "echo hi", "Cwd": "/tmp" }
             }
         });
-        let payload = HookPayload::from_antigravity(raw);
-        assert_eq!(payload.session_id.as_deref(), Some("6f000787-c5d3-4485-b266-142a15f7d79d"));
+        let payload = HookPayload::from_antigravity(raw, "gemini-beforetool");
+        assert_eq!(
+            payload.session_id.as_deref(),
+            Some("6f000787-c5d3-4485-b266-142a15f7d79d")
+        );
         assert_eq!(payload.tool, "antigravity");
         assert_eq!(payload.tool_name, "run_command");
         assert_eq!(payload.tool_input["CommandLine"], "echo hi");
+        assert_eq!(payload.hook_name, "gemini-beforetool");
     }
 
     #[test]
     fn test_hook_payload_from_antigravity_no_toolcall() {
         let raw = serde_json::json!({"conversationId": "abc-123"});
-        let payload = HookPayload::from_antigravity(raw);
+        let payload = HookPayload::from_antigravity(raw, "gemini-sessionstart");
         assert_eq!(payload.tool_name, "");
         assert!(payload.tool_input.is_object());
+        assert_eq!(payload.hook_name, "gemini-sessionstart");
     }
 
     #[test]

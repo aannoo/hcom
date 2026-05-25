@@ -200,7 +200,14 @@ impl Agent {
 /// Strip known internal prefixes from status_context for display.
 /// e.g. "tool:Bash" → "Bash", "tui:not-ready" → "not-ready"
 fn strip_context_prefix(ctx: &str) -> &str {
-    const PREFIXES: &[&str] = &["tool:", "deliver:", "approved:", "exit:", "stale:", "tui:"];
+    if let Some(rest) = ctx.strip_prefix("exit:") {
+        return match rest {
+            "unknown" => "ended",
+            "" => "ended",
+            other => other,
+        };
+    }
+    const PREFIXES: &[&str] = &["tool:", "deliver:", "approved:", "stale:", "tui:"];
     for p in PREFIXES {
         if let Some(rest) = ctx.strip_prefix(p) {
             return rest;

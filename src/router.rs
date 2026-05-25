@@ -1111,12 +1111,7 @@ mod tests {
     #[test]
     fn launch_agy_direct() {
         let action = resolve_action(&sv(&["agy"]));
-        assert_eq!(
-            action,
-            Action::Launch {
-                args: sv(&["agy"])
-            }
-        );
+        assert_eq!(action, Action::Launch { args: sv(&["agy"]) });
     }
 
     #[test]

@@ -1195,3 +1195,9 @@ fn test_pty_codex() {
 fn test_pty_opencode() {
     run_pty_test_opencode();
 }
+
+#[test]
+#[ignore]
+fn test_pty_antigravity() {
+    run_pty_test("antigravity");
+}

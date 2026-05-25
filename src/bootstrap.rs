@@ -63,7 +63,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <claude|gemini|codex|opencode|antigravity|agy> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   background, set prompt, system, forward args: <claude|gemini|codex|opencode> --help
@@ -107,6 +107,15 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."
 // they instinctively run `sleep` or `hcom listen` to "wait", burning a tool
 // call for no benefit.  "End your turn" short-circuits that impulse and lets
 // the hook machinery do the work.
+
+const ANTIGRAVITY_DELIVERY: &str = r#"## ANTIGRAVITY DELIVERY (hook-primary)
+
+Antigravity delivers hcom messages through hooks, not only the prompt line:
+- `<hcom>` in the prompt is a **wake tag** only — the full message body arrives in hook `additionalContext` on the next turn (`beforeagent` / `aftertool`).
+- When you receive a delivery with `intent=request` (or any hcom delivery asking for a reply): your **first tool action** must be `hcom send @{SENDER} ...` — do not explore the repo or read files first.
+- After replying via `hcom send`, end your turn so the next delivery can arrive.
+
+Messages still arrive automatically — end your turn to receive them."#;
 
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
@@ -411,8 +420,11 @@ pub fn get_bootstrap(
     }
 
     // Tool-specific delivery
-    if tool == "claude"
-        || ((tool == "codex" || tool == "gemini" || tool == "opencode" || tool == "antigravity") && ctx.is_launched)
+    if tool == "antigravity" && ctx.is_launched {
+        parts.push(ANTIGRAVITY_DELIVERY);
+        parts.push(DELIVERY_AUTO);
+    } else if tool == "claude"
+        || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
     } else {

@@ -1,5 +1,8 @@
 //! PTY message delivery loop — injects messages via TCP, verifies via cursor advance.
 
+#[path = "delivery/antigravity.rs"]
+mod antigravity;
+
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -28,7 +31,7 @@ fn full_display_name(db: &HcomDb, name: &str) -> String {
 
 /// Check process binding and update current_name if it changed.
 /// Returns true if the name changed.
-fn refresh_binding(
+pub(crate) fn refresh_binding(
     db: &HcomDb,
     process_id: &str,
     current_name: &mut String,
@@ -73,7 +76,7 @@ fn refresh_binding(
 }
 
 /// Refresh shared status from DB. Updates current_status if changed.
-fn refresh_status(
+pub(crate) fn refresh_status(
     db: &HcomDb,
     current_name: &str,
     current_status: &mut String,
@@ -103,7 +106,7 @@ fn refresh_status(
 }
 
 /// Refresh shared display name (picks up tag changes at runtime).
-fn refresh_display_name(
+pub(crate) fn refresh_display_name(
     db: &HcomDb,
     current_name: &str,
     shared_name: &Option<Arc<std::sync::RwLock<String>>>,
@@ -315,15 +318,14 @@ impl ToolConfig {
 
     /// Get config for Antigravity.
     ///
-    /// Antigravity is a headless CLI with hook-based delivery (like Gemini).
-    /// No PTY TUI rendering — `require_ready_prompt=false`, no screen gating.
+    /// Antigravity TUI: hook-primary delivery; PTY only sends a minimal wake tag.
     pub fn antigravity() -> Self {
         Self {
             tool: "antigravity".to_string(),
             require_idle: true,
-            require_ready_prompt: false,
+            require_ready_prompt: true,
             require_prompt_empty: false,
-            block_on_user_activity: true,
+            block_on_user_activity: false,
             block_on_approval: true,
         }
     }
@@ -457,7 +459,7 @@ pub(crate) fn evaluate_gate(
 /// Inject text to PTY via TCP (text only, no Enter).
 /// Strips all C0 control chars (0x00-0x1F) except tab. This blocks ESC (0x1B),
 /// so ANSI escape sequences cannot pass through.
-fn inject_text(port: u16, text: &str) -> bool {
+pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     let safe_text: String = text
         .chars()
         .filter(|c| *c >= ' ' || *c == '\t') // >= 0x20 or tab; blocks ESC, NULL, BEL, etc.
@@ -474,7 +476,7 @@ fn inject_text(port: u16, text: &str) -> bool {
 }
 
 /// Inject Enter key to PTY via TCP
-fn inject_enter(port: u16) -> bool {
+pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
         Ok(mut stream) => stream.write_all(b"\r").is_ok(),
         Err(_) => false,
@@ -694,6 +696,18 @@ pub fn run_delivery_loop(
                 log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
             }
         }
+    } else if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
+        antigravity::run_antigravity_delivery_loop(
+            running,
+            db,
+            notify,
+            state,
+            &mut current_name,
+            &process_id,
+            config,
+            shared_name,
+            shared_status,
+        );
     } else {
         // Active delivery mode (existing state machine)
 
@@ -1359,74 +1373,85 @@ pub fn run_delivery_loop(
         &format!("Cleaning up instance {}", current_name),
     );
 
-    // Ownership check: verify we still own this instance name.
-    // If a new process launched with the same name, the process_binding now points
-    // to the new process — skip destructive cleanup to avoid nuking the new instance.
-    let owns_instance = if process_id.is_empty() {
-        true // No process_id to check — assume ownership (legacy/adhoc)
+    let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
+
+    if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
+        antigravity::cleanup_antigravity_pty_exit(db, &current_name, &process_id, owns_instance);
     } else {
-        match db.get_process_binding(&process_id) {
-            Ok(Some(bound_name)) => bound_name == current_name,
-            Ok(None) => false, // Binding deleted — new process took over
-            Err(_) => false,   // DB error — be conservative, don't delete
+        cleanup_pty_exit_default(db, &current_name, &process_id, owns_instance);
+    }
+}
+
+/// True when this delivery thread's process_id still owns `current_name`.
+fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &str) -> bool {
+    if process_id.is_empty() {
+        return true;
+    }
+    match db.get_process_binding(process_id) {
+        Ok(Some(bound_name)) => bound_name == current_name,
+        Ok(None) => false,
+        Err(_) => false,
+    }
+}
+
+/// Hard PTY exit cleanup: inactive status, life event, delete instance row.
+pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
+    let snapshot = match db.get_instance_snapshot(current_name) {
+        Ok(snap) => snap,
+        Err(e) => {
+            log_error(
+                "native",
+                "delivery.cleanup",
+                &format!("DB error getting instance snapshot: {}", e),
+            );
+            None
         }
     };
 
+    let was_killed = crate::pty::EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    let (exit_context, exit_reason) = if was_killed {
+        ("exit:killed", "killed")
+    } else {
+        ("exit:closed", "closed")
+    };
+    if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
+        log_warn(
+            "native",
+            "delivery.set_status_fail",
+            &format!("Failed to set inactive status: {}", e),
+        );
+    }
+
+    if let Err(e) = db.delete_notify_endpoints(current_name) {
+        log_warn(
+            "native",
+            "delivery.cleanup_endpoints_fail",
+            &format!("{}", e),
+        );
+    }
+    if let Err(e) = db.cleanup_subscriptions(current_name) {
+        log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
+    }
+    if let Err(e) = db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot) {
+        log_warn(
+            "native",
+            "delivery.life_event_fail",
+            &format!("Failed to log life event: {}", e),
+        );
+    }
+    if let Err(e) = db.delete_instance(current_name) {
+        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+    }
+}
+
+fn cleanup_pty_exit_default(
+    db: &mut HcomDb,
+    current_name: &str,
+    process_id: &str,
+    owns_instance: bool,
+) {
     if owns_instance {
-        // 1. Get snapshot before deletion (for life event)
-        let snapshot = match db.get_instance_snapshot(&current_name) {
-            Ok(snap) => snap,
-            Err(e) => {
-                log_error(
-                    "native",
-                    "delivery.cleanup",
-                    &format!("DB error getting instance snapshot: {}", e),
-                );
-                None
-            }
-        };
-
-        // 2. Set status to "inactive" with appropriate context
-        // exit:closed = normal exit, exit:killed = SIGHUP/SIGTERM
-        let was_killed = crate::pty::EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
-        let (exit_context, exit_reason) = if was_killed {
-            ("exit:killed", "killed")
-        } else {
-            ("exit:closed", "closed")
-        };
-        if let Err(e) = db.set_status(&current_name, "inactive", exit_context) {
-            log_warn(
-                "native",
-                "delivery.set_status_fail",
-                &format!("Failed to set inactive status: {}", e),
-            );
-        }
-
-        // 3. Delete notify endpoints and event subscriptions
-        if let Err(e) = db.delete_notify_endpoints(&current_name) {
-            log_warn(
-                "native",
-                "delivery.cleanup_endpoints_fail",
-                &format!("{}", e),
-            );
-        }
-        if let Err(e) = db.cleanup_subscriptions(&current_name) {
-            log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
-        }
-        // 4. Log life event BEFORE delete — if log fails, row stays (stale cleanup catches it).
-        //    Previous order (delete first) lost snapshots when log_life_event hit DB lock.
-        if let Err(e) = db.log_life_event(&current_name, "stopped", "pty", exit_reason, snapshot) {
-            log_warn(
-                "native",
-                "delivery.life_event_fail",
-                &format!("Failed to log life event: {}", e),
-            );
-        }
-
-        // 5. Delete instance row
-        if let Err(e) = db.delete_instance(&current_name) {
-            eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
-        }
+        cleanup_deleted_instance(db, current_name);
     } else {
         log_info(
             "native",
@@ -1438,9 +1463,8 @@ pub fn run_delivery_loop(
         );
     }
 
-    // Always clean up our own process binding (keyed by our process_id, not name)
     if !process_id.is_empty()
-        && let Err(e) = db.delete_process_binding(&process_id)
+        && let Err(e) = db.delete_process_binding(process_id)
     {
         log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
     }
@@ -1501,6 +1525,14 @@ mod tests {
         let result = evaluate_gate(&config, &state, true);
         assert!(!result.safe);
         assert_eq!(result.reason, "approval");
+    }
+
+    #[test]
+    fn antigravity_config_allows_ready_footer_with_placeholder_text() {
+        let config = ToolConfig::antigravity();
+        assert!(config.require_ready_prompt);
+        assert!(!config.require_prompt_empty);
+        assert!(!config.block_on_user_activity);
     }
 
     #[test]

@@ -229,6 +229,37 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
         .map(|suffix| suffix.to_string())
 }
 
+/// Recreate a missing instance row from an active placeholder (resume after stop/kill).
+fn recreate_instance_from_placeholder(
+    db: &HcomDb,
+    target_name: &str,
+    session_id: &str,
+    ph: Option<&InstanceRow>,
+) {
+    if db.get_instance_full(target_name).ok().flatten().is_some() {
+        return;
+    }
+    let Some(ph) = ph else {
+        return;
+    };
+    initialize_instance_in_position_file(
+        db,
+        target_name,
+        Some(session_id),
+        ph.parent_session_id.as_deref(),
+        ph.parent_name.as_deref(),
+        ph.agent_id.as_deref(),
+        (!ph.transcript_path.is_empty()).then_some(ph.transcript_path.as_str()),
+        Some(ph.tool.as_str()),
+        ph.background != 0,
+        ph.tag.as_deref(),
+        None,
+        None,
+        ph.hints.as_deref(),
+        Some(ph.directory.as_str()),
+    );
+}
+
 /// Bind session_id to canonical instance for process_id.
 /// Handles 4 paths: canonical exists (with placeholder merge/switch), placeholder bind,
 /// and two no-op paths.
@@ -285,6 +316,13 @@ pub fn bind_session_to_process(
                 "canonical={}, placeholder={:?}",
                 canonical_name, placeholder_name
             ),
+        );
+
+        recreate_instance_from_placeholder(
+            db,
+            canonical_name,
+            session_id,
+            placeholder_data.as_ref(),
         );
 
         // Reset last_stop on resume
@@ -387,6 +425,43 @@ pub fn bind_session_to_process(
         }
 
         return Some(canonical_name.clone());
+    }
+
+    // Path 1b: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
+    if canonical.is_none()
+        && let Ok(Some(stopped_name)) = db.find_stopped_instance_by_session_id(session_id)
+    {
+        crate::log::log_info(
+            "binding",
+            "bind_session_to_process.restore_stopped",
+            &format!("stopped_name={stopped_name}, session_id={session_id}"),
+        );
+        recreate_instance_from_placeholder(
+            db,
+            &stopped_name,
+            session_id,
+            placeholder_data.as_ref(),
+        );
+
+        if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
+            crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert("session_id".into(), serde_json::json!(session_id));
+        update_instance_position(db, &stopped_name, &updates);
+        if let Err(e) = db.rebind_session(session_id, &stopped_name) {
+            crate::log::log_error("binding", "restore_stopped.rebind_session", &format!("{e}"));
+        }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "restore_stopped.set_process_binding",
+                &format!("{e}"),
+            );
+        }
+        return Some(stopped_name);
     }
 
     // Path 2: No canonical, but placeholder exists — bind session to placeholder
@@ -709,7 +784,10 @@ pub fn resolve_instance_from_binding(
 /// Auto-subscribe instance to default event subscriptions from config.
 /// Called during instance creation.
 fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
-    if !matches!(tool, "claude" | "gemini" | "codex" | "opencode" | "antigravity") {
+    if !matches!(
+        tool,
+        "claude" | "gemini" | "codex" | "opencode" | "antigravity"
+    ) {
         return;
     }
 
@@ -1115,6 +1193,54 @@ mod tests {
 
         db.delete_instance("luna").unwrap();
         assert_eq!(db.get_session_binding("sess-1").unwrap(), None);
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_bind_session_restores_deleted_canonical_from_placeholder() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut canonical_data = serde_json::Map::new();
+        canonical_data.insert("name".into(), serde_json::json!("miso"));
+        canonical_data.insert("session_id".into(), serde_json::json!("sid-resume"));
+        canonical_data.insert("tool".into(), serde_json::json!("antigravity"));
+        canonical_data.insert("created_at".into(), serde_json::json!(now));
+        canonical_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("miso", &canonical_data).unwrap();
+        db.rebind_session("sid-resume", "miso").unwrap();
+
+        let mut ph_data = serde_json::Map::new();
+        ph_data.insert("name".into(), serde_json::json!("nova"));
+        ph_data.insert("tool".into(), serde_json::json!("antigravity"));
+        ph_data.insert("tag".into(), serde_json::json!("work"));
+        ph_data.insert("created_at".into(), serde_json::json!(now));
+        ph_data.insert("status".into(), serde_json::json!("pending"));
+        ph_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("nova", &ph_data).unwrap();
+        db.set_process_binding("pid-agy", "", "nova").unwrap();
+
+        let snapshot = serde_json::json!({
+            "session_id": "sid-resume",
+            "tool": "antigravity",
+            "tag": "work",
+        });
+        db.log_life_event("miso", "stopped", "test", "exit", Some(snapshot))
+            .unwrap();
+
+        db.delete_instance("miso").unwrap();
+        assert!(db.get_instance_full("miso").unwrap().is_none());
+        assert_eq!(db.get_session_binding("sid-resume").unwrap(), None);
+
+        let result = bind_session_to_process(&db, "sid-resume", Some("pid-agy"));
+        assert_eq!(result, Some("miso".to_string()));
+
+        let restored = db.get_instance_full("miso").unwrap().unwrap();
+        assert_eq!(restored.session_id.as_deref(), Some("sid-resume"));
+        assert_eq!(restored.tool, "antigravity");
+        assert_eq!(restored.tag.as_deref(), Some("work"));
 
         cleanup(path);
     }

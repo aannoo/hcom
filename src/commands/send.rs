@@ -246,10 +246,16 @@ pub fn send_message(
 ) -> Result<Vec<String>, String> {
     validate_message(message)?;
 
-    // Get participating instances
+    // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
+    // Adhoc instances use inactive:tool:* between commands — still @mentionable.
     let rows: Vec<InstanceInfo> = db
         .conn()
-        .prepare("SELECT name, tag FROM instances")
+        .prepare(
+            "SELECT name, tag FROM instances
+             WHERE status != 'stopped'
+               AND status_context != 'launch_failed'
+               AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
+        )
         .map_err(|e| format!("DB error: {e}"))?
         .query_map([], |row| {
             Ok(InstanceInfo {
@@ -1441,6 +1447,42 @@ mod tests {
             .unwrap();
         assert_eq!(scope, "mentions");
         assert!(mentions_json.contains("nova"));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn send_mention_excludes_inactive_instances() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('luna', 'listening', '', 1000.0),
+                        ('vine', 'inactive', 'exit:unknown', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let err =
+            send_message(&db, &sender, "ping", None, Some(&["vine".to_string()])).unwrap_err();
+        assert!(err.contains("@vine"), "err={err}");
+        assert!(err.contains("Available:"), "err={err}");
+        assert!(
+            err.contains("luna"),
+            "listening agent should be listed: {err}"
+        );
+        let available_line = err.lines().find(|l| l.contains("Available:")).unwrap_or("");
+        assert!(
+            !available_line.contains("vine"),
+            "inactive agent must not appear in Available: {err}"
+        );
 
         cleanup_test_db(path);
     }

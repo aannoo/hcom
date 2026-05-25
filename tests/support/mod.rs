@@ -98,7 +98,7 @@ impl Hcom {
     }
 }
 
-fn parse_hcom_marker(stdout: &str) -> Option<String> {
+pub fn parse_hcom_marker(stdout: &str) -> Option<String> {
     let marker = stdout
         .lines()
         .find(|l| l.trim_start().starts_with("[hcom:"))?;

@@ -367,7 +367,14 @@ fn unknown_command_errors() {
 #[test]
 fn antigravity_e2e_hook_dispatch() {
     let h = Hcom::new();
-    let _me = h.start(); // Spawns active instance, e.g. "luna"
+
+    // Spawn hcom start with HCOM_PROCESS_ID to register a process binding
+    let mut start_cmd = h.cmd();
+    start_cmd.arg("start");
+    start_cmd.env("HCOM_PROCESS_ID", "pid-agy-123");
+    let start_out = start_cmd.output().expect("failed to run hcom start");
+    let me = support::parse_hcom_marker(&String::from_utf8_lossy(&start_out.stdout))
+        .expect("no [hcom:NAME] marker");
 
     // 1. Pipe PreInvocation (session start) to gemini-sessionstart.
     // This will bind the session_id "sess-agy-1" to the active instance.
@@ -376,12 +383,13 @@ fn antigravity_e2e_hook_dispatch() {
         "transcriptPath": "/tmp/transcript.jsonl",
     });
 
-    use std::process::Stdio;
     use std::io::Write;
+    use std::process::Stdio;
 
     let mut cmd = h.cmd();
     cmd.args(["gemini-sessionstart"]);
     cmd.env("ANTIGRAVITY_AGENT", "1");
+    cmd.env("HCOM_PROCESS_ID", "pid-agy-123");
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -389,10 +397,29 @@ fn antigravity_e2e_hook_dispatch() {
     let mut child = cmd.spawn().expect("failed to spawn hcom sessionstart");
     {
         let mut stdin = child.stdin.take().expect("failed to open stdin");
-        stdin.write_all(serde_json::to_string(&session_start_payload).unwrap().as_bytes()).unwrap();
+        stdin
+            .write_all(
+                serde_json::to_string(&session_start_payload)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
     }
-    let out = child.wait_with_output().expect("failed to wait sessionstart");
-    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = child
+        .wait_with_output()
+        .expect("failed to wait sessionstart");
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify session_id binding matches in the DB via hcom list --json
+    let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("failed to parse list json");
+    assert_eq!(v["session_id"].as_str(), Some("sess-agy-1"));
 
     // 2. Now pipe PreToolUse to gemini-beforetool.
     // Since the session is bound, it should resolve the instance and execute successfully.
@@ -408,6 +435,7 @@ fn antigravity_e2e_hook_dispatch() {
     let mut cmd = h.cmd();
     cmd.args(["gemini-beforetool"]);
     cmd.env("ANTIGRAVITY_AGENT", "1");
+    cmd.env("HCOM_PROCESS_ID", "pid-agy-123");
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -415,11 +443,84 @@ fn antigravity_e2e_hook_dispatch() {
     let mut child = cmd.spawn().expect("failed to spawn hcom beforetool");
     {
         let mut stdin = child.stdin.take().expect("failed to open stdin");
-        stdin.write_all(serde_json::to_string(&before_tool_payload).unwrap().as_bytes()).unwrap();
+        stdin
+            .write_all(
+                serde_json::to_string(&before_tool_payload)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
     }
     let out = child.wait_with_output().expect("failed to wait beforetool");
-    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     // With silent allow, stdout should be empty
-    assert!(stdout.trim().is_empty(), "stdout should be empty on allow: {stdout}");
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout should be empty on allow: {stdout}"
+    );
+
+    // 3. AfterTool with pending message → hookSpecificOutput delivery schema.
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        &format!("@{me}"),
+        "--name",
+        &me,
+        "--intent",
+        "request",
+        "--",
+        "ping",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+
+    let after_tool_payload = serde_json::json!({
+        "conversationId": "sess-agy-1",
+        "transcriptPath": "/tmp/transcript.jsonl",
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "echo done", "Cwd": "/tmp" }
+        }
+    });
+
+    let mut cmd = h.cmd();
+    cmd.args(["gemini-aftertool"]);
+    cmd.env("ANTIGRAVITY_AGENT", "1");
+    cmd.env("HCOM_PROCESS_ID", "pid-agy-123");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn hcom aftertool");
+    {
+        let mut stdin = child.stdin.take().expect("failed to open stdin");
+        stdin
+            .write_all(
+                serde_json::to_string(&after_tool_payload)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+    }
+    let out = child.wait_with_output().expect("failed to wait aftertool");
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after_stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(after_stdout.trim()).expect("aftertool json");
+    assert_eq!(parsed["decision"], "allow");
+    assert!(parsed.get("hookSpecificOutput").is_some());
+    assert!(
+        parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
 }

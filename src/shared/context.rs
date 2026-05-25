@@ -186,7 +186,12 @@ impl HcomContext {
 
     /// Whether running inside any AI tool.
     pub fn is_inside_ai_tool(&self) -> bool {
-        self.is_claude || self.is_antigravity || self.is_launched || self.is_gemini || self.is_codex || self.is_opencode
+        self.is_claude
+            || self.is_antigravity
+            || self.is_launched
+            || self.is_gemini
+            || self.is_codex
+            || self.is_opencode
     }
 
     /// Detect current tool name, or "adhoc".

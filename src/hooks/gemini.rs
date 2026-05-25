@@ -480,19 +480,63 @@ fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -
     hook_noop()
 }
 
+/// Antigravity Stop stdin uses `terminationReason`, not Gemini's `reason`.
+fn antigravity_sessionend_reason(raw: &Value) -> String {
+    raw.get("terminationReason")
+        .or_else(|| raw.get("reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "closed".to_string())
+}
+
+/// True when agy Stop is turn-end only (session continues), not tab/process teardown.
+///
+/// Runtime evidence: `NO_TOOL_CALL` arrives with `fullyIdle: false` and still must not
+/// soft-stop (dove ping-pong 2026-05-25, debug log line `turn_idle_skip: false`).
+fn antigravity_stop_should_skip_soft_finalize(raw: &Value) -> bool {
+    if raw.get("fullyIdle").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    let reason = raw
+        .get("terminationReason")
+        .or_else(|| raw.get("reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    matches!(
+        reason.to_ascii_uppercase().as_str(),
+        "NO_TOOL_CALL" | "NO_TOOL_CALLS"
+    )
+}
+
 /// Handle SessionEnd hook - fires when a session ends.
-fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
     let instance = match resolve_instance_gemini(db, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
 
-    let reason = payload
-        .raw
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    common::finalize_session(db, &instance.name, reason, None);
+    let is_agy = payload.tool == "antigravity" || instance.tool == "antigravity";
+    let reason = if is_agy {
+        antigravity_sessionend_reason(&payload.raw)
+    } else {
+        payload
+            .raw
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let turn_idle_skip = is_agy && antigravity_stop_should_skip_soft_finalize(&payload.raw);
+
+    if turn_idle_skip {
+        return hook_noop();
+    }
+
+    if ctx.is_launched && is_agy {
+        common::soft_finalize_session(db, &instance.name, &reason, None);
+    } else {
+        common::finalize_session(db, &instance.name, &reason, None);
+    }
 
     hook_noop()
 }
@@ -520,61 +564,54 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
     }
 }
 
-/// Helper to serialize HookResult based on tool type.
+/// Serialize hook stdout JSON.
 ///
-/// Antigravity uses a flat decision JSON schema, whereas Gemini wraps
-/// additionalContext inside a hookSpecificOutput object.
+/// Lifecycle hooks (additionalContext): `hookSpecificOutput` for Gemini and Antigravity.
+/// Tool permission hooks: Antigravity uses flat `decision: deny` per agy-hooks.md.
 fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Option<Value> {
-    if tool == "antigravity" {
-        // Antigravity: flat decision schema, no hookSpecificOutput wrapper
-        match result {
-            HookResult::Allow { .. } => None, // silent allow = no output
-            HookResult::Block { reason } => Some(serde_json::json!({
-                "decision": "deny",
-                "reason": reason,
-            })),
-            HookResult::UpdateInput { updated_input } => Some(serde_json::json!({
-                "decision": "allow",
-                "overwrite": updated_input,
-            })),
+    let is_agy = tool == "antigravity";
+    match result {
+        // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
+        HookResult::Allow {
+            additional_context, ..
+        } => {
+            if let Some(ctx) = additional_context {
+                let event_name = match hook_name {
+                    "gemini-sessionstart" => "SessionStart",
+                    "gemini-beforeagent" => "BeforeAgent",
+                    "gemini-afteragent" => "AfterAgent",
+                    "gemini-beforetool" => "BeforeTool",
+                    "gemini-aftertool" => "AfterTool",
+                    "gemini-notification" => "Notification",
+                    "gemini-sessionend" => "SessionEnd",
+                    _ => hook_name,
+                };
+                Some(serde_json::json!({
+                    "decision": "allow",
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": ctx,
+                    }
+                }))
+            } else {
+                None
+            }
         }
-    } else {
-        // Gemini: hookSpecificOutput wrapper
-        match result {
-            // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
-            HookResult::Allow {
-                additional_context, ..
-            } => {
-                if let Some(ctx) = additional_context {
-                    // Map hook name to Gemini event name (e.g. "gemini-beforeagent" → "BeforeAgent")
-                    let event_name = match hook_name {
-                        "gemini-sessionstart" => "SessionStart",
-                        "gemini-beforeagent" => "BeforeAgent",
-                        "gemini-afteragent" => "AfterAgent",
-                        "gemini-beforetool" => "BeforeTool",
-                        "gemini-aftertool" => "AfterTool",
-                        "gemini-notification" => "Notification",
-                        "gemini-sessionend" => "SessionEnd",
-                        _ => hook_name,
-                    };
-                    Some(serde_json::json!({
-                        "decision": "allow",
-                        "hookSpecificOutput": {
-                            "hookEventName": event_name,
-                            "additionalContext": ctx,
-                        }
-                    }))
-                } else {
-                    None
-                }
+        HookResult::Block { reason } => {
+            if is_agy {
+                Some(serde_json::json!({
+                    "decision": "deny",
+                    "reason": reason,
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "decision": "block",
+                    "reason": reason,
+                }))
             }
-            HookResult::Block { reason } => Some(serde_json::json!({
-                "decision": "block",
-                "reason": reason,
-            })),
-            HookResult::UpdateInput { updated_input } => {
-                Some(serde_json::json!({ "updatedInput": updated_input }))
-            }
+        }
+        HookResult::UpdateInput { updated_input } => {
+            Some(serde_json::json!({ "updatedInput": updated_input }))
         }
     }
 }
@@ -597,13 +634,11 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
     };
 
     // Detect antigravity payload (nested toolCall schema)
-    let is_agy = stdin_json.get("conversationId").is_some()
-        || stdin_json.get("toolCall").is_some();
+    let is_agy =
+        ctx.is_antigravity || (stdin_json.get("conversationId").is_some() && !ctx.is_gemini);
 
     let payload = if is_agy {
-        let mut p = HookPayload::from_antigravity(stdin_json);
-        p.hook_name = hook_name.to_string();
-        p
+        HookPayload::from_antigravity(stdin_json, hook_name)
     } else {
         HookPayload::from_gemini(stdin_json)
     };
@@ -1748,6 +1783,32 @@ mod tests {
     }
 
     #[test]
+    fn test_antigravity_sessionend_reason_from_termination_reason() {
+        let raw = serde_json::json!({
+            "terminationReason": "USER_CANCEL",
+            "fullyIdle": true
+        });
+        assert_eq!(antigravity_sessionend_reason(&raw), "user_cancel");
+        assert!(antigravity_stop_should_skip_soft_finalize(&raw));
+    }
+
+    #[test]
+    fn test_antigravity_sessionend_reason_defaults_closed() {
+        let raw = serde_json::json!({ "fullyIdle": false });
+        assert_eq!(antigravity_sessionend_reason(&raw), "closed");
+        assert!(!antigravity_stop_should_skip_soft_finalize(&raw));
+    }
+
+    #[test]
+    fn test_antigravity_no_tool_call_skips_soft_finalize_when_not_fully_idle() {
+        let raw = serde_json::json!({
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": false
+        });
+        assert!(antigravity_stop_should_skip_soft_finalize(&raw));
+    }
+
+    #[test]
     fn test_hook_noop() {
         let result = hook_noop();
         assert_eq!(result.exit_code(), 0);
@@ -2886,7 +2947,7 @@ mod tests {
     }
 
     #[test]
-    fn test_antigravity_serialization_allow() {
+    fn test_antigravity_serialization_allow_no_context() {
         let result = HookResult::Allow {
             additional_context: None,
             system_message: None,
@@ -2897,6 +2958,22 @@ mod tests {
     }
 
     #[test]
+    fn test_antigravity_serialization_allow_with_context() {
+        let result = HookResult::Allow {
+            additional_context: Some("pending messages".to_string()),
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforeagent", &result).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "pending messages"
+        );
+    }
+
+    #[test]
     fn test_antigravity_serialization_block() {
         let result = HookResult::Block {
             reason: "permission denied".to_string(),
@@ -2904,16 +2981,16 @@ mod tests {
         let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
         assert_eq!(out["decision"], "deny");
         assert_eq!(out["reason"], "permission denied");
+        assert!(out.get("hookSpecificOutput").is_none());
     }
 
     #[test]
-    fn test_antigravity_serialization_overwrite() {
+    fn test_antigravity_serialization_update_input() {
         let result = HookResult::UpdateInput {
             updated_input: serde_json::json!({"command": "ls -l"}),
         };
         let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
-        assert_eq!(out["decision"], "allow");
-        assert_eq!(out["overwrite"]["command"], "ls -l");
+        assert_eq!(out["updatedInput"]["command"], "ls -l");
     }
 
     #[test]
@@ -2937,7 +3014,10 @@ mod tests {
         let out = serialize_hook_result("gemini", "gemini-beforetool", &result).unwrap();
         assert_eq!(out["decision"], "allow");
         assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeTool");
-        assert_eq!(out["hookSpecificOutput"]["additionalContext"], "injected context");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "injected context"
+        );
     }
 
     fn make_test_db() -> (tempfile::TempDir, HcomDb) {
