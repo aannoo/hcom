@@ -928,7 +928,7 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
-/// Delivery state machine for the native PTY path (Claude/Gemini/Codex).
+/// Delivery state machine for the native PTY path (Claude/Gemini/Codex/Antigravity).
 ///
 /// OpenCode bypasses this entirely — it early-returns with its own loop
 /// inside `run_delivery_loop`.
@@ -1144,18 +1144,6 @@ pub fn run_delivery_loop(
                 log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
             }
         }
-    } else if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
-        antigravity::run_antigravity_delivery_loop(
-            running,
-            db,
-            notify,
-            state,
-            &mut current_name,
-            &process_id,
-            config,
-            shared_name,
-            shared_status,
-        );
     } else {
         // Active delivery mode (existing state machine)
 
