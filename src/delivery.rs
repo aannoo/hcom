@@ -630,6 +630,43 @@ impl LaunchOutcome {
     }
 }
 
+/// Drive the launch-outcome state machine for one tick.
+///
+/// - Pending: emit Ready if screen is good, else maybe emit Blocked.
+/// - Blocked: only emit Ready (recovery from launch_blocked, e.g. user
+///   accepted agy's trust-folder prompt). Never re-block once cleared.
+/// - Ready/Failed: terminal, no-op.
+fn drive_launch_outcome(
+    db: &HcomDb,
+    state: &DeliveryState,
+    current_name: &str,
+    current_status: &str,
+    config: &ToolConfig,
+    launch_outcome: &mut LaunchOutcome,
+) {
+    match *launch_outcome {
+        LaunchOutcome::Pending => {
+            if launch_ready_observed(config, state) {
+                emit_launch_ready_once(db, state, current_name, launch_outcome);
+            } else {
+                maybe_emit_launch_blocked(
+                    db,
+                    state,
+                    current_name,
+                    current_status,
+                    launch_outcome,
+                );
+            }
+        }
+        LaunchOutcome::Blocked => {
+            if launch_ready_observed(config, state) {
+                emit_launch_ready_once(db, state, current_name, launch_outcome);
+            }
+        }
+        LaunchOutcome::Ready | LaunchOutcome::Failed => {}
+    }
+}
+
 /// Screen state snapshot for gate checks
 #[derive(Clone)]
 pub struct ScreenState {
@@ -763,10 +800,19 @@ fn emit_launch_ready_once(
     current_name: &str,
     outcome: &mut LaunchOutcome,
 ) {
-    if !outcome.is_pending() {
+    // Allow Pending → Ready (first readiness) and Blocked → Ready (recovery,
+    // e.g. user accepted agy's trust-folder prompt after launch_blocked fired).
+    // Ready/Failed are terminal and re-fire is a no-op.
+    let was_blocked = matches!(outcome, LaunchOutcome::Blocked);
+    if !outcome.is_pending() && !was_blocked {
         return;
     }
-    if let Err(e) = db.set_status(current_name, ST_LISTENING, "ready_observed") {
+    let context = if was_blocked {
+        "launch_blocked_cleared"
+    } else {
+        "ready_observed"
+    };
+    if let Err(e) = db.set_status(current_name, ST_LISTENING, context) {
         log_warn(
             "native",
             "delivery.launch_ready_status_fail",
@@ -774,7 +820,7 @@ fn emit_launch_ready_once(
         );
         return;
     }
-    if let Err(e) = db.emit_ready_event(current_name, ST_LISTENING, "ready_observed") {
+    if let Err(e) = db.emit_ready_event(current_name, ST_LISTENING, context) {
         log_warn(
             "native",
             "delivery.launch_ready_event_fail",
@@ -1073,19 +1119,14 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
-            if launch_outcome.is_pending() {
-                if launch_ready_observed(config, state) {
-                    emit_launch_ready_once(db, state, &current_name, &mut launch_outcome);
-                } else {
-                    maybe_emit_launch_blocked(
-                        db,
-                        state,
-                        &current_name,
-                        &current_status,
-                        &mut launch_outcome,
-                    );
-                }
-            }
+            drive_launch_outcome(
+                db,
+                state,
+                &current_name,
+                &current_status,
+                config,
+                &mut launch_outcome,
+            );
 
             // Wait for notify or timeout
             notify.wait(IDLE_WAIT);
@@ -1173,19 +1214,14 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
-            if launch_outcome.is_pending() {
-                if launch_ready_observed(config, state) {
-                    emit_launch_ready_once(db, state, &current_name, &mut launch_outcome);
-                } else {
-                    maybe_emit_launch_blocked(
-                        db,
-                        state,
-                        &current_name,
-                        &current_status,
-                        &mut launch_outcome,
-                    );
-                }
-            }
+            drive_launch_outcome(
+                db,
+                state,
+                &current_name,
+                &current_status,
+                config,
+                &mut launch_outcome,
+            );
 
             match delivery_state {
                 State::Idle => {
