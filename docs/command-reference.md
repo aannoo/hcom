@@ -35,6 +35,8 @@ Resume/fork targets can be names, stopped names, session UUIDs, or thread names.
 
 Codex tool args are passed through hcom's Codex parser before launch. hcom recognizes Codex's hidden `--yolo` flag as a boolean sandbox override, equivalent in precedence to `--dangerously-bypass-approvals-and-sandbox`, so `hcom codex --yolo` does not also inherit the configured workspace sandbox mode.
 
+Claude does not have a native `--yolo` flag, but hcom accepts it as an ergonomic alias for `--dangerously-skip-permissions`. `hcom claude --yolo` (and `hcom r <claude-session> --yolo`) parse successfully, get rewritten to `--dangerously-skip-permissions` before reaching the `claude` binary, and emit a one-line note to stderr at launch: `hcom: Claude session — accepting --yolo as --dangerously-skip-permissions.`
+
 ## Messaging
 
 ```bash

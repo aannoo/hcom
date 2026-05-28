@@ -423,6 +423,20 @@ fn prepare_resume_plan_from_source(
         bail!("--headless is only supported for Claude resume/fork launches");
     }
 
+    // Translate hcom's `--yolo` alias to Claude's real
+    // `--dangerously-skip-permissions` for resume/fork too. Mirrors the
+    // translation in `launcher::launch_instances`.
+    if tool == "claude" {
+        let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
+        let (translated, fired) = claude_args::translate_yolo_alias(&spec);
+        if fired {
+            eprintln!(
+                "hcom: Claude session — accepting `--yolo` as `--dangerously-skip-permissions`."
+            );
+            merged_args = translated.rebuild_tokens(true);
+        }
+    }
+
     let is_headless =
         launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
     let use_pty = tool == "claude" && !is_headless && cfg!(unix);

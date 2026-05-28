@@ -92,6 +92,7 @@ hcom validates:
 - shell-quoted tool args.
 - Codex sandbox mode: `workspace`, `untrusted`, `danger-full-access`, or `none`.
 - Codex launch args: hidden Codex `--yolo` is accepted and treated as a sandbox override.
+- Claude launch args: hcom-only `--yolo` is accepted as an alias for `--dangerously-skip-permissions` (rewritten before the `claude` binary sees it).
 - `auto_subscribe`: comma-separated alphanumeric/underscore preset names.
 
 ## Terminal Presets

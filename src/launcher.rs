@@ -839,6 +839,21 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
     }
 
+    // Translate hcom's `--yolo` alias to Claude's real
+    // `--dangerously-skip-permissions` before the args reach the `claude`
+    // binary. Codex accepts `--yolo` natively; Claude does not, so we surface
+    // a one-line note explaining that we rewrote it on the user's behalf.
+    if matches!(normalized, LaunchTool::Claude | LaunchTool::ClaudePty) {
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&params.args), None);
+        let (translated, fired) = crate::hooks::claude_args::translate_yolo_alias(&spec);
+        if fired {
+            eprintln!(
+                "hcom: Claude session — accepting `--yolo` as `--dangerously-skip-permissions`."
+            );
+            params.args = translated.rebuild_tokens(true);
+        }
+    }
+
     // System prompt file for Gemini/Codex
     if let Some(ref sp) = params.system_prompt
         && normalized == LaunchTool::Gemini

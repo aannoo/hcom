@@ -38,6 +38,10 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "--continue",
     "-c",
     "--dangerously-skip-permissions",
+    // hcom-only convenience alias for --dangerously-skip-permissions
+    // (Claude itself does not accept --yolo). Translated to the canonical
+    // flag at launch time via `translate_yolo_alias`.
+    "--yolo",
     "--include-partial-messages",
     "--allow-dangerously-skip-permissions",
     "--bare",
@@ -414,6 +418,43 @@ pub fn add_background_defaults(spec: &ClaudeArgsSpec) -> ClaudeArgsSpec {
     }
 
     parse_tokens(&tokens, spec.source)
+}
+
+/// Rewrite hcom's `--yolo` alias to Claude's real `--dangerously-skip-permissions`.
+///
+/// Claude has no native `--yolo` flag; this is an hcom-only ergonomic alias for
+/// users who already type `--yolo` for Codex. We accept it in the parser so the
+/// allowlist passes, then translate it here before the args reach the `claude`
+/// binary. Returns `true` if any token was translated.
+///
+/// Tokens after `--` are left alone (those are prompt text, not Claude flags).
+/// If the canonical `--dangerously-skip-permissions` already appears earlier in
+/// the args, the translated `--yolo` will be deduplicated by the normal boolean
+/// dedup pass on the next `parse_tokens` round-trip.
+pub fn translate_yolo_alias(spec: &ClaudeArgsSpec) -> (ClaudeArgsSpec, bool) {
+    let dash_idx = spec
+        .clean_tokens
+        .iter()
+        .position(|t| t == "--")
+        .unwrap_or(spec.clean_tokens.len());
+
+    let mut translated = false;
+    let mut new_tokens = spec.clean_tokens.clone();
+    for token in new_tokens.iter_mut().take(dash_idx) {
+        if token.to_lowercase() == "--yolo" {
+            *token = "--dangerously-skip-permissions".to_string();
+            translated = true;
+        }
+    }
+
+    if !translated {
+        return (spec.clone(), false);
+    }
+
+    // Re-parse to refresh derived fields (and let dedup drop any duplicate
+    // canonical flag the user might also have passed alongside --yolo).
+    let deduped = deduplicate_boolean_flags(&new_tokens);
+    (parse_tokens(&deduped, spec.source), true)
 }
 
 /// Check for conflicting flag combinations. Returns warning messages.
@@ -921,6 +962,61 @@ mod tests {
         assert!(spec.has_flag(&["--verbose"], &[]));
         assert!(spec.has_flag(&["--continue"], &[]));
         assert!(!spec.is_background);
+    }
+
+    #[test]
+    fn test_parse_yolo_accepted_as_boolean() {
+        let args: Vec<String> = vec!["--yolo".into(), "--model".into(), "opus".into()];
+        let spec = parse_tokens(&args, SourceType::Cli);
+        assert!(!spec.has_errors(), "{:?}", spec.errors);
+        assert!(spec.has_flag(&["--yolo"], &[]));
+        assert!(spec.positional_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_translate_yolo_rewrites_to_dangerously_skip() {
+        let spec = parse_tokens(&["--yolo", "--model", "opus"], SourceType::Cli);
+        let (translated, fired) = translate_yolo_alias(&spec);
+        assert!(fired);
+        assert!(translated.has_flag(&["--dangerously-skip-permissions"], &[]));
+        assert!(!translated.has_flag(&["--yolo"], &[]));
+        assert_eq!(
+            translated.get_flag_value("--model"),
+            Some("opus".to_string())
+        );
+    }
+
+    #[test]
+    fn test_translate_yolo_noop_without_flag() {
+        let spec = parse_tokens(&["--model", "opus"], SourceType::Cli);
+        let (translated, fired) = translate_yolo_alias(&spec);
+        assert!(!fired);
+        assert_eq!(translated.clean_tokens, spec.clean_tokens);
+    }
+
+    #[test]
+    fn test_translate_yolo_dedups_against_canonical() {
+        let spec = parse_tokens(
+            &["--dangerously-skip-permissions", "--yolo"],
+            SourceType::Cli,
+        );
+        let (translated, fired) = translate_yolo_alias(&spec);
+        assert!(fired);
+        let count = translated
+            .clean_tokens
+            .iter()
+            .filter(|t| t.to_lowercase() == "--dangerously-skip-permissions")
+            .count();
+        assert_eq!(count, 1, "{:?}", translated.clean_tokens);
+    }
+
+    #[test]
+    fn test_translate_yolo_preserves_prompt_after_double_dash() {
+        let spec = parse_tokens(&["--yolo", "--", "literal --yolo prompt"], SourceType::Cli);
+        let (translated, fired) = translate_yolo_alias(&spec);
+        assert!(fired);
+        assert!(translated.has_flag(&["--dangerously-skip-permissions"], &[]));
+        assert_eq!(translated.positional_tokens, vec!["literal --yolo prompt"]);
     }
 
     #[test]

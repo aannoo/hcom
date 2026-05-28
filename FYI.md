@@ -81,3 +81,20 @@ The installed `hcom` (`uv tool install hcom`) was v0.7.17 from PyPI, lacking our
 - Safety tag `pre-merge-v0.7.18-20260523`
 - Upstream PR https://github.com/aannoo/hcom/pull/54
 - Backup binary `~/.local/share/uv/tools/hcom/bin/hcom.0.7.17.bak`
+
+## 2026-05-28 — Claude --yolo alias for --dangerously-skip-permissions
+### What
+Added hcom-side support for `--yolo` on Claude sessions as an ergonomic alias for `--dangerously-skip-permissions`. Symmetric with the Codex `--yolo` support landed 2026-05-22 (PR #54), but mechanics differ: Codex accepts `--yolo` natively (hcom just allowlists it), while Claude does not — hcom rewrites the flag before the `claude` binary sees it.
+### Why
+User asked for `--yolo` parity across Claude and Codex sessions because it's shorter to type. Claude's real flag is `--dangerously-skip-permissions`, so we translate at the hcom boundary and surface a one-line note explaining the rewrite so users (and future readers of session transcripts) aren't confused about what mode the agent is running in.
+### How
+- `src/hooks/claude_args.rs`: added `--yolo` to `BOOLEAN_FLAGS` (passes the allowlist) and introduced `translate_yolo_alias(spec) -> (ClaudeArgsSpec, bool)` that rewrites `--yolo` → `--dangerously-skip-permissions` for tokens before `--`, leaves prompt text alone, and dedupes if the canonical was already present. Five new unit tests cover acceptance, translation, no-op, dedup, and post-`--` preservation.
+- `src/launcher.rs`: after `validate_tool_args`, if the tool is `Claude` or `ClaudePty` we call `translate_yolo_alias` on `params.args`. When it fires, hcom prints `hcom: Claude session — accepting --yolo as --dangerously-skip-permissions.` to stderr and replaces `params.args` with the translated form before any launch path consumes it.
+- `src/commands/resume.rs`: applied the same translation to `merged_args` ahead of the headless/PTY routing, so `hcom r <claude-session> --yolo` and `hcom f <claude-session> --yolo` behave identically to fresh launches.
+- Docs: updated `docs/command-reference.md` and `docs/configuration.md` to document the alias and the note. No new public CLI surface; `claude --help` itself still does not list `--yolo`.
+### Impact
+`hcom claude --yolo` (and resume/fork variants) now pass validation, get translated, and launch the Claude TUI in `--dangerously-skip-permissions` mode. Users typing the shorter Codex-style flag get a deterministic, visible translation rather than a hard parser error. Both new launches and resumed/forked sessions emit the same one-line stderr note. `cargo test` passes (1542 + 13 unit/integration tests; the four upstream-CLI-required drift guards remain `ignored` as designed).
+### Related
+- Commit (pending) on branch `main`
+- Sibling Codex `--yolo` support: FYI entry 2026-05-22 and commit `b993078`
+- Files touched: `src/hooks/claude_args.rs`, `src/launcher.rs`, `src/commands/resume.rs`, `docs/command-reference.md`, `docs/configuration.md`, `FYI.md`
