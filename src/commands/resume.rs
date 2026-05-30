@@ -1553,7 +1553,67 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
+    // 5. Cursor
+    if let Some(path) = derive_cursor_transcript_path(session_id) {
+        let tool = detect_agent_type(&path).to_string();
+        return Some((tool, Some(path)));
+    }
+
     None
+}
+
+/// Locate a cursor-agent transcript by conversation UUID (== hcom session_id).
+/// cursor writes it at `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/
+/// <uuid>.jsonl` — the same path the hook reports. The `<slug>` can't be
+/// derived from the UUID, so scan the per-project dirs for the nested file.
+/// (The flat `projects/agent-transcripts/<uuid>.jsonl` mirror is skipped: it
+/// has no sibling `.workspace-trusted`, so no cwd could be recovered from it.)
+fn derive_cursor_transcript_path(session_id: &str) -> Option<String> {
+    let projects = dirs::home_dir()?.join(".cursor").join("projects");
+    let file = format!("{session_id}.jsonl");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let candidate = entry
+            .path()
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(&file);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// cursor transcripts carry no `cwd`, so recover it from the per-workspace
+/// `.workspace-trusted` marker cursor writes at
+/// `~/.cursor/projects/<slug>/.workspace-trusted` (`workspacePath` field). The
+/// transcript lives under `<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`, so
+/// walk up to the project-slug dir (the direct child of `projects/`) and read
+/// it. Returns the recorded (canonicalized) workspace path.
+fn recover_cursor_cwd(transcript_path: &str) -> Option<String> {
+    let path = std::path::Path::new(transcript_path);
+    let mut slug_dir = None;
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("projects")
+        {
+            slug_dir = Some(dir);
+            break;
+        }
+        cursor = dir.parent();
+    }
+    let marker = slug_dir?.join(".workspace-trusted");
+    let data = std::fs::read_to_string(&marker).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    parsed
+        .get("workspacePath")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Recover the session's working directory from the tool's on-disk state.
@@ -1565,6 +1625,8 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
 /// - **Gemini**: the session JSON has `projectHash = sha256(cwd)` (hex).
 ///   `~/.gemini/projects.json` maps `cwd → short-id`. Hash each key and
 ///   match against `projectHash` to recover the original CWD.
+/// - **Cursor**: the transcript has no `cwd`; recover it from the sibling
+///   `~/.cursor/projects/<slug>/.workspace-trusted` marker (`workspacePath`).
 fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
     match tool {
         "claude" => scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str())),
@@ -1574,6 +1636,7 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 .and_then(|c| c.as_str())
         }),
         "gemini" => recover_gemini_cwd(path),
+        "cursor" => recover_cursor_cwd(path),
         _ => None,
     }
 }
@@ -1669,7 +1732,8 @@ fn build_adopt_plan(
                 "Session {sid} not found. Searched:\n  \
                  - Claude:   {claude}/*/{sid}.jsonl\n  \
                  - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
-                 - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json",
+                 - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
+                 - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
                 short = session_id.split('-').next().unwrap_or(session_id),
@@ -1766,6 +1830,30 @@ mod tests {
     fn test_build_resume_args_claude_fork() {
         let args = build_resume_args("claude", "sess-123", true);
         assert_eq!(args, s(&["--resume", "sess-123", "--fork-session"]));
+    }
+
+    #[test]
+    fn test_recover_cursor_cwd_from_workspace_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mirror ~/.cursor/projects/<slug>/{agent-transcripts/<uuid>/<uuid>.jsonl,.workspace-trusted}
+        let slug = dir.path().join("projects").join("Users-anno-Dev-x");
+        let tdir = slug.join("agent-transcripts").join("uuid-1");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(
+            slug.join(".workspace-trusted"),
+            json!({"workspacePath": "/Users/anno/Dev/x", "trustMethod": null}).to_string(),
+        )
+        .unwrap();
+        let transcript = tdir.join("uuid-1.jsonl");
+        std::fs::write(&transcript, "{}").unwrap();
+
+        assert_eq!(
+            recover_cursor_cwd(&transcript.to_string_lossy()),
+            Some("/Users/anno/Dev/x".to_string())
+        );
+        // No marker → None (graceful: caller falls back to $PWD).
+        std::fs::remove_file(slug.join(".workspace-trusted")).unwrap();
+        assert_eq!(recover_cursor_cwd(&transcript.to_string_lossy()), None);
     }
 
     #[test]

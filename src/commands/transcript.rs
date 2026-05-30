@@ -120,6 +120,10 @@ pub(crate) fn detect_agent_type(path: &str) -> &str {
     let lower = path.to_ascii_lowercase();
     if lower.contains("antigravity") || lower.contains("/agy/") || lower.contains("/agy-") {
         "antigravity"
+    } else if lower.contains(".cursor") {
+        // Must precede the Claude `/projects/` catch: cursor transcripts live at
+        // `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`.
+        "cursor"
     } else if path.contains(".claude") || path.contains("/projects/") {
         "claude"
     } else if lower.contains(".gemini") {
@@ -1341,12 +1345,14 @@ mod tests {
                 "/home/user/Library/Application Support/Antigravity/session.jsonl",
                 "antigravity",
             ),
+            (
+                "/home/user/.cursor/projects/x/agent-transcripts/abc/abc.jsonl",
+                "cursor",
+            ),
         ];
         let expected: std::collections::HashSet<&str> =
             crate::integration_spec::released_tool_names()
                 .into_iter()
-                // Cursor transcript parsing is a Phase 2 integration.
-                .filter(|tool| *tool != "cursor")
                 .collect();
         let actual: std::collections::HashSet<&str> = cases
             .iter()

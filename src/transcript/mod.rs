@@ -6,6 +6,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod gemini;
 pub mod opencode;
 pub mod shared;
@@ -26,6 +27,7 @@ pub enum ToolKind {
     Gemini,
     Codex,
     OpenCode,
+    Cursor,
 }
 
 /// Options for reading a transcript.
@@ -61,6 +63,7 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
         ToolKind::Antigravity => claude::parse_claude_jsonl(path, opts.last, opts.detailed),
         ToolKind::Gemini => gemini::parse_gemini_json(path, opts.last),
         ToolKind::Codex => codex::parse_codex_jsonl(path, opts.last, opts.detailed),
+        ToolKind::Cursor => cursor::parse_cursor_jsonl(path, opts.last, opts.detailed),
         ToolKind::OpenCode => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -106,6 +109,7 @@ pub fn kind_from_agent_or_path(agent: &str, path: &str) -> ToolKind {
         "gemini" => ToolKind::Gemini,
         "codex" => ToolKind::Codex,
         "opencode" => ToolKind::OpenCode,
+        "cursor" | "cursor-agent" => ToolKind::Cursor,
         _ => detect_kind_from_path(path).unwrap_or(ToolKind::Claude),
     }
 }
