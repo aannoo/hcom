@@ -531,6 +531,10 @@ impl ToolConfig {
     pub fn antigravity() -> Self {
         Self::for_tool(crate::tool::Tool::Antigravity)
     }
+    #[cfg(test)]
+    pub fn cursor() -> Self {
+        Self::for_tool(crate::tool::Tool::Cursor)
+    }
 }
 
 /// Gate evaluation result
@@ -1194,8 +1198,18 @@ pub fn run_delivery_loop(
                     // Capture wall clock before wait to detect system sleep
                     let wall_before = crate::shared::time::now_epoch_i64() as u64;
 
-                    // Wait for notification or timeout
-                    let notified = notify.wait(IDLE_WAIT);
+                    // Recheck launch readiness promptly while the TUI is still
+                    // painting its initial screen. Some tools can start the
+                    // delivery loop just before their input prompt appears.
+                    let idle_wait = if matches!(
+                        launch_outcome,
+                        LaunchOutcome::Pending | LaunchOutcome::Blocked
+                    ) {
+                        RETRY_DELAY
+                    } else {
+                        IDLE_WAIT
+                    };
+                    let notified = notify.wait(idle_wait);
 
                     if !running.load(Ordering::Acquire) {
                         log_info(
@@ -1335,7 +1349,9 @@ pub fn run_delivery_loop(
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
-                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
+                            Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor) => {
+                                "<hcom>".to_string()
+                            }
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
@@ -2101,6 +2117,7 @@ mod tests {
         assert!(launch_ready_observed(&ToolConfig::codex(), &state));
         assert!(launch_ready_observed(&ToolConfig::claude(), &state));
         assert!(!launch_ready_observed(&ToolConfig::opencode(), &state));
+        assert!(!launch_ready_observed(&ToolConfig::cursor(), &state));
 
         let state = make_state(screen.clone(), 500);
         assert!(!launch_ready_observed(&ToolConfig::gemini(), &state));
@@ -2108,10 +2125,12 @@ mod tests {
         screen.ready = true;
         let state = make_state(screen.clone(), 500);
         assert!(launch_ready_observed(&ToolConfig::opencode(), &state));
+        assert!(launch_ready_observed(&ToolConfig::cursor(), &state));
 
         screen.prompt_empty = false;
         let state = make_state(screen, 500);
         assert!(!launch_ready_observed(&ToolConfig::codex(), &state));
+        assert!(!launch_ready_observed(&ToolConfig::cursor(), &state));
     }
 
     #[test]

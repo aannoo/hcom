@@ -50,6 +50,8 @@ const LAUNCH_TOOLS: &[&str] = &[
     "opencode",
     "antigravity",
     "agy",
+    "cursor",
+    "cursor-agent",
     "f",
     "r",
 ];
@@ -103,6 +105,10 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
         Tool::OpenCode => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
         Tool::Antigravity => (
             crate::hooks::gemini::dispatch_gemini_hook(hook),
+            String::new(),
+        ),
+        Tool::Cursor => (
+            crate::hooks::cursor::dispatch_cursor_hook_native(hook),
             String::new(),
         ),
         Tool::Adhoc => unreachable!("adhoc has no hooks"),

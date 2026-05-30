@@ -82,6 +82,7 @@ pub enum Tool {
     Codex,
     OpenCode,
     Antigravity,
+    Cursor,
     Adhoc,
 }
 
@@ -94,6 +95,7 @@ impl Tool {
             Self::Codex => crate::tool::Tool::Codex,
             Self::OpenCode => crate::tool::Tool::OpenCode,
             Self::Antigravity => crate::tool::Tool::Antigravity,
+            Self::Cursor => crate::tool::Tool::Cursor,
             Self::Adhoc => crate::tool::Tool::Adhoc,
         }
     }
@@ -114,7 +116,8 @@ impl Tool {
             Self::Gemini => Self::Codex,
             Self::Codex => Self::OpenCode,
             Self::OpenCode => Self::Antigravity,
-            Self::Antigravity => Self::Claude,
+            Self::Antigravity => Self::Cursor,
+            Self::Cursor => Self::Claude,
             Self::Adhoc => Self::Adhoc,
         }
     }
@@ -122,11 +125,12 @@ impl Tool {
     /// Cycle backward (for launch panel). Adhoc is not launchable.
     pub fn prev(&self) -> Self {
         match self {
-            Self::Claude => Self::Antigravity,
+            Self::Claude => Self::Cursor,
             Self::Gemini => Self::Claude,
             Self::Codex => Self::Gemini,
             Self::OpenCode => Self::Codex,
             Self::Antigravity => Self::OpenCode,
+            Self::Cursor => Self::Antigravity,
             Self::Adhoc => Self::Adhoc,
         }
     }
@@ -1164,12 +1168,14 @@ mod tests {
         assert_eq!(Tool::Gemini.next(), Tool::Codex);
         assert_eq!(Tool::Codex.next(), Tool::OpenCode);
         assert_eq!(Tool::OpenCode.next(), Tool::Antigravity);
-        assert_eq!(Tool::Antigravity.next(), Tool::Claude);
+        assert_eq!(Tool::Antigravity.next(), Tool::Cursor);
+        assert_eq!(Tool::Cursor.next(), Tool::Claude);
     }
 
     #[test]
     fn tool_prev_cycles_backward() {
-        assert_eq!(Tool::Claude.prev(), Tool::Antigravity);
+        assert_eq!(Tool::Claude.prev(), Tool::Cursor);
+        assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);
         assert_eq!(Tool::Antigravity.prev(), Tool::OpenCode);
         assert_eq!(Tool::OpenCode.prev(), Tool::Codex);
         assert_eq!(Tool::Codex.prev(), Tool::Gemini);

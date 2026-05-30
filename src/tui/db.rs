@@ -240,6 +240,7 @@ fn parse_tool(s: &str) -> Tool {
         "codex" => Tool::Codex,
         "opencode" => Tool::OpenCode,
         "antigravity" => Tool::Antigravity,
+        "cursor" => Tool::Cursor,
         _ => Tool::Adhoc,
     }
 }

@@ -6,6 +6,7 @@ pub mod claude_args;
 pub mod codex;
 pub mod codex_file_edits;
 pub mod common;
+pub mod cursor;
 pub mod family;
 pub mod gemini;
 pub mod opencode;
@@ -291,6 +292,29 @@ impl HookPayload {
             tool_name: Self::str_field(&raw, &["tool_name"]),
             tool_input: Self::obj_field(&raw, &["tool_input"]),
             tool_result: match raw.get("tool_response") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            notification_type: None,
+            raw,
+        }
+    }
+
+    /// Build from native Cursor Agent hook JSON.
+    ///
+    /// Cursor hooks use snake_case and include a common conversation ID on
+    /// every agent hook. `sessionStart` also includes the same value as
+    /// `session_id`.
+    pub fn from_cursor_native(hook_type: &str, raw: Value) -> Self {
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id", "conversation_id"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcript_path"]),
+            hook_name: hook_type.to_string(),
+            tool: "cursor".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result: match raw.get("tool_output") {
                 Some(Value::String(s)) => s.clone(),
                 Some(v) => v.to_string(),
                 None => String::new(),

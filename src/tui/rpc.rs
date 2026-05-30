@@ -54,6 +54,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 ///   codex:  bare positional (interactive)
 ///   opencode: `--prompt "prompt"`
 ///   antigravity: `--prompt-interactive "prompt"` (agy's documented interactive flag)
+///   cursor: bare positional
 ///
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
@@ -80,8 +81,8 @@ pub fn build_launch_argv(
     // Tool-specific prompt flags
     if !prompt.is_empty() {
         match tool {
-            Tool::Claude | Tool::Codex => {
-                if headless {
+            Tool::Claude | Tool::Codex | Tool::Cursor => {
+                if headless && tool == Tool::Claude {
                     argv.push("-p".into());
                 }
                 argv.push(prompt.into());
@@ -99,7 +100,7 @@ pub fn build_launch_argv(
             }
             Tool::Adhoc => {}
         }
-    } else if headless {
+    } else if headless && tool == Tool::Claude {
         // headless without prompt (claude only)
         argv.push("-p".into());
     }
@@ -223,6 +224,22 @@ mod tests {
             vec![
                 "1",
                 "codex",
+                "--no-run-here",
+                "--terminal",
+                "tmux",
+                "do task"
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_argv_cursor_prompt_is_positional() {
+        let argv = build_launch_argv(Tool::Cursor, 1, "", false, "tmux", "do task");
+        assert_eq!(
+            argv,
+            vec![
+                "1",
+                "cursor",
                 "--no-run-here",
                 "--terminal",
                 "tmux",

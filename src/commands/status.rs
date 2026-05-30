@@ -70,6 +70,10 @@ fn check_antigravity_hooks() -> bool {
     crate::hooks::antigravity::verify_antigravity_hooks_installed(false)
 }
 
+fn check_cursor_hooks() -> bool {
+    crate::hooks::cursor::verify_cursor_hooks_installed(false)
+}
+
 // ── Status Collection ────────────────────────────────────────────────────
 
 struct ToolStatus {
@@ -116,6 +120,11 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
             name: "Antigravity",
             installed: is_antigravity_installed(),
             hooks: check_antigravity_hooks(),
+        },
+        ToolStatus {
+            name: "Cursor",
+            installed: crate::terminal::which_bin("cursor-agent").is_some(),
+            hooks: check_cursor_hooks(),
         },
     ]
 }
@@ -225,6 +234,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     let gemini_settings_path = crate::hooks::gemini::get_gemini_settings_path();
     let codex_config_path = crate::hooks::codex::get_codex_config_path();
     let antigravity_hooks_path = crate::hooks::antigravity::get_antigravity_hooks_path();
+    let cursor_hooks_path = crate::hooks::cursor::get_cursor_hooks_path();
 
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
@@ -268,6 +278,11 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     "installed": tools[4].installed,
                     "hooks": tools[4].hooks,
                     "settings_path": antigravity_hooks_path.to_string_lossy(),
+                },
+                "cursor": {
+                    "installed": tools[5].installed,
+                    "hooks": tools[5].hooks,
+                    "settings_path": cursor_hooks_path.to_string_lossy(),
                 },
             },
             "terminal": {

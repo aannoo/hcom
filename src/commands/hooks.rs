@@ -19,7 +19,14 @@ pub struct HooksArgs {
 /// Valid tool names for hooks management. Must stay in sync with released
 /// hook-bearing specs in `integration_spec.rs` — see
 /// `router::tests::hook_tools_match_released_specs_with_hooks` for the guard.
-pub(crate) const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity"];
+pub(crate) const HOOK_TOOLS: &[&str] = &[
+    "claude",
+    "gemini",
+    "codex",
+    "opencode",
+    "antigravity",
+    "cursor",
+];
 
 /// Get hook installation status for each tool.
 ///
@@ -72,7 +79,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, cursor, all");
         return 1;
     };
 
@@ -137,6 +144,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 "codex" => "Codex",
                 "opencode" => "OpenCode",
                 "antigravity" => "Antigravity",
+                "cursor" => "Cursor Agent",
                 other => other,
             };
             println!("Restart {tool_name} to activate hooks.");
@@ -157,7 +165,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, cursor, all");
         return 1;
     };
 
@@ -218,8 +226,8 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
              Usage:\n  \
              hcom hooks                  Show hook status for all tools\n  \
              hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|antigravity|all)\n  \
-             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|antigravity|all)\n\n\
+             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|antigravity|cursor|all)\n  \
+             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|antigravity|cursor|all)\n\n\
              Examples:\n  \
              hcom hooks add claude       Add Claude Code hooks only\n  \
              hcom hooks add              Auto-detect tool or add all\n  \

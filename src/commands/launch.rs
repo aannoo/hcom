@@ -435,6 +435,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "gemini" => preview.config.gemini_args.as_str(),
             "codex" => preview.config.codex_args.as_str(),
             "opencode" => preview.config.opencode_args.as_str(),
+            "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
             _ => "",
         }
     } else {
@@ -585,6 +586,16 @@ pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConf
             let cli_spec = codex_args::resolve_codex_args(Some(cli_args), None);
             let merged = codex_args::merge_codex_args(&env_spec, &cli_spec);
             merged.rebuild_tokens(true, true)
+        }
+        "cursor" | "cursor-agent" => {
+            let env_str = &config.cursor_args;
+            if env_str.is_empty() {
+                return cli_args.to_vec();
+            }
+            let mut env_tokens: Vec<String> =
+                crate::tools::args_common::shell_split(env_str).unwrap_or_default();
+            env_tokens.extend(cli_args.iter().cloned());
+            env_tokens
         }
         _ => cli_args.to_vec(), // opencode: pass through
     }

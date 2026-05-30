@@ -63,10 +63,10 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode|antigravity|agy> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <claude|gemini|codex|opencode|antigravity|agy|cursor> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
-  background, set prompt, system, forward args: <claude|gemini|codex|opencode> --help
+  background, set prompt, system, forward args: <claude|gemini|codex|opencode|cursor> --help
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
@@ -135,6 +135,15 @@ End your turn and wait — a reply will arrive on a later `<hcom>` wake when the
 pub(crate) fn is_antigravity_tool(tool: &str) -> bool {
     tool == "antigravity"
 }
+
+const CURSOR_DELIVERY: &str = r#"## CURSOR DELIVERY (hook-primary)
+
+Cursor delivers hcom messages through hooks:
+- A prompt that is only `<hcom>` is a wake trigger, not a task. Do not answer it and do not run tools or discovery commands. End your turn immediately. The queued hcom message will arrive automatically as your next prompt.
+- A populated `<hcom>…</hcom>` block is the real delivery. Read it and follow its `intent`.
+- After handling a delivery, end your turn so the next message can arrive.
+
+Messages arrive automatically — end your turn to receive them."#;
 
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
@@ -441,6 +450,8 @@ pub fn get_bootstrap(
     // Tool-specific delivery
     if tool == "antigravity" && ctx.is_launched {
         parts.push(ANTIGRAVITY_DELIVERY);
+    } else if tool == "cursor" && ctx.is_launched {
+        parts.push(CURSOR_DELIVERY);
     } else if tool == "claude"
         || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
     {
@@ -892,6 +903,28 @@ mod tests {
         );
 
         assert!(result.contains("Messages do NOT arrive automatically"));
+    }
+
+    #[test]
+    fn test_get_bootstrap_cursor_launched_gets_hook_primary_delivery() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "nova",
+            "cursor",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(result.contains("CURSOR DELIVERY"));
+        assert!(result.contains("wake trigger"));
+        assert!(result.contains("End your turn immediately"));
     }
 
     #[test]

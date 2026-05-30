@@ -62,6 +62,8 @@ pub const TOOL_MARKER_VARS: &[&str] = &[
     "CODEX_MANAGED_BY_BUN",
     "CODEX_THREAD_ID",
     "OPENCODE",
+    "CURSOR_AGENT",
+    "CURSOR_PROJECT_DIR",
 ];
 
 /// HCOM identity vars — set per-instance, cleared to prevent parent identity leakage.

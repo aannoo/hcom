@@ -221,6 +221,15 @@ const OPENCODE_HOOKS: &[&str] = &[
     "opencode-stop",
 ];
 
+const CURSOR_HOOKS: &[&str] = &[
+    "cursor-sessionstart",
+    "cursor-beforesubmitprompt",
+    "cursor-pretooluse",
+    "cursor-posttooluse",
+    "cursor-stop",
+    "cursor-sessionend",
+];
+
 // ── Help examples / extra-env tables ────────────────────────────────────
 
 const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -275,6 +284,14 @@ const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
     ("hcom agy --sandbox", "Flags forwarded to agy"),
     ("hcom r <name>", "Resume a stopped agy session"),
+];
+
+const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom cursor --model sonnet-4", "Use a specific model"),
+    (
+        "hcom cursor --force",
+        "Allow commands unless explicitly denied",
+    ),
 ];
 
 // ── Per-tool integration constants ──────────────────────────────────────
@@ -527,6 +544,54 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static CURSOR: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Cursor,
+    name: "cursor",
+    label: "Cursor",
+    aliases: &["cursor-agent"],
+    cli_binary: "cursor-agent",
+    tui_prefix: "cur ",
+    adhoc_icon: None,
+    released: true,
+    // Cursor's input placeholder is styled rather than a stable ASCII footer.
+    // Prompt-empty detection is the readiness signal for the MVP.
+    ready_pattern: b"",
+    hooks: HooksSpec {
+        names: CURSOR_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_CURSOR_ARGS"),
+        config_dir_env: None,
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: CURSOR_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["Shell"],
+        file: &["Write", "Edit"],
+        delegate: &["Task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -574,7 +639,15 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
 
 /// All specs in canonical order. `Tool::spec` indexes into this implicitly via
 /// match — exposed for iteration (released-list helpers, hook-name routing).
-pub static ALL: &[&IntegrationSpec] = &[&CLAUDE, &GEMINI, &CODEX, &OPENCODE, &ANTIGRAVITY, &ADHOC];
+pub static ALL: &[&IntegrationSpec] = &[
+    &CLAUDE,
+    &GEMINI,
+    &CODEX,
+    &OPENCODE,
+    &ANTIGRAVITY,
+    &CURSOR,
+    &ADHOC,
+];
 
 impl Tool {
     /// Return this tool's integration spec.
@@ -585,6 +658,7 @@ impl Tool {
             Tool::Codex => &CODEX,
             Tool::OpenCode => &OPENCODE,
             Tool::Antigravity => &ANTIGRAVITY,
+            Tool::Cursor => &CURSOR,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -620,6 +694,7 @@ mod tests {
             Tool::Codex,
             Tool::OpenCode,
             Tool::Antigravity,
+            Tool::Cursor,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
@@ -674,7 +749,8 @@ mod tests {
         assert!(names.contains(&"codex"));
         assert!(names.contains(&"opencode"));
         assert!(names.contains(&"antigravity"));
-        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"cursor"));
+        assert_eq!(names.len(), 6);
     }
 
     #[test]

@@ -92,6 +92,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_CURSOR_ARGS",
+        "Default args for cursor-agent on launch",
+        "string",
+    ),
+    (
         "HCOM_CODEX_SANDBOX_MODE",
         "Codex permission profile (workspace | untrusted | danger-full-access | none)",
         "string",
@@ -179,6 +184,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "codex_sandbox_mode" => Some("launch.codex.sandbox_mode"),
         "codex_system_prompt" => Some("launch.codex.system_prompt"),
         "opencode_args" => Some("launch.opencode.args"),
+        "cursor_args" => Some("launch.cursor.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -1468,7 +1474,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/agy)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/agy/cursor)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -1481,6 +1487,16 @@ Example: hcom config opencode_args \"--model o3\"
 Clear:   hcom config opencode_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
+        ),
+
+        "HCOM_CURSOR_ARGS" => Some(
+            "\
+HCOM_CURSOR_ARGS - Default args passed to cursor-agent on launch
+
+Example: hcom config cursor_args \"--model auto\"
+Clear:   hcom config cursor_args \"\"
+
+Prepended to launch-time cli args.",
         ),
 
         "HCOM_RELAY_ENABLED" => Some(

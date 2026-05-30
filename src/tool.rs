@@ -16,6 +16,7 @@ pub enum Tool {
     Codex,
     OpenCode,
     Antigravity,
+    Cursor,
     Adhoc,
 }
 
@@ -89,6 +90,9 @@ impl Tool {
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
+            Tool::Cursor => {
+                crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
+            }
             Tool::Adhoc => false,
         }
     }
@@ -112,6 +116,8 @@ impl Tool {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
             }
+            Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
+                .map_err(|e| e.to_string()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -128,6 +134,7 @@ impl Tool {
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
             Tool::Antigravity => Ok(crate::hooks::antigravity::remove_antigravity_hooks()),
+            Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Adhoc => Ok(false),
         }
     }
@@ -141,6 +148,7 @@ impl Tool {
             Tool::Codex => crate::hooks::codex::get_codex_config_path(),
             Tool::OpenCode => crate::hooks::opencode::get_opencode_plugin_path(),
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
+            Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()
@@ -189,7 +197,13 @@ mod tests {
         // Antigravity shares Gemini hooks, but every gemini-* name resolves to
         // Gemini because Antigravity declares Gemini as the hook owner.
         let mut owners = HashMap::new();
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
+        for tool in [
+            Tool::Claude,
+            Tool::Gemini,
+            Tool::Codex,
+            Tool::OpenCode,
+            Tool::Cursor,
+        ] {
             for hook in tool.hooks() {
                 assert_eq!(
                     owners.insert(*hook, tool),

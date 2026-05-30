@@ -49,6 +49,7 @@ pub struct HcomContext {
     pub is_gemini: bool,
     pub is_codex: bool,
     pub is_opencode: bool,
+    pub is_cursor: bool,
     /// HCOM_IS_FORK=1 (--fork-session launch).
     pub is_fork: bool,
     /// Codex thread ID (session equivalent).
@@ -99,6 +100,7 @@ impl HcomContext {
             || is_set("CODEX_MANAGED_BY_BUN")
             || is_set("CODEX_THREAD_ID");
         let is_opencode = is_eq("OPENCODE", "1");
+        let is_cursor = is_set("CURSOR_AGENT") || is_set("CURSOR_PROJECT_DIR");
 
         // Determine tool type
         let tool = if is_claude {
@@ -111,6 +113,8 @@ impl HcomContext {
             Tool::Codex
         } else if is_opencode {
             Tool::OpenCode
+        } else if is_cursor {
+            Tool::Cursor
         } else {
             Tool::Adhoc
         };
@@ -134,6 +138,7 @@ impl HcomContext {
             is_gemini,
             is_codex,
             is_opencode,
+            is_cursor,
             is_fork: is_eq("HCOM_IS_FORK", "1"),
             codex_thread_id: get_nonempty("CODEX_THREAD_ID"),
             launched_by: get_nonempty("HCOM_LAUNCHED_BY"),
@@ -192,6 +197,7 @@ impl HcomContext {
             || self.is_gemini
             || self.is_codex
             || self.is_opencode
+            || self.is_cursor
     }
 
     /// Detect current tool name, or "adhoc".

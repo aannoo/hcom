@@ -370,6 +370,7 @@ impl ScreenTracker {
             Ok(Tool::Codex) => self.get_codex_input_text(),
             Ok(Tool::OpenCode) => None, // OpenCode: plugin handles delivery, no PTY input detection needed
             Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
+            Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -634,6 +635,29 @@ impl ScreenTracker {
         None
     }
 
+    /// Extract Cursor Agent input text.
+    ///
+    /// Cursor renders a `→` prompt with dim placeholder text while idle.
+    /// Submitted or user-entered text uses normal intensity.
+    fn get_cursor_input_text(&self) -> Option<String> {
+        let lines = self.get_screen_lines();
+        for (row_idx, line) in lines.iter().enumerate().rev() {
+            let trimmed = line.trim_start();
+            if let Some(text) = trimmed.strip_prefix("→ ") {
+                let text = trim_with_nbsp(text);
+                if text.is_empty() {
+                    return Some(String::new());
+                }
+                return match self.is_dim_after_prompt(row_idx as u16, "→") {
+                    Some(true) => Some(String::new()),
+                    Some(false) => Some(text.to_string()),
+                    None => Some(text.to_string()),
+                };
+            }
+        }
+        None
+    }
+
     /// Check and perform periodic dump if 5 seconds elapsed
     /// Returns true if dump was performed
     pub fn check_periodic_dump(&mut self, tool: &str, inject_port: u16, label: &str) -> bool {
@@ -695,6 +719,7 @@ impl ScreenTracker {
                     Ok(Tool::Codex) => Some("›"),
                     Ok(Tool::Gemini) => Some(">"),
                     Ok(Tool::Antigravity) => Some(">"),
+                    Ok(Tool::Cursor) => Some("→"),
                     _ => None,
                 };
                 if let Some(pc) = prompt_char {
@@ -958,6 +983,27 @@ mod tests {
             t.get_codex_input_text(),
             Some("<hcom>test message</hcom>".to_string())
         );
+    }
+
+    // ---- Cursor input extraction ----
+
+    #[test]
+    fn cursor_extracts_non_dim_text_after_prompt() {
+        let mut t = make_tracker(24, 80, "");
+        t.process("→ <hcom>\r\n".as_bytes());
+        assert_eq!(t.get_cursor_input_text(), Some("<hcom>".to_string()));
+    }
+
+    #[test]
+    fn cursor_dim_placeholder_returns_empty() {
+        let mut t = make_tracker(24, 80, "");
+        let mut data = Vec::new();
+        data.extend_from_slice("→ ".as_bytes());
+        data.extend_from_slice(b"\x1b[2mPlan, search, build anything\x1b[0m");
+        data.extend_from_slice(b"\r\n");
+        t.process(&data);
+        assert_eq!(t.get_cursor_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("cursor"));
     }
 
     // ---- Gemini input extraction ----
