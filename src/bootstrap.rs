@@ -66,7 +66,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - Spawn agents: [num] <claude|gemini|codex|opencode|antigravity|agy|cursor> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
-  background, set prompt, system, forward args: <claude|gemini|codex|opencode|cursor> --help
+  background, set prompt, system, forward args: <claude|gemini|codex|opencode|agy|cursor> --help
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
@@ -136,7 +136,7 @@ pub(crate) fn is_antigravity_tool(tool: &str) -> bool {
     tool == "antigravity"
 }
 
-const CURSOR_DELIVERY: &str = r#"## CURSOR DELIVERY (hook-primary)
+const CURSOR_DELIVERY: &str = r#"## CURSOR DELIVERY
 
 Cursor delivers hcom messages through hooks:
 - A prompt that is only `<hcom>` is a wake trigger, not a task. Do not answer it and do not run tools or discovery commands. End your turn immediately. The queued hcom message will arrive automatically as your next prompt.
@@ -449,8 +449,10 @@ pub fn get_bootstrap(
 
     // Tool-specific delivery
     if tool == "antigravity" && ctx.is_launched {
+        parts.push(DELIVERY_AUTO);
         parts.push(ANTIGRAVITY_DELIVERY);
     } else if tool == "cursor" && ctx.is_launched {
+        parts.push(DELIVERY_AUTO);
         parts.push(CURSOR_DELIVERY);
     } else if tool == "claude"
         || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
@@ -815,7 +817,7 @@ mod tests {
         assert!(result.contains("ANTIGRAVITY DELIVERY"));
         assert!(result.contains("preview"));
         assert!(result.contains("hcom --help"));
-        assert!(!result.contains("Messages instantly and automatically arrive"));
+        assert!(result.contains("Messages instantly and automatically arrive"));
     }
 
     #[test]
