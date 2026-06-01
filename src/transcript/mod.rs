@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 
 pub use shared::{Exchange, ToolUse, format_exchanges, summarize_action};
 
-pub(crate) use opencode::{get_opencode_db_path, search_opencode_sessions};
+pub(crate) use opencode::{
+    get_kilo_db_path, get_opencode_db_path, search_kilo_sessions, search_opencode_sessions,
+};
 
 /// Which tool produced the transcript (replaces stringly-typed agent codes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +115,7 @@ pub fn kind_from_agent_or_path(agent: &str, path: &str) -> ToolKind {
         "antigravity" | "agy" => ToolKind::Antigravity,
         "gemini" => ToolKind::Gemini,
         "codex" => ToolKind::Codex,
-        "opencode" => ToolKind::OpenCode,
+        "opencode" | "kilo" => ToolKind::OpenCode,
         "cursor" | "cursor-agent" => ToolKind::Cursor,
         _ => detect_kind_from_path(path).unwrap_or(ToolKind::Claude),
     }

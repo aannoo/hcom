@@ -506,11 +506,58 @@ fn installed_opencode_help_crawls_but_hcom_keeps_opencode_args_pass_through() {
     let launcher = parser_source("src/launcher.rs");
     let launch_command = parser_source("src/commands/launch.rs");
     assert!(
-        launcher.contains("LaunchTool::OpenCode | LaunchTool::Antigravity => Vec::new(),"),
+        launcher.contains(
+            "LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Antigravity => Vec::new(),"
+        ),
         "OpenCode has no hcom parser table; if validation is added, add opencode to this drift guard"
     );
     assert!(
-        launch_command.contains("_ => cli_args.to_vec(), // opencode: pass through"),
+        launch_command.contains("_ => cli_args.to_vec(), // OpenCode-family tools: pass through"),
         "OpenCode launch args should remain pass-through unless an opencode parser drift guard is added"
+    );
+}
+
+#[test]
+#[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
+fn installed_kilo_help_crawls_but_hcom_keeps_kilo_args_pass_through() {
+    // Kilo is an OpenCode-family fork: same launch surface (`--agent`,
+    // `--model provider/model`) and the same pass-through handling in hcom.
+    let pages = collect_help_pages("kilo", CommandStyle::Prefixed("kilo"), 0);
+    let root_options = option_tokens(&pages[0]);
+    let option_count = root_options.len();
+    assert!(option_count > 0, "kilo help crawl found no options");
+    let root_option_tokens = root_options
+        .iter()
+        .map(|option| option.token.as_str())
+        .collect::<BTreeSet<_>>();
+    for token in ["--agent", "--model", "-m"] {
+        assert!(
+            root_option_tokens.contains(token),
+            "hcom observes Kilo launch arg {token}, but installed kilo root help does not list it"
+        );
+    }
+    let model_option = root_options
+        .iter()
+        .find(|option| option.token == "--model" || option.token == "-m")
+        .expect("model option should be present in Kilo help");
+    assert!(
+        model_option.line.contains("provider/model"),
+        "hcom expects Kilo --model/-m values to be provider/model, but help line changed: {}",
+        model_option.line
+    );
+
+    // Kilo shares OpenCode's pass-through launch handling; the invariants live in
+    // the same source lines the opencode guard asserts.
+    let launcher = parser_source("src/launcher.rs");
+    let launch_command = parser_source("src/commands/launch.rs");
+    assert!(
+        launcher.contains(
+            "LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Antigravity => Vec::new(),"
+        ),
+        "Kilo has no hcom parser table; if validation is added, add kilo to this drift guard"
+    );
+    assert!(
+        launch_command.contains("_ => cli_args.to_vec(), // OpenCode-family tools: pass through"),
+        "Kilo launch args should remain pass-through unless a kilo parser drift guard is added"
     );
 }

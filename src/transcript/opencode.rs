@@ -19,19 +19,47 @@ pub(crate) struct TranscriptSearchMatch {
     pub label: Option<String>,
 }
 
-pub(crate) fn get_opencode_db_path() -> Option<PathBuf> {
+fn get_family_db_path(tool: &str) -> Option<PathBuf> {
     let xdg_data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.local/share")
     });
-    let db_path = PathBuf::from(xdg_data).join("opencode").join("opencode.db");
+    let data_dir = PathBuf::from(xdg_data).join(tool);
+    let db_path = if tool == "kilo" {
+        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
+            return None;
+        }
+        std::env::var("KILO_DB")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    data_dir.join(path)
+                }
+            })
+            .unwrap_or_else(|| data_dir.join("kilo.db"))
+    } else {
+        data_dir.join("opencode.db")
+    };
     db_path.exists().then_some(db_path)
 }
 
-pub(crate) fn search_opencode_sessions(
+pub(crate) fn get_opencode_db_path() -> Option<PathBuf> {
+    get_family_db_path("opencode")
+}
+
+pub(crate) fn get_kilo_db_path() -> Option<PathBuf> {
+    get_family_db_path("kilo")
+}
+
+fn search_family_sessions(
     db_path: &Path,
     pattern: &str,
     limit: usize,
+    agent: &str,
 ) -> Result<Vec<TranscriptSearchMatch>, String> {
     let re = Regex::new(pattern).map_err(|e| format!("Invalid regex: {e}"))?;
     let conn =
@@ -87,7 +115,7 @@ pub(crate) fn search_opencode_sessions(
             order.push(session_id.clone());
             TranscriptSearchMatch {
                 path: db_path.to_string_lossy().to_string(),
-                agent: "opencode".to_string(),
+                agent: agent.to_string(),
                 line: 0,
                 text: truncate_str(&text.replace('\n', " "), 100).to_string(),
                 matches: 0,
@@ -103,6 +131,22 @@ pub(crate) fn search_opencode_sessions(
         .filter_map(|session_id| by_session.remove(&session_id))
         .take(limit)
         .collect())
+}
+
+pub(crate) fn search_opencode_sessions(
+    db_path: &Path,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<TranscriptSearchMatch>, String> {
+    search_family_sessions(db_path, pattern, limit, "opencode")
+}
+
+pub(crate) fn search_kilo_sessions(
+    db_path: &Path,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<TranscriptSearchMatch>, String> {
+    search_family_sessions(db_path, pattern, limit, "kilo")
 }
 
 /// Parse OpenCode SQLite transcript database.

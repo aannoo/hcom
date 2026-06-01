@@ -1,4 +1,4 @@
-# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode
+# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code
 
 Verified behavior when mixing different AI coding tools via hcom.
 
@@ -40,10 +40,20 @@ Verified behavior when mixing different AI coding tools via hcom.
 
 ### OpenCode
 - **Hooks**: start, status, read, stop — via TypeScript plugin
-- **Plugin location**: `$XDG_DATA_HOME/opencode/plugins/hcom/`
+- **Plugin location**: `$XDG_CONFIG_HOME/opencode/plugins/hcom.ts`
 - **Session binding**: Via TCP binding ceremony (plugin calls `hcom opencode-start --session-id`)
 - **Message delivery**: Plugin TCP endpoint
 - **Auto-approval**: `OPENCODE_PERMISSION` env var scoped to safe hcom command prefixes
+
+### Kilo Code
+
+- **Delivery**: Shares OpenCode's `hcom.ts` plugin and `opencode-*` hook handlers.
+- **Plugin location**: `$XDG_CONFIG_HOME/kilo/plugins/hcom.ts`
+- **Session binding**: Via the OpenCode-family TCP binding ceremony.
+- **Transcript**: SQLite at `$XDG_DATA_HOME/kilo/kilo.db` unless `KILO_DB` overrides it.
+- **Resume/Fork**: `--session <id>` / `--session <id> --fork`
+- **Message delivery**: Plugin TCP endpoint
+- **Auto-approval**: `KILO_PERMISSION` env var scoped to safe hcom command prefixes
 
 ### Cursor (cursor-agent)
 - **Hooks**: sessionStart, beforeSubmitPrompt, preToolUse, postToolUse, stop, sessionEnd

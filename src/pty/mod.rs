@@ -735,8 +735,8 @@ impl Proxy {
             Ok(Tool::Claude) | Ok(Tool::Codex) | Ok(Tool::Antigravity) | Ok(Tool::Cursor) => {
                 Duration::from_secs(5) // ? for shortcuts footer (Claude/Codex/agy)
             }
-            Ok(Tool::OpenCode) => Duration::from_secs(5), // Empty ready_pattern fires immediately; 5s fallback
-            _ => Duration::from_secs(60),                 // Gemini: ready pattern always visible
+            Ok(Tool::OpenCode) | Ok(Tool::Kilo) => Duration::from_secs(5),
+            _ => Duration::from_secs(60), // Gemini: ready pattern always visible
         };
 
         loop {

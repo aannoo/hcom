@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "hcom"
 version = "0.7.19"
-description = "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode, Antigravity."
+description = "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Antigravity."
 readme = "README.md"
 license = "MIT"
 authors = [{name = "aannoo"}]
-keywords = ["claude", "claude-code", "gemini", "codex", "opencode", "antigravity", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
+keywords = ["claude", "claude-code", "gemini", "codex", "opencode", "kilo", "kilocode", "antigravity", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
 dependencies = []
 classifiers = [
     "Development Status :: 4 - Beta",

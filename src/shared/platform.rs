@@ -126,6 +126,8 @@ pub fn is_inside_ai_tool() -> bool {
         || is_set("CODEX_THREAD_ID")
         // OpenCode
         || is_eq("OPENCODE", "1")
+        // Kilo Code
+        || is_eq("KILO", "1")
         // Cursor Agent
         || is_set("CURSOR_AGENT")
         || is_set("CURSOR_PROJECT_DIR")
@@ -156,6 +158,8 @@ pub fn detect_current_tool_from_env() -> &'static str {
         "codex"
     } else if is_eq("OPENCODE", "1") {
         "opencode"
+    } else if is_eq("KILO", "1") {
+        "kilo"
     } else if is_set("CURSOR_AGENT") || is_set("CURSOR_PROJECT_DIR") {
         "cursor"
     } else {

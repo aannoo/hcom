@@ -990,7 +990,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             let merged = codex_args::merge_codex_args(&orig_spec, &resume_spec);
             merged.rebuild_tokens(true, true)
         }
-        "opencode" => merge_opencode_args(original, resume),
+        "opencode" | "kilo" => merge_opencode_args(original, resume),
         "antigravity" => merge_antigravity_args(original, resume),
         "cursor" => merge_cursor_args(original, resume),
         _ => {
@@ -1464,18 +1464,18 @@ fn is_opencode_session_id(s: &str) -> bool {
 ///
 /// If none exist, falls through to the platform default path (even though
 /// it's absent) so callers can surface a useful "searched here" message.
-fn opencode_data_dir() -> Option<std::path::PathBuf> {
+fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
         && !xdg.is_empty()
     {
-        candidates.push(std::path::PathBuf::from(xdg).join("opencode"));
+        candidates.push(std::path::PathBuf::from(xdg).join(tool));
     }
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local/share/opencode"));
+        candidates.push(home.join(".local/share").join(tool));
     }
     if let Some(data) = dirs::data_dir() {
-        candidates.push(data.join("opencode"));
+        candidates.push(data.join(tool));
     }
 
     for candidate in &candidates {
@@ -1486,11 +1486,39 @@ fn opencode_data_dir() -> Option<std::path::PathBuf> {
     candidates.into_iter().next_back()
 }
 
-/// Query opencode's SQLite DB for a session's working directory.
+fn opencode_data_dir() -> Option<std::path::PathBuf> {
+    opencode_family_data_dir("opencode")
+}
+
+fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
+    let data_dir = opencode_family_data_dir(tool)?;
+    if tool == "kilo" {
+        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
+            return None;
+        }
+        return Some(
+            std::env::var("KILO_DB")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        data_dir.join(path)
+                    }
+                })
+                .unwrap_or_else(|| data_dir.join("kilo.db")),
+        );
+    }
+    Some(data_dir.join("opencode.db"))
+}
+
+/// Query an OpenCode-family SQLite DB for a session's working directory.
 /// Returns (exists, cwd). `exists=true, cwd=None` is impossible given the
 /// schema (directory is NOT NULL), so `cwd=None` implies the row is absent.
-fn lookup_opencode_session(session_id: &str) -> Option<String> {
-    let db_path = opencode_data_dir()?.join("opencode.db");
+fn lookup_opencode_family_session(tool: &str, session_id: &str) -> Option<String> {
+    let db_path = opencode_family_db_path(tool)?;
     if !db_path.exists() {
         return None;
     }
@@ -1508,6 +1536,12 @@ fn lookup_opencode_session(session_id: &str) -> Option<String> {
     .ok()
 }
 
+fn lookup_family_session(session_id: &str) -> Option<(String, String)> {
+    ["opencode", "kilo"].into_iter().find_map(|tool| {
+        lookup_opencode_family_session(tool, session_id).map(|cwd| (tool.to_string(), cwd))
+    })
+}
+
 /// Resolve a session ID to the owning tool and (optionally) a pre-recovered
 /// working directory.
 ///
@@ -1516,10 +1550,10 @@ fn lookup_opencode_session(session_id: &str) -> Option<String> {
 /// - Opencode: returns `(tool="opencode", None)` — opencode stores sessions
 ///   in SQLite; CWD comes from a separate DB query, not a transcript file.
 fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
-    // 1. Opencode: prefix-scoped, query the SQLite DB directly.
+    // 1. OpenCode family: prefix-scoped, query the SQLite DBs directly.
     if is_opencode_session_id(session_id) {
-        if lookup_opencode_session(session_id).is_some() {
-            return Some(("opencode".to_string(), None));
+        if let Some((tool, _)) = lookup_family_session(session_id) {
+            return Some((tool, None));
         }
         return None;
     }
@@ -1714,17 +1748,22 @@ fn build_adopt_plan(
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
     let (tool, transcript_path) = find_session_on_disk(session_id).ok_or_else(|| {
-        // find_session_on_disk short-circuits for `ses_` IDs (only opencode is
-        // searched), so scope the error to match what was actually checked.
+        // find_session_on_disk short-circuits for `ses_` IDs (the OpenCode
+        // family is searched), so scope the error to match that lookup.
         let opencode_db = opencode_data_dir()
             .map(|d| d.join("opencode.db").display().to_string())
+            .unwrap_or_else(|| "(no data dir)".to_string());
+        let kilo_db = opencode_family_db_path("kilo")
+            .map(|path| path.display().to_string())
             .unwrap_or_else(|| "(no data dir)".to_string());
         if is_opencode_session_id(session_id) {
             anyhow::anyhow!(
                 "Session {sid} not found. Searched:\n  \
-                 - Opencode: {opencode_db} (table 'session')",
+                 - Opencode: {opencode_db} (table 'session')\n  \
+                 - Kilo:     {kilo_db} (table 'session')",
                 sid = session_id,
                 opencode_db = opencode_db,
+                kilo_db = kilo_db,
             )
         } else {
             let claude_projects = claude_config_dir().join("projects");
@@ -1748,8 +1787,8 @@ fn build_adopt_plan(
     let cwd_hint = if fork {
         None
     } else {
-        let raw = if tool == "opencode" {
-            lookup_opencode_session(session_id)
+        let raw = if tool == "opencode" || tool == "kilo" {
+            lookup_opencode_family_session(&tool, session_id)
         } else if let Some(ref path) = transcript_path {
             extract_cwd_from_transcript(path, &tool)
         } else {
@@ -2221,6 +2260,25 @@ mod tests {
     fn test_build_resume_args_opencode_fork() {
         let args = build_resume_args("opencode", "sess-000", true);
         assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
+    }
+
+    #[test]
+    fn test_build_resume_args_kilo_fork() {
+        let args = build_resume_args("kilo", "sess-000", true);
+        assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
+    }
+
+    #[test]
+    fn test_merge_resume_args_kilo_preserves_non_session_flags() {
+        let merged = merge_resume_args(
+            "kilo",
+            &s(&["--model", "kilo/kilo-auto/free", "--prompt", "old prompt"]),
+            &s(&["--session", "new-sess"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--session", "new-sess", "--model", "kilo/kilo-auto/free"])
+        );
     }
 
     #[test]

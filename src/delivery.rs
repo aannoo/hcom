@@ -1096,7 +1096,10 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(Tool::from_str(&config.tool), Ok(Tool::OpenCode)) {
+    if matches!(
+        Tool::from_str(&config.tool),
+        Ok(Tool::OpenCode | Tool::Kilo)
+    ) {
         log_info(
             "native",
             "delivery.opencode_mode",

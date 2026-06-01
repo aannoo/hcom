@@ -92,6 +92,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_KILO_ARGS",
+        "Default args for kilo on launch",
+        "string",
+    ),
+    (
         "HCOM_CURSOR_ARGS",
         "Default args for cursor-agent on launch",
         "string",
@@ -184,6 +189,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "codex_sandbox_mode" => Some("launch.codex.sandbox_mode"),
         "codex_system_prompt" => Some("launch.codex.system_prompt"),
         "opencode_args" => Some("launch.opencode.args"),
+        "kilo_args" => Some("launch.kilo.args"),
         "cursor_args" => Some("launch.cursor.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
@@ -1410,7 +1416,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Antigravity/Cursor auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1478,7 +1484,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/agy/cursor)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/agy/cursor)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -1491,6 +1497,16 @@ Example: hcom config opencode_args \"--model o3\"
 Clear:   hcom config opencode_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
+        ),
+
+        "HCOM_KILO_ARGS" => Some(
+            "\
+HCOM_KILO_ARGS - Default args passed to kilo on launch
+
+Example: hcom config kilo_args \"--model kilo/kilo-auto/free\"
+Clear:   hcom config kilo_args \"\"
+
+Prepended to launch-time cli args.",
         ),
 
         "HCOM_CURSOR_ARGS" => Some(
@@ -2051,7 +2067,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Antigravity/Cursor"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");

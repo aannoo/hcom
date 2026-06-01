@@ -75,6 +75,8 @@ fn ready_pattern(tool: &str) -> &'static str {
         "codex" => "\u{203a} ",
         "gemini" => "Type your message",
         "opencode" => "ctrl+p commands",
+        // Kilo is an OpenCode-family fork: same TUI footer.
+        "kilo" => "ctrl+p commands",
         "antigravity" => "? for shortcuts",
         // Cursor has no stable ASCII ready footer (spec ready_pattern is empty,
         // so is_ready() is always true); readiness is asserted via ready/
@@ -1075,12 +1077,16 @@ fn run_pty_test(tool: &str) {
     logln!(log, "{}", "=".repeat(60));
 }
 
-// ── OpenCode test flow ─────────────────────────────────────────────────
+// ── OpenCode-family test flow ──────────────────────────────────────────
 
-fn run_pty_test_opencode() {
+/// Shared flow for OpenCode-family tools (opencode, kilo): the agent boots in a
+/// PTY, the first message is delivered via bootstrap injection, and subsequent
+/// messages are delivered by the shared TypeScript plugin. Kilo registers the
+/// same `opencode-*` hooks (HooksSpec.shared_hooks_with = OpenCode), so the
+/// `opencode-read --check` quiescence probe applies verbatim to both.
+fn run_pty_test_opencode_family(tool: &str) {
     let _serial = serial_lock();
 
-    let tool = "opencode";
     let terminal = configure_test_terminal_env();
     let log = TestLog::new(tool);
 
@@ -1186,7 +1192,7 @@ fn run_pty_test_opencode() {
     assert_eq!(
         screen["ready"].as_bool(),
         Some(true),
-        "OpenCode should be ready after poll"
+        "{tool} should be ready after poll"
     );
     logln!(log, "  OK: ready=true");
     validate_ready_pattern(&screen, tool);
@@ -1197,7 +1203,7 @@ fn run_pty_test_opencode() {
     );
     assert!(
         screen["input_text"].is_null(),
-        "OpenCode input_text should be null, got {:?}",
+        "{tool} input_text should be null, got {:?}",
         screen["input_text"]
     );
     logln!(log, "  OK: input_text=null (no input detection)");
@@ -1402,7 +1408,13 @@ fn test_pty_codex() {
 #[test]
 #[ignore]
 fn test_pty_opencode() {
-    run_pty_test_opencode();
+    run_pty_test_opencode_family("opencode");
+}
+
+#[test]
+#[ignore]
+fn test_pty_kilo() {
+    run_pty_test_opencode_family("kilo");
 }
 
 #[test]

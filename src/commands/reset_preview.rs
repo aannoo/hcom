@@ -73,7 +73,7 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
          1. Stop all {instance_count} local instances (kills processes, logs snapshots)\n  \
          2. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
          3. Delete database (hcom.db)\n  \
-         4. Remove hooks from Claude/Gemini/Codex/OpenCode/Antigravity/Cursor configs\n  \
+         4. Remove hooks from Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor configs\n  \
          5. Archive and delete config.toml + env\n  \
          6. Clear device identity (new UUID on next relay)\n\n\
          Add --go flag and run again to proceed:\n  \

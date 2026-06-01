@@ -280,6 +280,11 @@ const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[(
     "Use a specific model",
 )];
 
+const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom kilo --model kilo/kilo-auto/free",
+    "Use Kilo's free auto model",
+)];
+
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
     ("hcom agy --sandbox", "Flags forwarded to agy"),
@@ -489,6 +494,54 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static KILO: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Kilo,
+    name: "kilo",
+    label: "Kilo Code",
+    aliases: &["kilocode"],
+    cli_binary: "kilo",
+    tui_prefix: "kil ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"ctrl+p commands",
+    hooks: HooksSpec {
+        names: OPENCODE_HOOKS,
+        shared_hooks_with: Some(Tool::OpenCode),
+        invocation: HookInvocation::Argv,
+    },
+    // Kilo is an OpenCode-family variant: its shared TypeScript plugin owns
+    // delivery after the first PTY bootstrap turn.
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: false,
+        block_on_approval: false,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_KILO_ARGS"),
+        config_dir_env: Some("KILO_CONFIG_DIR"),
+        initial_prompt: InitialPromptShape::Flag("--prompt"),
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--session"),
+        fork: Some(ForkArgs::AppendFlag("--fork")),
+    }),
+    help: HelpSpec {
+        unique_examples: KILO_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &[],
+        file: &[],
+        delegate: &[],
+    },
+};
+
 pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     tool: Tool::Antigravity,
     name: "antigravity",
@@ -652,6 +705,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &GEMINI,
     &CODEX,
     &OPENCODE,
+    &KILO,
     &ANTIGRAVITY,
     &CURSOR,
     &ADHOC,
@@ -665,6 +719,7 @@ impl Tool {
             Tool::Gemini => &GEMINI,
             Tool::Codex => &CODEX,
             Tool::OpenCode => &OPENCODE,
+            Tool::Kilo => &KILO,
             Tool::Antigravity => &ANTIGRAVITY,
             Tool::Cursor => &CURSOR,
             Tool::Adhoc => &ADHOC,
@@ -701,6 +756,7 @@ mod tests {
             Tool::Gemini,
             Tool::Codex,
             Tool::OpenCode,
+            Tool::Kilo,
             Tool::Antigravity,
             Tool::Cursor,
             Tool::Adhoc,
@@ -742,6 +798,12 @@ mod tests {
     }
 
     #[test]
+    fn kilo_hooks_match_opencode() {
+        assert_eq!(KILO.hooks.names, OPENCODE.hooks.names);
+        assert_eq!(KILO.hooks.shared_hooks_with, Some(Tool::OpenCode));
+    }
+
+    #[test]
     fn adhoc_is_quiet() {
         assert!(ADHOC.hooks.names.is_empty());
         assert_eq!(ADHOC.hooks.invocation, HookInvocation::None);
@@ -756,9 +818,10 @@ mod tests {
         assert!(names.contains(&"gemini"));
         assert!(names.contains(&"codex"));
         assert!(names.contains(&"opencode"));
+        assert!(names.contains(&"kilo"));
         assert!(names.contains(&"antigravity"));
         assert!(names.contains(&"cursor"));
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
     }
 
     #[test]

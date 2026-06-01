@@ -435,6 +435,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "gemini" => preview.config.gemini_args.as_str(),
             "codex" => preview.config.codex_args.as_str(),
             "opencode" => preview.config.opencode_args.as_str(),
+            "kilo" | "kilocode" => preview.config.kilo_args.as_str(),
             "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
             _ => "",
         }
@@ -600,7 +601,7 @@ pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConf
             tokens.extend(cli_args.iter().cloned());
             tokens
         }
-        _ => cli_args.to_vec(), // opencode: pass through
+        _ => cli_args.to_vec(), // OpenCode-family tools: pass through
     }
 }
 

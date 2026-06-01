@@ -72,7 +72,7 @@ pub struct TranscriptSearchArgs {
     /// Max results (default: 20)
     #[arg(long, default_value = "20")]
     pub limit: usize,
-    /// Filter by agent type (claude, gemini, codex, opencode)
+    /// Filter by agent type (claude, gemini, codex, opencode, kilo)
     #[arg(long)]
     pub agent: Option<String>,
 }
@@ -137,6 +137,8 @@ pub(crate) fn detect_agent_type(path: &str) -> &str {
         "codex"
     } else if lower.contains("opencode") {
         "opencode"
+    } else if lower.contains("kilo") {
+        "kilo"
     } else {
         "unknown"
     }
@@ -294,6 +296,11 @@ fn cmd_transcript_search(
         } else {
             None
         };
+        let kilo_db = if transcript_agent_matches(agent_filter, "kilo") {
+            transcript::get_kilo_db_path()
+        } else {
+            None
+        };
 
         if transcript_agent_matches(agent_filter, "claude") {
             let p = claude_config_dir().join("projects");
@@ -316,7 +323,7 @@ fn cmd_transcript_search(
             }
         }
 
-        if search_dirs.is_empty() && opencode_db.is_none() {
+        if search_dirs.is_empty() && opencode_db.is_none() && kilo_db.is_none() {
             println!("No transcript directories found on disk.");
             return 0;
         }
@@ -341,10 +348,19 @@ fn cmd_transcript_search(
             .as_deref()
             .map(|db_path| transcript::search_opencode_sessions(db_path, pattern, limit))
             .transpose();
-        let opencode_matches = match opencode_matches {
-            Ok(Some(matches)) => matches,
-            Ok(None) => Vec::new(),
-            Err(err) => {
+        let kilo_matches = kilo_db
+            .as_deref()
+            .map(|db_path| transcript::search_kilo_sessions(db_path, pattern, limit))
+            .transpose();
+        let opencode_matches = match (opencode_matches, kilo_matches) {
+            (Ok(Some(mut matches)), Ok(Some(kilo))) => {
+                matches.extend(kilo);
+                matches
+            }
+            (Ok(Some(matches)), Ok(None)) => matches,
+            (Ok(None), Ok(Some(matches))) => matches,
+            (Ok(None), Ok(None)) => Vec::new(),
+            (Err(err), _) | (_, Err(err)) => {
                 eprintln!("Error: {err}");
                 return 1;
             }
@@ -1334,6 +1350,10 @@ mod tests {
             "opencode"
         );
         assert_eq!(
+            detect_agent_type("/home/user/.local/share/kilo/kilo.db"),
+            "kilo"
+        );
+        assert_eq!(
             detect_agent_type("/home/user/Library/Application Support/Antigravity/session.jsonl"),
             "antigravity"
         );
@@ -1346,6 +1366,7 @@ mod tests {
             ("/home/user/.gemini/tmp/session.json", "gemini"),
             ("/home/user/.codex/sessions/x/rollout.jsonl", "codex"),
             ("/home/user/.local/share/opencode/opencode.db", "opencode"),
+            ("/home/user/.local/share/kilo/kilo.db", "kilo"),
             (
                 "/home/user/Library/Application Support/Antigravity/session.jsonl",
                 "antigravity",

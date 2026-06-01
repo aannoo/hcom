@@ -42,6 +42,7 @@ pub mod test_helpers {
         saved_xdg_config_home: Option<String>,
         saved_codex_home: Option<String>,
         saved_gemini_cli_home: Option<String>,
+        saved_kilo_config_dir: Option<String>,
         saved_test_codex_cli_version: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
@@ -64,6 +65,7 @@ pub mod test_helpers {
                 saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
                 saved_codex_home: std::env::var("CODEX_HOME").ok(),
                 saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
+                saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
                 _lock: lock,
             }
@@ -96,6 +98,10 @@ pub mod test_helpers {
                 match &self.saved_gemini_cli_home {
                     Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
                     None => std::env::remove_var("GEMINI_CLI_HOME"),
+                }
+                match &self.saved_kilo_config_dir {
+                    Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
+                    None => std::env::remove_var("KILO_CONFIG_DIR"),
                 }
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),

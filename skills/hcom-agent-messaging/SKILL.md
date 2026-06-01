@@ -12,7 +12,7 @@ AI agents running in separate terminals are isolated. hcom connects them via hoo
 
 ```bash
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom agy, hcom cursor-agent
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom agy, hcom cursor-agent
 hcom              # TUI dashboard
 ```
 
@@ -56,6 +56,7 @@ run `hcom --help` for full command syntax and flags.
 | gemini cli (>= 0.26.0) | automatic | `hcom gemini` |
 | codex | automatic | `hcom codex` |
 | opencode | automatic | `hcom opencode` |
+| kilo code | automatic | `hcom kilo` |
 | antigravity | automatic | `hcom agy` |
 | cursor | automatic | `hcom cursor-agent` |
 | any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |

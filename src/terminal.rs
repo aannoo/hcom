@@ -405,6 +405,7 @@ pub fn which_bin(name: &str) -> Option<String> {
                 home.join(".claude").join("bin").join("claude"),
             ],
             "opencode" => &[home.join(".opencode").join("bin").join("opencode")],
+            "kilo" => &[home.join(".kilo").join("bin").join("kilo")],
             "cursor-agent" => &[home.join(".local").join("bin").join("cursor-agent")],
             _ => &[],
         };
@@ -625,6 +626,8 @@ pub fn create_bash_script(
         let cmd_lower = command_str.to_lowercase();
         if cmd_lower.contains("opencode") {
             "OpenCode"
+        } else if cmd_lower.contains("kilo") {
+            "Kilo Code"
         } else if cmd_lower.contains("cursor-agent") {
             "Cursor Agent"
         } else if cmd_lower.contains("gemini") {

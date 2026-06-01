@@ -66,6 +66,10 @@ fn check_opencode_hooks() -> bool {
     crate::hooks::opencode::verify_opencode_plugin_installed()
 }
 
+fn check_kilo_hooks() -> bool {
+    crate::hooks::opencode::verify_kilo_plugin_installed()
+}
+
 fn check_antigravity_hooks() -> bool {
     crate::hooks::antigravity::verify_antigravity_hooks_installed(false)
 }
@@ -115,6 +119,11 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
             name: "OpenCode",
             installed: is_in_path("opencode"),
             hooks: check_opencode_hooks(),
+        },
+        ToolStatus {
+            name: "Kilo Code",
+            installed: crate::terminal::which_bin("kilo").is_some(),
+            hooks: check_kilo_hooks(),
         },
         ToolStatus {
             name: "Antigravity",
@@ -274,14 +283,18 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     "installed": tools[3].installed,
                     "hooks": tools[3].hooks,
                 },
-                "antigravity": {
+                "kilo": {
                     "installed": tools[4].installed,
                     "hooks": tools[4].hooks,
+                },
+                "antigravity": {
+                    "installed": tools[5].installed,
+                    "hooks": tools[5].hooks,
                     "settings_path": antigravity_hooks_path.to_string_lossy(),
                 },
                 "cursor": {
-                    "installed": tools[5].installed,
-                    "hooks": tools[5].hooks,
+                    "installed": tools[6].installed,
+                    "hooks": tools[6].hooks,
                     "settings_path": cursor_hooks_path.to_string_lossy(),
                 },
             },

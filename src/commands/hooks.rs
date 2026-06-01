@@ -24,6 +24,7 @@ pub(crate) const HOOK_TOOLS: &[&str] = &[
     "gemini",
     "codex",
     "opencode",
+    "kilo",
     "antigravity",
     "cursor",
 ];
@@ -100,7 +101,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, cursor, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, all");
         return 1;
     };
 
@@ -164,6 +165,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 "gemini" => "Gemini CLI",
                 "codex" => "Codex",
                 "opencode" => "OpenCode",
+                "kilo" => "Kilo Code",
                 "antigravity" => "Antigravity",
                 "cursor" => "Cursor Agent",
                 other => other,
@@ -186,7 +188,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, antigravity, cursor, all");
+        eprintln!("Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, all");
         return 1;
     };
 
@@ -247,8 +249,8 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
              Usage:\n  \
              hcom hooks                  Show hook status for all tools\n  \
              hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|antigravity|cursor|all)\n  \
-             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|antigravity|cursor|all)\n\n\
+             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|kilo|antigravity|cursor|all)\n  \
+             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|kilo|antigravity|cursor|all)\n\n\
              Examples:\n  \
              hcom hooks add claude       Add Claude Code hooks only\n  \
              hcom hooks add              Auto-detect tool or add all\n  \

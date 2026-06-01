@@ -31,6 +31,7 @@ pub enum LaunchTool {
     Gemini,
     Codex,
     OpenCode,
+    Kilo,
     Antigravity,
     Cursor,
 }
@@ -44,6 +45,7 @@ impl LaunchTool {
             "gemini" => Ok(LaunchTool::Gemini),
             "codex" => Ok(LaunchTool::Codex),
             "opencode" => Ok(LaunchTool::OpenCode),
+            "kilo" | "kilocode" => Ok(LaunchTool::Kilo),
             "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             _ => bail!("Unknown tool: {}", s),
@@ -57,6 +59,7 @@ impl LaunchTool {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Kilo => "kilo",
             LaunchTool::Antigravity => "antigravity",
             LaunchTool::Cursor => "cursor",
         }
@@ -72,6 +75,7 @@ impl LaunchTool {
             LaunchTool::Gemini => crate::tool::Tool::Gemini,
             LaunchTool::Codex => crate::tool::Tool::Codex,
             LaunchTool::OpenCode => crate::tool::Tool::OpenCode,
+            LaunchTool::Kilo => crate::tool::Tool::Kilo,
             LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
         }
@@ -136,6 +140,7 @@ impl LaunchBackend {
             LaunchTool::Gemini
             | LaunchTool::Codex
             | LaunchTool::OpenCode
+            | LaunchTool::Kilo
             | LaunchTool::Antigravity
             | LaunchTool::Cursor => LaunchBackend::HeadlessPty,
         }
@@ -417,11 +422,18 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::OpenCode => {
-            if crate::hooks::opencode::ensure_plugin_installed() {
+            if crate::hooks::opencode::ensure_plugin_installed("opencode") {
                 return Ok(());
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
+        }
+        LaunchTool::Kilo => {
+            if crate::hooks::opencode::ensure_plugin_installed("kilo") {
+                return Ok(());
+            }
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup Kilo Code plugin. Run: hcom hooks add kilo\n{diag}");
         }
         LaunchTool::Antigravity => {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
@@ -1363,9 +1375,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     )
                 }
 
-                LaunchTool::OpenCode => {
+                LaunchTool::OpenCode | LaunchTool::Kilo => {
                     opencode_preprocessing::preprocess_opencode_env(
                         &mut instance_env,
+                        base_tool,
                         &instance_name,
                         hcom_config.auto_approve,
                     );
@@ -1382,7 +1395,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     launch_pty_or_background(
                         &mut BackgroundLaunchCtx {
                             db,
-                            tool: "opencode",
+                            tool: base_tool,
                             instance_name: &instance_name,
                             process_id: &process_id,
                             terminal_mode,
@@ -1555,7 +1568,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
             errs
         }
         LaunchTool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
-        LaunchTool::OpenCode | LaunchTool::Antigravity => Vec::new(),
+        LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Antigravity => Vec::new(),
     }
 }
 
@@ -1590,6 +1603,14 @@ mod tests {
         assert_eq!(
             LaunchTool::from_str("opencode", false).unwrap(),
             LaunchTool::OpenCode
+        );
+        assert_eq!(
+            LaunchTool::from_str("kilo", false).unwrap(),
+            LaunchTool::Kilo
+        );
+        assert_eq!(
+            LaunchTool::from_str("kilocode", false).unwrap(),
+            LaunchTool::Kilo
         );
         assert_eq!(
             LaunchTool::from_str("antigravity", false).unwrap(),
@@ -1632,6 +1653,7 @@ mod tests {
         assert!(LaunchTool::Gemini.uses_pty());
         assert!(LaunchTool::Codex.uses_pty());
         assert!(LaunchTool::OpenCode.uses_pty());
+        assert!(LaunchTool::Kilo.uses_pty());
     }
 
     #[test]
@@ -1643,6 +1665,7 @@ mod tests {
             LaunchTool::Gemini,
             LaunchTool::Codex,
             LaunchTool::OpenCode,
+            LaunchTool::Kilo,
             LaunchTool::Antigravity,
         ] {
             let pty = tool.uses_pty();
@@ -1680,6 +1703,7 @@ mod tests {
             LaunchTool::Gemini,
             LaunchTool::Codex,
             LaunchTool::OpenCode,
+            LaunchTool::Kilo,
             LaunchTool::Antigravity,
         ] {
             assert_eq!(

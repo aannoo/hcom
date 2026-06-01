@@ -94,6 +94,9 @@ pub fn build_launch_argv(
             Tool::OpenCode => {
                 argv.extend(["--prompt".into(), prompt.into()]);
             }
+            Tool::Kilo => {
+                argv.extend(["--prompt".into(), prompt.into()]);
+            }
             Tool::Antigravity => {
                 // agy uses --prompt-interactive for interactive initial prompts
                 argv.extend(["--prompt-interactive".into(), prompt.into()]);

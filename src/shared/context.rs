@@ -49,6 +49,7 @@ pub struct HcomContext {
     pub is_gemini: bool,
     pub is_codex: bool,
     pub is_opencode: bool,
+    pub is_kilo: bool,
     pub is_cursor: bool,
     /// HCOM_IS_FORK=1 (--fork-session launch).
     pub is_fork: bool,
@@ -100,6 +101,7 @@ impl HcomContext {
             || is_set("CODEX_MANAGED_BY_BUN")
             || is_set("CODEX_THREAD_ID");
         let is_opencode = is_eq("OPENCODE", "1");
+        let is_kilo = is_eq("KILO", "1");
         let is_cursor = is_set("CURSOR_AGENT") || is_set("CURSOR_PROJECT_DIR");
 
         // Determine tool type
@@ -113,6 +115,8 @@ impl HcomContext {
             Tool::Codex
         } else if is_opencode {
             Tool::OpenCode
+        } else if is_kilo {
+            Tool::Kilo
         } else if is_cursor {
             Tool::Cursor
         } else {
@@ -138,6 +142,7 @@ impl HcomContext {
             is_gemini,
             is_codex,
             is_opencode,
+            is_kilo,
             is_cursor,
             is_fork: is_eq("HCOM_IS_FORK", "1"),
             codex_thread_id: get_nonempty("CODEX_THREAD_ID"),
@@ -197,6 +202,7 @@ impl HcomContext {
             || self.is_gemini
             || self.is_codex
             || self.is_opencode
+            || self.is_kilo
             || self.is_cursor
     }
 
@@ -300,6 +306,16 @@ mod tests {
     }
 
     #[test]
+    fn test_from_env_kilo() {
+        let env = make_env(&[("KILO", "1"), ("HOME", "/home/test")]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+
+        assert!(ctx.is_kilo);
+        assert_eq!(ctx.tool, Tool::Kilo);
+        assert_eq!(ctx.detect_vanilla_tool(), Some("kilo"));
+    }
+
+    #[test]
     fn test_from_env_adhoc() {
         let env = make_env(&[("HOME", "/home/test")]);
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
@@ -308,6 +324,7 @@ mod tests {
         assert!(!ctx.is_gemini);
         assert!(!ctx.is_codex);
         assert!(!ctx.is_opencode);
+        assert!(!ctx.is_kilo);
         assert_eq!(ctx.tool, Tool::Adhoc);
     }
 
@@ -468,6 +485,7 @@ mod tests {
         assert_eq!(Tool::Gemini.as_str(), "gemini");
         assert_eq!(Tool::Codex.as_str(), "codex");
         assert_eq!(Tool::OpenCode.as_str(), "opencode");
+        assert_eq!(Tool::Kilo.as_str(), "kilo");
         assert_eq!(Tool::Adhoc.as_str(), "adhoc");
     }
 

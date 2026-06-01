@@ -187,11 +187,11 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [ANTIGRAVITY]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [ANTIGRAVITY]  hcom-launched (PTY + hooks)",
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [antigravity] [cursor]  vanilla (hooks only)",
+        "[claude] [gemini] [codex] [opencode] [kilo] [antigravity] [cursor]  vanilla (hooks only)",
     ),
     ("", "[AD-HOC]                              manual polling"),
 ];
@@ -443,7 +443,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .antigravity, .cursor",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .antigravity, .cursor",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -477,7 +477,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / cursor_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / cursor_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -541,7 +541,7 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("  --limit N", "Max results (default: 20)"),
     (
         "  --agent TYPE",
-        "Filter: claude | gemini | codex | opencode",
+        "Filter: claude | gemini | codex | opencode | kilo",
     ),
     (
         "  --exclude-self",
@@ -609,11 +609,11 @@ const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks status", "Same as above"),
     (
         "hooks add [tool]",
-        "Add hooks (claude | gemini | codex | opencode | antigravity | cursor | all)",
+        "Add hooks (claude | gemini | codex | opencode | kilo | antigravity | cursor | all)",
     ),
     (
         "hooks remove [tool]",
-        "Remove hooks (claude | gemini | codex | opencode | antigravity | cursor | all)",
+        "Remove hooks (claude | gemini | codex | opencode | kilo | antigravity | cursor | all)",
     ),
     ("", ""),
     (
@@ -848,6 +848,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "gemini",
     "codex",
     "opencode",
+    "kilo",
+    "kilocode",
     "antigravity",
     "agy",
     "cursor",
@@ -864,9 +866,9 @@ Usage:\n\
   hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] claude|gemini|codex|opencode|agy|cursor-agent [flags] [tool-args]\n\
+  hcom [N] claude|gemini|codex|opencode|kilo|agy|cursor-agent [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session (claude/codex/opencode)\n\
+  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
@@ -922,7 +924,7 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
          <target> can be:\n\
          \x20 <name>                            hcom name (4-letter)\n\
          \x20 <uuid>                            claude/codex/gemini session UUID\n\
-         \x20 ses_<id>                          opencode session ID\n\
+         \x20 ses_<id>                          opencode/kilo session ID\n\
          \x20 <thread-name>                     claude /rename title or codex thread_name\n\
          \x20 <target>:<device>                 run on a remote device via relay\n\
          \n\
@@ -954,14 +956,14 @@ pub fn get_command_help(name: &str) -> String {
             "Adopting by UUID or thread-name reclaims the original hcom\n\
              identity if one existed; otherwise a new identity is assigned.\n\
              CWD is recovered from the session's transcript/DB.",
-            "hcom f <target>                   Fork an agent session (claude/codex/opencode)",
+            "hcom f <target>                   Fork an agent session (claude/codex/opencode/kilo)",
         );
     }
     if name == "f" || name == "fork" {
         return resume_fork_help(
             "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
             "Creates a new agent that continues from the forked session.\n\
-             Supported tools: claude, codex, opencode. (gemini does not fork.)\n\
+             Supported tools: claude, codex, opencode, kilo. (gemini does not fork.)\n\
              Remote fork (`:<device>`) requires --dir to pin the target cwd.",
             "hcom r <target>                   Resume a stopped agent",
         );
@@ -1153,9 +1155,9 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(help.contains("claude|gemini|codex|opencode|agy"));
+        assert!(help.contains("claude|gemini|codex|opencode|kilo|agy"));
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode)"
+            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo)"
         ));
     }
 }
