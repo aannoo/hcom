@@ -132,6 +132,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_AUTO_TRUST_WORKSPACE",
+        "Auto-inject ephemeral workspace trust for gemini/codex/cursor at launch (true/false)",
+        "boolean",
+    ),
+    (
         "HCOM_NAME_EXPORT",
         "Export instance name to custom env var",
         "string",
@@ -182,6 +187,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "notes" => Some("launch.notes"),
         "subagent_timeout" => Some("launch.subagent_timeout"),
         "auto_subscribe" => Some("launch.auto_subscribe"),
+        "auto_trust_workspace" => Some("launch.auto_trust_workspace"),
         "claude_args" => Some("launch.claude.args"),
         "gemini_args" => Some("launch.gemini.args"),
         "gemini_system_prompt" => Some("launch.gemini.system_prompt"),
@@ -367,6 +373,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_TIMEOUT" => "86400",
         "HCOM_SUBAGENT_TIMEOUT" => "30",
         "HCOM_AUTO_APPROVE" => "true",
+        "HCOM_AUTO_TRUST_WORKSPACE" => "true",
         _ => "",
     };
     (default.to_string(), "default")

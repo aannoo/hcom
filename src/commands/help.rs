@@ -482,6 +482,10 @@ const CONFIG_HELP: &[HelpEntry] = &[
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
     ("  auto_subscribe", "Event auto-subscribe presets"),
+    (
+        "  auto_trust_workspace",
+        "Auto-trust launch dir (skip folder-trust prompt)",
+    ),
     ("  name_export", "Export agent name to custom env var"),
     ("", "hcom config <key> --info for details"),
     ("", ""),

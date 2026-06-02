@@ -859,6 +859,53 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
     );
 }
 
+/// Inject ephemeral workspace trust flags into args for gemini and codex.
+///
+/// - gemini: adds `--skip-trust` (session-scoped, no persisted state)
+/// - codex: adds `-c` with a TOML inline-table value that sets trust for the
+///   canonical CWD. Uses key `projects` (no dots in the key path) so codex's
+///   naive `.`-splitting never touches the path itself, making it robust to
+///   dotted directory components. Paths containing a literal `"` or backslash
+///   would break the TOML quoting — a Windows-only edge case, not handled here.
+///
+/// When `auto_trust` is false, returns immediately without modifying args.
+/// Idempotent: no-op if the relevant flag is already present.
+/// Cursor is handled separately via `ensure_cursor_workspace_trusted`.
+pub(crate) fn inject_workspace_trust_args(
+    tool: &LaunchTool,
+    canonical_dir: &std::path::Path,
+    args: &mut Vec<String>,
+    auto_trust: bool,
+) {
+    if !auto_trust {
+        return;
+    }
+    match tool {
+        LaunchTool::Gemini if !args.iter().any(|a| a == "--skip-trust") => {
+            args.push("--skip-trust".to_string());
+        }
+        LaunchTool::Gemini => {}
+        LaunchTool::Codex => {
+            let already_set = args
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1].contains("trust_level"));
+            if !already_set {
+                let canonical_str = canonical_dir.to_string_lossy();
+                // codex -c: key="projects" (no dots → no split issue), value is a TOML
+                // inline table with the quoted path as key. apply_single_override replaces
+                // the projects table for this session only (file stays untouched).
+                let trust_override = format!(
+                    "projects={{ \"{}\" = {{ trust_level = \"trusted\" }} }}",
+                    canonical_str
+                );
+                args.push("-c".to_string());
+                args.push(trust_override);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Launch one or more AI tool instances with consistent tracking.
 ///
 /// This is the unified entry point for launching Claude, Gemini, Codex,
@@ -974,9 +1021,22 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
-    if matches!(normalized, LaunchTool::Cursor) {
-        cursor_preprocessing::ensure_cursor_workspace_trusted(Path::new(working_dir))?;
+    let canonical_dir = std::fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
+    // Folder trust is a first-run gate: until the launch dir is trusted, the tool
+    // parks on a "do you trust this folder?" prompt and never starts. Pre-grant
+    // trust for the dir the user pointed hcom at. Cursor's lever is a marker file
+    // (its `--trust` flag is print-only, inert in our PTY), so it's seeded here;
+    // gemini/codex use arg injection below.
+    if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Cursor) {
+        cursor_preprocessing::ensure_cursor_workspace_trusted(&canonical_dir)?;
     }
+    inject_workspace_trust_args(
+        &normalized,
+        &canonical_dir,
+        &mut params.args,
+        hcom_config.auto_trust_workspace,
+    );
     let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
         let process_id = std::env::var("HCOM_PROCESS_ID").ok();
@@ -1851,5 +1911,114 @@ mod tests {
         assert!(err.contains("already exists"), "unexpected: {err}");
         // Row should still be present — no deletion on conflict.
         assert!(db.get_instance("rune").unwrap().is_some());
+    }
+
+    // ── inject_workspace_trust_args ──────────────────────────────────────────
+
+    #[test]
+    fn test_auto_trust_workspace_default_true() {
+        assert!(crate::config::HcomConfig::default().auto_trust_workspace);
+    }
+
+    #[test]
+    fn test_gemini_flag_on_injects_skip_trust() {
+        let dir = std::path::Path::new("/some/workspace");
+        let mut args = vec!["--model".to_string(), "gemini-2.5-flash".to_string()];
+        inject_workspace_trust_args(&LaunchTool::Gemini, dir, &mut args, true);
+        assert!(args.contains(&"--skip-trust".to_string()));
+    }
+
+    #[test]
+    fn test_gemini_flag_off_no_injection() {
+        let dir = std::path::Path::new("/some/workspace");
+        let mut args = vec!["--model".to_string(), "gemini-2.5-flash".to_string()];
+        inject_workspace_trust_args(&LaunchTool::Gemini, dir, &mut args, false);
+        assert!(!args.contains(&"--skip-trust".to_string()));
+    }
+
+    #[test]
+    fn test_gemini_inject_idempotent_when_present() {
+        let dir = std::path::Path::new("/some/workspace");
+        let mut args = vec![
+            "--skip-trust".to_string(),
+            "--model".to_string(),
+            "x".to_string(),
+        ];
+        inject_workspace_trust_args(&LaunchTool::Gemini, dir, &mut args, true);
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "--skip-trust").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_codex_flag_on_injects_trust_level() {
+        let dir = std::path::Path::new("/my/project");
+        let mut args = vec!["--model".to_string(), "o4-mini".to_string()];
+        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        let c_idx = args
+            .iter()
+            .position(|a| a == "-c")
+            .expect("-c not injected");
+        let val = &args[c_idx + 1];
+        assert!(val.contains("/my/project"), "path missing: {val}");
+        assert!(val.contains("trust_level"), "trust_level missing: {val}");
+        assert!(val.contains("\"trusted\""), "trusted value missing: {val}");
+    }
+
+    #[test]
+    fn test_codex_flag_off_no_injection() {
+        let dir = std::path::Path::new("/my/project");
+        let mut args = vec!["--model".to_string(), "o4-mini".to_string()];
+        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, false);
+        assert!(!args.iter().any(|a| a == "-c"));
+    }
+
+    #[test]
+    fn test_codex_inject_idempotent_when_present() {
+        let dir = std::path::Path::new("/my/project");
+        // Any -c value containing "trust_level" suppresses re-injection.
+        let existing = r#"projects={ "/my/project" = { trust_level = "trusted" } }"#.to_string();
+        let mut args = vec!["-c".to_string(), existing];
+        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-c").count(), 1);
+    }
+
+    #[test]
+    fn test_codex_dotted_path_encoded_as_single_key() {
+        // A path like /Users/x/proj.v2 has a dot in a component. The inline-table
+        // format keeps the whole path as one TOML quoted key — no dot-splitting.
+        let dir = std::path::Path::new("/Users/x/proj.v2");
+        let mut args: Vec<String> = vec![];
+        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        let c_idx = args
+            .iter()
+            .position(|a| a == "-c")
+            .expect("-c not injected");
+        let val = &args[c_idx + 1];
+        // The full dotted path must survive intact as one quoted string.
+        assert!(
+            val.contains("\"/Users/x/proj.v2\""),
+            "full dotted path must be a single quoted key: {val}"
+        );
+        assert!(val.contains("trust_level"), "trust_level missing: {val}");
+    }
+
+    #[test]
+    fn test_non_trust_tools_unaffected() {
+        let dir = std::path::Path::new("/some/workspace");
+        for tool in &[
+            LaunchTool::Claude,
+            LaunchTool::ClaudePty,
+            LaunchTool::OpenCode,
+        ] {
+            let mut args = vec!["--model".to_string(), "x".to_string()];
+            inject_workspace_trust_args(tool, dir, &mut args, true);
+            assert_eq!(
+                args,
+                vec!["--model".to_string(), "x".to_string()],
+                "{tool:?} args should be unchanged"
+            );
+        }
     }
 }

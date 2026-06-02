@@ -909,7 +909,12 @@ fn maybe_emit_launch_blocked(
     }
 
     let screen = state.screen.read().unwrap();
-    if screen.last_output.elapsed() < SETTLE_THRESHOLD {
+    let tail_text = screen.visible_tail.as_deref().unwrap_or("");
+    // Gemini's animated startup banner keeps emitting output for ~60s, defeating
+    // the settle heuristic. Its trust prompt is distinctive — fire immediately
+    // when it appears rather than waiting for the banner animation to stop.
+    let trust_prompt_visible = tail_text.contains("Do you trust the files in this folder?");
+    if !trust_prompt_visible && screen.last_output.elapsed() < SETTLE_THRESHOLD {
         return;
     }
     let Some(tail) = screen

@@ -103,6 +103,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
+    ("auto_trust_workspace", "launch.auto_trust_workspace"),
 ];
 
 /// Mapping: HcomConfig field name -> HCOM_* env var key.
@@ -135,6 +136,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("auto_approve", "HCOM_AUTO_APPROVE"),
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
+    ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
 ];
 
 /// Relay fields — file-only, no env var override.
@@ -240,6 +242,7 @@ pub struct HcomConfig {
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
+    pub auto_trust_workspace: bool,
 }
 
 impl Default for HcomConfig {
@@ -268,6 +271,7 @@ impl Default for HcomConfig {
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
+            auto_trust_workspace: true,
         }
     }
 }
@@ -418,6 +422,9 @@ impl HcomConfig {
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
+            "auto_trust_workspace" => {
+                Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
+            }
             _ => None,
         }
     }
@@ -463,6 +470,7 @@ impl HcomConfig {
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
+            "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
             _ => return Err(format!("unknown field: {field}")),
         }
         Ok(())
@@ -580,7 +588,7 @@ impl HcomConfig {
         }
 
         // Load boolean fields
-        for bool_field in &["relay_enabled", "auto_approve"] {
+        for bool_field in &["relay_enabled", "auto_approve", "auto_trust_workspace"] {
             if let Some(val) = get_var(bool_field) {
                 match val {
                     TomlFieldValue::Bool(b) => {
@@ -892,6 +900,7 @@ hints = ""
 notes = ""
 subagent_timeout = 30
 auto_subscribe = "collision"
+auto_trust_workspace = true
 
 [launch.claude]
 args = ""
