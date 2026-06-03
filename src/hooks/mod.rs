@@ -9,6 +9,7 @@ pub mod common;
 pub mod cursor;
 pub mod family;
 pub mod gemini;
+pub mod kimi;
 pub mod opencode;
 pub mod utils;
 
@@ -327,6 +328,33 @@ impl HookPayload {
                 None => String::new(),
             },
             notification_type: None,
+            raw,
+        }
+    }
+
+    /// Build from Kimi Code CLI hook JSON.
+    ///
+    /// Kimi hooks pass JSON on stdin with snake_case fields such as:
+    ///   { "session_id", "hook_event_name", "tool_name", "tool_input",
+    ///     "tool_output", "prompt", "source", "cwd" }
+    pub fn from_kimi(hook_type: &str, raw: Value) -> Self {
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id"]),
+            transcript_path: None,
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "kimi".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result: match raw.get("tool_output") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            notification_type: Self::opt_str_field(&raw, &["notification_type", "sink"]),
             raw,
         }
     }

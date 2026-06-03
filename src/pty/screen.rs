@@ -394,6 +394,7 @@ impl ScreenTracker {
             Ok(Tool::Kilo) => None,     // Kilo shares OpenCode's plugin delivery model
             Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
+            Ok(Tool::Kimi) => None, // Kimi: standard PTY delivery, no custom input detection needed
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }

@@ -72,7 +72,7 @@ pub struct TranscriptSearchArgs {
     /// Max results (default: 20)
     #[arg(long, default_value = "20")]
     pub limit: usize,
-    /// Filter by agent type (claude, gemini, codex, opencode, kilo)
+    /// Filter by agent type (claude, gemini, codex, opencode, kilo, kimi)
     #[arg(long)]
     pub agent: Option<String>,
 }
@@ -139,6 +139,8 @@ pub(crate) fn detect_agent_type(path: &str) -> &str {
         "opencode"
     } else if lower.contains("kilo") {
         "kilo"
+    } else if lower.contains("kimi") {
+        "kimi"
     } else {
         "unknown"
     }
@@ -1374,6 +1376,10 @@ mod tests {
             (
                 "/home/user/.cursor/projects/x/agent-transcripts/abc/abc.jsonl",
                 "cursor",
+            ),
+            (
+                "/home/user/.kimi/sessions/abc123/def456/context.jsonl",
+                "kimi",
             ),
         ];
         let expected: std::collections::HashSet<&str> =

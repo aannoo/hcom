@@ -43,7 +43,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode / kilo / agy / cursor-agent
+hcom claude   # codex / gemini / opencode / kilo / agy / cursor-agent / kimi
 ```
 
 Terminal 2:
@@ -251,7 +251,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|agy|opencode|kilo|cursor-agent   # launch N agents
+hcom [N] claude|gemini|codex|agy|opencode|kilo|cursor-agent|kimi   # launch N agents
 hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane

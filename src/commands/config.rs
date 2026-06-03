@@ -102,6 +102,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_KIMI_ARGS",
+        "Default args for kimi on launch",
+        "string",
+    ),
+    (
         "HCOM_CODEX_SANDBOX_MODE",
         "Codex permission profile (workspace | untrusted | danger-full-access | none)",
         "string",
@@ -197,6 +202,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "opencode_args" => Some("launch.opencode.args"),
         "kilo_args" => Some("launch.kilo.args"),
         "cursor_args" => Some("launch.cursor.args"),
+        "kimi_args" => Some("launch.kimi.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -1491,7 +1497,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/agy/cursor)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/agy/cursor/kimi)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -1522,6 +1528,16 @@ HCOM_CURSOR_ARGS - Default args passed to cursor-agent on launch
 
 Example: hcom config cursor_args \"--model auto\"
 Clear:   hcom config cursor_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_KIMI_ARGS" => Some(
+            "\
+HCOM_KIMI_ARGS - Default args passed to kimi on launch
+
+Example: hcom config kimi_args \"--model kimi-k2.6\"
+Clear:   hcom config kimi_args \"\"
 
 Prepended to launch-time cli args.",
         ),

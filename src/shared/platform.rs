@@ -131,6 +131,9 @@ pub fn is_inside_ai_tool() -> bool {
         // Cursor Agent
         || is_set("CURSOR_AGENT")
         || is_set("CURSOR_PROJECT_DIR")
+        // Kimi Code
+        || is_eq("KIMI_CODE_CLI", "1")
+        || is_set("KIMI_SESSION_ID")
         // hcom-launched
         || is_eq("HCOM_LAUNCHED", "1")
 }
@@ -162,6 +165,8 @@ pub fn detect_current_tool_from_env() -> &'static str {
         "kilo"
     } else if is_set("CURSOR_AGENT") || is_set("CURSOR_PROJECT_DIR") {
         "cursor"
+    } else if is_eq("KIMI_CODE_CLI", "1") || is_set("KIMI_SESSION_ID") {
+        "kimi"
     } else {
         "adhoc"
     }

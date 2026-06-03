@@ -34,6 +34,7 @@ pub enum LaunchTool {
     Kilo,
     Antigravity,
     Cursor,
+    Kimi,
 }
 
 impl LaunchTool {
@@ -48,6 +49,7 @@ impl LaunchTool {
             "kilo" | "kilocode" => Ok(LaunchTool::Kilo),
             "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
+            "kimi" => Ok(LaunchTool::Kimi),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -62,6 +64,7 @@ impl LaunchTool {
             LaunchTool::Kilo => "kilo",
             LaunchTool::Antigravity => "antigravity",
             LaunchTool::Cursor => "cursor",
+            LaunchTool::Kimi => "kimi",
         }
     }
 
@@ -78,6 +81,7 @@ impl LaunchTool {
             LaunchTool::Kilo => crate::tool::Tool::Kilo,
             LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
+            LaunchTool::Kimi => crate::tool::Tool::Kimi,
         }
     }
 
@@ -142,7 +146,8 @@ impl LaunchBackend {
             | LaunchTool::OpenCode
             | LaunchTool::Kilo
             | LaunchTool::Antigravity
-            | LaunchTool::Cursor => LaunchBackend::HeadlessPty,
+            | LaunchTool::Cursor
+            | LaunchTool::Kimi => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -469,6 +474,23 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
                 bail!(
                     "Failed to setup Cursor hooks: {e}\n\
                      Run: hcom hooks add cursor\n\
+                     {diag}"
+                );
+            }
+            Ok(())
+        }
+        LaunchTool::Kimi => {
+            if crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions) {
+                return Ok(());
+            }
+            if let Err(e) = crate::hooks::kimi::try_setup_kimi_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[("hooks_path", crate::hooks::kimi::get_kimi_settings_path())],
+                );
+                bail!(
+                    "Failed to setup Kimi hooks: {e}\n\
+                     Run: hcom hooks add kimi\n\
                      {diag}"
                 );
             }
@@ -1528,6 +1550,34 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+
+                LaunchTool::Kimi => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(params.args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "kimi",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -1628,6 +1678,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
             errs
         }
         LaunchTool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
+        LaunchTool::Kimi => Vec::new(),
         LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Antigravity => Vec::new(),
     }
 }

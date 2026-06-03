@@ -95,6 +95,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("opencode_args", "launch.opencode.args"),
     ("kilo_args", "launch.kilo.args"),
     ("cursor_args", "launch.cursor.args"),
+    ("kimi_args", "launch.kimi.args"),
     ("relay", "relay.url"),
     ("relay_id", "relay.id"),
     ("relay_token", "relay.token"),
@@ -123,6 +124,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
     ("kilo_args", "HCOM_KILO_ARGS"),
     ("cursor_args", "HCOM_CURSOR_ARGS"),
+    ("kimi_args", "HCOM_KIMI_ARGS"),
     ("relay", "HCOM_RELAY"),
     ("relay_id", "HCOM_RELAY_ID"),
     ("relay_token", "HCOM_RELAY_TOKEN"),
@@ -231,6 +233,7 @@ pub struct HcomConfig {
     pub opencode_args: String,
     pub kilo_args: String,
     pub cursor_args: String,
+    pub kimi_args: String,
     pub codex_sandbox_mode: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
@@ -260,6 +263,7 @@ impl Default for HcomConfig {
             opencode_args: String::new(),
             kilo_args: String::new(),
             cursor_args: String::new(),
+            kimi_args: String::new(),
             codex_sandbox_mode: "workspace".to_string(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
@@ -351,6 +355,7 @@ impl HcomConfig {
             ("opencode_args", &self.opencode_args),
             ("kilo_args", &self.kilo_args),
             ("cursor_args", &self.cursor_args),
+            ("kimi_args", &self.kimi_args),
         ] {
             if !value.is_empty()
                 && let Err(e) = shell_words::split(value)
@@ -411,6 +416,7 @@ impl HcomConfig {
             "opencode_args" => Some(self.opencode_args.clone()),
             "kilo_args" => Some(self.kilo_args.clone()),
             "cursor_args" => Some(self.cursor_args.clone()),
+            "kimi_args" => Some(self.kimi_args.clone()),
             "codex_sandbox_mode" => Some(self.codex_sandbox_mode.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
@@ -452,6 +458,7 @@ impl HcomConfig {
             "opencode_args" => self.opencode_args = value.to_string(),
             "kilo_args" => self.kilo_args = value.to_string(),
             "cursor_args" => self.cursor_args = value.to_string(),
+            "kimi_args" => self.kimi_args = value.to_string(),
             "codex_sandbox_mode" => {
                 // Normalize legacy value
                 self.codex_sandbox_mode = if value == "full-auto" {

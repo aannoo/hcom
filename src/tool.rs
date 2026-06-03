@@ -18,6 +18,7 @@ pub enum Tool {
     Kilo,
     Antigravity,
     Cursor,
+    Kimi,
     Adhoc,
 }
 
@@ -95,6 +96,9 @@ impl Tool {
             Tool::Cursor => {
                 crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
             }
+            Tool::Kimi => {
+                crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions)
+            }
             Tool::Adhoc => false,
         }
     }
@@ -125,6 +129,8 @@ impl Tool {
             }
             Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
+            Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
+                .map_err(|e| e.to_string()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -145,6 +151,7 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Antigravity => Ok(crate::hooks::antigravity::remove_antigravity_hooks()),
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
+            Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Adhoc => Ok(false),
         }
     }
@@ -160,6 +167,7 @@ impl Tool {
             Tool::Kilo => crate::hooks::opencode::get_kilo_plugin_path(),
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
+            Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()

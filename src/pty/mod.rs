@@ -732,7 +732,7 @@ impl Proxy {
         use std::str::FromStr;
 
         let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
-            Ok(Tool::Claude) | Ok(Tool::Codex) | Ok(Tool::Antigravity) | Ok(Tool::Cursor) => {
+            Ok(Tool::Claude) | Ok(Tool::Codex) | Ok(Tool::Antigravity) | Ok(Tool::Cursor) | Ok(Tool::Kimi) => {
                 Duration::from_secs(5) // ? for shortcuts footer (Claude/Codex/agy)
             }
             Ok(Tool::OpenCode) | Ok(Tool::Kilo) => Duration::from_secs(5),

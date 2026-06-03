@@ -54,6 +54,7 @@ const LAUNCH_TOOLS: &[&str] = &[
     "agy",
     "cursor",
     "cursor-agent",
+    "kimi",
     "f",
     "r",
 ];
@@ -112,6 +113,10 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
         ),
         Tool::Cursor => (
             crate::hooks::cursor::dispatch_cursor_hook_native(hook),
+            String::new(),
+        ),
+        Tool::Kimi => (
+            crate::hooks::kimi::dispatch_kimi_hook(hook),
             String::new(),
         ),
         Tool::Adhoc => unreachable!("adhoc has no hooks"),

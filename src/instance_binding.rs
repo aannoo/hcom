@@ -809,7 +809,7 @@ pub fn resolve_instance_from_binding(
 fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
     if !matches!(
         tool,
-        "claude" | "gemini" | "codex" | "opencode" | "kilo" | "antigravity" | "cursor"
+        "claude" | "gemini" | "codex" | "opencode" | "kilo" | "antigravity" | "cursor" | "kimi"
     ) {
         return;
     }

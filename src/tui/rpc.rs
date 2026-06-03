@@ -81,7 +81,7 @@ pub fn build_launch_argv(
     // Tool-specific prompt flags
     if !prompt.is_empty() {
         match tool {
-            Tool::Claude | Tool::Codex | Tool::Cursor => {
+            Tool::Claude | Tool::Codex | Tool::Cursor | Tool::Kimi => {
                 if headless && tool == Tool::Claude {
                     argv.push("-p".into());
                 }

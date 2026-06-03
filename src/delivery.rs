@@ -535,6 +535,10 @@ impl ToolConfig {
     pub fn cursor() -> Self {
         Self::for_tool(crate::tool::Tool::Cursor)
     }
+    #[cfg(test)]
+    pub fn kimi() -> Self {
+        Self::for_tool(crate::tool::Tool::Kimi)
+    }
 }
 
 /// Gate evaluation result
@@ -1389,7 +1393,7 @@ pub fn run_delivery_loop(
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
-                            Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor) => {
+                            Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor) | Some(Tool::Kimi) => {
                                 "<hcom>".to_string()
                             }
                             _ => build_wake_inject_text(db, &current_name, input_box_width),

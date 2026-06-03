@@ -16,6 +16,7 @@ use crate::db::HcomDb;
 use crate::hooks::claude_args;
 use crate::hooks::codex::derive_codex_transcript_path;
 use crate::hooks::gemini::derive_gemini_transcript_path;
+use crate::hooks::kimi::derive_kimi_transcript_path;
 use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
@@ -424,13 +425,13 @@ fn prepare_resume_plan_from_source(
 
     let mut merged_args = merged_cli_args.clone();
 
-    if launch_flags.headless && tool != "claude" {
-        bail!("--headless is only supported for Claude resume/fork launches");
+    if launch_flags.headless && tool != "claude" && tool != "kimi" {
+        bail!("--headless is only supported for Claude and Kimi resume/fork launches");
     }
 
     let is_headless =
         launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
-    let use_pty = tool == "claude" && !is_headless && cfg!(unix);
+    let use_pty = (tool == "claude" || tool == "kimi") && !is_headless && cfg!(unix);
 
     if tool == "claude" && is_headless {
         let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
@@ -993,6 +994,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         "opencode" | "kilo" => merge_opencode_args(original, resume),
         "antigravity" => merge_antigravity_args(original, resume),
         "cursor" => merge_cursor_args(original, resume),
+        "kimi" => merge_kimi_args(original, resume),
         _ => {
             // For unknown tools: resume args only.
             resume.to_vec()
@@ -1207,6 +1209,31 @@ fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
             continue;
         }
         if token == "--fork" || token.starts_with("--session=") || token.starts_with("--prompt=") {
+            i += 1;
+            continue;
+        }
+
+        preserved.push(token.clone());
+        i += 1;
+    }
+
+    let mut merged = resume.to_vec();
+    merged.extend(preserved);
+    merged
+}
+
+fn merge_kimi_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut i = 0;
+
+    while i < original.len() {
+        let token = &original[i];
+
+        if token == "--resume" || token == "--fork" {
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--resume=") || token.starts_with("--fork=") {
             i += 1;
             continue;
         }
@@ -1593,6 +1620,12 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
+    // 6. Kimi
+    if let Some(path) = derive_kimi_transcript_path(session_id) {
+        let tool = detect_agent_type(&path).to_string();
+        return Some((tool, Some(path)));
+    }
+
     None
 }
 
@@ -1671,6 +1704,7 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
         }),
         "gemini" => recover_gemini_cwd(path),
         "cursor" => recover_cursor_cwd(path),
+        "kimi" => None, // Kimi context.jsonl does not store cwd
         _ => None,
     }
 }

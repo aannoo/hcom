@@ -230,6 +230,18 @@ const CURSOR_HOOKS: &[&str] = &[
     "cursor-sessionend",
 ];
 
+const KIMI_HOOKS: &[&str] = &[
+    "kimi-sessionstart",
+    "kimi-userpromptsubmit",
+    "kimi-pretooluse",
+    "kimi-posttooluse",
+    "kimi-stop",
+    "kimi-sessionend",
+    "kimi-subagentstart",
+    "kimi-subagentstop",
+    "kimi-notification",
+];
+
 // ── Help examples / extra-env tables ────────────────────────────────────
 
 const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -296,6 +308,20 @@ const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
     (
         "hcom cursor-agent --force",
         "Allow commands unless explicitly denied",
+    ),
+];
+
+const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom kimi --model kimi-k2.6", "Use a specific model"),
+    (
+        "hcom kimi --yolo",
+        "Bypass permission prompts",
+    ),
+];
+const KIMI_HELP_EXTRA_ENV: &[HelpEntry] = &[
+    (
+        "HCOM_KIMI_SYSTEM_PROMPT",
+        "System prompt (env var or config)",
     ),
 ];
 
@@ -653,6 +679,52 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static KIMI: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Kimi,
+    name: "kimi",
+    label: "Kimi",
+    aliases: &[],
+    cli_binary: "kimi",
+    tui_prefix: "kim ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"> ",
+    hooks: HooksSpec {
+        names: KIMI_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_KIMI_ARGS"),
+        config_dir_env: Some("KIMI_CONFIG_DIR"),
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: Some(ForkArgs::AppendFlag("--fork")),
+    }),
+    help: HelpSpec {
+        unique_examples: KIMI_HELP_EXAMPLES,
+        extra_env: KIMI_HELP_EXTRA_ENV,
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["Bash", "Shell", "ExecuteCommand"],
+        file: &["WriteFile", "EditFile", "Replace"],
+        delegate: &["Subagent", "Delegate"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -708,6 +780,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &KILO,
     &ANTIGRAVITY,
     &CURSOR,
+    &KIMI,
     &ADHOC,
 ];
 
@@ -722,6 +795,7 @@ impl Tool {
             Tool::Kilo => &KILO,
             Tool::Antigravity => &ANTIGRAVITY,
             Tool::Cursor => &CURSOR,
+            Tool::Kimi => &KIMI,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -759,6 +833,7 @@ mod tests {
             Tool::Kilo,
             Tool::Antigravity,
             Tool::Cursor,
+            Tool::Kimi,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
@@ -821,7 +896,8 @@ mod tests {
         assert!(names.contains(&"kilo"));
         assert!(names.contains(&"antigravity"));
         assert!(names.contains(&"cursor"));
-        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"kimi"));
+        assert_eq!(names.len(), 8);
     }
 
     #[test]

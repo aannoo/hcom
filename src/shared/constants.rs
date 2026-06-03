@@ -65,6 +65,8 @@ pub const TOOL_MARKER_VARS: &[&str] = &[
     "KILO",
     "CURSOR_AGENT",
     "CURSOR_PROJECT_DIR",
+    "KIMI_CODE_CLI",
+    "KIMI_SESSION_ID",
 ];
 
 /// HCOM identity vars — set per-instance, cleared to prevent parent identity leakage.

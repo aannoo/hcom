@@ -437,6 +437,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "opencode" => preview.config.opencode_args.as_str(),
             "kilo" | "kilocode" => preview.config.kilo_args.as_str(),
             "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
+            "kimi" => preview.config.kimi_args.as_str(),
             _ => "",
         }
     } else {

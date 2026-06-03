@@ -84,6 +84,7 @@ pub enum Tool {
     Kilo,
     Antigravity,
     Cursor,
+    Kimi,
     Adhoc,
 }
 
@@ -98,6 +99,7 @@ impl Tool {
             Self::Kilo => crate::tool::Tool::Kilo,
             Self::Antigravity => crate::tool::Tool::Antigravity,
             Self::Cursor => crate::tool::Tool::Cursor,
+            Self::Kimi => crate::tool::Tool::Kimi,
             Self::Adhoc => crate::tool::Tool::Adhoc,
         }
     }
@@ -120,7 +122,8 @@ impl Tool {
             Self::OpenCode => Self::Kilo,
             Self::Kilo => Self::Antigravity,
             Self::Antigravity => Self::Cursor,
-            Self::Cursor => Self::Claude,
+            Self::Cursor => Self::Kimi,
+            Self::Kimi => Self::Claude,
             Self::Adhoc => Self::Adhoc,
         }
     }
@@ -128,13 +131,14 @@ impl Tool {
     /// Cycle backward (for launch panel). Adhoc is not launchable.
     pub fn prev(&self) -> Self {
         match self {
-            Self::Claude => Self::Cursor,
+            Self::Claude => Self::Kimi,
             Self::Gemini => Self::Claude,
             Self::Codex => Self::Gemini,
             Self::OpenCode => Self::Codex,
             Self::Antigravity => Self::Kilo,
             Self::Kilo => Self::OpenCode,
             Self::Cursor => Self::Antigravity,
+            Self::Kimi => Self::Cursor,
             Self::Adhoc => Self::Adhoc,
         }
     }
@@ -1174,12 +1178,14 @@ mod tests {
         assert_eq!(Tool::OpenCode.next(), Tool::Kilo);
         assert_eq!(Tool::Kilo.next(), Tool::Antigravity);
         assert_eq!(Tool::Antigravity.next(), Tool::Cursor);
-        assert_eq!(Tool::Cursor.next(), Tool::Claude);
+        assert_eq!(Tool::Cursor.next(), Tool::Kimi);
+        assert_eq!(Tool::Kimi.next(), Tool::Claude);
     }
 
     #[test]
     fn tool_prev_cycles_backward() {
-        assert_eq!(Tool::Claude.prev(), Tool::Cursor);
+        assert_eq!(Tool::Claude.prev(), Tool::Kimi);
+        assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
         assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);
         assert_eq!(Tool::Antigravity.prev(), Tool::Kilo);
         assert_eq!(Tool::Kilo.prev(), Tool::OpenCode);

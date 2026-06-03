@@ -51,6 +51,7 @@ pub struct HcomContext {
     pub is_opencode: bool,
     pub is_kilo: bool,
     pub is_cursor: bool,
+    pub is_kimi: bool,
     /// HCOM_IS_FORK=1 (--fork-session launch).
     pub is_fork: bool,
     /// Codex thread ID (session equivalent).
@@ -103,6 +104,7 @@ impl HcomContext {
         let is_opencode = is_eq("OPENCODE", "1");
         let is_kilo = is_eq("KILO", "1");
         let is_cursor = is_set("CURSOR_AGENT") || is_set("CURSOR_PROJECT_DIR");
+        let is_kimi = is_eq("KIMI_CODE_CLI", "1") || is_set("KIMI_SESSION_ID");
 
         // Determine tool type
         let tool = if is_claude {
@@ -119,6 +121,8 @@ impl HcomContext {
             Tool::Kilo
         } else if is_cursor {
             Tool::Cursor
+        } else if is_kimi {
+            Tool::Kimi
         } else {
             Tool::Adhoc
         };
@@ -144,6 +148,7 @@ impl HcomContext {
             is_opencode,
             is_kilo,
             is_cursor,
+            is_kimi,
             is_fork: is_eq("HCOM_IS_FORK", "1"),
             codex_thread_id: get_nonempty("CODEX_THREAD_ID"),
             launched_by: get_nonempty("HCOM_LAUNCHED_BY"),
@@ -204,6 +209,7 @@ impl HcomContext {
             || self.is_opencode
             || self.is_kilo
             || self.is_cursor
+            || self.is_kimi
     }
 
     /// Detect current tool name, or "adhoc".
