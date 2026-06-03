@@ -9,6 +9,7 @@ const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
 type PromptModel = {
   providerID: string
   modelID: string
+  variant?: string
 }
 
 // Best-effort fallback for non-hcom/manual plugin runs.
@@ -31,18 +32,38 @@ function parseCliModelArg() {
   if (!raw) return null
   const slash = raw.indexOf("/")
   if (slash <= 0 || slash === raw.length - 1) return null
+  const variant = parseCliArgValue("--variant") ?? undefined
   return {
     providerID: raw.slice(0, slash),
     modelID: raw.slice(slash + 1),
+    ...(variant ? { variant } : {}),
   }
 }
 
-function normalizePromptModel(model: unknown) {
+function normalizePromptModel(model: unknown, inputVariant?: unknown) {
   if (!model || typeof model !== "object") return null
   const providerID = (model as Record<string, unknown>).providerID
   const modelID = (model as Record<string, unknown>).modelID
   if (typeof providerID !== "string" || typeof modelID !== "string") return null
-  return { providerID, modelID }
+  const modelVariant = (model as Record<string, unknown>).variant
+  const variant = typeof inputVariant === "string"
+    ? inputVariant
+    : typeof modelVariant === "string"
+      ? modelVariant
+      : undefined
+  return {
+    providerID,
+    modelID,
+    ...(variant ? { variant } : {}),
+  }
+}
+
+function promptModelRef(model: PromptModel | null) {
+  if (!model) return undefined
+  return {
+    providerID: model.providerID,
+    modelID: model.modelID,
+  }
 }
 
 function log(
@@ -179,6 +200,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         session_id: sid,
         current_agent: currentAgent,
         current_model: currentModel?.modelID ?? null,
+        current_variant: currentModel?.variant ?? null,
       })
       try {
         // Runtime contract note: keep this cast until the plugin's bundled client
@@ -187,7 +209,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           path: { id: sid },
           body: {
             agent: currentAgent ?? undefined,
-            model: currentModel ?? undefined,
+            model: promptModelRef(currentModel),
+            variant: currentModel?.variant ?? undefined,
             parts: [{ type: "text", text: formatted }],
           },
         } as any) // SDK types don't expose agent/model on the async variant; body shape matches the sync prompt endpoint
@@ -456,7 +479,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         }
         if (isBoundSession(input.sessionID)) {
           if (input.agent) currentAgent = input.agent
-          const resolvedModel = normalizePromptModel(input.model)
+          const resolvedModel = normalizePromptModel(input.model, input.variant)
           if (resolvedModel) currentModel = resolvedModel
         } else {
           ignoreForeignSession("plugin.chat_message_ignored_foreign_session", input.sessionID)
@@ -465,6 +488,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           session_id: input.sessionID,
           agent: input.agent,
           model: input.model?.modelID,
+          variant: input.variant,
         })
       } catch (e) {
         log("ERROR", "plugin.chat_message_error", instanceName, { error: String(e) })
