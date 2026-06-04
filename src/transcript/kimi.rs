@@ -1,25 +1,52 @@
 //! Kimi Code CLI transcript parser.
 //!
-//! Reads `context.jsonl` from Kimi session directories and normalizes into
-//! the tool-agnostic `Exchange` format used by hcom.
+//! Reads a session's `wire.jsonl` (the kimi-code wire log) and normalizes it
+//! into the tool-agnostic `Exchange` format used by hcom.
 //!
-//! Kimi context.jsonl structure (per-line JSON):
-//!   - `role`: "user" | "assistant" | "tool" | "_system_prompt" | "_checkpoint" | "_usage"
-//!   - `content`: string or object (assistant has `think`/`text` sub-fields)
-//!   - `tool_calls`: array on assistant messages
-//!   - `tool_call_id`: on tool messages
+//! `wire.jsonl` is a streaming event log — one JSON object per line, tagged by
+//! `type`. A conversational turn is structured as:
+//!   - `turn.prompt` — `{input:[{type:"text",text}], origin}` — the submitted prompt
+//!   - `context.append_message` — persisted messages. Only `role:"user"` is
+//!     persisted live (assistant content is streamed, see below). The `origin`
+//!     distinguishes real input (`user`) from hcom hook deliveries
+//!     (`hook_result`, `system_trigger`).
+//!   - `context.append_loop_event` — carries the assistant turn:
+//!       - `event.type:"content.part"` → `part:{type:"text"|"think", …}`
+//!       - `event.type:"tool.call"`    → `{toolCallId, name, args:{…}}`
+//!       - `event.type:"tool.result"`  → `{toolCallId, result:{output, isError}}`
+//!
+//! Other event types (metadata, config.update, usage.record, step.*, …) are
+//! skipped. Assistant text/think/tools are NOT in `context.append_message`.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use super::shared::{Exchange, ToolUse, extract_edit_info, is_error_result, normalize_tool_name};
+use super::shared::{
+    Exchange, ToolUse, extract_content_text, extract_edit_info, finalize_action_text,
+    is_error_result, normalize_tool_name,
+};
 
-/// Parse Kimi `context.jsonl` into exchanges.
-pub fn parse_kimi_context_jsonl(
+/// In-progress turn accumulator.
+#[derive(Default)]
+struct Turn {
+    user: String,
+    think: String,
+    text: String,
+    tools: Vec<ToolUse>,
+    edits: Vec<Value>,
+    errors: Vec<Value>,
+    ended_on_error: bool,
+    files: Vec<String>,
+    /// toolCallId → index into `tools`, for matching results back to calls.
+    call_index: HashMap<String, usize>,
+}
+
+/// Parse a Kimi `wire.jsonl` into exchanges.
+pub fn parse_kimi_wire_jsonl(
     path: &Path,
     last: usize,
     detailed: bool,
@@ -27,171 +54,133 @@ pub fn parse_kimi_context_jsonl(
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
     let reader = BufReader::new(file);
 
-    let mut lines: Vec<Value> = Vec::new();
+    let mut exchanges: Vec<Exchange> = Vec::new();
+    let mut position = 0;
+    let mut cur: Option<Turn> = None;
+
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Read error: {e}"))?;
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line).map_err(|e| format!("JSON parse: {e}"))?;
-        // Skip internal meta roles
-        if let Some(role) = value.get("role").and_then(|v| v.as_str())
-            && role.starts_with('_')
-        {
-            continue;
-        }
-        lines.push(value);
-    }
+        let v: Value = serde_json::from_str(&line).map_err(|e| format!("JSON parse: {e}"))?;
 
-    // Group messages into exchanges: user -> assistant [-> tool]*
-    let mut exchanges: Vec<Exchange> = Vec::new();
-    let mut i = 0;
-    let mut position = 0;
-
-    while i < lines.len() {
-        let role = lines[i].get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role != "user" {
-            i += 1;
-            continue;
-        }
-
-        position += 1;
-        let user_text = extract_text(&lines[i]);
-        let assistant_idx = i + 1;
-
-        // Gather tools and tool results that follow the assistant message
-        let mut tools: Vec<ToolUse> = Vec::new();
-        let mut edits: Vec<Value> = Vec::new();
-        let mut errors: Vec<Value> = Vec::new();
-        let mut ended_on_error = false;
-        let mut action_parts: Vec<String> = Vec::new();
-
-        if assistant_idx < lines.len() {
-            let next_role = lines[assistant_idx]
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if next_role == "assistant" {
-                // Extract tool_calls from assistant message
-                if let Some(calls) = lines[assistant_idx].get("tool_calls").and_then(|v| v.as_array())
-                {
-                    // Build a map of tool_call_id -> tool result for matching
-                    let mut results: HashMap<String, Value> = HashMap::new();
-                    let mut j = assistant_idx + 1;
-                    while j < lines.len() {
-                        let r = lines[j].get("role").and_then(|v| v.as_str()).unwrap_or("");
-                        if r == "tool" {
-                            if let Some(id) = lines[j]
-                                .get("tool_call_id")
-                                .and_then(|v| v.as_str())
-                            {
-                                results.insert(id.to_string(), lines[j].clone());
+        match v.get("type").and_then(Value::as_str).unwrap_or("") {
+            "turn.prompt" => {
+                if let Some(t) = cur.take() {
+                    position += 1;
+                    exchanges.push(build_exchange(t, position, detailed));
+                }
+                cur = Some(Turn {
+                    user: extract_content_text(v.get("input")),
+                    ..Default::default()
+                });
+            }
+            "context.append_message" => {
+                let Some(t) = cur.as_mut() else { continue };
+                let Some(m) = v.get("message") else { continue };
+                if m.get("role").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                // hcom messages arrive as hook-injected user messages; prefer
+                // their (unwrapped) content over the bare `<hcom>` trigger that
+                // turn.prompt recorded.
+                let origin = m
+                    .get("origin")
+                    .and_then(|o| o.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if origin == "hook_result" || origin == "system_trigger" {
+                    let cleaned = unwrap_hook_result(&extract_content_text(m.get("content")));
+                    if !cleaned.is_empty() {
+                        t.user = cleaned;
+                    }
+                }
+            }
+            "context.append_loop_event" => {
+                let Some(t) = cur.as_mut() else { continue };
+                let Some(ev) = v.get("event") else { continue };
+                match ev.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "content.part" => {
+                        let part = ev.get("part").unwrap_or(&Value::Null);
+                        match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                            "text" => {
+                                if let Some(s) = part.get("text").and_then(Value::as_str) {
+                                    t.text.push_str(s);
+                                }
                             }
-                            j += 1;
-                        } else {
-                            break;
+                            "think" if detailed => {
+                                if let Some(s) = part.get("think").and_then(Value::as_str) {
+                                    t.think.push_str(s);
+                                }
+                            }
+                            _ => {}
                         }
                     }
-
-                    for call in calls {
-                        let name = call
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let call_id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let arguments = call
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
-                        let args_parsed: Value =
-                            serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
-
-                        let result = results.get(call_id).cloned();
-                        let is_err = result.as_ref().map(is_error_result).unwrap_or(false);
-                        let result_text = result
-                            .as_ref()
-                            .and_then(|r| r.get("content").and_then(|v| v.as_str()))
-                            .unwrap_or("");
-
-                        let file = args_parsed
+                    "tool.call" => {
+                        let name = ev.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                        let args = ev.get("args").cloned().unwrap_or_else(|| json!({}));
+                        // Kimi file tools key the path off `path`; alias it to
+                        // `file_path` for the shared file/edit extractors.
+                        let mut aliased = args.clone();
+                        if let Some(obj) = aliased.as_object_mut()
+                            && !obj.contains_key("file_path")
+                            && let Some(p) = obj.get("path").cloned()
+                        {
+                            obj.insert("file_path".into(), p);
+                        }
+                        let file = aliased
                             .get("file_path")
-                            .or_else(|| args_parsed.get("path"))
-                            .or_else(|| args_parsed.get("file"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        let command = args_parsed
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let command = aliased
                             .get("command")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        let canonical_name = normalize_tool_name(&name).to_string();
-
-                        if is_err {
-                            ended_on_error = true;
-                            errors.push(serde_json::json!({
-                                "tool": canonical_name,
-                                "error": result_text,
-                            }));
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        if let Some(f) = &file
+                            && !t.files.contains(f)
+                        {
+                            t.files.push(f.clone());
                         }
-
-                        if let Some(edit) = extract_edit_info(&result, &args_parsed) {
-                            edits.push(edit);
+                        if let Some(edit) = extract_edit_info(&None, &aliased) {
+                            t.edits.push(edit);
                         }
-                        if !action_parts.contains(&canonical_name) {
-                            action_parts.push(canonical_name.clone());
+                        if let Some(id) = ev.get("toolCallId").and_then(Value::as_str) {
+                            t.call_index.insert(id.to_string(), t.tools.len());
                         }
-
-                        tools.push(ToolUse {
-                            name: canonical_name,
-                            is_error: is_err,
-                            file: file.clone(),
-                            command: command.clone(),
+                        t.tools.push(ToolUse {
+                            name: normalize_tool_name(name).to_string(),
+                            is_error: false,
+                            file,
+                            command,
                         });
                     }
+                    "tool.result" => {
+                        let id = ev.get("toolCallId").and_then(Value::as_str).unwrap_or("");
+                        let result = ev.get("result").unwrap_or(&Value::Null);
+                        let output = result.get("output").and_then(Value::as_str).unwrap_or("");
+                        let is_err = result
+                            .get("isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            || is_error_result(&json!({"is_error": false, "content": output}));
+                        t.ended_on_error = is_err;
+                        if is_err && let Some(&idx) = t.call_index.get(id) {
+                            t.tools[idx].is_error = true;
+                            let tool = t.tools[idx].name.clone();
+                            t.errors.push(json!({"tool": tool, "error": output}));
+                        }
+                    }
+                    _ => {}
                 }
-
-                // Advance past assistant + any tool results we consumed
-                i = assistant_idx + 1;
-                while i < lines.len()
-                    && lines[i].get("role").and_then(|v| v.as_str()) == Some("tool")
-                {
-                    i += 1;
-                }
-            } else {
-                i = assistant_idx;
             }
-        } else {
-            i = assistant_idx;
+            _ => {}
         }
+    }
 
-        let action = if action_parts.is_empty() {
-            String::new()
-        } else {
-            action_parts.join(", ")
-        };
-
-        let files: Vec<String> = tools
-            .iter()
-            .filter_map(|t| t.file.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        exchanges.push(Exchange {
-            position,
-            user: user_text,
-            action,
-            files,
-            timestamp: String::new(),
-            tools,
-            edits,
-            errors,
-            ended_on_error,
-        });
+    if let Some(t) = cur.take() {
+        position += 1;
+        exchanges.push(build_exchange(t, position, detailed));
     }
 
     if !detailed && exchanges.len() > last {
@@ -201,24 +190,47 @@ pub fn parse_kimi_context_jsonl(
     Ok(exchanges)
 }
 
-/// Extract human-readable text from a Kimi message.
-fn extract_text(msg: &Value) -> String {
-    match msg.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Object(obj)) => {
-            // Assistant message with think/text parts
-            let think = obj.get("think").and_then(|v| v.as_str()).unwrap_or("");
-            let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if think.is_empty() {
-                text.to_string()
-            } else if text.is_empty() {
-                format!("[think]\n{think}")
-            } else {
-                format!("[think]\n{think}\n\n{text}")
-            }
+fn build_exchange(t: Turn, position: usize, detailed: bool) -> Exchange {
+    let text = t.text.trim();
+    let think = t.think.trim();
+    let action_text = if detailed && !think.is_empty() {
+        if text.is_empty() {
+            format!("[think]\n{think}")
+        } else {
+            format!("[think]\n{think}\n\n{text}")
         }
-        _ => String::new(),
+    } else {
+        text.to_string()
+    };
+    let action = finalize_action_text(&action_text, &t.tools, &t.errors, t.ended_on_error);
+
+    Exchange {
+        position,
+        user: t.user,
+        action,
+        files: t.files,
+        timestamp: String::new(),
+        tools: t.tools,
+        edits: t.edits,
+        errors: t.errors,
+        ended_on_error: t.ended_on_error,
     }
+}
+
+/// Strip the `<hook_result hook_event="…">…</hook_result>` wrapper that kimi
+/// puts around UserPromptSubmit hook deliveries, leaving the inner message.
+fn unwrap_hook_result(text: &str) -> String {
+    let t = text.trim();
+    if let Some(rest) = t.strip_prefix("<hook_result")
+        && let Some(gt) = rest.find('>')
+    {
+        let inner = rest[gt + 1..]
+            .trim_end()
+            .strip_suffix("</hook_result>")
+            .unwrap_or(&rest[gt + 1..]);
+        return inner.trim().to_string();
+    }
+    t.to_string()
 }
 
 #[cfg(test)]
@@ -226,7 +238,24 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn make_temp_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
+    fn turn_prompt(text: &str) -> String {
+        json!({"type": "turn.prompt", "input": [{"type": "text", "text": text}], "origin": {"kind": "user"}}).to_string()
+    }
+    fn content_part(part: Value) -> String {
+        json!({"type": "context.append_loop_event", "event": {"type": "content.part", "part": part}})
+            .to_string()
+    }
+    fn tool_call(id: &str, name: &str, args: Value) -> String {
+        json!({"type": "context.append_loop_event", "event": {"type": "tool.call", "toolCallId": id, "name": name, "args": args}}).to_string()
+    }
+    fn tool_result(id: &str, result: Value) -> String {
+        json!({"type": "context.append_loop_event", "event": {"type": "tool.result", "toolCallId": id, "result": result}}).to_string()
+    }
+    fn append_user(origin: Value, text: &str) -> String {
+        json!({"type": "context.append_message", "message": {"role": "user", "content": [{"type": "text", "text": text}], "origin": origin}}).to_string()
+    }
+
+    fn make_temp_jsonl(lines: &[String]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         for line in lines {
             writeln!(file, "{}", line).unwrap();
@@ -235,43 +264,114 @@ mod tests {
     }
 
     #[test]
-    fn parse_simple_user_assistant() {
-        let jsonl = make_temp_jsonl(&[
-            r#"{"role":"user","content":"hello"}"#,
-            r#"{"role":"assistant","content":{"think":"","text":"hi there"}}"#,
-        ]);
-        let exchanges = parse_kimi_context_jsonl(jsonl.path(), 10, true).unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].user, "hello");
-        assert!(exchanges[0].action.is_empty());
-        assert!(exchanges[0].tools.is_empty());
+    fn extracts_assistant_text_from_loop_events() {
+        let lines = vec![
+            json!({"type": "metadata", "protocol_version": "1.3"}).to_string(),
+            turn_prompt("what is hcom?"),
+            content_part(json!({"type": "think", "think": "pondering"})),
+            content_part(json!({"type": "text", "text": "hcom is a comms tool."})),
+            json!({"type": "usage.record", "usage": {}}).to_string(),
+        ];
+        let jsonl = make_temp_jsonl(&lines);
+
+        let ex = parse_kimi_wire_jsonl(jsonl.path(), 10, false).unwrap();
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].user, "what is hcom?");
+        // The core regression: assistant text must be extracted (not "(no response)").
+        assert_eq!(ex[0].action, "hcom is a comms tool.");
     }
 
     #[test]
-    fn parse_with_bash_tool() {
-        let jsonl = make_temp_jsonl(&[
-            r#"{"role":"user","content":"run ls"}"#,
-            r#"{"role":"assistant","content":{"think":"","text":""},"tool_calls":[{"id":"call_1","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]}"#,
-            r#"{"role":"tool","content":"file.txt","tool_call_id":"call_1"}"#,
-        ]);
-        let exchanges = parse_kimi_context_jsonl(jsonl.path(), 10, true).unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].tools.len(), 1);
-        assert_eq!(exchanges[0].tools[0].name, "Bash");
-        assert_eq!(exchanges[0].tools[0].command, Some("ls".to_string()));
-        assert_eq!(exchanges[0].action, "Bash");
+    fn detailed_includes_think() {
+        let lines = vec![
+            turn_prompt("q"),
+            content_part(json!({"type": "think", "think": "reasoning"})),
+            content_part(json!({"type": "text", "text": "answer"})),
+        ];
+        let jsonl = make_temp_jsonl(&lines);
+
+        let ex = parse_kimi_wire_jsonl(jsonl.path(), 10, true).unwrap();
+        assert!(ex[0].action.contains("[think]"));
+        assert!(ex[0].action.contains("reasoning"));
+        assert!(ex[0].action.contains("answer"));
     }
 
     #[test]
-    fn skips_internal_roles() {
-        let jsonl = make_temp_jsonl(&[
-            r#"{"role":"_system_prompt","content":"you are helpful"}"#,
-            r#"{"role":"user","content":"hi"}"#,
-            r#"{"role":"assistant","content":{"think":"","text":"hello"}}"#,
-            r#"{"role":"_usage","content":""}"#,
-        ]);
-        let exchanges = parse_kimi_context_jsonl(jsonl.path(), 10, true).unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].user, "hi");
+    fn parses_tool_call_and_result() {
+        let lines = vec![
+            turn_prompt("run who"),
+            tool_call("c1", "Bash", json!({"command": "who"})),
+            tool_result("c1", json!({"output": "anno  console"})),
+            content_part(json!({"type": "text", "text": "done"})),
+        ];
+        let jsonl = make_temp_jsonl(&lines);
+
+        let ex = parse_kimi_wire_jsonl(jsonl.path(), 10, true).unwrap();
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].tools.len(), 1);
+        assert_eq!(ex[0].tools[0].name, "Bash");
+        assert_eq!(ex[0].tools[0].command.as_deref(), Some("who"));
+        assert!(!ex[0].tools[0].is_error);
+        assert_eq!(ex[0].action, "done");
+    }
+
+    #[test]
+    fn flags_tool_error_via_iserror() {
+        let lines = vec![
+            turn_prompt("edit"),
+            tool_call(
+                "c2",
+                "Edit",
+                json!({"path": "/a.txt", "old_string": "x", "new_string": "y"}),
+            ),
+            tool_result("c2", json!({"output": "rejected by user", "isError": true})),
+        ];
+        let jsonl = make_temp_jsonl(&lines);
+
+        let ex = parse_kimi_wire_jsonl(jsonl.path(), 10, true).unwrap();
+        assert!(ex[0].tools[0].is_error);
+        assert!(ex[0].ended_on_error);
+        assert_eq!(ex[0].tools[0].name, "Edit");
+        assert_eq!(ex[0].files, vec!["/a.txt".to_string()]);
+        assert_eq!(ex[0].errors.len(), 1);
+    }
+
+    #[test]
+    fn hcom_delivery_uses_hook_message_not_trigger() {
+        // hcom delivery: the trigger is `<hcom>` but the real message arrives as
+        // a hook_result user message — the transcript should show the message.
+        let lines = vec![
+            turn_prompt("<hcom>"),
+            append_user(json!({"kind": "user"}), "<hcom>"),
+            append_user(
+                json!({"kind": "hook_result", "event": "UserPromptSubmit"}),
+                "<hook_result hook_event=\"UserPromptSubmit\">\n<hcom>[request #1] bigboss → me: ping</hcom>\n</hook_result>",
+            ),
+            content_part(json!({"type": "text", "text": "pong"})),
+        ];
+        let jsonl = make_temp_jsonl(&lines);
+
+        let ex = parse_kimi_wire_jsonl(jsonl.path(), 10, false).unwrap();
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].user, "<hcom>[request #1] bigboss → me: ping</hcom>");
+        assert_eq!(ex[0].action, "pong");
+    }
+
+    #[test]
+    fn multiple_turns_split_correctly() {
+        let lines = vec![
+            turn_prompt("first"),
+            content_part(json!({"type": "text", "text": "one"})),
+            turn_prompt("second"),
+            content_part(json!({"type": "text", "text": "two"})),
+        ];
+        let jsonl = make_temp_jsonl(&lines);
+
+        let ex = parse_kimi_wire_jsonl(jsonl.path(), 10, false).unwrap();
+        assert_eq!(ex.len(), 2);
+        assert_eq!(ex[0].user, "first");
+        assert_eq!(ex[0].action, "one");
+        assert_eq!(ex[1].user, "second");
+        assert_eq!(ex[1].action, "two");
     }
 }

@@ -1080,6 +1080,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // When a real hcom participant launched us, append a reply instruction so
     // the spawned agent knows to send its result back.
     if let Some(ref prompt) = params.initial_prompt {
+        // Kimi has no way to accept an initial prompt at launch: `-p/--prompt` is
+        // a non-interactive print-and-exit mode, and a bare positional errors
+        // ("too many arguments"). Fail clearly instead of launching a broken
+        // command — the task can be sent as a message once the agent is up.
+        if normalized.spec().tool == crate::tool::Tool::Kimi {
+            anyhow::bail!(
+                "kimi does not support an initial prompt at launch. \
+                 Launch `hcom kimi` without a prompt, then send the task with \
+                 `hcom send @<name> -- \"…\"`."
+            );
+        }
         let reply_suffix =
             if params.append_reply_handoff && launcher_name != "api" && launcher_name != "user" {
                 format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")

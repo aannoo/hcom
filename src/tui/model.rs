@@ -229,7 +229,14 @@ fn strip_context_prefix(ctx: &str) -> &str {
             other => other,
         };
     }
-    const PREFIXES: &[&str] = &["tool:", "deliver:", "approved:", "stale:", "tui:"];
+    const PREFIXES: &[&str] = &[
+        "tool:",
+        "deliver:",
+        "approved:",
+        "denied:",
+        "stale:",
+        "tui:",
+    ];
     for p in PREFIXES {
         if let Some(rest) = ctx.strip_prefix(p) {
             return rest;

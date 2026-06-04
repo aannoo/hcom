@@ -102,7 +102,9 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, kimi, all");
+        eprintln!(
+            "Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, kimi, all"
+        );
         return 1;
     };
 
@@ -190,7 +192,9 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, kimi, all");
+        eprintln!(
+            "Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, kimi, all"
+        );
         return 1;
     };
 

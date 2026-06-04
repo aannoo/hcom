@@ -421,6 +421,8 @@ pub fn get_status_description(status: &str, context: &str) -> String {
                 format!("active: {tool}")
             } else if let Some(tool) = context.strip_prefix("approved:") {
                 format!("active: approved {tool}")
+            } else if let Some(tool) = context.strip_prefix("denied:") {
+                format!("active: denied {tool}")
             } else if context == "resuming" {
                 "resuming...".to_string()
             } else if context.is_empty() {

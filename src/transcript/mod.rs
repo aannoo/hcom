@@ -68,7 +68,7 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
         ToolKind::Gemini => gemini::parse_gemini_json(path, opts.last),
         ToolKind::Codex => codex::parse_codex_jsonl(path, opts.last, opts.detailed),
         ToolKind::Cursor => cursor::parse_cursor_jsonl(path, opts.last, opts.detailed),
-        ToolKind::Kimi => kimi::parse_kimi_context_jsonl(path, opts.last, opts.detailed),
+        ToolKind::Kimi => kimi::parse_kimi_wire_jsonl(path, opts.last, opts.detailed),
         ToolKind::OpenCode => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {

@@ -235,6 +235,8 @@ const KIMI_HOOKS: &[&str] = &[
     "kimi-userpromptsubmit",
     "kimi-pretooluse",
     "kimi-posttooluse",
+    "kimi-permissionrequest",
+    "kimi-permissionresult",
     "kimi-stop",
     "kimi-sessionend",
     "kimi-subagentstart",
@@ -313,17 +315,12 @@ const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
 
 const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom kimi --model kimi-k2.6", "Use a specific model"),
-    (
-        "hcom kimi --yolo",
-        "Bypass permission prompts",
-    ),
+    ("hcom kimi --yolo", "Bypass permission prompts"),
 ];
-const KIMI_HELP_EXTRA_ENV: &[HelpEntry] = &[
-    (
-        "HCOM_KIMI_SYSTEM_PROMPT",
-        "System prompt (env var or config)",
-    ),
-];
+const KIMI_HELP_EXTRA_ENV: &[HelpEntry] = &[(
+    "HCOM_KIMI_SYSTEM_PROMPT",
+    "System prompt (env var or config)",
+)];
 
 // ── Per-tool integration constants ──────────────────────────────────────
 
@@ -704,24 +701,37 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_KIMI_ARGS"),
-        config_dir_env: Some("KIMI_CONFIG_DIR"),
+        // Kimi's data root (config + sessions + credentials) is overridden via
+        // KIMI_CODE_HOME; it does not honor a separate config-dir variable.
+        config_dir_env: Some("KIMI_CODE_HOME"),
+        // Kimi has no CLI flag for an interactive initial prompt (`-p/--prompt`
+        // is non-interactive print-and-exit, and a bare positional errors with
+        // "too many arguments"). Launches carrying an initial prompt fast-fail
+        // in the launcher rather than passing a broken arg.
         initial_prompt: InitialPromptShape::Positional,
         uses_pty_default: true,
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
     resume: Some(ResumeSpec {
+        // `-r/--resume` is a documented alias of `--session <id>`.
         resume: ResumeArgs::Flag("--resume"),
-        fork: Some(ForkArgs::AppendFlag("--fork")),
+        // Kimi has no CLI fork primitive — `/fork` is an interactive slash
+        // command only (`kimi --fork` errors "unknown option"). Like
+        // gemini/cursor/agy, leave fork unsupported.
+        fork: None,
     }),
     help: HelpSpec {
         unique_examples: KIMI_HELP_EXAMPLES,
         extra_env: KIMI_HELP_EXTRA_ENV,
     },
+    // Tool names verified against kimi-code 0.9.0 built-in tools
+    // (docs/reference/tools.md): shell is `Bash`, file writes are `Write`/`Edit`,
+    // and the subagent tool is `Agent`.
     status_detail: StatusDetailSpec {
-        bash: &["Bash", "Shell", "ExecuteCommand"],
-        file: &["WriteFile", "EditFile", "Replace"],
-        delegate: &["Subagent", "Delegate"],
+        bash: &["Bash"],
+        file: &["Write", "Edit"],
+        delegate: &["Agent"],
     },
 };
 

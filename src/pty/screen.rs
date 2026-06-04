@@ -394,7 +394,7 @@ impl ScreenTracker {
             Ok(Tool::Kilo) => None,     // Kilo shares OpenCode's plugin delivery model
             Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
-            Ok(Tool::Kimi) => None, // Kimi: standard PTY delivery, no custom input detection needed
+            Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -576,6 +576,66 @@ impl ScreenTracker {
         }
 
         None // Prompt not found
+    }
+
+    /// Extract Kimi input box text.
+    ///
+    /// Kimi renders the prompt inside a rounded box:
+    /// ```text
+    ///   ╭───────────────╮
+    ///   │ > <user text> │
+    ///   ╰───────────────╯
+    /// ```
+    /// Multi-line input adds `│ … │` continuation rows before the bottom border.
+    ///
+    /// Unlike Gemini, Kimi's ready pattern (`> `) stays on screen even with user
+    /// text present, so emptiness is decided purely from the box contents — there
+    /// is no `is_ready()` shortcut. Searching bottom-to-top finds the input box
+    /// (lowest on screen) before the welcome banner box.
+    fn get_kimi_input_text(&self) -> Option<String> {
+        let lines = self.get_screen_lines();
+        let num_lines = lines.len();
+
+        for row_idx in (0..num_lines.saturating_sub(1)).rev() {
+            if !lines[row_idx].contains('╭') {
+                continue;
+            }
+            let prompt_line = &lines[row_idx + 1];
+            let Some(open) = prompt_line.find('│') else {
+                continue;
+            };
+            let after = &prompt_line[open + '│'.len_utf8()..];
+            let Some(close) = after.rfind('│') else {
+                continue;
+            };
+            let mut inner = after[..close].trim();
+            // Strip the leading prompt marker (`>` normal mode, `*` yolo mode).
+            if let Some(rest) = inner.strip_prefix('>').or_else(|| inner.strip_prefix('*')) {
+                inner = rest.trim();
+            }
+            if inner.is_empty() {
+                return Some(String::new());
+            }
+            // Collect wrapped continuation rows until the bottom border.
+            let mut text = inner.to_string();
+            for cont in &lines[(row_idx + 2)..num_lines] {
+                if cont.contains('╰') || cont.contains('╭') {
+                    break;
+                }
+                let t = cont
+                    .trim()
+                    .trim_start_matches('│')
+                    .trim_end_matches('│')
+                    .trim();
+                if !t.is_empty() {
+                    text.push(' ');
+                    text.push_str(t);
+                }
+            }
+            return Some(text);
+        }
+
+        None // Input box not found
     }
 
     /// Extract Codex input text.
@@ -1163,6 +1223,65 @@ mod tests {
         t.process(format!("{}\r\n", bottom).as_bytes());
         // Ready pattern visible in prompt text → empty
         assert_eq!(t.get_gemini_input_text(), Some(String::new()));
+    }
+
+    // ---- Kimi input extraction ----
+
+    #[test]
+    fn kimi_empty_box_is_empty() {
+        let mut t = make_tracker(24, 80, "> ");
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│ >                        │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        assert_eq!(t.get_kimi_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("kimi"));
+    }
+
+    #[test]
+    fn kimi_extracts_typed_text() {
+        let mut t = make_tracker(24, 80, "> ");
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│ > hello kimi             │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        assert_eq!(t.get_kimi_input_text(), Some("hello kimi".to_string()));
+        // Crucial: ready pattern `> ` is still on screen, but the box has text,
+        // so the prompt must NOT be reported empty (would clobber user input).
+        assert!(!t.is_prompt_empty("kimi"));
+    }
+
+    #[test]
+    fn kimi_picks_input_box_over_welcome_banner() {
+        let mut t = make_tracker(30, 80, "> ");
+        // Welcome banner box (also uses ╭ … ╰) above the input box.
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│  Welcome to Kimi Code!   │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│ >                        │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        assert_eq!(t.get_kimi_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn kimi_multi_line_input() {
+        let mut t = make_tracker(24, 80, "> ");
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│ > first line             │\r\n".as_bytes());
+        t.process("│   second line            │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        assert_eq!(
+            t.get_kimi_input_text(),
+            Some("first line second line".to_string())
+        );
+    }
+
+    #[test]
+    fn kimi_yolo_marker_stripped() {
+        let mut t = make_tracker(24, 80, "> ");
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│ *                        │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        assert_eq!(t.get_kimi_input_text(), Some(String::new()));
     }
 
     #[test]

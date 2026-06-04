@@ -96,9 +96,7 @@ impl Tool {
             Tool::Cursor => {
                 crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
             }
-            Tool::Kimi => {
-                crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions)
-            }
+            Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
             Tool::Adhoc => false,
         }
     }
