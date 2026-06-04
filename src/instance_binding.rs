@@ -1451,6 +1451,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_restore_stopped_deletes_true_placeholder() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1501,6 +1502,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_restore_stopped_migrates_pid_and_launch_context_to_canonical() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1555,6 +1557,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_restore_stopped_migrates_ready_promoted_placeholder_runtime_state() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
