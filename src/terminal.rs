@@ -68,7 +68,7 @@ const MACOS_APP_FALLBACKS: &[(&str, &str)] = &[
 /// Terminal context vars stripped from the env before spawning a terminal launcher subprocess.
 /// Prevents outer terminal identity from leaking into newly-launched terminal panes.
 /// Must stay in sync with every env var read by detect_terminal_from_env().
-const TERMINAL_CONTEXT_VARS: &[&str] = &[
+pub(crate) const TERMINAL_CONTEXT_VARS: &[&str] = &[
     // Multiplexers
     "CMUX_WORKSPACE_ID",
     "CMUX_SURFACE_ID",

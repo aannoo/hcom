@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -253,9 +254,21 @@ pub fn will_run_in_current_terminal(
     count == 1
 }
 
-/// Build base environment from config.toml + env extras.
+/// Build base environment: inherit parent env (minus leak-prone categories),
+/// then overlay config.toml + ~/.hcom/env (these win).
+///
+/// This makes the new-window/runner-script path behave like the PTY path
+/// (`Command::new` inherits parent env by default). The runner script
+/// already `unset`s TOOL_MARKER_VARS + HCOM_IDENTITY_VARS before exec,
+/// so those categories are safe to include here (they're cleared in-script).
 pub fn build_launch_env(hcom_config: &HcomConfig) -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = HashMap::new();
+    // Start from parent environment, stripping the closed-category sets.
+    // The runner script also `unset`s TOOL_MARKER_VARS + HCOM_IDENTITY_VARS
+    // inline, so these deletes are belt-and-suspenders.
+    let strip = env_strip_set();
+    let mut env: HashMap<String, String> = std::env::vars()
+        .filter(|(k, _)| !strip.contains(k.as_str()))
+        .collect();
 
     // HCOM_* settings from config.toml
     for (key, value) in hcom_config.to_env_dict() {
@@ -264,7 +277,7 @@ pub fn build_launch_env(hcom_config: &HcomConfig) -> HashMap<String, String> {
         }
     }
 
-    // Passthrough vars from env file
+    // Passthrough vars from env file (these win over everything)
     let env_path = paths::hcom_path(&["env"]);
     for (key, value) in config::load_env_extras(&env_path) {
         if !value.is_empty() {
@@ -273,6 +286,33 @@ pub fn build_launch_env(hcom_config: &HcomConfig) -> HashMap<String, String> {
     }
 
     env
+}
+
+/// Build the set of env var names to strip from inherited env.
+///
+/// Three closed categories (owned by hcom):
+/// 1. HCOM_IDENTITY_VARS
+/// 2. TOOL_MARKER_VARS
+/// 3. TERMINAL_CONTEXT_VARS
+///
+/// Per-tool instance-state vars are NOT in the initial strip — they are
+/// stripped per-instance later via `strip_instance_state_vars` so that
+/// cross-tool nesting doesn't strip vars the child tool doesn't own.
+fn env_strip_set() -> std::collections::HashSet<String> {
+    let mut strip: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for v in crate::shared::constants::HCOM_IDENTITY_VARS {
+        strip.insert((*v).to_string());
+    }
+    for v in crate::shared::constants::TOOL_MARKER_VARS {
+        strip.insert((*v).to_string());
+    }
+    strip.insert("HCOM_LAUNCHED_PRESET".to_string());
+    for v in crate::terminal::TERMINAL_CONTEXT_VARS {
+        strip.insert((*v).to_string());
+    }
+
+    strip
 }
 
 fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
@@ -591,6 +631,9 @@ pub fn create_runner_script(
     tool_args: &[String],
     run_here: bool,
 ) -> Result<String> {
+    // Resolve the tool's IntegrationSpec for instance-state env stripping
+    let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
+    let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
     let native_bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("hcom"));
     let native_bin_str = native_bin.to_string_lossy();
 
@@ -605,7 +648,50 @@ pub fn create_runner_script(
         rand::random::<u16>() % 9000 + 1000
     ));
 
-    let env_block = terminal::build_env_string(env, "bash_export");
+    // Route ALL forwarded non-HCOM env vars through the 0600 sidecar.
+    // The visible .sh only exports HCOM_* vars + PATH + cwd (minimal).
+    // This avoids the sensitivity-classification heuristic entirely — no
+    // secret ever lands in the 0755 world-readable script.
+    let hcom_env: HashMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| k.starts_with("HCOM_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let sidecar_strip: std::collections::HashSet<&str> = TOOL_MARKER_VARS
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(instance_state_env.iter())
+        .copied()
+        .collect();
+    let ambient_env: HashMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| !k.starts_with("HCOM_") && !sidecar_strip.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let env_block = terminal::build_env_string(&hcom_env, "bash_export");
+    let sensitive_env_source = if ambient_env.is_empty() {
+        String::new()
+    } else {
+        let env_file = launch_dir.join(format!(
+            "{}_{}_{}_{}.env",
+            tool,
+            instance_name,
+            std::process::id(),
+            rand::random::<u16>() % 9000 + 1000
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&env_file)?;
+        writeln!(
+            file,
+            "{}",
+            terminal::build_env_string(&ambient_env, "bash_export")
+        )?;
+        let quoted = crate::tools::args_common::shell_quote(&env_file.to_string_lossy());
+        format!("if [ -f {quoted} ]; then\n  . {quoted}\n  rm -f {quoted}\nfi")
+    };
     let tool_args_str: String = tool_args
         .iter()
         .map(|a| crate::tools::args_common::shell_quote(a))
@@ -654,6 +740,8 @@ pub fn create_runner_script(
          \n\
          unset {}\n\
          unset {}\n\
+         unset {}\n\
+         {}\n\
          {}\n\
          {}\n\
          \n\
@@ -669,7 +757,9 @@ pub fn create_runner_script(
         crate::tools::args_common::shell_quote(cwd),
         TOOL_MARKER_VARS.join(" "),
         HCOM_IDENTITY_VARS.join(" "),
+        instance_state_env.join(" "),
         env_block,
+        sensitive_env_source,
         path_export,
         use_exec,
         crate::tools::args_common::shell_quote(&native_bin_str),
@@ -684,10 +774,11 @@ pub fn create_runner_script(
         "pty",
         "native.script",
         &format!(
-            "script={} tool={} instance={}",
+            "script={} tool={} instance={} forwarded_keys=[{}]",
             script_file.display(),
             tool,
-            instance_name
+            instance_name,
+            ambient_env.keys().cloned().collect::<Vec<_>>().join(", ")
         ),
     );
 
@@ -729,10 +820,15 @@ pub fn launch_pty(
         "bash {}",
         crate::tools::args_common::shell_quote(&script_file)
     );
+    let terminal_env: HashMap<String, String> = runner_env
+        .iter()
+        .filter(|(k, _)| k.starts_with("HCOM_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let (launch_result, effective_preset) = terminal::launch_terminal(
         &command,
-        &runner_env,
+        &terminal_env,
         Some(cwd),
         false, // not background
         run_here,
@@ -835,9 +931,14 @@ fn launch_background_runner(
         "bash {}",
         crate::tools::args_common::shell_quote(&script_file)
     );
+    let terminal_env: HashMap<String, String> = runner_env
+        .iter()
+        .filter(|(k, _)| k.starts_with("HCOM_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let (launch_result, effective_preset) = terminal::launch_terminal(
         &command,
-        &runner_env,
+        &terminal_env,
         Some(cwd),
         true,
         false,
@@ -1044,7 +1145,8 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
 
-    // Build base environment
+    // Build base environment (inherits parent env minus leak-prone categories,
+    // then overlays config.toml + ~/.hcom/env which win)
     let mut base_env = build_launch_env(&hcom_config);
     if let Some(ref caller_env) = params.env {
         base_env.extend(caller_env.clone());
@@ -1790,6 +1892,7 @@ fn cleanup_instance(db: &HcomDb, name: &str, process_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_launch_tool_from_str() {
@@ -2026,6 +2129,169 @@ mod tests {
             runner_env.get("ANTIGRAVITY_AGENT").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn test_env_strip_set_strips_closed_categories() {
+        let strip = env_strip_set();
+        // HCOM identity
+        assert!(strip.contains("HCOM_PROCESS_ID"));
+        assert!(strip.contains("HCOM_LAUNCHED"));
+        // Tool markers
+        assert!(strip.contains("CLAUDECODE"));
+        assert!(strip.contains("CODEX_SANDBOX"));
+        assert!(strip.contains("CODEX_THREAD_ID"));
+        assert!(strip.contains("GEMINI_SYSTEM_MD"));
+        assert!(strip.contains("HCOM_PI"));
+        assert!(!strip.contains("PI_CODING_AGENT_DIR"));
+        // Terminal context
+        assert!(strip.contains("KITTY_WINDOW_ID"));
+        assert!(strip.contains("TMUX_PANE"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_build_launch_env_inherits_parent_env() {
+        unsafe { std::env::set_var("RORI_TEST_MY_VAR", "hello") }
+        unsafe { std::env::set_var("RORI_TEST_OPENROUTER_API_KEY", "sk-test-123") }
+        unsafe { std::env::set_var("RORI_TEST_PI_OFFLINE", "1") }
+
+        let config = crate::config::HcomConfig::default();
+        let env = build_launch_env(&config);
+
+        assert_eq!(
+            env.get("RORI_TEST_MY_VAR").map(String::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            env.get("RORI_TEST_OPENROUTER_API_KEY").map(String::as_str),
+            Some("sk-test-123")
+        );
+        assert_eq!(
+            env.get("RORI_TEST_PI_OFFLINE").map(String::as_str),
+            Some("1")
+        );
+
+        unsafe { std::env::remove_var("RORI_TEST_MY_VAR") }
+        unsafe { std::env::remove_var("RORI_TEST_OPENROUTER_API_KEY") }
+        unsafe { std::env::remove_var("RORI_TEST_PI_OFFLINE") }
+    }
+
+    #[test]
+    #[serial]
+    fn test_build_launch_env_strips_closed_categories() {
+        unsafe { std::env::set_var("HCOM_PROCESS_ID", "pid-stale") }
+        unsafe { std::env::set_var("CLAUDECODE", "1") }
+        unsafe { std::env::set_var("CODEX_THREAD_ID", "thread-stale") }
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", "/tmp/pi-config") }
+        unsafe { std::env::set_var("KITTY_WINDOW_ID", "1337") }
+
+        let config = crate::config::HcomConfig::default();
+        let env = build_launch_env(&config);
+
+        assert!(!env.contains_key("HCOM_PROCESS_ID"));
+        assert!(!env.contains_key("CLAUDECODE"));
+        assert!(!env.contains_key("CODEX_THREAD_ID"));
+        assert_eq!(
+            env.get("PI_CODING_AGENT_DIR").map(String::as_str),
+            Some("/tmp/pi-config")
+        );
+        assert!(!env.contains_key("KITTY_WINDOW_ID"));
+
+        unsafe { std::env::remove_var("HCOM_PROCESS_ID") }
+        unsafe { std::env::remove_var("CLAUDECODE") }
+        unsafe { std::env::remove_var("CODEX_THREAD_ID") }
+        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") }
+        unsafe { std::env::remove_var("KITTY_WINDOW_ID") }
+    }
+
+    #[test]
+    #[serial]
+    fn test_build_launch_env_config_overrides_ambient() {
+        unsafe { std::env::set_var("HCOM_TAG", "ambient-tag") }
+
+        let config = crate::config::HcomConfig {
+            tag: "config-tag".to_string(),
+            ..Default::default()
+        };
+        let env = build_launch_env(&config);
+
+        assert_eq!(env.get("HCOM_TAG").map(String::as_str), Some("config-tag"));
+
+        unsafe { std::env::remove_var("HCOM_TAG") }
+    }
+
+    #[test]
+    fn test_runner_script_strips_instance_state_vars() {
+        let env = HashMap::from([
+            ("GEMINI_PTY_INFO".to_string(), "child_process".to_string()),
+            ("GEMINI_API_KEY".to_string(), "gem-key".to_string()),
+            ("GEMINI_CLI".to_string(), "1".to_string()),
+            ("RORI_MY_VAR".to_string(), "myval".to_string()),
+        ]);
+
+        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], false).unwrap();
+
+        let content = std::fs::read_to_string(&script).unwrap();
+        // Instance-state stripped from unset block
+        assert!(
+            content.contains("GEMINI_PTY_INFO"),
+            "GEMINI_PTY_INFO should appear in unset"
+        );
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+        assert!(!sidecar.contains("GEMINI_PTY_INFO"));
+        assert!(!sidecar.contains("GEMINI_CLI"));
+        assert!(sidecar.contains("GEMINI_API_KEY"));
+        assert!(sidecar.contains("RORI_MY_VAR"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn test_same_tool_nesting_strips_instance_state() {
+        unsafe { std::env::set_var("GEMINI_PTY_INFO", "child_process") }
+        unsafe { std::env::set_var("GEMINI_API_KEY", "parent-key") }
+
+        let config = crate::config::HcomConfig::default();
+        let mut env = build_launch_env(&config);
+
+        let gemini_spec: &'static crate::integration_spec::IntegrationSpec =
+            crate::tool::Tool::Gemini.spec();
+        for var in gemini_spec.instance_state_env {
+            env.remove(*var);
+        }
+
+        assert!(!env.contains_key("GEMINI_PTY_INFO"));
+        assert_eq!(
+            env.get("GEMINI_API_KEY").map(String::as_str),
+            Some("parent-key")
+        );
+
+        unsafe { std::env::remove_var("GEMINI_PTY_INFO") }
+        unsafe { std::env::remove_var("GEMINI_API_KEY") }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cross_tool_nesting_forwards_auth() {
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "sk-parent") }
+
+        let config = crate::config::HcomConfig::default();
+        let env = build_launch_env(&config);
+
+        assert_eq!(
+            env.get("OPENROUTER_API_KEY").map(String::as_str),
+            Some("sk-parent")
+        );
+
+        unsafe { std::env::remove_var("OPENROUTER_API_KEY") }
     }
 
     fn launcher_test_db() -> crate::db::HcomDb {

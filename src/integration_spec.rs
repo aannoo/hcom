@@ -172,6 +172,24 @@ pub struct IntegrationSpec {
     pub released: bool,
     /// PTY ready-pattern bytes (empty for Adhoc).
     pub ready_pattern: &'static [u8],
+    /// Environment variables specific to this tool's instance state that
+    /// will corrupt a same-tool child if leaked (session IDs, sandbox modes,
+    /// config-directory pointers, process-role assignments, per-instance
+    /// server URLs). Stripped before inheritance and `unset` in runner
+    /// scripts. Must NOT include auth/API-key env vars or user config
+    /// toggles (those forward). These are in ADDITION to TOOL_MARKER_VARS
+    /// which already covers the broad-detection markers.
+    ///
+    /// Entries must meet ALL THREE criteria:
+    /// (a) read as input on fresh start
+    /// (b) instance-specific (session/thread/sandbox/path/role)
+    /// (c) NOT re-set by the child's own launch
+    ///
+    /// This is a known-vars strip — NOT a completeness guarantee. Unknown
+    /// instance-state vars on closed-source tools, or future vars on any
+    /// tool, are a documented gap (same risk the PTY path already lives with
+    /// today). Recoverable by adding the var when discovered.
+    pub instance_state_env: &'static [&'static str],
 
     pub hooks: HooksSpec,
     pub gates: GatesSpec,
@@ -359,6 +377,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"? for shortcuts",
+    instance_state_env: &[],
     hooks: HooksSpec {
         names: CLAUDE_HOOKS,
         shared_hooks_with: None,
@@ -408,6 +427,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"Type your message",
+    instance_state_env: &["GEMINI_PTY_INFO"],
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
         shared_hooks_with: None,
@@ -456,6 +476,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: "\u{203A} ".as_bytes(),
+    instance_state_env: &["CODEX_EXEC_SERVER_URL"],
     hooks: HooksSpec {
         names: CODEX_HOOKS,
         shared_hooks_with: None,
@@ -504,6 +525,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"ctrl+p commands",
+    instance_state_env: &["OPENCODE_RUN_ID", "OPENCODE_PROCESS_ROLE"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: None,
@@ -552,6 +574,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"ctrl+p commands",
+    instance_state_env: &["KILO_DB"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: Some(Tool::OpenCode),
@@ -600,6 +623,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"? for shortcuts",
+    instance_state_env: &["ANTIGRAVITY_EXECUTABLE_DATA_DIR", "GEMINI_PTY_INFO"],
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
         // Antigravity reuses Gemini hook names; routing resolves those names
@@ -657,6 +681,8 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     // Cursor's input placeholder is styled rather than a stable ASCII footer.
     // Prompt-empty detection is the readiness signal for the MVP.
     ready_pattern: b"",
+    // Closed-source; unknown instance-state vars are a documented gap.
+    instance_state_env: &[],
     hooks: HooksSpec {
         names: CURSOR_HOOKS,
         shared_hooks_with: None,
@@ -773,6 +799,8 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     // hooks/instructions. Gate on "/ commands" footer text so delivery doesn't
     // inject during the loading window.
     ready_pattern: b"/ commands",
+    // Closed-source; unknown instance-state vars are a documented gap.
+    instance_state_env: &[],
     hooks: HooksSpec {
         names: COPILOT_HOOKS,
         shared_hooks_with: None,
@@ -819,6 +847,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     adhoc_icon: Some("\u{25e6}"), // ◦ neutral dot
     released: false,
     ready_pattern: b"",
+    instance_state_env: &[],
     hooks: HooksSpec {
         names: &[],
         shared_hooks_with: None,
