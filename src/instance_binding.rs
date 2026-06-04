@@ -258,13 +258,13 @@ fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
         .unwrap_or(false)
 }
 
-fn rollback_placeholder_notify_migration(db: &HcomDb, canonical_name: &str, placeholder_name: &str) {
+fn rollback_placeholder_notify_migration(
+    db: &HcomDb,
+    canonical_name: &str,
+    placeholder_name: &str,
+) {
     if let Err(e) = db.migrate_notify_endpoints(canonical_name, placeholder_name) {
-        crate::log::log_error(
-            "binding",
-            "placeholder.rollback_endpoints",
-            &format!("{e}"),
-        );
+        crate::log::log_error("binding", "placeholder.rollback_endpoints", &format!("{e}"));
     }
 }
 
@@ -276,11 +276,7 @@ fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str, canonic
             rollback_placeholder_notify_migration(db, canonical_name, placeholder_name);
         }
         Err(e) => {
-            crate::log::log_error(
-                "binding",
-                "placeholder.delete",
-                &format!("{e}"),
-            );
+            crate::log::log_error("binding", "placeholder.delete", &format!("{e}"));
             rollback_placeholder_notify_migration(db, canonical_name, placeholder_name);
         }
     }
@@ -301,11 +297,7 @@ fn retire_true_placeholder_after_canonical_bind(
     }
 
     if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
-        crate::log::log_error(
-            "binding",
-            "placeholder.migrate_endpoints",
-            &format!("{e}"),
-        );
+        crate::log::log_error("binding", "placeholder.migrate_endpoints", &format!("{e}"));
     }
 
     if is_true_launch_placeholder(placeholder_data) {
