@@ -252,6 +252,67 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
         .map(|suffix| suffix.to_string())
 }
 
+fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
+    data.as_ref()
+        .map(|d| d.session_id.is_none())
+        .unwrap_or(false)
+}
+
+fn rollback_placeholder_notify_migration(db: &HcomDb, canonical_name: &str, placeholder_name: &str) {
+    if let Err(e) = db.migrate_notify_endpoints(canonical_name, placeholder_name) {
+        crate::log::log_error(
+            "binding",
+            "placeholder.rollback_endpoints",
+            &format!("{e}"),
+        );
+    }
+}
+
+/// Delete a true launch placeholder row; restore notify rows on failure.
+fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str, canonical_name: &str) {
+    match db.delete_instance(placeholder_name) {
+        Ok(true) => {}
+        Ok(false) => {
+            rollback_placeholder_notify_migration(db, canonical_name, placeholder_name);
+        }
+        Err(e) => {
+            crate::log::log_error(
+                "binding",
+                "placeholder.delete",
+                &format!("{e}"),
+            );
+            rollback_placeholder_notify_migration(db, canonical_name, placeholder_name);
+        }
+    }
+}
+
+/// Path 2: after restore_stopped bind, merge notify ports and drop the launch placeholder.
+fn retire_true_placeholder_after_canonical_bind(
+    db: &HcomDb,
+    placeholder_name: Option<&String>,
+    canonical_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) {
+    let Some(ph_name) = placeholder_name else {
+        return;
+    };
+    if ph_name == canonical_name {
+        return;
+    }
+
+    if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
+        crate::log::log_error(
+            "binding",
+            "placeholder.migrate_endpoints",
+            &format!("{e}"),
+        );
+    }
+
+    if is_true_launch_placeholder(placeholder_data) {
+        delete_true_placeholder_instance(db, ph_name, canonical_name);
+    }
+}
+
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
 fn recreate_instance_from_placeholder(
     db: &HcomDb,
@@ -365,12 +426,7 @@ pub fn bind_session_to_process(
                 );
             }
 
-            let is_true_placeholder = placeholder_data
-                .as_ref()
-                .map(|d| d.session_id.is_none())
-                .unwrap_or(false);
-
-            if is_true_placeholder {
+            if is_true_launch_placeholder(placeholder_data.as_ref()) {
                 // Path 1a: True placeholder merge
                 if let Some(ref ph_data) = placeholder_data {
                     if let Some(ref tag) = ph_data.tag {
@@ -389,33 +445,7 @@ pub fn bind_session_to_process(
                     }
                 }
 
-                // Delete true placeholder (temporary identity)
-                match db.delete_instance(ph_name) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                            crate::log::log_error(
-                                "binding",
-                                "bind_canonical.rollback_endpoints",
-                                &format!("{e}"),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        crate::log::log_error(
-                            "binding",
-                            "bind_canonical.delete_placeholder",
-                            &format!("{e}"),
-                        );
-                        if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                            crate::log::log_error(
-                                "binding",
-                                "bind_canonical.rollback_endpoints",
-                                &format!("{e}"),
-                            );
-                        }
-                    }
-                }
+                delete_true_placeholder_instance(db, ph_name, canonical_name);
             } else {
                 // Path 1b: Session switch — mark old instance inactive
                 crate::instance_lifecycle::set_status(
@@ -484,6 +514,14 @@ pub fn bind_session_to_process(
                 &format!("{e}"),
             );
         }
+
+        retire_true_placeholder_after_canonical_bind(
+            db,
+            placeholder_name.as_ref(),
+            &stopped_name,
+            placeholder_data.as_ref(),
+        );
+
         return Some(stopped_name);
     }
 
@@ -1340,6 +1378,57 @@ mod tests {
         assert_eq!(restored.session_id.as_deref(), Some("sid-resume"));
         assert_eq!(restored.tool, "antigravity");
         assert_eq!(restored.tag.as_deref(), Some("work"));
+        assert!(db.get_instance_full("nova").unwrap().is_none());
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_bind_session_restore_stopped_deletes_true_placeholder() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+
+        let snapshot = serde_json::json!({
+            "session_id": "ses-opencode-1",
+            "tool": "opencode",
+        });
+        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot))
+            .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc", "", "mozi").unwrap();
+
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.session_id.as_deref(), Some("ses-opencode-1"));
+        assert_eq!(
+            db.get_session_binding("ses-opencode-1").unwrap(),
+            Some("fano".to_string())
+        );
+        assert_eq!(
+            db.get_process_binding("pid-oc").unwrap(),
+            Some("fano".to_string())
+        );
 
         cleanup(path);
     }

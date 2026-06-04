@@ -52,22 +52,31 @@ impl HcomDb {
         }
     }
 
-    /// Migrate notify endpoints from old instance to new instance
+    /// Migrate notify endpoints from old instance to new instance.
+    ///
+    /// Per-kind merge: rows already on `new_name` (e.g. `plugin` registered during
+    /// opencode-start on the canonical name) are preserved; only missing kinds move
+    /// from `old_name`.
     pub fn migrate_notify_endpoints(&self, old_name: &str, new_name: &str) -> Result<()> {
         if old_name == new_name {
             return Ok(());
         }
 
-        // Delete existing endpoints for new name
+        // Drop source rows for kinds the target already owns (e.g. keep canonical `plugin`).
         self.conn.execute(
-            "DELETE FROM notify_endpoints WHERE instance = ?",
-            params![new_name],
+            "DELETE FROM notify_endpoints
+             WHERE instance = ?1
+               AND kind IN (SELECT kind FROM notify_endpoints WHERE instance = ?2)",
+            params![old_name, new_name],
         )?;
-
-        // Move endpoints from old to new
+        // Move remaining kinds to the target, then remove any stragglers on the source.
         self.conn.execute(
-            "UPDATE notify_endpoints SET instance = ? WHERE instance = ?",
-            params![new_name, old_name],
+            "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
+            params![old_name, new_name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM notify_endpoints WHERE instance = ?1",
+            params![old_name],
         )?;
 
         Ok(())
@@ -355,6 +364,7 @@ impl HcomDb {
 mod tests {
     use super::super::HcomDb;
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
+    use rusqlite::params;
 
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.
@@ -539,6 +549,78 @@ mod tests {
 
         db.delete_process_bindings_for_instance("luna").unwrap();
         assert!(!db.has_process_binding_for_instance("luna"));
+
+        cleanup_test_db(db_path);
+    }
+
+    fn endpoint_port(db: &HcomDb, instance: &str, kind: &str) -> Option<i64> {
+        db.conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = ?",
+                params![instance, kind],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn endpoint_count_for(db: &HcomDb, instance: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?",
+                params![instance],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_migrate_notify_endpoints_preserves_plugin_on_target() {
+        let (db, db_path) = setup_full_test_db();
+
+        // Canonical already has plugin from opencode-start; placeholder has PTY ports.
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+        db.upsert_notify_endpoint("mozi", "inject", 55_558).unwrap();
+
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));
+        assert_eq!(endpoint_port(&db, "fano", "inject"), Some(55_558));
+        assert_eq!(endpoint_count_for(&db, "mozi"), 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_migrate_notify_endpoints_keeps_target_kind_on_conflict() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("fano", "pty", 58_321).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "fano", "pty"), Some(58_321));
+        assert_eq!(endpoint_count_for(&db, "mozi"), 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_migrate_notify_endpoints_moves_kind_missing_on_target() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));
+        assert_eq!(endpoint_count_for(&db, "mozi"), 0);
 
         cleanup_test_db(db_path);
     }
