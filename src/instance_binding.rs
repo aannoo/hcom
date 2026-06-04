@@ -258,27 +258,40 @@ fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
         .unwrap_or(false)
 }
 
-fn rollback_placeholder_notify_migration(
-    db: &HcomDb,
-    canonical_name: &str,
-    placeholder_name: &str,
-) {
-    if let Err(e) = db.migrate_notify_endpoints(canonical_name, placeholder_name) {
-        crate::log::log_error("binding", "placeholder.rollback_endpoints", &format!("{e}"));
+fn migrate_placeholder_notify(db: &HcomDb, placeholder_name: &str, canonical_name: &str) -> bool {
+    match db.migrate_notify_endpoints(placeholder_name, canonical_name) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::log::log_error("binding", "placeholder.migrate_endpoints", &format!("{e}"));
+            false
+        }
     }
 }
 
-/// Delete a true launch placeholder row; restore notify rows on failure.
-fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str, canonical_name: &str) {
+/// Delete a true launch placeholder row. Notify endpoints remain on the canonical instance.
+fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str) {
     match db.delete_instance(placeholder_name) {
         Ok(true) => {}
         Ok(false) => {
-            rollback_placeholder_notify_migration(db, canonical_name, placeholder_name);
+            crate::log::log_info(
+                "binding",
+                "placeholder.delete_missing",
+                &format!("placeholder={placeholder_name}"),
+            );
         }
         Err(e) => {
             crate::log::log_error("binding", "placeholder.delete", &format!("{e}"));
-            rollback_placeholder_notify_migration(db, canonical_name, placeholder_name);
         }
+    }
+}
+
+fn delete_true_placeholder_if_migrated(
+    db: &HcomDb,
+    placeholder_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) {
+    if is_true_launch_placeholder(placeholder_data) {
+        delete_true_placeholder_instance(db, placeholder_name);
     }
 }
 
@@ -296,13 +309,11 @@ fn retire_true_placeholder_after_canonical_bind(
         return;
     }
 
-    if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
-        crate::log::log_error("binding", "placeholder.migrate_endpoints", &format!("{e}"));
+    if !migrate_placeholder_notify(db, ph_name, canonical_name) {
+        return;
     }
 
-    if is_true_launch_placeholder(placeholder_data) {
-        delete_true_placeholder_instance(db, ph_name, canonical_name);
-    }
+    delete_true_placeholder_if_migrated(db, ph_name, placeholder_data);
 }
 
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
@@ -409,14 +420,7 @@ pub fn bind_session_to_process(
         if let Some(ref ph_name) = placeholder_name
             && ph_name != canonical_name
         {
-            // Always migrate notify_endpoints
-            if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_canonical.migrate_endpoints",
-                    &format!("{e}"),
-                );
-            }
+            let migrated = migrate_placeholder_notify(db, ph_name, canonical_name);
 
             if is_true_launch_placeholder(placeholder_data.as_ref()) {
                 // Path 1a: True placeholder merge
@@ -437,8 +441,10 @@ pub fn bind_session_to_process(
                     }
                 }
 
-                delete_true_placeholder_instance(db, ph_name, canonical_name);
-            } else {
+                if migrated {
+                    delete_true_placeholder_if_migrated(db, ph_name, placeholder_data.as_ref());
+                }
+            } else if migrated {
                 // Path 1b: Session switch — mark old instance inactive
                 crate::instance_lifecycle::set_status(
                     db,
@@ -1419,6 +1425,90 @@ mod tests {
         );
         assert_eq!(
             db.get_process_binding("pid-oc").unwrap(),
+            Some("fano".to_string())
+        );
+
+        cleanup(path);
+    }
+
+    fn notify_endpoint_port(db: &HcomDb, instance: &str, kind: &str) -> Option<i64> {
+        db.conn()
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ?1 AND kind = ?2",
+                rusqlite::params![instance, kind],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    struct MigrateNotifyFailGuard;
+
+    impl MigrateNotifyFailGuard {
+        fn enable() -> Self {
+            HcomDb::set_test_migrate_notify_fail(true);
+            Self
+        }
+    }
+
+    impl Drop for MigrateNotifyFailGuard {
+        fn drop(&mut self) {
+            HcomDb::set_test_migrate_notify_fail(false);
+        }
+    }
+
+    #[test]
+    fn test_delete_placeholder_failure_keeps_notify_on_canonical() {
+        let (db, path) = setup_test_db();
+
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        delete_true_placeholder_instance(&db, "ghost_placeholder");
+
+        assert_eq!(notify_endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(notify_endpoint_port(&db, "fano", "pty"), Some(55_568));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_retire_skips_delete_when_migrate_fails() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let _guard = MigrateNotifyFailGuard::enable();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+
+        let snapshot = serde_json::json!({
+            "session_id": "ses-opencode-1",
+            "tool": "opencode",
+        });
+        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot))
+            .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc", "", "mozi").unwrap();
+
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("ses-opencode-1").unwrap(),
             Some("fano".to_string())
         );
 

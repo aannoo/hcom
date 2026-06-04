@@ -6,6 +6,12 @@ use rusqlite::params;
 use super::HcomDb;
 use crate::shared::time::now_epoch_f64;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+static TEST_MIGRATE_NOTIFY_FAIL: AtomicBool = AtomicBool::new(false);
+
 impl HcomDb {
     /// Delete process binding (for cleanup)
     pub fn delete_process_binding(&self, process_id: &str) -> Result<()> {
@@ -62,22 +68,29 @@ impl HcomDb {
             return Ok(());
         }
 
+        #[cfg(test)]
+        if TEST_MIGRATE_NOTIFY_FAIL.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("test_injected_migrate_notify_fail"));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
         // Drop source rows for kinds the target already owns (e.g. keep canonical `plugin`).
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM notify_endpoints
              WHERE instance = ?1
                AND kind IN (SELECT kind FROM notify_endpoints WHERE instance = ?2)",
             params![old_name, new_name],
         )?;
         // Move remaining kinds to the target, then remove any stragglers on the source.
-        self.conn.execute(
+        tx.execute(
             "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
             params![old_name, new_name],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM notify_endpoints WHERE instance = ?1",
             params![old_name],
         )?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -365,6 +378,7 @@ mod tests {
     use super::super::HcomDb;
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
     use rusqlite::params;
+    use serial_test::serial;
 
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.
@@ -574,8 +588,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_migrate_notify_endpoints_preserves_plugin_on_target() {
         let (db, db_path) = setup_full_test_db();
+        HcomDb::set_test_migrate_notify_fail(false);
 
         // Canonical already has plugin from opencode-start; placeholder has PTY ports.
         db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
@@ -593,8 +609,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_migrate_notify_endpoints_keeps_target_kind_on_conflict() {
         let (db, db_path) = setup_full_test_db();
+        HcomDb::set_test_migrate_notify_fail(false);
 
         db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
         db.upsert_notify_endpoint("fano", "pty", 58_321).unwrap();
@@ -610,8 +628,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_migrate_notify_endpoints_moves_kind_missing_on_target() {
         let (db, db_path) = setup_full_test_db();
+        HcomDb::set_test_migrate_notify_fail(false);
 
         db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
         db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
@@ -623,5 +643,68 @@ mod tests {
         assert_eq!(endpoint_count_for(&db, "mozi"), 0);
 
         cleanup_test_db(db_path);
+    }
+
+    struct MigrateNotifyFailGuard;
+
+    impl MigrateNotifyFailGuard {
+        fn enable() -> Self {
+            HcomDb::set_test_migrate_notify_fail(true);
+            Self
+        }
+    }
+
+    impl Drop for MigrateNotifyFailGuard {
+        fn drop(&mut self) {
+            HcomDb::set_test_migrate_notify_fail(false);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_migrate_notify_endpoints_rolls_back_on_injected_failure() {
+        let (db, db_path) = setup_full_test_db();
+        let _guard = MigrateNotifyFailGuard::enable();
+
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+
+        let err = db
+            .migrate_notify_endpoints("mozi", "fano")
+            .expect_err("injected migrate failure");
+        assert!(
+            err.to_string()
+                .contains("test_injected_migrate_notify_fail")
+        );
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "mozi", "pty"), Some(55_568));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_migrate_notify_endpoints_commits_on_success_after_fail_guard_cleared() {
+        let (db, db_path) = setup_full_test_db();
+        HcomDb::set_test_migrate_notify_fail(false);
+
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));
+        assert_eq!(endpoint_count_for(&db, "mozi"), 0);
+
+        cleanup_test_db(db_path);
+    }
+}
+
+#[cfg(test)]
+impl HcomDb {
+    pub fn set_test_migrate_notify_fail(fail: bool) {
+        TEST_MIGRATE_NOTIFY_FAIL.store(fail, Ordering::SeqCst);
     }
 }
