@@ -881,6 +881,14 @@ mod tests {
         insert_instance(&db, "canonical", Some("thread-resume"), None);
         insert_session_binding(&db, "thread-resume", "canonical");
         insert_instance(&db, "placeholder", None, None);
+        // Real launch placeholders are pending/new (PLACEHOLDER_STATUS/CONTEXT); set that
+        // here so deletion is gated on genuine placeholder-ness, not merely a null session.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'pending', status_context = 'new' WHERE name = 'placeholder'",
+                [],
+            )
+            .unwrap();
         insert_process_binding(&db, "pid-codex", "placeholder");
 
         let identity = resolve_identity(

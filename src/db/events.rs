@@ -105,17 +105,19 @@ impl HcomDb {
     /// - event.type = 'message'
     /// - instance is in scope (broadcast or direct)
     pub fn get_unread_messages(&self, name: &str) -> Vec<Message> {
-        // Get last_event_id for this instance
+        // Get last_event_id for this instance. A missing/unreadable row means there is
+        // no recipient — return no unread rather than falling back to cursor 0, which
+        // would treat the whole channel backlog (broadcasts match everyone) as unread.
         let last_event_id = match self.get_instance_status(name) {
             Ok(Some(status)) => status.last_event_id,
-            Ok(None) => 0, // No instance found
+            Ok(None) => return vec![],
             Err(e) => {
                 crate::log::log_error(
                     "db",
                     "get_unread_messages.get_instance_status",
                     &format!("{e}"),
                 );
-                0
+                return vec![];
             }
         };
 
@@ -593,6 +595,27 @@ mod tests {
 
         assert!(id1 > 0);
         assert_eq!(id2, id1 + 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    // Regression: a missing recipient must yield no unread messages, not the whole
+    // backlog (broadcasts match every recipient when the cursor falls back to 0).
+    #[test]
+    fn test_get_unread_messages_empty_for_missing_instance() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.log_event(
+            "message",
+            "kera",
+            &serde_json::json!({"from": "kera", "scope": "broadcast", "text": "ack"}),
+        )
+        .unwrap();
+
+        assert!(
+            db.get_unread_messages("ghost").is_empty(),
+            "missing instance must have no unread, not the full backlog"
+        );
 
         cleanup_test_db(db_path);
     }

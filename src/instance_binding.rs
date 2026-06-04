@@ -7,8 +7,8 @@
 use crate::db::{HcomDb, InstanceRow};
 use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
-use crate::shared::ST_INACTIVE;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
+use crate::shared::{ST_INACTIVE, ST_LISTENING};
 
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
@@ -253,9 +253,27 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
 }
 
 fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
-    data.as_ref()
-        .map(|d| d.session_id.is_none())
-        .unwrap_or(false)
+    let Some(data) = data else {
+        return false;
+    };
+    if data.session_id.is_some() {
+        return false;
+    }
+
+    if crate::instances::is_launching_placeholder(data) {
+        return true;
+    }
+
+    // OpenCode and other PTY-backed tools can be marked ready/listening by the PTY
+    // watcher before their later session-start hook binds a session id. Those rows
+    // are still launch placeholders, but no longer match the stricter "pending/new"
+    // display predicate. Keep this narrow: active no-session rows are real work, not
+    // launch placeholders.
+    data.status == ST_LISTENING
+        && matches!(
+            data.status_context.as_str(),
+            "start" | "ready_observed" | "launch_blocked_cleared"
+        )
 }
 
 fn migrate_placeholder_notify(db: &HcomDb, placeholder_name: &str, canonical_name: &str) -> bool {
@@ -285,12 +303,46 @@ fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str) {
     }
 }
 
+/// Carry runtime state the PTY wrapper wrote onto the placeholder row over to the
+/// canonical instance before the placeholder is deleted. The OS `pid` and terminal
+/// `launch_context` (pane_id) are written once at spawn under the launch name
+/// (`src/pty/mod.rs`); without migrating them, `hcom kill <canonical>` finds no pid
+/// and can't close the terminal pane.
+fn migrate_placeholder_runtime_state(
+    db: &HcomDb,
+    canonical_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) {
+    let Some(ph) = placeholder_data else {
+        return;
+    };
+    if let Some(pid) = ph.pid
+        && let Ok(pid_u32) = u32::try_from(pid)
+        && let Err(e) = db.update_instance_pid(canonical_name, pid_u32)
+    {
+        crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+    }
+    if let Some(ref ctx) = ph.launch_context
+        && let Err(e) = db.store_launch_context(canonical_name, ctx)
+    {
+        crate::log::log_error(
+            "binding",
+            "placeholder.migrate_launch_context",
+            &format!("{e}"),
+        );
+    }
+}
+
 fn delete_true_placeholder_if_migrated(
     db: &HcomDb,
     placeholder_name: &str,
+    canonical_name: &str,
     placeholder_data: Option<&InstanceRow>,
 ) {
     if is_true_launch_placeholder(placeholder_data) {
+        // Move pid/launch_context to the canonical row before dropping the placeholder
+        // so the restored agent stays killable and its pane closeable.
+        migrate_placeholder_runtime_state(db, canonical_name, placeholder_data);
         delete_true_placeholder_instance(db, placeholder_name);
     }
 }
@@ -313,7 +365,7 @@ fn retire_true_placeholder_after_canonical_bind(
         return;
     }
 
-    delete_true_placeholder_if_migrated(db, ph_name, placeholder_data);
+    delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data);
 }
 
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
@@ -442,10 +494,27 @@ pub fn bind_session_to_process(
                 }
 
                 if migrated {
-                    delete_true_placeholder_if_migrated(db, ph_name, placeholder_data.as_ref());
+                    delete_true_placeholder_if_migrated(
+                        db,
+                        ph_name,
+                        canonical_name,
+                        placeholder_data.as_ref(),
+                    );
                 }
-            } else if migrated {
-                // Path 1b: Session switch — mark old instance inactive
+            } else {
+                // Path 1b: Session switch — retire the real old identity. Unlike a true
+                // launch placeholder (deletion above stays gated on endpoint migration),
+                // this is a live old identity: retire it regardless of migration outcome,
+                // else a migrate failure leaves a duplicate active/listening row and a
+                // stale session binding. Endpoints may remain imperfect on the old name,
+                // but the delivery loop re-registers under the canonical name.
+                if !migrated {
+                    crate::log::log_info(
+                        "binding",
+                        "bind_canonical.session_switch_migrate_failed",
+                        &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
+                    );
+                }
                 crate::instance_lifecycle::set_status(
                     db,
                     ph_name,
@@ -1426,6 +1495,156 @@ mod tests {
         assert_eq!(
             db.get_process_binding("pid-oc").unwrap(),
             Some("fano".to_string())
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_restore_stopped_migrates_pid_and_launch_context_to_canonical() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-oc-pid", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        // Launch placeholder with the runtime state the PTY wrapper writes at spawn.
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc", "", "mozi").unwrap();
+        db.update_instance_pid("mozi", 4242).unwrap();
+        db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-oc-pid", Some("pid-oc"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        // Placeholder gone; pid + launch_context now live on the canonical so the
+        // restored agent stays killable and its pane closeable.
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.pid, Some(4242));
+        assert!(
+            fano.launch_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kitty-99"),
+            "launch_context not migrated: {:?}",
+            fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_restore_stopped_migrates_ready_promoted_placeholder_runtime_state() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-oc-ready", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        // PTY ready detection can promote the launch row before opencode-start binds
+        // the session. It is still the launch placeholder and must be retired.
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("listening"));
+        mozi_data.insert("status_context".into(), serde_json::json!("start"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc-ready", "", "mozi").unwrap();
+        db.update_instance_pid("mozi", 4343).unwrap();
+        db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-oc-ready", Some("pid-oc-ready"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.pid, Some(4343));
+        assert!(
+            fano.launch_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kitty-101"),
+            "launch_context not migrated: {:?}",
+            fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_restore_stopped_keeps_active_no_session_row() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-keep", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        // An ACTIVE row bound to the pid that happens to lack a session_id — NOT a launch
+        // placeholder (status_context != "new", status active). It must not be deleted.
+        let mut busy_data = serde_json::Map::new();
+        busy_data.insert("name".into(), serde_json::json!("busy"));
+        busy_data.insert("tool".into(), serde_json::json!("opencode"));
+        busy_data.insert("created_at".into(), serde_json::json!(now));
+        busy_data.insert("status".into(), serde_json::json!("active"));
+        busy_data.insert("status_context".into(), serde_json::json!("tool:write"));
+        db.save_instance_named("busy", &busy_data).unwrap();
+        db.set_process_binding("pid-busy", "", "busy").unwrap();
+
+        let result = bind_session_to_process(&db, "ses-keep", Some("pid-busy"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(
+            db.get_instance_full("busy").unwrap().is_some(),
+            "active non-placeholder row must not be deleted by restore_stopped"
         );
 
         cleanup(path);
