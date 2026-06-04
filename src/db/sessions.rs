@@ -374,6 +374,13 @@ impl HcomDb {
 }
 
 #[cfg(test)]
+impl HcomDb {
+    pub fn set_test_migrate_notify_fail(fail: bool) {
+        TEST_MIGRATE_NOTIFY_FAIL.store(fail, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::HcomDb;
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
@@ -699,12 +706,5 @@ mod tests {
         assert_eq!(endpoint_count_for(&db, "mozi"), 0);
 
         cleanup_test_db(db_path);
-    }
-}
-
-#[cfg(test)]
-impl HcomDb {
-    pub fn set_test_migrate_notify_fail(fail: bool) {
-        TEST_MIGRATE_NOTIFY_FAIL.store(fail, Ordering::SeqCst);
     }
 }
