@@ -184,7 +184,20 @@ pub fn do_resume(
         return Ok(0);
     }
 
-    let exit = execute_prepared_resume(&db, &resolved, fork, &plan, &hcom_config, true)?;
+    let inline_readiness_wait_secs = if ctx.is_inside_ai_tool() {
+        Some(crate::commands::launch::INLINE_SINGLE_LAUNCH_WAIT_SECS)
+    } else {
+        None
+    };
+    let exit = execute_prepared_resume(
+        &db,
+        &resolved,
+        fork,
+        &plan,
+        &hcom_config,
+        true,
+        inline_readiness_wait_secs,
+    )?;
     if is_adoption {
         log_info(
             if fork { "fork" } else { "resume" },
@@ -546,6 +559,7 @@ fn execute_prepared_resume(
     plan: &PreparedResume,
     hcom_config: &crate::config::HcomConfig,
     print_feedback_now: bool,
+    inline_readiness_wait_secs: Option<u64>,
 ) -> Result<i32> {
     let result = execute_prepared_resume_result(db, name, fork, plan)?;
 
@@ -560,9 +574,15 @@ fn execute_prepared_resume(
             background: plan.output.background,
             run_here: plan.output.run_here,
             hcom_config,
-            inline_readiness_wait_secs: None,
+            inline_readiness_wait_secs,
         };
         print_launch_feedback(db, &result, &output)?;
+        // Resume/fork share launch's inline readiness wait + exit-code mapping:
+        // when invoked from inside an AI tool we block briefly so the caller
+        // sees ready/blocked/failed instead of a bare "spawned" line.
+        let readiness_state = inline_readiness_wait_secs
+            .filter(|_| result.launched == 1)
+            .map(|secs| crate::commands::launch::print_inline_launch_readiness(db, &result, secs));
         log_info(
             if fork { "fork" } else { "resume" },
             &format!("cmd.{}", if fork { "fork" } else { "resume" }),
@@ -571,6 +591,10 @@ fn execute_prepared_resume(
                 name, plan.output.tool, plan.session_id, result.launched
             ),
         );
+        return Ok(crate::commands::launch::readiness_exit_code(
+            readiness_state,
+            result.failed,
+        ));
     }
 
     Ok(if result.launched > 0 { 0 } else { 1 })
