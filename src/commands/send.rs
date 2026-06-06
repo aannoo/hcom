@@ -456,8 +456,12 @@ fn get_intent_from_event(db: &HcomDb, event_id: i64) -> Option<String> {
 }
 
 /// Resolve message from one of 5 source modes.
-/// Returns (message_text, had_explicit_source).
-fn resolve_message(args: &SendArgs) -> Result<String, String> {
+/// Returns `(message_text, stripped_name_flag)` where `stripped_name_flag` is true
+/// if a trailing `--name <agent>` token was silently stripped from the message.
+fn resolve_message(
+    args: &SendArgs,
+    auto_sender_name: Option<&str>,
+) -> Result<(String, bool), String> {
     let has_separator = args.has_separator();
 
     // Mutual exclusivity
@@ -476,16 +480,26 @@ fn resolve_message(args: &SendArgs) -> Result<String, String> {
 
     // 1. -- separator
     if has_separator {
-        let text = args.message.join(" ");
+        let stripped = auto_sender_name.is_some_and(|name| {
+            args.message.len() >= 2
+                && args.message[args.message.len() - 2] == "--name"
+                && args.message.last().is_some_and(|value| value == name)
+        });
+        let message_tokens = if stripped {
+            &args.message[..args.message.len() - 2]
+        } else {
+            &args.message
+        };
+        let text = message_tokens.join(" ");
         if text.is_empty() {
             return Err("No message after --".to_string());
         }
-        return Ok(text);
+        return Ok((text, stripped));
     }
 
     // 2. --stdin
     if args.stdin {
-        return read_stdin();
+        return read_stdin().map(|s| (s, false));
     }
 
     // 3. --file
@@ -496,7 +510,7 @@ fn resolve_message(args: &SendArgs) -> Result<String, String> {
             std::env::current_dir().unwrap_or_default().join(path)
         };
         return match std::fs::read_to_string(&resolved) {
-            Ok(content) if !content.is_empty() => Ok(content),
+            Ok(content) if !content.is_empty() => Ok((content, false)),
             Ok(_) => Err(format!("File is empty: {path}")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(format!("File not found: {path}"))
@@ -516,12 +530,12 @@ fn resolve_message(args: &SendArgs) -> Result<String, String> {
         if s.is_empty() {
             return Err("Base64 decoded to empty string".to_string());
         }
-        return Ok(s);
+        return Ok((s, false));
     }
 
     // 5. Auto-pipe (stdin is a pipe, no explicit source)
     if !std::io::stdin().is_terminal() {
-        return read_stdin();
+        return read_stdin().map(|s| (s, false));
     }
 
     // No message source found
@@ -729,11 +743,18 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         };
 
     // ── Resolve message ──
-    let mut message = if let Some(msg) = compat_message {
-        msg
+    let (mut message, name_was_stripped) = if let Some(msg) = compat_message {
+        (msg, false)
     } else {
-        match resolve_message(args) {
-            Ok(m) => m,
+        let auto_sender_name = if from_name.is_none() && explicit_name.is_none() {
+            ctx.and_then(|c| c.identity.as_ref())
+                .filter(|id| matches!(id.kind, SenderKind::Instance))
+                .map(|id| id.name.as_str())
+        } else {
+            None
+        };
+        match resolve_message(args, auto_sender_name) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("Error: {e}");
                 return 1;
@@ -976,6 +997,18 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     } else {
         println!("{feedback}");
+    }
+
+    // ── Trailing --name hint ──
+    if name_was_stripped {
+        let sender_name = &sender_identity.name;
+        println!();
+        println!(
+            "[hcom] Note: '--name {sender_name}' was stripped from the end of your message body."
+        );
+        println!("  Correct syntax (--name goes BEFORE --):");
+        println!("    hcom send --name {sender_name} @target -- your message");
+        println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
     }
 
     // Adhoc unread delivery: for --name instances, show unread preview
@@ -1229,6 +1262,44 @@ mod tests {
             SendArgs::try_parse_from(["send", "@luna", "--", "--this", "is", "a", "message"])
                 .unwrap();
         assert_eq!(args.message, vec!["--this", "is", "a", "message"]);
+    }
+
+    #[test]
+    fn resolve_message_strips_redundant_trailing_auto_name_tokens() {
+        let mut args =
+            SendArgs::try_parse_from(["send", "@luna", "--", "message", "--name", "beru"]).unwrap();
+        args.had_separator = true;
+
+        assert_eq!(resolve_message(&args, Some("beru")).unwrap().0, "message");
+    }
+
+    #[test]
+    fn resolve_message_keeps_quoted_name_suffix_inside_one_argument() {
+        let mut args = SendArgs::try_parse_from([
+            "send",
+            "@luna",
+            "--",
+            "I always end commands with --name beru",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        assert_eq!(
+            resolve_message(&args, Some("beru")).unwrap().0,
+            "I always end commands with --name beru"
+        );
+    }
+
+    #[test]
+    fn resolve_message_keeps_trailing_name_for_different_sender() {
+        let mut args =
+            SendArgs::try_parse_from(["send", "@luna", "--", "message", "--name", "nova"]).unwrap();
+        args.had_separator = true;
+
+        assert_eq!(
+            resolve_message(&args, Some("beru")).unwrap().0,
+            "message --name nova"
+        );
     }
 
     #[test]

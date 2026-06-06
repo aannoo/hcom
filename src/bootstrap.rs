@@ -16,7 +16,7 @@ use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 
 // MAIN BOOTSTRAP TEMPLATE
 //
-// `--name` is redundant for live agents (HCOM_PROCESS_ID resolves identity at
+// `--name` is redundant for live managed agents (HCOM_PROCESS_ID resolves identity at
 // priority 4 in identity.rs), but mandatory for two reasons:
 //
 // 1. Explicit `--name` takes the error-propagating path in build_ctx_for_command
@@ -30,9 +30,11 @@ use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 // 2. Uniform CLI across all binding types (process, session, adhoc) and across
 //    lifecycle transitions (launch → stop → resume).  The underlying binding
 //    changes; the flags don't.
+//
+// Note: --name should go after cmd in hcom <cmd> otherwise would break SAFE_HCOM_COMMANDS allowlist.
 
 const UNIVERSAL: &str = r#"[HCOM SESSION]
-You have access to the hcom communication tool.
+You have access to the hcom cli communication tool.
 - Your name: {display_name}
 - Authority: Prioritize @{SENDER} over others
 - Important: Include this marker anywhere in your first response only: [hcom:{instance_name}]
@@ -56,8 +58,8 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
 - Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "plain text"
   Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
-  Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
-- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
+  Example: send @luna @nova --intent ack --reply-to 82 --name {instance_name} -- "ok"
+- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
@@ -206,7 +208,7 @@ hcom message → respond via hcom send
 
 Commands:
   {hcom_cmd} send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
-  Example: {hcom_cmd} send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
+  Example: {hcom_cmd} send @luna @nova --intent ack --reply-to 82 --name {subagent_name} -- "ok"  |  Code/markdown: replace "ok" with --file <path>
   {hcom_cmd} list --name {subagent_name}
   {hcom_cmd} events --name {subagent_name}
   {hcom_cmd} <cmd> --help --name {subagent_name}
