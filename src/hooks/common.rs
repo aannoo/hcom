@@ -1256,10 +1256,19 @@ fn stop_instance_inner(
     }
 }
 
-/// Soft session end for Antigravity: keep `instances` row for `hcom r` / @mention resume path.
+/// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
 ///
-/// Clears session/process bindings and logs a stopped life event with snapshot,
-/// but does not delete the instance row (PTY cleanup skips `delete_instance` when inactive).
+/// agy has no process-death hook — its hook set is only PreToolUse/PostToolUse/
+/// PreInvocation/PostInvocation/Stop. We synthesize "SessionEnd" from `Stop`, which
+/// fires when an *execution loop* terminates, NOT when the process dies: the agy
+/// editor stays alive and routinely runs more turns after a `Stop` (observed in the
+/// wild — instances soft-stopped here go straight back to listening/active). So the
+/// hook path must never hard-delete: doing so would strand a still-running agent.
+/// agy's real teardown is the PTY exit (`cleanup_antigravity_pty_exit`), which sees
+/// the inactive status and preserves the row for `hcom r`.
+///
+/// Clears session/process bindings and logs a stopped life event with snapshot, but
+/// does not delete the instance row.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,

@@ -641,9 +641,10 @@ fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
         return hook_noop();
     }
 
-    // agy always soft-finalizes: the instance row is the only resume handle for both
-    // launched and adhoc agy (hcom r reads it). Hard-deleting it would strand adhoc
-    // agy sessions that were bound via bind_pending_antigravity_instance.
+    // agy always soft-finalizes: this `Stop` is a loop-end signal on a *live* process
+    // (agy has no SessionEnd hook), so hard-deleting would strand a still-running agent
+    // that's about to take another turn. Real teardown is the PTY exit. Other gemini
+    // tools have a genuine SessionEnd == process death, so they hard-finalize.
     if is_agy {
         common::soft_finalize_session(db, &instance.name, &reason, None);
     } else {
