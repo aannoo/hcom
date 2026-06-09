@@ -95,7 +95,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let notifyServer: ReturnType<typeof Bun.listen> | null = null  // TCP notify server for instant message wake
   let lastReportedStatus: string | null = null  // Skip redundant status updates
   let pendingAckId: number | null = null        // Deferred ack: set by deliverPendingToIdle, acked by transform
-  let deliveryInFlight = false                  // Delivery guard flag: rejects concurrent callers (not a queuing mutex)
+  let deliveryInFlight = false                  // Delivery guard flag set before the first await
+  let deliveryPending = false                   // Wake arrived while delivery was already in flight
+  let deliveryRetryScheduled = false            // Avoid duplicate queued retry passes
   let permissionPending = false                  // Exact permission gate from OpenCode events
   let launchedAgent: string | null = parseCliArgValue("--agent")
   let launchedModel: PromptModel | null = parseCliModelArg()
@@ -142,18 +144,42 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     return `<hcom>[${messages.length} new messages] | ${parts.join(" | ")}</hcom>`
   }
 
+  function schedulePendingDelivery(sid: string, reason: string): void {
+    if (deliveryRetryScheduled) return
+    deliveryRetryScheduled = true
+    log("DEBUG", "plugin.delivery_retry_scheduled", instanceName, { reason })
+    queueMicrotask(() => {
+      deliveryRetryScheduled = false
+      if (!instanceName) return
+      void deliverPendingToIdle(sid)
+    })
+  }
+
+  // Re-arm a queued wake once nothing is mid-flight. The pendingAckId guard
+  // leaves the still-injecting case to the post-ack drain so we do not
+  // double-deliver the same unread message batch.
+  function drainPendingDelivery(sid: string, reason: string): void {
+    if (deliveryPending && pendingAckId === null) {
+      deliveryPending = false
+      schedulePendingDelivery(sid, reason)
+    }
+  }
+
   // Deliver pending messages via promptAsync. Ack is deferred to transform
   // (fires on the loop iteration that actually processes the user message).
   //
-  // Two-layer serialization:
+  // Three-layer serialization:
   //   deliveryInFlight — guard flag set synchronously before the first await.
   //     Closes the TOCTOU window where TCP notify and idle-status wake paths
   //     could both pass a null check before either one set the value.
-  //     Concurrent callers are rejected (not queued); they will retry on the
-  //     next wake event.
+  //     Concurrent callers set deliveryPending so their wake is replayed after
+  //     the current pass, or after the current injected message is acked.
   //   pendingAckId — set after messages are read, cleared by transform.
   //     Prevents re-delivery while a prior injection is still being processed.
   //     If promptAsync fails to queue, pendingAckId is cleared immediately.
+  //   deliveryPending — a wake that arrived while delivery was in-flight or an
+  //     injection was pending ack. drainPendingDelivery replays it at each exit
+  //     point: normal finally, deferred ack, and promptAsync rejection.
   async function deliverPendingToIdle(sid: string): Promise<boolean> {
     if (permissionPending) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "permission_pending" })
@@ -164,11 +190,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       return false
     }
     if (deliveryInFlight) {
-      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "delivery_in_flight" })
+      deliveryPending = true
+      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "delivery_in_flight", queued: true })
       return false
     }
     if (pendingAckId !== null) {
-      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "pending_ack_in_flight", pending_ack: pendingAckId })
+      deliveryPending = true
+      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "pending_ack_in_flight", pending_ack: pendingAckId, queued: true })
       return false
     }
     deliveryInFlight = true
@@ -221,6 +249,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
               error: String(e),
               pending_ack: maxId,
             })
+            drainPendingDelivery(sid, "prompt_async_failed_pending_wake")
           })
         }
       } catch (e) {
@@ -240,6 +269,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       return true
     } finally {
       deliveryInFlight = false
+      drainPendingDelivery(sid, "delivery_in_flight_wake")
     }
   }
 
@@ -450,6 +480,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             lastReportedStatus = null
             pendingAckId = null
             deliveryInFlight = false
+            deliveryPending = false
+            deliveryRetryScheduled = false
             permissionPending = false
             currentAgent = launchedAgent
             currentModel = launchedModel
@@ -563,6 +595,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           pendingAckId = null
           await $.nothrow()`hcom opencode-read --name ${instanceName} --ack --up-to ${String(ackId)}`.quiet()
           log("INFO", "plugin.deferred_ack", instanceName, { acked_to: ackId })
+          if (deliveryPending && sessionId) {
+            drainPendingDelivery(sessionId, "post_ack_pending_wake")
+          }
         }
       } catch (e) {
         log("ERROR", "plugin.transform_error", instanceName, { error: String(e) })
