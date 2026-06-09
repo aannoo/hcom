@@ -1008,7 +1008,17 @@ fn send_sub_notification(db: &HcomDb, caller: &str, message: &str) -> bool {
     };
 
     let text = format!("@{} {}", full_name, message);
-    send_system_message(db, "[hcom-events]", &text).is_ok()
+    let Ok(delivered_to) = send_system_message(db, "[hcom-events]", &text) else {
+        return false;
+    };
+    // send_system_message only logs the [hcom-events] row; unlike `hcom send`
+    // it does not ping notify endpoints, so the notification can sit unread
+    // until an unrelated wake. Wake only the matching caller here: this path
+    // runs inline from log_event, so avoid a broader wake_all fan-out.
+    if delivered_to.iter().any(|recipient| recipient == caller) {
+        crate::notify::wake(db, caller, &[]);
+    }
+    true
 }
 
 /// SHA-256 hex hash.
@@ -1024,7 +1034,10 @@ fn sha256_hash(input: &str) -> String {
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     fn setup_full_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1045,6 +1058,28 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    fn bind_probe() -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    }
+
+    fn await_connect(listener: &TcpListener, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok(_) => return true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
+        }
     }
 
     fn count_reqwatch_without_reply_notifications(db: &HcomDb, requester: &str) -> i64 {
@@ -1703,6 +1738,41 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.len(), 1);
         assert!(delivered.contains(&"luna".to_string()));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_send_sub_notification_wakes_target_instance() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tag, created_at) VALUES ('tofu', '', 1000.0), ('rune', '', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let tofu_probe = bind_probe();
+        let rune_probe = bind_probe();
+        db.upsert_notify_endpoint("tofu", "plugin", tofu_probe.local_addr().unwrap().port())
+            .unwrap();
+        db.upsert_notify_endpoint("rune", "plugin", rune_probe.local_addr().unwrap().port())
+            .unwrap();
+
+        assert!(send_sub_notification(
+            &db,
+            "tofu",
+            "[sub:test] #42 dani status | blocked | approval"
+        ));
+
+        assert!(
+            await_connect(&tofu_probe, Duration::from_millis(500)),
+            "subscription notification should wake the subscribed instance"
+        );
+        assert!(
+            !await_connect(&rune_probe, Duration::from_millis(100)),
+            "subscription notification should not broadcast-wake unrelated instances"
+        );
 
         cleanup_test_db(db_path);
     }
