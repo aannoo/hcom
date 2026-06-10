@@ -46,52 +46,29 @@ fn is_antigravity_installed() -> bool {
         })
 }
 
-// Hook-installation checks delegate to the `verify_*` functions in `hooks::*`
-// so `hcom status` and `hcom hooks status` never disagree.
+// Hook-installation checks delegate to the canonical tool adapter so status
+// stays aligned with `hcom hooks status` as integrations are added.
 
-fn check_claude_hooks() -> bool {
-    crate::hooks::claude::verify_claude_hooks_installed(None, false)
-}
-
-fn check_gemini_hooks() -> bool {
-    crate::hooks::gemini::verify_gemini_hooks_installed(false)
-}
-
-fn check_codex_hooks() -> bool {
-    crate::hooks::codex::verify_codex_hooks_installed(false)
-        && crate::hooks::codex::codex_current_feature_enabled()
-}
-
-fn check_opencode_hooks() -> bool {
-    crate::hooks::opencode::verify_opencode_plugin_installed()
-}
-
-fn check_kilo_hooks() -> bool {
-    crate::hooks::opencode::verify_kilo_plugin_installed()
-}
-
-fn check_pi_hooks() -> bool {
-    crate::hooks::pi::verify_pi_plugin_installed()
-}
-
-fn check_antigravity_hooks() -> bool {
-    crate::hooks::antigravity::verify_antigravity_hooks_installed(false)
-}
-
-fn check_cursor_hooks() -> bool {
-    crate::hooks::cursor::verify_cursor_hooks_installed(false)
-}
-
-fn check_copilot_hooks() -> bool {
-    crate::hooks::copilot::verify_copilot_hooks_installed(false)
+fn is_tool_installed(tool: crate::tool::Tool) -> bool {
+    match tool {
+        crate::tool::Tool::Antigravity => is_antigravity_installed(),
+        crate::tool::Tool::Kilo => crate::terminal::which_bin("kilo").is_some(),
+        crate::tool::Tool::Pi => crate::terminal::which_bin("pi").is_some(),
+        crate::tool::Tool::Cursor => crate::terminal::which_bin("cursor-agent").is_some(),
+        crate::tool::Tool::Copilot => crate::terminal::which_bin("copilot").is_some(),
+        crate::tool::Tool::Adhoc => false,
+        _ => is_in_path(tool.spec().cli_binary),
+    }
 }
 
 // ── Status Collection ────────────────────────────────────────────────────
 
 struct ToolStatus {
+    key: &'static str,
     name: &'static str,
     installed: bool,
     hooks: bool,
+    settings_path: String,
 }
 
 impl ToolStatus {
@@ -107,53 +84,31 @@ impl ToolStatus {
 }
 
 fn get_tool_statuses() -> Vec<ToolStatus> {
-    vec![
-        ToolStatus {
-            name: "Claude",
-            installed: is_in_path("claude"),
-            hooks: check_claude_hooks(),
-        },
-        ToolStatus {
-            name: "Gemini",
-            installed: is_in_path("gemini"),
-            hooks: check_gemini_hooks(),
-        },
-        ToolStatus {
-            name: "Codex",
-            installed: is_in_path("codex"),
-            hooks: check_codex_hooks(),
-        },
-        ToolStatus {
-            name: "OpenCode",
-            installed: is_in_path("opencode"),
-            hooks: check_opencode_hooks(),
-        },
-        ToolStatus {
-            name: "Kilo Code",
-            installed: crate::terminal::which_bin("kilo").is_some(),
-            hooks: check_kilo_hooks(),
-        },
-        ToolStatus {
-            name: "Pi",
-            installed: crate::terminal::which_bin("pi").is_some(),
-            hooks: check_pi_hooks(),
-        },
-        ToolStatus {
-            name: "Antigravity",
-            installed: is_antigravity_installed(),
-            hooks: check_antigravity_hooks(),
-        },
-        ToolStatus {
-            name: "Cursor",
-            installed: crate::terminal::which_bin("cursor-agent").is_some(),
-            hooks: check_cursor_hooks(),
-        },
-        ToolStatus {
-            name: "Copilot",
-            installed: crate::terminal::which_bin("copilot").is_some(),
-            hooks: check_copilot_hooks(),
-        },
-    ]
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| ToolStatus {
+            key: spec.name,
+            name: spec.label,
+            installed: is_tool_installed(spec.tool),
+            hooks: spec.tool.verify_hooks_installed(false),
+            settings_path: spec.tool.hooks_settings_path(),
+        })
+        .collect()
+}
+
+fn tool_statuses_json(tools: &[ToolStatus]) -> serde_json::Value {
+    let entries = tools.iter().map(|tool| {
+        let mut status = serde_json::Map::from_iter([
+            ("installed".to_string(), json!(tool.installed)),
+            ("hooks".to_string(), json!(tool.hooks)),
+        ]);
+        if !tool.settings_path.is_empty() {
+            status.insert("settings_path".to_string(), json!(tool.settings_path));
+        }
+        (tool.key.to_string(), serde_json::Value::Object(status))
+    });
+    serde_json::Value::Object(entries.collect())
 }
 
 struct AgentCounts {
@@ -256,13 +211,6 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     let hcom_dir_override = std::env::var("HCOM_DIR").is_ok();
     let project_root = crate::paths::get_project_root();
 
-    // Settings paths
-    let claude_settings_path = crate::hooks::claude::get_claude_settings_path();
-    let gemini_settings_path = crate::hooks::gemini::get_gemini_settings_path();
-    let codex_config_path = crate::hooks::codex::get_codex_config_path();
-    let antigravity_hooks_path = crate::hooks::antigravity::get_antigravity_hooks_path();
-    let cursor_hooks_path = crate::hooks::cursor::get_cursor_hooks_path();
-
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
         // Call get_update_info once to avoid inconsistent state (it has side effects)
@@ -281,49 +229,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             "project_root": project_root.to_string_lossy(),
             "config_valid": config_valid,
             "config_errors": config_errors,
-            "tools": {
-                "claude": {
-                    "installed": tools[0].installed,
-                    "hooks": tools[0].hooks,
-                    "settings_path": claude_settings_path.to_string_lossy(),
-                },
-                "gemini": {
-                    "installed": tools[1].installed,
-                    "hooks": tools[1].hooks,
-                    "settings_path": gemini_settings_path.to_string_lossy(),
-                },
-                "codex": {
-                    "installed": tools[2].installed,
-                    "hooks": tools[2].hooks,
-                    "settings_path": codex_config_path.to_string_lossy(),
-                },
-                "opencode": {
-                    "installed": tools[3].installed,
-                    "hooks": tools[3].hooks,
-                },
-                "kilo": {
-                    "installed": tools[4].installed,
-                    "hooks": tools[4].hooks,
-                },
-                "pi": {
-                    "installed": tools[5].installed,
-                    "hooks": tools[5].hooks,
-                },
-                "antigravity": {
-                    "installed": tools[6].installed,
-                    "hooks": tools[6].hooks,
-                    "settings_path": antigravity_hooks_path.to_string_lossy(),
-                },
-                "cursor": {
-                    "installed": tools[7].installed,
-                    "hooks": tools[7].hooks,
-                    "settings_path": cursor_hooks_path.to_string_lossy(),
-                },
-                "copilot": {
-                    "installed": tools[8].installed,
-                    "hooks": tools[8].hooks,
-                },
-            },
+            "tools": tool_statuses_json(&tools),
             "terminal": {
                 "config": terminal_config,
                 "available": terminal_available,
@@ -600,23 +506,29 @@ mod tests {
     #[test]
     fn test_tool_symbol() {
         let t = ToolStatus {
+            key: "claude",
             name: "Claude",
             installed: true,
             hooks: true,
+            settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "✓");
 
         let t = ToolStatus {
+            key: "claude",
             name: "Claude",
             installed: true,
             hooks: false,
+            settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "~");
 
         let t = ToolStatus {
+            key: "claude",
             name: "Claude",
             installed: false,
             hooks: false,
+            settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "✗");
     }
@@ -638,9 +550,41 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_statuses_include_antigravity() {
+    fn test_tool_statuses_cover_released_specs_including_kimi() {
         let tools = get_tool_statuses();
-        assert!(tools.iter().any(|t| t.name == "Antigravity"));
+        let keys: Vec<_> = tools.iter().map(|tool| tool.key).collect();
+        let expected: Vec<_> = crate::integration_spec::ALL
+            .iter()
+            .filter(|spec| spec.released)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(keys, expected);
+        assert!(keys.contains(&"kimi"));
+    }
+
+    #[test]
+    fn test_tool_status_json_is_keyed_by_canonical_name() {
+        let tools = vec![
+            ToolStatus {
+                key: "kimi",
+                name: "Kimi",
+                installed: true,
+                hooks: false,
+                settings_path: "/tmp/kimi.json".to_string(),
+            },
+            ToolStatus {
+                key: "claude",
+                name: "Claude",
+                installed: false,
+                hooks: false,
+                settings_path: String::new(),
+            },
+        ];
+        let value = tool_statuses_json(&tools);
+        assert_eq!(value["kimi"]["installed"], true);
+        assert_eq!(value["kimi"]["settings_path"], "/tmp/kimi.json");
+        assert_eq!(value["claude"]["installed"], false);
+        assert!(value.get("0").is_none());
     }
 
     #[test]

@@ -869,8 +869,33 @@ pub const COMMAND_NAMES: &[&str] = &[
     "copilot",
 ];
 
+fn resumable_tool_names() -> String {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released && spec.resume.is_some())
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn forkable_tool_names() -> String {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| {
+            spec.released
+                && spec
+                    .resume
+                    .as_ref()
+                    .is_some_and(|resume| resume.fork.is_some())
+        })
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Get the top-level help text as a String.
 pub fn get_help_text() -> String {
+    let forkable = forkable_tool_names();
     format!(
         "hcom (hook-comms) v{} - multi-agent communication\n\
 \n\
@@ -881,7 +906,7 @@ Usage:\n\
 Launch:\n\
   hcom [N] claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/kimi)\n\
+  hcom f <name>                         Fork agent session ({forkable})\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
@@ -963,21 +988,33 @@ pub fn get_command_help(name: &str) -> String {
 
     // Resume / Fork shortcuts — share the target/flag body, differ only on header + see-also.
     if name == "r" || name == "resume" {
+        let see_also = format!(
+            "hcom f <target>                   Fork an agent session ({})",
+            forkable_tool_names()
+        );
         return resume_fork_help(
             "hcom r <target> [tool-args...]    Resume a stopped agent",
             "Adopting by UUID or thread-name reclaims the original hcom\n\
              identity if one existed; otherwise a new identity is assigned.\n\
              CWD is recovered from the session's transcript/DB.",
-            "hcom f <target>                   Fork an agent session (claude/codex/opencode/kilo/pi)",
+            &see_also,
         );
     }
     if name == "f" || name == "fork" {
+        let blurb = format!(
+            "Creates a new agent that continues from the forked session.\n\
+             Supported tools: {}.\n\
+             Remote fork (`:<device>`) requires --dir to pin the target cwd.",
+            forkable_tool_names().replace('/', ", ")
+        );
+        let see_also = format!(
+            "hcom r <target>                   Resume a stopped agent ({})",
+            resumable_tool_names()
+        );
         return resume_fork_help(
             "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
-            "Creates a new agent that continues from the forked session.\n\
-             Supported tools: claude, codex, opencode, kilo, pi. (gemini/kimi do not fork.)\n\
-             Remote fork (`:<device>`) requires --dir to pin the target cwd.",
-            "hcom r <target>                   Resume a stopped agent",
+            &blurb,
+            &see_also,
         );
     }
 
@@ -1172,7 +1209,9 @@ mod tests {
             help.contains("claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot")
         );
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/kimi)"
+            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi)"
         ));
+        assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/kimi)"));
+        assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi");
     }
 }

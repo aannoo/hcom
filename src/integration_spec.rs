@@ -91,6 +91,8 @@ pub enum BackgroundMode {
 /// How `--hcom-prompt` becomes tool-side CLI args.
 #[derive(Debug, Clone, Copy)]
 pub enum InitialPromptShape {
+    /// The tool cannot accept an interactive initial prompt at launch.
+    Unsupported { reason: &'static str },
     /// `claude` — `--` then positional.
     DashDashPositional,
     /// `gemini`, `codex` — bare positional (interactive).
@@ -776,11 +778,9 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         // Kimi's data root (config + sessions + credentials) is overridden via
         // KIMI_CODE_HOME; it does not honor a separate config-dir variable.
         config_dir_env: Some("KIMI_CODE_HOME"),
-        // Kimi has no CLI flag for an interactive initial prompt (`-p/--prompt`
-        // is non-interactive print-and-exit, and a bare positional errors with
-        // "too many arguments"). Launches carrying an initial prompt fast-fail
-        // in the launcher rather than passing a broken arg.
-        initial_prompt: InitialPromptShape::Positional,
+        initial_prompt: InitialPromptShape::Unsupported {
+            reason: "kimi does not support an initial prompt at launch. Launch `hcom kimi` without a prompt, then send the task with `hcom send @<name> -- \"…\"`.",
+        },
         uses_pty_default: true,
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
@@ -1018,6 +1018,14 @@ pub fn released_background_tool_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn kimi_initial_prompt_is_explicitly_unsupported() {
+        assert!(matches!(
+            KIMI.launch.initial_prompt,
+            InitialPromptShape::Unsupported { .. }
+        ));
+    }
 
     #[test]
     fn every_tool_variant_has_a_spec() {

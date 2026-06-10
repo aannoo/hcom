@@ -46,15 +46,40 @@ fn load_preview_state(db: &HcomDb) -> ResetPreviewState {
     }
 }
 
+fn hook_tool_specs() -> impl Iterator<Item = &'static crate::integration_spec::IntegrationSpec> {
+    crate::integration_spec::ALL
+        .iter()
+        .copied()
+        .filter(|spec| spec.released && !spec.hooks.names.is_empty())
+}
+
+fn hook_preview_lines() -> String {
+    hook_tool_specs()
+        .map(|spec| {
+            format!(
+                "  \u{2022} Remove hooks from {} ({})",
+                spec.label,
+                spec.tool.hooks_settings_path()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn hook_tool_labels(separator: &str) -> String {
+    hook_tool_specs()
+        .map(|spec| spec.label)
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn render_hooks_preview() -> String {
     let hcom_cmd = "hcom";
+    let actions = hook_preview_lines();
     format!(
         "\n== RESET HOOKS PREVIEW ==\n\
          This will remove hcom hooks from tool configs.\n\n\
-         Actions:\n  \
-         \u{2022} Remove hooks from Claude Code settings (~/.claude/settings.json)\n  \
-         \u{2022} Remove hooks from Gemini CLI settings (~/.gemini/settings.json)\n  \
-         \u{2022} Remove hooks from Codex config (~/.codex/)\n\n\
+         Actions:\n{actions}\n\n\
          To reinstall: hcom hooks add\n\n\
          Add --go flag and run again to proceed:\n  \
          {hcom_cmd} --go reset hooks\n"
@@ -73,7 +98,7 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
          1. Stop all {instance_count} local instances (kills processes, logs snapshots)\n  \
          2. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
          3. Delete database (hcom.db)\n  \
-         4. Remove hooks from Claude/Gemini/Codex/OpenCode/Kilo/Pi/Antigravity/Cursor/Copilot configs\n  \
+         4. Remove hooks from {hook_labels} configs\n  \
          5. Archive and delete config.toml + env\n  \
          6. Clear device identity (new UUID on next relay)\n\n\
          Add --go flag and run again to proceed:\n  \
@@ -82,6 +107,7 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
         plural = state.plural,
         names_display = state.names_display,
         event_count = state.event_count,
+        hook_labels = hook_tool_labels("/"),
     )
 }
 
@@ -118,4 +144,23 @@ pub(crate) fn print_reset_preview(target: Option<ResetTarget>, db: &HcomDb) {
         _ => render_reset_preview(&state),
     };
     println!("{preview}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_previews_cover_all_released_hook_tools() {
+        let labels = hook_tool_labels("/");
+        assert!(labels.contains("Kimi"));
+        for spec in hook_tool_specs() {
+            assert!(labels.split('/').any(|label| label == spec.label));
+        }
+
+        let preview = render_hooks_preview();
+        for spec in hook_tool_specs() {
+            assert!(preview.contains(spec.label));
+        }
+    }
 }

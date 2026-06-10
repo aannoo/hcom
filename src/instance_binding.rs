@@ -911,19 +911,13 @@ pub fn resolve_instance_from_binding(
 
 /// Auto-subscribe instance to default event subscriptions from config.
 /// Called during instance creation.
+fn auto_subscribe_eligible(tool: &str) -> bool {
+    tool.parse::<crate::tool::Tool>()
+        .is_ok_and(|tool| tool.spec().released)
+}
+
 fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
-    if !matches!(
-        tool,
-        "claude"
-            | "gemini"
-            | "codex"
-            | "opencode"
-            | "kilo"
-            | "antigravity"
-            | "cursor"
-            | "kimi"
-            | "copilot"
-    ) {
+    if !auto_subscribe_eligible(tool) {
         return;
     }
 
@@ -1024,6 +1018,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn auto_subscribe_eligibility_follows_released_specs() {
+        assert!(auto_subscribe_eligible("pi"));
+        assert!(auto_subscribe_eligible("kimi"));
+        assert!(!auto_subscribe_eligible("adhoc"));
+        assert!(!auto_subscribe_eligible("unknown"));
     }
 
     #[test]

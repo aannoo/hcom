@@ -1166,6 +1166,41 @@ pub(crate) fn inject_workspace_trust_args(
     }
 }
 
+fn validate_launch_count(tool: &LaunchTool, count: usize) -> Result<()> {
+    if count == 0 {
+        bail!("Count must be positive");
+    }
+    let max = tool.spec().launch.max_launch_count;
+    if count > max {
+        bail!(
+            "Too many {} instances requested (max {})",
+            tool.as_str(),
+            max
+        );
+    }
+    Ok(())
+}
+
+fn append_initial_prompt_args(
+    tool: &LaunchTool,
+    args: &mut Vec<String>,
+    prompt: String,
+) -> Result<()> {
+    match tool.spec().launch.initial_prompt {
+        crate::integration_spec::InitialPromptShape::Unsupported { reason } => bail!("{reason}"),
+        crate::integration_spec::InitialPromptShape::DashDashPositional => {
+            args.push("--".to_string());
+            args.push(prompt);
+        }
+        crate::integration_spec::InitialPromptShape::Positional => args.push(prompt),
+        crate::integration_spec::InitialPromptShape::Flag(flag) => {
+            args.push(flag.to_string());
+            args.push(prompt);
+        }
+    }
+    Ok(())
+}
+
 /// Launch one or more AI tool instances with consistent tracking.
 ///
 /// This is the unified entry point for launching Claude, Gemini, Codex,
@@ -1202,15 +1237,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     let backend = LaunchBackend::resolve(&normalized, params.background);
 
     // Validation
-    if params.count == 0 {
-        bail!("Count must be positive");
-    }
-    if params.count > 100 {
-        bail!(
-            "Too many {} instances requested (max 100)",
-            normalized.as_str()
-        );
-    }
+    validate_launch_count(&normalized, params.count)?;
 
     // HCOM_DIR placement: refuse if it sits under a tool-protected metadata
     // directory. codex hard-denies apply_patch into these via
@@ -1373,17 +1400,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // When a real hcom participant launched us, append a reply instruction so
     // the spawned agent knows to send its result back.
     if let Some(ref prompt) = params.initial_prompt {
-        // Kimi has no way to accept an initial prompt at launch: `-p/--prompt` is
-        // a non-interactive print-and-exit mode, and a bare positional errors
-        // ("too many arguments"). Fail clearly instead of launching a broken
-        // command — the task can be sent as a message once the agent is up.
-        if normalized.spec().tool == crate::tool::Tool::Kimi {
-            anyhow::bail!(
-                "kimi does not support an initial prompt at launch. \
-                 Launch `hcom kimi` without a prompt, then send the task with \
-                 `hcom send @<name> -- \"…\"`."
-            );
-        }
         let reply_suffix =
             if params.append_reply_handoff && launcher_name != "api" && launcher_name != "user" {
                 format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")
@@ -1391,20 +1407,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 String::new()
             };
         let full_prompt = format!("{prompt}{reply_suffix}");
-        // Per-tool shape lives in the integration spec.
-        match normalized.spec().launch.initial_prompt {
-            crate::integration_spec::InitialPromptShape::DashDashPositional => {
-                params.args.push("--".to_string());
-                params.args.push(full_prompt);
-            }
-            crate::integration_spec::InitialPromptShape::Positional => {
-                params.args.push(full_prompt);
-            }
-            crate::integration_spec::InitialPromptShape::Flag(flag) => {
-                params.args.push(flag.to_string());
-                params.args.push(full_prompt);
-            }
-        }
+        append_initial_prompt_args(&normalized, &mut params.args, full_prompt)?;
     }
     let batch_id = params
         .batch_id
@@ -2119,6 +2122,32 @@ mod tests {
             LaunchTool::Copilot
         );
         assert!(LaunchTool::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn launch_count_uses_per_tool_spec_limit() {
+        assert!(validate_launch_count(&LaunchTool::Kimi, 10).is_ok());
+        let err = validate_launch_count(&LaunchTool::Kimi, 11).unwrap_err();
+        assert!(err.to_string().contains("max 10"));
+
+        assert!(validate_launch_count(&LaunchTool::Claude, 100).is_ok());
+        let err = validate_launch_count(&LaunchTool::Claude, 101).unwrap_err();
+        assert!(err.to_string().contains("max 100"));
+    }
+
+    #[test]
+    fn unsupported_initial_prompt_is_spec_driven() {
+        let mut args = Vec::new();
+        let err =
+            append_initial_prompt_args(&LaunchTool::Kimi, &mut args, "task".into()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("kimi does not support an initial prompt")
+        );
+        assert!(args.is_empty());
+
+        append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "task".into()).unwrap();
+        assert_eq!(args, vec!["task"]);
     }
 
     #[test]
