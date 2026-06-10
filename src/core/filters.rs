@@ -38,21 +38,29 @@ const MESSAGE_FLAGS: &[&str] = &["from", "mention", "intent", "thread", "reply_t
 const LIFE_FLAGS: &[&str] = &["action"];
 
 /// File-write tool contexts for SQL filters.
-pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit')";
+pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create')";
 
 /// All file operation contexts.
 pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:Write",
     "tool:Edit",
+    "tool:NotebookEdit",
     "tool:Read",
     "tool:write_file",
     "tool:replace",
     "tool:read_file",
     "tool:apply_patch",
+    "tool:write",
+    "tool:edit",
+    "tool:write_to_file",
+    "tool:replace_file_content",
+    "tool:multi_replace_file_content",
+    "tool:StrReplace",
+    "tool:create",
 ];
 
 /// Shell tool contexts.
-pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell')";
+pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell')";
 
 /// Parsed filter values — multiple values per key (OR semantics).
 pub type FilterMap = HashMap<String, Vec<String>>;
@@ -401,9 +409,12 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
     if filters.contains_key("collision") {
         let collision_sql = format!(
             "(type = 'status' AND status_context IN {ctx}\n\
+             AND events_v.status_detail IS NOT NULL\n\
+             AND events_v.status_detail != ''\n\
              AND EXISTS (\n\
              \x20   SELECT 1 FROM events_v e\n\
              \x20   WHERE e.type = 'status' AND e.status_context IN {ctx}\n\
+             \x20   AND e.status_detail IS NOT NULL AND e.status_detail != ''\n\
              \x20   AND e.status_detail = events_v.status_detail\n\
              \x20   AND e.instance != events_v.instance\n\
              \x20   AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30\n\
@@ -718,6 +729,98 @@ mod tests {
         let sql = build_sql_from_flags(&filters).unwrap();
         assert!(sql.contains("EXISTS"));
         assert!(sql.contains("ABS(strftime"));
+    }
+
+    fn sql_context_list_contains(list: &str, operation: &str) -> bool {
+        list.contains(&format!("'tool:{operation}'"))
+    }
+
+    #[test]
+    fn test_activity_contexts_cover_integration_specs() {
+        for spec in crate::integration_spec::ALL {
+            for operation in spec.status_detail.file {
+                let context = format!("tool:{operation}");
+                assert!(
+                    sql_context_list_contains(FILE_WRITE_CONTEXTS, operation),
+                    "missing file-write context {context} for {}",
+                    spec.name
+                );
+                assert!(
+                    FILE_OP_CONTEXTS.contains(&context.as_str()),
+                    "missing file-op context {context} for {}",
+                    spec.name
+                );
+            }
+            for operation in spec.status_detail.bash {
+                assert!(
+                    sql_context_list_contains(SHELL_TOOL_CONTEXTS, operation),
+                    "missing shell context tool:{operation} for {}",
+                    spec.name
+                );
+            }
+        }
+
+        assert!(sql_context_list_contains(
+            FILE_WRITE_CONTEXTS,
+            "NotebookEdit"
+        ));
+        assert!(FILE_OP_CONTEXTS.contains(&"tool:NotebookEdit"));
+    }
+
+    #[test]
+    fn test_collision_filter_matches_real_writes_and_rejects_empty_details() {
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
+        db.init_db().unwrap();
+
+        let insert = |instance: &str, timestamp: &str, context: &str, detail: Option<&str>| {
+            let data = serde_json::json!({
+                "status": "active",
+                "context": context,
+                "detail": detail,
+            });
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'status', ?2, ?3)",
+                    rusqlite::params![timestamp, instance, data.to_string()],
+                )
+                .unwrap();
+        };
+
+        insert(
+            "luna",
+            "2026-06-07T12:00:00Z",
+            "tool:StrReplace",
+            Some("src/main.rs"),
+        );
+        insert(
+            "nova",
+            "2026-06-07T12:00:10Z",
+            "tool:create",
+            Some("src/main.rs"),
+        );
+        insert(
+            "solo",
+            "2026-06-07T12:00:15Z",
+            "tool:write_to_file",
+            Some("src/solo.rs"),
+        );
+        insert("empty-a", "2026-06-07T12:00:20Z", "tool:Write", Some(""));
+        insert("empty-b", "2026-06-07T12:00:21Z", "tool:Edit", Some(""));
+        insert("null-a", "2026-06-07T12:00:22Z", "tool:Write", None);
+        insert("null-b", "2026-06-07T12:00:23Z", "tool:Edit", None);
+
+        let mut filters = FilterMap::new();
+        filters.insert("collision".into(), vec!["true".into()]);
+        let where_sql = build_sql_from_flags(&filters).unwrap();
+        let query = format!("SELECT instance FROM events_v WHERE {where_sql} ORDER BY instance");
+        let mut stmt = db.conn().prepare(&query).unwrap();
+        let matches: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(matches, vec!["luna".to_string(), "nova".to_string()]);
     }
 
     #[test]

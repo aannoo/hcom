@@ -467,8 +467,7 @@ fn native_termux_prefix() -> bool {
 }
 
 fn proc_self_root_is_root() -> bool {
-    fs::read_link("/proc/self/root")
-        .is_ok_and(|root| root == Path::new("/"))
+    fs::read_link("/proc/self/root").is_ok_and(|root| root == Path::new("/"))
 }
 
 fn is_native_termux_runtime_from(

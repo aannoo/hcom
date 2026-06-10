@@ -26,11 +26,13 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
             .unwrap_or("")
             .to_string();
     }
-    if detail.file.contains(&tool_name) {
+    let is_notebook_edit = tool_enum == Tool::Claude && tool_name == "NotebookEdit";
+    if detail.file.contains(&tool_name) || is_notebook_edit {
         return tool_input
             .get("file_path")
+            .or_else(|| tool_input.get("notebook_path")) // claude NotebookEdit
             .or_else(|| tool_input.get("TargetFile")) // antigravity
-            .or_else(|| tool_input.get("path")) // cursor (Write/StrReplace)
+            .or_else(|| tool_input.get("path")) // cursor/copilot
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -189,6 +191,55 @@ mod tests {
             extract_tool_detail("gemini", "write_file", &input),
             "/src/main.rs"
         );
+    }
+
+    #[test]
+    fn test_extract_tool_detail_notebook_edit() {
+        let input = serde_json::json!({"notebook_path": "/src/analysis.ipynb"});
+        assert_eq!(
+            extract_tool_detail("claude", "NotebookEdit", &input),
+            "/src/analysis.ipynb"
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_detail_covers_all_registered_operations() {
+        let input = serde_json::json!({
+            "command": "echo ok",
+            "CommandLine": "echo ok",
+            "file_path": "/src/main.rs",
+            "TargetFile": "/src/main.rs",
+            "path": "/src/main.rs",
+            "prompt": "delegate",
+            "task": "delegate",
+        });
+
+        for spec in crate::integration_spec::ALL {
+            for operation in spec.status_detail.bash {
+                assert!(
+                    !extract_tool_detail(spec.name, operation, &input).is_empty(),
+                    "shell detail extraction missing for {} tool:{}",
+                    spec.name,
+                    operation
+                );
+            }
+            for operation in spec.status_detail.file {
+                assert!(
+                    !extract_tool_detail(spec.name, operation, &input).is_empty(),
+                    "file detail extraction missing for {} tool:{}",
+                    spec.name,
+                    operation
+                );
+            }
+            for operation in spec.status_detail.delegate {
+                assert!(
+                    !extract_tool_detail(spec.name, operation, &input).is_empty(),
+                    "delegate detail extraction missing for {} tool:{}",
+                    spec.name,
+                    operation
+                );
+            }
+        }
     }
 
     #[test]
