@@ -1693,10 +1693,8 @@ pub fn run_delivery_loop(
                             let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
-                            let ownership = prompt_ownership(
-                                screen.input_text.as_deref(),
-                                &injected_text,
-                            );
+                            let ownership =
+                                prompt_ownership(screen.input_text.as_deref(), &injected_text);
                             drop(screen);
 
                             if ownership != PromptOwnership::Exclusive {
@@ -1832,10 +1830,7 @@ pub fn run_delivery_loop(
                                 log_info(
                                     "native",
                                     "delivery.enter_retry_blocked",
-                                    &format!(
-                                        "Enter retry blocked (user_active={})",
-                                        user_active
-                                    ),
+                                    &format!("Enter retry blocked (user_active={})", user_active),
                                 );
                             }
                             continue;

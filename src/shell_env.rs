@@ -90,28 +90,23 @@ struct ShellOutput {
 }
 
 fn timed_shell_output(shell: &Path, cmd: &str, marker: &str) -> Option<ShellOutput> {
-    let mut child = Command::new(shell)
-        .arg("-lic")
-        .arg(cmd)
-        .env_clear()
-        .envs(clean_shell_seed_env(shell))
-        .env(MARKER_VAR, marker)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+    timed_shell_output_with_timeout(shell, cmd, marker, SHELL_TIMEOUT)
+}
 
+fn timed_shell_output_with_timeout(
+    shell: &Path,
+    cmd: &str,
+    marker: &str,
+    timeout: Duration,
+) -> Option<ShellOutput> {
+    let mut child = shell_command(shell, cmd, marker).spawn().ok()?;
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
                 if let Some(mut out) = child.stdout.take() {
                     let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_end(&mut stderr);
                 }
                 if !status.success() {
                     return None;
@@ -119,20 +114,65 @@ fn timed_shell_output(shell: &Path, cmd: &str, marker: &str) -> Option<ShellOutp
                 return Some(ShellOutput { stdout });
             }
             Ok(None) => {
-                if start.elapsed() >= SHELL_TIMEOUT {
-                    let _ = child.kill();
+                if start.elapsed() >= timeout {
+                    kill_shell_process_group(&mut child);
                     let _ = child.wait();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(_) => {
-                let _ = child.kill();
+                kill_shell_process_group(&mut child);
                 let _ = child.wait();
                 return None;
             }
         }
     }
+}
+
+fn shell_command(shell: &Path, cmd: &str, marker: &str) -> Command {
+    let mut command = Command::new(shell);
+    command
+        .arg("-lic")
+        .arg(cmd)
+        .env_clear()
+        .envs(clean_shell_seed_env(shell))
+        .env(MARKER_VAR, marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    command
+}
+
+fn kill_shell_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let Ok(raw_pid) = i32::try_from(child.id()) else {
+            let _ = child.kill();
+            return;
+        };
+        if killpg(Pid::from_raw(raw_pid), Signal::SIGKILL).is_ok() {
+            return;
+        }
+    }
+
+    let _ = child.kill();
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +375,118 @@ mod tests {
 
         let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_shell_starts_in_a_new_session() {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::{Pid, getsid};
+
+        let shell = test_shell_path();
+        let mut command = shell_command(&shell, "sleep 30", "setsid-test");
+        command.stdout(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let child_pid = Pid::from_raw(child.id() as i32);
+
+        let current_session = getsid(None).unwrap();
+        let child_session = getsid(Some(child_pid)).unwrap();
+
+        let _ = killpg(child_pid, Signal::SIGKILL);
+        let _ = child.wait();
+
+        assert_eq!(child_session, child_pid);
+        assert_ne!(child_session, current_session);
+    }
+
+    #[test]
+    fn resolver_discards_stderr_without_breaking_env_resolution() {
+        let shell = test_shell_path();
+        let marker = "hcom-shell-env-stderr-test";
+        let cmd = format!(
+            "i=0; while [ \"$i\" -lt 8192 ]; do \
+             printf 'verbose resolver diagnostic\n' >&2; i=$((i + 1)); done; \
+             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
+        );
+
+        let output =
+            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(5)).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        let expected_shell = shell.to_string_lossy();
+        assert_eq!(
+            env.get("SHELL").map(String::as_str),
+            Some(expected_shell.as_ref())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_shell_process_group() {
+        let shell = test_shell_path();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("resolver-pids");
+        let pid_file_str = pid_file.to_string_lossy();
+        let pid_file_arg = shell_words::quote(pid_file_str.as_ref());
+        // The killed scope is the shell's process group. An interactive login
+        // shell may give `&` jobs their own group (job control), so descendant
+        // cleanup is best-effort and not asserted here.
+        let cmd = format!("printf '%s' \"$$\" > {pid_file_arg}; sleep 30");
+
+        let output = timed_shell_output_with_timeout(
+            &shell,
+            &cmd,
+            "process-group-test",
+            Duration::from_millis(500),
+        );
+
+        assert!(output.is_none());
+        let pids = fs::read_to_string(pid_file).unwrap();
+        let shell_pid = pids.trim().parse::<i32>().unwrap();
+
+        assert!(wait_for_process_exit(shell_pid));
+    }
+
+    fn test_shell_path() -> PathBuf {
+        ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.exists())
+            .or_else(shell_path)
+            .expect("a POSIX-compatible shell is required for this test")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32) -> bool {
+        for _ in 0..100 {
+            if process_has_exited(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn process_has_exited(pid: i32) -> bool {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        if matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH)) {
+            return true;
+        }
+
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            return stat
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.chars().next())
+                == Some('Z');
+        }
+
+        false
     }
 
     #[test]
