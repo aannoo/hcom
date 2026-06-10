@@ -971,7 +971,53 @@ pub(crate) fn inject_enter(port: u16) -> bool {
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Timeout for phase 1 (text render verification).
-const PHASE1_TIMEOUT: Duration = Duration::from_secs(2);
+const PHASE1_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Classify the prompt text relative to the text injected by this delivery attempt.
+///
+/// Only an exact match grants submit authority. A substring match is deliberately
+/// classified as mixed because pressing Enter would also submit unrelated text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptOwnership {
+    Exclusive,
+    Mixed,
+    Other,
+}
+
+fn prompt_ownership(input_text: Option<&str>, injected_text: &str) -> PromptOwnership {
+    match input_text {
+        Some(input) if !injected_text.is_empty() && input == injected_text => {
+            PromptOwnership::Exclusive
+        }
+        Some(input) if !injected_text.is_empty() && input.contains(injected_text) => {
+            PromptOwnership::Mixed
+        }
+        _ => PromptOwnership::Other,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase1Decision {
+    Rendered,
+    MixedPrompt,
+    Waiting,
+    TimedOut,
+}
+
+/// Decide phase-1 state from one screen snapshot. Ownership checks intentionally
+/// precede the deadline so a complete render observed at the boundary succeeds.
+fn phase1_decision(
+    input_text: Option<&str>,
+    injected_text: &str,
+    elapsed: Duration,
+) -> Phase1Decision {
+    match prompt_ownership(input_text, injected_text) {
+        PromptOwnership::Exclusive => Phase1Decision::Rendered,
+        PromptOwnership::Mixed => Phase1Decision::MixedPrompt,
+        PromptOwnership::Other if elapsed > PHASE1_TIMEOUT => Phase1Decision::TimedOut,
+        PromptOwnership::Other => Phase1Decision::Waiting,
+    }
+}
 
 /// Timeout for phase 2 (text clear verification).
 const PHASE2_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1612,24 +1658,13 @@ pub fn run_delivery_loop(
                 State::WaitTextRender => {
                     let elapsed = phase_started_at.elapsed();
 
-                    if elapsed > PHASE1_TIMEOUT {
-                        // Timeout - retry from pending
-                        log_warn(
-                            "native",
-                            "delivery.phase1_timeout",
-                            &format!(
-                                "Text render timeout after {:?}, inject_attempt={}",
-                                elapsed, inject_attempt
-                            ),
-                        );
-                        delivery_state = State::Pending;
-                        inject_attempt += 1;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    // Check if injected text appeared in input box
+                    // Inspect the latest screen before applying the deadline. This
+                    // avoids rejecting a render that completed at the timeout edge.
                     let screen = state.screen.read().unwrap();
+                    let input_text = screen.input_text.clone();
+                    let ready = screen.ready;
+                    drop(screen);
+
                     // Debug: log what we see at start and every 500ms
                     if elapsed.as_millis() < 50 || elapsed.as_millis() % 500 < 50 {
                         log_info(
@@ -1638,54 +1673,96 @@ pub fn run_delivery_loop(
                             &format!(
                                 "t={}ms input={:?} want={} ready={}",
                                 elapsed.as_millis(),
-                                screen.input_text.as_deref().unwrap_or("None"),
+                                input_text.as_deref().unwrap_or("None"),
                                 truncate_chars(&injected_text, 25),
-                                screen.ready
+                                ready
                             ),
                         );
                     }
-                    if let Some(ref input_text) = screen.input_text
-                        && !injected_text.is_empty()
-                        && input_text.contains(&injected_text)
-                    {
-                        drop(screen);
-                        log_info(
-                            "native",
-                            "delivery.text_rendered",
-                            "Injected text appeared in input box, sending Enter",
-                        );
-                        // Text appeared - send Enter
-                        delivery_state = State::WaitTextClear;
-                        phase_started_at = Instant::now();
-                        enter_attempt = 0;
 
-                        // Re-check submit hazards only. The full gate ran before
-                        // injection; by now a permission prompt or user typing may
-                        // have appeared. Text in the prompt is harmless — pressing
-                        // Enter is what would clobber state.
-                        if !state.is_user_active() {
+                    match phase1_decision(input_text.as_deref(), &injected_text, elapsed) {
+                        Phase1Decision::Rendered => {
+                            log_info(
+                                "native",
+                                "delivery.text_rendered",
+                                "Injected text exclusively owns the input box",
+                            );
+
+                            // Re-check all submit hazards from one fresh snapshot.
+                            // The prompt can change between render detection and Enter.
+                            let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
-                            if !screen.approval {
-                                drop(screen);
+                            let approval = screen.approval;
+                            let ownership = prompt_ownership(
+                                screen.input_text.as_deref(),
+                                &injected_text,
+                            );
+                            drop(screen);
+
+                            if ownership != PromptOwnership::Exclusive {
+                                log_warn(
+                                    "native",
+                                    "delivery.prompt_ownership_lost",
+                                    "Prompt changed before Enter; refusing automatic submission",
+                                );
+                                delivery_state = State::Pending;
+                                inject_attempt += 1;
+                                attempt += 1;
+                                continue;
+                            }
+
+                            delivery_state = State::WaitTextClear;
+                            phase_started_at = Instant::now();
+                            enter_attempt = 0;
+
+                            if !user_active && !approval {
                                 log_info("native", "delivery.send_enter", "Sending Enter key");
                                 inject_enter(state.inject_port);
-                            } else {
+                            } else if approval {
                                 log_info(
                                     "native",
                                     "delivery.enter_blocked",
                                     "Enter blocked by approval prompt",
                                 );
+                            } else {
+                                log_info(
+                                    "native",
+                                    "delivery.enter_blocked",
+                                    "Enter blocked by user activity",
+                                );
                             }
-                        } else {
-                            log_info(
-                                "native",
-                                "delivery.enter_blocked",
-                                "Enter blocked by user activity",
-                            );
+                            continue;
                         }
-                        continue;
+                        Phase1Decision::MixedPrompt => {
+                            log_warn(
+                                "native",
+                                "delivery.mixed_prompt",
+                                concat!(
+                                    "Injected text is mixed with unrelated prompt text; ",
+                                    "refusing automatic submission"
+                                ),
+                            );
+                            delivery_state = State::Pending;
+                            inject_attempt += 1;
+                            attempt += 1;
+                            continue;
+                        }
+                        Phase1Decision::TimedOut => {
+                            log_warn(
+                                "native",
+                                "delivery.phase1_timeout",
+                                &format!(
+                                    "Text render timeout after {:?}, inject_attempt={}",
+                                    elapsed, inject_attempt
+                                ),
+                            );
+                            delivery_state = State::Pending;
+                            inject_attempt += 1;
+                            attempt += 1;
+                            continue;
+                        }
+                        Phase1Decision::Waiting => {}
                     }
-                    drop(screen);
 
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1714,10 +1791,29 @@ pub fn run_delivery_loop(
                     if elapsed > PHASE2_TIMEOUT {
                         if enter_attempt < MAX_ENTER_ATTEMPTS {
                             // Retry Enter with backoff
+                            let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
-                            let can_send = !state.is_user_active() && !screen.approval;
+                            let approval = screen.approval;
+                            let ownership =
+                                prompt_ownership(screen.input_text.as_deref(), &injected_text);
                             drop(screen);
 
+                            if ownership != PromptOwnership::Exclusive {
+                                log_warn(
+                                    "native",
+                                    "delivery.prompt_ownership_lost",
+                                    concat!(
+                                        "Prompt changed before Enter retry; ",
+                                        "refusing automatic submission"
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                inject_attempt += 1;
+                                attempt += 1;
+                                continue;
+                            }
+
+                            let can_send = !user_active && !approval;
                             if can_send {
                                 log_info(
                                     "native",
@@ -1738,7 +1834,7 @@ pub fn run_delivery_loop(
                                     "delivery.enter_retry_blocked",
                                     &format!(
                                         "Enter retry blocked (user_active={})",
-                                        state.is_user_active()
+                                        user_active
                                     ),
                                 );
                             }
@@ -2068,6 +2164,81 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    // ---- phase-1 ownership tests ----
+
+    #[test]
+    fn phase1_timeout_is_ten_seconds() {
+        assert_eq!(PHASE1_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn phase1_complete_render_wins_at_deadline() {
+        assert_eq!(
+            phase1_decision(
+                Some("<hcom>"),
+                "<hcom>",
+                PHASE1_TIMEOUT + Duration::from_millis(1),
+            ),
+            Phase1Decision::Rendered,
+        );
+    }
+
+    #[test]
+    fn phase1_rejects_user_text_after_injected_text() {
+        assert_eq!(
+            phase1_decision(Some("<hcom> user draft"), "<hcom>", Duration::ZERO),
+            Phase1Decision::MixedPrompt,
+        );
+    }
+
+    #[test]
+    fn phase1_rejects_user_text_before_injected_text() {
+        assert_eq!(
+            phase1_decision(Some("user draft <hcom>"), "<hcom>", Duration::ZERO),
+            Phase1Decision::MixedPrompt,
+        );
+    }
+
+    #[test]
+    fn phase1_rejects_mixed_prompt_after_activity_cooldown() {
+        assert_eq!(
+            phase1_decision(
+                Some("<hcom> user draft"),
+                "<hcom>",
+                Duration::from_millis(501),
+            ),
+            Phase1Decision::MixedPrompt,
+        );
+    }
+
+    #[test]
+    fn phase1_unrelated_text_times_out_normally() {
+        assert_eq!(
+            phase1_decision(
+                Some("user draft"),
+                "<hcom>",
+                PHASE1_TIMEOUT + Duration::from_millis(1),
+            ),
+            Phase1Decision::TimedOut,
+        );
+    }
+
+    #[test]
+    fn submit_authority_requires_exact_prompt_ownership() {
+        assert_eq!(
+            prompt_ownership(Some("<hcom>"), "<hcom>"),
+            PromptOwnership::Exclusive,
+        );
+        assert_eq!(
+            prompt_ownership(Some("<hcom> user draft"), "<hcom>"),
+            PromptOwnership::Mixed,
+        );
+        assert_eq!(
+            prompt_ownership(Some("user draft"), "<hcom>"),
+            PromptOwnership::Other,
+        );
     }
 
     // ---- evaluate_gate tests ----
