@@ -1,4 +1,4 @@
-//! Unified launcher for Claude, Gemini, Codex, and OpenCode.
+//! Unified launcher pipeline for released AI-tool integrations.
 //!
 //!
 //! Provides a single entry point for launching all supported AI tools

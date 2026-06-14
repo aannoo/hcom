@@ -73,9 +73,19 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         eprintln!();
         eprintln!("Usage: hcom pty <tool> [args...]");
         eprintln!();
-        eprintln!(
-            "Tools: claude, gemini, codex, opencode, kilo, pi, antigravity (agy), cursor, kimi"
-        );
+        let tools = integration_spec::ALL
+            .iter()
+            .filter(|spec| spec.released)
+            .map(|spec| {
+                if spec.aliases.is_empty() {
+                    spec.name.to_string()
+                } else {
+                    format!("{} ({})", spec.name, spec.aliases.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("Tools: {tools}");
         eprintln!();
         eprintln!("The PTY wrapper provides:");
         eprintln!("  - Text injection via TCP port (INJECT_PORT)");

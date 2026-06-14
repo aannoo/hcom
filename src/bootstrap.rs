@@ -65,7 +65,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode|kilo|pi|agy|cursor|kimi|copilot> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   each supports --help (set prompt, system, background, forward args, etc)
@@ -270,6 +270,15 @@ fn get_active_instances(db: &HcomDb, exclude_name: &str) -> String {
     format!("\nActive (snapshot): {}", parts.join(" | "))
 }
 
+fn launch_tool_names() -> String {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Get combined list of bundled + user scripts.
 /// Returns empty string if none, or "Scripts: clone, debate, ...".
 fn get_scripts(hcom_dir: &std::path::Path) -> String {
@@ -316,6 +325,7 @@ struct BootstrapContext {
     is_headless: bool,
     active_instances: String,
     scripts: String,
+    launch_tools: String,
     notes: String,
 }
 
@@ -364,6 +374,7 @@ fn build_context(
         is_headless,
         active_instances: get_active_instances(db, instance_name),
         scripts: get_scripts(hcom_dir),
+        launch_tools: launch_tool_names(),
         notes: notes.to_string(),
     }
 }
@@ -380,6 +391,7 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{hcom_cmd}", &ctx.hcom_cmd)
         .replace("{active_instances}", &ctx.active_instances)
         .replace("{scripts}", &ctx.scripts)
+        .replace("{launch_tools}", &ctx.launch_tools)
         .replace("{{", "{")
         .replace("}}", "}")
 }
@@ -392,7 +404,7 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
 ///   db: Database handle for reading active instances and instance data
 ///   hcom_dir: Path to hcom data directory (for scripts discovery)
 ///   instance_name: The instance name (as stored in DB)
-///   tool: "claude", "gemini", "codex", "opencode", or "adhoc"
+///   tool: canonical integration name, or "adhoc"
 ///   headless: Whether running in headless/background mode
 ///   is_launched: Whether instance was launched by hcom
 ///   notes: User notes (from HCOM_NOTES env var or config)
@@ -793,6 +805,7 @@ mod tests {
             is_headless: false,
             active_instances: String::new(),
             scripts: "Scripts: clone".to_string(),
+            launch_tools: launch_tool_names(),
             notes: String::new(),
         };
 

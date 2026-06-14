@@ -42,32 +42,12 @@ const COMMANDS: &[&str] = &[
     "update",
 ];
 
-/// Tools that support launch commands (hcom [N] <tool>)
-const LAUNCH_TOOLS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "opencode",
-    "kilo",
-    "kilocode",
-    "pi",
-    "pi-agent",
-    "antigravity",
-    "agy",
-    "cursor",
-    "cursor-agent",
-    "kimi",
-    "copilot",
-    "f",
-    "r",
-];
-
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
 }
 
 fn is_launch_tool(name: &str) -> bool {
-    LAUNCH_TOOLS.contains(&name)
+    matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
 fn maybe_external_send_name_hint(
@@ -933,45 +913,33 @@ mod tests {
     }
 
     #[test]
-    fn hook_tools_match_released_specs_with_hooks() {
-        use crate::commands::hooks::HOOK_TOOLS;
-        let expected: Vec<&str> = crate::integration_spec::ALL
+    fn hook_tools_are_derived_from_released_specs() {
+        let actual = crate::commands::hooks::hook_tools();
+        let expected: Vec<Tool> = crate::integration_spec::ALL
             .iter()
-            .filter(|s| s.released && !s.hooks.names.is_empty())
-            .map(|s| s.name)
+            .filter(|spec| spec.released && !spec.hooks.names.is_empty())
+            .map(|spec| spec.tool)
             .collect();
-        for name in &expected {
-            assert!(
-                HOOK_TOOLS.contains(name),
-                "HOOK_TOOLS missing released hook-bearing tool {name}"
-            );
-        }
-        for name in HOOK_TOOLS {
-            assert!(
-                expected.contains(name),
-                "HOOK_TOOLS contains {name} but it is not a released hook-bearing spec"
-            );
-        }
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn launch_tools_covers_every_released_spec() {
-        // LAUNCH_TOOLS is the router-side allowlist; every released tool's
-        // canonical name and its aliases must appear here or `hcom <tool>` is
-        // not even recognised as a launch invocation.
+        // Launch recognition is derived from canonical Tool parsing; every
+        // released canonical name and alias must therefore route automatically.
         for spec in crate::integration_spec::ALL {
             if !spec.released {
                 continue;
             }
             assert!(
-                LAUNCH_TOOLS.contains(&spec.name),
-                "LAUNCH_TOOLS missing released tool {}",
+                is_launch_tool(spec.name),
+                "router did not recognise released tool {}",
                 spec.name
             );
             for alias in spec.aliases {
                 assert!(
-                    LAUNCH_TOOLS.contains(alias),
-                    "LAUNCH_TOOLS missing alias {} for {}",
+                    is_launch_tool(alias),
+                    "router did not recognise alias {} for {}",
                     alias,
                     spec.name
                 );
@@ -1412,10 +1380,7 @@ mod tests {
         ] {
             for hook in tool.hooks() {
                 assert!(!COMMANDS.contains(hook), "{hook} collides with command");
-                assert!(
-                    !LAUNCH_TOOLS.contains(hook),
-                    "{hook} collides with launch tool"
-                );
+                assert!(!is_launch_tool(hook), "{hook} collides with launch tool");
             }
         }
     }

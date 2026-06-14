@@ -543,10 +543,7 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("  --live", "Only currently alive agents"),
     ("  --all", "All transcripts (includes non-hcom sessions)"),
     ("  --limit N", "Max results (default: 20)"),
-    (
-        "  --agent TYPE",
-        "Filter: claude | gemini | codex | opencode | kilo | pi | kimi | copilot",
-    ),
+    ("  --agent TYPE", "Filter: {transcript_agents}"),
     (
         "  --exclude-self",
         "Exclude the searching agent's own transcript",
@@ -611,14 +608,8 @@ const UPDATE_HELP: &[HelpEntry] = &[
 const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks", "Show hook status"),
     ("hooks status", "Same as above"),
-    (
-        "hooks add [tool]",
-        "Add hooks (claude | gemini | codex | opencode | kilo | pi | antigravity | cursor | kimi | copilot | all)",
-    ),
-    (
-        "hooks remove [tool]",
-        "Remove hooks (claude | gemini | codex | opencode | kilo | pi | antigravity | cursor | kimi | copilot | all)",
-    ),
+    ("hooks add [tool]", "Add hooks ({hook_tools} | all)"),
+    ("hooks remove [tool]", "Remove hooks ({hook_tools} | all)"),
     ("", ""),
     (
         "",
@@ -896,6 +887,7 @@ fn forkable_tool_names() -> String {
 /// Get the top-level help text as a String.
 pub fn get_help_text() -> String {
     let forkable = forkable_tool_names();
+    let launchable = crate::integration_spec::released_tool_names().join("|");
     format!(
         "hcom (hook-comms) v{} - multi-agent communication\n\
 \n\
@@ -904,7 +896,7 @@ Usage:\n\
   hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot [flags] [tool-args]\n\
+  hcom [N] {launchable} [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
   hcom f <name>                         Fork agent session ({forkable})\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
@@ -948,6 +940,11 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
 fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> String {
     let mut flags = String::new();
     for (flag, desc) in SHARED_LAUNCH_FLAGS {
+        let desc = if *flag == "--headless" {
+            "Run in background (Claude/Kimi resume or fork only)"
+        } else {
+            *desc
+        };
         flags.push_str(&format!("  {:<34}{}\n", flag, desc));
     }
     flags.push_str(&format!(
@@ -1028,12 +1025,12 @@ pub fn get_command_help(name: &str) -> String {
         "listen" => Some(LISTEN_HELP),
         "reset" => Some(RESET_HELP),
         "relay" => Some(RELAY_HELP),
-        "transcript" => Some(TRANSCRIPT_HELP),
+        "transcript" => None,
         "archive" => Some(ARCHIVE_HELP),
         "run" => Some(RUN_HELP),
         "status" => Some(STATUS_HELP),
         "update" => Some(UPDATE_HELP),
-        "hooks" => Some(HOOKS_HELP),
+        "hooks" => None,
         "term" => Some(TERM_HELP),
         _ => None,
     };
@@ -1048,6 +1045,25 @@ pub fn get_command_help(name: &str) -> String {
         lines.extend(format_entries(FILTER_HELP));
         lines.extend(format_entries(EVENTS_HELP_2));
         return lines.join("\n");
+    }
+
+    // Transcript agent filters come from the same canonical backend registry
+    // used by parser selection and disk discovery.
+    if name == "transcript" {
+        lines.extend(format_entries(TRANSCRIPT_HELP));
+        let agents = crate::transcript::transcript_tool_names().join(" | ");
+        return lines.join("\n").replace("{transcript_agents}", &agents);
+    }
+
+    // Hook help is derived from released hook-bearing integrations.
+    if name == "hooks" {
+        lines.extend(format_entries(HOOKS_HELP));
+        let tools = crate::commands::hooks::hook_tools()
+            .into_iter()
+            .map(|tool| tool.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return lines.join("\n").replace("{hook_tools}", &tools);
     }
 
     // Config is special: has dynamic config files hint
@@ -1203,10 +1219,32 @@ mod tests {
     }
 
     #[test]
+    fn capability_driven_help_lists_current_integrations() {
+        let transcript_help = get_command_help("transcript");
+        for tool in crate::transcript::transcript_tool_names() {
+            assert!(
+                transcript_help.contains(tool),
+                "transcript help omitted {tool}"
+            );
+        }
+
+        let hooks_help = get_command_help("hooks");
+        for tool in crate::commands::hooks::hook_tools() {
+            assert!(
+                hooks_help.contains(tool.as_str()),
+                "hooks help omitted {tool}"
+            );
+        }
+
+        let resume_help = get_command_help("r");
+        assert!(resume_help.contains("Claude/Kimi resume or fork only"));
+    }
+
+    #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
         assert!(
-            help.contains("claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot")
+            help.contains("claude|gemini|codex|opencode|kilo|pi|antigravity|cursor|kimi|copilot")
         );
         assert!(help.contains(
             "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi)"

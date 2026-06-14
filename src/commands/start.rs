@@ -668,44 +668,42 @@ fn start_bare(
         .and_then(|n| db.get_instance_full(n).ok().flatten())
         .is_some();
 
-    // Vanilla tool detection: auto-install hooks for unmanaged AI tools
-    if !has_valid_identity && let Some(vanilla_tool) = ctx.detect_vanilla_tool() {
-        // Auto-install hooks if missing
-        let hooks_installed = match vanilla_tool {
-            "claude" => crate::hooks::claude::verify_claude_hooks_installed(None, false),
-            "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(false),
-            "codex" => {
-                crate::hooks::codex::verify_codex_hooks_installed(false)
-                    && crate::hooks::codex::codex_current_feature_enabled()
-            }
-            _ => true,
-        };
-        if !hooks_installed {
-            let tool_display = match vanilla_tool {
-                "claude" => "Claude Code",
-                "gemini" => "Gemini CLI",
-                "codex" => "Codex",
-                _ => vanilla_tool,
-            };
-            println!("Installing {} hooks...", vanilla_tool);
+    // Vanilla tool detection: auto-install hooks for unmanaged AI tools.
+    // Identity is already canonical on HcomContext, so route every released
+    // hook-bearing integration through the typed Tool hook adapter. This keeps
+    // bare `hcom start` aligned with `hcom hooks add` as integrations evolve.
+    if !has_valid_identity && ctx.detect_vanilla_tool().is_some() {
+        let vanilla_tool = ctx.tool;
+        if !vanilla_tool.hooks().is_empty() && !vanilla_tool.verify_hooks_installed(false) {
+            println!("Installing {} hooks...", vanilla_tool.as_str());
             let include_perms = crate::config::load_config_snapshot().core.auto_approve;
-            let ok = match vanilla_tool {
-                "claude" => crate::hooks::claude::setup_claude_hooks(include_perms),
-                "gemini" => crate::hooks::gemini::setup_gemini_hooks(include_perms),
-                "codex" => crate::hooks::codex::setup_codex_hooks(include_perms),
-                _ => false,
-            };
-            if ok {
-                println!("\nRestart {tool_display} to enable automatic message delivery.");
-                println!("Then run: hcom start");
-            } else {
-                eprintln!("Failed to install hooks. Run: hcom hooks add {vanilla_tool}");
+            match vanilla_tool.try_setup_hooks(include_perms) {
+                Ok(()) => {
+                    println!(
+                        "\nRestart {} to enable automatic message delivery.",
+                        vanilla_tool.spec().label
+                    );
+                    println!("Then run: hcom start");
+                }
+                Err(error) if error.is_empty() => {
+                    eprintln!(
+                        "Failed to install hooks. Run: hcom hooks add {}",
+                        vanilla_tool.as_str()
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Failed to install {} hooks: {error}\nRun: hcom hooks add {}",
+                        vanilla_tool.as_str(),
+                        vanilla_tool.as_str()
+                    );
+                }
             }
             return Ok(1);
         }
 
         // Gemini: ensure hooksConfig.enabled is set (self-heal for v0.26.0+)
-        if vanilla_tool == "gemini" {
+        if vanilla_tool == crate::tool::Tool::Gemini {
             let _ = crate::hooks::gemini::ensure_hooks_enabled();
         }
     }
