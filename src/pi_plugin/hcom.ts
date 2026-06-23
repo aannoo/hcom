@@ -216,6 +216,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				}
 				const sender = String(pending.messages[0]?.from ?? "");
 				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
+				await ackPending(ctx.isIdle() ? "sendUserMessage:idle" : "sendUserMessage:followUp");
 				log("INFO", "plugin.delivery_pending", instanceName, {
 					count: pending.messages.length,
 					pending_ack: pending.maxId,
