@@ -673,19 +673,10 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Create a bash script for terminal launch.
-///
-/// Scripts provide uniform execution across all platforms/terminals.
-pub fn create_bash_script(
-    script_file: &Path,
-    env: &HashMap<String, String>,
-    cwd: Option<&str>,
-    command_str: &str,
-    background: bool,
-    tool_name: Option<&str>,
-    opens_new_window: bool,
-) -> Result<()> {
-    let tool_name = tool_name.unwrap_or_else(|| {
+/// Resolve a human-readable tool name for the launch script title/banner,
+/// detecting from the command when not explicitly provided.
+fn launch_display_name<'a>(command_str: &str, tool_name: Option<&'a str>) -> &'a str {
+    tool_name.unwrap_or_else(|| {
         let cmd_lower = command_str.to_lowercase();
         if cmd_lower.contains("opencode") {
             "OpenCode"
@@ -702,7 +693,22 @@ pub fn create_bash_script(
         } else {
             "hcom"
         }
-    });
+    })
+}
+
+/// Create a bash script for terminal launch.
+///
+/// Scripts provide uniform execution across all platforms/terminals.
+pub fn create_bash_script(
+    script_file: &Path,
+    env: &HashMap<String, String>,
+    cwd: Option<&str>,
+    command_str: &str,
+    background: bool,
+    tool_name: Option<&str>,
+    opens_new_window: bool,
+) -> Result<()> {
+    let tool_name = launch_display_name(command_str, tool_name);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
 
@@ -799,6 +805,151 @@ pub fn create_bash_script(
 
     // Make executable
     crate::sys::fs::set_executable(script_file)?;
+
+    Ok(())
+}
+
+/// Quote a string as a PowerShell single-quoted literal (embedded `'` doubled).
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Build sorted `$env:K = 'V'` assignments, applying the same key validation
+/// as `build_env_string` so only well-formed names are emitted.
+fn ps_env_assignments(env_vars: &HashMap<String, String>) -> Vec<String> {
+    let mut valid: Vec<(&String, &String)> = env_vars
+        .iter()
+        .filter(|(k, _)| {
+            k.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect();
+    valid.sort_by_key(|(k, _)| k.to_string());
+    valid
+        .iter()
+        .map(|(k, v)| format!("$env:{} = {}", k, ps_quote(v)))
+        .collect()
+}
+
+/// Create a PowerShell launch script — the Windows-native equivalent of
+/// `create_bash_script`. Emits a `.ps1` that sets the window title, scrubs
+/// inherited tool/identity vars, prepends discovered tool directories to PATH,
+/// assigns the per-launch env, changes directory, then runs the tool command
+/// via the call operator. The window-open vs. run-once cleanup mirrors the
+/// bash version; the window is kept alive by launching with `powershell -NoExit`.
+pub fn create_powershell_script(
+    script_file: &Path,
+    env: &HashMap<String, String>,
+    cwd: Option<&str>,
+    command_str: &str,
+    background: bool,
+    tool_name: Option<&str>,
+    opens_new_window: bool,
+) -> Result<()> {
+    let tool_name = launch_display_name(command_str, tool_name);
+
+    let mut f = fs::File::create(script_file).context("Failed to create script file")?;
+
+    writeln!(
+        f,
+        "$Host.UI.RawUI.WindowTitle = \"hcom: starting {}...\"",
+        tool_name
+    )?;
+    writeln!(f, "Write-Host \"Starting {}...\"", tool_name)?;
+
+    // Scrub inherited tool markers and identity vars so the child can't inherit
+    // them (PowerShell ignores Env: entries that don't exist).
+    let scrub: Vec<String> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .map(|v| format!("Env:{v}"))
+        .collect();
+    writeln!(
+        f,
+        "Remove-Item {} -ErrorAction SilentlyContinue",
+        scrub.join(",")
+    )?;
+
+    // Discover paths for minimal environments.
+    let mut paths_to_add: Vec<String> = Vec::new();
+
+    fn add_path(paths: &mut Vec<String>, binary_path: Option<String>) {
+        if let Some(bp) = binary_path
+            && let Some(dir) = Path::new(&bp).parent()
+        {
+            let dir_str = dir.to_string_lossy().to_string();
+            if !paths.contains(&dir_str) {
+                paths.push(dir_str);
+            }
+        }
+    }
+
+    add_path(&mut paths_to_add, which_bin("hcom"));
+    add_path(&mut paths_to_add, which_bin("python3"));
+    let cmd_stripped = command_str.trim_start();
+    let tool_cmd = cmd_stripped.split_whitespace().next().unwrap_or("");
+    add_path(&mut paths_to_add, which_bin(tool_cmd));
+    if tool_cmd == "claude" {
+        add_path(&mut paths_to_add, which_bin("node"));
+    }
+
+    if !paths_to_add.is_empty() {
+        // Windows PATH is `;`-separated.
+        let prefix = format!("{};", paths_to_add.join(";"));
+        writeln!(f, "$env:PATH = {} + $env:PATH", ps_quote(&prefix))?;
+    }
+
+    for line in ps_env_assignments(env) {
+        writeln!(f, "{line}")?;
+    }
+
+    if let Some(dir) = cwd {
+        writeln!(f, "Set-Location {}", ps_quote(dir))?;
+    }
+
+    // Resolve the tool to a full path and invoke it through the call operator so
+    // a quoted path runs as a command. If the tool isn't found, fall through to
+    // the bare command name (resolved via the PATH we just prepended).
+    let mut final_command = command_str.to_string();
+    if !tool_cmd.is_empty()
+        && let Some(tool_path) = which_bin(tool_cmd)
+    {
+        final_command = final_command.replacen(
+            &format!("{tool_cmd} "),
+            &format!("& {} ", ps_quote(&tool_path)),
+            1,
+        );
+    }
+
+    writeln!(f, "{final_command}")?;
+
+    if opens_new_window {
+        // Clear hcom state from the interactive shell left open after the tool
+        // exits (window persists via `powershell -NoExit`).
+        let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
+        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
+        let leftover: Vec<String> = leftover_vars.iter().map(|v| format!("Env:{v}")).collect();
+        writeln!(
+            f,
+            "Remove-Item {} -ErrorAction SilentlyContinue",
+            leftover.join(",")
+        )?;
+        writeln!(
+            f,
+            "Remove-Item -Force -ErrorAction SilentlyContinue {}",
+            ps_quote(&script_file.to_string_lossy())
+        )?;
+    } else if !background {
+        writeln!(f, "$hcom_status = $LASTEXITCODE")?;
+        writeln!(
+            f,
+            "Remove-Item -Force -ErrorAction SilentlyContinue {}",
+            ps_quote(&script_file.to_string_lossy())
+        )?;
+        writeln!(f, "exit $hcom_status")?;
+    }
 
     Ok(())
 }
@@ -1386,7 +1537,9 @@ pub fn launch_terminal(
 
     // Determine script extension after terminal mode resolution so explicit
     // Terminal.app uses the macOS `.command` launcher just like auto-detect.
-    let extension = if should_use_command_extension(background, &terminal_mode) {
+    let extension = if cfg!(windows) {
+        ".ps1"
+    } else if should_use_command_extension(background, &terminal_mode) {
         ".command"
     } else {
         ".sh"
@@ -1406,16 +1559,28 @@ pub fn launch_terminal(
         fs::create_dir_all(parent).ok();
     }
 
-    // Create script
-    create_bash_script(
-        &script_file,
-        &final_env,
-        cwd,
-        command,
-        background,
-        None,
-        opens_new_window,
-    )?;
+    // Create script. Windows uses a native PowerShell script; Unix uses bash.
+    if cfg!(windows) {
+        create_powershell_script(
+            &script_file,
+            &final_env,
+            cwd,
+            command,
+            background,
+            None,
+            opens_new_window,
+        )?;
+    } else {
+        create_bash_script(
+            &script_file,
+            &final_env,
+            cwd,
+            command,
+            background,
+            None,
+            opens_new_window,
+        )?;
+    }
 
     // Background mode
     if background {
@@ -2167,6 +2332,75 @@ mod tests {
         assert!(content.contains("name: \"hcom-test-pid\""));
         assert!(content.contains("exec: \"bash /tmp/script.sh\""));
         assert!(content.contains("cwd: \"/some/dir\""));
+    }
+
+    #[test]
+    fn test_ps_quote_doubles_single_quotes() {
+        assert_eq!(ps_quote("plain"), "'plain'");
+        assert_eq!(ps_quote("it's"), "'it''s'");
+        assert_eq!(ps_quote(""), "''");
+    }
+
+    #[test]
+    fn test_ps_env_assignments_sorted_and_validated() {
+        let mut env = HashMap::new();
+        env.insert("ZED".to_string(), "z".to_string());
+        env.insert("ABE".to_string(), "a'b".to_string());
+        env.insert("1bad".to_string(), "skip".to_string()); // invalid name dropped
+        let lines = ps_env_assignments(&env);
+        assert_eq!(
+            lines,
+            vec![
+                "$env:ABE = 'a''b'".to_string(),
+                "$env:ZED = 'z'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_powershell_script_window_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.ps1");
+        let mut env = HashMap::new();
+        env.insert("HCOM_TOOL".to_string(), "claude".to_string());
+        create_powershell_script(
+            &script,
+            &env,
+            Some("/work/dir"),
+            "claude --foo",
+            false, // background
+            None,
+            true, // opens_new_window
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude Code...\""));
+        assert!(content.contains("Write-Host \"Starting Claude Code...\""));
+        assert!(content.contains("Remove-Item Env:"));
+        assert!(content.contains("$env:HCOM_TOOL = 'claude'"));
+        assert!(content.contains("Set-Location '/work/dir'"));
+        // The command args survive whether or not the tool resolved to a full
+        // path (bare `claude --foo` or call-operator `& '<path>' --foo`).
+        assert!(content.contains("--foo"));
+        // Window mode self-deletes but does not `exit` (window persists via -NoExit).
+        assert!(content.contains("Remove-Item -Force -ErrorAction SilentlyContinue"));
+        assert!(!content.contains("exit $hcom_status"));
+    }
+
+    #[test]
+    fn test_create_powershell_script_run_once_exits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.ps1");
+        let env = HashMap::new();
+        create_powershell_script(
+            &script, &env, None, "codex", false, // background
+            None, false, // run-once (not a new window)
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(content.contains("$hcom_status = $LASTEXITCODE"));
+        assert!(content.contains("exit $hcom_status"));
+        assert!(!content.contains("Set-Location"));
     }
 
     #[test]
