@@ -676,6 +676,12 @@ pub fn build_env_string(env_vars: &HashMap<String, String>, format_type: &str) -
             .map(|(k, v)| format!("export {}={};", k, shell_quote(v)))
             .collect::<Vec<_>>()
             .join(" ")
+    } else if format_type == "powershell" {
+        valid
+            .iter()
+            .map(|(k, v)| format!("$env:{} = {}", k, ps_quote(v)))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         valid
             .iter()
@@ -837,7 +843,7 @@ pub fn create_bash_script(
 }
 
 /// Quote a string as a PowerShell single-quoted literal (embedded `'` doubled).
-fn ps_quote(s: &str) -> String {
+pub fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -2495,6 +2501,15 @@ mod tests {
         assert!(content.contains("$hcom_status = $LASTEXITCODE"));
         assert!(content.contains("exit $hcom_status"));
         assert!(!content.contains("Set-Location"));
+    }
+
+    #[test]
+    fn test_build_env_string_powershell_format() {
+        let mut env = HashMap::new();
+        env.insert("HCOM_A".to_string(), "x".to_string());
+        env.insert("HCOM_B".to_string(), "y'z".to_string());
+        let out = build_env_string(&env, "powershell");
+        assert_eq!(out, "$env:HCOM_A = 'x'\n$env:HCOM_B = 'y''z'");
     }
 
     #[test]

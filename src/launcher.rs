@@ -702,6 +702,170 @@ fn background_runner_env(
     runner_env
 }
 
+/// Windows runner: a PowerShell script that runs the tool **directly**.
+///
+/// The PTY wrapper (`hcom pty`) is not yet available on Windows, so on Windows
+/// we launch the tool itself and rely on hcom's hooks for message delivery
+/// (screen-tracking / injection arrive with ConPTY in a later phase). Mirrors
+/// the bash runner's env scrubbing, HCOM env, secret sidecar, and PATH setup.
+fn create_runner_script_windows(
+    tool: &str,
+    cwd: &str,
+    instance_name: &str,
+    env: &HashMap<String, String>,
+    tool_args: &[String],
+) -> Result<String> {
+    let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
+    let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
+
+    let launch_dir = paths::hcom_path(&[paths::LAUNCH_DIR]);
+    fs::create_dir_all(&launch_dir).ok();
+    let script_file = launch_dir.join(format!(
+        "{}_{}_{}_{}.ps1",
+        tool,
+        instance_name,
+        std::process::id(),
+        rand::random::<u16>() % 9000 + 1000
+    ));
+
+    // Visible HCOM_* env, plus the managed-launch marker so hooks engage.
+    let mut hcom_env: HashMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| k.starts_with("HCOM_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    hcom_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+    let env_block = terminal::build_env_string(&hcom_env, "powershell");
+
+    // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
+    // that is dot-sourced then deleted, matching the bash runner.
+    let sidecar_strip: std::collections::HashSet<&str> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(instance_state_env.iter())
+        .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
+        .copied()
+        .collect();
+    let ambient_env: HashMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| !k.starts_with("HCOM_") && !sidecar_strip.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let sidecar_source = if ambient_env.is_empty() {
+        String::new()
+    } else {
+        let env_file = launch_dir.join(format!(
+            "{}_{}_{}_{}.ps1",
+            tool,
+            instance_name,
+            std::process::id(),
+            rand::random::<u16>() % 9000 + 1000
+        ));
+        let mut file = crate::sys::fs::create_private_new(&env_file)?;
+        writeln!(
+            file,
+            "{}",
+            terminal::build_env_string(&ambient_env, "powershell")
+        )?;
+        let q = terminal::ps_quote(&env_file.to_string_lossy());
+        format!("if (Test-Path {q}) {{ . {q}; Remove-Item -Force {q} }}")
+    };
+
+    // Scrub inherited tool markers / identity / instance-state vars.
+    let unset_names: Vec<String> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(instance_state_env.iter())
+        .map(|v| format!("Env:{v}"))
+        .collect();
+    let unset_line = if unset_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Remove-Item {} -ErrorAction SilentlyContinue",
+            unset_names.join(",")
+        )
+    };
+
+    // Resolve binary directories for minimal PATH environments.
+    let mut path_dirs: Vec<String> = Vec::new();
+    if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT")
+        && let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root))
+        && let Some(dir) = bin.parent()
+    {
+        path_dirs.push(dir.to_string_lossy().into_owned());
+    }
+    let tool_bin = tool
+        .parse::<crate::tool::Tool>()
+        .map(|t| t.spec().cli_binary)
+        .unwrap_or(tool);
+    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
+        if let Some(bin_path) = terminal::which_bin(bin_name)
+            && let Some(dir) = Path::new(&bin_path).parent()
+        {
+            let d = dir.to_string_lossy().to_string();
+            if !path_dirs.contains(&d) {
+                path_dirs.push(d);
+            }
+        }
+    }
+    let path_line = if path_dirs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "$env:PATH = {} + $env:PATH",
+            terminal::ps_quote(&format!("{};", path_dirs.join(";")))
+        )
+    };
+
+    // Run the tool directly via the call operator (no PTY wrapper yet).
+    let tool_path = terminal::which_bin(tool_bin).unwrap_or_else(|| tool_bin.to_string());
+    let args_str: String = tool_args
+        .iter()
+        .map(|a| terminal::ps_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let run_line = if args_str.is_empty() {
+        format!("& {}", terminal::ps_quote(&tool_path))
+    } else {
+        format!("& {} {}", terminal::ps_quote(&tool_path), args_str)
+    };
+
+    let display = tool
+        .chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .collect::<String>()
+        + &tool[1..];
+    let content = format!(
+        "# {display} hcom native runner ({instance_name})\n\
+         Set-Location {cwd}\n\
+         {unset_line}\n\
+         {env_block}\n\
+         {sidecar_source}\n\
+         {path_line}\n\
+         \n\
+         {run_line}\n",
+        cwd = terminal::ps_quote(cwd),
+    );
+
+    fs::write(&script_file, &content)?;
+
+    crate::log::log_info(
+        "pty",
+        "native.script",
+        &format!(
+            "script={} tool={} instance={} (windows direct launch)",
+            script_file.display(),
+            tool,
+            instance_name
+        ),
+    );
+
+    Ok(script_file.to_string_lossy().to_string())
+}
+
 /// Create a bash script that runs a tool via the hcom native PTY wrapper.
 ///
 /// The script sets up the environment and calls `hcom pty <tool> [args...]`.
@@ -713,6 +877,9 @@ pub fn create_runner_script(
     tool_args: &[String],
     run_here: bool,
 ) -> Result<String> {
+    if cfg!(windows) {
+        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args);
+    }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
@@ -864,6 +1031,22 @@ pub fn create_runner_script(
     Ok(script_file.to_string_lossy().to_string())
 }
 
+/// Build the command that runs a generated runner script in the launched
+/// terminal: PowerShell on Windows, bash elsewhere.
+fn runner_invocation_command(script_file: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "powershell -ExecutionPolicy Bypass -File {}",
+            crate::terminal::ps_quote(script_file)
+        )
+    } else {
+        format!(
+            "bash {}",
+            crate::tools::args_common::shell_quote(script_file)
+        )
+    }
+}
+
 /// Launch a tool via PTY wrapper in a terminal.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_pty(
@@ -895,10 +1078,7 @@ pub fn launch_pty(
     let script_file =
         create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, run_here)?;
 
-    let command = format!(
-        "bash {}",
-        crate::tools::args_common::shell_quote(&script_file)
-    );
+    let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
         .iter()
         .filter(|(k, _)| k.starts_with("HCOM_"))
@@ -1009,10 +1189,7 @@ fn launch_background_runner(
     runner_env.insert("HCOM_BACKGROUND".to_string(), log_filename);
     let script_file =
         create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, false)?;
-    let command = format!(
-        "bash {}",
-        crate::tools::args_common::shell_quote(&script_file)
-    );
+    let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
         .iter()
         .filter(|(k, _)| k.starts_with("HCOM_"))
