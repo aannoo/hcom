@@ -795,6 +795,16 @@ fn create_runner_script_windows(
     {
         path_dirs.push(dir.to_string_lossy().into_owned());
     }
+    // Ensure the launched tool (and its hooks) can call back to *this* hcom by
+    // name — a dev binary may not be on the global PATH.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let d = dir.to_string_lossy().to_string();
+        if !path_dirs.contains(&d) {
+            path_dirs.push(d);
+        }
+    }
     let tool_bin = tool
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
