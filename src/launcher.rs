@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -763,11 +762,7 @@ pub fn create_runner_script(
             std::process::id(),
             rand::random::<u16>() % 9000 + 1000
         ));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&env_file)?;
+        let mut file = crate::sys::fs::create_private_new(&env_file)?;
         writeln!(
             file,
             "{}",
@@ -852,7 +847,7 @@ pub fn create_runner_script(
     );
 
     fs::write(&script_file, &content)?;
-    fs::set_permissions(&script_file, fs::Permissions::from_mode(0o755))?;
+    crate::sys::fs::set_executable(&script_file)?;
 
     crate::log::log_info(
         "pty",

@@ -499,18 +499,8 @@ fn poll_loop(
         };
 
         if let Some(server) = notify_server {
-            // Block on poll(2) instead of busy-looping with accept+sleep
-            use std::os::fd::AsRawFd;
-            let fd = server.as_raw_fd();
-            let timeout_ms = wait_time.as_millis().min(i32::MAX as u128) as i32;
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: valid pollfd, nfds=1, bounded timeout
-            let ret = unsafe { libc::poll(&mut pfd as *mut _, 1, timeout_ms) };
-            if ret > 0 {
+            // Block until a wake-up connection arrives instead of busy-looping
+            if crate::sys::net::wait_readable(server, wait_time) {
                 // Drain all pending connections
                 if let Err(e) = server.set_nonblocking(true) {
                     log::log_warn(
@@ -545,18 +535,7 @@ fn poll_loop(
 /// POLLERR (broken pipe) and POLLNVAL (fd was closed/invalidated).
 ///
 fn check_stdin_closed() -> bool {
-    let mut pfd = libc::pollfd {
-        fd: 0, // stdin
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: valid pollfd, nfds=1, timeout=0
-    let ret = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-    if ret < 0 {
-        return true; // poll error → assume closed
-    }
-    // Only POLLERR/POLLNVAL — NOT POLLHUP (normal pipe EOF)
-    (pfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0
+    crate::sys::io::stdin_appears_broken()
 }
 
 /// Create TCP server socket for instant message wake notifications.
@@ -980,36 +959,27 @@ fn stop_instance_inner(
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
     if let Some(pid_val) = pid {
-        let pid_i32 = pid_val as i32;
+        let pid_u32 = pid_val as u32;
         if is_headless {
             // SIGTERM → wait up to 2s → SIGKILL
-            let term_ret = unsafe { libc::killpg(pid_i32, libc::SIGTERM) };
-            if term_ret == 0 {
+            use crate::sys::process::GroupSignal;
+            if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
                 let mut dead = false;
                 for _ in 0..20 {
                     std::thread::sleep(Duration::from_millis(100));
-                    let probe = unsafe { libc::kill(pid_i32, 0) };
-                    if probe != 0 {
+                    if !crate::sys::process::is_alive(pid_u32) {
                         dead = true;
                         break;
                     }
                 }
                 if !dead {
-                    unsafe { libc::killpg(pid_i32, libc::SIGKILL) };
+                    crate::sys::process::kill_group(pid_u32);
                 }
             }
-            // ESRCH/EPERM from initial killpg is fine — process already gone or foreign
+            // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
         } else {
             // Track surviving PTY processes in pidtrack
-            let alive = {
-                let probe = unsafe { libc::kill(pid_i32, 0) };
-                if probe == 0 {
-                    true
-                } else {
-                    // EPERM = exists but foreign user — still track
-                    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                }
-            };
+            let alive = crate::sys::process::is_alive(pid_u32);
             if alive {
                 let hcom_dir = crate::paths::hcom_dir();
 

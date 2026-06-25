@@ -3,7 +3,6 @@
 //! All hooks and commands are handled natively in Rust.
 
 use std::env;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -397,8 +396,10 @@ pub fn maybe_reexec_dev_root() {
 
     // Re-exec: replace this process with the dev root's binary
     let args: Vec<String> = env::args().collect();
-    let err = Command::new(&target_binary).args(&args[1..]).exec();
-    // exec() only returns on error
+    let mut cmd = Command::new(&target_binary);
+    cmd.args(&args[1..]);
+    let err = crate::sys::process::exec_replace(cmd);
+    // exec_replace only returns on error
     log_error(
         "router",
         "dev_root_reexec_failed",

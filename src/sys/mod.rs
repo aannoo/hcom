@@ -8,4 +8,7 @@
 //! keeps Unix and Windows behavior side by side.
 
 pub mod fs;
+pub mod io;
+pub mod net;
 pub mod process;
+pub mod signal;

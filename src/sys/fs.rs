@@ -1,8 +1,87 @@
 //! Filesystem primitives that differ across platforms: Unix permission bits and
 //! stable on-disk file identity.
 
+use std::fs::File;
 use std::io;
 use std::path::Path;
+
+/// Create a new file restricted to the owner (`0o600` on Unix), failing if it
+/// already exists. On Windows the file is created with default ACLs (no Unix
+/// mode); profile-local files are already private.
+pub fn create_private_new(path: &Path) -> io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Acquire a blocking exclusive lock on an open file. The lock is released when
+/// the file handle is closed (dropped).
+///
+/// Unix: `flock(LOCK_EX)`, retrying on `EINTR`. Windows: `LockFileEx` with
+/// `LOCKFILE_EXCLUSIVE_LOCK` over the whole file.
+pub fn lock_exclusive(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            // SAFETY: flock on a valid fd; return value is checked.
+            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if ret == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: valid handle for the file's lifetime; whole-file range.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Whether `path` is a Unix-domain socket. Always false on Windows, which has
+/// no filesystem socket node type.
+pub fn is_socket(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
 
 /// Restrict a file to owner-only read/write (`0o600` on Unix).
 ///

@@ -71,6 +71,90 @@ pub fn terminate(pid: u32) -> bool {
     }
 }
 
+/// Outcome of signalling a process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSignal {
+    /// The signal was delivered.
+    Sent,
+    /// No such process/group exists (already gone).
+    NotFound,
+    /// The caller lacks permission to signal the group.
+    PermissionDenied,
+    /// Any other failure.
+    Other,
+}
+
+/// Send a graceful termination request to a process group by PID.
+///
+/// Unix: `killpg(SIGTERM)`. Windows has no process-group signal, so this
+/// terminates the single process.
+pub fn terminate_group(pid: u32) -> GroupSignal {
+    #[cfg(unix)]
+    {
+        signal_group_unix(pid, libc::SIGTERM)
+    }
+    #[cfg(windows)]
+    {
+        if terminate_win(pid) {
+            GroupSignal::Sent
+        } else {
+            GroupSignal::NotFound
+        }
+    }
+}
+
+/// Forcefully kill a process group by PID.
+///
+/// Unix: `killpg(SIGKILL)`. Windows terminates the single process.
+pub fn kill_group(pid: u32) -> GroupSignal {
+    #[cfg(unix)]
+    {
+        signal_group_unix(pid, libc::SIGKILL)
+    }
+    #[cfg(windows)]
+    {
+        if terminate_win(pid) {
+            GroupSignal::Sent
+        } else {
+            GroupSignal::NotFound
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_group_unix(pid: u32, sig: libc::c_int) -> GroupSignal {
+    // SAFETY: killpg with a valid signal number; return value is checked.
+    let ret = unsafe { libc::killpg(pid as i32, sig) };
+    if ret == 0 {
+        return GroupSignal::Sent;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => GroupSignal::NotFound,
+        Some(libc::EPERM) => GroupSignal::PermissionDenied,
+        _ => GroupSignal::Other,
+    }
+}
+
+/// Replace the current process with the given command.
+///
+/// Unix uses `exec()` and only returns (an error) on failure. Windows has no
+/// `exec`, so it spawns the command, waits, and exits with the child's status
+/// code — likewise not returning on success.
+pub fn exec_replace(mut cmd: Command) -> std::io::Error {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    }
+    #[cfg(windows)]
+    {
+        match cmd.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => e,
+        }
+    }
+}
+
 /// Kill a child process together with its process group.
 ///
 /// Unix: `killpg(SIGKILL)` on the child's group (set up via [`detach_session`]),

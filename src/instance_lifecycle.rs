@@ -337,7 +337,7 @@ pub(crate) fn finalize_launch_failure_detail(
         0
     };
     let process_state = data.pid.and_then(|pid| {
-        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        let alive = crate::sys::process::is_alive(pid as u32);
         alive.then(|| format!("process alive {age}s, never bound"))
     });
     let mut detail = fallback_detail
