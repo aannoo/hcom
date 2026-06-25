@@ -392,13 +392,40 @@ pub fn wezterm_reachable() -> bool {
         .unwrap_or(false)
 }
 
+/// Candidate file names to probe for `name` in a PATH directory. On Windows an
+/// extension-less name is expanded with PATHEXT (`.exe`, `.cmd`, …); elsewhere
+/// the name is used verbatim.
+fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        if Path::new(name).extension().is_some() {
+            return vec![dir.join(name)];
+        }
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let mut out: Vec<std::path::PathBuf> = exts
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|ext| dir.join(format!("{name}{ext}")))
+            .collect();
+        out.push(dir.join(name));
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(name)]
+    }
+}
+
 /// Simple `which` implementation — find binary in PATH.
 pub fn which_bin(name: &str) -> Option<String> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in path_var.split(':') {
-        let candidate = Path::new(dir).join(name);
-        if candidate.exists() && candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
+    let path_var = std::env::var_os("PATH")?;
+    // `split_paths` uses the platform separator (`;` on Windows, `:` elsewhere),
+    // which also avoids splitting Windows drive letters like `C:`.
+    for dir in std::env::split_paths(&path_var) {
+        for candidate in which_candidates(&dir, name) {
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
     }
 
@@ -1272,6 +1299,55 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
     None
 }
 
+/// Default Windows terminal launch argv ({script} substituted by the caller).
+///
+/// Prefers Windows Terminal, which parses everything after `--` as a literal
+/// argv so a script path with spaces stays a single argument. Without it, opens
+/// a fresh console via cmd's `start` (the empty arg is start's window-title
+/// slot; the path is quoted so start keeps spaces together). Either way the
+/// shell runs the generated `.ps1` with the execution policy bypassed and stays
+/// open (`-NoExit`) for the new window.
+fn get_windows_terminal_argv() -> Vec<String> {
+    let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    if which_bin("wt").is_some() {
+        return to_vec(&[
+            "wt",
+            "--",
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-NoExit",
+            "-File",
+            "{script}",
+        ]);
+    }
+    to_vec(&[
+        "cmd",
+        "/c",
+        "start",
+        "",
+        "powershell",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoExit",
+        "-File",
+        "\"{script}\"",
+    ])
+}
+
+/// On Windows, rewrite a preset's bash invocation to run the generated `.ps1`
+/// via PowerShell. Inherently-bash terminals (mintty, shipped with Git Bash)
+/// are left untouched.
+fn windows_shellify_preset(template: &str) -> String {
+    if template.starts_with("mintty") {
+        return template.to_string();
+    }
+    template.replace(
+        "bash {script}",
+        "powershell -ExecutionPolicy Bypass -NoExit -File {script}",
+    )
+}
+
 /// Spawn terminal process, detached when inside AI tools.
 ///
 /// Returns (success, stdout_first_line) — stdout captured for {id} in close commands.
@@ -1729,6 +1805,12 @@ pub fn launch_terminal(
                 .map(|s| s.as_str())
                 .filter(|s| !s.is_empty()),
         };
+        // On Windows, run the generated .ps1 via PowerShell instead of bash.
+        let cmd_template = if cfg!(windows) {
+            windows_shellify_preset(&cmd_template)
+        } else {
+            cmd_template
+        };
         let final_argv = parse_terminal_command(&cmd_template, ctx)?;
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
         write_terminal_id(env, &captured_id);
@@ -1788,6 +1870,7 @@ pub fn launch_terminal(
             )?,
             "Linux" => get_linux_terminal_argv()
                 .ok_or_else(|| anyhow::anyhow!("No supported terminal emulator found"))?,
+            "Windows" => get_windows_terminal_argv(),
             other => bail!("Unsupported platform: {}", other),
         };
 
@@ -2401,6 +2484,23 @@ mod tests {
         assert!(content.contains("$hcom_status = $LASTEXITCODE"));
         assert!(content.contains("exit $hcom_status"));
         assert!(!content.contains("Set-Location"));
+    }
+
+    #[test]
+    fn test_windows_shellify_preset_rewrites_bash() {
+        assert_eq!(
+            windows_shellify_preset("wezterm start -- bash {script}"),
+            "wezterm start -- powershell -ExecutionPolicy Bypass -NoExit -File {script}"
+        );
+        assert_eq!(
+            windows_shellify_preset("wt -- bash {script}"),
+            "wt -- powershell -ExecutionPolicy Bypass -NoExit -File {script}"
+        );
+        // mintty ships with Git Bash, so its bash invocation is left intact.
+        assert_eq!(
+            windows_shellify_preset("mintty bash {script}"),
+            "mintty bash {script}"
+        );
     }
 
     #[test]
