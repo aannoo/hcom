@@ -40,8 +40,12 @@ pub mod transcript;
 mod tui;
 mod update;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::panic;
+// Used only by the Unix PTY wrapper (run_pty).
+#[cfg(unix)]
+use anyhow::Context;
+#[cfg(unix)]
 use std::str::FromStr;
 
 fn main() -> Result<()> {
