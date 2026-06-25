@@ -31,6 +31,7 @@ mod runtime_env;
 pub mod scripts;
 pub mod shared;
 mod shell_env;
+mod sys;
 pub mod terminal;
 mod tool;
 pub mod tools;

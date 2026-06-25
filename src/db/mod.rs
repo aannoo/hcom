@@ -65,8 +65,7 @@ pub struct HcomDb {
 }
 
 fn get_inode(path: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+    crate::sys::fs::file_id(path)
 }
 
 impl HcomDb {

@@ -366,9 +366,7 @@ fn stop_relay_worker_quiet() {
 
     // Last resort: a stale worker pinned to the old namespace must not survive
     // a relay reset or shutdown.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    crate::sys::process::kill(pid);
     crate::relay::worker::remove_relay_pid_file();
 }
 
