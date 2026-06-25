@@ -15,6 +15,12 @@ use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
+/// Whether the wrapped child exited because hcom killed it (vs. closed on its
+/// own). Set by the PTY proxy (Unix) and read here during delivery cleanup to
+/// choose the exit status context. Lives here rather than in `pty` so the
+/// delivery loop compiles on platforms without the PTY wrapper.
+pub static EXIT_WAS_KILLED: AtomicBool = AtomicBool::new(false);
+
 /// Safely truncate a string to at most `max_chars` characters.
 /// Unlike byte slicing `&s[..n]`, this won't panic on multi-byte UTF-8.
 pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -1970,7 +1976,7 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         }
     };
 
-    let was_killed = crate::pty::EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
         ("exit:killed", "killed")
     } else {

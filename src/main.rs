@@ -24,6 +24,7 @@ pub mod messages;
 mod notify;
 mod paths;
 mod pidtrack;
+#[cfg(unix)]
 mod pty;
 pub mod relay;
 pub mod router;
@@ -68,6 +69,17 @@ fn main() -> Result<()> {
 }
 
 /// Run PTY wrapper mode.
+///
+/// The PTY wrapper (screen tracking + message injection) is built on Unix
+/// pseudo-terminals and is not yet available on Windows; native ConPTY support
+/// is a later phase. Messaging, relay, hooks, and launching all work without it.
+#[cfg(windows)]
+pub fn run_pty(_args: &[String]) -> Result<()> {
+    bail!("PTY wrapper mode is not yet supported on Windows");
+}
+
+/// Run PTY wrapper mode.
+#[cfg(unix)]
 pub fn run_pty(args: &[String]) -> Result<()> {
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!("hcom pty - PTY wrapper for hcom");
@@ -159,6 +171,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     std::process::exit(exit_code);
 }
 
+#[cfg(unix)]
 fn pty_child_env() -> Vec<(String, String)> {
     vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
 }
@@ -212,6 +225,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_pty_child_env_marks_launched() {
         assert_eq!(

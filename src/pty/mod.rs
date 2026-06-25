@@ -517,10 +517,9 @@ static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-// Exit reason flag (for cleanup to know context)
-// false = normal exit (closed), true = signal exit (killed)
-// Pub so delivery.rs can check it during cleanup
-pub static EXIT_WAS_KILLED: AtomicBool = AtomicBool::new(false);
+// Exit reason flag lives in `delivery` so the delivery loop compiles without
+// the PTY wrapper; the proxy sets it here.
+use crate::delivery::EXIT_WAS_KILLED;
 
 pub extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
