@@ -17,8 +17,10 @@ jobs:
 
   # Windows is Phase 1: the crate compiles and links, with the Unix PTY wrapper
   # gated off (run_pty returns a clear "not supported" error). We assert the
-  # build and that all test targets compile; running the full suite on Windows
-  # is a follow-up once the remaining Windows runtime paths are validated.
+  # build and that the bin unit tests compile. The integration tests under
+  # tests/ are Unix-only (process groups, real-tool lifecycle) and are not
+  # compiled here; running the full suite on Windows is a follow-up once the
+  # remaining Windows runtime paths are validated.
   windows-build:
     runs-on: windows-latest
     steps:
@@ -26,7 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo build --locked
-      - run: cargo test --locked --no-run
+      - run: cargo test --locked --no-run --bins
 
   real-tool-tests:
     name: Real tool (${{ matrix.tool }})

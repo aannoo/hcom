@@ -1933,6 +1933,7 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
     struct EnvGuard(Vec<(&'static str, Option<String>)>);
@@ -1984,6 +1985,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_termux_dispatch_rejects_nonzero_exit_status() {
         let status = std::process::ExitStatus::from_raw(1 << 8);
         let err = validate_termux_dispatch_status(status)
@@ -2089,6 +2091,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_zellij_session_ambiguity_stderr_fails_launch_even_with_exit_zero() {
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(0),

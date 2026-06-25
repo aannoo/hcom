@@ -209,9 +209,7 @@ pub fn detach_session(command: &mut Command) {
 #[cfg(windows)]
 fn terminate_win(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
     // SAFETY: opens a terminate-only handle, closes it before returning.
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);

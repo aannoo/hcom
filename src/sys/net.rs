@@ -35,15 +35,7 @@ pub fn wait_readable(listener: &TcpListener, timeout: Duration) -> bool {
             tv_usec: timeout.subsec_micros() as i32,
         };
         // SAFETY: read set holds one valid socket; nfds is ignored on Windows.
-        let ret = unsafe {
-            select(
-                0,
-                &mut set,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &tv,
-            )
-        };
+        let ret = unsafe { select(0, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &tv) };
         ret > 0
     }
 }
