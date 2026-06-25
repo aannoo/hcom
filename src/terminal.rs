@@ -1667,7 +1667,13 @@ pub fn launch_terminal(
 
         let log_handle = fs::File::create(&log_file).context("Failed to create log file")?;
 
-        let mut cmd = Command::new("bash");
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c
+        } else {
+            Command::new("bash")
+        };
         cmd.arg(&script_file)
             .stdin(std::process::Stdio::null())
             .stdout(log_handle.try_clone()?)
@@ -1705,8 +1711,13 @@ pub fn launch_terminal(
             std::env::set_current_dir(dir).ok();
         }
         // Replace this process entirely with the script's shell.
-        let bash_path = which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string());
-        let mut cmd = Command::new(&bash_path);
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c
+        } else {
+            Command::new(which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string()))
+        };
         cmd.arg(script_file).env_clear().envs(&full_env);
         let err = crate::sys::process::exec_replace(cmd);
         bail!("exec failed: {}", err);
