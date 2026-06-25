@@ -15,6 +15,19 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # Windows is Phase 1: the crate compiles and links, with the Unix PTY wrapper
+  # gated off (run_pty returns a clear "not supported" error). We assert the
+  # build and that all test targets compile; running the full suite on Windows
+  # is a follow-up once the remaining Windows runtime paths are validated.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build --locked
+      - run: cargo test --locked --no-run
+
   real-tool-tests:
     name: Real tool (${{ matrix.tool }})
     runs-on: ubuntu-latest
