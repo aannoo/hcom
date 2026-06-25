@@ -1837,7 +1837,7 @@ pub fn kill_process(
 
     // SIGTERM the process group
     use crate::sys::process::GroupSignal;
-    let kill_result = match crate::sys::process::terminate_group(pid as u32) {
+    let kill_result = match crate::sys::process::terminate_group(pid) {
         GroupSignal::Sent => KillResult::Sent,
         GroupSignal::PermissionDenied => KillResult::PermissionDenied,
         GroupSignal::NotFound | GroupSignal::Other => KillResult::AlreadyDead,
