@@ -675,7 +675,11 @@ fn build_claude_command(args: &[String]) -> String {
 /// Tool-specific extra environment variables for PTY mode.
 fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
-    if tool == "claude" {
+    // On Windows there is no PTY wrapper (the tool is launched directly), so the
+    // Stop hook must run its own poll loop rather than defer to a wrapper that
+    // would handle injection. Setting HCOM_PTY_MODE there makes the hook exit
+    // immediately and messages are never delivered.
+    if tool == "claude" && !cfg!(windows) {
         m.insert("HCOM_PTY_MODE".to_string(), "1".to_string());
     }
     if tool == "antigravity" {
@@ -2643,10 +2647,16 @@ mod tests {
             runner_env.get("HCOM_INSTANCE_NAME").map(String::as_str),
             Some("hone")
         );
-        assert_eq!(
-            runner_env.get("HCOM_PTY_MODE").map(String::as_str),
-            Some("1")
-        );
+        // Windows launches claude directly (no PTY wrapper), so the PTY-mode
+        // marker must be absent there or the Stop hook won't poll for messages.
+        if cfg!(windows) {
+            assert!(!runner_env.contains_key("HCOM_PTY_MODE"));
+        } else {
+            assert_eq!(
+                runner_env.get("HCOM_PTY_MODE").map(String::as_str),
+                Some("1")
+            );
+        }
     }
 
     #[test]
