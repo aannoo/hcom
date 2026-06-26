@@ -2056,17 +2056,14 @@ pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
 /// after `brew uninstall hcom`), the hook exits 0 instead of emitting a "command
 /// not found" error inside the tool.
 fn build_hook_entry_command(cmd_suffix: &str) -> String {
-    if cfg!(windows) {
-        // Claude runs Windows hooks through cmd.exe, where the POSIX form is
-        // invalid. Use %HCOM% (set in the settings env block) and silently
-        // exit 0 when hcom is absent so the tool doesn't surface an error.
-        format!("where %HCOM% >nul 2>nul && %HCOM% {cmd_suffix} || exit /b 0")
-    } else {
-        format!(
-            "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
-            cmd_suffix
-        )
-    }
+    // Claude runs hook commands through a POSIX shell on every platform
+    // (Git Bash on Windows), so the same command works everywhere. The
+    // `${HCOM:-hcom}` default plus the `command -v` guard make it silently
+    // exit 0 when hcom isn't on PATH.
+    format!(
+        "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
+        cmd_suffix
+    )
 }
 
 /// Format a single Claude permission pattern: `Bash(prefix cmd:*)`.
@@ -2840,18 +2837,11 @@ mod tests {
     #[test]
     fn test_build_hook_entry_command_avoids_nested_shell() {
         let command = build_hook_entry_command("poll");
-        if cfg!(windows) {
-            assert_eq!(
-                command,
-                "where %HCOM% >nul 2>nul && %HCOM% poll || exit /b 0"
-            );
-        } else {
-            assert_eq!(
-                command,
-                "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
-            );
-            assert!(!command.starts_with("sh -c"));
-        }
+        assert_eq!(
+            command,
+            "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
+        );
+        assert!(!command.starts_with("sh -c"));
     }
 
     #[test]
