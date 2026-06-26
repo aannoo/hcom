@@ -65,6 +65,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_Storage_FileSystem",
     "Win32_Networking_WinSock",
 ] }
+# ConPTY-backed pseudoterminal for the Windows PTY wrapper (Phase 2 / M2).
+portable-pty = "0.9"
 
 [dev-dependencies]
 serial_test = "3"

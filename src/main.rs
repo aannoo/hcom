@@ -24,7 +24,6 @@ pub mod messages;
 mod notify;
 mod paths;
 mod pidtrack;
-#[cfg(unix)]
 mod pty;
 pub mod relay;
 pub mod router;

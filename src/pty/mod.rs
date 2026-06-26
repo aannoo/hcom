@@ -9,33 +9,59 @@
 
 mod inject;
 pub mod screen;
+#[cfg(unix)]
 mod terminal;
 
+#[cfg(unix)]
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
+#[cfg(unix)]
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+#[cfg(unix)]
 use nix::pty::openpty;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::{Pid, read, write};
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::process::{Child, Command, ExitStatus};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+#[cfg(unix)]
 use std::sync::mpsc;
+#[cfg(unix)]
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
+#[cfg(unix)]
 use inject::InjectServer;
+#[cfg(unix)]
 use screen::ScreenTracker;
+#[cfg(unix)]
 use terminal::TerminalGuard;
 
+#[cfg(unix)]
 use crate::config::Config;
+#[cfg(unix)]
 use crate::db::HcomDb;
+#[cfg(unix)]
 use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop};
+#[cfg(unix)]
 use crate::log::{log_error, log_info, log_warn};
+#[cfg(unix)]
 use crate::notify::NotifyServer;
+#[cfg(unix)]
 use crate::shared::{ST_BLOCKED, ST_LISTENING, status_icon};
 use crate::tool::Tool;
 
@@ -80,6 +106,7 @@ impl PtyTarget {
 /// Tracks what type of incomplete escape sequence is pending on stdout.
 /// Used to defer title writes until the sequence completes across read boundaries.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg(unix)]
 enum PendingEscape {
     None,
     /// Incomplete CSI (ESC [) — complete when final byte (0x40-0x7E) appears
@@ -111,6 +138,7 @@ enum PendingEscape {
 /// continuously-rendering TUI (e.g. pi during a turn) never yields a quiet
 /// iteration, which starved status-icon title updates entirely.
 #[inline]
+#[cfg(unix)]
 fn title_write_safe(pending_utf8: u8, pending_escape: PendingEscape) -> bool {
     pending_utf8 == 0 && pending_escape == PendingEscape::None
 }
@@ -120,6 +148,7 @@ fn title_write_safe(pending_utf8: u8, pending_escape: PendingEscape) -> bool {
 /// The prompt can briefly become undetectable while a TUI redraws, so treat
 /// non-empty -> None the same as non-empty -> empty. That preserves the
 /// cooldown across a Some("text") -> None -> Some("") transition.
+#[cfg(unix)]
 fn prompt_submit_observed(
     previous_input_text: Option<&str>,
     current_input_text: Option<&str>,
@@ -144,6 +173,7 @@ fn prompt_submit_observed(
 /// Terminals emit these 3-byte events atomically, so a sequence split across
 /// reads is not tracked — it would pass through and cause at most one transient
 /// pause, self-corrected by the next focus event.
+#[cfg(unix)]
 fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
     if !buf.contains(&0x1b) {
         return None;
@@ -180,6 +210,7 @@ fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
 /// so those never appear in the filtered output. This function only sees
 /// ESC bytes that the filter passed through (non-title sequences).
 #[inline]
+#[cfg(unix)]
 fn has_pending_escape(data: &[u8]) -> PendingEscape {
     if data.is_empty() {
         return PendingEscape::None;
@@ -278,6 +309,7 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
 /// - SingleShift: any single byte completes the shift
 /// - NfSeq: a final byte 0x30-0x7E
 #[inline]
+#[cfg(unix)]
 fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape {
     match pending {
         PendingEscape::None => PendingEscape::None,
@@ -326,6 +358,7 @@ fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape 
 /// - 3-byte: 1110xxxx 10xxxxxx 10xxxxxx (starts 0xE0-0xEF)
 /// - 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx (starts 0xF0-0xF7)
 #[inline]
+#[cfg(unix)]
 fn pending_utf8_bytes(data: &[u8]) -> u8 {
     if data.is_empty() {
         return 0;
@@ -400,6 +433,7 @@ fn pending_utf8_bytes(data: &[u8]) -> u8 {
 /// This filter only DISCARDS title bytes — real output passes through immediately.
 /// Max 3 prefix bytes (ESC, ], digit) held at buffer boundary for one poll cycle.
 #[derive(Clone, Copy, PartialEq)]
+#[cfg(unix)]
 enum TitleFilterState {
     Pass,
     SawEsc,
@@ -412,11 +446,13 @@ enum TitleFilterState {
     InTitleSawEsc,
 }
 
+#[cfg(unix)]
 struct TitleOscFilter {
     state: TitleFilterState,
     discard_count: usize,
 }
 
+#[cfg(unix)]
 impl TitleOscFilter {
     fn new() -> Self {
         Self {
@@ -512,27 +548,36 @@ impl TitleOscFilter {
 }
 
 // Signal flags (set by signal handlers, checked in main loop)
+#[cfg(unix)]
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 // Exit reason flag lives in `delivery` so the delivery loop compiles without
 // the PTY wrapper; the proxy sets it here.
+#[cfg(unix)]
 use crate::delivery::EXIT_WAS_KILLED;
 
+#[cfg(unix)]
 pub extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
 }
 
+#[cfg(unix)]
 pub extern "C" fn handle_sigint(_: libc::c_int) {
     SIGINT_RECEIVED.store(true, Ordering::Release);
 }
 
+#[cfg(unix)]
 pub extern "C" fn handle_sigterm(_: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Release);
 }
 
+#[cfg(unix)]
 extern "C" fn handle_sighup(_: libc::c_int) {
     SIGHUP_RECEIVED.store(true, Ordering::Release);
 }
@@ -540,6 +585,7 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 /// Build minimal launch_context JSON from env vars available in the PTY process.
 /// Captures process_id and late-bound terminal metadata needed by kill.
 /// The start hook captures the full context (git_branch, tty, env snapshot) later.
+#[cfg(unix)]
 fn build_early_launch_context() -> String {
     use serde_json::{Map, Value};
 
@@ -645,6 +691,7 @@ impl Default for ProxyConfig {
 }
 
 /// PTY proxy that manages the child process and I/O forwarding
+#[cfg(unix)]
 pub struct Proxy {
     config: ProxyConfig,
     pty_master: OwnedFd,
@@ -674,6 +721,7 @@ pub struct Proxy {
     current_status: Arc<RwLock<String>>,
 }
 
+#[cfg(unix)]
 impl Proxy {
     /// Spawn a new PTY process
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
@@ -1806,6 +1854,7 @@ impl Proxy {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Proxy {
     fn drop(&mut self) {
         use crate::log::log_info;
@@ -1861,6 +1910,7 @@ impl Drop for Proxy {
     }
 }
 
+#[cfg(unix)]
 fn exit_code_from_status(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
@@ -1872,6 +1922,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     }
 }
 
+#[cfg(unix)]
 fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     let flags = fcntl(fd.as_fd(), FcntlArg::F_GETFL).context("fcntl F_GETFL failed")?;
     let flags = OFlag::from_bits_truncate(flags);
@@ -1880,6 +1931,7 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     let mut written = 0;
     while written < data.len() {
@@ -1896,6 +1948,7 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
@@ -1903,6 +1956,7 @@ fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
 /// Initialize delivery components with dependency injection for testing
 ///
 /// Returns (db, notify) on success, Err on failure
+#[cfg(unix)]
 fn initialize_delivery_components<DbF, NotifyF>(
     instance_name: &str,
     db_factory: DbF,
@@ -1925,7 +1979,7 @@ where
     Ok((db, notify))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
