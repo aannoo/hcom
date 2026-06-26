@@ -42,6 +42,11 @@ pub struct Proxy {
     rows: u16,
     cols: u16,
     delivery_handle: Option<JoinHandle<()>>,
+    /// Job object the child is assigned to (`KILL_ON_JOB_CLOSE`). Reaps the
+    /// child's whole tree even if this proxy dies abnormally and `Drop` never
+    /// runs. `None` if the child couldn't be assigned (falls back to the
+    /// snapshot-based kill in `Drop`).
+    _job: Option<job::KillOnDropJob>,
 }
 
 impl Proxy {
@@ -82,6 +87,10 @@ impl Proxy {
             let _ = db.update_instance_pid(instance_name, pid);
         }
 
+        // Tie the child to a kill-on-close job so its whole tree is reaped if we
+        // die abnormally (the explicit snapshot-kill in Drop covers clean exit).
+        let job = child.process_id().and_then(job::KillOnDropJob::assign);
+
         let initial_name = config.instance_name.clone().unwrap_or_default();
 
         Ok(Self {
@@ -98,6 +107,7 @@ impl Proxy {
             rows,
             cols,
             delivery_handle: None,
+            _job: job,
         })
     }
 
@@ -303,6 +313,12 @@ impl Proxy {
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        // Reap the child and any descendants it spawned (race-free snapshot
+        // walk). The `_job` field's kill-on-close is the backstop for the case
+        // where Drop never runs.
+        if let Some(pid) = self.child.process_id() {
+            let _ = crate::sys::process::kill_group(pid);
+        }
         let _ = self.child.kill();
         if let Some(ref instance_name) = self.config.instance_name
             && let Ok(db) = HcomDb::open()
@@ -457,6 +473,78 @@ fn update_screen_state(
         };
         state.last_output = screen.last_output_instant();
         state.cols = screen.cols();
+    }
+}
+
+/// A job object whose assigned processes are killed when the handle closes.
+mod job {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    pub struct KillOnDropJob {
+        /// HANDLE stored as `isize` (matches the console module) so the field
+        /// stays `Send` and doesn't infect the proxy with a raw pointer.
+        handle: isize,
+    }
+
+    impl KillOnDropJob {
+        /// Create a `KILL_ON_JOB_CLOSE` job and assign `pid` to it. Returns
+        /// `None` (caller falls back to an explicit kill) if any step fails —
+        /// e.g. the process already exited or assignment is refused.
+        pub fn assign(pid: u32) -> Option<Self> {
+            // SAFETY: each handle is closed on every failure path; the limit
+            // struct is zero-initialized before its one field is set.
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let set = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if set == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if proc.is_null() {
+                    CloseHandle(handle);
+                    return None;
+                }
+                let assigned = AssignProcessToJobObject(handle, proc);
+                CloseHandle(proc);
+                if assigned == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                Some(KillOnDropJob {
+                    handle: handle as isize,
+                })
+            }
+        }
+    }
+
+    impl Drop for KillOnDropJob {
+        fn drop(&mut self) {
+            // Closing the last handle to a KILL_ON_JOB_CLOSE job terminates
+            // every process still assigned to it.
+            // SAFETY: handle came from CreateJobObjectW and is closed once.
+            unsafe {
+                CloseHandle(self.handle as _);
+            }
+        }
     }
 }
 

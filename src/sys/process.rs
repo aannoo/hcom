@@ -86,8 +86,9 @@ pub enum GroupSignal {
 
 /// Send a graceful termination request to a process group by PID.
 ///
-/// Unix: `killpg(SIGTERM)`. Windows has no process-group signal, so this
-/// terminates the single process.
+/// Unix: `killpg(SIGTERM)`. Windows has no process-group signal and no graceful
+/// per-tree signal for an unrelated process, so this maps to a forceful
+/// process-tree termination ([`kill_tree_win`]) — the same as [`kill_group`].
 pub fn terminate_group(pid: u32) -> GroupSignal {
     #[cfg(unix)]
     {
@@ -95,17 +96,17 @@ pub fn terminate_group(pid: u32) -> GroupSignal {
     }
     #[cfg(windows)]
     {
-        if terminate_win(pid) {
-            GroupSignal::Sent
-        } else {
-            GroupSignal::NotFound
-        }
+        kill_tree_win(pid)
     }
 }
 
 /// Forcefully kill a process group by PID.
 ///
-/// Unix: `killpg(SIGKILL)`. Windows terminates the single process.
+/// Unix: `killpg(SIGKILL)`. Windows has no process groups in the POSIX sense, so
+/// this terminates the target PID **and all of its descendants** via a process
+/// snapshot ([`kill_tree_win`]). This matters because hcom records the PID of
+/// the launcher (e.g. the background `powershell` host), and the real agent runs
+/// as its child; killing only the recorded PID would orphan the agent.
 pub fn kill_group(pid: u32) -> GroupSignal {
     #[cfg(unix)]
     {
@@ -113,11 +114,7 @@ pub fn kill_group(pid: u32) -> GroupSignal {
     }
     #[cfg(windows)]
     {
-        if terminate_win(pid) {
-            GroupSignal::Sent
-        } else {
-            GroupSignal::NotFound
-        }
+        kill_tree_win(pid)
     }
 }
 
@@ -159,8 +156,8 @@ pub fn exec_replace(mut cmd: Command) -> std::io::Error {
 ///
 /// Unix: `killpg(SIGKILL)` on the child's group (set up via [`detach_session`]),
 /// falling back to `Child::kill` if the group signal fails. Windows: terminates
-/// the child process directly (full job-object group semantics are a later
-/// phase).
+/// the child's whole process tree ([`kill_tree_win`]), then reaps the immediate
+/// child handle so the OS releases it.
 pub fn kill_child_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -172,6 +169,11 @@ pub fn kill_child_group(child: &mut std::process::Child) {
         {
             return;
         }
+    }
+
+    #[cfg(windows)]
+    {
+        kill_tree_win(child.id());
     }
 
     let _ = child.kill();
@@ -220,6 +222,81 @@ fn terminate_win(pid: u32) -> bool {
         CloseHandle(handle);
         ok
     }
+}
+
+/// Terminate `root` and all of its descendants.
+///
+/// Windows has no process groups, so the only general way to "kill the agent and
+/// its children" by PID from an unrelated process is to walk the parent/child
+/// links in a process snapshot. The full descendant set is collected from a
+/// single snapshot *before* any termination, so killing a parent can't strand a
+/// child behind a now-stale parent PID (Windows does not reparent orphans).
+///
+/// Returns `Sent` if the root was present (and termination was attempted),
+/// `NotFound` if no live process had the root PID. Like `killpg`, individual
+/// termination failures are best-effort and don't change the result.
+///
+/// Caveat: PID reuse can make a parent link stale; this shares the same
+/// theoretical race as `taskkill /T`, which is the accepted Windows approach.
+#[cfg(windows)]
+fn kill_tree_win(root: u32) -> GroupSignal {
+    use std::collections::HashMap;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // Build pid -> parent_pid for every live process from one snapshot.
+    let mut parents: HashMap<u32, u32> = HashMap::new();
+    // SAFETY: snapshot handle is closed before returning; the PROCESSENTRY32W is
+    // fully initialized (dwSize set) before the enumeration calls.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            // Can't enumerate; fall back to killing just the root.
+            return if terminate_win(root) {
+                GroupSignal::Sent
+            } else {
+                GroupSignal::NotFound
+            };
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+
+    if !parents.contains_key(&root) {
+        return GroupSignal::NotFound;
+    }
+
+    // Collect root + all descendants (BFS over the parent links).
+    let mut tree = vec![root];
+    let mut i = 0;
+    while i < tree.len() {
+        let current = tree[i];
+        for (&pid, &ppid) in &parents {
+            if ppid == current && !tree.contains(&pid) {
+                tree.push(pid);
+            }
+        }
+        i += 1;
+    }
+
+    // Terminate children before parents (deepest first) so a parent can't spawn
+    // a new child after we've passed it.
+    for &pid in tree.iter().rev() {
+        terminate_win(pid);
+    }
+    GroupSignal::Sent
 }
 
 #[cfg(test)]
