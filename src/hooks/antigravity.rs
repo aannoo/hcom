@@ -1125,6 +1125,10 @@ mod tests {
         assert!(!remove_antigravity_hooks());
     }
 
+    // Unix-only: redirects the home dir via $HOME, but on Windows
+    // `dirs::home_dir()` reads USERPROFILE and ignores it, so the home-based
+    // cleanup dir points outside the test's temp tree.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_remove_cleans_default_and_active_hcom_dir_local_paths() {

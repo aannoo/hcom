@@ -849,6 +849,10 @@ mod tests {
         );
     }
 
+    // Unix-only: relies on redirecting the home dir via $HOME, but on Windows
+    // `dirs::home_dir()` reads USERPROFILE and ignores the test's temp HOME, so
+    // the normal-vs-isolated mode check never sees the override.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn normal_mode_permissions_honor_cursor_config_dir() {
@@ -942,6 +946,9 @@ mod tests {
         );
     }
 
+    // Unix-only: same $HOME-redirection limitation as
+    // `normal_mode_permissions_honor_cursor_config_dir`.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn remove_cleans_default_and_isolated_paths() {

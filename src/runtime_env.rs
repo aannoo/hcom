@@ -58,7 +58,9 @@ pub(crate) fn set_terminal_title(instance_name: &str) {
     }
 }
 
-#[cfg(test)]
+// Unix-only: these assert $HOME resolution and POSIX path canonicalization
+// (Windows resolves USERPROFILE and prefixes canonical paths with \\?\).
+#[cfg(all(test, unix))]
 mod tests {
     use crate::hooks::test_helpers::EnvGuard;
     use serial_test::serial;

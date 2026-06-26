@@ -365,6 +365,11 @@ impl HcomDb {
                 // recovery can re-register them into the fresh DB.
                 self.snapshot_running_to_pidtrack();
 
+                // Release our handle to the old DB file before archiving. Windows
+                // refuses to delete a file that still has an open handle; Unix
+                // unlinks an open file fine, so this is a no-op there.
+                self.conn = Connection::open_in_memory()?;
+
                 // Archive the old DB
                 let archive_path = Self::archive_db_at(&self.db_path)?;
                 if let Some(ref path) = archive_path {

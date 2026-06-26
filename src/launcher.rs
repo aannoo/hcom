@@ -2864,6 +2864,9 @@ mod tests {
         );
     }
 
+    // Unix-only: asserts the bash runner's `. 'sidecar'` sourcing + unset block;
+    // Windows generates a PowerShell runner with a different shape.
+    #[cfg(unix)]
     #[test]
     fn test_runner_script_strips_instance_state_vars() {
         let env = HashMap::from([

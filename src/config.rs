@@ -1321,6 +1321,9 @@ mod tests {
         }
     }
 
+    // Unix-only: asserts against $HOME and POSIX absolute paths; Windows
+    // resolves the base dir from USERPROFILE and treats "/x" as drive-relative.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_default_config_uses_home_hcom() {
@@ -1335,6 +1338,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_hcom_dir_overrides_home() {
@@ -1431,6 +1435,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_hcom_dir_absolute_stays_absolute() {

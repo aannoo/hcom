@@ -572,6 +572,9 @@ mod tests {
         assert_eq!(t.symbol(), "✗");
     }
 
+    // Unix-only: `is_in_path` splits PATH on ':' and doesn't apply PATHEXT, so
+    // it (and this test's `ls`) only make sense on Unix.
+    #[cfg(unix)]
     #[test]
     fn test_is_in_path() {
         // ls should be in PATH on any Unix system

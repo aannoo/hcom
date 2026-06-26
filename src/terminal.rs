@@ -2417,6 +2417,8 @@ mod tests {
         assert_eq!(dir, Path::new("/h/.warp/launch_configurations"));
     }
 
+    // Unix-only: Warp is a macOS terminal and the assertion pins POSIX paths.
+    #[cfg(unix)]
     #[test]
     fn test_write_warp_launch_config_writes_to_stable_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2529,6 +2531,9 @@ mod tests {
         );
     }
 
+    // Unix-only: "/abs/path" isn't absolute on Windows (no drive), so it would
+    // be rewritten to the current dir.
+    #[cfg(unix)]
     #[test]
     fn test_resolve_warp_cwd_keeps_absolute() {
         let home = Path::new("/h");

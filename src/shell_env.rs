@@ -372,6 +372,9 @@ mod tests {
         assert_ne!(child_session, current_session);
     }
 
+    // Unix-only: drives a POSIX shell (`env -0`, sh loops) that isn't resolved
+    // on Windows.
+    #[cfg(unix)]
     #[test]
     fn resolver_discards_stderr_without_breaking_env_resolution() {
         let shell = test_shell_path();
