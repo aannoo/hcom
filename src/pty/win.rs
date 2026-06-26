@@ -1,0 +1,405 @@
+//! Windows ConPTY proxy — the Windows-native equivalent of the Unix PTY wrapper.
+//!
+//! The Unix proxy (`super`) is built on `openpty` + `nix::poll`. Windows has no
+//! such primitives, so this spawns the tool under a **ConPTY** (via
+//! `portable-pty`) and drives it with blocking IO threads instead of a poll
+//! loop. The upper layers are reused unchanged: [`ScreenTracker`] for vt100
+//! screen tracking, [`InjectServer`] for TCP text injection, and
+//! [`run_delivery_loop`] for notify-driven message delivery. This is what lets
+//! an **idle** agent be woken on Windows (the M1 limitation): the delivery loop
+//! injects `<hcom>` text into the ConPTY input when a message arrives.
+
+use anyhow::{Context, Result};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+use super::ProxyConfig;
+use super::inject::{InjectResult, InjectServer};
+use super::screen::ScreenTracker;
+
+use crate::db::HcomDb;
+use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop};
+use crate::log::{log_error, log_info, log_warn};
+use crate::notify::NotifyServer;
+
+/// Windows ConPTY-backed PTY proxy.
+pub struct Proxy {
+    config: ProxyConfig,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    screen_state: Arc<RwLock<ScreenState>>,
+    launch_phase_active: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    notify_port: Arc<AtomicU16>,
+    current_name: Arc<RwLock<String>>,
+    current_status: Arc<RwLock<String>>,
+    rows: u16,
+    cols: u16,
+    delivery_handle: Option<JoinHandle<()>>,
+}
+
+impl Proxy {
+    /// Spawn `command` under a ConPTY and prepare the proxy.
+    pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("openpty (ConPTY) failed")?;
+
+        let mut cmd = CommandBuilder::new(command);
+        cmd.args(args);
+        for (k, v) in &config.env_vars {
+            cmd.env(k, v);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .context("ConPTY spawn failed")?;
+        // The parent does not need the slave handle once the child holds it.
+        drop(pair.slave);
+
+        let writer = pair.master.take_writer().context("take_writer failed")?;
+
+        // Persist PID so `hcom kill` can target the agent.
+        if let Some(ref instance_name) = config.instance_name
+            && let Ok(db) = HcomDb::open()
+            && let Some(pid) = child.process_id()
+        {
+            let _ = db.update_instance_pid(instance_name, pid);
+        }
+
+        let initial_name = config.instance_name.clone().unwrap_or_default();
+
+        Ok(Self {
+            config,
+            child,
+            master: pair.master,
+            writer: Arc::new(Mutex::new(writer)),
+            screen_state: Arc::new(RwLock::new(ScreenState::default())),
+            launch_phase_active: Arc::new(AtomicBool::new(true)),
+            running: Arc::new(AtomicBool::new(true)),
+            notify_port: Arc::new(AtomicU16::new(0)),
+            current_name: Arc::new(RwLock::new(initial_name)),
+            current_status: Arc::new(RwLock::new(String::new())),
+            rows,
+            cols,
+            delivery_handle: None,
+        })
+    }
+
+    /// Run the proxy until the child exits, returning its exit code.
+    pub fn run(&mut self) -> Result<i32> {
+        // Put our console into raw + VT passthrough so the tool's TUI renders
+        // and keystrokes flow through unbuffered. Restored on drop.
+        let _console = console::RawConsoleGuard::enable();
+
+        let inject_server = InjectServer::new()?;
+        let inject_port = inject_server.port();
+
+        self.spawn_reader_thread();
+        self.spawn_stdin_thread();
+        self.spawn_inject_thread(inject_server);
+        self.spawn_delivery_thread(inject_port);
+
+        // Block until the child exits.
+        let status = self.child.wait().context("waiting for ConPTY child")?;
+        let exit_code = status.exit_code() as i32;
+
+        // Signal threads to stop and wake the delivery loop's notify select.
+        self.running.store(false, Ordering::Release);
+        let port = self.notify_port.load(Ordering::Acquire);
+        if port != 0 {
+            let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        }
+        if let Some(handle) = self.delivery_handle.take() {
+            let _ = handle.join();
+        }
+
+        Ok(exit_code)
+    }
+
+    /// PTY output → our stdout, feeding the screen tracker and the shared
+    /// screen state the delivery loop reads. portable-pty's reader blocks, so a
+    /// dedicated thread replaces the Unix poll loop.
+    fn spawn_reader_thread(&self) {
+        let reader = match self.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                log_error("native", "win.reader", &format!("try_clone_reader: {e}"));
+                return;
+            }
+        };
+        let running = self.running.clone();
+        let screen_state = self.screen_state.clone();
+        let launch_phase = self.launch_phase_active.clone();
+        let tool_name = self.config.target.name().to_string();
+        let ready_pattern = self.config.ready_pattern.clone();
+        let instance = self.config.instance_name.clone();
+        let (rows, cols) = (self.rows, self.cols);
+
+        thread::spawn(move || {
+            let mut reader = reader;
+            let mut screen =
+                ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
+            let mut stdout = std::io::stdout();
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // child exited / PTY closed
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        let _ = stdout.write_all(data);
+                        let _ = stdout.flush();
+                        screen.process(data);
+                        update_screen_state(&screen_state, &screen, &tool_name, &launch_phase);
+                    }
+                    Err(_) => break,
+                }
+            }
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    /// Our stdin → PTY input. Detached: a blocking stdin read can outlive the
+    /// child, but the process exits when `run` returns.
+    fn spawn_stdin_thread(&self) {
+        let writer = self.writer.clone();
+        let running = self.running.clone();
+        thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 4096];
+            loop {
+                if !running.load(Ordering::Acquire) {
+                    break;
+                }
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = w.write_all(&buf[..n]);
+                            let _ = w.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    /// InjectServer → PTY input. Polls for inject connections (the delivery loop
+    /// and `hcom term inject` connect here) and writes the text to the ConPTY.
+    fn spawn_inject_thread(&self, mut inject_server: InjectServer) {
+        let writer = self.writer.clone();
+        let running = self.running.clone();
+        thread::spawn(move || {
+            while running.load(Ordering::Acquire) {
+                // Drain the accept queue.
+                while matches!(inject_server.accept(), Ok(true)) {}
+                // Process clients high-to-low so completed-client removal inside
+                // read_client doesn't shift indices we haven't visited.
+                for i in (0..inject_server.client_count()).rev() {
+                    match inject_server.read_client(i) {
+                        Ok(InjectResult::Inject(text)) => {
+                            if let Ok(mut w) = writer.lock() {
+                                let _ = w.write_all(text.as_bytes());
+                                let _ = w.flush();
+                            }
+                        }
+                        // Screen queries (`hcom term`) are not served by the
+                        // ConPTY proxy yet; answer empty so the client unblocks.
+                        Ok(InjectResult::Query(q)) => q.respond(""),
+                        _ => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
+    /// Notify-driven delivery loop: wakes on `hcom send` and injects the message
+    /// into the ConPTY (via `inject_port`), which is how an idle agent reacts.
+    fn spawn_delivery_thread(&mut self, inject_port: u16) {
+        let running = self.running.clone();
+        let screen_state = self.screen_state.clone();
+        let launch_phase = self.launch_phase_active.clone();
+        let notify_port_shared = self.notify_port.clone();
+        let shared_name = self.current_name.clone();
+        let shared_status = self.current_status.clone();
+        let instance_name = self.config.instance_name.clone().unwrap_or_default();
+        let delivery_tool = self.config.target.delivery_tool();
+        let user_activity_cooldown_ms = 500u64;
+
+        let handle = thread::spawn(move || {
+            let mut db = match HcomDb::open() {
+                Ok(db) => db,
+                Err(e) => {
+                    log_error("native", "win.delivery.init", &format!("db open: {e}"));
+                    return;
+                }
+            };
+            let notify = match NotifyServer::new() {
+                Ok(n) => n,
+                Err(e) => {
+                    log_error("native", "win.delivery.init", &format!("notify: {e}"));
+                    return;
+                }
+            };
+            notify_port_shared.store(notify.port(), Ordering::Release);
+            if let Err(e) = db.register_inject_port(&instance_name, inject_port) {
+                log_warn("native", "win.inject.register", &format!("{e}"));
+            }
+            log_info(
+                "native",
+                "win.delivery.start",
+                &format!("ConPTY delivery loop for {instance_name}"),
+            );
+
+            let state = DeliveryState {
+                screen: screen_state,
+                launch_phase_active: launch_phase,
+                inject_port,
+                user_activity_cooldown_ms,
+            };
+            let config = ToolConfig::for_tool(delivery_tool);
+
+            run_delivery_loop(
+                running,
+                &mut db,
+                &notify,
+                &state,
+                &instance_name,
+                &config,
+                Some(shared_name),
+                Some(shared_status),
+            );
+        });
+        self.delivery_handle = Some(handle);
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        let _ = self.child.kill();
+        if let Some(ref instance_name) = self.config.instance_name
+            && let Ok(db) = HcomDb::open()
+        {
+            let _ = db.delete_notify_endpoint(instance_name, "inject");
+        }
+    }
+}
+
+/// Refresh the shared [`ScreenState`] from the screen tracker so the delivery
+/// loop's gates (idle / ready / prompt-empty) see current screen contents.
+/// A trimmed Windows counterpart to the Unix proxy's `update_delivery_state`;
+/// approval-scrape latching (Codex/Cursor) is deferred.
+fn update_screen_state(
+    screen_state: &Arc<RwLock<ScreenState>>,
+    screen: &ScreenTracker,
+    tool_name: &str,
+    launch_phase: &Arc<AtomicBool>,
+) {
+    if let Ok(mut state) = screen_state.write() {
+        state.ready = screen.is_ready();
+        let input_text = screen.get_input_box_text(tool_name);
+        let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
+        // Stamp the submit-edge cooldown when input goes from a known non-empty
+        // value to empty/undetected, mirroring the Unix proxy so the gate does
+        // not double-deliver during the hook's status-flip lag.
+        let was_non_empty = state.input_text.as_deref().is_some_and(|t| !t.is_empty());
+        let now_empty = input_text.as_deref().map(|t| t.is_empty()).unwrap_or(true);
+        if was_non_empty && now_empty {
+            state.last_prompt_submit = Some(Instant::now());
+        }
+        state.prompt_empty = new_prompt_empty;
+        state.input_text = input_text;
+        state.visible_tail = if launch_phase.load(Ordering::Acquire) {
+            screen.visible_tail(5, 500)
+        } else {
+            None
+        };
+        state.last_output = screen.last_output_instant();
+        state.cols = screen.cols();
+    }
+}
+
+/// Windows console raw-mode + VT passthrough, restored on drop.
+mod console {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+        GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+
+    pub struct RawConsoleGuard {
+        stdin_handle: isize,
+        stdout_handle: isize,
+        prev_in: CONSOLE_MODE,
+        prev_out: CONSOLE_MODE,
+        restore: bool,
+    }
+
+    impl RawConsoleGuard {
+        /// Best-effort: disable line input/echo on stdin, enable VT input, and
+        /// enable VT processing on stdout so the child's escape sequences render.
+        /// If the handles aren't consoles (piped), this is a no-op.
+        pub fn enable() -> Self {
+            // SAFETY: GetStdHandle returns process-owned console handles; the
+            // mode getters/setters only touch those handles.
+            unsafe {
+                let stdin_handle = GetStdHandle(STD_INPUT_HANDLE) as isize;
+                let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE) as isize;
+                let mut prev_in: CONSOLE_MODE = 0;
+                let mut prev_out: CONSOLE_MODE = 0;
+                let ok_in = GetConsoleMode(stdin_handle as _, &mut prev_in) != 0;
+                let ok_out = GetConsoleMode(stdout_handle as _, &mut prev_out) != 0;
+                if ok_in {
+                    let raw_in = (prev_in
+                        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                        | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                    SetConsoleMode(stdin_handle as _, raw_in);
+                }
+                if ok_out {
+                    SetConsoleMode(
+                        stdout_handle as _,
+                        prev_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                    );
+                }
+                RawConsoleGuard {
+                    stdin_handle,
+                    stdout_handle,
+                    prev_in,
+                    prev_out,
+                    restore: ok_in || ok_out,
+                }
+            }
+        }
+    }
+
+    impl Drop for RawConsoleGuard {
+        fn drop(&mut self) {
+            if !self.restore {
+                return;
+            }
+            // SAFETY: restoring the previously-read modes on the same handles.
+            unsafe {
+                SetConsoleMode(self.stdin_handle as _, self.prev_in);
+                SetConsoleMode(self.stdout_handle as _, self.prev_out);
+            }
+        }
+    }
+}

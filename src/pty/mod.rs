@@ -11,6 +11,11 @@ mod inject;
 pub mod screen;
 #[cfg(unix)]
 mod terminal;
+#[cfg(windows)]
+mod win;
+
+#[cfg(windows)]
+pub use win::Proxy;
 
 #[cfg(unix)]
 use anyhow::{Context, Result, bail};

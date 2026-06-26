@@ -39,12 +39,8 @@ pub mod transcript;
 mod tui;
 mod update;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::panic;
-// Used only by the Unix PTY wrapper (run_pty).
-#[cfg(unix)]
-use anyhow::Context;
-#[cfg(unix)]
 use std::str::FromStr;
 
 fn main() -> Result<()> {
@@ -73,16 +69,8 @@ fn main() -> Result<()> {
 
 /// Run PTY wrapper mode.
 ///
-/// The PTY wrapper (screen tracking + message injection) is built on Unix
-/// pseudo-terminals and is not yet available on Windows; native ConPTY support
-/// is a later phase. Messaging, relay, hooks, and launching all work without it.
-#[cfg(windows)]
-pub fn run_pty(_args: &[String]) -> Result<()> {
-    bail!("PTY wrapper mode is not yet supported on Windows");
-}
-
-/// Run PTY wrapper mode.
-#[cfg(unix)]
+/// Uses Unix pseudo-terminals on Unix and ConPTY (via `portable-pty`) on
+/// Windows; the proxy backend is selected inside `pty::Proxy`.
 pub fn run_pty(args: &[String]) -> Result<()> {
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!("hcom pty - PTY wrapper for hcom");
@@ -174,7 +162,6 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     std::process::exit(exit_code);
 }
 
-#[cfg(unix)]
 fn pty_child_env() -> Vec<(String, String)> {
     vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
 }
@@ -228,7 +215,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_pty_child_env_marks_launched() {
         assert_eq!(
