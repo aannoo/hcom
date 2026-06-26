@@ -156,13 +156,22 @@ impl Proxy {
             let mut screen =
                 ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
             let mut stdout = std::io::stdout();
+            let mut filter = OutputModeFilter::default();
             let mut buf = [0u8; 8192];
+            let mut scratch: Vec<u8> = Vec::with_capacity(8192);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // child exited / PTY closed
                     Ok(n) => {
                         let data = &buf[..n];
-                        let _ = stdout.write_all(data);
+                        // Strip the child's Win32-input/focus mode-set sequences
+                        // before they reach the *outer* terminal (see
+                        // OutputModeFilter); otherwise the outer terminal answers
+                        // the child's DSR query in Win32 input-record encoding,
+                        // which the child can't parse, and startup hangs.
+                        scratch.clear();
+                        filter.filter(data, &mut scratch);
+                        let _ = stdout.write_all(&scratch);
                         let _ = stdout.flush();
                         screen.process(data);
                         update_screen_state(&screen_state, &screen, &tool_name, &launch_phase);
@@ -300,6 +309,120 @@ impl Drop for Proxy {
         {
             let _ = db.delete_notify_endpoint(instance_name, "inject");
         }
+    }
+}
+
+/// Strips the child's DEC private-mode **sets** for Win32 input mode (`?9001`)
+/// and focus reporting (`?1004`) from the output stream, so the *outer*
+/// terminal is never switched into them.
+///
+/// A ConPTY wrapper sits between the child and the real terminal. If the child's
+/// `ESC[?9001h` reaches the outer terminal, that terminal starts encoding its
+/// input — including its automatic `ESC[6n` (cursor position) reply — as Win32
+/// input records. The child, which only understands a plain `ESC[15;1R`, then
+/// waits forever for a reply it can parse. Dropping these mode-sets keeps the
+/// outer terminal in normal VT mode so the DSR reply round-trips correctly.
+///
+/// Only complete `CSI ? 9001/1004 h|l` sequences are dropped; the parser is
+/// stateful so sequences split across reads are handled, and every other byte
+/// (including all other escape sequences) passes through unchanged.
+#[derive(Default)]
+struct OutputModeFilter {
+    state: FilterState,
+    buf: Vec<u8>,
+}
+
+#[derive(Default, PartialEq)]
+enum FilterState {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+}
+
+impl OutputModeFilter {
+    fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        for &b in input {
+            match self.state {
+                FilterState::Ground => {
+                    if b == 0x1b {
+                        self.buf.clear();
+                        self.buf.push(b);
+                        self.state = FilterState::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                FilterState::Esc => {
+                    self.buf.push(b);
+                    if b == b'[' {
+                        self.state = FilterState::Csi;
+                    } else {
+                        // Not a CSI sequence — pass through untouched.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::Ground;
+                    }
+                }
+                FilterState::Csi => {
+                    self.buf.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        if !self.is_blocked() {
+                            out.extend_from_slice(&self.buf);
+                        }
+                        self.buf.clear();
+                        self.state = FilterState::Ground;
+                    } else if self.buf.len() > 32 {
+                        // Malformed/overlong — give up filtering, emit as-is.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::Ground;
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_blocked(&self) -> bool {
+        self.buf.starts_with(b"\x1b[?9001") || self.buf.starts_with(b"\x1b[?1004")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputModeFilter;
+
+    fn run(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+        for c in chunks {
+            f.filter(c, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn drops_win32_and_focus_mode_sets() {
+        // ESC[?9001h ESC[?1004h "hi" ESC[6n
+        let input = b"\x1b[?9001h\x1b[?1004h hi \x1b[6n";
+        assert_eq!(run(&[input]), b" hi \x1b[6n");
+    }
+
+    #[test]
+    fn passes_other_sequences_and_text() {
+        let input = b"\x1b[31mred\x1b[0m\x1b[2J plain";
+        assert_eq!(run(&[input]), input);
+    }
+
+    #[test]
+    fn handles_sequence_split_across_reads() {
+        // ESC[?9001h split mid-sequence must still be dropped.
+        assert_eq!(run(&[b"\x1b[?90", b"01h", b"X"]), b"X");
+    }
+
+    #[test]
+    fn drops_mode_reset_too() {
+        assert_eq!(run(&[b"\x1b[?9001l\x1b[?1004lY"]), b"Y");
     }
 }
 
