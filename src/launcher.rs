@@ -675,11 +675,9 @@ fn build_claude_command(args: &[String]) -> String {
 /// Tool-specific extra environment variables for PTY mode.
 fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
-    // On Windows there is no PTY wrapper (the tool is launched directly), so the
-    // Stop hook must run its own poll loop rather than defer to a wrapper that
-    // would handle injection. Setting HCOM_PTY_MODE there makes the hook exit
-    // immediately and messages are never delivered.
-    if tool == "claude" && !cfg!(windows) {
+    // Claude is driven by the PTY wrapper (ConPTY on Windows, openpty on Unix),
+    // which handles injection; HCOM_PTY_MODE tells the Stop hook to defer to it.
+    if tool == "claude" {
         m.insert("HCOM_PTY_MODE".to_string(), "1".to_string());
     }
     if tool == "antigravity" {
@@ -706,12 +704,10 @@ fn background_runner_env(
     runner_env
 }
 
-/// Windows runner: a PowerShell script that runs the tool **directly**.
-///
-/// The PTY wrapper (`hcom pty`) is not yet available on Windows, so on Windows
-/// we launch the tool itself and rely on hcom's hooks for message delivery
-/// (screen-tracking / injection arrive with ConPTY in a later phase). Mirrors
-/// the bash runner's env scrubbing, HCOM env, secret sidecar, and PATH setup.
+/// Windows runner: a PowerShell script that launches the tool through the hcom
+/// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
+/// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
+/// runner's env scrubbing, HCOM env, secret sidecar, and PATH setup.
 fn create_runner_script_windows(
     tool: &str,
     cwd: &str,
@@ -832,17 +828,26 @@ fn create_runner_script_windows(
         )
     };
 
-    // Run the tool directly via the call operator (no PTY wrapper yet).
-    let tool_path = terminal::which_bin(tool_bin).unwrap_or_else(|| tool_bin.to_string());
+    // Run through the hcom PTY wrapper (ConPTY) so the tool is driven by the
+    // delivery loop — this is what wakes an idle agent on Windows. Mirrors the
+    // Unix runner's `hcom pty <tool>` call.
+    let hcom_bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "hcom".to_string());
     let args_str: String = tool_args
         .iter()
         .map(|a| terminal::ps_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
     let run_line = if args_str.is_empty() {
-        format!("& {}", terminal::ps_quote(&tool_path))
+        format!("& {} pty {}", terminal::ps_quote(&hcom_bin), tool)
     } else {
-        format!("& {} {}", terminal::ps_quote(&tool_path), args_str)
+        format!(
+            "& {} pty {} {}",
+            terminal::ps_quote(&hcom_bin),
+            tool,
+            args_str
+        )
     };
 
     let display = tool
@@ -870,7 +875,7 @@ fn create_runner_script_windows(
         "pty",
         "native.script",
         &format!(
-            "script={} tool={} instance={} (windows direct launch)",
+            "script={} tool={} instance={} (windows ConPTY launch)",
             script_file.display(),
             tool,
             instance_name
@@ -2647,16 +2652,10 @@ mod tests {
             runner_env.get("HCOM_INSTANCE_NAME").map(String::as_str),
             Some("hone")
         );
-        // Windows launches claude directly (no PTY wrapper), so the PTY-mode
-        // marker must be absent there or the Stop hook won't poll for messages.
-        if cfg!(windows) {
-            assert!(!runner_env.contains_key("HCOM_PTY_MODE"));
-        } else {
-            assert_eq!(
-                runner_env.get("HCOM_PTY_MODE").map(String::as_str),
-                Some("1")
-            );
-        }
+        assert_eq!(
+            runner_env.get("HCOM_PTY_MODE").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
