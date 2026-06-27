@@ -23,8 +23,8 @@ use super::inject::{InjectResult, InjectServer};
 use super::screen::ScreenTracker;
 
 use crate::db::HcomDb;
-use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop};
-use crate::log::{log_error, log_info, log_warn};
+use crate::delivery::{DeliveryState, EXIT_WAS_KILLED, ScreenState, ToolConfig, run_delivery_loop};
+use crate::log::{log_error, log_warn};
 use crate::notify::NotifyServer;
 
 /// Windows ConPTY-backed PTY proxy.
@@ -129,6 +129,13 @@ impl Proxy {
         let status = self.child.wait().context("waiting for ConPTY child")?;
         let exit_code = status.exit_code() as i32;
 
+        // Commit the exit reason before setting running=false. The delivery
+        // thread reads EXIT_WAS_KILLED in cleanup; if we set running=false first
+        // (or allow the reader thread to do so), the delivery loop can enter
+        // cleanup before this store — recording exit:closed for a kill.
+        // Exit code 130 is the sentinel written by terminate_win().
+        EXIT_WAS_KILLED.store(exit_code == 130, Ordering::Release);
+
         // Signal threads to stop and wake the delivery loop's notify select.
         self.running.store(false, Ordering::Release);
         let port = self.notify_port.load(Ordering::Acquire);
@@ -189,7 +196,11 @@ impl Proxy {
                     Err(_) => break,
                 }
             }
-            running.store(false, Ordering::Release);
+            // Do NOT store running=false here. Letting run() be the sole writer
+            // ensures EXIT_WAS_KILLED is committed before the delivery thread
+            // sees running=false and enters cleanup. If the reader set it first,
+            // the delivery loop could read EXIT_WAS_KILLED=false and record
+            // exit:closed even when the child was killed via `hcom kill`.
         });
     }
 
@@ -281,12 +292,6 @@ impl Proxy {
             if let Err(e) = db.register_inject_port(&instance_name, inject_port) {
                 log_warn("native", "win.inject.register", &format!("{e}"));
             }
-            log_info(
-                "native",
-                "win.delivery.start",
-                &format!("ConPTY delivery loop for {instance_name}"),
-            );
-
             let state = DeliveryState {
                 screen: screen_state,
                 launch_phase_active: launch_phase,
@@ -317,6 +322,10 @@ impl Drop for Proxy {
         // walk). The `_job` field's kill-on-close is the backstop for the case
         // where Drop never runs.
         if let Some(pid) = self.child.process_id() {
+            // Drop running kill_group means run() exited early (error path) and
+            // we are force-killing the child. Mark as killed so the delivery
+            // thread records exit:killed if it is still running.
+            EXIT_WAS_KILLED.store(true, Ordering::Release);
             let _ = crate::sys::process::kill_group(pid);
         }
         let _ = self.child.kill();

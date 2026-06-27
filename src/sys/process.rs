@@ -218,7 +218,10 @@ fn terminate_win(pid: u32) -> bool {
         if handle.is_null() {
             return false;
         }
-        let ok = TerminateProcess(handle, 1) != 0;
+        // Exit code 130 (128 + SIGINT) is the hcom sentinel for "externally
+        // killed via hcom kill". The pty proxy reads this back from child.wait()
+        // to set EXIT_WAS_KILLED before the delivery thread records exit status.
+        let ok = TerminateProcess(handle, 130) != 0;
         CloseHandle(handle);
         ok
     }
