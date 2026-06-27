@@ -54,11 +54,13 @@ pub fn kill(pid: u32) -> bool {
     }
 }
 
-/// Request termination of a process by PID. Best-effort; returns whether the
-/// request was delivered.
+/// Request graceful termination of a process by PID. Best-effort; returns
+/// whether the request was delivered. Like Unix `SIGTERM`, this only *asks* the
+/// process to exit — it does not force it. Callers that need a guarantee must
+/// wait and then escalate to [`kill`].
 ///
-/// Unix: `SIGTERM` (graceful). Windows has no general-purpose `SIGTERM` for an
-/// arbitrary unrelated process, so this maps to `TerminateProcess`.
+/// Unix: `SIGTERM`. Windows: `CTRL_BREAK_EVENT` to the target's process group
+/// (see [`request_shutdown_win`]), which mirrors the SIGTERM-sets-a-flag model.
 pub fn terminate(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -67,7 +69,7 @@ pub fn terminate(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        terminate_win(pid)
+        request_shutdown_win(pid)
     }
 }
 
@@ -206,6 +208,27 @@ pub fn detach_session(command: &mut Command) {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
+}
+
+/// Best-effort graceful shutdown request on Windows, the analogue of Unix
+/// `SIGTERM`: it asks the target to exit but does not force it.
+///
+/// Sends `CTRL_BREAK_EVENT` to the target's process group. Processes spawned via
+/// [`detach_session`] use `CREATE_NEW_PROCESS_GROUP`, so their process-group id
+/// equals their PID, and a process that has registered a handler (see
+/// `sys::signal::register_term`) sets its shutdown flag in response.
+///
+/// Delivery only reaches a process that shares the caller's console. A relay
+/// worker spawned from a different console (the common case) does not receive
+/// it, and this returns `false`; the caller's wait + [`kill`] fallback then
+/// terminates it. This matches Unix, where `SIGTERM` likewise only *requests*
+/// shutdown and callers escalate to `SIGKILL`.
+#[cfg(windows)]
+fn request_shutdown_win(pid: u32) -> bool {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // SAFETY: plain FFI call, no pointers; the process-group id is the target
+    // PID (valid because detach_session uses CREATE_NEW_PROCESS_GROUP).
+    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0 }
 }
 
 #[cfg(windows)]
