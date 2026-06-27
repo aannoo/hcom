@@ -255,9 +255,14 @@ fn kill_tree_win(root: u32) -> GroupSignal {
     // SAFETY: snapshot handle is closed before returning; the PROCESSENTRY32W is
     // fully initialized (dwSize set) before the enumeration calls.
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        let mut snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            // Can't enumerate; fall back to killing just the root.
+            // Snapshot can fail transiently under high load; retry once.
+            snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        }
+        if snapshot == INVALID_HANDLE_VALUE {
+            // Still can't enumerate; kill only the root. Any surviving
+            // descendants will be reaped when the job object closes.
             return if terminate_win(root) {
                 GroupSignal::Sent
             } else {
