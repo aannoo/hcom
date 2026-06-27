@@ -204,8 +204,17 @@ impl Proxy {
         });
     }
 
-    /// Our stdin → PTY input. Detached: a blocking stdin read can outlive the
-    /// child, but the process exits when `run` returns.
+    /// Our stdin → PTY input. Intentionally detached and never joined.
+    ///
+    /// The `running` check at the loop top only catches shutdown *between*
+    /// reads; a `stdin.read()` already blocked when the child exits cannot be
+    /// interrupted and outlives the child. This does not leak: `main` calls
+    /// `std::process::exit` immediately after `run` returns (and `Proxy::drop`),
+    /// which terminates the process and reaps this thread even mid-read. The
+    /// thread holds no lock across the blocking read, so it cannot wedge
+    /// cleanup. If `Proxy` ever gains a caller that keeps running after `run`
+    /// returns, this read would need an explicit interrupt (e.g.
+    /// `CancelSynchronousIo`).
     fn spawn_stdin_thread(&self) {
         let writer = self.writer.clone();
         let running = self.running.clone();
