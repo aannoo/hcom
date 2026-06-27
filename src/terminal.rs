@@ -949,11 +949,18 @@ pub fn create_powershell_script(
     if !tool_cmd.is_empty()
         && let Some(tool_path) = which_bin(tool_cmd)
     {
-        final_command = final_command.replacen(
+        let replaced = final_command.replacen(
             &format!("{tool_cmd} "),
             &format!("& {} ", ps_quote(&tool_path)),
             1,
         );
+        final_command = if replaced != final_command {
+            replaced
+        } else {
+            // No arguments: the command is exactly the tool name (no trailing
+            // space to match), so replace the bare name directly.
+            final_command.replacen(tool_cmd, &format!("& {}", ps_quote(&tool_path)), 1)
+        };
     }
 
     writeln!(f, "{final_command}")?;
