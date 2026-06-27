@@ -350,29 +350,9 @@ fn relay_push() -> i32 {
     0
 }
 
-fn stop_relay_worker_quiet() {
-    let Some(pid) = crate::relay::worker::relay_worker_pid() else {
-        return;
-    };
-
-    let _ = crate::relay::worker::stop_relay_worker();
-    for _ in 0..50 {
-        if !crate::pidtrack::is_alive(pid) {
-            crate::relay::worker::remove_relay_pid_file();
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Last resort: a stale worker pinned to the old namespace must not survive
-    // a relay reset or shutdown.
-    crate::sys::process::kill(pid);
-    crate::relay::worker::remove_relay_pid_file();
-}
-
 fn restart_relay_worker_for_config_change() -> bool {
     if crate::relay::worker::is_relay_worker_running() {
-        stop_relay_worker_quiet();
+        crate::relay::worker::stop_relay_worker_blocking();
     }
     crate::relay::worker::ensure_worker(false)
 }
@@ -471,7 +451,7 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
         }
     }
 
-    stop_relay_worker_quiet();
+    crate::relay::worker::stop_relay_worker_blocking();
     println!("{FG_YELLOW}Relay: disabled{RESET}");
     println!("\nRun 'hcom relay connect' to reconnect");
     0

@@ -507,6 +507,36 @@ pub fn stop_relay_worker() -> bool {
     false
 }
 
+/// Stop the relay worker and block until it exits, escalating to a force-kill
+/// if the graceful request does not take effect within ~5s. Removes the PID
+/// file once the worker is gone.
+///
+/// Unlike [`stop_relay_worker`], this *guarantees* termination. Callers with no
+/// other backstop must use this: [`terminate`](crate::sys::process::terminate)
+/// is best-effort and on Windows may not be delivered when the worker shares no
+/// console with the caller, so a bare `stop_relay_worker` could leave the worker
+/// running (the auto-exit watchdog only winds down when no local instances
+/// remain).
+pub fn stop_relay_worker_blocking() {
+    let Some(pid) = read_pid_file() else {
+        return;
+    };
+
+    let _ = stop_relay_worker();
+    for _ in 0..50 {
+        if !crate::pidtrack::is_alive(pid) {
+            remove_pid_file();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Graceful request did not take effect in time; force-kill so a stale
+    // worker cannot survive a relay reset/off.
+    crate::sys::process::kill(pid);
+    remove_pid_file();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
