@@ -260,6 +260,14 @@ const PI_HOOKS: &[&str] = &[
     "pi-stop",
 ];
 
+const OMP_HOOKS: &[&str] = &[
+    "omp-start",
+    "omp-status",
+    "omp-read",
+    "omp-beforetool",
+    "omp-stop",
+];
+
 const CURSOR_HOOKS: &[&str] = &[
     "cursor-sessionstart",
     "cursor-beforesubmitprompt",
@@ -354,6 +362,9 @@ const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
 
 const PI_HELP_EXAMPLES: &[HelpEntry] =
     &[("hcom pi --model claude-3-5-sonnet", "Use a specific model")];
+
+const OMP_HELP_EXAMPLES: &[HelpEntry] =
+    &[("hcom omp --model claude-3-5-sonnet", "Use a specific model")];
 
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
@@ -901,6 +912,56 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static OMP: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Omp,
+    name: "omp",
+    label: "Oh My Pi",
+    aliases: &["omp-agent"],
+    cli_binary: "omp",
+    tui_prefix: "omp ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"/ commands",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
+    instance_state_env: &[],
+    hooks: HooksSpec {
+        names: OMP_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::Argv,
+    },
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: false,
+        block_on_approval: true,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_OMP_ARGS"),
+        config_dir_env: Some("PI_CODING_AGENT_DIR"),
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: OMP_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["bash"],
+        file: &["edit", "write"],
+        delegate: &[],
+    },
+};
+
 pub static COPILOT: IntegrationSpec = IntegrationSpec {
     tool: Tool::Copilot,
     name: "copilot",
@@ -1013,6 +1074,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &OPENCODE,
     &KILO,
     &PI,
+    &OMP,
     &ANTIGRAVITY,
     &CURSOR,
     &KIMI,
@@ -1029,6 +1091,7 @@ impl Tool {
             Tool::Codex => &CODEX,
             Tool::OpenCode => &OPENCODE,
             Tool::Kilo => &KILO,
+            Tool::Omp => &OMP,
             Tool::Pi => &PI,
             Tool::Antigravity => &ANTIGRAVITY,
             Tool::Cursor => &CURSOR,
@@ -1082,6 +1145,7 @@ mod tests {
             Tool::Kimi,
             Tool::Copilot,
             Tool::Pi,
+            Tool::Omp,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
@@ -1147,7 +1211,8 @@ mod tests {
         assert!(names.contains(&"cursor"));
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
-        assert_eq!(names.len(), 10);
+        assert!(names.contains(&"omp"));
+        assert_eq!(names.len(), 11);
     }
 
     #[test]

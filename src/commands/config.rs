@@ -98,6 +98,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     ("HCOM_PI_ARGS", "Default args for pi on launch", "string"),
+    ("HCOM_OMP_ARGS", "Default args for omp on launch", "string"),
     (
         "HCOM_CURSOR_ARGS",
         "Default args for cursor-agent on launch",
@@ -209,6 +210,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "opencode_args" => Some("launch.opencode.args"),
         "kilo_args" => Some("launch.kilo.args"),
         "pi_args" => Some("launch.pi.args"),
+        "omp_args" => Some("launch.omp.args"),
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
         "copilot_args" => Some("launch.copilot.args"),

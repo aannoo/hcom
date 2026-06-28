@@ -47,6 +47,8 @@ pub mod test_helpers {
         saved_kilo_config_dir: Option<String>,
         saved_copilot_home: Option<String>,
         saved_test_codex_cli_version: Option<String>,
+        saved_pi_coding_agent_dir: Option<String>,
+        saved_pi_coding_agent_session_dir: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -71,6 +73,9 @@ pub mod test_helpers {
                 saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
                 saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
+                saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
+                saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
+                    .ok(),
                 _lock: lock,
             }
         }
@@ -114,6 +119,14 @@ pub mod test_helpers {
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
                     None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
+                }
+                match &self.saved_pi_coding_agent_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+                }
+                match &self.saved_pi_coding_agent_session_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
                 }
             }
             crate::config::Config::reset();
@@ -729,3 +742,4 @@ mod tests {
         }
     }
 }
+pub mod omp;

@@ -25,7 +25,7 @@ use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
     ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
-    OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
+    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -45,6 +45,7 @@ pub enum LaunchTool {
     Cursor,
     Kimi,
     Copilot,
+    Omp,
 }
 
 impl LaunchTool {
@@ -58,6 +59,7 @@ impl LaunchTool {
             "opencode" => Ok(LaunchTool::OpenCode),
             "kilo" | "kilocode" => Ok(LaunchTool::Kilo),
             "pi" | "pi-agent" => Ok(LaunchTool::Pi),
+            "omp" | "omp-agent" => Ok(LaunchTool::Omp),
             "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
@@ -75,6 +77,7 @@ impl LaunchTool {
             LaunchTool::OpenCode => "opencode",
             LaunchTool::Kilo => "kilo",
             LaunchTool::Pi => "pi",
+            LaunchTool::Omp => "omp",
             LaunchTool::Antigravity => "antigravity",
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
@@ -94,6 +97,7 @@ impl LaunchTool {
             LaunchTool::OpenCode => crate::tool::Tool::OpenCode,
             LaunchTool::Kilo => crate::tool::Tool::Kilo,
             LaunchTool::Pi => crate::tool::Tool::Pi,
+            LaunchTool::Omp => crate::tool::Tool::Omp,
             LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
@@ -163,6 +167,7 @@ impl LaunchBackend {
             | LaunchTool::OpenCode
             | LaunchTool::Kilo
             | LaunchTool::Pi
+            | LaunchTool::Omp
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
             | LaunchTool::Kimi
@@ -398,6 +403,7 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::Codex => ".codex",
         crate::tool::Tool::Kilo => ".kilo",
         crate::tool::Tool::Pi => ".pi",
+        crate::tool::Tool::Omp => ".omp",
         crate::tool::Tool::Cursor => ".cursor",
         crate::tool::Tool::Kimi => ".kimi",
         crate::tool::Tool::Copilot => ".copilot",
@@ -584,6 +590,13 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup Pi plugin. Run: hcom hooks add pi\n{diag}");
+        }
+        LaunchTool::Omp => {
+            if crate::hooks::omp::ensure_omp_plugin_installed() {
+                return Ok(());
+            }
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
         }
         LaunchTool::Antigravity => {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
@@ -1790,7 +1803,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     )
                 }
 
-                LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi => {
+                LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi | LaunchTool::Omp => {
                     opencode_preprocessing::preprocess_opencode_env(
                         &mut instance_env,
                         base_tool,
@@ -2036,6 +2049,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         }
         LaunchTool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
         LaunchTool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
+        LaunchTool::Omp => validate_rejected_args("Oh My Pi", "hcom omp", args, OMP_REJECTED_ARGS),
         LaunchTool::Antigravity => validate_rejected_args(
             "Antigravity",
             "hcom antigravity",

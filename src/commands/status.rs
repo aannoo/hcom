@@ -54,6 +54,7 @@ fn is_tool_installed(tool: crate::tool::Tool) -> bool {
         crate::tool::Tool::Antigravity => is_antigravity_installed(),
         crate::tool::Tool::Kilo => crate::terminal::which_bin("kilo").is_some(),
         crate::tool::Tool::Pi => crate::terminal::which_bin("pi").is_some(),
+        crate::tool::Tool::Omp => crate::terminal::which_bin("omp").is_some(),
         crate::tool::Tool::Cursor => crate::terminal::which_bin("cursor-agent").is_some(),
         crate::tool::Tool::Copilot => crate::terminal::which_bin("copilot").is_some(),
         crate::tool::Tool::Adhoc => false,

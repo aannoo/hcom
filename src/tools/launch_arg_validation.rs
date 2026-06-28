@@ -85,6 +85,19 @@ pub(crate) const PI_REJECTED_ARGS: &[RejectedArg] = &[
     },
 ];
 
+pub(crate) const OMP_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "-p",
+        reason: "runs non-interactively and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--print",
+        reason: "runs non-interactively and exits",
+        kind: RejectedArgKind::Flag,
+    },
+];
+
 pub(crate) const GEMINI_REJECTED_ARGS: &[RejectedArg] = &[
     RejectedArg {
         token: "-p",

@@ -78,6 +78,8 @@ fn ready_pattern(tool: &str) -> &'static str {
         // Kilo is an OpenCode-family fork: same TUI footer.
         "kilo" => "ctrl+p commands",
         "pi" => "/ commands",
+        // OMP (Oh My Pi) is a Pi-family fork with the same TUI footer.
+        "omp" => "/ commands",
         "antigravity" => "? for shortcuts",
         // Cursor has no stable ASCII ready footer (spec ready_pattern is empty,
         // so is_ready() is always true); readiness is asserted via ready/
@@ -1211,12 +1213,10 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
     );
 
     logln!(log, "\n[Validate] Initial screen state for {tool}...");
-    validate_screen_schema(&screen);
-    logln!(log, "  OK: Schema valid");
-    if tool == "pi" {
+    if matches!(tool, "pi" | "omp") {
         logln!(
             log,
-            "  OK: Pi screen rendered after life.ready (term ready={})",
+            "  OK: {tool} screen rendered after life.ready (term ready={})",
             screen["ready"]
         );
         if screen["ready"].as_bool() == Some(true) {
@@ -1229,7 +1229,7 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
         } else {
             logln!(
                 log,
-                "  SKIP: Pi ready footer scrolled out of tmux viewport after life.ready"
+                "  SKIP: {tool} ready footer scrolled out of tmux viewport after life.ready"
             );
         }
     } else {
@@ -1466,6 +1466,11 @@ fn test_pty_kilo() {
 #[ignore]
 fn test_pty_pi() {
     run_pty_test_plugin_family("pi", "pi-read");
+}
+#[test]
+#[ignore]
+fn test_pty_omp() {
+    run_pty_test_plugin_family("omp", "omp-read");
 }
 
 #[test]

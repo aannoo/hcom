@@ -58,6 +58,7 @@ enum TranscriptDiscovery {
     KimiSessions,
     CopilotSessionState,
     PiSessions,
+    OmpSessions,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +98,11 @@ static TRANSCRIPT_PROFILES: &[TranscriptProfile] = &[
         tool: Tool::Pi,
         backend: TranscriptBackend::PiJsonl,
         discovery: TranscriptDiscovery::PiSessions,
+    },
+    TranscriptProfile {
+        tool: Tool::Omp,
+        backend: TranscriptBackend::PiJsonl,
+        discovery: TranscriptDiscovery::OmpSessions,
     },
     TranscriptProfile {
         tool: Tool::Antigravity,
@@ -255,6 +261,8 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
         || (lower.contains("/session-state/") && file_name == "events.jsonl")
     {
         Some(Tool::Copilot)
+    } else if lower.contains("/.omp/agent/sessions/") {
+        Some(Tool::Omp)
     } else if lower.contains("/.pi/agent/sessions/")
         || lower.contains("/.pi/sessions/")
         || lower.contains("pi_coding_agent_session")
@@ -383,6 +391,23 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
             roots.push(home.join(".pi").join("agent").join("sessions"));
             roots
         }
+        TranscriptDiscovery::OmpSessions => {
+            let mut roots = Vec::new();
+            if let Ok(path) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+                && !path.is_empty()
+            {
+                roots.push(PathBuf::from(path));
+            }
+            // When the launcher isolates OMP config via PI_CODING_AGENT_DIR,
+            // sessions live under <dir>/sessions.
+            if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
+                && !dir.is_empty()
+            {
+                roots.push(PathBuf::from(dir).join("sessions"));
+            }
+            roots.push(home.join(".omp").join("agent").join("sessions"));
+            roots
+        }
         TranscriptDiscovery::OpenCodeDatabase | TranscriptDiscovery::KiloDatabase => Vec::new(),
     }
 }
@@ -489,6 +514,10 @@ mod tests {
             Some(Tool::Pi)
         );
         assert_eq!(
+            detect_tool_from_path("/h/.omp/agent/sessions/r/u.jsonl"),
+            Some(Tool::Omp)
+        );
+        assert_eq!(
             detect_tool_from_path("/h/.kimi-code/sessions/wd/u/agents/main/wire.jsonl"),
             Some(Tool::Kimi)
         );
@@ -575,5 +604,21 @@ mod tests {
                 assert!(!roots.is_empty(), "missing disk discovery roots for {tool}");
             }
         }
+    }
+
+    #[test]
+    fn omp_disk_roots_include_pi_coding_agent_dir_sessions() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe {
+            std::env::set_var("PI_CODING_AGENT_DIR", "/tmp/test-omp-agent");
+        }
+
+        let roots = disk_search_roots(Tool::Omp);
+        assert!(
+            roots
+                .iter()
+                .any(|r| r == &PathBuf::from("/tmp/test-omp-agent/sessions")),
+            "OMP roots must include PI_CODING_AGENT_DIR/sessions, got {roots:?}"
+        );
     }
 }

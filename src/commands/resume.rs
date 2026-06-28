@@ -1039,6 +1039,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
         crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
+        crate::tool::Tool::Omp => merge_omp_args(original, resume),
         crate::tool::Tool::Adhoc => {
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
@@ -1813,7 +1814,59 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some(("pi".to_string(), Some(path)));
     }
 
+    // 9. OMP
+    if let Some(path) = derive_omp_transcript_path(session_id) {
+        return Some(("omp".to_string(), Some(path)));
+    }
+
     None
+}
+
+/// Merge `omp` transcript arguments for a resumed or forked session.
+///
+/// Omp uses `--resume <id>`, and lacks `--fork` and `--session`.
+fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut i = 0;
+
+    while i < original.len() {
+        let token = &original[i];
+        let token_str = token.as_str();
+
+        if matches!(
+            token_str,
+            "--session" | "--session-id" | "--session-dir" | "--fork"
+        ) {
+            i += 2;
+            continue;
+        }
+        if matches!(token_str, "--continue" | "--resume")
+            || token_str.starts_with("--session=")
+            || token_str.starts_with("--session-id=")
+            || token_str.starts_with("--session-dir=")
+            || token_str.starts_with("--fork=")
+        {
+            i += 1;
+            continue;
+        }
+
+        if !token_str.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        preserved.push(token.clone());
+        if i + 1 < original.len() && !original[i + 1].starts_with('-') {
+            preserved.push(original[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut final_args = resume.to_vec();
+    final_args.extend(preserved);
+    final_args
 }
 
 /// Locate a Pi transcript by session id under the configured session dir
@@ -1826,6 +1879,40 @@ fn derive_pi_transcript_path(session_id: &str) -> Option<String> {
         roots.push(std::path::PathBuf::from(dir));
     }
     roots.push(dirs::home_dir()?.join(".pi").join("agent").join("sessions"));
+
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        if let Some(path) = find_pi_transcript_in_root(&root, session_id) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Locate an OMP transcript by session id. Searches, in order:
+/// `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR/sessions`, and the
+/// default `~/.omp/agent/sessions`. The `PI_CODING_AGENT_DIR` root matters
+/// when the launcher isolates OMP config into a project-local dir.
+fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
+    let mut roots = Vec::new();
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+        && !dir.is_empty()
+    {
+        roots.push(std::path::PathBuf::from(dir));
+    }
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        && !dir.is_empty()
+    {
+        roots.push(std::path::PathBuf::from(dir).join("sessions"));
+    }
+    roots.push(
+        dirs::home_dir()?
+            .join(".omp")
+            .join("agent")
+            .join("sessions"),
+    );
 
     for root in roots {
         if !root.exists() {
@@ -1970,6 +2057,15 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 .and_then(|data| data.get("cwd"))
                 .and_then(|cwd| cwd.as_str())
         }),
+        "omp" => scan_lines_for_cwd(path, 10, |v| {
+            if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                v.get("cwd")
+                    .or_else(|| v.get("session").and_then(|s| s.get("cwd")))
+                    .and_then(|c| c.as_str())
+            } else {
+                None
+            }
+        }),
         "pi" => scan_lines_for_cwd(path, 10, |v| {
             if v.get("type").and_then(|t| t.as_str()) == Some("session") {
                 v.get("cwd")
@@ -2082,6 +2178,7 @@ fn build_adopt_plan(
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
+                 - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
                  - Pi:       ~/.pi/agent/sessions/**/*{sid}*.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
