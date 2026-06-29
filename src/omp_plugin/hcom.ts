@@ -313,11 +313,17 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		startReconcileTimer();
 	});
 
-	pi.on("session_shutdown", async (event) => {
+	pi.on("session_shutdown", async (_event) => {
 		if (instanceName) {
-			await hcom(["omp-stop", "--name", instanceName, "--reason", event.reason ?? "shutdown"]);
+			await hcom(["omp-stop", "--name", instanceName, "--reason", "shutdown"]);
 		}
 		resetBinding();
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		currentCtx = ctx;
+		resetBinding();
+		await bindIdentity(ctx);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -330,21 +336,21 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	pi.on("input", async (event: InputEvent, ctx) => {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
-		if (!instanceName) return { action: "continue" };
+		if (!instanceName) return {};
 		if (event.source === "extension") {
-			await ackPending(event.streamingBehavior ?? "extension");
-			return { action: "continue" };
+			await ackPending("extension");
+			return {};
 		}
 		if (isBodylessWake(event.text) && pendingAckId === null) {
 			const pending = await fetchPending();
 			if (pending) {
 				pendingAckId = pending.maxId;
-				return { action: "transform", text: formatMessagesForInjection(pending.messages, instanceName) };
+				return { text: formatMessagesForInjection(pending.messages, instanceName) };
 			}
-			return { action: "handled" };
+			return { handled: true };
 		}
 		await reportStatus(ctx, "active", event.text.trim() === "<hcom>" ? "trigger" : "prompt");
-		return { action: "continue" };
+		return {};
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {

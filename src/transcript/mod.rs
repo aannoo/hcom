@@ -398,6 +398,11 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
             {
                 roots.push(PathBuf::from(path));
             }
+            if let Ok(path) = std::env::var("XDG_DATA_HOME")
+                && !path.is_empty()
+            {
+                roots.push(PathBuf::from(path).join("omp").join("sessions"));
+            }
             // When the launcher isolates OMP config via PI_CODING_AGENT_DIR,
             // sessions live under <dir>/sessions.
             if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
@@ -619,6 +624,22 @@ mod tests {
                 .iter()
                 .any(|r| r == &PathBuf::from("/tmp/test-omp-agent/sessions")),
             "OMP roots must include PI_CODING_AGENT_DIR/sessions, got {roots:?}"
+        );
+    }
+
+    #[test]
+    fn omp_disk_roots_include_xdg_data_home_sessions() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "/tmp/test-omp-xdg");
+        }
+
+        let roots = disk_search_roots(Tool::Omp);
+        assert!(
+            roots
+                .iter()
+                .any(|r| r == &PathBuf::from("/tmp/test-omp-xdg/omp/sessions")),
+            "OMP roots must include XDG_DATA_HOME/omp/sessions, got {roots:?}"
         );
     }
 }

@@ -42,6 +42,7 @@ pub mod test_helpers {
         saved_home: Option<String>,
         saved_cursor_config_dir: Option<String>,
         saved_xdg_config_home: Option<String>,
+        saved_xdg_data_home: Option<String>,
         saved_codex_home: Option<String>,
         saved_gemini_cli_home: Option<String>,
         saved_kilo_config_dir: Option<String>,
@@ -68,6 +69,7 @@ pub mod test_helpers {
                 saved_home: std::env::var("HOME").ok(),
                 saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
                 saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
+                saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
                 saved_codex_home: std::env::var("CODEX_HOME").ok(),
                 saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
                 saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
@@ -99,6 +101,10 @@ pub mod test_helpers {
                 match &self.saved_xdg_config_home {
                     Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                     None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+                match &self.saved_xdg_data_home {
+                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
                 }
                 match &self.saved_codex_home {
                     Some(v) => std::env::set_var("CODEX_HOME", v),

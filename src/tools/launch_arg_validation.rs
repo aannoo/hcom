@@ -96,6 +96,16 @@ pub(crate) const OMP_REJECTED_ARGS: &[RejectedArg] = &[
         reason: "runs non-interactively and exits",
         kind: RejectedArgKind::Flag,
     },
+    RejectedArg {
+        token: "--mode",
+        reason: "can disable the interactive extension host used by hcom delivery",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--no-extensions",
+        reason: "prevents hcom's delivery extension from loading",
+        kind: RejectedArgKind::Flag,
+    },
 ];
 
 pub(crate) const GEMINI_REJECTED_ARGS: &[RejectedArg] = &[
@@ -188,6 +198,7 @@ mod tests {
             ("OpenCode", "hcom opencode", OPENCODE_REJECTED_ARGS),
             ("Kilo", "hcom kilo", KILO_REJECTED_ARGS),
             ("Pi", "hcom pi", PI_REJECTED_ARGS),
+            ("Oh My Pi", "hcom omp", OMP_REJECTED_ARGS),
             ("Gemini", "hcom gemini", GEMINI_REJECTED_ARGS),
             ("Antigravity", "hcom antigravity", ANTIGRAVITY_REJECTED_ARGS),
         ] {
@@ -223,6 +234,28 @@ mod tests {
                 "hcom gemini",
                 &["-i".to_string(), "task".to_string()],
                 GEMINI_REJECTED_ARGS,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn omp_rejects_non_interactive_or_extensionless_modes() {
+        for args in [
+            vec!["--mode".to_string(), "json".to_string()],
+            vec!["--mode=rpc".to_string()],
+            vec!["--no-extensions".to_string()],
+        ] {
+            let errors = validate_rejected_args("Oh My Pi", "hcom omp", &args, OMP_REJECTED_ARGS);
+            assert_eq!(errors.len(), 1, "expected rejection for {args:?}");
+        }
+
+        assert!(
+            validate_rejected_args(
+                "Oh My Pi",
+                "hcom omp",
+                &["--model".to_string(), "opus".to_string()],
+                OMP_REJECTED_ARGS,
             )
             .is_empty()
         );

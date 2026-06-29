@@ -1809,14 +1809,15 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
-    // 8. Pi
-    if let Some(path) = derive_pi_transcript_path(session_id) {
-        return Some(("pi".to_string(), Some(path)));
-    }
-
-    // 9. OMP
+    // 8. OMP. Check before Pi because OMP deliberately reuses Pi's
+    // PI_CODING_AGENT_* environment variables for its own session roots.
     if let Some(path) = derive_omp_transcript_path(session_id) {
         return Some(("omp".to_string(), Some(path)));
+    }
+
+    // 9. Pi
+    if let Some(path) = derive_pi_transcript_path(session_id) {
+        return Some(("pi".to_string(), Some(path)));
     }
 
     None
@@ -1835,12 +1836,16 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
 
         if matches!(
             token_str,
-            "--session" | "--session-id" | "--session-dir" | "--fork"
+            "-r" | "--resume" | "--session" | "--session-id" | "--session-dir" | "--fork"
         ) {
-            i += 2;
+            i += 1;
+            if i < original.len() && !original[i].starts_with('-') {
+                i += 1;
+            }
             continue;
         }
-        if matches!(token_str, "--continue" | "--resume")
+        if matches!(token_str, "-c" | "--continue")
+            || token_str.starts_with("--resume=")
             || token_str.starts_with("--session=")
             || token_str.starts_with("--session-id=")
             || token_str.starts_with("--session-dir=")
@@ -1892,9 +1897,10 @@ fn derive_pi_transcript_path(session_id: &str) -> Option<String> {
 }
 
 /// Locate an OMP transcript by session id. Searches, in order:
-/// `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR/sessions`, and the
-/// default `~/.omp/agent/sessions`. The `PI_CODING_AGENT_DIR` root matters
-/// when the launcher isolates OMP config into a project-local dir.
+/// `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR/sessions`,
+/// `XDG_DATA_HOME/omp/sessions`, and the default `~/.omp/agent/sessions`.
+/// The `PI_CODING_AGENT_DIR` root matters when the launcher isolates OMP config
+/// into a project-local dir.
 fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
     let mut roots = Vec::new();
     if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
@@ -1906,6 +1912,11 @@ fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
         && !dir.is_empty()
     {
         roots.push(std::path::PathBuf::from(dir).join("sessions"));
+    }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME")
+        && !dir.is_empty()
+    {
+        roots.push(std::path::PathBuf::from(dir).join("omp").join("sessions"));
     }
     roots.push(
         dirs::home_dir()?
@@ -2318,6 +2329,82 @@ mod tests {
     fn test_build_resume_args_gemini() {
         let args = build_resume_args("gemini", "sess-789", false);
         assert_eq!(args, s(&["--resume", "sess-789"]));
+    }
+
+    #[test]
+    fn test_build_resume_args_omp_has_no_fork_flag() {
+        let args = build_resume_args("omp", "sess-omp", true);
+        assert_eq!(args, s(&["--resume", "sess-omp"]));
+    }
+
+    #[test]
+    fn test_merge_omp_args_strips_resume_aliases_and_values() {
+        let resume = s(&["--resume", "new"]);
+        assert_eq!(
+            merge_omp_args(&s(&["--model", "opus", "-r", "old"]), &resume),
+            s(&["--resume", "new", "--model", "opus"])
+        );
+        assert_eq!(
+            merge_omp_args(&s(&["--resume=old", "--thinking", "high"]), &resume),
+            s(&["--resume", "new", "--thinking", "high"])
+        );
+        assert_eq!(
+            merge_omp_args(
+                &s(&["--continue", "-c", "--session-dir", "/tmp/s"]),
+                &resume
+            ),
+            s(&["--resume", "new"])
+        );
+    }
+
+    #[test]
+    fn test_merge_omp_args_does_not_drop_following_flags() {
+        let resume = s(&["--resume", "new"]);
+        assert_eq!(
+            merge_omp_args(&s(&["--session-dir", "--model", "opus"]), &resume),
+            s(&["--resume", "new", "--model", "opus"])
+        );
+    }
+
+    #[test]
+    fn test_derive_omp_transcript_path_checks_xdg_data_home() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("omp").join("sessions").join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("session-xyz.jsonl"), "{}").unwrap();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+        }
+
+        let path = derive_omp_transcript_path("session-xyz").unwrap();
+        assert!(
+            path.contains("session-xyz.jsonl"),
+            "unexpected path: {path}"
+        );
+    }
+
+    #[test]
+    fn test_find_session_on_disk_prefers_omp_for_omp_paths() {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let root = home
+            .join(".omp")
+            .join("agent")
+            .join("sessions")
+            .join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("session-omp.jsonl"), "{}").unwrap();
+        unsafe {
+            std::env::set_var(
+                "PI_CODING_AGENT_SESSION_DIR",
+                home.join(".omp").join("agent").join("sessions"),
+            );
+        }
+
+        let found = find_session_on_disk("session-omp").unwrap();
+        assert_eq!(found.0, "omp");
     }
 
     #[test]

@@ -366,6 +366,13 @@ pub fn get_omp_plugin_path() -> std::path::PathBuf {
     omp_plugin_dir().join(PLUGIN_FILENAME)
 }
 
+pub fn extension_inject_args() -> Vec<String> {
+    vec![
+        "-e".to_string(),
+        get_omp_plugin_path().to_string_lossy().to_string(),
+    ]
+}
+
 fn plugin_matches_source(path: &std::path::Path) -> bool {
     match std::fs::read_to_string(path) {
         Ok(content) => content == PLUGIN_SOURCE,
@@ -605,6 +612,46 @@ mod tests {
 
         let path = get_omp_plugin_path();
         assert_eq!(path, custom.join("extensions").join("hcom.ts"));
+    }
+
+    #[test]
+    fn extension_inject_args_contains_absolute_plugin_path() {
+        with_isolated_omp_env(|_| {
+            let args = extension_inject_args();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], "-e");
+            let path = std::path::Path::new(&args[1]);
+            assert!(path.is_absolute());
+            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("hcom.ts"));
+        });
+    }
+
+    #[test]
+    fn plugin_source_uses_omp_cli_commands_only() {
+        assert!(PLUGIN_SOURCE.contains("[\"omp-read\""));
+        assert!(PLUGIN_SOURCE.contains("[\"omp-status\""));
+        assert!(PLUGIN_SOURCE.contains("[\"omp-stop\""));
+        assert!(!PLUGIN_SOURCE.contains("[\"pi-read\""));
+        assert!(!PLUGIN_SOURCE.contains("[\"pi-status\""));
+        assert!(!PLUGIN_SOURCE.contains("[\"pi-stop\""));
+    }
+
+    #[test]
+    fn plugin_source_matches_omp_input_result_shape() {
+        assert!(PLUGIN_SOURCE.contains("return {}"));
+        assert!(PLUGIN_SOURCE.contains("return { text:"));
+        assert!(PLUGIN_SOURCE.contains("return { handled: true }"));
+        assert!(!PLUGIN_SOURCE.contains("action: \"continue\""));
+        assert!(!PLUGIN_SOURCE.contains("action: \"transform\""));
+        assert!(!PLUGIN_SOURCE.contains("action: \"handled\""));
+        assert!(!PLUGIN_SOURCE.contains("streamingBehavior"));
+    }
+
+    #[test]
+    fn plugin_source_handles_omp_session_switch_and_shutdown_shape() {
+        assert!(PLUGIN_SOURCE.contains("pi.on(\"session_switch\""));
+        assert!(PLUGIN_SOURCE.contains("\"--reason\", \"shutdown\""));
+        assert!(!PLUGIN_SOURCE.contains("event.reason"));
     }
 
     #[test]

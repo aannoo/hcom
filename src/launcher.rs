@@ -1209,6 +1209,23 @@ fn validate_launch_count(tool: &LaunchTool, count: usize) -> Result<()> {
     Ok(())
 }
 
+fn inject_omp_extension_args(tool: &LaunchTool, args: &mut Vec<String>) {
+    if !matches!(tool, LaunchTool::Omp) {
+        return;
+    }
+    let extension_args = crate::hooks::omp::extension_inject_args();
+    let plugin_path = extension_args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or_default();
+    let already_present = args
+        .windows(2)
+        .any(|window| matches!(window, [flag, path] if flag == "-e" && path == plugin_path));
+    if !already_present {
+        args.extend(extension_args);
+    }
+}
+
 fn append_initial_prompt_args(
     tool: &LaunchTool,
     args: &mut Vec<String>,
@@ -1334,6 +1351,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
+    inject_omp_extension_args(&normalized, &mut params.args);
 
     // Build base environment for the current launch regime, then overlay
     // config.toml + ~/.hcom/env which win.
@@ -2284,6 +2302,18 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--print"));
         assert!(validate_tool_args(&LaunchTool::Pi, &["--fork".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn omp_extension_args_are_injected_once() {
+        let mut args = vec!["--model".to_string(), "opus".to_string()];
+        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
+        assert!(args.iter().any(|arg| arg == "-e"));
+        assert!(args.iter().any(|arg| arg.ends_with("hcom.ts")));
+
+        let once = args.clone();
+        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
+        assert_eq!(args, once);
     }
 
     #[test]
