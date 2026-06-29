@@ -21,17 +21,20 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use super::ProxyConfig;
 use super::inject::{InjectResult, InjectServer};
 use super::screen::ScreenTracker;
+use super::shared;
 
 use crate::db::HcomDb;
-use crate::delivery::{DeliveryState, EXIT_WAS_KILLED, ScreenState, ToolConfig, run_delivery_loop};
-use crate::log::{log_error, log_warn};
-use crate::notify::NotifyServer;
+use crate::delivery::{EXIT_WAS_KILLED, ScreenState};
+use crate::log::log_error;
 
 /// Windows ConPTY-backed PTY proxy.
 pub struct Proxy {
     config: ProxyConfig,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    master: Box<dyn MasterPty + Send>,
+    /// ConPTY master, shared so the resize-watcher (calls `resize`) and the
+    /// reader-spawn (calls `try_clone_reader`) can both lock it. `MasterPty` is
+    /// `Send` but not `Clone`, so a `Mutex` is the only way to share it.
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     screen_state: Arc<RwLock<ScreenState>>,
     launch_phase_active: Arc<AtomicBool>,
@@ -41,7 +44,22 @@ pub struct Proxy {
     current_status: Arc<RwLock<String>>,
     rows: u16,
     cols: u16,
-    delivery_handle: Option<JoinHandle<()>>,
+    /// Delivery thread handle. Wrapped in `Arc<Mutex<Option<_>>>` because the
+    /// reader thread starts delivery (ready-or-timeout gated) and stores the
+    /// handle, while `run()`/`Drop` take it to join.
+    delivery_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Set by the stdin/inject threads when a genuine keystroke (or injected
+    /// answer) should clear a pending approval; consumed by the reader thread,
+    /// which owns the `ScreenTracker` and calls `clear_approval()`.
+    approval_clear_requested: Arc<AtomicBool>,
+    /// Pending terminal resize `(rows, cols)` detected by the resize-watcher;
+    /// applied to the `ScreenTracker` by the reader thread before `process`.
+    pending_resize: Arc<RwLock<Option<(u16, u16)>>>,
+    /// Visible tail captured by the reader thread on EOF, read by `run()` to
+    /// build the launch-failure diagnostic.
+    last_tail: Arc<RwLock<Option<String>>>,
+    /// Set when delivery initialization fails; `run()` maps it to a nonzero exit.
+    launch_failed: Arc<AtomicBool>,
     /// Job object the child is assigned to (`KILL_ON_JOB_CLOSE`). Reaps the
     /// child's whole tree even if this proxy dies abnormally and `Drop` never
     /// runs. `None` if the child couldn't be assigned (falls back to the
@@ -96,7 +114,7 @@ impl Proxy {
         Ok(Self {
             config,
             child,
-            master: pair.master,
+            master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),
             screen_state: Arc::new(RwLock::new(ScreenState::default())),
             launch_phase_active: Arc::new(AtomicBool::new(true)),
@@ -106,7 +124,11 @@ impl Proxy {
             current_status: Arc::new(RwLock::new(String::new())),
             rows,
             cols,
-            delivery_handle: None,
+            delivery_handle: Arc::new(Mutex::new(None)),
+            approval_clear_requested: Arc::new(AtomicBool::new(false)),
+            pending_resize: Arc::new(RwLock::new(None)),
+            last_tail: Arc::new(RwLock::new(None)),
+            launch_failed: Arc::new(AtomicBool::new(false)),
             _job: job,
         })
     }
@@ -117,13 +139,17 @@ impl Proxy {
         // and keystrokes flow through unbuffered. Restored on drop.
         let _console = console::RawConsoleGuard::enable();
 
+        let startup_time = Instant::now();
+
         let inject_server = InjectServer::new()?;
         let inject_port = inject_server.port();
 
-        self.spawn_reader_thread();
+        // The reader thread now owns delivery-thread startup (ready-or-timeout
+        // gated), so it needs the inject port.
+        self.spawn_reader_thread(inject_port);
         self.spawn_stdin_thread();
         self.spawn_inject_thread(inject_server);
-        self.spawn_delivery_thread(inject_port);
+        self.spawn_resize_watcher();
 
         // Block until the child exits.
         let status = self.child.wait().context("waiting for ConPTY child")?;
@@ -136,36 +162,114 @@ impl Proxy {
         // Exit code 130 is the sentinel written by terminate_win().
         EXIT_WAS_KILLED.store(exit_code == 130, Ordering::Release);
 
+        // Record a precise launch-failure (exited-before-bind) BEFORE flipping
+        // running=false, mirroring the Unix proxy. Skipped on a kill so a manual
+        // `hcom kill` is never recorded as a launch failure.
+        if !EXIT_WAS_KILLED.load(Ordering::Acquire) {
+            let tail = self.last_tail.read().ok().and_then(|g| g.clone());
+            shared::finalize_launch_failure_after_exit(
+                self.config.instance_name.as_deref(),
+                tail.as_deref(),
+                &self.launch_phase_active,
+                startup_time.elapsed(),
+                exit_code,
+            );
+        }
+
         // Signal threads to stop and wake the delivery loop's notify select.
         self.running.store(false, Ordering::Release);
         let port = self.notify_port.load(Ordering::Acquire);
         if port != 0 {
             let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         }
-        if let Some(handle) = self.delivery_handle.take() {
+        let handle = self.delivery_handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(handle) = handle {
             let _ = handle.join();
+        }
+
+        // If delivery initialization failed, surface it as a nonzero exit. main
+        // maps the returned Err to a nonzero process exit; Drop still runs after
+        // to reap the child.
+        if self.launch_failed.load(Ordering::Acquire) {
+            anyhow::bail!("delivery initialization failed");
         }
 
         Ok(exit_code)
     }
 
+    /// Poll the outer terminal size and forward changes to the ConPTY and the
+    /// screen tracker. Windows has no SIGWINCH, so this ~200ms poll is the
+    /// Windows counterpart to the Unix proxy's `forward_winsize`.
+    fn spawn_resize_watcher(&self) {
+        let running = self.running.clone();
+        let master = self.master.clone();
+        let pending_resize = self.pending_resize.clone();
+        let (mut last_cols, mut last_rows) = (self.cols, self.rows);
+        thread::spawn(move || {
+            while running.load(Ordering::Acquire) {
+                if let Ok((cols, rows)) = crossterm::terminal::size()
+                    && (cols, rows) != (last_cols, last_rows)
+                {
+                    last_cols = cols;
+                    last_rows = rows;
+                    if let Ok(master) = master.lock() {
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    // Hand the new size to the reader thread, which owns the
+                    // ScreenTracker and applies it before the next `process`.
+                    if let Ok(mut g) = pending_resize.write() {
+                        *g = Some((rows, cols));
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+    }
+
     /// PTY output → our stdout, feeding the screen tracker and the shared
     /// screen state the delivery loop reads. portable-pty's reader blocks, so a
     /// dedicated thread replaces the Unix poll loop.
-    fn spawn_reader_thread(&self) {
-        let reader = match self.master.try_clone_reader() {
-            Ok(r) => r,
+    ///
+    /// This thread also owns the Windows equivalents of the Unix poll loop's
+    /// per-iteration work: refreshing the shared delivery state (via
+    /// `shared::update_delivery_state`), starting the delivery thread once the
+    /// tool is ready (or the start-timeout elapses), consuming approval-clear
+    /// requests from the stdin/inject threads, applying pending resizes, and
+    /// emitting title OSC updates on status/name changes.
+    fn spawn_reader_thread(&self, inject_port: u16) {
+        let reader = match self.master.lock() {
+            Ok(master) => match master.try_clone_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    log_error("native", "win.reader", &format!("try_clone_reader: {e}"));
+                    return;
+                }
+            },
             Err(e) => {
-                log_error("native", "win.reader", &format!("try_clone_reader: {e}"));
+                log_error("native", "win.reader", &format!("master lock: {e}"));
                 return;
             }
         };
         let running = self.running.clone();
         let screen_state = self.screen_state.clone();
         let launch_phase = self.launch_phase_active.clone();
-        let tool_name = self.config.target.name().to_string();
+        let target = self.config.target.clone();
         let ready_pattern = self.config.ready_pattern.clone();
         let instance = self.config.instance_name.clone();
+        let current_name = self.current_name.clone();
+        let current_status = self.current_status.clone();
+        let approval_clear_requested = self.approval_clear_requested.clone();
+        let pending_resize = self.pending_resize.clone();
+        let last_tail = self.last_tail.clone();
+        let launch_failed = self.launch_failed.clone();
+        let delivery_handle = self.delivery_handle.clone();
+        let notify_port = self.notify_port.clone();
+        let delivery_start_timeout = self.config.target.delivery_start_timeout();
         let (rows, cols) = (self.rows, self.cols);
 
         thread::spawn(move || {
@@ -176,10 +280,37 @@ impl Proxy {
             let mut filter = OutputModeFilter::default();
             let mut buf = [0u8; 8192];
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
+
+            let mut delivery_started = false;
+            let mut ready_signaled = false;
+            let startup = Instant::now();
+            let mut last_name = String::new();
+            let mut last_status = String::new();
+
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break, // child exited / PTY closed
+                    Ok(0) => {
+                        // EOF: capture the visible tail so run() can build the
+                        // launch-failure diagnostic before the screen is gone.
+                        if let Ok(mut g) = last_tail.write() {
+                            *g = screen.visible_tail(8, 1000);
+                        }
+                        break; // child exited / PTY closed
+                    }
                     Ok(n) => {
+                        // A genuine keystroke / injected answer flagged a pending
+                        // approval for clearing; the reader owns the tracker.
+                        if approval_clear_requested.swap(false, Ordering::AcqRel) {
+                            screen.clear_approval();
+                        }
+                        // Apply a pending terminal resize before processing this
+                        // frame so the screen model matches the new geometry.
+                        if let Some((r, c)) =
+                            pending_resize.write().ok().and_then(|mut g| g.take())
+                        {
+                            screen.resize(r, c);
+                        }
+
                         let data = &buf[..n];
                         // Strip the child's Win32-input/focus mode-set sequences
                         // before they reach the *outer* terminal (see
@@ -191,7 +322,68 @@ impl Proxy {
                         let _ = stdout.write_all(&scratch);
                         let _ = stdout.flush();
                         screen.process(data);
-                        update_screen_state(&screen_state, &screen, &tool_name, &launch_phase);
+
+                        let publish = |a: bool| {
+                            shared::publish_approval_status(a, instance.as_deref(), &current_status)
+                        };
+                        shared::update_delivery_state(
+                            &screen_state,
+                            &screen,
+                            &target,
+                            &launch_phase,
+                            &publish,
+                        );
+
+                        if !ready_signaled && screen.is_ready() {
+                            ready_signaled = true;
+                        }
+                        if !delivery_started
+                            && (ready_signaled || startup.elapsed() > delivery_start_timeout)
+                        {
+                            delivery_started = true;
+                            match shared::start_delivery_thread(
+                                instance.as_deref(),
+                                running.clone(),
+                                screen_state.clone(),
+                                launch_phase.clone(),
+                                inject_port,
+                                target.clone(),
+                                notify_port.clone(),
+                                current_name.clone(),
+                                current_status.clone(),
+                            ) {
+                                Ok(Some(h)) => {
+                                    if let Ok(mut g) = delivery_handle.lock() {
+                                        *g = Some(h);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(_) => launch_failed.store(true, Ordering::Release),
+                            }
+                        }
+
+                        // Title OSC update. Only safe to write between complete
+                        // sequences — the OutputModeFilter exposes Ground state
+                        // for exactly that. The delivery thread updates the name
+                        // and status Arcs; mirror them into the window title.
+                        if filter.at_ground() {
+                            let name =
+                                current_name.read().ok().map(|n| n.clone()).unwrap_or_default();
+                            let status = current_status
+                                .read()
+                                .ok()
+                                .map(|s| s.clone())
+                                .unwrap_or_default();
+                            if !name.is_empty()
+                                && (name != last_name || status != last_status)
+                            {
+                                let esc = shared::build_title_escape(&name, &status, target.name());
+                                let _ = stdout.write_all(esc.as_bytes());
+                                let _ = stdout.flush();
+                                last_name = name;
+                                last_status = status;
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
@@ -218,6 +410,11 @@ impl Proxy {
     fn spawn_stdin_thread(&self) {
         let writer = self.writer.clone();
         let running = self.running.clone();
+        let target = self.config.target.clone();
+        let screen_state = self.screen_state.clone();
+        let current_status = self.current_status.clone();
+        let instance = self.config.instance_name.clone();
+        let approval_clear_requested = self.approval_clear_requested.clone();
         thread::spawn(move || {
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 4096];
@@ -232,6 +429,23 @@ impl Proxy {
                             let _ = w.write_all(&buf[..n]);
                             let _ = w.flush();
                         }
+                        if n > 0 {
+                            // A genuine keystroke answering a title-detected
+                            // approval clears it immediately. Record the cleared
+                            // edge against shared state; the reader thread owns
+                            // the tracker, so request a tracker-clear via the
+                            // atomic it consumes.
+                            let publish = |a: bool| {
+                                shared::publish_approval_status(
+                                    a,
+                                    instance.as_deref(),
+                                    &current_status,
+                                )
+                            };
+                            if shared::note_user_keystroke(&target, &screen_state, &publish) {
+                                approval_clear_requested.store(true, Ordering::Release);
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
@@ -244,6 +458,11 @@ impl Proxy {
     fn spawn_inject_thread(&self, mut inject_server: InjectServer) {
         let writer = self.writer.clone();
         let running = self.running.clone();
+        let target = self.config.target.clone();
+        let screen_state = self.screen_state.clone();
+        let current_status = self.current_status.clone();
+        let instance = self.config.instance_name.clone();
+        let approval_clear_requested = self.approval_clear_requested.clone();
         thread::spawn(move || {
             while running.load(Ordering::Acquire) {
                 // Drain the accept queue.
@@ -257,6 +476,24 @@ impl Proxy {
                                 let _ = w.write_all(text.as_bytes());
                                 let _ = w.flush();
                             }
+                            // An injected answer reaches the PTY directly and
+                            // bypasses the stdin handler. Publish the cleared
+                            // edge synchronously (while the row is still blocked)
+                            // and request a tracker-clear from the reader thread.
+                            let publish = |a: bool| {
+                                shared::publish_approval_status(
+                                    a,
+                                    instance.as_deref(),
+                                    &current_status,
+                                )
+                            };
+                            if shared::clear_injected_approval_state(
+                                &target,
+                                &screen_state,
+                                &publish,
+                            ) {
+                                approval_clear_requested.store(true, Ordering::Release);
+                            }
                         }
                         // Screen queries (`hcom term`) are not served by the
                         // ConPTY proxy yet; answer empty so the client unblocks.
@@ -269,59 +506,6 @@ impl Proxy {
         });
     }
 
-    /// Notify-driven delivery loop: wakes on `hcom send` and injects the message
-    /// into the ConPTY (via `inject_port`), which is how an idle agent reacts.
-    fn spawn_delivery_thread(&mut self, inject_port: u16) {
-        let running = self.running.clone();
-        let screen_state = self.screen_state.clone();
-        let launch_phase = self.launch_phase_active.clone();
-        let notify_port_shared = self.notify_port.clone();
-        let shared_name = self.current_name.clone();
-        let shared_status = self.current_status.clone();
-        let instance_name = self.config.instance_name.clone().unwrap_or_default();
-        let delivery_tool = self.config.target.delivery_tool();
-        let user_activity_cooldown_ms = 500u64;
-
-        let handle = thread::spawn(move || {
-            let mut db = match HcomDb::open() {
-                Ok(db) => db,
-                Err(e) => {
-                    log_error("native", "win.delivery.init", &format!("db open: {e}"));
-                    return;
-                }
-            };
-            let notify = match NotifyServer::new() {
-                Ok(n) => n,
-                Err(e) => {
-                    log_error("native", "win.delivery.init", &format!("notify: {e}"));
-                    return;
-                }
-            };
-            notify_port_shared.store(notify.port(), Ordering::Release);
-            if let Err(e) = db.register_inject_port(&instance_name, inject_port) {
-                log_warn("native", "win.inject.register", &format!("{e}"));
-            }
-            let state = DeliveryState {
-                screen: screen_state,
-                launch_phase_active: launch_phase,
-                inject_port,
-                user_activity_cooldown_ms,
-            };
-            let config = ToolConfig::for_tool(delivery_tool);
-
-            run_delivery_loop(
-                running,
-                &mut db,
-                &notify,
-                &state,
-                &instance_name,
-                &config,
-                Some(shared_name),
-                Some(shared_status),
-            );
-        });
-        self.delivery_handle = Some(handle);
-    }
 }
 
 impl Drop for Proxy {
@@ -420,6 +604,13 @@ impl OutputModeFilter {
     fn is_blocked(&self) -> bool {
         self.buf.starts_with(b"\x1b[?9001") || self.buf.starts_with(b"\x1b[?1004")
     }
+
+    /// True when the filter is not mid-sequence (no incomplete ESC/CSI held).
+    /// The reader thread gates title-OSC writes on this so a title escape is
+    /// never interleaved into an incomplete sequence still being assembled.
+    fn at_ground(&self) -> bool {
+        self.state == FilterState::Ground
+    }
 }
 
 #[cfg(test)]
@@ -457,40 +648,6 @@ mod tests {
     #[test]
     fn drops_mode_reset_too() {
         assert_eq!(run(&[b"\x1b[?9001l\x1b[?1004lY"]), b"Y");
-    }
-}
-
-/// Refresh the shared [`ScreenState`] from the screen tracker so the delivery
-/// loop's gates (idle / ready / prompt-empty) see current screen contents.
-/// A trimmed Windows counterpart to the Unix proxy's `update_delivery_state`;
-/// approval-scrape latching (Codex/Cursor) is deferred.
-fn update_screen_state(
-    screen_state: &Arc<RwLock<ScreenState>>,
-    screen: &ScreenTracker,
-    tool_name: &str,
-    launch_phase: &Arc<AtomicBool>,
-) {
-    if let Ok(mut state) = screen_state.write() {
-        state.ready = screen.is_ready();
-        let input_text = screen.get_input_box_text(tool_name);
-        let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
-        // Stamp the submit-edge cooldown when input goes from a known non-empty
-        // value to empty/undetected, mirroring the Unix proxy so the gate does
-        // not double-deliver during the hook's status-flip lag.
-        let was_non_empty = state.input_text.as_deref().is_some_and(|t| !t.is_empty());
-        let now_empty = input_text.as_deref().map(|t| t.is_empty()).unwrap_or(true);
-        if was_non_empty && now_empty {
-            state.last_prompt_submit = Some(Instant::now());
-        }
-        state.prompt_empty = new_prompt_empty;
-        state.input_text = input_text;
-        state.visible_tail = if launch_phase.load(Ordering::Acquire) {
-            screen.visible_tail(5, 500)
-        } else {
-            None
-        };
-        state.last_output = screen.last_output_instant();
-        state.cols = screen.cols();
     }
 }
 
