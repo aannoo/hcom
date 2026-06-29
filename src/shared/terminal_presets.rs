@@ -2,28 +2,83 @@
 
 use std::sync::LazyLock;
 
+/// An argument-vector template: `argv[0]` is the executable, the rest are
+/// argument templates (one element per argument; no shell splitting). Each
+/// element may contain placeholders like `{script}` or `{pane_id}` that are
+/// substituted per-element at launch time.
+pub type ArgvTemplate = &'static [&'static str];
+
+/// A per-platform argv template. `default` covers Unix (Darwin + Linux) and any
+/// platform without a specific override; `windows` is a Windows-only override
+/// (e.g. launching the generated `.ps1` directly via PowerShell). When both are
+/// `None`, the API (open or close) is unavailable.
+#[derive(Debug, Clone, Copy)]
+pub struct PlatformArgv {
+    pub default: Option<ArgvTemplate>,
+    pub windows: Option<ArgvTemplate>,
+}
+
+impl PlatformArgv {
+    /// Select the argv template for the given platform. Windows falls back to
+    /// `default` when no Windows-specific override is present.
+    pub const fn select(&self, is_windows: bool) -> Option<ArgvTemplate> {
+        if is_windows {
+            if self.windows.is_some() {
+                self.windows
+            } else {
+                self.default
+            }
+        } else {
+            self.default
+        }
+    }
+}
+
 /// Terminal preset configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TerminalPreset {
     /// Binary to check for availability (None = check app bundle).
     pub binary: Option<&'static str>,
     /// App name for macOS bundle detection (e.g., "kitty", "WezTerm").
     pub app_name: Option<&'static str>,
-    /// Command template with {script} placeholder.
-    pub open: &'static str,
-    /// Close command template with {pane_id} placeholder (None = no close API).
-    pub close: Option<&'static str>,
+    /// Open command argv template (per-platform), with a `{script}` placeholder.
+    pub open: PlatformArgv,
+    /// Close command argv template (per-platform), with a `{pane_id}` placeholder
+    /// (both slots None = no close API).
+    pub close: PlatformArgv,
     /// Env var that contains the pane ID.
     pub pane_id_env: Option<&'static str>,
     /// Supported platforms.
     pub platforms: &'static [&'static str],
 }
 
+/// An argv template available on all platforms (Windows reuses the default).
+const fn argv(default: ArgvTemplate) -> PlatformArgv {
+    PlatformArgv {
+        default: Some(default),
+        windows: None,
+    }
+}
+
+/// An argv template with a distinct Windows variant.
+const fn argv_win(default: ArgvTemplate, windows: ArgvTemplate) -> PlatformArgv {
+    PlatformArgv {
+        default: Some(default),
+        windows: Some(windows),
+    }
+}
+
+/// No open/close API on any platform.
+const NONE_ARGV: PlatformArgv = PlatformArgv {
+    default: None,
+    windows: None,
+};
+
 const fn p(
     binary: Option<&'static str>,
     app_name: Option<&'static str>,
-    open: &'static str,
-    close: Option<&'static str>,
+    open: PlatformArgv,
+    close: PlatformArgv,
     pane_id_env: Option<&'static str>,
     platforms: &'static [&'static str],
 ) -> TerminalPreset {
@@ -48,8 +103,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 None,
                 None,
-                "open -a Terminal {script}",
-                None,
+                argv(&["open", "-a", "Terminal", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Darwin"],
             ),
@@ -59,8 +114,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 None,
                 None,
-                "open -a iTerm {script}",
-                None,
+                argv(&["open", "-a", "iTerm", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Darwin"],
             ),
@@ -70,8 +125,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 None,
                 None,
-                "open -na Ghostty.app --args -e bash {script}",
-                None,
+                argv(&["open", "-na", "Ghostty.app", "--args", "-e", "bash", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Darwin"],
             ),
@@ -81,8 +136,10 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("cmux"),
                 Some("cmux"),
-                "cmux new-workspace --command 'bash {script}'",
-                Some("cmux close-workspace --workspace {pane_id}"),
+                // `bash {script}` is a single argv element on purpose — cmux
+                // re-parses its `--command` value internally.
+                argv(&["cmux", "new-workspace", "--command", "bash {script}"]),
+                argv(&["cmux", "close-workspace", "--workspace", "{pane_id}"]),
                 Some("CMUX_WORKSPACE_ID"),
                 &["Darwin"],
             ),
@@ -93,8 +150,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("kitty"),
                 Some("kitty"),
-                "kitty --env HCOM_PROCESS_ID={process_id} {script}",
-                Some("kitten @ close-window --match id:{pane_id}"),
+                argv(&["kitty", "--env", "HCOM_PROCESS_ID={process_id}", "{script}"]),
+                argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
                 None,
                 DL,
             ),
@@ -104,8 +161,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("kitty"),
                 Some("kitty"),
-                "kitty --env HCOM_PROCESS_ID={process_id} {script}",
-                Some("kitten @ close-window --match id:{pane_id}"),
+                argv(&["kitty", "--env", "HCOM_PROCESS_ID={process_id}", "{script}"]),
+                argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
                 None,
                 DL,
             ),
@@ -115,8 +172,14 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wezterm"),
                 Some("WezTerm"),
-                "wezterm start -- bash {script}",
-                Some("wezterm cli kill-pane --pane-id {pane_id}"),
+                argv_win(
+                    &["wezterm", "start", "--", "bash", "{script}"],
+                    &[
+                        "wezterm", "start", "--", "powershell", "-ExecutionPolicy", "Bypass",
+                        "-NoExit", "-File", "{script}",
+                    ],
+                ),
+                argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
                 Some("WEZTERM_PANE"),
                 DLW,
             ),
@@ -126,8 +189,14 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wezterm"),
                 Some("WezTerm"),
-                "wezterm start -- bash {script}",
-                Some("wezterm cli kill-pane --pane-id {pane_id}"),
+                argv_win(
+                    &["wezterm", "start", "--", "bash", "{script}"],
+                    &[
+                        "wezterm", "start", "--", "powershell", "-ExecutionPolicy", "Bypass",
+                        "-NoExit", "-File", "{script}",
+                    ],
+                ),
+                argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
                 Some("WEZTERM_PANE"),
                 DLW,
             ),
@@ -137,8 +206,14 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("alacritty"),
                 Some("Alacritty"),
-                "alacritty -e bash {script}",
-                None,
+                argv_win(
+                    &["alacritty", "-e", "bash", "{script}"],
+                    &[
+                        "alacritty", "-e", "powershell", "-ExecutionPolicy", "Bypass", "-NoExit",
+                        "-File", "{script}",
+                    ],
+                ),
+                NONE_ARGV,
                 None,
                 DLW,
             ),
@@ -148,8 +223,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 None,
                 Some("Warp"),
-                "open warp://launch/hcom-{process_id}",
-                None,
+                argv(&["open", "warp://launch/hcom-{process_id}"]),
+                NONE_ARGV,
                 None,
                 &["Darwin"],
             ),
@@ -157,15 +232,22 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
         // Tab utilities
         (
             "ttab",
-            p(Some("ttab"), None, "ttab {script}", None, None, &["Darwin"]),
+            p(
+                Some("ttab"),
+                None,
+                argv(&["ttab", "{script}"]),
+                NONE_ARGV,
+                None,
+                &["Darwin"],
+            ),
         ),
         (
             "wttab",
             p(
                 Some("wttab"),
                 None,
-                "wttab {script}",
-                None,
+                argv(&["wttab", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Windows"],
             ),
@@ -176,8 +258,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("gnome-terminal"),
                 None,
-                "gnome-terminal --window -- bash {script}",
-                None,
+                argv(&["gnome-terminal", "--window", "--", "bash", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Linux"],
             ),
@@ -187,8 +269,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("konsole"),
                 None,
-                "konsole -e bash {script}",
-                None,
+                argv(&["konsole", "-e", "bash", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Linux"],
             ),
@@ -198,8 +280,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("xterm"),
                 None,
-                "xterm -e bash {script}",
-                None,
+                argv(&["xterm", "-e", "bash", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Linux"],
             ),
@@ -209,8 +291,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("tilix"),
                 None,
-                "tilix -e bash {script}",
-                None,
+                argv(&["tilix", "-e", "bash", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Linux"],
             ),
@@ -220,8 +302,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("terminator"),
                 None,
-                "terminator -x bash {script}",
-                None,
+                argv(&["terminator", "-x", "bash", "{script}"]),
+                NONE_ARGV,
                 None,
                 &["Linux"],
             ),
@@ -231,8 +313,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("zellij"),
                 None,
-                "zellij action new-pane -- bash {script}",
-                Some("zellij action close-pane --pane-id {pane_id}"),
+                argv(&["zellij", "action", "new-pane", "--", "bash", "{script}"]),
+                argv(&["zellij", "action", "close-pane", "--pane-id", "{pane_id}"]),
                 Some("ZELLIJ_PANE_ID"),
                 DL,
             ),
@@ -242,8 +324,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wsh"),
                 None,
-                "wsh run -- bash {script}",
-                Some("wsh deleteblock -b {pane_id}"),
+                argv(&["wsh", "run", "--", "bash", "{script}"]),
+                argv(&["wsh", "deleteblock", "-b", "{pane_id}"]),
                 Some("WAVETERM_BLOCKID"),
                 DL,
             ),
@@ -254,8 +336,11 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wt"),
                 None,
-                "wt -- bash {script}",
-                None,
+                argv(&[
+                    "wt", "--", "powershell", "-ExecutionPolicy", "Bypass", "-NoExit", "-File",
+                    "{script}",
+                ]),
+                NONE_ARGV,
                 None,
                 &["Windows"],
             ),
@@ -265,8 +350,13 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("mintty"),
                 None,
-                "mintty bash {script}",
-                None,
+                // Run the generated PowerShell script directly — never hand a
+                // `.ps1` to bash (the old `mintty bash {script}` bug).
+                argv(&[
+                    "mintty", "powershell", "-ExecutionPolicy", "Bypass", "-NoExit", "-File",
+                    "{script}",
+                ]),
+                NONE_ARGV,
                 None,
                 &["Windows"],
             ),
@@ -277,8 +367,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("tmux"),
                 None,
-                "tmux new-session -d bash {script}",
-                Some("tmux kill-pane -t {pane_id}"),
+                argv(&["tmux", "new-session", "-d", "bash", "{script}"]),
+                argv(&["tmux", "kill-pane", "-t", "{pane_id}"]),
                 Some("TMUX_PANE"),
                 DL,
             ),
@@ -288,8 +378,8 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("tmux"),
                 None,
-                "tmux split-window -h {script}",
-                Some("tmux kill-pane -t {pane_id}"),
+                argv(&["tmux", "split-window", "-h", "{script}"]),
+                argv(&["tmux", "kill-pane", "-t", "{pane_id}"]),
                 Some("TMUX_PANE"),
                 DL,
             ),
@@ -299,8 +389,14 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wezterm"),
                 Some("WezTerm"),
-                "wezterm cli spawn -- bash {script}",
-                Some("wezterm cli kill-pane --pane-id {pane_id}"),
+                argv_win(
+                    &["wezterm", "cli", "spawn", "--", "bash", "{script}"],
+                    &[
+                        "wezterm", "cli", "spawn", "--", "powershell", "-ExecutionPolicy", "Bypass",
+                        "-NoExit", "-File", "{script}",
+                    ],
+                ),
+                argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
                 Some("WEZTERM_PANE"),
                 DLW,
             ),
@@ -310,8 +406,14 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wezterm"),
                 Some("WezTerm"),
-                "wezterm cli split-pane --top-level --right -- bash {script}",
-                Some("wezterm cli kill-pane --pane-id {pane_id}"),
+                argv_win(
+                    &["wezterm", "cli", "split-pane", "--top-level", "--right", "--", "bash", "{script}"],
+                    &[
+                        "wezterm", "cli", "split-pane", "--top-level", "--right", "--", "powershell",
+                        "-ExecutionPolicy", "Bypass", "-NoExit", "-File", "{script}",
+                    ],
+                ),
+                argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
                 Some("WEZTERM_PANE"),
                 DLW,
             ),
@@ -321,8 +423,11 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("kitten"),
                 Some("kitty"),
-                "kitten @ launch --type=tab --env HCOM_PROCESS_ID={process_id} -- bash {script}",
-                Some("kitten @ close-window --match id:{pane_id}"),
+                argv(&[
+                    "kitten", "@", "launch", "--type=tab", "--env",
+                    "HCOM_PROCESS_ID={process_id}", "--", "bash", "{script}",
+                ]),
+                argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
                 None,
                 DL,
             ),
@@ -332,8 +437,11 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("kitten"),
                 Some("kitty"),
-                "kitten @ launch --type=window --env HCOM_PROCESS_ID={process_id} -- bash {script}",
-                Some("kitten @ close-window --match id:{pane_id}"),
+                argv(&[
+                    "kitten", "@", "launch", "--type=window", "--env",
+                    "HCOM_PROCESS_ID={process_id}", "--", "bash", "{script}",
+                ]),
+                argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
                 None,
                 DL,
             ),
@@ -348,8 +456,11 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("herdr"),
                 None,
-                "herdr agent start {instance_name} --cwd {cwd} --no-focus -- bash {script}",
-                Some("herdr pane close {pane_id}"),
+                argv(&[
+                    "herdr", "agent", "start", "{instance_name}", "--cwd", "{cwd}", "--no-focus",
+                    "--", "bash", "{script}",
+                ]),
+                argv(&["herdr", "pane", "close", "{pane_id}"]),
                 Some("HERDR_PANE_ID"),
                 DL,
             ),
@@ -402,7 +513,7 @@ mod tests {
     fn test_terminal_preset_lookup() {
         let preset = get_terminal_preset("kitty").unwrap();
         assert_eq!(preset.binary, Some("kitty"));
-        assert!(preset.close.is_some());
+        assert!(preset.close.select(false).is_some());
 
         assert!(get_terminal_preset("nonexistent").is_none());
     }
@@ -411,8 +522,41 @@ mod tests {
     fn test_kitty_tab_close_matches_window_id() {
         let preset = get_terminal_preset("kitty-tab").unwrap();
         assert_eq!(
-            preset.close,
-            Some("kitten @ close-window --match id:{pane_id}")
+            preset.close.select(false),
+            Some(&["kitten", "@", "close-window", "--match", "id:{pane_id}"] as ArgvTemplate)
         );
+    }
+
+    #[test]
+    fn test_platform_argv_select_falls_back_to_default_when_no_windows() {
+        let pa = argv(&["foo", "bar"]);
+        assert_eq!(pa.select(false), Some(&["foo", "bar"] as ArgvTemplate));
+        assert_eq!(pa.select(true), Some(&["foo", "bar"] as ArgvTemplate));
+    }
+
+    #[test]
+    fn test_wezterm_open_selects_powershell_variant_on_windows() {
+        let preset = get_terminal_preset("wezterm").unwrap();
+        let unix = preset.open.select(false).unwrap();
+        let win = preset.open.select(true).unwrap();
+        // Unix runs bash; Windows runs the .ps1 via PowerShell.
+        assert!(unix.contains(&"bash"));
+        assert!(!unix.contains(&"powershell"));
+        assert!(win.contains(&"powershell"));
+        assert!(!win.contains(&"bash"));
+        assert!(win.contains(&"-File"));
+    }
+
+    #[test]
+    fn test_mintty_open_contains_no_bash() {
+        let preset = get_terminal_preset("mintty").unwrap();
+        // mintty is Windows-only; the selected argv must avoid bash.
+        let win = preset.open.select(true).unwrap();
+        assert!(
+            !win.contains(&"bash"),
+            "mintty open must not hand a .ps1 to bash"
+        );
+        assert!(win.contains(&"powershell"));
+        assert_eq!(win.first(), Some(&"mintty"));
     }
 }

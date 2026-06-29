@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::paths;
 use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::platform;
-use crate::shared::terminal_presets::TERMINAL_ENV_MAP;
+use crate::shared::terminal_presets::{ArgvTemplate, TERMINAL_ENV_MAP};
 use crate::shared::tool_detection::tool_marker_vars;
 
 /// Result of kill_process().
@@ -53,15 +53,15 @@ pub enum LaunchResult {
 
 /// macOS app bundle fallback commands for cross-platform terminals.
 /// Used when CLI binary isn't in PATH but .app bundle is installed.
-const MACOS_APP_FALLBACKS: &[(&str, &str)] = &[
-    ("kitty-window", "open -n -a kitty.app --args {script}"),
+const MACOS_APP_FALLBACKS: &[(&str, ArgvTemplate)] = &[
+    ("kitty-window", &["open", "-n", "-a", "kitty.app", "--args", "{script}"]),
     (
         "wezterm-window",
-        "open -n -a WezTerm.app --args start -- bash {script}",
+        &["open", "-n", "-a", "WezTerm.app", "--args", "start", "--", "bash", "{script}"],
     ),
     (
         "alacritty",
-        "open -n -a Alacritty.app --args -e bash {script}",
+        &["open", "-n", "-a", "Alacritty.app", "--args", "-e", "bash", "{script}"],
     ),
 ];
 
@@ -179,28 +179,30 @@ fn find_macos_app(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Replace `open -a <app>` app names with absolute `.app` bundle paths.
+/// Replace `open -a <app>` app names with absolute `.app` bundle paths, in place
+/// on an argv vector.
 ///
 /// This is only safe for app-launch commands where `open` passes argv via
 /// `--args`. Plain file-open forms like `open -a Terminal {script}` must keep
 /// `-a`, otherwise `open` treats the app bundle and script as regular paths and
-/// falls back to file association for the script.
-fn rewrite_open_command_with_app_path(template: &str, app_path: &Path) -> Result<String> {
-    let mut parts = shell_split(template)?;
-    for idx in 0..parts.len().saturating_sub(1) {
-        let flag = &parts[idx];
+/// falls back to file association for the script. No-ops if no `--args` tail is
+/// present or no app flag is found.
+fn rewrite_open_argv_with_app_path(argv: &mut Vec<String>, app_path: &Path) {
+    for idx in 0..argv.len().saturating_sub(1) {
+        let flag = &argv[idx];
         let takes_app_arg = flag == "-a"
             || (flag.starts_with('-')
                 && !flag.starts_with("--")
                 && flag.chars().skip(1).any(|c| c == 'a'));
         if takes_app_arg {
-            let has_args_tail = parts.iter().skip(idx + 2).any(|part| part == "--args");
+            let has_args_tail = argv.iter().skip(idx + 2).any(|part| part == "--args");
             if !has_args_tail {
-                return Ok(template.to_string());
+                return;
             }
+            let app_path_str = app_path.to_string_lossy().to_string();
             if flag == "-a" {
-                parts.remove(idx);
-                parts[idx] = app_path.to_string_lossy().to_string();
+                argv.remove(idx);
+                argv[idx] = app_path_str;
             } else {
                 let mut rewritten_flag = String::from("-");
                 for ch in flag.chars().skip(1) {
@@ -209,31 +211,25 @@ fn rewrite_open_command_with_app_path(template: &str, app_path: &Path) -> Result
                     }
                 }
                 if rewritten_flag == "-" {
-                    parts.remove(idx);
-                    parts[idx] = app_path.to_string_lossy().to_string();
+                    argv.remove(idx);
+                    argv[idx] = app_path_str;
                 } else {
-                    parts[idx] = rewritten_flag;
-                    parts[idx + 1] = app_path.to_string_lossy().to_string();
+                    argv[idx] = rewritten_flag;
+                    argv[idx + 1] = app_path_str;
                 }
             }
-            return Ok(parts
-                .iter()
-                .map(|p| shell_quote(p))
-                .collect::<Vec<_>>()
-                .join(" "));
+            return;
         }
     }
-    Ok(template.to_string())
 }
 
-fn rewrite_macos_open_app_command(template: &str, app_name: &str) -> String {
+fn rewrite_macos_open_app_argv(argv: &mut Vec<String>, app_name: &str) {
     if !cfg!(target_os = "macos") {
-        return template.to_string();
+        return;
     }
-    let Some(app_path) = find_macos_app(app_name) else {
-        return template.to_string();
-    };
-    rewrite_open_command_with_app_path(template, &app_path).unwrap_or_else(|_| template.to_string())
+    if let Some(app_path) = find_macos_app(app_name) {
+        rewrite_open_argv_with_app_path(argv, &app_path);
+    }
 }
 
 fn should_use_command_extension(background: bool, terminal_mode: &str) -> bool {
@@ -576,13 +572,15 @@ fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) 
     }
 }
 
-/// Resolve preset name to command template string.
+/// Resolve preset name to an open-command argv template (placeholders intact).
 ///
 /// On macOS, if CLI binary isn't in PATH but .app bundle exists,
-/// uses a hardcoded fallback or substitutes the full binary path.
-pub fn resolve_terminal_preset(preset_name: &str) -> Option<String> {
+/// uses a hardcoded fallback or substitutes the full binary path. The returned
+/// argv still contains placeholders like `{script}`; substitute via
+/// `substitute_open_argv`.
+pub fn resolve_terminal_open_argv(preset_name: &str) -> Option<Vec<String>> {
     let merged = crate::config::get_merged_preset(preset_name)?;
-    let mut open_cmd = merged.open;
+    let mut open_argv = merged.open_argv(cfg!(windows));
     let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
 
     if let Some(ref binary) = merged.binary
@@ -592,18 +590,21 @@ pub fn resolve_terminal_preset(preset_name: &str) -> Option<String> {
         // New-window presets have hardcoded fallbacks using `open -a`
         for &(name, fallback) in MACOS_APP_FALLBACKS {
             if name == preset_name && find_macos_app(app_name).is_some() {
-                return Some(rewrite_macos_open_app_command(fallback, app_name));
+                let mut argv: Vec<String> = fallback.iter().map(|s| s.to_string()).collect();
+                rewrite_macos_open_app_argv(&mut argv, app_name);
+                return Some(argv);
             }
         }
-        // Tab/split presets: substitute leading binary with full path
+        // Tab/split presets: substitute leading binary element with full path
         if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name)
-            && open_cmd.starts_with(binary.as_str())
+            && open_argv.first().map(String::as_str) == Some(binary.as_str())
         {
-            open_cmd = format!("{}{}", full_path, &open_cmd[binary.len()..]);
+            open_argv[0] = full_path;
         }
     }
 
-    Some(rewrite_macos_open_app_command(&open_cmd, app_name))
+    rewrite_macos_open_app_argv(&mut open_argv, app_name);
+    Some(open_argv)
 }
 
 /// Get terminal presets for current platform with availability status.
@@ -1025,7 +1026,7 @@ where
 /// Inputs to terminal command template substitution.
 ///
 /// All fields are borrowed and may be empty; unknown placeholders are left
-/// in place by `parse_terminal_command` (no substitution panics).
+/// in place by `substitute_open_argv` (no substitution panics).
 #[derive(Default, Clone, Copy)]
 pub(crate) struct TerminalCommandContext<'a> {
     pub script: &'a str,
@@ -1038,9 +1039,15 @@ pub(crate) struct TerminalCommandContext<'a> {
     pub pane_title: Option<&'a str>,
 }
 
-/// Parse terminal command template safely to prevent shell injection.
-fn parse_terminal_command(template: &str, ctx: TerminalCommandContext<'_>) -> Result<Vec<String>> {
-    if !template.contains("{script}") {
+/// Substitute placeholders into an open-command argv template, per element.
+///
+/// Each element of `template` is one argument (no shell splitting). Placeholders
+/// are replaced inside each element with `String::replace`, so a Windows path
+/// like `C:\Users\x\s.ps1` substituted into the `{script}` element survives
+/// intact (no backslash mangling, no re-quoting). Requires at least one element
+/// to contain `{script}`.
+fn substitute_open_argv(template: &[String], ctx: TerminalCommandContext<'_>) -> Result<Vec<String>> {
+    if !template.iter().any(|p| p.contains("{script}")) {
         bail!(
             "Custom terminal command must include {{script}} placeholder\n\
              Example: open -n -a kitty.app --args bash \"{{script}}\""
@@ -1052,83 +1059,85 @@ fn parse_terminal_command(template: &str, ctx: TerminalCommandContext<'_>) -> Re
         .filter(|s| !s.is_empty())
         .unwrap_or(ctx.instance_name);
 
-    let mut replaced = Vec::new();
-    let mut placeholder_found = false;
-    for mut part in shell_split(template)? {
-        for (placeholder, value) in [
-            ("{process_id}", ctx.process_id),
-            ("{cwd}", ctx.cwd),
-            ("{instance_name}", ctx.instance_name),
-            ("{tool}", ctx.tool),
-            ("{pane_title}", pane_title),
-        ] {
-            if part.contains(placeholder) {
-                part = part.replace(placeholder, value);
+    let replaced: Vec<String> = template
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            for (placeholder, value) in [
+                ("{process_id}", ctx.process_id),
+                ("{cwd}", ctx.cwd),
+                ("{instance_name}", ctx.instance_name),
+                ("{tool}", ctx.tool),
+                ("{pane_title}", pane_title),
+                ("{script}", ctx.script),
+            ] {
+                if part.contains(placeholder) {
+                    part = part.replace(placeholder, value);
+                }
             }
-        }
-        if part.contains("{script}") {
-            part = part.replace("{script}", ctx.script);
-            placeholder_found = true;
-        }
-        replaced.push(part);
-    }
-
-    if !placeholder_found {
-        bail!("{{script}} placeholder not found after parsing");
-    }
+            part
+        })
+        .collect();
 
     Ok(replaced)
 }
 
-/// Shell-split a string.
-fn shell_split(s: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape_next = false;
+/// Substitute placeholders into a close-command argv template, per element.
+///
+/// Mirrors the open path but for close placeholders. Returns `None` (caller
+/// treats as "skip the close") when a required placeholder appears in the
+/// template but the corresponding value is empty — preserving the previous
+/// `close_terminal_pane` skip semantics. `effective_pane_id` is the resolved
+/// pane id (caller falls back from `pane_id` to `terminal_id`).
+fn substitute_close_argv(
+    template: &[String],
+    pid: u32,
+    effective_pane_id: &str,
+    process_id: &str,
+    terminal_id: &str,
+) -> Option<Vec<String>> {
+    let needs = |ph: &str| template.iter().any(|p| p.contains(ph));
 
-    for ch in s.chars() {
-        if escape_next {
-            current.push(ch);
-            escape_next = false;
-            continue;
-        }
-        if ch == '\\' && !in_single {
-            escape_next = true;
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if ch.is_whitespace() && !in_single && !in_double {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+    if needs("{pane_id}") && effective_pane_id.is_empty() {
+        return None;
+    }
+    if needs("{process_id}") && process_id.is_empty() {
+        return None;
+    }
+    if needs("{id}") && terminal_id.is_empty() {
+        return None;
+    }
+
+    let pid_str = pid.to_string();
+    let argv: Vec<String> = template
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            for (placeholder, value) in [
+                ("{pid}", pid_str.as_str()),
+                ("{pane_id}", effective_pane_id),
+                ("{process_id}", process_id),
+                ("{id}", terminal_id),
+            ] {
+                if part.contains(placeholder) {
+                    part = part.replace(placeholder, value);
+                }
             }
-            continue;
-        }
-        current.push(ch);
-    }
+            part
+        })
+        .collect();
 
-    if in_single || in_double {
-        bail!("Unmatched quote in command");
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    Ok(tokens)
+    Some(argv)
 }
 
-/// Get macOS Terminal.app launch command.
-fn get_macos_terminal_command() -> String {
-    rewrite_macos_open_app_command("open -a Terminal {script}", "Terminal")
+/// Get macOS Terminal.app launch argv ({script} substituted by the caller).
+fn get_macos_terminal_argv() -> Vec<String> {
+    let mut argv: Vec<String> = ["open", "-a", "Terminal", "{script}"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    rewrite_macos_open_app_argv(&mut argv, "Terminal");
+    argv
 }
 
 /// Escape a string for use inside a YAML double-quoted scalar.
@@ -1348,19 +1357,6 @@ fn get_windows_terminal_argv() -> Vec<String> {
     ])
 }
 
-/// On Windows, rewrite a preset's bash invocation to run the generated `.ps1`
-/// via PowerShell. Inherently-bash terminals (mintty, shipped with Git Bash)
-/// are left untouched.
-fn windows_shellify_preset(template: &str) -> String {
-    if template.starts_with("mintty") {
-        return template.to_string();
-    }
-    template.replace(
-        "bash {script}",
-        "powershell -ExecutionPolicy Bypass -NoExit -File {script}",
-    )
-}
-
 /// Spawn terminal process, detached when inside AI tools.
 ///
 /// Returns (success, stdout_first_line) — stdout captured for {id} in close commands.
@@ -1429,13 +1425,20 @@ pub fn is_zellij_preset(preset_name: &str) -> bool {
         return true;
     }
 
+    let is_zellij_argv0 = |argv: &[String]| argv.first().map(String::as_str) == Some("zellij");
+
     crate::config::get_merged_preset(preset_name).is_some_and(|preset| {
         preset.binary.as_deref() == Some("zellij")
-            || preset.open.starts_with("zellij ")
+            || is_zellij_argv0(&preset.open)
             || preset
-                .close
+                .open_windows
                 .as_deref()
-                .is_some_and(|close| close.starts_with("zellij "))
+                .is_some_and(is_zellij_argv0)
+            || preset.close.as_deref().is_some_and(is_zellij_argv0)
+            || preset
+                .close_windows
+                .as_deref()
+                .is_some_and(is_zellij_argv0)
     })
 }
 
@@ -1737,7 +1740,7 @@ pub fn launch_terminal(
     }
 
     // New window / custom command mode
-    let custom_cmd: Option<String> = if terminal_mode == "default" {
+    let custom_cmd: Option<Vec<String>> = if terminal_mode == "default" {
         None
     } else if crate::config::get_merged_preset(&terminal_mode).is_some() {
         // Known preset — check kitty remote control requirements
@@ -1757,26 +1760,38 @@ pub fn launch_terminal(
                 );
             }
         }
-        let mut cmd = resolve_terminal_preset(&terminal_mode).unwrap_or_default();
-        // Inject --to for kitty commands launched outside kitty
-        if !kitty_socket.is_empty() && cmd.contains("kitten @") && !cmd.contains("--to") {
-            cmd = cmd.replace(
-                "kitten @",
-                &format!("kitten @ --to {}", shell_quote(&kitty_socket)),
-            );
+        let mut argv = resolve_terminal_open_argv(&terminal_mode).unwrap_or_default();
+        // Inject `--to <socket>` (after the `@`) for kitten commands launched
+        // outside kitty. Splice as separate argv elements — no shell quoting.
+        if !kitty_socket.is_empty()
+            && argv.first().map(String::as_str) == Some("kitten")
+            && argv.get(1).map(String::as_str) == Some("@")
+            && !argv.iter().any(|a| a == "--to")
+        {
+            argv.splice(2..2, ["--to".to_string(), kitty_socket.clone()]);
         }
-        // Target launcher's tab for splits
+        // Target launcher's tab for splits: insert `--match window_id:<wid>`
+        // before the `--` separator.
         if (terminal_mode == "kitty-tab" || terminal_mode == "kitty-split")
             && let Ok(wid) = std::env::var("KITTY_WINDOW_ID")
             && !wid.is_empty()
-            && cmd.contains(" -- ")
+            && let Some(sep) = argv.iter().position(|a| a == "--")
         {
-            cmd = cmd.replacen(" -- ", &format!(" --match window_id:{} -- ", wid), 1);
+            argv.splice(
+                sep..sep,
+                ["--match".to_string(), format!("window_id:{wid}")],
+            );
         }
-        Some(cmd)
+        Some(argv)
     } else {
-        // Custom command template
-        Some(terminal_mode.clone())
+        // Custom command template string (HCOM_TERMINAL / config custom command).
+        // Tokenize once via the double-quote-aware splitter; the array-form TOML
+        // preset path never reaches here (those are known presets).
+        match crate::tools::args_common::shell_split(&terminal_mode) {
+            Ok(argv) if !argv.is_empty() => Some(argv),
+            Ok(_) => bail!("custom terminal command is empty"),
+            Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
+        }
     };
 
     let script_str = script_file.to_string_lossy().to_string();
@@ -1829,13 +1844,9 @@ pub fn launch_terminal(
                 .map(|s| s.as_str())
                 .filter(|s| !s.is_empty()),
         };
-        // On Windows, run the generated .ps1 via PowerShell instead of bash.
-        let cmd_template = if cfg!(windows) {
-            windows_shellify_preset(&cmd_template)
-        } else {
-            cmd_template
-        };
-        let final_argv = parse_terminal_command(&cmd_template, ctx)?;
+        // The Windows `.ps1`-via-PowerShell variant is already selected by the
+        // preset's `open_argv(cfg!(windows))`; no text rewrite needed.
+        let final_argv = substitute_open_argv(&cmd_template, ctx)?;
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
         write_terminal_id(env, &captured_id);
         if success {
@@ -1878,8 +1889,8 @@ pub fn launch_terminal(
         }
 
         let argv = match platform::platform_name() {
-            "Darwin" => parse_terminal_command(
-                &get_macos_terminal_command(),
+            "Darwin" => substitute_open_argv(
+                &get_macos_terminal_argv(),
                 TerminalCommandContext {
                     script: &script_str,
                     process_id: env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
@@ -1901,6 +1912,7 @@ pub fn launch_terminal(
         let final_argv: Vec<String> = if platform::platform_name() == "Darwin" {
             argv
         } else {
+            // Linux/Windows defaults carry only `{script}` placeholders.
             argv.iter()
                 .map(|a| a.replace("{script}", &script_str))
                 .collect()
@@ -1952,12 +1964,10 @@ pub fn close_terminal_pane(
         None => return false,
     };
 
-    let close_template = match merged.close {
-        Some(ref c) => c.clone(),
+    let close_template = match merged.close_argv(cfg!(windows)) {
+        Some(c) => c,
         None => return false,
     };
-
-    let mut close_cmd = close_template;
 
     // Determine effective pane_id (fall back to terminal_id)
     let effective_pane_id = if pane_id.is_empty() && !terminal_id.is_empty() {
@@ -1966,21 +1976,18 @@ pub fn close_terminal_pane(
         pane_id
     };
 
-    // Skip if command needs a placeholder we don't have
-    if close_cmd.contains("{pane_id}") && effective_pane_id.is_empty() {
-        return false;
-    }
-    if close_cmd.contains("{process_id}") && process_id.is_empty() {
-        return false;
-    }
-    if close_cmd.contains("{id}") && terminal_id.is_empty() {
-        return false;
-    }
-
-    close_cmd = close_cmd.replace("{pid}", &pid.to_string());
-    close_cmd = close_cmd.replace("{pane_id}", effective_pane_id);
-    close_cmd = close_cmd.replace("{process_id}", process_id);
-    close_cmd = close_cmd.replace("{id}", terminal_id);
+    // Substitute close placeholders per-element. Returns None when a required
+    // placeholder is present but its value is empty (skip the close).
+    let mut argv = match substitute_close_argv(
+        &close_template,
+        pid,
+        effective_pane_id,
+        process_id,
+        terminal_id,
+    ) {
+        Some(a) => a,
+        None => return false,
+    };
 
     let is_zellij = is_zellij_preset(preset_name);
 
@@ -1994,47 +2001,51 @@ pub fn close_terminal_pane(
         None
     };
 
-    if is_zellij && !zellij_session_name.is_empty() && close_cmd.starts_with("zellij action ") {
-        close_cmd = format!(
-            "zellij --session {}{}",
-            shell_quote(zellij_session_name),
-            &close_cmd["zellij".len()..]
+    // Splice `--session <name>` right after `zellij` for `zellij action ...`.
+    if is_zellij
+        && !zellij_session_name.is_empty()
+        && argv.first().map(String::as_str) == Some("zellij")
+        && argv.get(1).map(String::as_str) == Some("action")
+    {
+        argv.splice(
+            1..1,
+            ["--session".to_string(), zellij_session_name.to_string()],
         );
     }
 
-    // Resolve binary path via app bundle fallback
+    // Resolve binary path via app bundle fallback (replace argv[0]).
     if let Some(ref binary) = merged.binary {
         let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
         if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name)
-            && close_cmd.starts_with(binary.as_str())
+            && argv.first().map(String::as_str) == Some(binary.as_str())
         {
-            close_cmd = format!("{}{}", full_path, &close_cmd[binary.len()..]);
+            argv[0] = full_path;
         }
     }
-    if close_cmd.starts_with("kitten ")
+    if argv.first().map(String::as_str) == Some("kitten")
         && let Some(full_path) = find_kitten_binary()
     {
-        close_cmd = format!(
-            "{}{}",
-            shell_quote(&full_path),
-            &close_cmd["kitten".len()..]
-        );
+        argv[0] = full_path;
     }
 
-    // Inject --to for kitten commands when we have the socket path
-    if close_cmd.contains("kitten @")
+    // Inject `--to <socket>` (after the `@`) for kitten commands when we have
+    // the socket path.
+    if argv.first().map(String::as_str) == Some("kitten")
+        && argv.get(1).map(String::as_str) == Some("@")
         && !kitty_listen_on.is_empty()
-        && !close_cmd.contains("--to")
+        && !argv.iter().any(|a| a == "--to")
         && !kitty_listen_on.starts_with("fd:")
     {
-        close_cmd = close_cmd.replace(
-            "kitten @",
-            &format!("kitten @ --to {}", shell_quote(kitty_listen_on)),
-        );
+        argv.splice(2..2, ["--to".to_string(), kitty_listen_on.to_string()]);
     }
 
-    let output = Command::new("sh")
-        .args(["-c", &close_cmd])
+    if argv.is_empty() {
+        return false;
+    }
+
+    // Run the close command directly (no shell) so it works on Windows too.
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -2286,27 +2297,9 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
-    #[test]
-    fn test_shell_split_basic() {
-        let parts = shell_split("foo bar baz").unwrap();
-        assert_eq!(parts, vec!["foo", "bar", "baz"]);
-    }
-
-    #[test]
-    fn test_shell_split_quoted() {
-        let parts = shell_split("foo 'bar baz' qux").unwrap();
-        assert_eq!(parts, vec!["foo", "bar baz", "qux"]);
-    }
-
-    #[test]
-    fn test_shell_split_double_quoted() {
-        let parts = shell_split(r#"foo "bar baz" qux"#).unwrap();
-        assert_eq!(parts, vec!["foo", "bar baz", "qux"]);
-    }
-
-    #[test]
-    fn test_shell_split_unmatched_quote() {
-        assert!(shell_split("foo 'bar").is_err());
+    /// Build a `Vec<String>` argv from `&str` literals (test helper).
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -2522,20 +2515,28 @@ mod tests {
     }
 
     #[test]
-    fn test_windows_shellify_preset_rewrites_bash() {
-        assert_eq!(
-            windows_shellify_preset("wezterm start -- bash {script}"),
-            "wezterm start -- powershell -ExecutionPolicy Bypass -NoExit -File {script}"
+    fn test_wezterm_open_argv_selects_powershell_on_windows() {
+        // The PowerShell variant is now selected by the preset's PlatformArgv,
+        // not a text rewrite. Confirm the merged preset surfaces it.
+        let merged = crate::config::get_merged_preset("wezterm").unwrap();
+        let win = merged.open_argv(true);
+        assert!(win.iter().any(|a| a == "powershell"));
+        assert!(win.iter().any(|a| a == "-File"));
+        assert!(!win.iter().any(|a| a == "bash"));
+        let unix = merged.open_argv(false);
+        assert!(unix.iter().any(|a| a == "bash"));
+    }
+
+    #[test]
+    fn test_mintty_open_argv_has_no_bash() {
+        let merged = crate::config::get_merged_preset("mintty").unwrap();
+        let argv = merged.open_argv(true);
+        assert_eq!(argv.first().map(String::as_str), Some("mintty"));
+        assert!(
+            !argv.iter().any(|a| a == "bash"),
+            "mintty must not hand a .ps1 to bash"
         );
-        assert_eq!(
-            windows_shellify_preset("wt -- bash {script}"),
-            "wt -- powershell -ExecutionPolicy Bypass -NoExit -File {script}"
-        );
-        // mintty ships with Git Bash, so its bash invocation is left intact.
-        assert_eq!(
-            windows_shellify_preset("mintty bash {script}"),
-            "mintty bash {script}"
-        );
+        assert!(argv.iter().any(|a| a == "powershell"));
     }
 
     // Unix-only: "/abs/path" isn't absolute on Windows (no drive), so it would
@@ -2597,7 +2598,8 @@ mod tests {
         let preset = crate::shared::terminal_presets::get_terminal_preset("warp").unwrap();
         assert_eq!(preset.app_name, Some("Warp"));
         assert_eq!(preset.binary, None);
-        assert!(preset.open.contains("warp://launch/hcom-{process_id}"));
+        let open = preset.open.select(false).unwrap();
+        assert!(open.contains(&"warp://launch/hcom-{process_id}"));
         assert_eq!(preset.platforms, &["Darwin"]);
     }
 
@@ -2705,46 +2707,94 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_terminal_command_basic() {
-        let argv =
-            parse_terminal_command("open -a Terminal {script}", ctx_with_script("/tmp/test.sh"))
-                .unwrap();
-        assert_eq!(argv, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
-    }
-
-    #[test]
-    fn test_rewrite_open_command_with_app_path() {
-        let rewritten = rewrite_open_command_with_app_path(
-            "open -a Terminal {script}",
-            Path::new("/System/Applications/Utilities/Terminal.app"),
+    fn test_substitute_open_argv_basic() {
+        let out = substitute_open_argv(
+            &argv(&["open", "-a", "Terminal", "{script}"]),
+            ctx_with_script("/tmp/test.sh"),
         )
         .unwrap();
-        assert_eq!(rewritten, "open -a Terminal {script}");
+        assert_eq!(out, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
     }
 
     #[test]
-    fn test_rewrite_open_command_with_combined_flag() {
-        let rewritten = rewrite_open_command_with_app_path(
-            "open -na Ghostty.app --args -e bash {script}",
-            Path::new("/Applications/Ghostty.app"),
+    fn test_substitute_open_argv_preserves_windows_path() {
+        // A backslashed Windows .ps1 path substituted into a single argv element
+        // must survive byte-for-byte (no shell splitting, no escaping).
+        let out = substitute_open_argv(
+            &argv(&["wt", "--", "powershell", "-File", "{script}"]),
+            ctx_with_script(r"C:\Users\x\s.ps1"),
         )
         .unwrap();
         assert_eq!(
-            rewritten,
-            "open -n /Applications/Ghostty.app --args -e bash '{script}'"
+            out,
+            vec!["wt", "--", "powershell", "-File", r"C:\Users\x\s.ps1"]
         );
     }
 
     #[test]
-    fn test_rewrite_open_command_with_explicit_args() {
-        let rewritten = rewrite_open_command_with_app_path(
-            "open -a Terminal --args bash {script}",
-            Path::new("/System/Applications/Utilities/Terminal.app"),
+    fn test_substitute_open_argv_process_id_element() {
+        // `HCOM_PROCESS_ID={process_id}` is one element; the placeholder is
+        // replaced inside it without needing quoting.
+        let out = substitute_open_argv(
+            &argv(&["kitty", "--env", "HCOM_PROCESS_ID={process_id}", "{script}"]),
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                ..TerminalCommandContext::default()
+            },
         )
         .unwrap();
         assert_eq!(
-            rewritten,
-            "open /System/Applications/Utilities/Terminal.app --args bash '{script}'"
+            out,
+            vec!["kitty", "--env", "HCOM_PROCESS_ID=abc-123", "/tmp/test.sh"]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_open_argv_with_app_path_keeps_plain_open_a() {
+        // No `--args` tail ⇒ leave `-a Terminal` intact (file-open form).
+        let mut v = argv(&["open", "-a", "Terminal", "{script}"]);
+        rewrite_open_argv_with_app_path(
+            &mut v,
+            Path::new("/System/Applications/Utilities/Terminal.app"),
+        );
+        assert_eq!(v, vec!["open", "-a", "Terminal", "{script}"]);
+    }
+
+    #[test]
+    fn test_rewrite_open_argv_with_combined_flag() {
+        let mut v = argv(&["open", "-na", "Ghostty.app", "--args", "-e", "bash", "{script}"]);
+        rewrite_open_argv_with_app_path(&mut v, Path::new("/Applications/Ghostty.app"));
+        assert_eq!(
+            v,
+            vec![
+                "open",
+                "-n",
+                "/Applications/Ghostty.app",
+                "--args",
+                "-e",
+                "bash",
+                "{script}"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_open_argv_with_explicit_args() {
+        let mut v = argv(&["open", "-a", "Terminal", "--args", "bash", "{script}"]);
+        rewrite_open_argv_with_app_path(
+            &mut v,
+            Path::new("/System/Applications/Utilities/Terminal.app"),
+        );
+        assert_eq!(
+            v,
+            vec![
+                "open",
+                "/System/Applications/Utilities/Terminal.app",
+                "--args",
+                "bash",
+                "{script}"
+            ]
         );
     }
 
@@ -2790,16 +2840,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_terminal_command_missing_placeholder() {
+    fn test_substitute_open_argv_missing_placeholder() {
         assert!(
-            parse_terminal_command("open -a Terminal", ctx_with_script("/tmp/test.sh")).is_err()
+            substitute_open_argv(&argv(&["open", "-a", "Terminal"]), ctx_with_script("/tmp/test.sh"))
+                .is_err()
         );
     }
 
     #[test]
-    fn test_parse_terminal_command_with_process_id() {
-        let argv = parse_terminal_command(
-            "tmux split -t {process_id} -- {script}",
+    fn test_substitute_open_argv_with_process_id() {
+        let out = substitute_open_argv(
+            &argv(&["tmux", "split", "-t", "{process_id}", "--", "{script}"]),
             TerminalCommandContext {
                 script: "/tmp/test.sh",
                 process_id: "abc-123",
@@ -2808,15 +2859,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            argv,
+            out,
             vec!["tmux", "split", "-t", "abc-123", "--", "/tmp/test.sh"]
         );
     }
 
     #[test]
     fn test_waveterm_preset_uses_run_separator() {
-        let cmd = resolve_terminal_preset("waveterm").unwrap();
-        let argv = parse_terminal_command(
+        let cmd = resolve_terminal_open_argv("waveterm").unwrap();
+        let out = substitute_open_argv(
             &cmd,
             TerminalCommandContext {
                 script: "/tmp/test.sh",
@@ -2825,7 +2876,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(argv, vec!["wsh", "run", "--", "bash", "/tmp/test.sh"]);
+        assert_eq!(out, vec!["wsh", "run", "--", "bash", "/tmp/test.sh"]);
     }
 
     #[test]
@@ -2863,26 +2914,31 @@ mod tests {
         // (`◉ luna [claude]`) is pushed separately via `pane.rename` from the
         // delivery loop, not baked into the agent name.
         let preset = crate::shared::terminal_presets::get_terminal_preset("herdr").unwrap();
-        assert!(preset.open.contains("{script}"));
-        assert!(preset.open.contains("{instance_name}"));
+        let open = preset.open.select(false).unwrap();
+        assert!(open.contains(&"{script}"));
+        assert!(open.contains(&"{instance_name}"));
         assert!(
-            !preset.open.contains("{pane_title}"),
+            !open.contains(&"{pane_title}"),
             "herdr preset must not use {{pane_title}} as agent name"
         );
-        assert!(preset.open.contains("{cwd}"));
-        assert!(!preset.open.contains("{process_id}"));
+        assert!(open.contains(&"{cwd}"));
+        assert!(!open.contains(&"{process_id}"));
         assert_eq!(preset.binary, Some("herdr"));
         // Close must use {pane_id} (stable raw `p_N`), not {id} (public
         // `<ws>-<N>` which herdr renumbers when sibling panes close — a kill
         // batch addressing the public id can land on the wrong pane).
-        assert!(preset.close.unwrap().contains("{pane_id}"));
+        let close = preset.close.select(false).unwrap();
+        assert!(close.contains(&"{pane_id}"));
     }
 
     #[test]
-    fn test_parse_herdr_terminal_command_uses_pane_title() {
-        let cmd = "herdr agent start {pane_title} --cwd {cwd} --no-focus -- bash {script}";
-        let argv = parse_terminal_command(
-            cmd,
+    fn test_substitute_herdr_open_argv_uses_pane_title() {
+        let template = argv(&[
+            "herdr", "agent", "start", "{pane_title}", "--cwd", "{cwd}", "--no-focus", "--",
+            "bash", "{script}",
+        ]);
+        let out = substitute_open_argv(
+            &template,
             TerminalCommandContext {
                 script: "/tmp/test.sh",
                 process_id: "abc-123",
@@ -2894,7 +2950,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            argv,
+            out,
             vec![
                 "herdr",
                 "agent",
@@ -2911,9 +2967,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_terminal_command_pane_title_falls_back_to_instance_name() {
-        let argv = parse_terminal_command(
-            "herdr agent start {pane_title} -- bash {script}",
+    fn test_substitute_open_argv_pane_title_falls_back_to_instance_name() {
+        let out = substitute_open_argv(
+            &argv(&["herdr", "agent", "start", "{pane_title}", "--", "bash", "{script}"]),
             TerminalCommandContext {
                 script: "/tmp/test.sh",
                 instance_name: "abc-123",
@@ -2923,7 +2979,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            argv,
+            out,
             vec![
                 "herdr",
                 "agent",
@@ -2937,9 +2993,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_terminal_command_cwd_placeholder() {
-        let argv = parse_terminal_command(
-            "myterm --dir {cwd} -- bash {script}",
+    fn test_substitute_open_argv_cwd_placeholder() {
+        let out = substitute_open_argv(
+            &argv(&["myterm", "--dir", "{cwd}", "--", "bash", "{script}"]),
             TerminalCommandContext {
                 script: "/tmp/test.sh",
                 cwd: "/home/user",
@@ -2948,25 +3004,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            argv,
+            out,
+            vec!["myterm", "--dir", "/home/user", "--", "bash", "/tmp/test.sh"]
+        );
+    }
+
+    #[test]
+    fn test_substitute_open_argv_empty_cwd() {
+        // Templates without {cwd} should work with empty cwd
+        let out = substitute_open_argv(
+            &argv(&["open", "-a", "Terminal", "{script}"]),
+            ctx_with_script("/tmp/test.sh"),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
+    }
+
+    #[test]
+    fn test_substitute_close_argv_skips_when_pane_id_missing() {
+        // Required {pane_id} placeholder but empty value ⇒ None (skip close).
+        assert!(
+            substitute_close_argv(
+                &argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
+                42,
+                "",
+                "proc-1",
+                "",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_substitute_close_argv_substitutes_pane_id() {
+        let out = substitute_close_argv(
+            &argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
+            42,
+            "pane-7",
+            "proc-1",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec!["wezterm", "cli", "kill-pane", "--pane-id", "pane-7"]
+        );
+    }
+
+    #[test]
+    fn test_zellij_close_argv_session_splice() {
+        // Reproduce the close_terminal_pane splice: --session <name> after zellij.
+        let mut a = substitute_close_argv(
+            &argv(&["zellij", "action", "close-pane", "--pane-id", "{pane_id}"]),
+            0,
+            "6",
+            "",
+            "",
+        )
+        .unwrap();
+        a.splice(1..1, ["--session".to_string(), "wise-kangaroo".to_string()]);
+        assert_eq!(
+            a,
             vec![
-                "myterm",
-                "--dir",
-                "/home/user",
-                "--",
-                "bash",
-                "/tmp/test.sh"
+                "zellij",
+                "--session",
+                "wise-kangaroo",
+                "action",
+                "close-pane",
+                "--pane-id",
+                "6"
             ]
         );
     }
 
     #[test]
-    fn test_parse_terminal_command_empty_cwd() {
-        // Templates without {cwd} should work with empty cwd
-        let argv =
-            parse_terminal_command("open -a Terminal {script}", ctx_with_script("/tmp/test.sh"))
-                .unwrap();
-        assert_eq!(argv, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
+    fn test_kitten_close_argv_to_splice() {
+        // Reproduce the close_terminal_pane splice: --to <socket> after `@`.
+        let mut a = substitute_close_argv(
+            &argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
+            0,
+            "13",
+            "",
+            "",
+        )
+        .unwrap();
+        a.splice(2..2, ["--to".to_string(), "unix:/tmp/kitty".to_string()]);
+        assert_eq!(
+            a,
+            vec![
+                "kitten",
+                "@",
+                "--to",
+                "unix:/tmp/kitty",
+                "close-window",
+                "--match",
+                "id:13"
+            ]
+        );
     }
 
     #[test]

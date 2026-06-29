@@ -1026,14 +1026,8 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
                 .get("app_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            open: val
-                .get("open")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            close: val
-                .get("close")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            open: val.get("open").and_then(toml_val_to_argv),
+            close: val.get("close").and_then(toml_val_to_argv),
             pane_id_env: val
                 .get("pane_id_env")
                 .and_then(|v| v.as_str())
@@ -1046,20 +1040,45 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
     match (&toml_preset, &builtin) {
         (None, None) => None,
         _ => {
-            let b_open = builtin.map(|b| b.open).unwrap_or("");
-            let b_close = builtin.and_then(|b| b.close);
+            // Built-in argv templates, lowered to owned Vec<String> per platform.
+            let argv_vec = |sel: Option<crate::shared::terminal_presets::ArgvTemplate>| {
+                sel.map(|t| t.iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            };
+            let b_open = builtin.map(|b| b.open);
+            let b_close = builtin.map(|b| b.close);
             let b_binary = builtin.and_then(|b| b.binary);
             let b_app = builtin.and_then(|b| b.app_name);
             let b_pane_env = builtin.and_then(|b| b.pane_id_env);
 
             let t = toml_preset.as_ref();
+
+            // A TOML `open`/`close` override (string or array) replaces the
+            // built-in on BOTH platforms — TOML custom presets have no separate
+            // Windows slot, so the array form is the Windows escape hatch (it
+            // can carry literal Windows paths without shell mangling).
+            let toml_open = t.and_then(|t| t.open.clone());
+            let toml_close = t.and_then(|t| t.close.clone());
+
+            let (open, open_windows) = match toml_open {
+                Some(o) => (o, None),
+                None => (
+                    argv_vec(b_open.and_then(|o| o.default)).unwrap_or_default(),
+                    argv_vec(b_open.and_then(|o| o.windows)),
+                ),
+            };
+            let (close, close_windows) = match toml_close {
+                Some(c) => (Some(c), None),
+                None => (
+                    argv_vec(b_close.and_then(|c| c.default)),
+                    argv_vec(b_close.and_then(|c| c.windows)),
+                ),
+            };
+
             Some(MergedPreset {
-                open: t
-                    .and_then(|t| t.open.clone())
-                    .unwrap_or_else(|| b_open.to_string()),
-                close: t
-                    .and_then(|t| t.close.clone())
-                    .or_else(|| b_close.map(|s| s.to_string())),
+                open,
+                open_windows,
+                close,
+                close_windows,
                 binary: t
                     .and_then(|t| t.binary.clone())
                     .or_else(|| b_binary.map(|s| s.to_string())),
@@ -1074,23 +1093,84 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
     }
 }
 
+/// Convert a TOML preset `open`/`close` value into an argv vector.
+///
+/// Accepts BOTH forms:
+/// - Array: each element is collected directly (no tokenization), so literal
+///   Windows paths like `C:\Users\x\s.ps1` survive intact. This is the
+///   recommended escape hatch for custom presets.
+/// - String (legacy): tokenized once via the double-quote-aware
+///   `args_common::shell_split`. Backslashes are consumed by that tokenizer, so
+///   the array form is preferred for Windows paths.
+///
+/// Returns None when the value is neither a string nor a string array, or when
+/// a legacy string fails to tokenize (a warning is printed in that case).
+fn toml_val_to_argv(v: &toml::Value) -> Option<Vec<String>> {
+    match v {
+        toml::Value::Array(items) => {
+            let argv: Vec<String> = items
+                .iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect();
+            if argv.is_empty() { None } else { Some(argv) }
+        }
+        toml::Value::String(s) => match crate::tools::args_common::shell_split(s) {
+            Ok(argv) if !argv.is_empty() => Some(argv),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("Warning: invalid quoting in custom terminal preset command: {e}");
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
 /// Parsed TOML preset fields (all optional — overlay on built-in).
 struct TomlPresetFields {
     binary: Option<String>,
     app_name: Option<String>,
-    open: Option<String>,
-    close: Option<String>,
+    open: Option<Vec<String>>,
+    close: Option<Vec<String>>,
     pane_id_env: Option<String>,
 }
 
-/// Fully merged terminal preset (TOML + built-in).
+/// Fully merged terminal preset (TOML + built-in), as argument vectors.
 #[derive(Debug, Clone)]
 pub struct MergedPreset {
-    pub open: String,
-    pub close: Option<String>,
+    /// Default (Unix / fallback) open argv.
+    pub open: Vec<String>,
+    /// Windows-specific open argv override (None ⇒ use `open`).
+    pub open_windows: Option<Vec<String>>,
+    /// Default (Unix / fallback) close argv (None ⇒ no close API).
+    pub close: Option<Vec<String>>,
+    /// Windows-specific close argv override (None ⇒ use `close`).
+    pub close_windows: Option<Vec<String>>,
     pub binary: Option<String>,
     pub app_name: Option<String>,
     pub pane_id_env: Option<String>,
+}
+
+impl MergedPreset {
+    /// Open argv for the given platform (Windows falls back to the default).
+    pub fn open_argv(&self, is_windows: bool) -> Vec<String> {
+        if is_windows {
+            self.open_windows
+                .clone()
+                .unwrap_or_else(|| self.open.clone())
+        } else {
+            self.open.clone()
+        }
+    }
+
+    /// Close argv for the given platform (Windows falls back to the default).
+    pub fn close_argv(&self, is_windows: bool) -> Option<Vec<String>> {
+        if is_windows {
+            self.close_windows.clone().or_else(|| self.close.clone())
+        } else {
+            self.close.clone()
+        }
+    }
 }
 
 fn is_falsy(s: &str) -> bool {
@@ -2008,6 +2088,46 @@ binary = "myterm"
         assert!(presets.is_some());
         let presets = presets.unwrap();
         assert!(presets.as_table().unwrap().contains_key("myterm"));
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_array_preserves_windows_path() {
+        // Array form: elements collected verbatim, so a literal Windows path
+        // (backslashes, drive letter) survives without tokenization.
+        let v = toml::Value::Array(vec![
+            toml::Value::String("myterm".into()),
+            toml::Value::String("-e".into()),
+            toml::Value::String(r"C:\Users\x\s.ps1".into()),
+        ]);
+        assert_eq!(
+            toml_val_to_argv(&v),
+            Some(vec![
+                "myterm".to_string(),
+                "-e".to_string(),
+                r"C:\Users\x\s.ps1".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_string_tokenizes_legacy() {
+        let v = toml::Value::String("myterm -e bash {script}".into());
+        assert_eq!(
+            toml_val_to_argv(&v),
+            Some(vec![
+                "myterm".to_string(),
+                "-e".to_string(),
+                "bash".to_string(),
+                "{script}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_rejects_non_string_array_and_empty() {
+        assert_eq!(toml_val_to_argv(&toml::Value::Integer(3)), None);
+        assert_eq!(toml_val_to_argv(&toml::Value::Array(vec![])), None);
+        assert_eq!(toml_val_to_argv(&toml::Value::String(String::new())), None);
     }
 
     #[test]

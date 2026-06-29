@@ -1764,7 +1764,8 @@ pub fn terminal_help_text(show_current: bool) -> String {
     lines.push(String::new());
     lines.push("Other (opens window only):".to_string());
     for (name, preset) in TERMINAL_PRESETS.iter() {
-        if all_managed.contains(name) || preset.close.is_some() {
+        let has_close = preset.close.default.is_some() || preset.close.windows.is_some();
+        if all_managed.contains(name) || has_close {
             continue;
         }
         if !preset.platforms.is_empty() && !preset.platforms.contains(&platform) {
@@ -1782,10 +1783,11 @@ pub fn terminal_help_text(show_current: bool) -> String {
                 t.iter()
                     .filter(|(name, _)| !TERMINAL_PRESETS.iter().any(|(n, _)| *n == name.as_str()))
                     .map(|(name, val)| {
-                        let has_close = val
-                            .get("close")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|s| !s.is_empty());
+                        // close may be a legacy string or an argv array.
+                        let has_close = val.get("close").is_some_and(|v| {
+                            v.as_str().is_some_and(|s| !s.is_empty())
+                                || v.as_array().is_some_and(|a| !a.is_empty())
+                        });
                         (name.clone(), has_close)
                     })
                     .collect()
@@ -2343,7 +2345,7 @@ mod tests {
 
     #[test]
     fn test_terminal_help_text_documents_new_placeholders() {
-        // If you add a placeholder to parse_terminal_command, document it.
+        // If you add a placeholder to substitute_open_argv, document it.
         let help = terminal_help_text(false);
         for placeholder in ["{instance_name}", "{tool}", "{cwd}", "{pane_title}"] {
             assert!(
