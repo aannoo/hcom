@@ -456,8 +456,7 @@ pub(super) fn start_delivery_thread(
                 "delivery.init.timeout",
                 "Delivery thread init timed out after 5s",
             );
-            // The thread is detached and still running — flag this distinctly so
-            // a retrying caller does not spawn a second delivery thread.
+            // Detached thread is still running; flag as non-retryable.
             Err(DeliveryStartTimeout.into())
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -466,9 +465,8 @@ pub(super) fn start_delivery_thread(
                 "delivery.init.disconnect",
                 "Delivery thread init channel disconnected",
             );
-            // Disconnect means the spawned thread dropped its sender without
-            // sending — it has returned/panicked, so retrying is unsafe in the
-            // same way a timeout is (the thread may have partially registered).
+            // Sender dropped without sending: thread returned/panicked, possibly
+            // after partial registration. Non-retryable like a timeout.
             Err(DeliveryStartTimeout.into())
         }
     }
