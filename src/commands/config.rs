@@ -1721,7 +1721,7 @@ pub fn terminal_help_text(show_current: bool) -> String {
             lines.push(format!("Current: default (auto-detect){suffix}"));
         } else {
             let kind = if crate::config::get_merged_preset(&current)
-                .is_some_and(|p| p.close_argv(cfg!(windows)).is_some())
+                .is_some_and(|p| p.has_close(cfg!(windows)))
             {
                 "managed"
             } else {

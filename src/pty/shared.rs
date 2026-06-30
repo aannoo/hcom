@@ -24,7 +24,7 @@ use crate::delivery::{
 };
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
-use crate::shared::{ST_BLOCKED, ST_LISTENING, status_icon};
+use crate::shared::{ST_BLOCKED, ST_LISTENING};
 use crate::tool::Tool;
 
 use super::PtyTarget;
@@ -532,14 +532,14 @@ pub(super) fn finalize_launch_failure_after_exit(
 
 /// Build the OSC 1/2 title-set escape for `name`/`status` under `tool_name`.
 pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> String {
-    let icon = status_icon(status);
-    let title = format!("{} {} [{}]", icon, name, tool_name);
+    let title = crate::shared::format_pane_title(status, name, tool_name);
     format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::status_icon;
 
     #[test]
     fn delivery_start_timeout_downcasts_through_anyhow() {

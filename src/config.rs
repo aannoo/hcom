@@ -1205,6 +1205,15 @@ impl MergedPreset {
             self.close.clone()
         }
     }
+
+    /// Whether a close API exists for the given platform (no clone).
+    pub fn has_close(&self, is_windows: bool) -> bool {
+        if is_windows {
+            self.close_windows.is_some() || self.close.is_some()
+        } else {
+            self.close.is_some()
+        }
+    }
 }
 
 fn is_falsy(s: &str) -> bool {
