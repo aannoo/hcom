@@ -695,7 +695,6 @@ pub struct Proxy {
     screen: ScreenTracker,
     inject_server: InjectServer,
     last_user_input: Instant,
-    user_activity_cooldown_ms: u64,
     /// Shared delivery state (for delivery thread)
     delivery_state: Arc<RwLock<ScreenState>>,
     /// True while launch outcome is still Pending. Cleared by the delivery
@@ -810,8 +809,6 @@ impl Proxy {
         // Start injection server (port is registered to DB by delivery thread)
         let inject_server = InjectServer::new()?;
 
-        let user_activity_cooldown_ms = 500; // 0.5s for all tools (dim detection enables this for Claude)
-
         // Initialize shared state for terminal title (updated by delivery thread).
         // Query tag from DB to show full display name (tag-name) from the start.
         let initial_display_name = {
@@ -838,7 +835,6 @@ impl Proxy {
             screen,
             inject_server,
             last_user_input: Instant::now(),
-            user_activity_cooldown_ms,
             delivery_state: Arc::new(RwLock::new(ScreenState::default())),
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
