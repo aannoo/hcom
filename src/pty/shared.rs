@@ -137,9 +137,12 @@ pub(super) fn clear_injected_approval_state(
 /// Cursor's approval is screen-scraped and authoritative-by-prompt, so it clears
 /// only when the prompt actually leaves the screen.
 ///
-/// Returns `true` when the caller should clear the tracker's approval (i.e. the
-/// target is not cursor). The Unix caller already clears its tracker inline; the
-/// Windows caller sets an atomic the reader thread consumes.
+/// Returns `true` only when a standing approval was actually cleared — matching
+/// `clear_injected_approval_state`. The Unix caller ignores this and clears its
+/// tracker inline on every non-cursor keystroke; the Windows caller uses it to
+/// gate the tracker-clear atomic it consumes, so a keystroke with no approval
+/// showing does not wipe the OSC scrape buffer (`output_buffer`) and lose an
+/// approval edge that arrives in the same window.
 pub(super) fn note_user_keystroke(
     target: &PtyTarget,
     screen_state: &Arc<RwLock<ScreenState>>,
@@ -157,7 +160,7 @@ pub(super) fn note_user_keystroke(
     if approval_cleared {
         publish(false);
     }
-    !cursor_scrape
+    approval_cleared
 }
 
 /// Publish PTY approval edges independently of the delivery queue.
@@ -545,8 +548,8 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let publish = |_a: bool| calls.set(calls.get() + 1);
         // cursor name: must not clear approval, must not publish, returns false.
-        let should_clear = note_user_keystroke(&target, &state, &publish);
-        assert!(!should_clear);
+        let cleared = note_user_keystroke(&target, &state, &publish);
+        assert!(!cleared);
         assert!(state.read().unwrap().approval, "cursor approval untouched");
         assert_eq!(calls.get(), 0, "cursor keystroke must not publish");
     }
@@ -563,8 +566,8 @@ mod tests {
             assert!(!a, "keystroke publishes the cleared (false) edge");
             calls.set(calls.get() + 1);
         };
-        let should_clear = note_user_keystroke(&target, &state, &publish);
-        assert!(should_clear, "non-cursor caller should clear tracker");
+        let cleared = note_user_keystroke(&target, &state, &publish);
+        assert!(cleared, "a standing approval was cleared");
         assert!(!state.read().unwrap().approval, "approval cleared");
         assert_eq!(calls.get(), 1, "cleared edge published once");
     }
@@ -575,8 +578,13 @@ mod tests {
         let state = Arc::new(RwLock::new(ScreenState::default())); // approval=false
         let calls = std::cell::Cell::new(0);
         let publish = |_a: bool| calls.set(calls.get() + 1);
-        let should_clear = note_user_keystroke(&target, &state, &publish);
-        assert!(should_clear, "non-cursor still requests tracker clear");
+        // No approval was showing, so nothing is cleared and the Windows caller
+        // must not request a tracker-clear (which would wipe the scrape buffer).
+        let cleared = note_user_keystroke(&target, &state, &publish);
+        assert!(
+            !cleared,
+            "no standing approval means no tracker clear requested"
+        );
         assert_eq!(calls.get(), 0, "no edge to publish when already clear");
     }
 

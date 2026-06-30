@@ -477,7 +477,11 @@ impl Proxy {
                             // approval clears it immediately. Record the cleared
                             // edge against shared state; the reader thread owns
                             // the tracker, so request a tracker-clear via the
-                            // atomic it consumes.
+                            // atomic it consumes — but ONLY when an approval was
+                            // actually standing. `clear_approval()` wipes the OSC
+                            // scrape buffer, so requesting it on every keystroke
+                            // would let a routine keypress race out an approval
+                            // edge arriving in the same window.
                             let publish = |a: bool| {
                                 shared::publish_approval_status(
                                     a,
