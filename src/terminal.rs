@@ -54,14 +54,36 @@ pub enum LaunchResult {
 /// macOS app bundle fallback commands for cross-platform terminals.
 /// Used when CLI binary isn't in PATH but .app bundle is installed.
 const MACOS_APP_FALLBACKS: &[(&str, ArgvTemplate)] = &[
-    ("kitty-window", &["open", "-n", "-a", "kitty.app", "--args", "{script}"]),
+    (
+        "kitty-window",
+        &["open", "-n", "-a", "kitty.app", "--args", "{script}"],
+    ),
     (
         "wezterm-window",
-        &["open", "-n", "-a", "WezTerm.app", "--args", "start", "--", "bash", "{script}"],
+        &[
+            "open",
+            "-n",
+            "-a",
+            "WezTerm.app",
+            "--args",
+            "start",
+            "--",
+            "bash",
+            "{script}",
+        ],
     ),
     (
         "alacritty",
-        &["open", "-n", "-a", "Alacritty.app", "--args", "-e", "bash", "{script}"],
+        &[
+            "open",
+            "-n",
+            "-a",
+            "Alacritty.app",
+            "--args",
+            "-e",
+            "bash",
+            "{script}",
+        ],
     ),
 ];
 
@@ -1046,7 +1068,10 @@ pub(crate) struct TerminalCommandContext<'a> {
 /// like `C:\Users\x\s.ps1` substituted into the `{script}` element survives
 /// intact (no backslash mangling, no re-quoting). Requires at least one element
 /// to contain `{script}`.
-fn substitute_open_argv(template: &[String], ctx: TerminalCommandContext<'_>) -> Result<Vec<String>> {
+fn substitute_open_argv(
+    template: &[String],
+    ctx: TerminalCommandContext<'_>,
+) -> Result<Vec<String>> {
     if !template.iter().any(|p| p.contains("{script}")) {
         bail!(
             "Custom terminal command must include {{script}} placeholder\n\
@@ -1430,15 +1455,9 @@ pub fn is_zellij_preset(preset_name: &str) -> bool {
     crate::config::get_merged_preset(preset_name).is_some_and(|preset| {
         preset.binary.as_deref() == Some("zellij")
             || is_zellij_argv0(&preset.open)
-            || preset
-                .open_windows
-                .as_deref()
-                .is_some_and(is_zellij_argv0)
+            || preset.open_windows.as_deref().is_some_and(is_zellij_argv0)
             || preset.close.as_deref().is_some_and(is_zellij_argv0)
-            || preset
-                .close_windows
-                .as_deref()
-                .is_some_and(is_zellij_argv0)
+            || preset.close_windows.as_deref().is_some_and(is_zellij_argv0)
     })
 }
 
@@ -2763,7 +2782,15 @@ mod tests {
 
     #[test]
     fn test_rewrite_open_argv_with_combined_flag() {
-        let mut v = argv(&["open", "-na", "Ghostty.app", "--args", "-e", "bash", "{script}"]);
+        let mut v = argv(&[
+            "open",
+            "-na",
+            "Ghostty.app",
+            "--args",
+            "-e",
+            "bash",
+            "{script}",
+        ]);
         rewrite_open_argv_with_app_path(&mut v, Path::new("/Applications/Ghostty.app"));
         assert_eq!(
             v,
@@ -2842,8 +2869,11 @@ mod tests {
     #[test]
     fn test_substitute_open_argv_missing_placeholder() {
         assert!(
-            substitute_open_argv(&argv(&["open", "-a", "Terminal"]), ctx_with_script("/tmp/test.sh"))
-                .is_err()
+            substitute_open_argv(
+                &argv(&["open", "-a", "Terminal"]),
+                ctx_with_script("/tmp/test.sh")
+            )
+            .is_err()
         );
     }
 
@@ -2934,8 +2964,16 @@ mod tests {
     #[test]
     fn test_substitute_herdr_open_argv_uses_pane_title() {
         let template = argv(&[
-            "herdr", "agent", "start", "{pane_title}", "--cwd", "{cwd}", "--no-focus", "--",
-            "bash", "{script}",
+            "herdr",
+            "agent",
+            "start",
+            "{pane_title}",
+            "--cwd",
+            "{cwd}",
+            "--no-focus",
+            "--",
+            "bash",
+            "{script}",
         ]);
         let out = substitute_open_argv(
             &template,
@@ -2969,7 +3007,15 @@ mod tests {
     #[test]
     fn test_substitute_open_argv_pane_title_falls_back_to_instance_name() {
         let out = substitute_open_argv(
-            &argv(&["herdr", "agent", "start", "{pane_title}", "--", "bash", "{script}"]),
+            &argv(&[
+                "herdr",
+                "agent",
+                "start",
+                "{pane_title}",
+                "--",
+                "bash",
+                "{script}",
+            ]),
             TerminalCommandContext {
                 script: "/tmp/test.sh",
                 instance_name: "abc-123",
@@ -3005,7 +3051,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            vec!["myterm", "--dir", "/home/user", "--", "bash", "/tmp/test.sh"]
+            vec![
+                "myterm",
+                "--dir",
+                "/home/user",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
         );
     }
 
