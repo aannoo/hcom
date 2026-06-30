@@ -197,7 +197,15 @@ impl Proxy {
         if port != 0 {
             let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         }
-        let handle = self.delivery_handle.lock().ok().and_then(|mut g| g.take());
+        // Recover the guard even if the mutex was poisoned: a panic elsewhere
+        // must not strand the delivery thread unjoined. The handle is the only
+        // thing behind this lock, so the (possibly stale) inner value is safe to
+        // take.
+        let handle = self
+            .delivery_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(handle) = handle {
             let _ = handle.join();
         }
@@ -385,9 +393,11 @@ impl Proxy {
                                 current_status.clone(),
                             ) {
                                 Ok(Some(h)) => {
-                                    if let Ok(mut g) = delivery_handle.lock() {
-                                        *g = Some(h);
-                                    }
+                                    // Store even through a poisoned mutex, so the
+                                    // handle is never dropped here and left for
+                                    // run() unable to join it.
+                                    *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(h);
                                 }
                                 Ok(None) => {}
                                 Err(_) => launch_failed.store(true, Ordering::Release),
