@@ -145,8 +145,9 @@ impl Proxy {
         let inject_port = inject_server.port();
 
         // The reader thread now owns delivery-thread startup (ready-or-timeout
-        // gated), so it needs the inject port.
-        self.spawn_reader_thread(inject_port);
+        // gated), so it needs the inject port. Keep its handle: run() joins it
+        // below so the EOF-captured launch-failure tail is available.
+        let reader_handle = self.spawn_reader_thread(inject_port);
         self.spawn_stdin_thread();
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
@@ -162,9 +163,23 @@ impl Proxy {
         // Exit code 130 is the sentinel written by terminate_win().
         EXIT_WAS_KILLED.store(exit_code == 130, Ordering::Release);
 
+        // Join the reader BEFORE reading last_tail (and before running=false, so
+        // the ordering below still matches the Unix proxy). The reader breaks
+        // its loop on PTY EOF (Ok(0)), not on `running`, so the child having
+        // exited is enough for it to wind down — no stop signal is needed first.
+        // It writes last_tail only at that EOF, and on Windows the ConPTY pipe
+        // can signal EOF after `child.wait()` already returned; without the join
+        // we could read last_tail while it is still None and emit a launch
+        // failure with an empty PTY tail. Joining first closes that race.
+        if let Some(reader_handle) = reader_handle {
+            let _ = reader_handle.join();
+        }
+
         // Record a precise launch-failure (exited-before-bind) BEFORE flipping
-        // running=false, mirroring the Unix proxy. Skipped on a kill so a manual
-        // `hcom kill` is never recorded as a launch failure.
+        // running=false, mirroring the Unix proxy: finalize records the real
+        // evidence first, and the shared launch_phase flag then suppresses a
+        // duplicate generic failure from delivery cleanup. Skipped on a kill so
+        // a manual `hcom kill` is never recorded as a launch failure.
         if !EXIT_WAS_KILLED.load(Ordering::Acquire) {
             let tail = self.last_tail.read().ok().and_then(|g| g.clone());
             shared::finalize_launch_failure_after_exit(
@@ -252,18 +267,25 @@ impl Proxy {
     /// tool is ready (or the start-timeout elapses), consuming approval-clear
     /// requests from the stdin/inject threads, applying pending resizes, and
     /// emitting title OSC updates on status/name changes.
-    fn spawn_reader_thread(&self, inject_port: u16) {
+    ///
+    /// Returns the thread's `JoinHandle` so `run()` can join it after the child
+    /// exits and before reading `last_tail` — the reader writes `last_tail` only
+    /// at PTY EOF (`Ok(0)`), which on Windows can lag the child's exit, so the
+    /// join is what guarantees the launch-failure tail is populated. Returns
+    /// `None` if the reader could not be cloned (the proxy then runs without
+    /// screen tracking, exactly as before).
+    fn spawn_reader_thread(&self, inject_port: u16) -> Option<JoinHandle<()>> {
         let reader = match self.master.lock() {
             Ok(master) => match master.try_clone_reader() {
                 Ok(r) => r,
                 Err(e) => {
                     log_error("native", "win.reader", &format!("try_clone_reader: {e}"));
-                    return;
+                    return None;
                 }
             },
             Err(e) => {
                 log_error("native", "win.reader", &format!("master lock: {e}"));
-                return;
+                return None;
             }
         };
         let running = self.running.clone();
@@ -283,7 +305,7 @@ impl Proxy {
         let delivery_start_timeout = self.config.target.delivery_start_timeout();
         let (rows, cols) = (self.rows, self.cols);
 
-        thread::spawn(move || {
+        Some(thread::spawn(move || {
             let mut reader = reader;
             let mut screen =
                 ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
@@ -404,7 +426,7 @@ impl Proxy {
             // sees running=false and enters cleanup. If the reader set it first,
             // the delivery loop could read EXIT_WAS_KILLED=false and record
             // exit:closed even when the child was killed via `hcom kill`.
-        });
+        }))
     }
 
     /// Our stdin → PTY input. Intentionally detached and never joined.
