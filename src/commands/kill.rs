@@ -245,11 +245,12 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
         } else {
             String::new()
         }
-    } else if !preset_name.is_empty()
-        && crate::config::get_merged_preset(preset_name)
-            .is_some_and(|p| p.close_argv(cfg!(windows)).is_some())
+    } else if let Some(preset) = (!preset_name.is_empty())
+        .then(|| crate::config::get_merged_preset(preset_name))
+        .flatten()
+        .filter(|p| p.close_argv(cfg!(windows)).is_some())
     {
-        if crate::terminal::is_zellij_preset(preset_name) {
+        if crate::terminal::is_zellij_merged(&preset) {
             return " (zellij pane close unconfirmed)".to_string();
         }
         format!(" (pane close failed for {})", preset_name)
