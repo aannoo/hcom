@@ -2032,6 +2032,19 @@ pub fn close_terminal_pane(
         );
     }
 
+    // Inject `--to <socket>` (after the `@`) for kitten commands when we have
+    // the socket path. Must run before the binary-path rewrite below, because
+    // that rewrite replaces argv[0] with an absolute path and the "kitten"
+    // string check would no longer match.
+    if argv.first().map(String::as_str) == Some("kitten")
+        && argv.get(1).map(String::as_str) == Some("@")
+        && !kitty_listen_on.is_empty()
+        && !argv.iter().any(|a| a == "--to")
+        && !kitty_listen_on.starts_with("fd:")
+    {
+        argv.splice(2..2, ["--to".to_string(), kitty_listen_on.to_string()]);
+    }
+
     // Resolve binary path via app bundle fallback (replace argv[0]).
     if let Some(ref binary) = merged.binary {
         let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
@@ -2045,17 +2058,6 @@ pub fn close_terminal_pane(
         && let Some(full_path) = find_kitten_binary()
     {
         argv[0] = full_path;
-    }
-
-    // Inject `--to <socket>` (after the `@`) for kitten commands when we have
-    // the socket path.
-    if argv.first().map(String::as_str) == Some("kitten")
-        && argv.get(1).map(String::as_str) == Some("@")
-        && !kitty_listen_on.is_empty()
-        && !argv.iter().any(|a| a == "--to")
-        && !kitty_listen_on.starts_with("fd:")
-    {
-        argv.splice(2..2, ["--to".to_string(), kitty_listen_on.to_string()]);
     }
 
     if argv.is_empty() {
