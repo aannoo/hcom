@@ -1849,6 +1849,15 @@ pub fn launch_terminal(
         // Custom command template string (HCOM_TERMINAL / config custom command).
         // Tokenize once via the double-quote-aware splitter; the array-form TOML
         // preset path never reaches here (those are known presets).
+        //
+        // NOTE: `shell_split` treats `\` as an escape character (POSIX rules), so
+        // Windows paths like `C:\Tools\term.exe` are mangled when supplied via the
+        // HCOM_TERMINAL env var.  The TOML `[terminal_presets]` array form avoids
+        // this (elements are taken verbatim), but there is no equivalent escape
+        // hatch for the env-var path.  A proper fix would either (a) skip
+        // backslash-escape handling when running on Windows, or (b) document that
+        // Windows users must use forward slashes or double backslashes in
+        // HCOM_TERMINAL (e.g. `C:/Tools/term.exe` or `C:\\Tools\\term.exe`).
         let argv = match crate::tools::args_common::shell_split(&terminal_mode) {
             Ok(argv) if !argv.is_empty() => argv,
             Ok(_) => bail!("custom terminal command is empty"),
