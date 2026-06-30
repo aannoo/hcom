@@ -190,6 +190,17 @@ impl Proxy {
         // If delivery initialization failed, surface it as a nonzero exit. main
         // maps the returned Err to a nonzero process exit; Drop still runs after
         // to reap the child.
+        //
+        // Unlike the Unix proxy — which propagates the error immediately via
+        // `start_delivery_thread(...)?` and tears the child down at once — the
+        // reader thread here cannot return early or kill `child` (it does not
+        // own it), so it only sets `launch_failed`. The failure is therefore not
+        // surfaced until the child exits on its own and `run()` reaches this
+        // check: the returned Err matches Unix, but the report can lag by up to
+        // the child's full lifetime. This is left as-is because delivery-init
+        // failure (DB open / notify-port registration) is rare and, when it
+        // happens, the delivery thread never started, so the delayed report is
+        // the only observable cost.
         if self.launch_failed.load(Ordering::Acquire) {
             anyhow::bail!("delivery initialization failed");
         }
