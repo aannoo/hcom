@@ -594,6 +594,32 @@ fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) 
     }
 }
 
+/// Rewrite a `bash {script}` executor pair to PowerShell in a custom
+/// (non-preset) command argv, so the generated `.ps1` runs on Windows without
+/// requiring Git Bash on PATH. Matches an adjacent `bash` + `{script}` pair
+/// anywhere in the argv — not just at argv[0] — mirroring the old
+/// `windows_shellify_preset` substring replacement of `"bash {script}"`. A
+/// `bash` with intervening flags (e.g. `bash -c {script}`) has no adjacent
+/// `{script}` and is intentionally left untouched, avoiding a broken splice.
+#[cfg(any(windows, test))]
+fn windows_shellify_custom_argv(argv: &mut Vec<String>) {
+    if let Some(i) = argv
+        .windows(2)
+        .position(|w| w[0] == "bash" && w[1] == "{script}")
+    {
+        argv.splice(
+            i..i + 1,
+            [
+                "powershell".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-NoExit".to_string(),
+                "-File".to_string(),
+            ],
+        );
+    }
+}
+
 /// Resolve preset name to an open-command argv template (placeholders intact).
 ///
 /// On macOS, if CLI binary isn't in PATH but .app bundle exists,
@@ -1452,7 +1478,7 @@ pub fn is_zellij_preset(preset_name: &str) -> bool {
     crate::config::get_merged_preset(preset_name).is_some_and(|p| is_zellij_merged(&p))
 }
 
-fn is_zellij_merged(preset: &crate::config::MergedPreset) -> bool {
+pub fn is_zellij_merged(preset: &crate::config::MergedPreset) -> bool {
     let is_zellij_argv0 = |argv: &[String]| argv.first().map(String::as_str) == Some("zellij");
     preset.binary.as_deref() == Some("zellij")
         || is_zellij_argv0(&preset.open)
@@ -1812,22 +1838,8 @@ pub fn launch_terminal(
             Ok(_) => bail!("custom terminal command is empty"),
             Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
         };
-        // On Windows, rewrite a bare `bash` executor to PowerShell so the
-        // generated .ps1 script is executed correctly without requiring Git Bash
-        // on PATH.
         #[cfg(windows)]
-        if argv.first().map(String::as_str) == Some("bash") {
-            argv.splice(
-                0..1,
-                [
-                    "powershell".to_string(),
-                    "-ExecutionPolicy".to_string(),
-                    "Bypass".to_string(),
-                    "-NoExit".to_string(),
-                    "-File".to_string(),
-                ],
-            );
-        }
+        windows_shellify_custom_argv(&mut argv);
         Some(argv)
     };
 
@@ -2257,6 +2269,52 @@ mod tests {
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    fn shellify(argv: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        windows_shellify_custom_argv(&mut v);
+        v
+    }
+
+    const PS: &[&str] = &[
+        "powershell",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoExit",
+        "-File",
+        "{script}",
+    ];
+
+    #[test]
+    fn shellify_rewrites_leading_bash_script() {
+        assert_eq!(shellify(&["bash", "{script}"]), PS);
+    }
+
+    #[test]
+    fn shellify_rewrites_non_leading_bash_script() {
+        // Finding 12: bash is argv[2], not argv[0]; must still be rewritten.
+        let mut expected = vec!["myterm".to_string(), "--".to_string()];
+        expected.extend(PS.iter().map(|s| s.to_string()));
+        assert_eq!(shellify(&["myterm", "--", "bash", "{script}"]), expected);
+    }
+
+    #[test]
+    fn shellify_leaves_bash_with_flags_alone() {
+        // Finding 15: `bash -c {script}` has no adjacent `{script}`, so the
+        // pair never matches and the argv is left intact (no broken splice).
+        assert_eq!(
+            shellify(&["bash", "-c", "{script}"]),
+            vec!["bash", "-c", "{script}"]
+        );
+    }
+
+    #[test]
+    fn shellify_leaves_non_bash_alone() {
+        assert_eq!(
+            shellify(&["myterm", "-e", "{script}"]),
+            vec!["myterm", "-e", "{script}"]
+        );
+    }
 
     struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
