@@ -1017,22 +1017,30 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
                     .map(|(_, v)| v)
             })?
             .as_table()?;
-        Some(TomlPresetFields {
-            binary: val
-                .get("binary")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            app_name: val
-                .get("app_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            open: val.get("open").and_then(toml_val_to_argv),
-            close: val.get("close").and_then(toml_val_to_argv),
-            pane_id_env: val
-                .get("pane_id_env")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-        })
+        let open_result = val.get("open").map(toml_val_to_argv).transpose();
+        let close_result = val.get("close").map(toml_val_to_argv).transpose();
+        match (open_result, close_result) {
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("Warning: skipping custom terminal preset {name:?}: {e}");
+                None
+            }
+            (Ok(open), Ok(close)) => Some(TomlPresetFields {
+                binary: val
+                    .get("binary")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                app_name: val
+                    .get("app_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                open: open.flatten(),
+                close: close.flatten(),
+                pane_id_env: val
+                    .get("pane_id_env")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            }),
+        }
     });
 
     let builtin = crate::shared::get_terminal_preset(name);
@@ -1096,33 +1104,59 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
 /// Convert a TOML preset `open`/`close` value into an argv vector.
 ///
 /// Accepts BOTH forms:
-/// - Array: each element is collected directly (no tokenization), so literal
-///   Windows paths like `C:\Users\x\s.ps1` survive intact. This is the
-///   recommended escape hatch for custom presets.
+/// - Array: each element must be a string; non-string elements are an error.
+///   Literal Windows paths like `C:\Users\x\s.ps1` survive intact — this is
+///   the recommended escape hatch for custom presets.
 /// - String (legacy): tokenized once via the double-quote-aware
 ///   `args_common::shell_split`. Backslashes are consumed by that tokenizer, so
-///   the array form is preferred for Windows paths.
+///   the array form is preferred for Windows paths. A `\` in the string triggers
+///   a warning so users can migrate to the array form.
 ///
-/// Returns None when the value is neither a string nor a string array, or when
-/// a legacy string fails to tokenize (a warning is printed in that case).
-fn toml_val_to_argv(v: &toml::Value) -> Option<Vec<String>> {
+/// Returns `Ok(None)` for an empty string/array (treated as "unset").
+/// Returns `Err` on non-string array elements or invalid shell quoting — the
+/// caller should treat this as a configuration error rather than falling back
+/// to a built-in preset.
+fn toml_val_to_argv(v: &toml::Value) -> Result<Option<Vec<String>>, String> {
     match v {
         toml::Value::Array(items) => {
-            let argv: Vec<String> = items
-                .iter()
-                .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                .collect();
-            if argv.is_empty() { None } else { Some(argv) }
-        }
-        toml::Value::String(s) => match crate::tools::args_common::shell_split(s) {
-            Ok(argv) if !argv.is_empty() => Some(argv),
-            Ok(_) => None,
-            Err(e) => {
-                eprintln!("Warning: invalid quoting in custom terminal preset command: {e}");
-                None
+            if items.is_empty() {
+                return Ok(None);
             }
-        },
-        _ => None,
+            let mut argv = Vec::with_capacity(items.len());
+            for (i, e) in items.iter().enumerate() {
+                match e.as_str() {
+                    Some(s) => argv.push(s.to_string()),
+                    None => {
+                        return Err(format!(
+                            "element [{}] is not a string (got {}); use quoted strings",
+                            i,
+                            e.type_str()
+                        ));
+                    }
+                }
+            }
+            Ok(Some(argv))
+        }
+        toml::Value::String(s) => {
+            if s.is_empty() {
+                return Ok(None);
+            }
+            if s.contains('\\') {
+                eprintln!(
+                    "Warning: custom terminal preset command contains backslashes; \
+                     use the array form to avoid shell tokenization issues on Windows: {s:?}"
+                );
+            }
+            match crate::tools::args_common::shell_split(s) {
+                Ok(argv) if !argv.is_empty() => Ok(Some(argv)),
+                Ok(_) => Ok(None),
+                Err(e) => Err(format!("invalid quoting in preset command: {e}")),
+            }
+        }
+        _ => Err(format!(
+            "expected a string or array of strings, got {}",
+            v.type_str()
+        )),
     }
 }
 
@@ -2101,12 +2135,22 @@ binary = "myterm"
         ]);
         assert_eq!(
             toml_val_to_argv(&v),
-            Some(vec![
+            Ok(Some(vec![
                 "myterm".to_string(),
                 "-e".to_string(),
                 r"C:\Users\x\s.ps1".to_string(),
-            ])
+            ]))
         );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_array_rejects_non_string_element() {
+        let v = toml::Value::Array(vec![
+            toml::Value::String("myterm".into()),
+            toml::Value::Integer(42),
+            toml::Value::String("{script}".into()),
+        ]);
+        assert!(toml_val_to_argv(&v).is_err());
     }
 
     #[test]
@@ -2114,20 +2158,29 @@ binary = "myterm"
         let v = toml::Value::String("myterm -e bash {script}".into());
         assert_eq!(
             toml_val_to_argv(&v),
-            Some(vec![
+            Ok(Some(vec![
                 "myterm".to_string(),
                 "-e".to_string(),
                 "bash".to_string(),
                 "{script}".to_string(),
-            ])
+            ]))
         );
     }
 
     #[test]
-    fn test_toml_val_to_argv_rejects_non_string_array_and_empty() {
-        assert_eq!(toml_val_to_argv(&toml::Value::Integer(3)), None);
-        assert_eq!(toml_val_to_argv(&toml::Value::Array(vec![])), None);
-        assert_eq!(toml_val_to_argv(&toml::Value::String(String::new())), None);
+    fn test_toml_val_to_argv_string_invalid_quoting_returns_err() {
+        let v = toml::Value::String(r#"kitty -- bash "unterminated"#.into());
+        assert!(toml_val_to_argv(&v).is_err());
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_empty_and_wrong_type() {
+        assert!(toml_val_to_argv(&toml::Value::Integer(3)).is_err());
+        assert_eq!(toml_val_to_argv(&toml::Value::Array(vec![])), Ok(None));
+        assert_eq!(
+            toml_val_to_argv(&toml::Value::String(String::new())),
+            Ok(None)
+        );
     }
 
     #[test]
