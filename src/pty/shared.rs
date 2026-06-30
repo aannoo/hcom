@@ -339,11 +339,6 @@ pub(super) fn start_delivery_thread(
     // Create oneshot channel for init result
     let (init_tx, init_rx) = mpsc::channel();
 
-    let user_activity_cooldown_ms = USER_ACTIVITY_COOLDOWN_MS;
-    let notify_port_shared = notify_port;
-    let shared_name = current_name;
-    let shared_status = current_status;
-
     // For Codex: spawn transcript watcher thread
     if matches!(target.known_tool(), Some(Tool::Codex)) {
         let watcher_running = running.clone();
@@ -377,7 +372,7 @@ pub(super) fn start_delivery_thread(
                     &format!("Initialized delivery for {}", instance_name),
                 );
                 // Store port for shutdown wakeup
-                notify_port_shared.store(notify.port(), Ordering::Release);
+                notify_port.store(notify.port(), Ordering::Release);
                 log_info(
                     "native",
                     "notify.registered",
@@ -412,7 +407,7 @@ pub(super) fn start_delivery_thread(
             screen: delivery_state,
             launch_phase_active,
             inject_port,
-            user_activity_cooldown_ms,
+            user_activity_cooldown_ms: USER_ACTIVITY_COOLDOWN_MS,
         };
 
         // Get tool config
@@ -426,8 +421,8 @@ pub(super) fn start_delivery_thread(
             &state,
             &instance_name,
             &config,
-            Some(shared_name),
-            Some(shared_status),
+            Some(current_name),
+            Some(current_status),
         );
 
         log_info(
