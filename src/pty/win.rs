@@ -171,8 +171,18 @@ impl Proxy {
         // can signal EOF after `child.wait()` already returned; without the join
         // we could read last_tail while it is still None and emit a launch
         // failure with an empty PTY tail. Joining first closes that race.
+        //
+        // Bounded join: the ConPTY pipe only reaches EOF once *every* process
+        // holding the slave handle exits. If the child spawned a grandchild that
+        // inherited the handle and outlives it, `reader.read()` never returns and
+        // an unbounded join would hang run() forever — running=false and the
+        // delivery join below would never run. Time-box the wait; on timeout we
+        // proceed (losing only the launch-failure tail) and let Drop kill the
+        // whole tree, which closes the pipe and lets the orphaned reader wind
+        // down. The normal EOF lag is milliseconds, so this only trips on a
+        // genuinely stuck grandchild.
         if let Some(reader_handle) = reader_handle {
-            let _ = reader_handle.join();
+            join_with_timeout(reader_handle, Duration::from_secs(2));
         }
 
         // Record a precise launch-failure (exited-before-bind) BEFORE flipping
@@ -581,6 +591,23 @@ impl Proxy {
             }
         });
     }
+}
+
+/// Join `handle`, but give up after `timeout` and return regardless.
+///
+/// `JoinHandle::join` has no timeout, so we hand the handle to a short-lived
+/// joiner thread and wait on a channel. On timeout the joiner thread is left
+/// running (detached) — it owns `handle` and completes on its own once the
+/// reader finally exits (e.g. after Drop kills the process tree and the ConPTY
+/// pipe closes). Dropping the receiver here does not abort it. The joiner holds
+/// no lock, so a lingering one cannot wedge the rest of shutdown.
+fn join_with_timeout(handle: JoinHandle<()>, timeout: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(timeout);
 }
 
 impl Drop for Proxy {
