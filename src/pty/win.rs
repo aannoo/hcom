@@ -328,11 +328,18 @@ impl Proxy {
             let mut last_name = String::new();
             let mut last_status = String::new();
 
-            // Start the delivery thread once and store its handle (through a
-            // poisoned mutex too, so the handle is never dropped here and left
-            // for run() unable to join it). Returns `true` if it started or was
-            // legitimately skipped (no instance name); leaves `launch_failed`
-            // set and returns `false` on init error.
+            // Attempt to start the delivery thread, storing its handle (through
+            // a poisoned mutex too, so the handle is never dropped here and left
+            // for run() unable to join it).
+            //
+            // Returns `true` when delivery is settled — it started, or was
+            // legitimately skipped (no instance name). A success also clears any
+            // `launch_failed` left by a prior failed attempt, so a transient
+            // error (e.g. the DB briefly locked) doesn't poison the exit code
+            // once a retry succeeds. Returns `false` and sets `launch_failed` on
+            // init error, so the caller leaves `delivery_started` clear and
+            // retries on the next chunk rather than disabling delivery for the
+            // whole session.
             let start_delivery = || match shared::start_delivery_thread(
                 instance.as_deref(),
                 running.clone(),
@@ -346,6 +353,7 @@ impl Proxy {
             ) {
                 Ok(Some(h)) => {
                     *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+                    launch_failed.store(false, Ordering::Release);
                     true
                 }
                 Ok(None) => true,
@@ -407,8 +415,11 @@ impl Proxy {
                         if !delivery_started
                             && (ready_signaled || startup.elapsed() > delivery_start_timeout)
                         {
-                            delivery_started = true;
-                            start_delivery();
+                            // Only latch as started when the attempt settled; a
+                            // transient init failure leaves this clear so the
+                            // next chunk retries instead of disabling delivery
+                            // for the rest of the session.
+                            delivery_started = start_delivery();
                         }
 
                         // Title OSC update. Only safe to write between complete
