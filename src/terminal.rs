@@ -601,8 +601,23 @@ fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) 
 /// `windows_shellify_preset` substring replacement of `"bash {script}"`. A
 /// `bash` with intervening flags (e.g. `bash -c {script}`) has no adjacent
 /// `{script}` and is intentionally left untouched, avoiding a broken splice.
+///
+/// Off Windows this is a passthrough (the generated script is a bash script).
+#[cfg(not(windows))]
+fn windows_shellify_custom_argv(argv: Vec<String>) -> Vec<String> {
+    argv
+}
+
+#[cfg(windows)]
+fn windows_shellify_custom_argv(argv: Vec<String>) -> Vec<String> {
+    shellify_bash_script_pair(argv)
+}
+
+/// Replace an adjacent `bash` + `{script}` pair with the PowerShell `.ps1`
+/// launcher. Platform-agnostic so it can be unit-tested on any host; the
+/// `windows_shellify_custom_argv` wrapper only applies it on Windows.
 #[cfg(any(windows, test))]
-fn windows_shellify_custom_argv(argv: &mut Vec<String>) {
+fn shellify_bash_script_pair(mut argv: Vec<String>) -> Vec<String> {
     if let Some(i) = argv
         .windows(2)
         .position(|w| w[0] == "bash" && w[1] == "{script}")
@@ -618,6 +633,7 @@ fn windows_shellify_custom_argv(argv: &mut Vec<String>) {
             ],
         );
     }
+    argv
 }
 
 /// Resolve preset name to an open-command argv template (placeholders intact).
@@ -1833,14 +1849,12 @@ pub fn launch_terminal(
         // Custom command template string (HCOM_TERMINAL / config custom command).
         // Tokenize once via the double-quote-aware splitter; the array-form TOML
         // preset path never reaches here (those are known presets).
-        let mut argv = match crate::tools::args_common::shell_split(&terminal_mode) {
+        let argv = match crate::tools::args_common::shell_split(&terminal_mode) {
             Ok(argv) if !argv.is_empty() => argv,
             Ok(_) => bail!("custom terminal command is empty"),
             Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
         };
-        #[cfg(windows)]
-        windows_shellify_custom_argv(&mut argv);
-        Some(argv)
+        Some(windows_shellify_custom_argv(argv))
     };
 
     let script_str = script_file.to_string_lossy().to_string();
@@ -2271,9 +2285,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     fn shellify(argv: &[&str]) -> Vec<String> {
-        let mut v: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        windows_shellify_custom_argv(&mut v);
-        v
+        shellify_bash_script_pair(argv.iter().map(|s| s.to_string()).collect())
     }
 
     const PS: &[&str] = &[
