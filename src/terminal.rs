@@ -1449,16 +1449,16 @@ pub fn is_zellij_preset(preset_name: &str) -> bool {
     if preset_name == "zellij" {
         return true;
     }
+    crate::config::get_merged_preset(preset_name).is_some_and(|p| is_zellij_merged(&p))
+}
 
+fn is_zellij_merged(preset: &crate::config::MergedPreset) -> bool {
     let is_zellij_argv0 = |argv: &[String]| argv.first().map(String::as_str) == Some("zellij");
-
-    crate::config::get_merged_preset(preset_name).is_some_and(|preset| {
-        preset.binary.as_deref() == Some("zellij")
-            || is_zellij_argv0(&preset.open)
-            || preset.open_windows.as_deref().is_some_and(is_zellij_argv0)
-            || preset.close.as_deref().is_some_and(is_zellij_argv0)
-            || preset.close_windows.as_deref().is_some_and(is_zellij_argv0)
-    })
+    preset.binary.as_deref() == Some("zellij")
+        || is_zellij_argv0(&preset.open)
+        || preset.open_windows.as_deref().is_some_and(is_zellij_argv0)
+        || preset.close.as_deref().is_some_and(is_zellij_argv0)
+        || preset.close_windows.as_deref().is_some_and(is_zellij_argv0)
 }
 
 fn validate_terminal_launch_output(
@@ -1783,6 +1783,7 @@ pub fn launch_terminal(
         // Inject `--to <socket>` (after the `@`) for kitten commands launched
         // outside kitty. Splice as separate argv elements — no shell quoting.
         if !kitty_socket.is_empty()
+            && !kitty_socket.starts_with("fd:")
             && argv.first().map(String::as_str) == Some("kitten")
             && argv.get(1).map(String::as_str) == Some("@")
             && !argv.iter().any(|a| a == "--to")
@@ -1806,11 +1807,28 @@ pub fn launch_terminal(
         // Custom command template string (HCOM_TERMINAL / config custom command).
         // Tokenize once via the double-quote-aware splitter; the array-form TOML
         // preset path never reaches here (those are known presets).
-        match crate::tools::args_common::shell_split(&terminal_mode) {
-            Ok(argv) if !argv.is_empty() => Some(argv),
+        let mut argv = match crate::tools::args_common::shell_split(&terminal_mode) {
+            Ok(argv) if !argv.is_empty() => argv,
             Ok(_) => bail!("custom terminal command is empty"),
             Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
+        };
+        // On Windows, rewrite a bare `bash` executor to PowerShell so the
+        // generated .ps1 script is executed correctly without requiring Git Bash
+        // on PATH.
+        #[cfg(windows)]
+        if argv.first().map(String::as_str) == Some("bash") {
+            argv.splice(
+                0..1,
+                [
+                    "powershell".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-NoExit".to_string(),
+                    "-File".to_string(),
+                ],
+            );
         }
+        Some(argv)
     };
 
     let script_str = script_file.to_string_lossy().to_string();
@@ -2008,7 +2026,7 @@ pub fn close_terminal_pane(
         None => return false,
     };
 
-    let is_zellij = is_zellij_preset(preset_name);
+    let is_zellij = is_zellij_merged(&merged);
 
     let zellij_before_close = if is_zellij {
         match zellij_terminal_pane_exists(zellij_session_name, effective_pane_id) {
