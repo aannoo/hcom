@@ -408,24 +408,24 @@ impl Proxy {
                         // sequences — the OutputModeFilter exposes Ground state
                         // for exactly that. The delivery thread updates the name
                         // and status Arcs; mirror them into the window title.
-                        if filter.at_ground() {
-                            let name = current_name
-                                .read()
-                                .ok()
-                                .map(|n| n.clone())
-                                .unwrap_or_default();
-                            let status = current_status
-                                .read()
-                                .ok()
-                                .map(|s| s.clone())
-                                .unwrap_or_default();
-                            if !name.is_empty() && (name != last_name || status != last_status) {
-                                let esc = shared::build_title_escape(&name, &status, target.name());
-                                let _ = stdout.write_all(esc.as_bytes());
-                                let _ = stdout.flush();
-                                last_name = name;
-                                last_status = status;
-                            }
+                        //
+                        // Compare under the read guards against the last-written
+                        // values and only build/clone when something actually
+                        // changed. This runs on every at-ground chunk (frequent
+                        // under heavy output) and name/status rarely change, so
+                        // the common path holds the two read locks briefly but
+                        // allocates nothing.
+                        if filter.at_ground()
+                            && let (Ok(name), Ok(status)) =
+                                (current_name.read(), current_status.read())
+                            && !name.is_empty()
+                            && (*name != last_name || *status != last_status)
+                        {
+                            let esc = shared::build_title_escape(&name, &status, target.name());
+                            let _ = stdout.write_all(esc.as_bytes());
+                            let _ = stdout.flush();
+                            last_name = name.clone();
+                            last_status = status.clone();
                         }
                     }
                     Err(_) => break,
