@@ -52,14 +52,9 @@ pub(super) fn update_delivery_state(
         // Cursor and Codex can briefly erase their approval surfaces during
         // redraws (Codex does this on focus changes). Latch positive detection
         // until output settles so a partial frame cannot clear blocked status.
-        let scrape_latched_tool = matches!(
-            target.known_tool(),
-            Some(Tool::Codex | Tool::Cursor)
-        );
+        let scrape_latched_tool = matches!(target.known_tool(), Some(Tool::Codex | Tool::Cursor));
         let scraped_approval = match target.known_tool() {
-            Some(Tool::Codex) => {
-                screen.is_waiting_approval() || screen.is_codex_approval_visible()
-            }
+            Some(Tool::Codex) => screen.is_waiting_approval() || screen.is_codex_approval_visible(),
             Some(Tool::Cursor) => screen.is_cursor_approval_visible(),
             _ => false,
         };
@@ -69,8 +64,7 @@ pub(super) fn update_delivery_state(
             screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS),
         );
         let approval = (scrape_latched_tool && state.approval_scrape_latched)
-            || (target.name() == "antigravity"
-                && screen.is_antigravity_approval_visible());
+            || (target.name() == "antigravity" && screen.is_antigravity_approval_visible());
         if approval != state.approval {
             approval_changed = Some(approval);
         }
@@ -489,11 +483,9 @@ pub(super) fn finalize_launch_failure_after_exit(
         fallback.push_str("\nPTY output:\n");
         fallback.push_str(tail);
     }
-    let Some(detail) = crate::instance_lifecycle::finalize_launch_failure_detail(
-        &db,
-        &instance,
-        Some(&fallback),
-    ) else {
+    let Some(detail) =
+        crate::instance_lifecycle::finalize_launch_failure_detail(&db, &instance, Some(&fallback))
+    else {
         return;
     };
     let _ = db.emit_launch_failed_event(

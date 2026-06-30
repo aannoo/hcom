@@ -305,8 +305,7 @@ impl Proxy {
                         }
                         // Apply a pending terminal resize before processing this
                         // frame so the screen model matches the new geometry.
-                        if let Some((r, c)) =
-                            pending_resize.write().ok().and_then(|mut g| g.take())
+                        if let Some((r, c)) = pending_resize.write().ok().and_then(|mut g| g.take())
                         {
                             screen.resize(r, c);
                         }
@@ -367,16 +366,17 @@ impl Proxy {
                         // for exactly that. The delivery thread updates the name
                         // and status Arcs; mirror them into the window title.
                         if filter.at_ground() {
-                            let name =
-                                current_name.read().ok().map(|n| n.clone()).unwrap_or_default();
+                            let name = current_name
+                                .read()
+                                .ok()
+                                .map(|n| n.clone())
+                                .unwrap_or_default();
                             let status = current_status
                                 .read()
                                 .ok()
                                 .map(|s| s.clone())
                                 .unwrap_or_default();
-                            if !name.is_empty()
-                                && (name != last_name || status != last_status)
-                            {
+                            if !name.is_empty() && (name != last_name || status != last_status) {
                                 let esc = shared::build_title_escape(&name, &status, target.name());
                                 let _ = stdout.write_all(esc.as_bytes());
                                 let _ = stdout.flush();
@@ -505,7 +505,6 @@ impl Proxy {
             }
         });
     }
-
 }
 
 impl Drop for Proxy {
