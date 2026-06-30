@@ -338,24 +338,10 @@ impl Proxy {
             let mut last_name = String::new();
             let mut last_status = String::new();
 
-            // Attempt to start the delivery thread, storing its handle (through
-            // a poisoned mutex too, so the handle is never dropped here and left
-            // for run() unable to join it).
-            //
-            // Returns `true` when delivery is *settled* and the caller must not
-            // retry; `false` when it should retry on the next chunk:
-            //
-            //  - Ok: started, or legitimately skipped (no instance name). Settled.
-            //    A success also clears any `launch_failed` left by an earlier
-            //    failed attempt, so a transient error doesn't poison the exit code
-            //    once a retry succeeds.
-            //  - Err timeout/disconnect: the spawned thread is detached and still
-            //    live — retrying would spawn a *second* delivery thread (no
-            //    singleton guard in run_delivery_loop) and double-deliver. So
-            //    settle, set `launch_failed` (as before), and never retry.
-            //  - Err up-front init failure: no thread is running, so the failure
-            //    may be transient (DB briefly locked). Leave unsettled and set
-            //    `launch_failed` so the next chunk retries.
+            // Attempt to start the delivery thread. Stores the handle through a
+            // poisoned mutex too, so it is never dropped here where run() can't
+            // join it. Returns `true` when delivery is settled (must not retry),
+            // `false` to retry on the next chunk; see the per-arm reasons below.
             let start_delivery = || match shared::start_delivery_thread(
                 instance.as_deref(),
                 running.clone(),
@@ -369,6 +355,8 @@ impl Proxy {
             ) {
                 Ok(Some(h)) => {
                     *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+                    // Clear any launch_failed from an earlier failed attempt so a
+                    // transient error doesn't poison the exit code once a retry wins.
                     launch_failed.store(false, Ordering::Release);
                     true
                 }
