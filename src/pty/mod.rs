@@ -971,19 +971,12 @@ impl Proxy {
                 Ok(0) => {
                     // Timeout - still update delivery state for time-based checks
                     if ready_signaled {
-                        let publish = |a: bool| {
-                            shared::publish_approval_status(
-                                a,
-                                self.config.instance_name.as_deref(),
-                                &self.current_status,
-                            )
-                        };
                         shared::update_delivery_state(
                             &self.delivery_state,
                             &self.screen,
                             &self.config.target,
                             &self.launch_phase_active,
-                            &publish,
+                            &|a| self.publish_approval(a),
                         );
                     }
                     // Start delivery thread on timeout if startup_time exceeded
@@ -1025,19 +1018,12 @@ impl Proxy {
                 Err(Errno::EINTR) => {
                     // Interrupted - still update delivery state
                     if ready_signaled {
-                        let publish = |a: bool| {
-                            shared::publish_approval_status(
-                                a,
-                                self.config.instance_name.as_deref(),
-                                &self.current_status,
-                            )
-                        };
                         shared::update_delivery_state(
                             &self.delivery_state,
                             &self.screen,
                             &self.config.target,
                             &self.launch_phase_active,
-                            &publish,
+                            &|a| self.publish_approval(a),
                         );
                     }
                     continue;
@@ -1137,19 +1123,12 @@ impl Proxy {
                         self.screen.process(raw);
                     }
                     if !raw_chunks.is_empty() {
-                        let publish = |a: bool| {
-                            shared::publish_approval_status(
-                                a,
-                                self.config.instance_name.as_deref(),
-                                &self.current_status,
-                            )
-                        };
                         shared::update_delivery_state(
                             &self.delivery_state,
                             &self.screen,
                             &self.config.target,
                             &self.launch_phase_active,
-                            &publish,
+                            &|a| self.publish_approval(a),
                         );
                         if !ready_signaled && self.screen.is_ready() {
                             ready_signaled = true;
@@ -1245,17 +1224,10 @@ impl Proxy {
                                 if !cursor_scrape {
                                     self.screen.clear_approval();
                                 }
-                                let publish = |a: bool| {
-                                    shared::publish_approval_status(
-                                        a,
-                                        self.config.instance_name.as_deref(),
-                                        &self.current_status,
-                                    )
-                                };
                                 shared::note_user_keystroke(
                                     &self.config.target,
                                     &self.delivery_state,
-                                    &publish,
+                                    &|a| self.publish_approval(a),
                                 );
                             }
                             // Copilot pauses stdin processing on terminal focus-out
@@ -1308,17 +1280,10 @@ impl Proxy {
                             // here — while the row is still blocked — instead of leaving
                             // it to the scrape falling edge, which races (and loses to)
                             // lifecycle hooks and drops the `pty:approval_cleared` event.
-                            let publish = |a: bool| {
-                                shared::publish_approval_status(
-                                    a,
-                                    self.config.instance_name.as_deref(),
-                                    &self.current_status,
-                                )
-                            };
                             if shared::clear_injected_approval_state(
                                 &self.config.target,
                                 &self.delivery_state,
-                                &publish,
+                                &|a| self.publish_approval(a),
                             ) {
                                 self.screen.clear_approval();
                             }
@@ -1404,6 +1369,15 @@ impl Proxy {
         self.running.store(false, Ordering::Release);
 
         Ok(exit_code)
+    }
+
+    /// Publish an approval-status edge for this proxy's instance.
+    fn publish_approval(&self, waiting: bool) {
+        shared::publish_approval_status(
+            waiting,
+            self.config.instance_name.as_deref(),
+            &self.current_status,
+        );
     }
 
     fn forward_winsize(&mut self) -> Result<()> {
