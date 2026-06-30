@@ -342,14 +342,20 @@ impl Proxy {
             // a poisoned mutex too, so the handle is never dropped here and left
             // for run() unable to join it).
             //
-            // Returns `true` when delivery is settled — it started, or was
-            // legitimately skipped (no instance name). A success also clears any
-            // `launch_failed` left by a prior failed attempt, so a transient
-            // error (e.g. the DB briefly locked) doesn't poison the exit code
-            // once a retry succeeds. Returns `false` and sets `launch_failed` on
-            // init error, so the caller leaves `delivery_started` clear and
-            // retries on the next chunk rather than disabling delivery for the
-            // whole session.
+            // Returns `true` when delivery is *settled* and the caller must not
+            // retry; `false` when it should retry on the next chunk:
+            //
+            //  - Ok: started, or legitimately skipped (no instance name). Settled.
+            //    A success also clears any `launch_failed` left by an earlier
+            //    failed attempt, so a transient error doesn't poison the exit code
+            //    once a retry succeeds.
+            //  - Err timeout/disconnect: the spawned thread is detached and still
+            //    live — retrying would spawn a *second* delivery thread (no
+            //    singleton guard in run_delivery_loop) and double-deliver. So
+            //    settle, set `launch_failed` (as before), and never retry.
+            //  - Err up-front init failure: no thread is running, so the failure
+            //    may be transient (DB briefly locked). Leave unsettled and set
+            //    `launch_failed` so the next chunk retries.
             let start_delivery = || match shared::start_delivery_thread(
                 instance.as_deref(),
                 running.clone(),
@@ -367,9 +373,12 @@ impl Proxy {
                     true
                 }
                 Ok(None) => true,
-                Err(_) => {
+                Err(e) => {
                     launch_failed.store(true, Ordering::Release);
-                    false
+                    // A timed-out start left a live detached thread; settle so we
+                    // do not spawn a duplicate. Any other init error is safe to
+                    // retry.
+                    e.downcast_ref::<shared::DeliveryStartTimeout>().is_some()
                 }
             };
 

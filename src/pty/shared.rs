@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::config::Config;
 use crate::db::HcomDb;
@@ -275,12 +275,37 @@ pub(super) fn publish_approval_status(
     }
 }
 
+/// Marker error: the delivery thread was spawned, but its init result did not
+/// arrive within the timeout (or the channel disconnected).
+///
+/// The spawned thread is detached and still running — it may yet finish
+/// `initialize_delivery_components` and enter `run_delivery_loop`. A caller that
+/// retries `start_delivery_thread` on a plain init `Err` MUST NOT retry on this
+/// one, or it would spawn a *second* delivery thread alongside the first (no
+/// singleton guard in `run_delivery_loop`) and double-deliver. Callers detect it
+/// with `err.downcast_ref::<DeliveryStartTimeout>()`.
+#[derive(Debug)]
+pub(super) struct DeliveryStartTimeout;
+
+impl std::fmt::Display for DeliveryStartTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "delivery thread initialization timed out")
+    }
+}
+
+impl std::error::Error for DeliveryStartTimeout {}
+
 /// Start the delivery thread (and transcript watcher for Codex).
 ///
 /// Returns `Ok(Some(handle))` when the delivery thread initialized successfully
 /// (DB opened, notify server created). Returns `Ok(None)` when there is no
 /// instance name (delivery disabled). Returns `Err` if initialization failed —
 /// the caller maps that to a launch failure.
+///
+/// The `Err` is a [`DeliveryStartTimeout`] when the thread was spawned but its
+/// init result timed out (the thread is detached and still live); any other
+/// `Err` means init failed up front and no thread is running. Retrying callers
+/// must distinguish the two — see [`DeliveryStartTimeout`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_delivery_thread(
     instance_name_cfg: Option<&str>,
@@ -436,7 +461,9 @@ pub(super) fn start_delivery_thread(
                 "delivery.init.timeout",
                 "Delivery thread init timed out after 5s",
             );
-            bail!("Delivery thread initialization timed out")
+            // The thread is detached and still running — flag this distinctly so
+            // a retrying caller does not spawn a second delivery thread.
+            Err(DeliveryStartTimeout.into())
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             log_error(
@@ -444,7 +471,10 @@ pub(super) fn start_delivery_thread(
                 "delivery.init.disconnect",
                 "Delivery thread init channel disconnected",
             );
-            bail!("Delivery thread initialization channel disconnected")
+            // Disconnect means the spawned thread dropped its sender without
+            // sending — it has returned/panicked, so retrying is unsafe in the
+            // same way a timeout is (the thread may have partially registered).
+            Err(DeliveryStartTimeout.into())
         }
     }
 }
@@ -517,6 +547,19 @@ pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_start_timeout_downcasts_through_anyhow() {
+        // The Windows reader gates its no-retry decision on downcasting the
+        // start_delivery_thread error to DeliveryStartTimeout. Guard that the
+        // marker survives the anyhow round-trip and that an ordinary error does
+        // not match it.
+        let timeout: anyhow::Error = DeliveryStartTimeout.into();
+        assert!(timeout.downcast_ref::<DeliveryStartTimeout>().is_some());
+
+        let other = anyhow::anyhow!("Failed to open database");
+        assert!(other.downcast_ref::<DeliveryStartTimeout>().is_none());
+    }
 
     #[test]
     fn build_title_escape_formats_osc_1_and_2() {
