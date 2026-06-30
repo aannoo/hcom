@@ -328,6 +328,33 @@ impl Proxy {
             let mut last_name = String::new();
             let mut last_status = String::new();
 
+            // Start the delivery thread once and store its handle (through a
+            // poisoned mutex too, so the handle is never dropped here and left
+            // for run() unable to join it). Returns `true` if it started or was
+            // legitimately skipped (no instance name); leaves `launch_failed`
+            // set and returns `false` on init error.
+            let start_delivery = || match shared::start_delivery_thread(
+                instance.as_deref(),
+                running.clone(),
+                screen_state.clone(),
+                launch_phase.clone(),
+                inject_port,
+                target.clone(),
+                notify_port.clone(),
+                current_name.clone(),
+                current_status.clone(),
+            ) {
+                Ok(Some(h)) => {
+                    *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+                    true
+                }
+                Ok(None) => true,
+                Err(_) => {
+                    launch_failed.store(true, Ordering::Release);
+                    false
+                }
+            };
+
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
@@ -381,27 +408,7 @@ impl Proxy {
                             && (ready_signaled || startup.elapsed() > delivery_start_timeout)
                         {
                             delivery_started = true;
-                            match shared::start_delivery_thread(
-                                instance.as_deref(),
-                                running.clone(),
-                                screen_state.clone(),
-                                launch_phase.clone(),
-                                inject_port,
-                                target.clone(),
-                                notify_port.clone(),
-                                current_name.clone(),
-                                current_status.clone(),
-                            ) {
-                                Ok(Some(h)) => {
-                                    // Store even through a poisoned mutex, so the
-                                    // handle is never dropped here and left for
-                                    // run() unable to join it.
-                                    *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(h);
-                                }
-                                Ok(None) => {}
-                                Err(_) => launch_failed.store(true, Ordering::Release),
-                            }
+                            start_delivery();
                         }
 
                         // Title OSC update. Only safe to write between complete
@@ -430,6 +437,17 @@ impl Proxy {
                     }
                     Err(_) => break,
                 }
+            }
+            // Fallback start: a child that exits with no output hits Ok(0) (or
+            // Err) on the first read and breaks before the in-loop start above
+            // ever runs. The old design called spawn_delivery_thread()
+            // unconditionally from run(); moving startup into this thread lost
+            // that guarantee. Start it here so an in-flight `hcom deliver`
+            // payload still has a consumer and notify/inject ports get
+            // registered, exactly as before — `run()` joins this thread before
+            // taking the handle, so the store is always visible to it.
+            if !delivery_started {
+                start_delivery();
             }
             // Do NOT store running=false here. Letting run() be the sole writer
             // ensures EXIT_WAS_KILLED is committed before the delivery thread
