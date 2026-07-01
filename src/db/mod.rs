@@ -368,6 +368,13 @@ impl HcomDb {
                 // Release our handle to the old DB file before archiving. Windows
                 // refuses to delete a file that still has an open handle; Unix
                 // unlinks an open file fine, so this is a no-op there.
+                //
+                // This only releases *our own* connection. If any other hcom
+                // process — another agent instance, a relay worker, a hook
+                // invocation — has the same DB file open at this moment, the
+                // `remove_file` inside `archive_db_at` below can still fail on
+                // Windows; see the doc comment there for why closing our own
+                // handle isn't sufficient in general.
                 self.conn = Connection::open_in_memory()?;
 
                 // Archive the old DB
@@ -586,6 +593,28 @@ impl HcomDb {
 
     /// Archive current database at a given path.
     /// WAL checkpoint, copy to archive dir (sibling archive/ directory), delete original.
+    ///
+    /// Known, deliberately deferred limitation on Windows: the `remove_file`
+    /// below can fail even though the caller already released its own
+    /// connection (see `ensure_schema`). Windows only allows deleting a file
+    /// while other handles remain open if *every* one of those handles was
+    /// opened with `FILE_SHARE_DELETE` — and SQLite's Windows VFS (and thus
+    /// rusqlite's default `Connection::open`) does not request that flag.
+    /// Unix has no equivalent restriction; `unlink` on an open file always
+    /// succeeds there, which is why this asymmetry doesn't show up in the
+    /// Unix path at all.
+    ///
+    /// In practice this only bites when a schema-version mismatch forces an
+    /// archive-and-reset (rare) while some other hcom process — another agent
+    /// instance, a relay worker, a hook invocation — still has the same DB
+    /// file open anywhere on the machine. When that happens, this call
+    /// returns a real, un-recoverable-in-place `Err`; there is no retry that
+    /// helps within this function. A proper fix would need a different
+    /// strategy entirely — e.g. copying the live file's contents into a fresh
+    /// DB and resetting schema in place, rather than deleting the original —
+    /// so no cross-process handle-closing coordination is required. That is a
+    /// larger change than this narrow Windows-support pass and is deferred
+    /// given how rare schema mismatches are in practice.
     fn archive_db_at(db_path: &std::path::Path) -> Result<Option<String>> {
         if !db_path.exists() {
             return Ok(None);

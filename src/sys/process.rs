@@ -276,6 +276,56 @@ fn terminate_win(pid: u32) -> bool {
     }
 }
 
+/// Snapshot every live process's pid -> parent_pid link via
+/// `CreateToolhelp32Snapshot`, retrying once on transient failure.
+///
+/// Returns `None` if the snapshot could not be taken even after the retry.
+#[cfg(windows)]
+fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
+    use std::collections::HashMap;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut parents: HashMap<u32, u32> = HashMap::new();
+    // SAFETY: snapshot handle is closed before returning; the PROCESSENTRY32W is
+    // fully initialized (dwSize set) before the enumeration calls.
+    unsafe {
+        let mut snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            // Snapshot can fail transiently under high load; retry once.
+            snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        }
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    Some(parents)
+}
+
+/// Number of extra re-scan rounds run after the initial kill pass, to catch
+/// descendants spawned after the first snapshot (see [`kill_tree_win_checked`]).
+#[cfg(windows)]
+const RESCAN_ROUNDS: u32 = 2;
+
+/// Delay between re-scan rounds, giving the OS a moment to start tearing down
+/// what was just killed before the next snapshot is taken.
+#[cfg(windows)]
+const RESCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(75);
+
 /// Terminate `root` and all of its descendants.
 ///
 /// Windows has no process groups, so the only general way to "kill the agent and
@@ -301,66 +351,51 @@ fn kill_tree_win(root: u32) -> GroupSignal {
 /// these — every descendant's individual termination result is discarded —
 /// so [`kill_child_group`] uses this directly to decide whether a retry via
 /// its own already-open `Child` handle is worthwhile.
+///
+/// Re-scan for stragglers: a single snapshot is inherently a point-in-time
+/// view, so a process spawned by any tree member *after* the snapshot but
+/// *before* that member is terminated is invisible to the first pass and would
+/// otherwise survive. Unix's `killpg` doesn't have this problem for
+/// already-existing group members — the kernel delivers the signal to the
+/// whole group atomically — but Windows has no equivalent primitive, so after
+/// the first kill pass this takes a couple of follow-up snapshots, each time
+/// looking for new processes parented by *any* previously-known tree member
+/// (not just `root`, since mid-tree descendants can keep spawning children of
+/// their own even after `root` is gone) and killing those too. This narrows
+/// the race window considerably but, being fundamentally snapshot-based, does
+/// not eliminate it: a straggler spawned after the very last re-scan's
+/// snapshot can still escape.
 #[cfg(windows)]
 fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
-    use std::collections::HashMap;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
+    let Some(parents) = snapshot_parents() else {
+        // Still can't enumerate descendants; kill only the root. Any
+        // surviving descendants will be reaped when the job object
+        // closes. This still reports `Sent` (not a distinct "partial"
+        // result) — `GroupSignal`/`KillResult` are a flat success/
+        // not-found/permission-denied/other set consumed by ~15 call
+        // sites across the CLI kill-reporting path and the relay JSON
+        // protocol (see commands/kill.rs, relay/control.rs); threading a
+        // new "partial" variant through all of them is a larger, separate
+        // change. Logging at least makes this rare degraded path visible
+        // instead of leaving zero trace anywhere.
+        crate::log::log_error(
+            "native",
+            "win.kill_tree",
+            &format!(
+                "CreateToolhelp32Snapshot failed twice; killing root pid {root} only, \
+                 descendants may be left running until the job object reaps them"
+            ),
+        );
+        let ok = terminate_win(root);
+        return (
+            if ok {
+                GroupSignal::Sent
+            } else {
+                GroupSignal::NotFound
+            },
+            ok,
+        );
     };
-
-    // Build pid -> parent_pid for every live process from one snapshot.
-    let mut parents: HashMap<u32, u32> = HashMap::new();
-    // SAFETY: snapshot handle is closed before returning; the PROCESSENTRY32W is
-    // fully initialized (dwSize set) before the enumeration calls.
-    unsafe {
-        let mut snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            // Snapshot can fail transiently under high load; retry once.
-            snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        }
-        if snapshot == INVALID_HANDLE_VALUE {
-            // Still can't enumerate descendants; kill only the root. Any
-            // surviving descendants will be reaped when the job object
-            // closes. This still reports `Sent` (not a distinct "partial"
-            // result) — `GroupSignal`/`KillResult` are a flat success/
-            // not-found/permission-denied/other set consumed by ~15 call
-            // sites across the CLI kill-reporting path and the relay JSON
-            // protocol (see commands/kill.rs, relay/control.rs); threading a
-            // new "partial" variant through all of them is a larger, separate
-            // change. Logging at least makes this rare degraded path visible
-            // instead of leaving zero trace anywhere.
-            crate::log::log_error(
-                "native",
-                "win.kill_tree",
-                &format!(
-                    "CreateToolhelp32Snapshot failed twice; killing root pid {root} only, \
-                     descendants may be left running until the job object reaps them"
-                ),
-            );
-            let ok = terminate_win(root);
-            return (
-                if ok {
-                    GroupSignal::Sent
-                } else {
-                    GroupSignal::NotFound
-                },
-                ok,
-            );
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-    }
 
     if !parents.contains_key(&root) {
         return (GroupSignal::NotFound, false);
@@ -388,6 +423,34 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
             root_terminated = ok;
         }
     }
+
+    // Re-scan for stragglers spawned between the snapshot and their parent's
+    // termination (see doc comment above). Keep the full known tree growing
+    // across rounds so a straggler that itself spawns another child before
+    // being killed is still caught by the next round.
+    for _ in 0..RESCAN_ROUNDS {
+        std::thread::sleep(RESCAN_DELAY);
+        let Some(parents) = snapshot_parents() else {
+            break;
+        };
+        let before = tree.len();
+        for (&pid, &ppid) in &parents {
+            if tree.contains(&ppid) && !tree.contains(&pid) {
+                tree.push(pid);
+            }
+        }
+        if tree.len() == before {
+            break;
+        }
+        // Kill only the newly discovered stragglers (deepest-first isn't
+        // load-bearing here since these are freshly discovered leaves relative
+        // to the known tree, but iterating in reverse discovery order costs
+        // nothing and keeps the same "children before parents" spirit).
+        for &pid in tree[before..].iter().rev() {
+            terminate_win(pid);
+        }
+    }
+
     (GroupSignal::Sent, root_terminated)
 }
 

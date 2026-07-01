@@ -536,6 +536,96 @@ pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> S
     format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
 }
 
+/// Build minimal launch_context JSON from env vars available in the PTY process.
+/// Captures process_id and late-bound terminal metadata needed by kill.
+/// The start hook captures the full context (git_branch, tty, env snapshot) later.
+///
+/// Portable: every operation here (`env::var`, `fs::read_to_string`, `thread::sleep`)
+/// works identically on Windows. `TMUX_PANE`/`ZELLIJ_PANE_ID` simply won't be set
+/// there, so those multiplexer-only fields degrade to absent — same as on Unix when
+/// not running inside tmux/zellij. `WEZTERM_PANE`/`KITTY_WINDOW_ID` are meaningful on
+/// Windows too, since wezterm and kitty both run there.
+pub(super) fn build_early_launch_context() -> String {
+    use serde_json::{Map, Value};
+
+    let mut ctx = Map::new();
+
+    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID")
+        && !pid.is_empty()
+    {
+        ctx.insert("process_id".into(), Value::String(pid));
+    }
+
+    // Kitty socket path for close-on-kill (needed when launching from outside kitty)
+    if let Ok(listen) = std::env::var("KITTY_LISTEN_ON")
+        && !listen.is_empty()
+    {
+        ctx.insert("kitty_listen_on".into(), Value::String(listen));
+    }
+
+    // Capture pane_id from terminal env vars for same-window launches.
+    let pane_id_vars: &[&str] = &[
+        "WEZTERM_PANE",
+        "TMUX_PANE",
+        "KITTY_WINDOW_ID",
+        "ZELLIJ_PANE_ID",
+    ];
+    for &var in pane_id_vars {
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            ctx.insert("pane_id".into(), Value::String(val));
+            break;
+        }
+    }
+
+    // Read terminal_id from temp file written by parent's launch stdout capture.
+    // This is the ID returned by `kitten @ launch` (or similar) and serves as
+    // fallback for pane_id when the terminal env var isn't available.
+    //
+    // Race condition: parent writes this file after `kitten @ launch` returns
+    // (~500ms after child starts), but we run within ~10-100ms of spawn.
+    // Retry with backoff only when pane_id not already captured from env vars
+    // (tmux/wezterm set env vars directly, no file needed).
+    if let Some(process_id) = ctx.get("process_id").and_then(|v| v.as_str()) {
+        let id_file = crate::paths::hcom_dir()
+            .join(".tmp")
+            .join("terminal_ids")
+            .join(process_id);
+        let needs_id = !ctx.contains_key("pane_id");
+        let max_attempts: usize = if needs_id { 10 } else { 1 };
+        let mut terminal_id_value = String::new();
+
+        for attempt in 0..max_attempts {
+            if let Ok(contents) = std::fs::read_to_string(&id_file) {
+                let trimmed = contents.trim().to_string();
+                if !trimmed.is_empty() {
+                    terminal_id_value = trimmed;
+                    break;
+                }
+            }
+            if attempt + 1 < max_attempts {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        if !terminal_id_value.is_empty() {
+            ctx.insert(
+                "terminal_id".into(),
+                Value::String(terminal_id_value.clone()),
+            );
+            if !ctx.contains_key("pane_id") {
+                ctx.insert("pane_id".into(), Value::String(terminal_id_value));
+            }
+        }
+        // Don't delete the file here — capture_context in the SessionStart hook
+        // reads it to persist terminal_id into DB launch_context. If we delete
+        // early, the hook finds exists=false and terminal_id is lost from DB.
+    }
+
+    Value::Object(ctx).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +749,80 @@ mod tests {
         let state = Arc::new(RwLock::new(ScreenState::default()));
         let publish = |_a: bool| panic!("must not publish when nothing to clear");
         assert!(!clear_injected_approval_state(&target, &state, &publish));
+    }
+
+    // build_early_launch_context is portable (env::var/fs::read_to_string/thread::sleep
+    // all work identically on Windows), so these run on every platform rather than
+    // being Unix-only. Each test clears the env vars it touches before asserting so a
+    // panic can't leak state into later tests; #[serial] additionally prevents these
+    // from interleaving with each other.
+    use serial_test::serial;
+
+    fn clear_launch_context_env() {
+        // SAFETY: tests are #[serial].
+        unsafe {
+            std::env::remove_var("HCOM_PROCESS_ID");
+            std::env::remove_var("KITTY_LISTEN_ON");
+            std::env::remove_var("WEZTERM_PANE");
+            std::env::remove_var("TMUX_PANE");
+            std::env::remove_var("KITTY_WINDOW_ID");
+            std::env::remove_var("ZELLIJ_PANE_ID");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_empty_when_no_env_vars_set() {
+        clear_launch_context_env();
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_captures_kitty_listen_on() {
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty.sock");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["kitty_listen_on"], "unix:/tmp/kitty.sock");
+        assert!(parsed.get("pane_id").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_prefers_first_pane_id_var_in_priority_order() {
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("WEZTERM_PANE", "wezterm-pane");
+            std::env::set_var("TMUX_PANE", "tmux-pane");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["pane_id"], "wezterm-pane");
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_ignores_multiplexer_only_vars_when_absent() {
+        // TMUX_PANE/ZELLIJ_PANE_ID never being set on Windows must degrade to
+        // simply absent fields, not an error — same as on Unix outside a
+        // multiplexer. This is the "no platform branching needed" behavior.
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("KITTY_WINDOW_ID", "kitty-window-1");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["pane_id"], "kitty-window-1");
     }
 }

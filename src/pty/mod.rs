@@ -577,91 +577,6 @@ extern "C" fn handle_sighup(_: libc::c_int) {
     SIGHUP_RECEIVED.store(true, Ordering::Release);
 }
 
-/// Build minimal launch_context JSON from env vars available in the PTY process.
-/// Captures process_id and late-bound terminal metadata needed by kill.
-/// The start hook captures the full context (git_branch, tty, env snapshot) later.
-#[cfg(unix)]
-fn build_early_launch_context() -> String {
-    use serde_json::{Map, Value};
-
-    let mut ctx = Map::new();
-
-    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID")
-        && !pid.is_empty()
-    {
-        ctx.insert("process_id".into(), Value::String(pid));
-    }
-
-    // Kitty socket path for close-on-kill (needed when launching from outside kitty)
-    if let Ok(listen) = std::env::var("KITTY_LISTEN_ON")
-        && !listen.is_empty()
-    {
-        ctx.insert("kitty_listen_on".into(), Value::String(listen));
-    }
-
-    // Capture pane_id from terminal env vars for same-window launches.
-    let pane_id_vars: &[&str] = &[
-        "WEZTERM_PANE",
-        "TMUX_PANE",
-        "KITTY_WINDOW_ID",
-        "ZELLIJ_PANE_ID",
-    ];
-    for &var in pane_id_vars {
-        if let Ok(val) = std::env::var(var)
-            && !val.is_empty()
-        {
-            ctx.insert("pane_id".into(), Value::String(val));
-            break;
-        }
-    }
-
-    // Read terminal_id from temp file written by parent's launch stdout capture.
-    // This is the ID returned by `kitten @ launch` (or similar) and serves as
-    // fallback for pane_id when the terminal env var isn't available.
-    //
-    // Race condition: parent writes this file after `kitten @ launch` returns
-    // (~500ms after child starts), but we run within ~10-100ms of spawn.
-    // Retry with backoff only when pane_id not already captured from env vars
-    // (tmux/wezterm set env vars directly, no file needed).
-    if let Some(process_id) = ctx.get("process_id").and_then(|v| v.as_str()) {
-        let id_file = crate::paths::hcom_dir()
-            .join(".tmp")
-            .join("terminal_ids")
-            .join(process_id);
-        let needs_id = !ctx.contains_key("pane_id");
-        let max_attempts: usize = if needs_id { 10 } else { 1 };
-        let mut terminal_id_value = String::new();
-
-        for attempt in 0..max_attempts {
-            if let Ok(contents) = std::fs::read_to_string(&id_file) {
-                let trimmed = contents.trim().to_string();
-                if !trimmed.is_empty() {
-                    terminal_id_value = trimmed;
-                    break;
-                }
-            }
-            if attempt + 1 < max_attempts {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-
-        if !terminal_id_value.is_empty() {
-            ctx.insert(
-                "terminal_id".into(),
-                Value::String(terminal_id_value.clone()),
-            );
-            if !ctx.contains_key("pane_id") {
-                ctx.insert("pane_id".into(), Value::String(terminal_id_value));
-            }
-        }
-        // Don't delete the file here — capture_context in the SessionStart hook
-        // reads it to persist terminal_id into DB launch_context. If we delete
-        // early, the hook finds exists=false and terminal_id is lost from DB.
-    }
-
-    Value::Object(ctx).to_string()
-}
-
 /// Configuration for the PTY proxy
 pub struct ProxyConfig {
     /// Pattern to detect when tool is ready (e.g., b"? for shortcuts")
@@ -789,7 +704,7 @@ impl Proxy {
 
             // Capture minimal launch context early so kill can close the terminal pane.
             // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &build_early_launch_context());
+            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
         }
 
         // Close slave in parent

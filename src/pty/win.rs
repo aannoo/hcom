@@ -140,6 +140,10 @@ impl Proxy {
             && let Some(pid) = child.process_id()
         {
             let _ = db.update_instance_pid(instance_name, pid);
+
+            // Capture minimal launch context early so kill can close the terminal pane.
+            // The start hook may later overwrite with richer context (git_branch, tty, env).
+            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
         }
 
         // Tie the child to a kill-on-close job so its whole tree is reaped if we
