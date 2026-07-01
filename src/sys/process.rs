@@ -425,7 +425,21 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     }
 
     // Re-scan for stragglers spawned between the snapshot and their parent's
-    // termination (see doc comment above). Always run all RESCAN_ROUNDS —
+    // termination (see doc comment above).
+    //
+    // This widens (but does not introduce in kind) the PID-reuse race already
+    // called out on `kill_tree_win_checked`: each extra round is another
+    // `terminate_win` -> sleep -> re-snapshot cycle, so there's more elapsed
+    // time in which a PID this function just terminated could be recycled by
+    // an unrelated process that happens to be parented under another PID
+    // still in `tree`. `KillOnDropJob` (see `pty::win::job`) remains as a
+    // backstop that reaps the real tree regardless of this race, so this is
+    // treated as an acceptable, documented widening rather than something to
+    // engineer away here — doing so would need per-candidate parent-identity
+    // confirmation (e.g. `GetProcessTimes` creation-time checks) for a
+    // vanishingly unlikely window (tens of milliseconds).
+    //
+    // Always run all RESCAN_ROUNDS —
     // round N finding nothing new doesn't mean a straggler can't still appear
     // before round N+1's snapshot, so stopping early would defeat the point of
     // having more than one round. Within a round, expand `tree` to a fixed
