@@ -123,6 +123,40 @@ pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf>
     candidates.into_iter().next_back()
 }
 
+/// Resolve the SQLite database path for an OpenCode-family tool (`opencode`/`kilo`).
+///
+/// Builds on [`opencode_family_data_dir`]. For `kilo`, honors `KILO_DB`: `:memory:`
+/// means no on-disk DB (returns `None`), an absolute path is used as-is, and a
+/// relative path is joined onto the data dir; if `KILO_DB` is unset, defaults to
+/// `<data_dir>/kilo.db`. Any other tool resolves to `<data_dir>/opencode.db`.
+///
+/// This performs path construction only — it does not check whether the
+/// resulting path exists on disk. Callers that need "exists" semantics should
+/// apply their own `.exists()` check.
+pub(crate) fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
+    let data_dir = opencode_family_data_dir(tool)?;
+    if tool == "kilo" {
+        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
+            return None;
+        }
+        return Some(
+            std::env::var("KILO_DB")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        data_dir.join(path)
+                    }
+                })
+                .unwrap_or_else(|| data_dir.join("kilo.db")),
+        );
+    }
+    Some(data_dir.join("opencode.db"))
+}
+
 /// Set terminal title via escape codes written to /dev/tty.
 pub(crate) fn set_terminal_title(instance_name: &str) {
     let title = format!("hcom: {}", instance_name);

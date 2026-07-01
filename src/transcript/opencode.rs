@@ -20,27 +20,7 @@ pub(crate) struct TranscriptSearchMatch {
 }
 
 fn get_family_db_path(tool: &str) -> Option<PathBuf> {
-    let data_dir = crate::runtime_env::opencode_family_data_dir(tool)?;
-    let db_path = if tool == "kilo" {
-        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
-            return None;
-        }
-        std::env::var("KILO_DB")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    data_dir.join(path)
-                }
-            })
-            .unwrap_or_else(|| data_dir.join("kilo.db"))
-    } else {
-        data_dir.join("opencode.db")
-    };
-    db_path.exists().then_some(db_path)
+    crate::runtime_env::opencode_family_db_path(tool).filter(|p| p.exists())
 }
 
 pub(crate) fn get_opencode_db_path() -> Option<PathBuf> {

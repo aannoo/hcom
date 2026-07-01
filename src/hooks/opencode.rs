@@ -118,31 +118,9 @@ fn instance_tool(db: &HcomDb, instance_name: &str) -> String {
 /// Both apps use XDG_DATA_HOME. Kilo additionally supports `KILO_DB`, which
 /// may be absolute or relative to Kilo's data directory.
 fn get_family_db_path(tool: &str) -> Option<String> {
-    let data_dir = crate::runtime_env::opencode_family_data_dir(tool)?;
-    let db_path = if tool == "kilo" {
-        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
-            return None;
-        }
-        std::env::var("KILO_DB")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    data_dir.join(path)
-                }
-            })
-            .unwrap_or_else(|| data_dir.join("kilo.db"))
-    } else {
-        data_dir.join("opencode.db")
-    };
-    if db_path.exists() {
-        Some(db_path.to_string_lossy().to_string())
-    } else {
-        None
-    }
+    crate::runtime_env::opencode_family_db_path(tool)
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 #[cfg(test)]

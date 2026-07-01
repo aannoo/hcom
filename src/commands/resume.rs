@@ -1660,27 +1660,7 @@ fn opencode_data_dir() -> Option<std::path::PathBuf> {
 }
 
 fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
-    let data_dir = crate::runtime_env::opencode_family_data_dir(tool)?;
-    if tool == "kilo" {
-        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
-            return None;
-        }
-        return Some(
-            std::env::var("KILO_DB")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(std::path::PathBuf::from)
-                .map(|path| {
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        data_dir.join(path)
-                    }
-                })
-                .unwrap_or_else(|| data_dir.join("kilo.db")),
-        );
-    }
-    Some(data_dir.join("opencode.db"))
+    crate::runtime_env::opencode_family_db_path(tool)
 }
 
 /// Query an OpenCode-family SQLite DB for a session's working directory.
