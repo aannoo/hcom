@@ -52,6 +52,13 @@ pub fn resolved_shell_env() -> Option<HashMap<String, String>> {
 }
 
 fn resolve_shell_env_uncached() -> Option<HashMap<String, String>> {
+    // Windows has no login-shell PATH-stripping problem to work around (unlike
+    // macOS GUI-launched apps), and `shell_path()`'s non-macOS fallback
+    // (`/bin/bash`) never exists there — skip straight to the `None` fail-open
+    // instead of spawning a command that's guaranteed to fail.
+    if cfg!(windows) {
+        return None;
+    }
     let shell = shell_path()?;
     if unsupported_shell(&shell) {
         return None;

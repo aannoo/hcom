@@ -73,9 +73,28 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
     }
 
     println!("Running: {}", info.cmd);
-    let status = std::process::Command::new("sh")
-        .args(["-c", info.cmd])
-        .status();
+
+    if cfg!(windows) && crate::update::is_shell_pipe_command(info.cmd) {
+        eprintln!(
+            "Automatic update isn't available for this install method on Windows yet. \
+             Update manually: pip install -U hcom  (or: uv tool upgrade hcom)"
+        );
+        return 1;
+    }
+
+    let status = if cfg!(windows) {
+        // The commands get_update_cmd() returns here (pip/uv/brew) are a plain
+        // program + args and need no shell — avoid depending on `sh`, which
+        // doesn't exist on Windows.
+        match crate::update::split_program_args(info.cmd) {
+            Some((program, args)) => std::process::Command::new(program).args(args).status(),
+            None => Err(std::io::Error::other("empty update command")),
+        }
+    } else {
+        std::process::Command::new("sh")
+            .args(["-c", info.cmd])
+            .status()
+    };
 
     match status {
         Ok(s) if s.success() => {
