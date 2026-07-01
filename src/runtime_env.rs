@@ -177,4 +177,179 @@ mod tests {
         std::env::set_current_dir(prev_cwd).unwrap();
         assert_eq!(root, expected);
     }
+
+    #[test]
+    #[serial]
+    fn user_home_prefers_home_env_when_set() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        assert_eq!(super::user_home(), Some(home));
+    }
+
+    #[test]
+    #[serial]
+    fn user_home_falls_through_when_home_env_empty() {
+        let _guard = EnvGuard::new();
+
+        unsafe {
+            std::env::set_var("HOME", "");
+        }
+
+        // Empty HOME is treated as unset, so resolution falls through to
+        // dirs::home_dir() rather than returning Some(PathBuf::from("")).
+        assert_eq!(super::user_home(), dirs::home_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn user_config_home_prefers_xdg_config_home_when_set() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg).unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        }
+
+        assert_eq!(super::user_config_home(), Some(xdg));
+    }
+
+    #[test]
+    #[serial]
+    fn user_config_home_empty_xdg_falls_back_to_dot_config() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", "");
+        }
+
+        // Empty XDG_CONFIG_HOME is treated as unset, so resolution falls
+        // back to $HOME/.config (the unix branch, given this test's cfg gate).
+        assert_eq!(super::user_config_home(), Some(home.join(".config")));
+    }
+
+    /// RAII guard for XDG_DATA_HOME, which crate::hooks::test_helpers::EnvGuard
+    /// does not track.
+    struct XdgDataHomeGuard(Option<String>);
+
+    impl XdgDataHomeGuard {
+        fn set(value: &str) -> Self {
+            let saved = std::env::var("XDG_DATA_HOME").ok();
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", value);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for XdgDataHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_family_data_dir_prefers_xdg_data_home_when_it_exists() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let xdg_data = temp.path().join("xdg-data");
+        let xdg_tool_dir = xdg_data.join("opencode");
+        let local_share_tool_dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&xdg_tool_dir).unwrap();
+        std::fs::create_dir_all(&local_share_tool_dir).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let _xdg_guard = XdgDataHomeGuard::set(xdg_data.to_str().unwrap());
+
+        // XDG_DATA_HOME wins even though ~/.local/share/opencode also exists.
+        assert_eq!(
+            super::opencode_family_data_dir("opencode"),
+            Some(xdg_tool_dir)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_family_data_dir_skips_nonexistent_xdg_candidate() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let local_share_tool_dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&local_share_tool_dir).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        // XDG_DATA_HOME is set but its opencode subdir does not exist on
+        // disk, so the probe must skip it and pick ~/.local/share/opencode.
+        let _xdg_guard =
+            XdgDataHomeGuard::set(temp.path().join("xdg-data-missing").to_str().unwrap());
+
+        assert_eq!(
+            super::opencode_family_data_dir("opencode"),
+            Some(local_share_tool_dir)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_family_data_dir_empty_xdg_falls_back_to_local_share() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let local_share_tool_dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&local_share_tool_dir).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let _xdg_guard = XdgDataHomeGuard::set("");
+
+        // Empty XDG_DATA_HOME is treated as unset (no candidate added for it).
+        assert_eq!(
+            super::opencode_family_data_dir("opencode"),
+            Some(local_share_tool_dir)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_family_data_dir_falls_back_to_last_candidate_when_none_exist() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let _xdg_guard = XdgDataHomeGuard::set("");
+
+        // Neither ~/.local/share/opencode nor dirs::data_dir()/opencode exist
+        // under this isolated HOME, so the last candidate (platform default)
+        // is returned even though it's not present on disk.
+        let expected = dirs::data_dir().map(|d| d.join("opencode"));
+        assert_eq!(super::opencode_family_data_dir("opencode"), expected);
+    }
 }
