@@ -194,14 +194,21 @@ impl Proxy {
         // (see wait_for_child docs). Never propagates an error via `?`: the
         // cleanup below (thread wake/join) must always run even if waiting on
         // the child itself goes wrong.
-        let exit_code = self.wait_for_child();
+        let (exit_code, escalated) = self.wait_for_child();
 
         // Commit the exit reason before setting running=false. The delivery
         // thread reads EXIT_WAS_KILLED in cleanup; if we set running=false first
         // (or allow the reader thread to do so), the delivery loop can enter
         // cleanup before this store — recording exit:closed for a kill.
-        // Exit code 130 is the sentinel written by terminate_win().
-        EXIT_WAS_KILLED.store(exit_code == 130, Ordering::Release);
+        // Exit code 130 is the sentinel written by terminate_win() for an
+        // externally-issued `hcom kill`. `escalated` excludes our own internal
+        // hang timeout from that check even though it goes through the same
+        // terminate_win sentinel: unlike a confirmed external kill, a hang
+        // that forced our own watchdog to intervene is exactly the kind of
+        // thing finalize_launch_failure_after_exit below exists to diagnose,
+        // mirroring the Unix proxy's drain_and_wait_child SIGKILL escalation,
+        // which likewise never sets EXIT_WAS_KILLED for its own timeout path.
+        EXIT_WAS_KILLED.store(exit_code == 130 && !escalated, Ordering::Release);
 
         // Join the reader BEFORE reading last_tail (and before running=false, so
         // the ordering below still matches the Unix proxy). The reader breaks
@@ -293,26 +300,25 @@ impl Proxy {
     /// then `kill_group` (mirrors the Unix flow's SIGKILL), then up to 2s more
     /// for the OS to actually reap it.
     ///
+    /// Returns `(exit_code, escalated)`. `escalated` is `true` once the grace
+    /// period has elapsed and we've called `kill_group` ourselves — the
+    /// caller uses it to tell "our own watchdog had to force this hung child
+    /// closed" apart from a confirmed external `hcom kill`, even though both
+    /// go through the same terminate_win sentinel exit code. It stays `false`
+    /// for any exit observed within the grace period, including one caused by
+    /// an external kill that happens to land before we would have escalated —
+    /// entering the escalation branch at all is itself proof nothing had
+    /// already killed the child up to that point.
+    ///
     /// Never returns an `Err` (unlike a bare `child.wait()?`): a wait failure
     /// is logged and treated as an unknown exit code, since propagating it via
     /// `?` here would skip run()'s cleanup below (stop signal, notify wake,
     /// delivery-thread join) — that cleanup must run regardless of whether
     /// waiting on the child itself succeeded.
-    fn wait_for_child(&mut self) -> i32 {
+    fn wait_for_child(&mut self) -> (i32, bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return status.exit_code() as i32,
-                Ok(None) => {}
-                Err(e) => {
-                    log_error("native", "win.wait", &format!("try_wait: {e}"));
-                    return 1;
-                }
-            }
-            if Instant::now() > deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
+        if let Some(code) = self.poll_child_exit(deadline, "try_wait") {
+            return (code, false);
         }
 
         // Timed out waiting for a voluntary exit — escalate to a forceful
@@ -321,30 +327,42 @@ impl Proxy {
             let _ = crate::sys::process::kill_group(pid);
         }
         let kill_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return status.exit_code() as i32,
-                Ok(None) => {}
-                Err(e) => {
-                    log_error("native", "win.wait", &format!("try_wait after kill: {e}"));
-                    return 1;
-                }
-            }
-            if Instant::now() > kill_deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
+        if let Some(code) = self.poll_child_exit(kill_deadline, "try_wait after kill") {
+            return (code, true);
         }
 
         // Still stuck (e.g. an uninterruptible wait state) — give up rather
         // than hang run() forever. Drop's kill_group and the job object's
-        // kill-on-close remain as backstops on the underlying process.
+        // kill-on-close remain as backstops on the underlying process. We did
+        // attempt the kill above, so this is still `escalated`, just with a
+        // synthetic (not the real) exit code — the child's actual eventual
+        // status, if it ever exits, is never observed.
         log_error(
             "native",
             "win.wait",
             "child did not exit after kill escalation; giving up on this wait",
         );
-        1
+        (1, true)
+    }
+
+    /// Poll `try_wait()` until it reports an exit or `deadline` passes.
+    /// Returns `None` on timeout (still running); `Some(exit_code)` on a
+    /// real exit or, if `try_wait()` itself errors, a synthetic `1`.
+    fn poll_child_exit(&mut self, deadline: Instant, log_ctx: &str) -> Option<i32> {
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status.exit_code() as i32),
+                Ok(None) => {}
+                Err(e) => {
+                    log_error("native", "win.wait", &format!("{log_ctx}: {e}"));
+                    return Some(1);
+                }
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Poll the outer terminal size and forward changes to the ConPTY and the

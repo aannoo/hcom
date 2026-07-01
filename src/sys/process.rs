@@ -181,15 +181,24 @@ pub fn kill_child_group(child: &mut std::process::Child) {
 
     #[cfg(windows)]
     {
-        // kill_tree_win already terminates `child` itself (with the hcom-kill
+        // kill_tree_win_checked terminates `child` itself (with the hcom-kill
         // sentinel exit code 130, via terminate_win) and its whole descendant
-        // tree — return here rather than falling through to child.kill()
-        // below. TerminateProcess only requests termination asynchronously, so
-        // a second call racing the first can overwrite the sentinel exit code
-        // with a different one, corrupting the EXIT_WAS_KILLED check that
-        // reads it back.
-        kill_tree_win(child.id());
-        return;
+        // tree. If root's own termination is confirmed, return rather than
+        // falling through to child.kill() below: TerminateProcess only
+        // requests termination asynchronously, so a second call racing the
+        // first can overwrite the sentinel exit code with a different one,
+        // corrupting the EXIT_WAS_KILLED check that reads it back.
+        //
+        // If root's termination was NOT confirmed, it may just be that the
+        // fresh-by-PID OpenProcess inside terminate_win failed for a reason
+        // other than "already gone" (a handle-table limit, or AV/EDR hooking
+        // around freshly-opened handles, for instance) — fall through to
+        // child.kill() as a retry via the handle Command already has open,
+        // which a failing OpenProcess-by-PID wouldn't affect.
+        let (_, root_terminated) = kill_tree_win_checked(child.id());
+        if root_terminated {
+            return;
+        }
     }
 
     let _ = child.kill();
@@ -283,6 +292,17 @@ fn terminate_win(pid: u32) -> bool {
 /// theoretical race as `taskkill /T`, which is the accepted Windows approach.
 #[cfg(windows)]
 fn kill_tree_win(root: u32) -> GroupSignal {
+    kill_tree_win_checked(root).0
+}
+
+/// Same as [`kill_tree_win`], but also reports whether `root`'s own
+/// `terminate_win` call specifically succeeded (as opposed to just "root was
+/// found in the snapshot"). `kill_tree_win`'s `Sent` doesn't distinguish
+/// these — every descendant's individual termination result is discarded —
+/// so [`kill_child_group`] uses this directly to decide whether a retry via
+/// its own already-open `Child` handle is worthwhile.
+#[cfg(windows)]
+fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     use std::collections::HashMap;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -319,11 +339,15 @@ fn kill_tree_win(root: u32) -> GroupSignal {
                      descendants may be left running until the job object reaps them"
                 ),
             );
-            return if terminate_win(root) {
-                GroupSignal::Sent
-            } else {
-                GroupSignal::NotFound
-            };
+            let ok = terminate_win(root);
+            return (
+                if ok {
+                    GroupSignal::Sent
+                } else {
+                    GroupSignal::NotFound
+                },
+                ok,
+            );
         }
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -339,7 +363,7 @@ fn kill_tree_win(root: u32) -> GroupSignal {
     }
 
     if !parents.contains_key(&root) {
-        return GroupSignal::NotFound;
+        return (GroupSignal::NotFound, false);
     }
 
     // Collect root + all descendants (BFS over the parent links).
@@ -357,10 +381,14 @@ fn kill_tree_win(root: u32) -> GroupSignal {
 
     // Terminate children before parents (deepest first) so a parent can't spawn
     // a new child after we've passed it.
+    let mut root_terminated = false;
     for &pid in tree.iter().rev() {
-        terminate_win(pid);
+        let ok = terminate_win(pid);
+        if pid == root {
+            root_terminated = ok;
+        }
     }
-    GroupSignal::Sent
+    (GroupSignal::Sent, root_terminated)
 }
 
 #[cfg(test)]
