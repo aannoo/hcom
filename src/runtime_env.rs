@@ -64,41 +64,36 @@ pub(crate) fn user_home() -> Option<std::path::PathBuf> {
 ///
 /// Resolution order:
 /// 1. `$XDG_CONFIG_HOME` (explicit override, all platforms)
-/// 2. Unix/macOS: `$HOME/.config` — the XDG-style location the OpenCode-family
-///    and Gemini Node CLIs use, including on macOS
-/// 3. Windows: `dirs::config_dir()` (`%APPDATA%`)
+/// 2. `$HOME/.config` — on every platform, including Windows and macOS
 ///
-/// Unix/macOS behavior is identical to the previous `xdg_config_home()`; only
-/// the Windows fallback is new.
+/// OpenCode and Kilo resolve their config directory via the `xdg-basedir` npm
+/// package, which has no Windows- or macOS-specific branch at all: it always
+/// resolves to `~/.config` (falling back to `$XDG_CONFIG_HOME` when set) on
+/// every OS. There is no `%APPDATA%` or `~/Library/Application Support`
+/// involved, so hcom must not special-case Windows here either.
 pub(crate) fn user_config_home() -> Option<std::path::PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
         return Some(std::path::PathBuf::from(xdg));
     }
-    #[cfg(windows)]
-    {
-        dirs::config_dir()
-    }
-    #[cfg(not(windows))]
-    {
-        user_home().map(|h| h.join(".config"))
-    }
+    user_home().map(|h| h.join(".config"))
 }
 
 /// Cross-platform data directory for an OpenCode-family tool (`opencode`/`kilo`),
 /// i.e. where the tool keeps its SQLite session DB.
 ///
-/// Probes candidates in order and returns the first that exists on disk; if none
-/// exist, returns the last candidate (platform default) so callers can surface a
-/// useful "searched here" path.
-///
 /// Resolution order:
 /// 1. `$XDG_DATA_HOME/<tool>` (explicit override, all platforms) — trusted
 ///    unconditionally, with no existence probe: an explicit override always
 ///    wins, even if the directory hasn't been created yet.
-/// 2. `~/.local/share/<tool>` (Linux + macOS XDG-style — where these CLIs write)
-/// 3. `dirs::data_dir()/<tool>` (Windows `%APPDATA%`, macOS Apple-style fallback)
+/// 2. `~/.local/share/<tool>` — on every platform, including Windows and macOS
+///
+/// Like [`user_config_home`], this follows OpenCode/Kilo's use of the
+/// `xdg-basedir` npm package, which always resolves to `~/.local/share`
+/// (falling back to `$XDG_DATA_HOME` when set) regardless of OS. There is no
+/// `%APPDATA%` or Apple-style data dir involved, so `dirs::data_dir()` is
+/// never a correct candidate for this tool family on any platform.
 ///
 /// This is the single source of truth for opencode/kilo data-dir resolution,
 /// shared by the hook dispatcher, the transcript search, and `resume`.
@@ -108,19 +103,7 @@ pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf>
     {
         return Some(std::path::PathBuf::from(xdg).join(tool));
     }
-
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = user_home() {
-        candidates.push(home.join(".local/share").join(tool));
-    }
-    if let Some(data) = dirs::data_dir() {
-        candidates.push(data.join(tool));
-    }
-
-    if let Some(existing) = candidates.iter().find(|c| c.is_dir()) {
-        return Some(existing.clone());
-    }
-    candidates.into_iter().next_back()
+    user_home().map(|h| h.join(".local/share").join(tool))
 }
 
 /// Resolve the SQLite database path for an OpenCode-family tool (`opencode`/`kilo`).
@@ -373,7 +356,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn opencode_family_data_dir_falls_back_to_last_candidate_when_none_exist() {
+    fn opencode_family_data_dir_returns_local_share_even_when_it_does_not_exist() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
@@ -384,10 +367,12 @@ mod tests {
         }
         let _xdg_guard = XdgDataHomeGuard::set("");
 
-        // Neither ~/.local/share/opencode nor dirs::data_dir()/opencode exist
-        // under this isolated HOME, so the last candidate (platform default)
-        // is returned even though it's not present on disk.
-        let expected = dirs::data_dir().map(|d| d.join("opencode"));
-        assert_eq!(super::opencode_family_data_dir("opencode"), expected);
+        // ~/.local/share/opencode doesn't exist under this isolated HOME, but
+        // it's still the only non-override candidate (OpenCode/Kilo never use
+        // dirs::data_dir() on any platform), so it's returned unconditionally.
+        assert_eq!(
+            super::opencode_family_data_dir("opencode"),
+            Some(home.join(".local/share/opencode"))
+        );
     }
 }
