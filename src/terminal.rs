@@ -636,23 +636,6 @@ fn shellify_bash_script_pair(mut argv: Vec<String>) -> Vec<String> {
     argv
 }
 
-/// Double every backslash in a custom terminal command string before it hits
-/// `shell_split`, so Windows paths like `C:\Tools\term.exe` survive parsing.
-///
-/// `shell_split` treats `\` as a POSIX escape character both inside and
-/// outside quotes, collapsing `\\` back to a single literal `\`. Doubling
-/// first therefore round-trips real Windows paths while leaving quoted
-/// POSIX-style escapes (e.g. `\"`) working as before. Takes `is_windows` as a
-/// plain bool (rather than `#[cfg(windows)]`) so the transform itself is
-/// testable on any host; call sites gate it with `cfg!(windows)`.
-fn escape_backslashes_for_shell_split(s: &str, is_windows: bool) -> String {
-    if is_windows {
-        s.replace('\\', "\\\\")
-    } else {
-        s.to_string()
-    }
-}
-
 /// Resolve preset name to an open-command argv template (placeholders intact).
 ///
 /// On macOS, if CLI binary isn't in PATH but .app bundle exists,
@@ -1867,14 +1850,11 @@ pub fn launch_terminal(
         // Tokenize once via the double-quote-aware splitter; the array-form TOML
         // preset path never reaches here (those are known presets).
         //
-        // NOTE: `shell_split` treats `\` as an escape character (POSIX rules), so
-        // Windows paths like `C:\Tools\term.exe` would otherwise be mangled when
-        // supplied via the HCOM_TERMINAL env var. On Windows, double every
-        // backslash first: `shell_split`'s escape handling (both inside and
-        // outside quotes) collapses each `\\` pair back to a single literal `\`,
-        // so this round-trips real paths while still allowing quoted args.
-        let escaped = escape_backslashes_for_shell_split(&terminal_mode, cfg!(windows));
-        let argv = match crate::tools::args_common::shell_split(&escaped) {
+        // `shell_split` itself treats an unquoted `\` as a literal character on
+        // Windows (instead of a POSIX escape), so Windows paths like
+        // `C:\Tools\term.exe` supplied via HCOM_TERMINAL survive intact without
+        // any pre-processing here.
+        let argv = match crate::tools::args_common::shell_split(&terminal_mode) {
             Ok(argv) if !argv.is_empty() => argv,
             Ok(_) => bail!("custom terminal command is empty"),
             Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
@@ -2350,35 +2330,6 @@ mod tests {
         assert_eq!(
             shellify(&["myterm", "-e", "{script}"]),
             vec!["myterm", "-e", "{script}"]
-        );
-    }
-
-    #[test]
-    fn windows_backslash_path_round_trips_through_shell_split() {
-        // Unquoted Windows path: doubling backslashes first means shell_split's
-        // own escape handling collapses each `\\` back to a single `\`.
-        let escaped = escape_backslashes_for_shell_split(r"C:\Tools\term.exe --flag", true);
-        let argv = crate::tools::args_common::shell_split(&escaped).unwrap();
-        assert_eq!(argv, vec![r"C:\Tools\term.exe", "--flag"]);
-    }
-
-    #[test]
-    fn windows_backslash_path_inside_quotes_round_trips_too() {
-        let escaped = escape_backslashes_for_shell_split(r#""C:\Tools\term.exe" --flag"#, true);
-        let argv = crate::tools::args_common::shell_split(&escaped).unwrap();
-        assert_eq!(argv, vec![r"C:\Tools\term.exe", "--flag"]);
-    }
-
-    #[test]
-    fn non_windows_leaves_backslashes_untouched() {
-        // POSIX custom terminal commands may rely on real backslash-escapes
-        // (e.g. `\"` inside a double-quoted arg); off Windows nothing changes.
-        let input = r#"myterm -e "say \"hi\"""#;
-        let escaped = escape_backslashes_for_shell_split(input, false);
-        assert_eq!(escaped, input);
-        assert_eq!(
-            crate::tools::args_common::shell_split(&escaped).unwrap(),
-            vec!["myterm", "-e", "say \"hi\""]
         );
     }
 
