@@ -165,8 +165,7 @@ pub fn exec_replace(mut cmd: Command) -> std::io::Error {
 ///
 /// Unix: `killpg(SIGKILL)` on the child's group (set up via [`detach_session`]),
 /// falling back to `Child::kill` if the group signal fails. Windows: terminates
-/// the child's whole process tree ([`kill_tree_win`]), then reaps the immediate
-/// child handle so the OS releases it.
+/// the child's whole process tree ([`kill_tree_win`]).
 pub fn kill_child_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -182,7 +181,15 @@ pub fn kill_child_group(child: &mut std::process::Child) {
 
     #[cfg(windows)]
     {
+        // kill_tree_win already terminates `child` itself (with the hcom-kill
+        // sentinel exit code 130, via terminate_win) and its whole descendant
+        // tree — return here rather than falling through to child.kill()
+        // below. TerminateProcess only requests termination asynchronously, so
+        // a second call racing the first can overwrite the sentinel exit code
+        // with a different one, corrupting the EXIT_WAS_KILLED check that
+        // reads it back.
         kill_tree_win(child.id());
+        return;
     }
 
     let _ = child.kill();
@@ -294,8 +301,24 @@ fn kill_tree_win(root: u32) -> GroupSignal {
             snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         }
         if snapshot == INVALID_HANDLE_VALUE {
-            // Still can't enumerate; kill only the root. Any surviving
-            // descendants will be reaped when the job object closes.
+            // Still can't enumerate descendants; kill only the root. Any
+            // surviving descendants will be reaped when the job object
+            // closes. This still reports `Sent` (not a distinct "partial"
+            // result) — `GroupSignal`/`KillResult` are a flat success/
+            // not-found/permission-denied/other set consumed by ~15 call
+            // sites across the CLI kill-reporting path and the relay JSON
+            // protocol (see commands/kill.rs, relay/control.rs); threading a
+            // new "partial" variant through all of them is a larger, separate
+            // change. Logging at least makes this rare degraded path visible
+            // instead of leaving zero trace anywhere.
+            crate::log::log_error(
+                "native",
+                "win.kill_tree",
+                &format!(
+                    "CreateToolhelp32Snapshot failed twice; killing root pid {root} only, \
+                     descendants may be left running until the job object reaps them"
+                ),
+            );
             return if terminate_win(root) {
                 GroupSignal::Sent
             } else {
@@ -372,5 +395,25 @@ mod tests {
             "an open handle to an already-exited process must not count as alive"
         );
         drop(child);
+    }
+
+    // Reproduces the bug fixed above: kill_tree_win's terminate_win writes the
+    // hcom-kill sentinel exit code 130. A trailing child.kill() (a second,
+    // competing TerminateProcess on the same PID) could overwrite it before
+    // the OS settles on a final exit code.
+    #[cfg(windows)]
+    #[test]
+    fn test_kill_child_group_preserves_sentinel_exit_code() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "timeout /T 30"])
+            .spawn()
+            .unwrap();
+        kill_child_group(&mut child);
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "kill_child_group must not let a second kill overwrite the hcom-kill sentinel"
+        );
     }
 }

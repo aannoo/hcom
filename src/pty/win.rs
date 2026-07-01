@@ -189,9 +189,12 @@ impl Proxy {
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
 
-        // Block until the child exits.
-        let status = self.child.wait().context("waiting for ConPTY child")?;
-        let exit_code = status.exit_code() as i32;
+        // Wait for the child to exit, escalating to a forceful kill-tree if it
+        // doesn't on its own within a bounded time instead of blocking forever
+        // (see wait_for_child docs). Never propagates an error via `?`: the
+        // cleanup below (thread wake/join) must always run even if waiting on
+        // the child itself goes wrong.
+        let exit_code = self.wait_for_child();
 
         // Commit the exit reason before setting running=false. The delivery
         // thread reads EXIT_WAS_KILLED in cleanup; if we set running=false first
@@ -276,6 +279,72 @@ impl Proxy {
         }
 
         Ok(exit_code)
+    }
+
+    /// Wait for the child to exit, escalating to a forceful kill-tree after a
+    /// timeout instead of blocking forever. The Windows analogue of the Unix
+    /// proxy's `drain_and_wait_child` SIGKILL escalation.
+    ///
+    /// The underlying `Child::wait()` (`portable-pty`) reaches
+    /// `WaitForSingleObject(..., INFINITE)`, which nothing but the process
+    /// exiting can release — a child that never exits (e.g. ignores its own
+    /// shutdown signals) would hang `run()`, and hcom with it, forever. Poll
+    /// with `try_wait()` instead so a stuck child can be escalated: 5s grace,
+    /// then `kill_group` (mirrors the Unix flow's SIGKILL), then up to 2s more
+    /// for the OS to actually reap it.
+    ///
+    /// Never returns an `Err` (unlike a bare `child.wait()?`): a wait failure
+    /// is logged and treated as an unknown exit code, since propagating it via
+    /// `?` here would skip run()'s cleanup below (stop signal, notify wake,
+    /// delivery-thread join) — that cleanup must run regardless of whether
+    /// waiting on the child itself succeeded.
+    fn wait_for_child(&mut self) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.exit_code() as i32,
+                Ok(None) => {}
+                Err(e) => {
+                    log_error("native", "win.wait", &format!("try_wait: {e}"));
+                    return 1;
+                }
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Timed out waiting for a voluntary exit — escalate to a forceful
+        // kill-tree and give the OS up to 2s to actually reap it.
+        if let Some(pid) = self.child.process_id() {
+            let _ = crate::sys::process::kill_group(pid);
+        }
+        let kill_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.exit_code() as i32,
+                Ok(None) => {}
+                Err(e) => {
+                    log_error("native", "win.wait", &format!("try_wait after kill: {e}"));
+                    return 1;
+                }
+            }
+            if Instant::now() > kill_deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Still stuck (e.g. an uninterruptible wait state) — give up rather
+        // than hang run() forever. Drop's kill_group and the job object's
+        // kill-on-close remain as backstops on the underlying process.
+        log_error(
+            "native",
+            "win.wait",
+            "child did not exit after kill escalation; giving up on this wait",
+        );
+        1
     }
 
     /// Poll the outer terminal size and forward changes to the ConPTY and the
@@ -650,14 +719,30 @@ impl Drop for Proxy {
         // Reap the child and any descendants it spawned (race-free snapshot
         // walk). The `_job` field's kill-on-close is the backstop for the case
         // where Drop never runs.
-        if let Some(pid) = self.child.process_id() {
-            // Drop running kill_group means run() exited early (error path) and
-            // we are force-killing the child. Mark as killed so the delivery
-            // thread records exit:killed if it is still running.
-            EXIT_WAS_KILLED.store(true, Ordering::Release);
-            let _ = crate::sys::process::kill_group(pid);
+        //
+        // `child.process_id()` keeps returning `Some` even after the child has
+        // already exited normally — it's a fresh `GetProcessId()` on our still-
+        // open handle, not a liveness check — so a bare `is_some()` can't tell
+        // "run() exited early and this child still needs killing" apart from
+        // "run() already waited on and reaped this child." Check `try_wait()`
+        // first (side-effect-free, safe to call again after run()'s own wait):
+        // today Drop only ever runs after run()'s wait/cleanup has completed,
+        // so this has no observable effect, but it guards against a future
+        // reordering marking a normal exit as `exit:killed`.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Some(pid) = self.child.process_id() {
+                // Mark as killed so the delivery thread records exit:killed if
+                // it is still running. Do not also call child.kill() below: it
+                // would send a second, competing TerminateProcess to the same
+                // PID and can overwrite the hcom-kill sentinel exit code (130)
+                // that kill_group's terminate_win already set — the same race
+                // fixed in kill_child_group (sys/process.rs).
+                EXIT_WAS_KILLED.store(true, Ordering::Release);
+                let _ = crate::sys::process::kill_group(pid);
+            } else {
+                let _ = self.child.kill();
+            }
         }
-        let _ = self.child.kill();
         if let Some(ref instance_name) = self.config.instance_name
             && let Ok(db) = HcomDb::open()
         {
