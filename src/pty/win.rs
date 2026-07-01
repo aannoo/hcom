@@ -87,6 +87,19 @@ impl Proxy {
         for (k, v) in &config.env_vars {
             cmd.env(k, v);
         }
+        // Pin the ConPTY child's working directory. The Unix runner `.sh` does
+        // `cd {cwd}` then `exec hcom`, so the openpty child inherits the launch
+        // dir; the Windows runner `.ps1` uses `Set-Location` then invokes
+        // `hcom.exe` as a *child*. `Set-Location` only moves the PowerShell
+        // host's cwd — the spawned hcom (and the ConPTY child) do not reliably
+        // inherit it, and `CommandBuilder` defaults the child to the process
+        // default (the user's home) when no cwd is set. That launched Claude
+        // outside the repo, so its file index fell back to a full-home ripgrep
+        // scan (~11s), freezing input and swallowing ESC-ESC. hcom's own cwd is
+        // already the launch dir, so pinning to it keeps Claude in-repo.
+        if let Ok(cwd) = std::env::current_dir() {
+            cmd.cwd(cwd);
+        }
 
         let child = pair
             .slave
