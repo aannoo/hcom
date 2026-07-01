@@ -193,26 +193,19 @@ impl Proxy {
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
 
-        // Wait for the child to exit, escalating to a forceful kill-tree if it
-        // doesn't on its own within a bounded time instead of blocking forever
-        // (see wait_for_child docs). Never propagates an error via `?`: the
-        // cleanup below (thread wake/join) must always run even if waiting on
-        // the child itself goes wrong.
-        let (exit_code, escalated) = self.wait_for_child();
+        // Wait for the child to exit. This blocks for the entire session —
+        // deliberately without a timeout (see wait_child_blocking) — and never
+        // propagates an error via `?`: the cleanup below (thread wake/join)
+        // must always run even if waiting on the child itself goes wrong.
+        let exit_code = wait_child_blocking(self.child.as_mut());
 
         // Commit the exit reason before setting running=false. The delivery
         // thread reads EXIT_WAS_KILLED in cleanup; if we set running=false first
         // (or allow the reader thread to do so), the delivery loop can enter
         // cleanup before this store — recording exit:closed for a kill.
         // Exit code 130 is the sentinel written by terminate_win() for an
-        // externally-issued `hcom kill`. `escalated` excludes our own internal
-        // hang timeout from that check even though it goes through the same
-        // terminate_win sentinel: unlike a confirmed external kill, a hang
-        // that forced our own watchdog to intervene is exactly the kind of
-        // thing finalize_launch_failure_after_exit below exists to diagnose,
-        // mirroring the Unix proxy's drain_and_wait_child SIGKILL escalation,
-        // which likewise never sets EXIT_WAS_KILLED for its own timeout path.
-        EXIT_WAS_KILLED.store(exit_code == 130 && !escalated, Ordering::Release);
+        // externally-issued `hcom kill`.
+        EXIT_WAS_KILLED.store(exit_code == 130, Ordering::Release);
 
         // Join the reader BEFORE reading last_tail (and before running=false, so
         // the ordering below still matches the Unix proxy). The reader breaks
@@ -290,83 +283,6 @@ impl Proxy {
         }
 
         Ok(exit_code)
-    }
-
-    /// Wait for the child to exit, escalating to a forceful kill-tree after a
-    /// timeout instead of blocking forever. The Windows analogue of the Unix
-    /// proxy's `drain_and_wait_child` SIGKILL escalation.
-    ///
-    /// The underlying `Child::wait()` (`portable-pty`) reaches
-    /// `WaitForSingleObject(..., INFINITE)`, which nothing but the process
-    /// exiting can release — a child that never exits (e.g. ignores its own
-    /// shutdown signals) would hang `run()`, and hcom with it, forever. Poll
-    /// with `try_wait()` instead so a stuck child can be escalated: 5s grace,
-    /// then `kill_group` (mirrors the Unix flow's SIGKILL), then up to 2s more
-    /// for the OS to actually reap it.
-    ///
-    /// Returns `(exit_code, escalated)`. `escalated` is `true` once the grace
-    /// period has elapsed and we've called `kill_group` ourselves — the
-    /// caller uses it to tell "our own watchdog had to force this hung child
-    /// closed" apart from a confirmed external `hcom kill`, even though both
-    /// go through the same terminate_win sentinel exit code. It stays `false`
-    /// for any exit observed within the grace period, including one caused by
-    /// an external kill that happens to land before we would have escalated —
-    /// entering the escalation branch at all is itself proof nothing had
-    /// already killed the child up to that point.
-    ///
-    /// Never returns an `Err` (unlike a bare `child.wait()?`): a wait failure
-    /// is logged and treated as an unknown exit code, since propagating it via
-    /// `?` here would skip run()'s cleanup below (stop signal, notify wake,
-    /// delivery-thread join) — that cleanup must run regardless of whether
-    /// waiting on the child itself succeeded.
-    fn wait_for_child(&mut self) -> (i32, bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        if let Some(code) = self.poll_child_exit(deadline, "try_wait") {
-            return (code, false);
-        }
-
-        // Timed out waiting for a voluntary exit — escalate to a forceful
-        // kill-tree and give the OS up to 2s to actually reap it.
-        if let Some(pid) = self.child.process_id() {
-            let _ = crate::sys::process::kill_group(pid);
-        }
-        let kill_deadline = Instant::now() + Duration::from_secs(2);
-        if let Some(code) = self.poll_child_exit(kill_deadline, "try_wait after kill") {
-            return (code, true);
-        }
-
-        // Still stuck (e.g. an uninterruptible wait state) — give up rather
-        // than hang run() forever. Drop's kill_group and the job object's
-        // kill-on-close remain as backstops on the underlying process. We did
-        // attempt the kill above, so this is still `escalated`, just with a
-        // synthetic (not the real) exit code — the child's actual eventual
-        // status, if it ever exits, is never observed.
-        log_error(
-            "native",
-            "win.wait",
-            "child did not exit after kill escalation; giving up on this wait",
-        );
-        (1, true)
-    }
-
-    /// Poll `try_wait()` until it reports an exit or `deadline` passes.
-    /// Returns `None` on timeout (still running); `Some(exit_code)` on a
-    /// real exit or, if `try_wait()` itself errors, a synthetic `1`.
-    fn poll_child_exit(&mut self, deadline: Instant, log_ctx: &str) -> Option<i32> {
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status.exit_code() as i32),
-                Ok(None) => {}
-                Err(e) => {
-                    log_error("native", "win.wait", &format!("{log_ctx}: {e}"));
-                    return Some(1);
-                }
-            }
-            if Instant::now() > deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
     }
 
     /// Poll the outer terminal size and forward changes to the ConPTY and the
@@ -718,6 +634,36 @@ impl Proxy {
     }
 }
 
+/// Block until `child` exits, returning its exit code.
+///
+/// This wait spans the entire interactive session, so it is deliberately
+/// unbounded: from here a healthy child running for hours is indistinguishable
+/// from a hung one, and any watchdog timeout at this spot force-kills every
+/// session once the timer elapses (a 5s escalation here used to kill Claude a
+/// few seconds after launch). The Unix proxy's 5s SIGKILL escalation is not an
+/// analogue for this wait — it lives in `drain_and_wait_child`, which runs
+/// only after the PTY signals EOF/HUP (the child is already tearing down) and
+/// exists to break the full-PTY-buffer write deadlock; that deadlock cannot
+/// happen here because the reader thread keeps draining the ConPTY pipe
+/// concurrently. A genuinely stuck child is still covered: `hcom kill`
+/// terminates the tree directly (releasing this wait), and Drop's kill_group
+/// plus the job object's kill-on-close reap anything left.
+///
+/// Never returns an `Err` (unlike a bare `child.wait()?`): a wait failure is
+/// logged and treated as an unknown exit code, since propagating it via `?`
+/// would skip run()'s cleanup (stop signal, notify wake, delivery-thread
+/// join) — that cleanup must run regardless of whether waiting on the child
+/// itself succeeded.
+fn wait_child_blocking(child: &mut (dyn portable_pty::Child + Send + Sync)) -> i32 {
+    match child.wait() {
+        Ok(status) => status.exit_code() as i32,
+        Err(e) => {
+            log_error("native", "win.wait", &format!("child wait failed: {e}"));
+            1
+        }
+    }
+}
+
 /// Join `handle`, but give up after `timeout` and return regardless.
 ///
 /// `JoinHandle::join` has no timeout, so we hand the handle to a short-lived
@@ -858,7 +804,56 @@ impl OutputModeFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputModeFilter, is_cmd_script};
+    use super::{OutputModeFilter, is_cmd_script, wait_child_blocking};
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::time::{Duration, Instant};
+
+    /// Spawn `argv` under a ConPTY. Returns the master too: dropping it closes
+    /// the ConPTY and kills the child, so tests must keep it alive while
+    /// waiting.
+    fn spawn_in_conpty(
+        argv: &[&str],
+    ) -> (
+        Box<dyn portable_pty::MasterPty + Send>,
+        Box<dyn portable_pty::Child + Send + Sync>,
+    ) {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty (ConPTY) failed");
+        let mut cmd = CommandBuilder::new(argv[0]);
+        cmd.args(&argv[1..]);
+        let child = pair.slave.spawn_command(cmd).expect("spawn failed");
+        drop(pair.slave);
+        (pair.master, child)
+    }
+
+    #[test]
+    fn wait_child_blocking_returns_the_child_exit_code() {
+        let (_master, mut child) = spawn_in_conpty(&["cmd.exe", "/c", "exit 42"]);
+        assert_eq!(wait_child_blocking(child.as_mut()), 42);
+    }
+
+    #[test]
+    fn wait_child_blocking_does_not_kill_a_healthy_long_running_child() {
+        // Regression: a 5s watchdog in run()'s child wait used to kill_group
+        // every session a few seconds after launch, forcing the kill sentinel
+        // (130) as the exit code. A child that outlives that window must still
+        // exit on its own, with its own code.
+        let (_master, mut child) = spawn_in_conpty(&["ping", "-n", "7", "127.0.0.1"]);
+        let start = Instant::now();
+        let code = wait_child_blocking(child.as_mut());
+        let elapsed = start.elapsed();
+        assert_eq!(code, 0, "child should exit on its own, not be killed");
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "child exited after {elapsed:?}; expected it to outlive the former 5s watchdog window"
+        );
+    }
 
     #[test]
     fn is_cmd_script_matches_cmd_and_bat_case_insensitively() {
