@@ -1358,6 +1358,30 @@ pub enum SetupError {
     },
 }
 
+/// Shell wrapper for a single hcom hook subcommand (`gemini-beforeagent`, etc.).
+///
+/// Silently no-ops (exit 0) when hcom isn't on PATH.
+///
+/// Gemini CLI's `getShellConfiguration()` (packages/core/src/utils/shell-utils.ts)
+/// runs hook commands via PowerShell on Windows (`-NoProfile -NonInteractive -Command`),
+/// never a POSIX shell, and via a POSIX shell (e.g. `bash -c`) elsewhere. The command
+/// string built here is PowerShell-native on Windows and POSIX `sh -c` elsewhere to
+/// match what actually executes it.
+fn hook_command(hcom_cmd: &str, cmd_suffix: &str) -> String {
+    let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    if cfg!(windows) {
+        // Single-quoted PowerShell strings don't expand `$variables` or backticks,
+        // mirroring how the POSIX branch avoids shell expansion via single quotes.
+        format!(
+            "if (Get-Command {bin} -ErrorAction SilentlyContinue) {{ {hcom_cmd} {cmd_suffix} }} else {{ exit 0 }}"
+        )
+    } else {
+        format!(
+            "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
+        )
+    }
+}
+
 /// Set up hcom hooks in Gemini settings.json.
 ///
 /// - Removes existing hcom hooks first (clean slate)
@@ -1426,16 +1450,12 @@ pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupErro
     if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
         for &(hook_type, matcher, cmd_suffix, timeout, description) in GEMINI_HOOK_CONFIGS {
             let hook_name = format!("hcom-{}", hook_type.to_lowercase());
-            let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-            let hook_command = format!(
-                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
-            );
             let hook_entry = serde_json::json!({
                 "matcher": matcher,
                 "hooks": [{
                     "name": hook_name,
                     "type": "command",
-                    "command": hook_command,
+                    "command": hook_command(&hcom_cmd, cmd_suffix),
                     "timeout": timeout,
                     "description": description,
                 }]
@@ -1667,6 +1687,38 @@ fn remove_hooks_from_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hook_command_platform_specific() {
+        let cmd = hook_command("hcom", "gemini-beforeagent");
+        if cfg!(windows) {
+            assert_eq!(
+                cmd,
+                "if (Get-Command hcom -ErrorAction SilentlyContinue) { hcom gemini-beforeagent } else { exit 0 }"
+            );
+        } else {
+            assert_eq!(
+                cmd,
+                "sh -c 'command -v hcom >/dev/null 2>&1 && exec hcom gemini-beforeagent || exit 0'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_command_uses_first_word_as_bin_for_uvx() {
+        let cmd = hook_command("uvx hcom", "gemini-sessionend");
+        if cfg!(windows) {
+            assert_eq!(
+                cmd,
+                "if (Get-Command uvx -ErrorAction SilentlyContinue) { uvx hcom gemini-sessionend } else { exit 0 }"
+            );
+        } else {
+            assert_eq!(
+                cmd,
+                "sh -c 'command -v uvx >/dev/null 2>&1 && exec uvx hcom gemini-sessionend || exit 0'"
+            );
+        }
+    }
 
     #[test]
     fn test_matches_session_pattern() {
@@ -2118,10 +2170,7 @@ mod tests {
             }
         };
         for &(hook_type, cmd_suffix) in expected {
-            let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-            let expected_full = format!(
-                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
-            );
+            let expected_full = hook_command(&hcom_cmd, cmd_suffix);
             let matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
                 Some(a) => a,
                 None => {
@@ -2222,10 +2271,7 @@ mod tests {
             );
             assert_eq!(hook["timeout"].as_u64().unwrap(), expected_timeout as u64);
             let hcom = crate::runtime_env::build_hcom_command();
-            let bin = hcom.split_whitespace().next().unwrap_or("hcom");
-            let expected_command = format!(
-                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom} {cmd_suffix} || exit 0'"
-            );
+            let expected_command = hook_command(&hcom, cmd_suffix);
             assert_eq!(
                 hook["command"].as_str().unwrap(),
                 expected_command,

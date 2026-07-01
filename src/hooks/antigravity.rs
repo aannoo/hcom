@@ -84,6 +84,15 @@ fn antigravity_hooks_path(gemini_dir: &Path) -> PathBuf {
 /// The fallback is delivered base64-encoded and piped through `base64 -d` so the
 /// JSON's quotes (and any apostrophes) survive the nested `sh -c '...'` pass —
 /// naive interpolation gets stripped or mis-tokenized by the inner shell.
+///
+/// This POSIX `sh -c` form is known to be Windows-incompatible in principle
+/// (Antigravity almost certainly doesn't invoke hooks via a POSIX shell on
+/// Windows). Unlike Gemini CLI — where `getShellConfiguration()` in
+/// `packages/core/src/utils/shell-utils.ts` confirms hooks run via PowerShell
+/// on Windows — Antigravity's actual Windows hook-execution mechanism could
+/// not be confirmed from source (closed-source, unverified provenance), so no
+/// PowerShell variant is implemented here pending real-Windows verification or
+/// an authoritative source.
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
     if fallback_json.is_empty() {
