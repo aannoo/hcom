@@ -2072,12 +2072,28 @@ fn format_claude_permission(prefix: &str, cmd: &str) -> String {
     format!("Bash({} {}{})", prefix, cmd, suffix)
 }
 
+/// Format a single Claude permission pattern for the PowerShell tool:
+/// `PowerShell(prefix cmd:*)`.
+///
+/// Claude Code uses the Bash tool on Windows when Git for Windows is present,
+/// and falls back to a separate PowerShell tool (same rule syntax as Bash)
+/// otherwise, so both patterns are installed to cover either case.
+fn format_claude_powershell_permission(prefix: &str, cmd: &str) -> String {
+    let suffix = if cmd.starts_with('-') { "" } else { ":*" };
+    format!("PowerShell({} {}{})", prefix, cmd, suffix)
+}
+
 /// Build permission patterns for installation using detected prefix.
 fn build_claude_permissions() -> Vec<String> {
     let prefix = crate::runtime_env::build_hcom_command();
     SAFE_HCOM_COMMANDS
         .iter()
         .map(|cmd| format_claude_permission(&prefix, cmd))
+        .chain(
+            SAFE_HCOM_COMMANDS
+                .iter()
+                .map(|cmd| format_claude_powershell_permission(&prefix, cmd)),
+        )
         .collect()
 }
 
@@ -2091,6 +2107,7 @@ fn build_all_claude_permission_patterns() -> Vec<String> {
     for prefix in &["hcom", "uvx hcom"] {
         for cmd in SAFE_HCOM_COMMANDS.iter().chain(LEGACY_HCOM_COMMANDS.iter()) {
             patterns.push(format_claude_permission(prefix, cmd));
+            patterns.push(format_claude_powershell_permission(prefix, cmd));
         }
     }
     patterns
@@ -2938,23 +2955,57 @@ mod tests {
     }
 
     #[test]
+    fn test_format_claude_powershell_permission() {
+        assert_eq!(
+            format_claude_powershell_permission("hcom", "send"),
+            "PowerShell(hcom send:*)"
+        );
+        assert_eq!(
+            format_claude_powershell_permission("hcom", "--help"),
+            "PowerShell(hcom --help)"
+        );
+        assert_eq!(
+            format_claude_powershell_permission("uvx hcom", "list"),
+            "PowerShell(uvx hcom list:*)"
+        );
+    }
+
+    #[test]
     fn test_build_claude_permissions() {
         let perms = build_claude_permissions();
         assert!(!perms.is_empty());
-        assert_eq!(perms.len(), SAFE_HCOM_COMMANDS.len());
-        // All should start with "Bash("
+        // Both Bash and PowerShell variants are installed for every safe command.
+        assert_eq!(perms.len(), SAFE_HCOM_COMMANDS.len() * 2);
+        assert_eq!(
+            perms.iter().filter(|p| p.starts_with("Bash(")).count(),
+            SAFE_HCOM_COMMANDS.len()
+        );
+        assert_eq!(
+            perms
+                .iter()
+                .filter(|p| p.starts_with("PowerShell("))
+                .count(),
+            SAFE_HCOM_COMMANDS.len()
+        );
+        // All should start with "Bash(" or "PowerShell("
         for p in &perms {
-            assert!(p.starts_with("Bash("), "bad permission: {}", p);
+            assert!(
+                p.starts_with("Bash(") || p.starts_with("PowerShell("),
+                "bad permission: {}",
+                p
+            );
         }
     }
 
     #[test]
     fn test_build_all_claude_permission_patterns() {
         let patterns = build_all_claude_permission_patterns();
-        // Should have both hcom and uvx hcom variants
-        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2;
+        // Should have both hcom and uvx hcom variants, each with Bash and PowerShell rules
+        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2 * 2;
         assert_eq!(patterns.len(), expected);
         assert!(patterns.iter().any(|p| p.contains("hcom send")));
+        assert!(patterns.iter().any(|p| p == "PowerShell(hcom send:*)"));
+        assert!(patterns.iter().any(|p| p == "PowerShell(uvx hcom send:*)"));
         assert!(patterns.iter().any(|p| p.contains("uvx hcom send")));
         // Legacy commands included for removal
         assert!(patterns.iter().any(|p| p.contains("hcom daemon")));

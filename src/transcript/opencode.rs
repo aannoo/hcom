@@ -20,11 +20,7 @@ pub(crate) struct TranscriptSearchMatch {
 }
 
 fn get_family_db_path(tool: &str) -> Option<PathBuf> {
-    let xdg_data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.local/share")
-    });
-    let data_dir = PathBuf::from(xdg_data).join(tool);
+    let data_dir = crate::runtime_env::opencode_family_data_dir(tool)?;
     let db_path = if tool == "kilo" {
         if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
             return None;

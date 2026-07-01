@@ -2,7 +2,6 @@
 //!
 //! Lifecycle: SessionStart → BeforeAgent → [BeforeTool → AfterTool]* → AfterAgent → SessionEnd
 
-use std::env;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -37,15 +36,7 @@ pub fn derive_gemini_transcript_path(session_id: &str) -> Option<String> {
         return None;
     }
 
-    let gemini_base = if let Ok(cli_home) = env::var("GEMINI_CLI_HOME") {
-        if !cli_home.is_empty() {
-            PathBuf::from(cli_home).join(".gemini")
-        } else {
-            PathBuf::from(env::var("HOME").ok()?).join(".gemini")
-        }
-    } else {
-        PathBuf::from(env::var("HOME").ok()?).join(".gemini")
-    };
+    let gemini_base = crate::runtime_env::gemini_family_config_dir();
     let gemini_tmp = gemini_base.join("tmp");
     if !gemini_tmp.exists() {
         return None;
@@ -946,6 +937,19 @@ pub fn get_gemini_version() -> Option<(u32, u32, u32)> {
     if !package_json.exists() {
         // Try parent (dist/index.js -> package.json at package root)
         package_json = real_path.parent()?.parent()?.join("package.json");
+    }
+    #[cfg(windows)]
+    if !package_json.exists() {
+        // npm on Windows installs a `gemini.cmd`/`.ps1` shim directly in the
+        // global bin dir (e.g. `%APPDATA%\npm\`) rather than a symlink into
+        // the package, so canonicalize() just resolves the shim itself. The
+        // package always lives in that same dir's `node_modules\@google\gemini-cli`.
+        package_json = real_path
+            .parent()?
+            .join("node_modules")
+            .join("@google")
+            .join("gemini-cli")
+            .join("package.json");
     }
     if !package_json.exists() {
         return None;

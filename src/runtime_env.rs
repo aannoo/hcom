@@ -49,6 +49,77 @@ pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
     tool_config_root().join(".gemini")
 }
 
+/// User home directory, honoring an explicit `HOME` override before falling back
+/// to the platform default (`dirs::home_dir()` resolves `%USERPROFILE%` on Windows).
+pub(crate) fn user_home() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return Some(std::path::PathBuf::from(home));
+    }
+    dirs::home_dir()
+}
+
+/// Cross-platform user config base directory.
+///
+/// Resolution order:
+/// 1. `$XDG_CONFIG_HOME` (explicit override, all platforms)
+/// 2. Unix/macOS: `$HOME/.config` — the XDG-style location the OpenCode-family
+///    and Gemini Node CLIs use, including on macOS
+/// 3. Windows: `dirs::config_dir()` (`%APPDATA%`)
+///
+/// Unix/macOS behavior is identical to the previous `xdg_config_home()`; only
+/// the Windows fallback is new.
+pub(crate) fn user_config_home() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(std::path::PathBuf::from(xdg));
+    }
+    #[cfg(windows)]
+    {
+        dirs::config_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        user_home().map(|h| h.join(".config"))
+    }
+}
+
+/// Cross-platform data directory for an OpenCode-family tool (`opencode`/`kilo`),
+/// i.e. where the tool keeps its SQLite session DB.
+///
+/// Probes candidates in order and returns the first that exists on disk; if none
+/// exist, returns the last candidate (platform default) so callers can surface a
+/// useful "searched here" path.
+///
+/// Resolution order:
+/// 1. `$XDG_DATA_HOME/<tool>` (explicit override, all platforms)
+/// 2. `~/.local/share/<tool>` (Linux + macOS XDG-style — where these CLIs write)
+/// 3. `dirs::data_dir()/<tool>` (Windows `%APPDATA%`, macOS Apple-style fallback)
+///
+/// This is the single source of truth for opencode/kilo data-dir resolution,
+/// shared by the hook dispatcher, the transcript search, and `resume`.
+pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        candidates.push(std::path::PathBuf::from(xdg).join(tool));
+    }
+    if let Some(home) = user_home() {
+        candidates.push(home.join(".local/share").join(tool));
+    }
+    if let Some(data) = dirs::data_dir() {
+        candidates.push(data.join(tool));
+    }
+
+    if let Some(existing) = candidates.iter().find(|c| c.is_dir()) {
+        return Some(existing.clone());
+    }
+    candidates.into_iter().next_back()
+}
+
 /// Set terminal title via escape codes written to /dev/tty.
 pub(crate) fn set_terminal_title(instance_name: &str) {
     let title = format!("hcom: {}", instance_name);
