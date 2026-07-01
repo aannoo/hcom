@@ -663,11 +663,18 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
     }
 }
 
-/// Build a command string for Claude (non-PTY mode).
+/// Build a command string for Claude (non-PTY mode). Quoting matches the
+/// shell that will run the resulting script: PowerShell on Windows, POSIX
+/// shell elsewhere (see `launch_terminal`'s `create_powershell_script` /
+/// `create_bash_script` split).
 fn build_claude_command(args: &[String]) -> String {
     let mut parts = vec!["claude".to_string()];
     for arg in args {
-        parts.push(crate::tools::args_common::shell_quote(arg));
+        if cfg!(windows) {
+            parts.push(terminal::ps_quote(arg));
+        } else {
+            parts.push(crate::tools::args_common::shell_quote(arg));
+        }
     }
     parts.join(" ")
 }
@@ -762,6 +769,10 @@ fn create_runner_script_windows(
             rand::random::<u16>() % 9000 + 1000
         ));
         let mut file = crate::sys::fs::create_private_new(&env_file)?;
+        // Windows PowerShell 5.1 reads BOM-less files using the legacy ANSI
+        // code page, corrupting non-ASCII env values; a UTF-8 BOM forces it
+        // to read as UTF-8.
+        file.write_all(b"\xEF\xBB\xBF")?;
         writeln!(
             file,
             "{}",
@@ -849,6 +860,10 @@ fn create_runner_script_windows(
             args_str
         )
     };
+    // `powershell -File` returns 0 unless the script exits with an explicit
+    // code, so surface the wrapper's real exit status (agent failures, PTY
+    // crashes, kill signals) instead of always reporting success.
+    let run_line = format!("{run_line}\nexit $LASTEXITCODE");
 
     let display = tool
         .chars()
@@ -869,7 +884,13 @@ fn create_runner_script_windows(
         cwd = terminal::ps_quote(cwd),
     );
 
-    fs::write(&script_file, &content)?;
+    // Windows PowerShell 5.1 reads BOM-less files using the legacy ANSI code
+    // page, corrupting non-ASCII usernames/paths/prompts/env values; a UTF-8
+    // BOM forces it to read as UTF-8.
+    let mut bytes = Vec::with_capacity(content.len() + 3);
+    bytes.extend_from_slice(b"\xEF\xBB\xBF");
+    bytes.extend_from_slice(content.as_bytes());
+    fs::write(&script_file, &bytes)?;
 
     crate::log::log_info(
         "pty",
