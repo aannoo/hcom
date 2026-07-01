@@ -501,33 +501,13 @@ impl Hcom {
     }
 
     pub fn process_group_alive(&self, pid: i64) -> bool {
-        if pid <= 1 || pid > i32::MAX as i64 {
-            return false;
-        }
-        // A negative pid addresses the process group whose id is `pid`.
-        let rc = unsafe { nix::libc::kill(-(pid as i32), 0) };
-        if rc == 0 {
-            return true;
-        }
-        std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EPERM)
+        process_group_alive(pid)
     }
 
     /// Terminate one hcom-owned process group, escalating only after bounded
     /// polling. Returns true once the group no longer exists.
     pub fn terminate_process_group(&self, pid: i64) -> bool {
-        if !self.process_group_alive(pid) {
-            return true;
-        }
-        unsafe {
-            nix::libc::kill(-(pid as i32), nix::libc::SIGTERM);
-        }
-        if poll_until(Duration::from_secs(3), || !self.process_group_alive(pid)) {
-            return true;
-        }
-        unsafe {
-            nix::libc::kill(-(pid as i32), nix::libc::SIGKILL);
-        }
-        poll_until(Duration::from_secs(3), || !self.process_group_alive(pid))
+        terminate_process_group(pid)
     }
 }
 
@@ -558,6 +538,82 @@ impl Drop for Hcom {
             let _ = self.terminate_process_group(pid);
         }
     }
+}
+
+#[cfg(unix)]
+pub fn process_group_alive(pid: i64) -> bool {
+    if pid <= 1 || pid > i32::MAX as i64 {
+        return false;
+    }
+    // A negative pid addresses the process group whose id is `pid`.
+    let rc = unsafe { nix::libc::kill(-(pid as i32), 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EPERM)
+}
+
+// Windows has no process-group primitive; this fixture only ever tracks a
+// single spawned pid on this codepath, so liveness degrades to a plain PID
+// check.
+#[cfg(windows)]
+pub fn process_group_alive(pid: i64) -> bool {
+    if pid <= 1 || pid > u32::MAX as i64 {
+        return false;
+    }
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: query-only access mask; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        CloseHandle(handle);
+        ok && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+/// Terminate one hcom-owned process group, escalating only after bounded
+/// polling. Returns true once the group no longer exists.
+#[cfg(unix)]
+pub fn terminate_process_group(pid: i64) -> bool {
+    if !process_group_alive(pid) {
+        return true;
+    }
+    unsafe {
+        nix::libc::kill(-(pid as i32), nix::libc::SIGTERM);
+    }
+    if poll_until(Duration::from_secs(3), || !process_group_alive(pid)) {
+        return true;
+    }
+    unsafe {
+        nix::libc::kill(-(pid as i32), nix::libc::SIGKILL);
+    }
+    poll_until(Duration::from_secs(3), || !process_group_alive(pid))
+}
+
+// Windows has no process-group primitive; terminate just the tracked pid.
+#[cfg(windows)]
+pub fn terminate_process_group(pid: i64) -> bool {
+    if !process_group_alive(pid) {
+        return true;
+    }
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: opens a terminate-only handle, closes it before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+    poll_until(Duration::from_secs(3), || !process_group_alive(pid))
 }
 
 pub fn parse_hcom_marker(stdout: &str) -> Option<String> {

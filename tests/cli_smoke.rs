@@ -3,6 +3,7 @@
 
 mod support;
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -10,9 +11,15 @@ use support::{Hcom, parse_hcom_marker};
 
 #[test]
 fn fixture_drop_terminates_registered_process_group() {
+    #[cfg(unix)]
     let mut child = Command::new("sh")
         .args(["-c", "sleep 60"])
         .process_group(0)
+        .spawn()
+        .expect("spawn cleanup test process group");
+    #[cfg(windows)]
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
         .spawn()
         .expect("spawn cleanup test process group");
     let pid = i64::from(child.id());
@@ -33,15 +40,13 @@ fn fixture_drop_terminates_registered_process_group() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(7);
-    while Instant::now() < deadline {
-        let rc = unsafe { nix::libc::kill(-(pid as i32), 0) };
-        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH) {
-            break;
-        }
+    while Instant::now() < deadline && support::process_group_alive(pid) {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let rc = unsafe { nix::libc::kill(-(pid as i32), 0) };
-    assert_ne!(rc, 0, "fixture drop left process group {pid} alive");
+    assert!(
+        !support::process_group_alive(pid),
+        "fixture drop left process group {pid} alive"
+    );
 }
 
 #[test]
