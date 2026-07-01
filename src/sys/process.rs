@@ -425,22 +425,30 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     }
 
     // Re-scan for stragglers spawned between the snapshot and their parent's
-    // termination (see doc comment above). Keep the full known tree growing
-    // across rounds so a straggler that itself spawns another child before
-    // being killed is still caught by the next round.
+    // termination (see doc comment above). Always run all RESCAN_ROUNDS —
+    // round N finding nothing new doesn't mean a straggler can't still appear
+    // before round N+1's snapshot, so stopping early would defeat the point of
+    // having more than one round. Within a round, expand `tree` to a fixed
+    // point (mirroring the initial BFS above) rather than a single pass, so a
+    // straggler and *its own* child that both first appear in the same
+    // snapshot are both caught in that round regardless of HashMap iteration
+    // order.
     for _ in 0..RESCAN_ROUNDS {
         std::thread::sleep(RESCAN_DELAY);
         let Some(parents) = snapshot_parents() else {
             break;
         };
         let before = tree.len();
-        for (&pid, &ppid) in &parents {
-            if tree.contains(&ppid) && !tree.contains(&pid) {
-                tree.push(pid);
+        loop {
+            let start_len = tree.len();
+            for (&pid, &ppid) in &parents {
+                if tree.contains(&ppid) && !tree.contains(&pid) {
+                    tree.push(pid);
+                }
             }
-        }
-        if tree.len() == before {
-            break;
+            if tree.len() == start_len {
+                break;
+            }
         }
         // Kill only the newly discovered stragglers (deepest-first isn't
         // load-bearing here since these are freshly discovered leaves relative

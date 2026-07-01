@@ -541,10 +541,10 @@ pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> S
 /// The start hook captures the full context (git_branch, tty, env snapshot) later.
 ///
 /// Portable: every operation here (`env::var`, `fs::read_to_string`, `thread::sleep`)
-/// works identically on Windows. `TMUX_PANE`/`ZELLIJ_PANE_ID` simply won't be set
-/// there, so those multiplexer-only fields degrade to absent — same as on Unix when
-/// not running inside tmux/zellij. `WEZTERM_PANE`/`KITTY_WINDOW_ID` are meaningful on
-/// Windows too, since wezterm and kitty both run there.
+/// works identically on Windows. `TMUX_PANE`/`ZELLIJ_PANE_ID`/`KITTY_WINDOW_ID` simply
+/// won't be set there — kitty and the multiplexers have no native Windows build — so
+/// those fields degrade to absent, same as on Unix outside of tmux/zellij/kitty.
+/// `WEZTERM_PANE` is meaningful on Windows too, since WezTerm is natively cross-platform.
 pub(super) fn build_early_launch_context() -> String {
     use serde_json::{Map, Value};
 
