@@ -8,8 +8,11 @@ use std::process::Command;
 /// Whether a process with the given PID is currently alive.
 ///
 /// Unix: `kill(pid, 0)`, treating `EPERM` (the process exists but is owned by
-/// another user) as alive. Windows: `OpenProcess` — a successful handle, or a
-/// failure with `ERROR_ACCESS_DENIED`, means the process exists.
+/// another user) as alive. Windows: `OpenProcess` followed by
+/// `GetExitCodeProcess` — a live handle alone isn't proof of life, since the
+/// process object stays valid as long as any handle (ours, or a job object's)
+/// is open even after the process has exited. A failure to open with
+/// `ERROR_ACCESS_DENIED` also means the process exists.
 pub fn is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -22,16 +25,20 @@ pub fn is_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+        };
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         // SAFETY: query-only access mask; the handle is closed before returning.
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if !handle.is_null() {
+                let mut exit_code = 0u32;
+                let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
                 CloseHandle(handle);
-                return true;
+                return ok && exit_code == STILL_ACTIVE as u32;
             }
             GetLastError() == ERROR_ACCESS_DENIED
         }
@@ -185,7 +192,9 @@ pub fn kill_child_group(child: &mut std::process::Child) {
 /// the resulting child can be signalled as a group and is detached from the
 /// parent's controlling terminal.
 ///
-/// Unix: `setsid()` via a `pre_exec` hook. Windows: `CREATE_NEW_PROCESS_GROUP`.
+/// Unix: `setsid()` via a `pre_exec` hook. Windows: `CREATE_NEW_PROCESS_GROUP`
+/// combined with `CREATE_NO_WINDOW`, so the child neither shares the parent's
+/// console nor dies when that console closes.
 pub fn detach_session(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -206,7 +215,8 @@ pub fn detach_session(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 }
 
