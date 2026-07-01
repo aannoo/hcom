@@ -2635,7 +2635,13 @@ mod tests {
     fn test_build_claude_command() {
         let args = vec!["--model".to_string(), "sonnet".to_string()];
         let cmd = build_claude_command(&args);
-        assert_eq!(cmd, "claude --model sonnet");
+        if cfg!(windows) {
+            // ps_quote() always quotes, unlike the POSIX shell_quote() used
+            // elsewhere, which leaves plain args unquoted.
+            assert_eq!(cmd, "claude '--model' 'sonnet'");
+        } else {
+            assert_eq!(cmd, "claude --model sonnet");
+        }
     }
 
     #[test]
