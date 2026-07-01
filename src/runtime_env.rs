@@ -94,19 +94,22 @@ pub(crate) fn user_config_home() -> Option<std::path::PathBuf> {
 /// useful "searched here" path.
 ///
 /// Resolution order:
-/// 1. `$XDG_DATA_HOME/<tool>` (explicit override, all platforms)
+/// 1. `$XDG_DATA_HOME/<tool>` (explicit override, all platforms) — trusted
+///    unconditionally, with no existence probe: an explicit override always
+///    wins, even if the directory hasn't been created yet.
 /// 2. `~/.local/share/<tool>` (Linux + macOS XDG-style — where these CLIs write)
 /// 3. `dirs::data_dir()/<tool>` (Windows `%APPDATA%`, macOS Apple-style fallback)
 ///
 /// This is the single source of truth for opencode/kilo data-dir resolution,
 /// shared by the hook dispatcher, the transcript search, and `resume`.
 pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
         && !xdg.is_empty()
     {
-        candidates.push(std::path::PathBuf::from(xdg).join(tool));
+        return Some(std::path::PathBuf::from(xdg).join(tool));
     }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(home) = user_home() {
         candidates.push(home.join(".local/share").join(tool));
     }
@@ -291,7 +294,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn opencode_family_data_dir_skips_nonexistent_xdg_candidate() {
+    fn opencode_family_data_dir_trusts_nonexistent_xdg_candidate() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
@@ -301,14 +304,15 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        // XDG_DATA_HOME is set but its opencode subdir does not exist on
-        // disk, so the probe must skip it and pick ~/.local/share/opencode.
-        let _xdg_guard =
-            XdgDataHomeGuard::set(temp.path().join("xdg-data-missing").to_str().unwrap());
+        // XDG_DATA_HOME is explicitly set but its opencode subdir does not
+        // exist on disk yet. An explicit override must win unconditionally
+        // rather than falling back to a stale ~/.local/share/opencode.
+        let xdg_data_missing = temp.path().join("xdg-data-missing");
+        let _xdg_guard = XdgDataHomeGuard::set(xdg_data_missing.to_str().unwrap());
 
         assert_eq!(
             super::opencode_family_data_dir("opencode"),
-            Some(local_share_tool_dir)
+            Some(xdg_data_missing.join("opencode"))
         );
     }
 

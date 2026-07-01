@@ -1370,8 +1370,9 @@ pub enum SetupError {
 fn hook_command(hcom_cmd: &str, cmd_suffix: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
     if cfg!(windows) {
-        // Single-quoted PowerShell strings don't expand `$variables` or backticks,
-        // mirroring how the POSIX branch avoids shell expansion via single quotes.
+        // hcom_cmd/cmd_suffix are always fixed hcom invocations (never user input),
+        // so no quoting is needed here; if that ever changes, note that PowerShell
+        // still expands `$variables` and backticks in bare (unquoted) script text.
         format!(
             "if (Get-Command {bin} -ErrorAction SilentlyContinue) {{ {hcom_cmd} {cmd_suffix} }} else {{ exit 0 }}"
         )
