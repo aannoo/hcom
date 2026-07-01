@@ -751,7 +751,23 @@ impl OutputModeFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::OutputModeFilter;
+    use super::{OutputModeFilter, is_cmd_script};
+
+    #[test]
+    fn is_cmd_script_matches_cmd_and_bat_case_insensitively() {
+        assert!(is_cmd_script("gemini.cmd"));
+        assert!(is_cmd_script(r"C:\Users\me\AppData\Roaming\npm\codex.CMD"));
+        assert!(is_cmd_script("run.bat"));
+        assert!(is_cmd_script("RUN.BAT"));
+    }
+
+    #[test]
+    fn is_cmd_script_rejects_other_extensions() {
+        assert!(!is_cmd_script("claude.exe"));
+        assert!(!is_cmd_script("gemini"));
+        assert!(!is_cmd_script("script.ps1"));
+        assert!(!is_cmd_script("noext."));
+    }
 
     fn run(chunks: &[&[u8]]) -> Vec<u8> {
         let mut f = OutputModeFilter::default();

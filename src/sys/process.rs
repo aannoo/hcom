@@ -353,4 +353,24 @@ mod tests {
     fn test_is_alive_dead_process() {
         assert!(!is_alive(99_999_999));
     }
+
+    // Reproduces the bug fixed above: the process object stays valid (and
+    // OpenProcess succeeds) as long as any handle is open, even after the
+    // process has exited. Holding `child` past `wait()` keeps its handle
+    // open while we probe the same PID with our own OpenProcess call.
+    #[cfg(windows)]
+    #[test]
+    fn test_is_alive_false_for_exited_process_with_handle_still_open() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(
+            !is_alive(pid),
+            "an open handle to an already-exited process must not count as alive"
+        );
+        drop(child);
+    }
 }

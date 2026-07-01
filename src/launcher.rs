@@ -2934,6 +2934,43 @@ mod tests {
         std::fs::remove_file(env_file).ok();
     }
 
+    // create_runner_script_windows() isn't cfg(windows)-gated (only its call
+    // site is, via a runtime cfg!(windows) check), so this runs on any host.
+    #[test]
+    fn test_runner_script_windows_has_bom_and_propagates_exit_code() {
+        let env = HashMap::from([("SOME_SECRET".to_string(), "sekrit".to_string())]);
+
+        let script = create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[]).unwrap();
+
+        let bytes = std::fs::read(&script).unwrap();
+        assert_eq!(
+            &bytes[..3],
+            b"\xEF\xBB\xBF",
+            "PowerShell 5.1 misreads BOM-less files as the legacy ANSI code page"
+        );
+        let content = String::from_utf8(bytes[3..].to_vec()).unwrap();
+        assert!(
+            content.contains("exit $LASTEXITCODE"),
+            "runner must surface the wrapped process's real exit code, not always report success"
+        );
+
+        let sidecar = content
+            .split("Test-Path '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("ambient env should be sourced from a sidecar file");
+        let sidecar_bytes = std::fs::read(sidecar).unwrap();
+        assert_eq!(
+            &sidecar_bytes[..3],
+            b"\xEF\xBB\xBF",
+            "sidecar env file needs the same BOM as the runner script"
+        );
+        assert!(String::from_utf8_lossy(&sidecar_bytes).contains("SOME_SECRET"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(sidecar).ok();
+    }
+
     #[test]
     #[serial]
     fn test_same_tool_nesting_strips_instance_state() {
