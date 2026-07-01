@@ -27,6 +27,17 @@ use crate::db::HcomDb;
 use crate::delivery::{EXIT_WAS_KILLED, ScreenState};
 use crate::log::log_error;
 
+/// True if `path` is a `.cmd`/`.bat` script (case-insensitive), which
+/// `CreateProcessW` cannot execute directly — only `cmd.exe /c` can run those.
+/// Covers npm-installed tool shims, which `terminal::which_bin` resolves to
+/// `<name>.cmd` via PATHEXT.
+fn is_cmd_script(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
 /// Windows ConPTY-backed PTY proxy.
 pub struct Proxy {
     config: ProxyConfig,
@@ -82,8 +93,21 @@ impl Proxy {
             })
             .context("openpty (ConPTY) failed")?;
 
-        let mut cmd = CommandBuilder::new(command);
-        cmd.args(args);
+        // npm-installed tool shims (e.g. `gemini.cmd`, `codex.cmd`) resolve to
+        // `.cmd`/`.bat` files. CreateProcessW cannot execute those directly —
+        // only `cmd.exe /c` knows how to run a batch file — so route through
+        // the shell in that case. Other extensions (`.exe`, extension-less)
+        // spawn directly, exactly as before.
+        let mut cmd = if is_cmd_script(command) {
+            let mut c = CommandBuilder::new("cmd.exe");
+            c.args(["/c", command]);
+            c.args(args);
+            c
+        } else {
+            let mut c = CommandBuilder::new(command);
+            c.args(args);
+            c
+        };
         for (k, v) in &config.env_vars {
             cmd.env(k, v);
         }
