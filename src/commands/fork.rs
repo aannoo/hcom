@@ -1,5 +1,5 @@
 //! Forks an active or stopped instance by launching with --fork-session
-//! (Claude), fork subcommand (Codex), --fork (OpenCode), or respective options for Kilo/Pi.
+//! (Claude), fork subcommand (Codex), --fork (OpenCode), or respective options for Kilo/Pi/OMP.
 
 use anyhow::Result;
 

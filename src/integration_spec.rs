@@ -980,7 +980,15 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     },
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
-        fork: None,
+        // Top-level `omp --help` omits `--fork`, but the flag is real: it has
+        // existed and been documented in session-operation docs since v15.1.9.
+        // `omp --fork <id>` routes through `SessionManager.forkFrom(...)` (takes
+        // the session id/path as its value) and is mutually exclusive with
+        // session persistence (`omp --fork x --no-session` -> "--fork requires
+        // session persistence"). Same shape as Pi: Subcommand emits
+        // `["--fork", <id>]` (replacing `--resume`), not `["--resume", <id>,
+        // "--fork"]`. Must not degrade `hcom f` into a plain `--resume`.
+        fork: Some(ForkArgs::Subcommand("--fork")),
     }),
     help: HelpSpec {
         unique_examples: OMP_HELP_EXAMPLES,

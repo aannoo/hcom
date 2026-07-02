@@ -648,7 +648,7 @@ const TERM_HELP: &[HelpEntry] = &[
     ("", "Logs: ~/.hcom/.tmp/logs/pty_debug/"),
 ];
 
-// ── Tool launch help (claude/gemini/codex/opencode) ─────────────────────
+// ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot) ─────────────────────
 
 /// Resolve the launch-help spec for a CLI name (`claude`, `agy`, …).
 fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::IntegrationSpec> {
@@ -1251,9 +1251,9 @@ mod tests {
             )
         );
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi)"
+            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/omp)"
         ));
-        assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/kimi)"));
-        assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi");
+        assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
+        assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");
     }
 }

@@ -1645,7 +1645,7 @@ fn format_system_time(t: std::time::SystemTime) -> String {
 // ── Session-ID adoption ──────────────────────────────────────────────────
 
 /// Check if a string looks like a known session-ID format.
-/// Claude, Codex, and Gemini use UUIDs. Opencode uses `ses_<hex+base62>`.
+/// Claude, Codex, and Gemini use UUIDs. OpenCode, Kilo, Pi, and OMP use specific prefixes or directories.
 fn is_session_id(s: &str) -> bool {
     uuid::Uuid::parse_str(s).is_ok() || is_opencode_session_id(s)
 }
@@ -1809,23 +1809,99 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
-    // 8. OMP. Check before Pi because OMP deliberately reuses Pi's
-    // PI_CODING_AGENT_* environment variables for its own session roots.
-    if let Some(path) = derive_omp_transcript_path(session_id) {
-        return Some(("omp".to_string(), Some(path)));
-    }
-
-    // 9. Pi
-    if let Some(path) = derive_pi_transcript_path(session_id) {
-        return Some(("pi".to_string(), Some(path)));
+    // 8. Pi / OMP. Attribute by root PROVENANCE, not probe order:
+    //   - `PI_CODING_AGENT_SESSION_DIR` + `~/.pi`            => Pi-exclusive
+    //   - XDG-omp / `~/.omp` / OMP profile trees             => OMP-exclusive
+    //   - `PI_CODING_AGENT_DIR/sessions`                     => genuinely shared
+    // Exclusive roots are authoritative. The shared root is attributed only by
+    // the path's product marker (managed configs carry `.pi`/`.omp`); a
+    // markerless arbitrary shared dir is genuinely ambiguous (both tools write
+    // identical headers) and is surfaced as an error by the caller rather than
+    // guessed. `PiOmpMatch::Ambiguous` carries the path so the caller can name it.
+    match resolve_pi_omp_on_disk(session_id) {
+        PiOmpMatch::Found { tool, path } => return Some((tool, Some(path))),
+        // Ambiguous is handled by build_adopt_plan (which re-derives via
+        // `ambiguous_pi_omp_session`); fall through to the not-found path here so
+        // untracked callers still get a definite answer.
+        PiOmpMatch::Ambiguous { .. } | PiOmpMatch::None => {}
     }
 
     None
 }
 
+enum PiOmpMatch {
+    Found { tool: String, path: String },
+    Ambiguous { path: String },
+    None,
+}
+
+/// Locate a Pi/OMP session id on disk and attribute it by root ownership.
+fn resolve_pi_omp_on_disk(session_id: &str) -> PiOmpMatch {
+    use crate::transcript::{
+        omp_exclusive_roots, omp_session_roots, pi_exclusive_roots, pi_session_roots,
+        shared_agent_dir_root,
+    };
+
+    let shared = shared_agent_dir_root();
+    let shared_owner = shared.as_ref().and_then(|root| {
+        let pi_active = pi_session_roots().contains(root);
+        let omp_active = omp_session_roots().contains(root);
+        match (pi_active, omp_active) {
+            (true, true) => Some(None),
+            (true, false) => Some(Some("pi")),
+            (false, true) => Some(Some("omp")),
+            (false, false) => None,
+        }
+    });
+
+    let roots = pi_exclusive_roots()
+        .into_iter()
+        .map(|root| (root, Some("pi")))
+        .chain(
+            omp_exclusive_roots()
+                .into_iter()
+                .map(|root| (root, Some("omp"))),
+        )
+        .chain(shared.zip(shared_owner));
+
+    for (root, owner) in roots {
+        if root.exists()
+            && let Some(path) = find_pi_transcript_in_root(&root, session_id)
+        {
+            return match owner.or_else(|| pi_omp_path_owner(&path)) {
+                Some(tool) => PiOmpMatch::Found {
+                    tool: tool.to_string(),
+                    path,
+                },
+                None => PiOmpMatch::Ambiguous { path },
+            };
+        }
+    }
+    PiOmpMatch::None
+}
+
+/// Return the owner encoded in a shared path's `.pi` or `.omp` marker.
+fn pi_omp_path_owner(path: &str) -> Option<&'static str> {
+    match crate::transcript::detect_tool_from_path(path) {
+        Some(crate::tool::Tool::Pi) => Some("pi"),
+        Some(crate::tool::Tool::Omp) => Some("omp"),
+        _ => None,
+    }
+}
+
+/// The path of a Pi/OMP session that was found but is genuinely ambiguous
+/// (markerless shared `PI_CODING_AGENT_DIR`). Used by the adoption path to raise
+/// a precise disambiguation error instead of "not found".
+fn ambiguous_pi_omp_session(session_id: &str) -> Option<String> {
+    match resolve_pi_omp_on_disk(session_id) {
+        PiOmpMatch::Ambiguous { path } => Some(path),
+        _ => None,
+    }
+}
+
 /// Merge `omp` transcript arguments for a resumed or forked session.
 ///
-/// Omp uses `--resume <id>`, and lacks `--fork` and `--session`.
+/// Omp uses `--resume <id>` and `--fork <id>`, and lacks `--session`.
 fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
     let mut preserved = Vec::new();
     let mut i = 0;
@@ -1874,58 +1950,13 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
     final_args
 }
 
-/// Locate a Pi transcript by session id under the configured session dir
-/// (`PI_CODING_AGENT_SESSION_DIR`) or the default `~/.pi/agent/sessions`.
-fn derive_pi_transcript_path(session_id: &str) -> Option<String> {
-    let mut roots = Vec::new();
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
-        && !dir.is_empty()
-    {
-        roots.push(std::path::PathBuf::from(dir));
-    }
-    roots.push(dirs::home_dir()?.join(".pi").join("agent").join("sessions"));
-
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
-        if let Some(path) = find_pi_transcript_in_root(&root, session_id) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Locate an OMP transcript by session id. Searches, in order:
-/// `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR/sessions`,
-/// `XDG_DATA_HOME/omp/sessions`, and the default `~/.omp/agent/sessions`.
-/// The `PI_CODING_AGENT_DIR` root matters when the launcher isolates OMP config
-/// into a project-local dir.
+/// Locate an OMP transcript by session id under OMP's currently active session
+/// root. Notably does **not** search `PI_CODING_AGENT_SESSION_DIR` — OMP never
+/// reads it, so it stays Pi-exclusive. Test helper: production attribution goes through
+/// [`resolve_pi_omp_on_disk`], which keeps exclusive/shared provenance.
+#[cfg(test)]
 fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
-    let mut roots = Vec::new();
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
-        && !dir.is_empty()
-    {
-        roots.push(std::path::PathBuf::from(dir));
-    }
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
-        && !dir.is_empty()
-    {
-        roots.push(std::path::PathBuf::from(dir).join("sessions"));
-    }
-    if let Ok(dir) = std::env::var("XDG_DATA_HOME")
-        && !dir.is_empty()
-    {
-        roots.push(std::path::PathBuf::from(dir).join("omp").join("sessions"));
-    }
-    roots.push(
-        dirs::home_dir()?
-            .join(".omp")
-            .join("agent")
-            .join("sessions"),
-    );
-
-    for root in roots {
+    for root in crate::transcript::omp_session_roots() {
         if !root.exists() {
             continue;
         }
@@ -2162,6 +2193,19 @@ fn build_adopt_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
+    // A markerless session under a shared PI_CODING_AGENT_DIR cannot be
+    // attributed to Pi vs OMP without guessing; surface it explicitly rather
+    // than launching the wrong tool against the transcript.
+    if let Some(path) = ambiguous_pi_omp_session(session_id) {
+        bail!(
+            "Session {session_id} was found under a shared PI_CODING_AGENT_DIR \
+             ({path}) with no product marker, so hcom cannot tell whether it is a \
+             Pi or Oh My Pi session (both write identical transcripts).\n\
+             Disambiguate by launching the owning tool explicitly, e.g.\n  \
+             hcom pi --resume {session_id}\n  hcom omp --resume {session_id}"
+        );
+    }
+
     let (tool, transcript_path) = find_session_on_disk(session_id).ok_or_else(|| {
         // find_session_on_disk short-circuits for `ses_` IDs (the OpenCode
         // family is searched), so scope the error to match that lookup.
@@ -2332,9 +2376,36 @@ mod tests {
     }
 
     #[test]
-    fn test_build_resume_args_omp_has_no_fork_flag() {
-        let args = build_resume_args("omp", "sess-omp", true);
+    fn test_build_resume_args_omp_resume() {
+        let args = build_resume_args("omp", "sess-omp", false);
         assert_eq!(args, s(&["--resume", "sess-omp"]));
+    }
+
+    #[test]
+    fn test_build_resume_args_omp_fork() {
+        // Top-level `omp --help` omits `--fork`, but v15.1.9+ implements it:
+        // `omp --fork <id>` takes the id as its value and routes through
+        // SessionManager.forkFrom(...). Same shape as Pi — fork must emit
+        // `["--fork", <id>]`, replacing `--resume`, not `["--resume", <id>,
+        // "--fork"]`. hcom must not degrade `hcom f` into a plain `--resume`.
+        let args = build_resume_args("omp", "sess-omp", true);
+        assert_eq!(args, s(&["--fork", "sess-omp"]));
+    }
+
+    #[test]
+    fn test_merge_omp_args_fork_replaces_prior_session_controls() {
+        // A fork's build_resume_args output (`--fork <id>`) merged over stored
+        // launch args must strip the old resume/session/fork controls and keep
+        // config flags.
+        let fork = s(&["--fork", "new"]);
+        assert_eq!(
+            merge_omp_args(&s(&["--model", "opus", "--fork", "old"]), &fork),
+            s(&["--fork", "new", "--model", "opus"])
+        );
+        assert_eq!(
+            merge_omp_args(&s(&["--fork=old", "-r", "prev"]), &fork),
+            s(&["--fork", "new"])
+        );
     }
 
     #[test]
@@ -2368,6 +2439,13 @@ mod tests {
 
     #[test]
     fn test_derive_omp_transcript_path_checks_xdg_data_home() {
+        if !cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android"
+        )) {
+            return;
+        }
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("omp").join("sessions").join("project");
@@ -2376,6 +2454,8 @@ mod tests {
         unsafe {
             std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
             std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
             std::env::set_var("XDG_DATA_HOME", dir.path());
         }
 
@@ -2389,6 +2469,13 @@ mod tests {
     #[test]
     fn test_find_session_on_disk_prefers_omp_for_omp_paths() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+        }
         let root = home
             .join(".omp")
             .join("agent")
@@ -2396,15 +2483,123 @@ mod tests {
             .join("project");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("session-omp.jsonl"), "{}").unwrap();
-        unsafe {
-            std::env::set_var(
-                "PI_CODING_AGENT_SESSION_DIR",
-                home.join(".omp").join("agent").join("sessions"),
-            );
-        }
 
         let found = find_session_on_disk("session-omp").unwrap();
         assert_eq!(found.0, "omp");
+    }
+
+    #[test]
+    fn test_find_session_on_disk_attributes_pi_session_dir_to_pi() {
+        // Regression guard for the shared-root bug: a Pi session reached via the
+        // Pi-exclusive PI_CODING_AGENT_SESSION_DIR override must be attributed to
+        // Pi, not stolen by OMP (which never reads that variable).
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let pi_sessions = tempfile::tempdir().unwrap();
+        let root = pi_sessions.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("session-pi.jsonl"), "{}").unwrap();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("HCOM_TOOL");
+            std::env::set_var("PI_CODING_AGENT_SESSION_DIR", pi_sessions.path());
+        }
+
+        // OMP must not find it at all.
+        assert!(derive_omp_transcript_path("session-pi").is_none());
+        let found = find_session_on_disk("session-pi").unwrap();
+        assert_eq!(found.0, "pi");
+    }
+
+    #[test]
+    fn test_find_session_on_disk_attributes_shared_agent_dir_by_path_marker() {
+        // The genuinely-shared PI_CODING_AGENT_DIR: attribution must key on the
+        // path's product marker (.pi vs .omp), not on which tool's root list or
+        // probe order found it. hcom isolates managed configs as <root>/.pi and
+        // <root>/.omp, so the marker is present.
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let base = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("HCOM_TOOL");
+        }
+
+        // Managed Pi: PI_CODING_AGENT_DIR=<base>/.pi -> sessions/<file>.
+        let pi_dir = base.path().join(".pi");
+        let pi_root = pi_dir.join("sessions").join("proj");
+        std::fs::create_dir_all(&pi_root).unwrap();
+        std::fs::write(pi_root.join("mgpi.jsonl"), "{}").unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &pi_dir) }
+        assert_eq!(find_session_on_disk("mgpi").unwrap().0, "pi");
+
+        // Managed OMP: PI_CODING_AGENT_DIR=<base>/.omp -> sessions/<file>.
+        let omp_dir = base.path().join(".omp");
+        let omp_root = omp_dir.join("sessions").join("proj");
+        std::fs::create_dir_all(&omp_root).unwrap();
+        std::fs::write(omp_root.join("mgomp.jsonl"), "{}").unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &omp_dir) }
+        assert_eq!(find_session_on_disk("mgomp").unwrap().0, "omp");
+    }
+
+    #[test]
+    fn test_markerless_shared_agent_dir_is_ambiguous_not_guessed() {
+        // Arbitrary shared PI_CODING_AGENT_DIR with no .pi/.omp marker must be
+        // reported ambiguous, never silently attributed — even when the caller
+        // itself is Pi or OMP.
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let shared = tempfile::tempdir().unwrap();
+        let root = shared.path().join("sessions").join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("amb.jsonl"), "{}").unwrap();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("HCOM_TOOL");
+            std::env::set_var("PI_CODING_AGENT_DIR", shared.path());
+        }
+
+        // No determinate attribution -> find_session_on_disk yields None, and the
+        // match is flagged ambiguous (found-but-unattributable).
+        assert!(find_session_on_disk("amb").is_none());
+        assert!(ambiguous_pi_omp_session("amb").is_some());
+
+        for caller in ["pi", "omp"] {
+            unsafe { std::env::set_var("HCOM_TOOL", caller) }
+            assert!(
+                find_session_on_disk("amb").is_none(),
+                "caller {caller} must not claim a markerless shared transcript"
+            );
+            assert!(ambiguous_pi_omp_session("amb").is_some());
+        }
+    }
+
+    #[test]
+    fn test_derive_omp_transcript_path_checks_named_profile() {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("PI_PROFILE");
+            std::env::set_var("OMP_PROFILE", "work");
+        }
+        let root = home
+            .join(".omp")
+            .join("profiles")
+            .join("work")
+            .join("agent")
+            .join("sessions")
+            .join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("session-prof.jsonl"), "{}").unwrap();
+
+        let path = derive_omp_transcript_path("session-prof").unwrap();
+        assert!(path.contains("session-prof.jsonl"), "unexpected: {path}");
     }
 
     #[test]

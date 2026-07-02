@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot).
 
 pub mod antigravity;
 pub mod claude;
@@ -50,6 +50,9 @@ pub mod test_helpers {
         saved_test_codex_cli_version: Option<String>,
         saved_pi_coding_agent_dir: Option<String>,
         saved_pi_coding_agent_session_dir: Option<String>,
+        saved_pi_config_dir: Option<String>,
+        saved_omp_profile: Option<String>,
+        saved_pi_profile: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -78,6 +81,9 @@ pub mod test_helpers {
                 saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
                 saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
                     .ok(),
+                saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
+                saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
+                saved_pi_profile: std::env::var("PI_PROFILE").ok(),
                 _lock: lock,
             }
         }
@@ -134,6 +140,18 @@ pub mod test_helpers {
                     Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
                     None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
                 }
+                match &self.saved_pi_config_dir {
+                    Some(v) => std::env::set_var("PI_CONFIG_DIR", v),
+                    None => std::env::remove_var("PI_CONFIG_DIR"),
+                }
+                match &self.saved_omp_profile {
+                    Some(v) => std::env::set_var("OMP_PROFILE", v),
+                    None => std::env::remove_var("OMP_PROFILE"),
+                }
+                match &self.saved_pi_profile {
+                    Some(v) => std::env::set_var("PI_PROFILE", v),
+                    None => std::env::remove_var("PI_PROFILE"),
+                }
             }
             crate::config::Config::reset();
             crate::config::Config::init();
@@ -189,7 +207,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "pi").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,

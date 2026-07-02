@@ -261,7 +261,11 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
         || (lower.contains("/session-state/") && file_name == "events.jsonl")
     {
         Some(Tool::Copilot)
-    } else if lower.contains("/.omp/agent/sessions/") {
+    } else if lower.contains("/.omp/") {
+        // Covers the default tree (`/.omp/agent/sessions/`) and named-profile
+        // trees (`/.omp/profiles/<name>/agent/sessions/`). XDG and
+        // PI_CODING_AGENT_DIR roots have no `.omp` in the path and are attributed
+        // by search-root provenance in `attribute_disk_match` instead.
         Some(Tool::Omp)
     } else if lower.contains("/.pi/agent/sessions/")
         || lower.contains("/.pi/sessions/")
@@ -350,6 +354,154 @@ pub(crate) fn claude_projects_dir() -> PathBuf {
     env_or_default_dir("CLAUDE_CONFIG_DIR", home.join(".claude")).join("projects")
 }
 
+/// Active OMP profile from the environment. `OMP_PROFILE` is canonical and wins;
+/// `PI_PROFILE` (legacy) is consulted only when `OMP_PROFILE` is entirely unset.
+/// OMP trims the selected value and treats empty/whitespace and the `"default"`
+/// sentinel as the implicit default profile.
+pub(crate) fn omp_profile_from_env() -> Option<String> {
+    let value = match std::env::var("OMP_PROFILE") {
+        Ok(value) => Some(value),
+        Err(_) => std::env::var("PI_PROFILE").ok(),
+    }?;
+    let normalized = value.trim();
+    (!normalized.is_empty() && normalized != "default").then(|| normalized.to_string())
+}
+
+/// The active OMP session root. Mirrors oh-my-pi's `DirResolver`/`getSessionsDir`:
+///
+/// - `PI_CONFIG_DIR` replaces the default `.omp` config-root name.
+/// - named profiles ignore `PI_CODING_AGENT_DIR`;
+/// - a default-profile agent-dir override disables XDG selection;
+/// - XDG is selected only on supported platforms and only after the applicable
+///   app/profile directory exists;
+/// - otherwise sessions remain under the config root.
+fn omp_active_session_root() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_name = std::env::var("PI_CONFIG_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".omp".to_string());
+    let profile = omp_profile_from_env();
+    let config_root = match &profile {
+        Some(name) => home.join(&config_name).join("profiles").join(name),
+        None => home.join(&config_name),
+    };
+    let default_agent = config_root.join("agent");
+    let agent_override = if profile.is_none() {
+        std::env::var("PI_CODING_AGENT_DIR")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(path)
+                }
+            })
+    } else {
+        None
+    };
+    let agent_dir = agent_override.unwrap_or_else(|| default_agent.clone());
+    let is_default_agent = agent_dir == default_agent;
+
+    // Bun reports `process.platform === "linux"` on Android/Termux, so OMP
+    // enables its XDG layout there even though Rust's target_os is `android`.
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )) && is_default_agent
+        && let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        let app_root = PathBuf::from(xdg).join("omp");
+        let candidate = match &profile {
+            Some(name) => app_root.join("profiles").join(name),
+            None => app_root,
+        };
+        if candidate.exists() {
+            return candidate.join("sessions");
+        }
+    }
+
+    agent_dir.join("sessions")
+}
+
+/// Disk root that holds OMP session files. Single source of truth shared by
+/// `transcript search --all` and resume/adoption so the two cannot drift.
+///
+/// Deliberately **excludes** `PI_CODING_AGENT_SESSION_DIR`: OMP (unlike Pi)
+/// never reads that variable, so honoring it here would let OMP claim Pi
+/// sessions stored under that override.
+pub(crate) fn omp_session_roots() -> Vec<PathBuf> {
+    vec![omp_active_session_root()]
+}
+
+/// The one session root Pi and OMP genuinely share: `PI_CODING_AGENT_DIR/sessions`
+/// (both tools read `PI_CODING_AGENT_DIR`). `None` when the var is unset. A match
+/// under this root carries no inherent tool provenance — attribute by the path's
+/// product marker only (managed configs carry `.pi`/`.omp`).
+pub(crate) fn shared_agent_dir_root() -> Option<PathBuf> {
+    std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| {
+            let path = PathBuf::from(dir);
+            let resolved = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            resolved.join("sessions")
+        })
+}
+
+/// The active OMP root when it is not the shared `PI_CODING_AGENT_DIR` root.
+pub(crate) fn omp_exclusive_roots() -> Vec<PathBuf> {
+    let active = omp_active_session_root();
+    if shared_agent_dir_root().as_ref() == Some(&active) {
+        Vec::new()
+    } else {
+        vec![active]
+    }
+}
+
+/// Pi-exclusive session roots (never read by OMP): `PI_CODING_AGENT_SESSION_DIR`
+/// (Pi's `--session-dir` env equivalent, which has precedence per pi `main.ts`)
+/// and the default `~/.pi/agent/sessions`. Excludes the shared
+/// `PI_CODING_AGENT_DIR`.
+pub(crate) fn pi_exclusive_roots() -> Vec<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let mut roots = Vec::new();
+    if let Ok(path) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+        && !path.is_empty()
+    {
+        roots.push(PathBuf::from(path));
+    }
+    roots.push(home.join(".pi").join("agent").join("sessions"));
+    roots
+}
+
+/// Disk roots that hold Pi session files, for `transcript search --all`.
+///
+/// Pi-exclusive roots plus the shared `PI_CODING_AGENT_DIR/sessions` — the
+/// latter only when `PI_CODING_AGENT_SESSION_DIR` is absent, since Pi's
+/// session-dir override has precedence over `getAgentDir()/sessions` (pi
+/// `main.ts`). hcom-managed Pi sessions (launched with
+/// `PI_CODING_AGENT_DIR=<root>/.pi`) live under the shared root, so they must be
+/// searched here too; attribution of that root is by path marker / provenance.
+pub(crate) fn pi_session_roots() -> Vec<PathBuf> {
+    let mut roots = pi_exclusive_roots();
+    let session_dir_set = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+        .ok()
+        .is_some_and(|v| !v.is_empty());
+    if !session_dir_set && let Some(shared) = shared_agent_dir_root() {
+        roots.push(shared);
+    }
+    roots
+}
+
 /// Filesystem roots searched by `transcript search --all` for a tool.
 /// Database-backed profiles return no roots and expose a database path through
 /// [`database_search_path`] instead.
@@ -381,38 +533,8 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         TranscriptDiscovery::CopilotSessionState => {
             vec![env_or_default_dir("COPILOT_HOME", home.join(".copilot")).join("session-state")]
         }
-        TranscriptDiscovery::PiSessions => {
-            let mut roots = Vec::new();
-            if let Ok(path) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
-                && !path.is_empty()
-            {
-                roots.push(PathBuf::from(path));
-            }
-            roots.push(home.join(".pi").join("agent").join("sessions"));
-            roots
-        }
-        TranscriptDiscovery::OmpSessions => {
-            let mut roots = Vec::new();
-            if let Ok(path) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
-                && !path.is_empty()
-            {
-                roots.push(PathBuf::from(path));
-            }
-            if let Ok(path) = std::env::var("XDG_DATA_HOME")
-                && !path.is_empty()
-            {
-                roots.push(PathBuf::from(path).join("omp").join("sessions"));
-            }
-            // When the launcher isolates OMP config via PI_CODING_AGENT_DIR,
-            // sessions live under <dir>/sessions.
-            if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
-                && !dir.is_empty()
-            {
-                roots.push(PathBuf::from(dir).join("sessions"));
-            }
-            roots.push(home.join(".omp").join("agent").join("sessions"));
-            roots
-        }
+        TranscriptDiscovery::PiSessions => pi_session_roots(),
+        TranscriptDiscovery::OmpSessions => omp_session_roots(),
         TranscriptDiscovery::OpenCodeDatabase | TranscriptDiscovery::KiloDatabase => Vec::new(),
     }
 }
@@ -615,6 +737,8 @@ mod tests {
     fn omp_disk_roots_include_pi_coding_agent_dir_sessions() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe {
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
             std::env::set_var("PI_CODING_AGENT_DIR", "/tmp/test-omp-agent");
         }
 
@@ -628,18 +752,161 @@ mod tests {
     }
 
     #[test]
-    fn omp_disk_roots_include_xdg_data_home_sessions() {
+    fn omp_disk_roots_use_xdg_data_home_only_on_supported_platforms() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let xdg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(xdg.path().join("omp")).unwrap();
         unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/test-omp-xdg");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::set_var("XDG_DATA_HOME", xdg.path());
         }
 
         let roots = disk_search_roots(Tool::Omp);
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android"
+        )) {
+            assert_eq!(roots, vec![xdg.path().join("omp").join("sessions")]);
+        } else {
+            assert_eq!(
+                roots,
+                vec![
+                    dirs::home_dir()
+                        .unwrap_or_default()
+                        .join(".omp")
+                        .join("agent")
+                        .join("sessions")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn omp_disk_roots_ignore_uninitialized_xdg_root() {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let xdg = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::set_var("XDG_DATA_HOME", xdg.path());
+        }
+
+        assert_eq!(
+            disk_search_roots(Tool::Omp),
+            vec![home.join(".omp").join("agent").join("sessions")]
+        );
+    }
+
+    #[test]
+    fn omp_disk_roots_honor_pi_config_dir_and_default_profile_sentinels() {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::set_var("PI_CONFIG_DIR", ".custom-omp");
+            std::env::set_var("OMP_PROFILE", "  default  ");
+            std::env::set_var("PI_PROFILE", "stale-legacy-profile");
+        }
+
+        assert_eq!(omp_profile_from_env(), None);
+        assert_eq!(
+            disk_search_roots(Tool::Omp),
+            vec![home.join(".custom-omp").join("agent").join("sessions")]
+        );
+
+        unsafe { std::env::set_var("OMP_PROFILE", "   ") }
+        assert_eq!(omp_profile_from_env(), None);
+    }
+
+    #[test]
+    fn omp_agent_override_disables_xdg_and_is_ignored_by_named_profiles() {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let xdg = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(xdg.path().join("omp")).unwrap();
+        unsafe {
+            std::env::remove_var("PI_CONFIG_DIR");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::set_var("XDG_DATA_HOME", xdg.path());
+            std::env::set_var("PI_CODING_AGENT_DIR", agent.path());
+        }
+
+        assert_eq!(
+            disk_search_roots(Tool::Omp),
+            vec![agent.path().join("sessions")]
+        );
+
+        unsafe { std::env::set_var("OMP_PROFILE", " work ") }
+        assert_eq!(
+            disk_search_roots(Tool::Omp),
+            vec![
+                home.join(".omp")
+                    .join("profiles")
+                    .join("work")
+                    .join("agent")
+                    .join("sessions")
+            ]
+        );
+    }
+
+    #[test]
+    fn omp_disk_roots_never_include_pi_session_dir_override() {
+        // PI_CODING_AGENT_SESSION_DIR is Pi-exclusive: OMP never reads it, so it
+        // must not appear as an OMP search root (else OMP claims Pi sessions).
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe {
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::set_var("PI_CODING_AGENT_SESSION_DIR", "/tmp/test-pi-sessions");
+        }
+
+        let omp_roots = disk_search_roots(Tool::Omp);
         assert!(
-            roots
+            !omp_roots
                 .iter()
-                .any(|r| r == &PathBuf::from("/tmp/test-omp-xdg/omp/sessions")),
-            "OMP roots must include XDG_DATA_HOME/omp/sessions, got {roots:?}"
+                .any(|r| r == &PathBuf::from("/tmp/test-pi-sessions")),
+            "OMP must not own PI_CODING_AGENT_SESSION_DIR, got {omp_roots:?}"
+        );
+        // Pi still owns it.
+        assert!(
+            disk_search_roots(Tool::Pi)
+                .iter()
+                .any(|r| r == &PathBuf::from("/tmp/test-pi-sessions")),
+        );
+    }
+
+    #[test]
+    fn omp_disk_roots_use_named_profile_subtree() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe {
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::set_var("OMP_PROFILE", "work");
+        }
+        let home = dirs::home_dir().unwrap_or_default();
+        let roots = disk_search_roots(Tool::Omp);
+        let expected = home
+            .join(".omp")
+            .join("profiles")
+            .join("work")
+            .join("agent")
+            .join("sessions");
+        assert!(
+            roots.iter().any(|r| r == &expected),
+            "OMP named-profile root missing, got {roots:?}"
+        );
+        // The default (profile-less) tree must NOT be searched under a profile.
+        assert!(
+            !roots
+                .iter()
+                .any(|r| r == &home.join(".omp").join("agent").join("sessions")),
         );
     }
 }
