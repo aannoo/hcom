@@ -118,35 +118,9 @@ fn instance_tool(db: &HcomDb, instance_name: &str) -> String {
 /// Both apps use XDG_DATA_HOME. Kilo additionally supports `KILO_DB`, which
 /// may be absolute or relative to Kilo's data directory.
 fn get_family_db_path(tool: &str) -> Option<String> {
-    let xdg_data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/.local/share", home)
-    });
-    let data_dir = std::path::PathBuf::from(&xdg_data).join(tool);
-    let db_path = if tool == "kilo" {
-        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
-            return None;
-        }
-        std::env::var("KILO_DB")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    data_dir.join(path)
-                }
-            })
-            .unwrap_or_else(|| data_dir.join("kilo.db"))
-    } else {
-        data_dir.join("opencode.db")
-    };
-    if db_path.exists() {
-        Some(db_path.to_string_lossy().to_string())
-    } else {
-        None
-    }
+    crate::runtime_env::opencode_family_db_path(tool)
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 #[cfg(test)]
@@ -578,17 +552,17 @@ pub const PLUGIN_SOURCE: &str = include_str!("../opencode_plugin/hcom.ts");
 const PLUGIN_FILENAME: &str = "hcom.ts";
 
 fn current_home_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
+    crate::runtime_env::user_home().unwrap_or_default()
 }
 
-/// Resolve XDG_CONFIG_HOME with fallback to ~/.config.
+/// Resolve the user config home (`XDG_CONFIG_HOME`, else `~/.config` on
+/// Unix/macOS or `%APPDATA%` on Windows), falling back to `~/.config` if
+/// unresolvable.
 fn xdg_config_home() -> String {
-    std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/.config", home)
-    })
+    crate::runtime_env::user_config_home()
+        .unwrap_or_else(|| current_home_dir().join(".config"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Get the canonical plugin install directory for an OpenCode-family app.

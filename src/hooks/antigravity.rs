@@ -84,6 +84,14 @@ fn antigravity_hooks_path(gemini_dir: &Path) -> PathBuf {
 /// The fallback is delivered base64-encoded and piped through `base64 -d` so the
 /// JSON's quotes (and any apostrophes) survive the nested `sh -c '...'` pass —
 /// naive interpolation gets stripped or mis-tokenized by the inner shell.
+///
+/// This POSIX `sh -c` form was verified to work on real Windows (agy, this
+/// branch): the hook fires and a sent message is delivered into the live agy
+/// session. agy resolves `sh` through an installed Git Bash even when `sh`
+/// itself is not on the user's PATH, so no PowerShell variant is needed here.
+/// This is the same Git Bash dependency hcom already requires for workflow
+/// scripts on Windows; on a Windows box without Git Bash the hook would not
+/// fire.
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
     if fallback_json.is_empty() {
@@ -1125,6 +1133,10 @@ mod tests {
         assert!(!remove_antigravity_hooks());
     }
 
+    // Unix-only: redirects the home dir via $HOME, but on Windows
+    // `dirs::home_dir()` reads USERPROFILE and ignores it, so the home-based
+    // cleanup dir points outside the test's temp tree.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_remove_cleans_default_and_active_hcom_dir_local_paths() {

@@ -28,7 +28,15 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
 
 /// Spawn a detached background process to fetch latest version and write the cache file.
 /// Returns immediately — result shows up on next command.
+///
+/// No-op on Windows: the script below is POSIX (`sh -c`, `awk`, `git`/`curl`
+/// piping), and there's no `sh` to run it. Porting this to PowerShell is
+/// disproportionate for a fire-and-forget cache refresh (errors are already
+/// silently swallowed), so Windows just skips the doomed spawn attempt.
 fn spawn_background_check(flag: &Path, current: &str) {
+    if cfg!(windows) {
+        return;
+    }
     let flag_str = flag.to_string_lossy().to_string();
     let current = current.to_string();
 
@@ -159,6 +167,27 @@ pub fn fetch_update_info() -> anyhow::Result<UpdateInfo> {
     })
 }
 
+/// Whether `cmd` needs POSIX shell semantics to run (currently: only the
+/// curl-installer fallback, which is a pipe to `sh`). All other commands
+/// `get_update_cmd()` returns (`pip install -U hcom`, `uv tool upgrade hcom`,
+/// `brew upgrade hcom`) are a plain program + args and need no shell at all.
+///
+/// Platform-independent so it's testable on any host; `cmd_update` uses this
+/// on Windows (which has no `sh`) to decide whether to refuse instead of
+/// attempting a doomed spawn.
+pub(crate) fn is_shell_pipe_command(cmd: &str) -> bool {
+    cmd.starts_with("curl ")
+}
+
+/// Split a plain `program arg1 arg2 ...` command string into program + args.
+/// Only meant for the shell-free update commands `get_update_cmd()` returns
+/// (no quoting to worry about); not a general shell parser.
+pub(crate) fn split_program_args(cmd: &str) -> Option<(&str, Vec<&str>)> {
+    let mut parts = cmd.split_whitespace();
+    let program = parts.next()?;
+    Some((program, parts.collect()))
+}
+
 /// Detect install method and return appropriate update command.
 fn get_update_cmd() -> &'static str {
     let exe = match std::env::current_exe() {
@@ -200,6 +229,14 @@ fn get_update_cmd() -> &'static str {
     "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh"
 }
 
+// NOTE: only checks the Unix `~/.local/bin` + `~/.local/lib/pythonX.Y/site-packages`
+// layout. A Windows `pip install --user hcom` uses a different layout (e.g.
+// under `%APPDATA%\Python`), which this doesn't detect — such an install
+// would fall through to the curl-installer default on Windows. Not adding a
+// Windows branch here without being able to verify the actual path layout on
+// a real Windows/Python install; this is a known, low-risk gap (worst case:
+// `hcom update` on Windows suggests the wrong command for this one install
+// method, users can still update manually).
 fn is_user_site_pip_install(exe: &Path) -> bool {
     let home = match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home),
@@ -301,6 +338,30 @@ mod tests {
         assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("bad"), None);
         assert_eq!(parse_version("1.2"), None);
+    }
+
+    #[test]
+    fn test_is_shell_pipe_command() {
+        assert!(is_shell_pipe_command(
+            "curl -fsSL https://example.com/install.sh | sh"
+        ));
+        assert!(!is_shell_pipe_command("pip install -U hcom"));
+        assert!(!is_shell_pipe_command("uv tool upgrade hcom"));
+        assert!(!is_shell_pipe_command("brew upgrade hcom"));
+    }
+
+    #[test]
+    fn test_split_program_args() {
+        assert_eq!(
+            split_program_args("pip install -U hcom"),
+            Some(("pip", vec!["install", "-U", "hcom"]))
+        );
+        assert_eq!(
+            split_program_args("uv tool upgrade hcom"),
+            Some(("uv", vec!["tool", "upgrade", "hcom"]))
+        );
+        assert_eq!(split_program_args(""), None);
+        assert_eq!(split_program_args("   "), None);
     }
 
     #[test]

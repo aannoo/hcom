@@ -56,11 +56,11 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "plain text"
+- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- 'plain text'
   Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
-  Example: send @luna @nova --intent ack --reply-to 82 --name {instance_name} -- "ok"
+  Example: send @luna @nova --intent ack --reply-to 82 --name {instance_name} -- 'ok'
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
-- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]
+- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
@@ -81,7 +81,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 1. Task via hcom → ack immediately, do work, report via hcom
 2. No filler messages (greetings, thanks, congratulations).
 3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
-4. User says "the gemini/claude/codex agent" or unclear → run `hcom list` to resolve name
+4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 {active_instances}
@@ -89,7 +89,7 @@ Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 This is session context, not a task for immediate action."#;
 
 const TAG_NOTICE: &str = r#"
-You are tagged "{tag}". Message your group: send @{tag}- -- msg"#;
+You are tagged '{tag}'. Message your group: send @{tag}- -- msg"#;
 
 const RELAY_NOTICE: &str = r#"
 Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in. Remote hcom events needs --remote-fetch --device BOXE. Remote events sub needs --device BOXE."#;
@@ -161,7 +161,7 @@ Messages do NOT arrive automatically.
 LISTENING REQUIREMENT:
 - After sending hcom message expecting reply → `hcom listen --timeout 60 --name {instance_name}`
 - After receiving a task via hcom → do the work, report, then enter CONNECTED MODE
-- User says "stay connected" → enter CONNECTED MODE
+- User says 'stay connected' → enter CONNECTED MODE
 
 CONNECTED MODE:
 1. Run exactly one foreground blocking command:
@@ -717,7 +717,7 @@ mod tests {
             None,
         );
 
-        assert!(result.contains("tagged \"p0c\""));
+        assert!(result.contains("tagged 'p0c'"));
         assert!(result.contains("send @p0c-"));
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
             None,
         );
 
-        assert!(result.contains("tagged \"team-a\""));
+        assert!(result.contains("tagged 'team-a'"));
         assert!(!result.contains("team-b"));
     }
 

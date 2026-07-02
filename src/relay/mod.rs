@@ -179,8 +179,8 @@ fn read_or_create_device_uuid_at(path: &std::path::Path) -> Option<String> {
         .open(&lock_path)
         .ok()?;
 
-    use nix::fcntl::{Flock, FlockArg};
-    let _flock = Flock::lock(lock_file, FlockArg::LockExclusive).ok()?;
+    // Held until `lock_file` drops at function scope end.
+    crate::sys::fs::lock_exclusive(&lock_file).ok()?;
 
     // Re-check under lock — a concurrent caller may have written by now.
     if let Some(uuid) = read_nonempty(path) {

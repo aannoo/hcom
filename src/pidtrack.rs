@@ -88,17 +88,9 @@ fn pidfile_path(hcom_dir: &Path) -> PathBuf {
     hcom_dir.join(PIDFILE_NAME)
 }
 
-/// Check if a process is alive via `kill(pid, 0)`.
-/// Handles EPERM (process exists but owned by another user).
+/// Check if a process is alive. See [`crate::sys::process::is_alive`].
 pub fn is_alive(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) is a no-op signal that just checks process existence.
-    let ret = unsafe { libc::kill(pid as i32, 0) };
-    if ret == 0 {
-        return true;
-    }
-    // EPERM means process exists but is owned by another user
-    let err = std::io::Error::last_os_error();
-    err.raw_os_error() == Some(libc::EPERM)
+    crate::sys::process::is_alive(pid)
 }
 
 /// Read raw pidfile data.

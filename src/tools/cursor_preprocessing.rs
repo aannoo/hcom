@@ -140,6 +140,9 @@ pub(crate) fn ensure_cursor_workspace_trusted(workspace: &Path) -> anyhow::Resul
 mod tests {
     use super::*;
 
+    // Unix-only: slugifies POSIX absolute paths; a Windows path (drive letter,
+    // backslashes) produces a different, platform-specific slug.
+    #[cfg(unix)]
     #[test]
     fn cursor_project_slug_matches_cursor_layout() {
         assert_eq!(

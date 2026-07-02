@@ -82,13 +82,18 @@ fn has_explicit_sandbox_or_approval(tokens: &[String]) -> bool {
     })
 }
 
-/// Ensure --add-dir ~/.hcom is present so hcom can write to its DB.
+/// Ensure ~/.hcom is a writable sandbox root so hcom can write to its DB.
 ///
-/// Codex's --add-dir flag is IGNORED in read-only sandbox mode, but required
-/// for workspace-write mode to allow hcom DB writes.
+/// Injected as `-c sandbox_workspace_write.writable_roots=[...]` rather than
+/// `--add-dir`: codex's TUI gates the flag on its effective-permissions
+/// preset, and a trusted project (hcom's auto-trust injection) or a missing
+/// explicit `-a` resolves to a preset that rejects extra writable roots
+/// outright ("Ignoring --add-dir ... Switch to workspace-write"). The config
+/// override bypasses that gate; like --add-dir, it is inert outside
+/// workspace-write mode.
 ///
-/// If no sandbox flags are present (mode="none"), skip adding --add-dir
-/// since user is using codex's own folder settings.
+/// If no sandbox flags are present (mode="none"), skip the injection since
+/// user is using codex's own folder settings.
 pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
     let has_sandbox = tokens.iter().any(|token| {
         matches!(
@@ -108,6 +113,11 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
     let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
 
     for (i, token) in tokens.iter().enumerate() {
+        // A user-supplied roots override owns the whole list — don't clobber.
+        if token.contains("sandbox_workspace_write.writable_roots") {
+            return tokens.to_vec();
+        }
+        // Respect an explicit --add-dir for the hcom dir.
         if token == "--add-dir" && i + 1 < tokens.len() && tokens[i + 1] == hcom_dir {
             return tokens.to_vec();
         }
@@ -119,8 +129,14 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
         }
     }
 
+    // TOML basic-string escaping (backslashes first, then quotes) — every
+    // Windows path carries backslashes.
+    let toml_escaped = hcom_dir.replace('\\', r"\\").replace('"', "\\\"");
     let mut result = tokens.to_vec();
-    result.extend(["--add-dir".to_string(), hcom_dir]);
+    result.extend([
+        "-c".to_string(),
+        format!("sandbox_workspace_write.writable_roots=[\"{toml_escaped}\"]"),
+    ]);
     result
 }
 
@@ -361,7 +377,7 @@ pub fn strip_codex_developer_instructions(codex_args: &[String]) -> Vec<String> 
 /// 1. Strip stale developer_instructions (resume/fork only — they carry old identity)
 /// 2. Sandbox flags based on mode
 /// 3. Runtime hook-trust bypass for Codex versions that require unmanaged hook trust
-/// 4. --add-dir ~/.hcom for hcom DB writes
+/// 4. writable_roots config override for ~/.hcom DB writes
 /// 5. Bootstrap injection via developer_instructions
 pub fn preprocess_codex_args(
     codex_args: &[String],
@@ -397,11 +413,13 @@ pub fn preprocess_codex_args(
 
     // Warn if mode is "none"
     if sandbox_mode == "none" {
-        eprintln!("[hcom] Warning: Sandbox mode is 'none' - --add-dir ~/.hcom disabled.");
+        eprintln!(
+            "[hcom] Warning: Sandbox mode is 'none' - ~/.hcom writable-root injection disabled."
+        );
         eprintln!("[hcom] hcom commands may fail unless HCOM_DIR is within workspace.");
     }
 
-    // 4. Ensure --add-dir ~/.hcom is present (skips if mode="none")
+    // 4. Ensure ~/.hcom is a writable sandbox root (skips if mode="none")
     args = ensure_hcom_writable(&args);
 
     // 5. Add bootstrap to developer_instructions
@@ -417,6 +435,12 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| i.to_string()).collect()
+    }
+
+    fn has_writable_roots(result: &[String]) -> bool {
+        result
+            .iter()
+            .any(|t| t.contains("sandbox_workspace_write.writable_roots"))
     }
 
     fn write_trusted_hcom_codex_hooks(codex_home: &std::path::Path) {
@@ -533,15 +557,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_ensure_hcom_writable_adds_dir() {
+    fn test_ensure_hcom_writable_adds_writable_root() {
         init_config();
         // --full-auto is still recognized as a sandbox-active marker for
         // back-compat with user-provided args, even though hcom no longer emits it.
         let tokens = s(&["--full-auto"]);
         let result = ensure_hcom_writable(&tokens);
         assert_eq!(result[0], "--full-auto");
-        assert_eq!(result[result.len() - 2], "--add-dir");
-        assert!(result.len() > 2);
+        assert_eq!(result[result.len() - 2], "-c");
+        assert!(
+            result[result.len() - 1].starts_with("sandbox_workspace_write.writable_roots=[\""),
+            "writable_roots override missing: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_toml_escapes_backslashes() {
+        init_config();
+        let tokens = s(&["--sandbox", "workspace-write"]);
+        let result = ensure_hcom_writable(&tokens);
+        let root = result.last().unwrap();
+        // The raw hcom dir path must not leak unescaped backslashes into the
+        // TOML string — codex would reject the value as an invalid escape.
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        if hcom_dir.contains('\\') {
+            assert!(root.contains(r"\\"), "backslashes must be escaped: {root}");
+            assert!(!root.contains(&format!("[\"{hcom_dir}\"]")));
+        }
     }
 
     #[test]
@@ -551,7 +595,11 @@ mod tests {
         let tokens = s(&["--yolo"]);
         let result = ensure_hcom_writable(&tokens);
         assert_eq!(result[0], "--yolo");
-        assert_eq!(result[result.len() - 2], "--add-dir");
+        assert!(
+            result[result.len() - 1].contains("writable_roots"),
+            "writable_roots override missing: {:?}",
+            result
+        );
         assert!(result.contains(&"--yolo".to_string()));
     }
 
@@ -565,13 +613,26 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_ensure_hcom_writable_no_duplicate() {
+    fn test_ensure_hcom_writable_respects_explicit_add_dir() {
         init_config();
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
         let tokens = vec!["--full-auto".to_string(), "--add-dir".to_string(), hcom_dir];
         let result = ensure_hcom_writable(&tokens);
-        let add_dir_count = result.iter().filter(|t| *t == "--add-dir").count();
-        assert_eq!(add_dir_count, 1);
+        assert_eq!(result, tokens, "explicit --add-dir must suppress injection");
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_respects_user_writable_roots() {
+        init_config();
+        let tokens = s(&[
+            "--sandbox",
+            "workspace-write",
+            "-c",
+            r#"sandbox_workspace_write.writable_roots=["/my/dir"]"#,
+        ]);
+        let result = ensure_hcom_writable(&tokens);
+        assert_eq!(result, tokens, "user roots override must not be clobbered");
     }
 
     #[test]
@@ -846,7 +907,7 @@ mod tests {
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
         assert!(result.contains(&"--sandbox".to_string()));
         assert!(result.contains(&"workspace-write".to_string()));
-        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(has_writable_roots(&result));
         assert!(result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
     }
@@ -876,7 +937,7 @@ mod tests {
         assert_eq!(result[sandbox_position + 1], "read-only");
         assert_eq!(result.iter().filter(|t| *t == "--sandbox").count(), 1);
         assert!(!result.contains(&"workspace-write".to_string()));
-        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(has_writable_roots(&result));
         assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
     }
 
@@ -891,7 +952,7 @@ mod tests {
         assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"workspace-write".to_string()));
         assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(has_writable_roots(&result));
     }
 
     #[test]
@@ -906,7 +967,7 @@ mod tests {
         assert!(!result.contains(&"untrusted".to_string()));
         assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-        assert!(!result.contains(&"--add-dir".to_string()));
+        assert!(!has_writable_roots(&result));
     }
 
     #[test]
@@ -926,7 +987,7 @@ mod tests {
         assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"-a".to_string()));
         assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(has_writable_roots(&result));
     }
 
     #[test]
@@ -948,7 +1009,7 @@ mod tests {
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "none");
         assert!(!result.contains(&"--sandbox".to_string()));
-        assert!(!result.contains(&"--add-dir".to_string()));
+        assert!(!has_writable_roots(&result));
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
     }
 

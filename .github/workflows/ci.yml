@@ -15,6 +15,21 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # Windows native support: the crate builds, the bin unit tests run, and the
+  # hermetic cli_smoke integration suite runs against the real binary. The
+  # remaining integration tests under tests/ (PTY delivery, real-tool/relay
+  # lifecycle) are Unix-only and don't compile on Windows, so they stay
+  # excluded.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build --locked
+      - run: cargo test --locked --bins
+      - run: cargo test --locked --test cli_smoke
+
   real-tool-tests:
     name: Real tool (${{ matrix.tool }})
     runs-on: ubuntu-latest

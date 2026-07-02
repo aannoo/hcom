@@ -332,10 +332,9 @@ pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
         .truncate(false)
         .open(&lock_path)?;
 
-    // Acquire exclusive file lock
-    use nix::fcntl::{Flock, FlockArg};
-    let flock = Flock::lock(lock_file, FlockArg::LockExclusive)
-        .map_err(|(_, e)| anyhow::anyhow!("flock failed: {}", e))?;
+    // Acquire exclusive file lock; released when `lock_file` drops at scope end.
+    crate::sys::fs::lock_exclusive(&lock_file)
+        .map_err(|e| anyhow::anyhow!("flock failed: {}", e))?;
 
     let result = (|| -> Result<String> {
         let name = allocate_unreserved_name(db)?;
@@ -357,8 +356,8 @@ pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
         Ok(name)
     })();
 
-    // Unlock (drop the flock guard)
-    let _file = Flock::unlock(flock);
+    // Lock released when `lock_file` is dropped at function scope end.
+    drop(lock_file);
 
     result
 }

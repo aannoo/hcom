@@ -208,10 +208,7 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
     if let Some(ref filter) = combined_sql {
         // Setup SIGTERM handler for filter mode
         let shutdown = Arc::new(AtomicBool::new(false));
-        {
-            let shutdown_flag = Arc::clone(&shutdown);
-            let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown_flag);
-        }
+        crate::sys::signal::register_term(&shutdown);
         return listen_with_filter(
             db,
             filter,
@@ -251,10 +248,7 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
 
     // Setup SIGTERM handler for clean shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown_flag = Arc::clone(&shutdown);
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown_flag);
-    }
+    crate::sys::signal::register_term(&shutdown);
 
     // Check if already disconnected
     if db

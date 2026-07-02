@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -677,11 +676,18 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
     }
 }
 
-/// Build a command string for Claude (non-PTY mode).
+/// Build a command string for Claude (non-PTY mode). Quoting matches the
+/// shell that will run the resulting script: PowerShell on Windows, POSIX
+/// shell elsewhere (see `launch_terminal`'s `create_powershell_script` /
+/// `create_bash_script` split).
 fn build_claude_command(args: &[String]) -> String {
     let mut parts = vec!["claude".to_string()];
     for arg in args {
-        parts.push(crate::tools::args_common::shell_quote(arg));
+        if cfg!(windows) {
+            parts.push(terminal::ps_quote(arg));
+        } else {
+            parts.push(crate::tools::args_common::shell_quote(arg));
+        }
     }
     parts.join(" ")
 }
@@ -689,6 +695,8 @@ fn build_claude_command(args: &[String]) -> String {
 /// Tool-specific extra environment variables for PTY mode.
 fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
+    // Claude is driven by the PTY wrapper (ConPTY on Windows, openpty on Unix),
+    // which handles injection; HCOM_PTY_MODE tells the Stop hook to defer to it.
     if tool == "claude" {
         m.insert("HCOM_PTY_MODE".to_string(), "1".to_string());
     }
@@ -716,6 +724,214 @@ fn background_runner_env(
     runner_env
 }
 
+/// Windows runner: a PowerShell script that launches the tool through the hcom
+/// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
+/// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
+/// runner's env scrubbing, HCOM env, secret sidecar, and PATH setup.
+fn create_runner_script_windows(
+    tool: &str,
+    cwd: &str,
+    instance_name: &str,
+    env: &HashMap<String, String>,
+    tool_args: &[String],
+) -> Result<String> {
+    let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
+    let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
+
+    let launch_dir = paths::hcom_path(&[paths::LAUNCH_DIR]);
+    fs::create_dir_all(&launch_dir).ok();
+    let script_file = launch_dir.join(format!(
+        "{}_{}_{}_{}.ps1",
+        tool,
+        instance_name,
+        std::process::id(),
+        rand::random::<u16>() % 9000 + 1000
+    ));
+
+    // Visible HCOM_* env, plus the managed-launch marker so hooks engage.
+    let mut hcom_env: HashMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| k.starts_with("HCOM_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    hcom_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+    let env_block = terminal::build_env_string(&hcom_env, "powershell");
+
+    // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
+    // that is dot-sourced then deleted, matching the bash runner.
+    let sidecar_strip: std::collections::HashSet<&str> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(instance_state_env.iter())
+        .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
+        .copied()
+        .collect();
+    let ambient_env: HashMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| !k.starts_with("HCOM_") && !sidecar_strip.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let sidecar_source = if ambient_env.is_empty() {
+        String::new()
+    } else {
+        let env_file = launch_dir.join(format!(
+            "{}_{}_{}_{}.ps1",
+            tool,
+            instance_name,
+            std::process::id(),
+            rand::random::<u16>() % 9000 + 1000
+        ));
+        let mut file = crate::sys::fs::create_private_new(&env_file)?;
+        // Windows PowerShell 5.1 reads BOM-less files using the legacy ANSI
+        // code page, corrupting non-ASCII env values; a UTF-8 BOM forces it
+        // to read as UTF-8.
+        file.write_all(b"\xEF\xBB\xBF")?;
+        writeln!(
+            file,
+            "{}",
+            terminal::build_env_string(&ambient_env, "powershell")
+        )?;
+        let q = terminal::ps_quote(&env_file.to_string_lossy());
+        format!("if (Test-Path {q}) {{ . {q}; Remove-Item -Force {q} }}")
+    };
+
+    // Scrub inherited tool markers / identity / instance-state vars.
+    let unset_names: Vec<String> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(instance_state_env.iter())
+        .map(|v| format!("Env:{v}"))
+        .collect();
+    let unset_line = if unset_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Remove-Item {} -ErrorAction SilentlyContinue",
+            unset_names.join(",")
+        )
+    };
+
+    // Resolve binary directories for minimal PATH environments.
+    let mut path_dirs: Vec<String> = Vec::new();
+    if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT")
+        && let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root))
+        && let Some(dir) = bin.parent()
+    {
+        path_dirs.push(dir.to_string_lossy().into_owned());
+    }
+    // Ensure the launched tool (and its hooks) can call back to *this* hcom by
+    // name — a dev binary may not be on the global PATH.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let d = dir.to_string_lossy().to_string();
+        if !path_dirs.contains(&d) {
+            path_dirs.push(d);
+        }
+    }
+    let tool_bin = tool
+        .parse::<crate::tool::Tool>()
+        .map(|t| t.spec().cli_binary)
+        .unwrap_or(tool);
+    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
+        if let Some(bin_path) = terminal::which_bin(bin_name)
+            && let Some(dir) = Path::new(&bin_path).parent()
+        {
+            let d = dir.to_string_lossy().to_string();
+            if !path_dirs.contains(&d) {
+                path_dirs.push(d);
+            }
+        }
+    }
+    let path_line = if path_dirs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "$env:PATH = {} + $env:PATH",
+            terminal::ps_quote(&format!("{};", path_dirs.join(";")))
+        )
+    };
+
+    // Run through the hcom PTY wrapper (ConPTY) so the tool is driven by the
+    // delivery loop — this is what wakes an idle agent on Windows. Mirrors the
+    // Unix runner's `hcom pty <tool>` call.
+    //
+    // Tool args travel via a JSON sidecar file, not the command line: the
+    // PowerShell → native-exe argv boundary mangles embedded double quotes
+    // (powershell.exe passes them unescaped, so the child's command-line
+    // parser re-splits at quote/space boundaries). Codex args always contain
+    // quotes (`-c projects={ "path" = ... }`, developer_instructions), which
+    // made `hcom codex` fail with "unexpected argument" (#66). Only the
+    // sidecar path — generated by hcom, never quote-bearing — goes on the
+    // command line. `hcom pty` reads and deletes the file.
+    let hcom_bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "hcom".to_string());
+    let run_line = if tool_args.is_empty() {
+        format!("& {} pty {}", terminal::ps_quote(&hcom_bin), tool)
+    } else {
+        let args_file = launch_dir.join(format!(
+            "{}_{}_{}_{}.args.json",
+            tool,
+            instance_name,
+            std::process::id(),
+            rand::random::<u16>() % 9000 + 1000
+        ));
+        let mut file = crate::sys::fs::create_private_new(&args_file)?;
+        file.write_all(serde_json::to_string(tool_args)?.as_bytes())?;
+        format!(
+            "& {} pty {} --hcom-args-file {}",
+            terminal::ps_quote(&hcom_bin),
+            tool,
+            terminal::ps_quote(&args_file.to_string_lossy())
+        )
+    };
+    // `powershell -File` returns 0 unless the script exits with an explicit
+    // code, so surface the wrapper's real exit status (agent failures, PTY
+    // crashes, kill signals) instead of always reporting success.
+    let run_line = format!("{run_line}\nexit $LASTEXITCODE");
+
+    let display = tool
+        .chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .collect::<String>()
+        + &tool[1..];
+    let content = format!(
+        "# {display} hcom native runner ({instance_name})\n\
+         Set-Location {cwd}\n\
+         {unset_line}\n\
+         {env_block}\n\
+         {sidecar_source}\n\
+         {path_line}\n\
+         \n\
+         {run_line}\n",
+        cwd = terminal::ps_quote(cwd),
+    );
+
+    // Windows PowerShell 5.1 reads BOM-less files using the legacy ANSI code
+    // page, corrupting non-ASCII usernames/paths/prompts/env values; a UTF-8
+    // BOM forces it to read as UTF-8.
+    let mut bytes = Vec::with_capacity(content.len() + 3);
+    bytes.extend_from_slice(b"\xEF\xBB\xBF");
+    bytes.extend_from_slice(content.as_bytes());
+    fs::write(&script_file, &bytes)?;
+
+    crate::log::log_info(
+        "pty",
+        "native.script",
+        &format!(
+            "script={} tool={} instance={} (windows ConPTY launch)",
+            script_file.display(),
+            tool,
+            instance_name
+        ),
+    );
+
+    Ok(script_file.to_string_lossy().to_string())
+}
+
 /// Create a bash script that runs a tool via the hcom native PTY wrapper.
 ///
 /// The script sets up the environment and calls `hcom pty <tool> [args...]`.
@@ -727,6 +943,9 @@ pub fn create_runner_script(
     tool_args: &[String],
     run_here: bool,
 ) -> Result<String> {
+    if cfg!(windows) {
+        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args);
+    }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
@@ -776,11 +995,7 @@ pub fn create_runner_script(
             std::process::id(),
             rand::random::<u16>() % 9000 + 1000
         ));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&env_file)?;
+        let mut file = crate::sys::fs::create_private_new(&env_file)?;
         writeln!(
             file,
             "{}",
@@ -865,7 +1080,7 @@ pub fn create_runner_script(
     );
 
     fs::write(&script_file, &content)?;
-    fs::set_permissions(&script_file, fs::Permissions::from_mode(0o755))?;
+    crate::sys::fs::set_executable(&script_file)?;
 
     crate::log::log_info(
         "pty",
@@ -880,6 +1095,22 @@ pub fn create_runner_script(
     );
 
     Ok(script_file.to_string_lossy().to_string())
+}
+
+/// Build the command that runs a generated runner script in the launched
+/// terminal: PowerShell on Windows, bash elsewhere.
+fn runner_invocation_command(script_file: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "powershell -ExecutionPolicy Bypass -File {}",
+            crate::terminal::ps_quote(script_file)
+        )
+    } else {
+        format!(
+            "bash {}",
+            crate::tools::args_common::shell_quote(script_file)
+        )
+    }
 }
 
 /// Launch a tool via PTY wrapper in a terminal.
@@ -913,10 +1144,7 @@ pub fn launch_pty(
     let script_file =
         create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, run_here)?;
 
-    let command = format!(
-        "bash {}",
-        crate::tools::args_common::shell_quote(&script_file)
-    );
+    let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
         .iter()
         .filter(|(k, _)| k.starts_with("HCOM_"))
@@ -1027,10 +1255,7 @@ fn launch_background_runner(
     runner_env.insert("HCOM_BACKGROUND".to_string(), log_filename);
     let script_file =
         create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, false)?;
-    let command = format!(
-        "bash {}",
-        crate::tools::args_common::shell_quote(&script_file)
-    );
+    let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
         .iter()
         .filter(|(k, _)| k.starts_with("HCOM_"))
@@ -1153,8 +1378,9 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
 /// - codex: adds `-c` with a TOML inline-table value that sets trust for the
 ///   canonical CWD. Uses key `projects` (no dots in the key path) so codex's
 ///   naive `.`-splitting never touches the path itself, making it robust to
-///   dotted directory components. Paths containing a literal `"` or backslash
-///   would break the TOML quoting — a Windows-only edge case, not handled here.
+///   dotted directory components. The path is TOML-escaped (`\` and `"`) —
+///   every Windows path carries backslashes, and unescaped they made codex
+///   reject the value as "invalid type: string, expected a map".
 ///
 /// When `auto_trust` is false, returns immediately without modifying args.
 /// Idempotent: no-op if the relevant flag is already present.
@@ -1179,12 +1405,26 @@ pub(crate) fn inject_workspace_trust_args(
                 .any(|w| w[0] == "-c" && w[1].contains("trust_level"));
             if !already_set {
                 let canonical_str = canonical_dir.to_string_lossy();
+                // std::fs::canonicalize returns \\?\-prefixed verbatim paths on
+                // Windows; codex tracks projects by their ordinary absolute
+                // form, so strip the prefix or the trust key never matches.
+                let simplified = if let Some(unc) = canonical_str.strip_prefix(r"\\?\UNC\") {
+                    format!(r"\\{unc}")
+                } else {
+                    canonical_str
+                        .strip_prefix(r"\\?\")
+                        .unwrap_or(&canonical_str)
+                        .to_string()
+                };
                 // codex -c: key="projects" (no dots → no split issue), value is a TOML
                 // inline table with the quoted path as key. apply_single_override replaces
                 // the projects table for this session only (file stays untouched).
+                // Escape backslashes before quotes: the quote escape introduces
+                // a backslash that must not itself be doubled.
+                let toml_escaped = simplified.replace('\\', r"\\").replace('"', "\\\"");
                 let trust_override = format!(
                     "projects={{ \"{}\" = {{ trust_level = \"trusted\" }} }}",
-                    canonical_str
+                    toml_escaped
                 );
                 args.push("-c".to_string());
                 args.push(trust_override);
@@ -2485,7 +2725,13 @@ mod tests {
     fn test_build_claude_command() {
         let args = vec!["--model".to_string(), "sonnet".to_string()];
         let cmd = build_claude_command(&args);
-        assert_eq!(cmd, "claude --model sonnet");
+        if cfg!(windows) {
+            // ps_quote() always quotes, unlike the POSIX shell_quote() used
+            // elsewhere, which leaves plain args unquoted.
+            assert_eq!(cmd, "claude '--model' 'sonnet'");
+        } else {
+            assert_eq!(cmd, "claude --model sonnet");
+        }
     }
 
     #[test]
@@ -2735,6 +2981,9 @@ mod tests {
         );
     }
 
+    // Unix-only: asserts the bash runner's `. 'sidecar'` sourcing + unset block;
+    // Windows generates a PowerShell runner with a different shape.
+    #[cfg(unix)]
     #[test]
     fn test_runner_script_strips_instance_state_vars() {
         let env = HashMap::from([
@@ -2773,6 +3022,99 @@ mod tests {
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
+    }
+
+    // create_runner_script_windows() isn't cfg(windows)-gated (only its call
+    // site is, via a runtime cfg!(windows) check), so this runs on any host.
+    #[test]
+    fn test_runner_script_windows_has_bom_and_propagates_exit_code() {
+        let env = HashMap::from([("SOME_SECRET".to_string(), "sekrit".to_string())]);
+
+        let script = create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[]).unwrap();
+
+        let bytes = std::fs::read(&script).unwrap();
+        assert_eq!(
+            &bytes[..3],
+            b"\xEF\xBB\xBF",
+            "PowerShell 5.1 misreads BOM-less files as the legacy ANSI code page"
+        );
+        let content = String::from_utf8(bytes[3..].to_vec()).unwrap();
+        assert!(
+            content.contains("exit $LASTEXITCODE"),
+            "runner must surface the wrapped process's real exit code, not always report success"
+        );
+
+        let sidecar = content
+            .split("Test-Path '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("ambient env should be sourced from a sidecar file");
+        let sidecar_bytes = std::fs::read(sidecar).unwrap();
+        assert_eq!(
+            &sidecar_bytes[..3],
+            b"\xEF\xBB\xBF",
+            "sidecar env file needs the same BOM as the runner script"
+        );
+        assert!(String::from_utf8_lossy(&sidecar_bytes).contains("SOME_SECRET"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(sidecar).ok();
+    }
+
+    // Tool args must travel via the JSON sidecar, never inline on the run
+    // line: powershell.exe passes embedded double quotes unescaped to native
+    // executables, so the child re-splits argv at quote boundaries (#66 —
+    // `hcom codex` failed on its quote-bearing `-c` values).
+    #[test]
+    fn test_runner_script_windows_passes_args_via_sidecar_file() {
+        let env = HashMap::new();
+        let args = vec![
+            "-c".to_string(),
+            r#"projects={ "C:\repo" = { trust_level = "trusted" } }"#.to_string(),
+            "-c".to_string(),
+            "developer_instructions=multi\nline \"quoted\" text".to_string(),
+        ];
+
+        let script =
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+
+        let run_line = content
+            .lines()
+            .find(|l| l.contains(" pty codex"))
+            .expect("runner must invoke hcom pty");
+        assert!(run_line.contains("--hcom-args-file"));
+        assert!(!run_line.contains("trust_level"));
+        assert!(!run_line.contains("developer_instructions"));
+
+        let args_file = run_line
+            .split("--hcom-args-file '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("run line should quote the args file path");
+        let json = std::fs::read_to_string(args_file).unwrap();
+        let roundtrip: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            roundtrip, args,
+            "args must survive the file round-trip exactly"
+        );
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(args_file).ok();
+    }
+
+    #[test]
+    fn test_runner_script_windows_no_args_skips_sidecar_file() {
+        let env = HashMap::new();
+        let script =
+            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[]).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let run_line = content
+            .lines()
+            .find(|l| l.contains(" pty gemini"))
+            .expect("runner must invoke hcom pty");
+        assert!(!run_line.contains("--hcom-args-file"));
+        std::fs::remove_file(&script).ok();
     }
 
     #[test]
@@ -2972,6 +3314,38 @@ mod tests {
             "full dotted path must be a single quoted key: {val}"
         );
         assert!(val.contains("trust_level"), "trust_level missing: {val}");
+    }
+
+    #[test]
+    fn test_codex_windows_verbatim_path_stripped_and_toml_escaped() {
+        // std::fs::canonicalize yields \\?\-prefixed paths on Windows. The
+        // prefix must go (codex keys projects by the plain absolute form) and
+        // backslashes must be TOML-escaped or codex rejects the inline table.
+        let dir = std::path::Path::new(r"\\?\C:\Users\x\proj");
+        let mut args: Vec<String> = vec![];
+        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        let val = &args[1];
+        assert!(
+            val.contains(r#""C:\\Users\\x\\proj""#),
+            "path must be prefix-stripped and backslash-escaped: {val}"
+        );
+        assert!(
+            !val.contains(r"\\?\"),
+            "verbatim prefix must be stripped: {val}"
+        );
+    }
+
+    #[test]
+    fn test_codex_windows_verbatim_unc_path_keeps_server_form() {
+        let dir = std::path::Path::new(r"\\?\UNC\server\share\dir");
+        let mut args: Vec<String> = vec![];
+        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        let val = &args[1];
+        // \\?\UNC\server\... → \\server\... → TOML-escaped \\\\server\\...
+        assert!(
+            val.contains(r#""\\\\server\\share\\dir""#),
+            "UNC path must keep its \\\\server form, escaped: {val}"
+        );
     }
 
     #[test]

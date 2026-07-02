@@ -1656,66 +1656,12 @@ fn is_opencode_session_id(s: &str) -> bool {
     s.starts_with("ses_") && s.len() >= 8 && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// Locate opencode's data dir. Opencode itself follows XDG on every platform
-/// (including macOS, unlike `dirs::data_dir`), so we check XDG-style paths
-/// first and only fall back to the platform default when neither exists.
-///
-/// Resolution order, returning the first that actually exists on disk:
-/// 1. `$XDG_DATA_HOME/opencode` (if `XDG_DATA_HOME` is set)
-/// 2. `~/.local/share/opencode` (macOS XDG-style + Linux)
-/// 3. `dirs::data_dir().join("opencode")` (macOS Apple-style + Windows
-///    `%LOCALAPPDATA%`)
-///
-/// If none exist, falls through to the platform default path (even though
-/// it's absent) so callers can surface a useful "searched here" message.
-fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        candidates.push(std::path::PathBuf::from(xdg).join(tool));
-    }
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local/share").join(tool));
-    }
-    if let Some(data) = dirs::data_dir() {
-        candidates.push(data.join(tool));
-    }
-
-    for candidate in &candidates {
-        if candidate.is_dir() {
-            return Some(candidate.clone());
-        }
-    }
-    candidates.into_iter().next_back()
-}
-
 fn opencode_data_dir() -> Option<std::path::PathBuf> {
-    opencode_family_data_dir("opencode")
+    crate::runtime_env::opencode_family_data_dir("opencode")
 }
 
 fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
-    let data_dir = opencode_family_data_dir(tool)?;
-    if tool == "kilo" {
-        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
-            return None;
-        }
-        return Some(
-            std::env::var("KILO_DB")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(std::path::PathBuf::from)
-                .map(|path| {
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        data_dir.join(path)
-                    }
-                })
-                .unwrap_or_else(|| data_dir.join("kilo.db")),
-        );
-    }
-    Some(data_dir.join("opencode.db"))
+    crate::runtime_env::opencode_family_db_path(tool)
 }
 
 /// Query an OpenCode-family SQLite DB for a session's working directory.
@@ -2467,6 +2413,10 @@ mod tests {
         );
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn test_find_session_on_disk_prefers_omp_for_omp_paths() {
@@ -2583,6 +2533,10 @@ mod tests {
         }
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn test_derive_omp_transcript_path_checks_named_profile() {

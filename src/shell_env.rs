@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,6 +52,13 @@ pub fn resolved_shell_env() -> Option<HashMap<String, String>> {
 }
 
 fn resolve_shell_env_uncached() -> Option<HashMap<String, String>> {
+    // Windows has no login-shell PATH-stripping problem to work around (unlike
+    // macOS GUI-launched apps), and `shell_path()`'s non-macOS fallback
+    // (`/bin/bash`) never exists there — skip straight to the `None` fail-open
+    // instead of spawning a command that's guaranteed to fail.
+    if cfg!(windows) {
+        return None;
+    }
     let shell = shell_path()?;
     if unsupported_shell(&shell) {
         return None;
@@ -115,14 +121,14 @@ fn timed_shell_output_with_timeout(
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    kill_shell_process_group(&mut child);
+                    crate::sys::process::kill_child_group(&mut child);
                     let _ = child.wait();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(_) => {
-                kill_shell_process_group(&mut child);
+                crate::sys::process::kill_child_group(&mut child);
                 let _ = child.wait();
                 return None;
             }
@@ -142,37 +148,9 @@ fn shell_command(shell: &Path, cmd: &str, marker: &str) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
+    crate::sys::process::detach_session(&mut command);
 
     command
-}
-
-fn kill_shell_process_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-
-        let Ok(raw_pid) = i32::try_from(child.id()) else {
-            let _ = child.kill();
-            return;
-        };
-        if killpg(Pid::from_raw(raw_pid), Signal::SIGKILL).is_ok() {
-            return;
-        }
-    }
-
-    let _ = child.kill();
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,9 +174,9 @@ fn write_cache(path: &Path, entry: &ShellEnvCache) -> std::io::Result<()> {
     let content = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
     fs::write(tmp.path(), content)?;
-    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o600))?;
+    crate::sys::fs::set_private(tmp.path())?;
     tmp.persist(path).map_err(std::io::Error::other)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    crate::sys::fs::set_private(path)?;
     Ok(())
 }
 
@@ -360,8 +338,10 @@ mod tests {
         assert!(!cache_is_fresh(&entry, 10, 101 + CACHE_TTL.as_secs()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn cache_write_uses_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shell_env.json");
         let entry = ShellEnvCache {
@@ -399,6 +379,9 @@ mod tests {
         assert_ne!(child_session, current_session);
     }
 
+    // Unix-only: drives a POSIX shell (`env -0`, sh loops) that isn't resolved
+    // on Windows.
+    #[cfg(unix)]
     #[test]
     fn resolver_discards_stderr_without_breaking_env_resolution() {
         let shell = test_shell_path();

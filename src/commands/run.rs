@@ -410,6 +410,10 @@ const SCRIPT_GUIDE: &str = r#"# Creating Custom Scripts
   User scripts:    ~/.hcom/scripts/
   File types:      *.sh (bash), *.py (python3)
 
+*.sh scripts (including the bundled confess/debate/fatcow workflows) run via
+`bash`. On Windows, install Git Bash (already a common dependency for
+Windows dev setups, including npm-installed AI CLIs) so `bash` is on PATH.
+
 User scripts shadow bundled scripts with the same name.
 Scripts are discovered automatically — drop a file and run `hcom run <name>`.
 Add a description comment on line 2 (after shebang) — it shows in `hcom run` listings.

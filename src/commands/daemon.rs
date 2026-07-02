@@ -48,10 +48,8 @@ pub(crate) fn daemon_stop() -> i32 {
         }
     };
 
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    println!("Sent SIGTERM to daemon (PID {pid})");
+    crate::sys::process::terminate(pid);
+    println!("Requested daemon shutdown (PID {pid})");
 
     for _ in 0..50 {
         thread::sleep(Duration::from_millis(100));
@@ -62,16 +60,15 @@ pub(crate) fn daemon_stop() -> i32 {
         }
     }
 
-    println!("Daemon did not respond to SIGTERM, escalating to SIGKILL");
-    let kill_ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    if kill_ret != 0 {
+    println!("Daemon did not exit in time, forcing termination");
+    if !crate::sys::process::kill(pid) {
         eprintln!(
-            "SIGKILL failed (errno {}), PID file retained",
+            "Force-kill failed (errno {}), PID file retained",
             std::io::Error::last_os_error()
         );
         return 1;
     }
-    println!("Daemon killed (SIGKILL)");
+    println!("Daemon killed");
     crate::relay::worker::remove_relay_pid_file();
     0
 }
