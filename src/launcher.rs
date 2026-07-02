@@ -3013,7 +3013,8 @@ mod tests {
             "developer_instructions=multi\nline \"quoted\" text".to_string(),
         ];
 
-        let script = create_runner_script_windows("codex", "/tmp", "test-args", &env, &args).unwrap();
+        let script =
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
 
         let run_line = content
@@ -3031,7 +3032,10 @@ mod tests {
             .expect("run line should quote the args file path");
         let json = std::fs::read_to_string(args_file).unwrap();
         let roundtrip: Vec<String> = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip, args, "args must survive the file round-trip exactly");
+        assert_eq!(
+            roundtrip, args,
+            "args must survive the file round-trip exactly"
+        );
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(args_file).ok();
@@ -3040,7 +3044,8 @@ mod tests {
     #[test]
     fn test_runner_script_windows_no_args_skips_sidecar_file() {
         let env = HashMap::new();
-        let script = create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[]).unwrap();
+        let script =
+            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[]).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let run_line = content
             .lines()
@@ -3262,7 +3267,10 @@ mod tests {
             val.contains(r#""C:\\Users\\x\\proj""#),
             "path must be prefix-stripped and backslash-escaped: {val}"
         );
-        assert!(!val.contains(r"\\?\"), "verbatim prefix must be stripped: {val}");
+        assert!(
+            !val.contains(r"\\?\"),
+            "verbatim prefix must be stripped: {val}"
+        );
     }
 
     #[test]

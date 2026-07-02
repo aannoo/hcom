@@ -413,7 +413,9 @@ pub fn preprocess_codex_args(
 
     // Warn if mode is "none"
     if sandbox_mode == "none" {
-        eprintln!("[hcom] Warning: Sandbox mode is 'none' - ~/.hcom writable-root injection disabled.");
+        eprintln!(
+            "[hcom] Warning: Sandbox mode is 'none' - ~/.hcom writable-root injection disabled."
+        );
         eprintln!("[hcom] hcom commands may fail unless HCOM_DIR is within workspace.");
     }
 
