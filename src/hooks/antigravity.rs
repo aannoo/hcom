@@ -85,14 +85,13 @@ fn antigravity_hooks_path(gemini_dir: &Path) -> PathBuf {
 /// JSON's quotes (and any apostrophes) survive the nested `sh -c '...'` pass —
 /// naive interpolation gets stripped or mis-tokenized by the inner shell.
 ///
-/// This POSIX `sh -c` form is known to be Windows-incompatible in principle
-/// (Antigravity almost certainly doesn't invoke hooks via a POSIX shell on
-/// Windows). Unlike Gemini CLI — where `getShellConfiguration()` in
-/// `packages/core/src/utils/shell-utils.ts` confirms hooks run via PowerShell
-/// on Windows — Antigravity's actual Windows hook-execution mechanism could
-/// not be confirmed from source (closed-source, unverified provenance), so no
-/// PowerShell variant is implemented here pending real-Windows verification or
-/// an authoritative source.
+/// This POSIX `sh -c` form was verified to work on real Windows (agy, this
+/// branch): the hook fires and a sent message is delivered into the live agy
+/// session. agy resolves `sh` through an installed Git Bash even when `sh`
+/// itself is not on the user's PATH, so no PowerShell variant is needed here.
+/// This is the same Git Bash dependency hcom already requires for workflow
+/// scripts on Windows; on a Windows box without Git Bash the hook would not
+/// fire.
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
     if fallback_json.is_empty() {
