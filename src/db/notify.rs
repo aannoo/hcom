@@ -74,6 +74,21 @@ impl HcomDb {
             )
             .is_ok()
     }
+
+    /// Check whether a notify endpoint of a specific `kind` exists for an
+    /// instance. `kind='plugin'` is registered only when a plugin-driven tool
+    /// (pi/omp) has bound its extension — a rendering-independent proof that the
+    /// interactive TUI is up, used as a launch-readiness signal where the
+    /// on-screen ready pattern is theme/preset dependent.
+    pub fn has_notify_endpoint_kind(&self, name: &str, kind: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM notify_endpoints WHERE instance = ? AND kind = ? LIMIT 1",
+                params![name, kind],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
 }
 
 #[cfg(test)]

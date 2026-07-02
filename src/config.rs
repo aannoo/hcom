@@ -95,6 +95,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("opencode_args", "launch.opencode.args"),
     ("kilo_args", "launch.kilo.args"),
     ("pi_args", "launch.pi.args"),
+    ("omp_args", "launch.omp.args"),
     ("cursor_args", "launch.cursor.args"),
     ("kimi_args", "launch.kimi.args"),
     ("copilot_args", "launch.copilot.args"),
@@ -126,6 +127,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
     ("kilo_args", "HCOM_KILO_ARGS"),
     ("pi_args", "HCOM_PI_ARGS"),
+    ("omp_args", "HCOM_OMP_ARGS"),
     ("cursor_args", "HCOM_CURSOR_ARGS"),
     ("kimi_args", "HCOM_KIMI_ARGS"),
     ("copilot_args", "HCOM_COPILOT_ARGS"),
@@ -237,6 +239,8 @@ pub struct HcomConfig {
     pub opencode_args: String,
     pub kilo_args: String,
     pub pi_args: String,
+    /// Oh My Pi specific launch arguments
+    pub omp_args: String,
     pub cursor_args: String,
     pub kimi_args: String,
     pub copilot_args: String,
@@ -269,6 +273,7 @@ impl Default for HcomConfig {
             opencode_args: String::new(),
             kilo_args: String::new(),
             pi_args: String::new(),
+            omp_args: String::new(),
             cursor_args: String::new(),
             kimi_args: String::new(),
             copilot_args: String::new(),
@@ -363,6 +368,7 @@ impl HcomConfig {
             ("opencode_args", &self.opencode_args),
             ("kilo_args", &self.kilo_args),
             ("pi_args", &self.pi_args),
+            ("omp_args", &self.omp_args),
             ("cursor_args", &self.cursor_args),
             ("kimi_args", &self.kimi_args),
             ("copilot_args", &self.copilot_args),
@@ -426,6 +432,7 @@ impl HcomConfig {
             "opencode_args" => Some(self.opencode_args.clone()),
             "kilo_args" => Some(self.kilo_args.clone()),
             "pi_args" => Some(self.pi_args.clone()),
+            "omp_args" => Some(self.omp_args.clone()),
             "cursor_args" => Some(self.cursor_args.clone()),
             "kimi_args" => Some(self.kimi_args.clone()),
             "copilot_args" => Some(self.copilot_args.clone()),
@@ -470,6 +477,7 @@ impl HcomConfig {
             "opencode_args" => self.opencode_args = value.to_string(),
             "kilo_args" => self.kilo_args = value.to_string(),
             "pi_args" => self.pi_args = value.to_string(),
+            "omp_args" => self.omp_args = value.to_string(),
             "cursor_args" => self.cursor_args = value.to_string(),
             "kimi_args" => self.kimi_args = value.to_string(),
             "copilot_args" => self.copilot_args = value.to_string(),
@@ -944,6 +952,9 @@ args = ""
 args = ""
 
 [launch.pi]
+args = ""
+
+[launch.omp]
 args = ""
 
 [launch.cursor]

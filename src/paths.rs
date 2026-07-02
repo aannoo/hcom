@@ -61,7 +61,7 @@ pub fn resolve_hcom_dir_from_env(env: &HashMap<String, String>, cwd: &Path) -> (
 ///   (DANGEROUS_DIRECTORIES auto-edit gate), gemini (GOVERNANCE_FILES).
 /// - `.codex`, `.agents`: codex protected metadata.
 /// - `.claude`: claude DANGEROUS_DIRECTORIES.
-const PROTECTED_HCOM_DIR_COMPONENTS: &[&str] = &[".git", ".codex", ".claude", ".agents"];
+const PROTECTED_HCOM_DIR_COMPONENTS: &[&str] = &[".git", ".codex", ".claude", ".agents", ".omp"];
 
 /// If `path` sits at or beneath a protected metadata component, return that
 /// component name. Component-wise match — `.gitfoo` and `dot.git` do not trigger.

@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot).
 
 pub mod antigravity;
 pub mod claude;
@@ -42,11 +42,17 @@ pub mod test_helpers {
         saved_home: Option<String>,
         saved_cursor_config_dir: Option<String>,
         saved_xdg_config_home: Option<String>,
+        saved_xdg_data_home: Option<String>,
         saved_codex_home: Option<String>,
         saved_gemini_cli_home: Option<String>,
         saved_kilo_config_dir: Option<String>,
         saved_copilot_home: Option<String>,
         saved_test_codex_cli_version: Option<String>,
+        saved_pi_coding_agent_dir: Option<String>,
+        saved_pi_coding_agent_session_dir: Option<String>,
+        saved_pi_config_dir: Option<String>,
+        saved_omp_profile: Option<String>,
+        saved_pi_profile: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -66,11 +72,18 @@ pub mod test_helpers {
                 saved_home: std::env::var("HOME").ok(),
                 saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
                 saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
+                saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
                 saved_codex_home: std::env::var("CODEX_HOME").ok(),
                 saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
                 saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
                 saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
+                saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
+                saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
+                    .ok(),
+                saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
+                saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
+                saved_pi_profile: std::env::var("PI_PROFILE").ok(),
                 _lock: lock,
             }
         }
@@ -95,6 +108,10 @@ pub mod test_helpers {
                     Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                     None => std::env::remove_var("XDG_CONFIG_HOME"),
                 }
+                match &self.saved_xdg_data_home {
+                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
                 match &self.saved_codex_home {
                     Some(v) => std::env::set_var("CODEX_HOME", v),
                     None => std::env::remove_var("CODEX_HOME"),
@@ -114,6 +131,26 @@ pub mod test_helpers {
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
                     None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
+                }
+                match &self.saved_pi_coding_agent_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+                }
+                match &self.saved_pi_coding_agent_session_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
+                }
+                match &self.saved_pi_config_dir {
+                    Some(v) => std::env::set_var("PI_CONFIG_DIR", v),
+                    None => std::env::remove_var("PI_CONFIG_DIR"),
+                }
+                match &self.saved_omp_profile {
+                    Some(v) => std::env::set_var("OMP_PROFILE", v),
+                    None => std::env::remove_var("OMP_PROFILE"),
+                }
+                match &self.saved_pi_profile {
+                    Some(v) => std::env::set_var("PI_PROFILE", v),
+                    None => std::env::remove_var("PI_PROFILE"),
                 }
             }
             crate::config::Config::reset();
@@ -170,7 +207,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "pi").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -729,3 +766,4 @@ mod tests {
         }
     }
 }
+pub mod omp;

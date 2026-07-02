@@ -31,7 +31,7 @@ pub type HelpEntry = (&'static str, &'static str);
 pub enum HookInvocation {
     /// JSON payload on stdin (Claude, Gemini, Codex, Antigravity).
     JsonStdin,
-    /// argv-style subcommand (OpenCode).
+    /// argv-style subcommand (OpenCode, Kilo, Pi, OMP).
     Argv,
     /// No hooks (Adhoc).
     None,
@@ -60,6 +60,12 @@ pub struct GatesSpec {
     pub block_on_user_activity: bool,
     pub block_on_approval: bool,
     pub launch_requires_ready: bool,
+    /// Treat the plugin's extension bind (a `kind='plugin'` notify endpoint) as
+    /// launch readiness, in addition to the on-screen `ready_pattern`. For
+    /// plugin-driven tools whose visible chrome is theme/preset configurable
+    /// (OMP: status-line presets omit the pi glyph), the bind is the only
+    /// rendering-independent proof the interactive TUI is up.
+    pub launch_ready_on_plugin_bind: bool,
 }
 
 /// Tool background-launch capability.
@@ -260,6 +266,14 @@ const PI_HOOKS: &[&str] = &[
     "pi-stop",
 ];
 
+const OMP_HOOKS: &[&str] = &[
+    "omp-start",
+    "omp-status",
+    "omp-read",
+    "omp-beforetool",
+    "omp-stop",
+];
+
 const CURSOR_HOOKS: &[&str] = &[
     "cursor-sessionstart",
     "cursor-beforesubmitprompt",
@@ -355,6 +369,9 @@ const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
 const PI_HELP_EXAMPLES: &[HelpEntry] =
     &[("hcom pi --model claude-3-5-sonnet", "Use a specific model")];
 
+const OMP_HELP_EXAMPLES: &[HelpEntry] =
+    &[("hcom omp --model claude-3-5-sonnet", "Use a specific model")];
+
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
     ("hcom agy --sandbox", "Flags forwarded to agy"),
@@ -416,6 +433,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_CLAUDE_ARGS"),
@@ -468,6 +486,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_GEMINI_ARGS"),
@@ -520,6 +539,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_CODEX_ARGS"),
@@ -572,6 +592,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: false,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_OPENCODE_ARGS"),
@@ -635,6 +656,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: false,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_KILO_ARGS"),
@@ -687,6 +709,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: true,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: None,
@@ -747,6 +770,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_CURSOR_ARGS"),
@@ -805,6 +829,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_KIMI_ARGS"),
@@ -870,6 +895,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: true,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_PI_ARGS"),
@@ -894,6 +920,80 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     },
     // `file` lists mutating ops only (like every other tool); Pi's `read` is a
     // read-only op and was producing a path in the status bar on plain reads.
+    status_detail: StatusDetailSpec {
+        bash: &["bash"],
+        file: &["edit", "write"],
+        delegate: &[],
+    },
+};
+
+pub static OMP: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Omp,
+    name: "omp",
+    label: "Oh My Pi",
+    aliases: &["omp-agent"],
+    cli_binary: "omp",
+    tui_prefix: "omp ",
+    adhoc_icon: None,
+    released: true,
+    // No usable on-screen readiness marker. Pi's `/ commands` comes from its
+    // startup-instructions header; OMP forked that away (WelcomeComponent never
+    // renders it — the only `/ commands` in OMP is the first-run theme wizard).
+    // Every other candidate lives in the status line, which is preset- and
+    // theme-configurable: the minimal/compact/ascii/custom presets omit the pi
+    // segment entirely and `icon.pi` is theme-selectable, so anchoring on `π `
+    // still falsely blocks established configs. Readiness is instead proven by
+    // the hcom extension's bind (`launch_ready_on_plugin_bind`), which is
+    // rendering-independent. Empty pattern => is_ready() is always true, so it
+    // never gates launch on scraped chrome; the plugin bind is authoritative.
+    ready_pattern: b"",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
+    instance_state_env: &[],
+    hooks: HooksSpec {
+        names: OMP_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::Argv,
+    },
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: false,
+        block_on_approval: true,
+        launch_requires_ready: true,
+        // OMP has no reliable on-screen ready marker (all candidates live in the
+        // preset/theme-configurable status line), so launch readiness is proven
+        // by the hcom extension's bind (kind='plugin' notify endpoint) instead —
+        // rendering-independent, and a dead extension correctly fails to bind and
+        // blocks. `ready_pattern` is empty; this is the authoritative signal.
+        launch_ready_on_plugin_bind: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_OMP_ARGS"),
+        config_dir_env: Some("PI_CODING_AGENT_DIR"),
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        // Top-level `omp --help` omits `--fork`, but the flag is real: it has
+        // existed and been documented in session-operation docs since v15.1.9.
+        // `omp --fork <id>` routes through `SessionManager.forkFrom(...)` (takes
+        // the session id/path as its value) and is mutually exclusive with
+        // session persistence (`omp --fork x --no-session` -> "--fork requires
+        // session persistence"). Same shape as Pi: Subcommand emits
+        // `["--fork", <id>]` (replacing `--resume`), not `["--resume", <id>,
+        // "--fork"]`. Must not degrade `hcom f` into a plain `--resume`.
+        fork: Some(ForkArgs::Subcommand("--fork")),
+    }),
+    help: HelpSpec {
+        unique_examples: OMP_HELP_EXAMPLES,
+        extra_env: &[],
+    },
     status_detail: StatusDetailSpec {
         bash: &["bash"],
         file: &["edit", "write"],
@@ -931,6 +1031,7 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_COPILOT_ARGS"),
@@ -983,6 +1084,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: true,
         block_on_approval: true,
         launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
     },
     launch: LaunchSpec {
         args_env: None,
@@ -1013,6 +1115,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &OPENCODE,
     &KILO,
     &PI,
+    &OMP,
     &ANTIGRAVITY,
     &CURSOR,
     &KIMI,
@@ -1029,6 +1132,7 @@ impl Tool {
             Tool::Codex => &CODEX,
             Tool::OpenCode => &OPENCODE,
             Tool::Kilo => &KILO,
+            Tool::Omp => &OMP,
             Tool::Pi => &PI,
             Tool::Antigravity => &ANTIGRAVITY,
             Tool::Cursor => &CURSOR,
@@ -1082,6 +1186,7 @@ mod tests {
             Tool::Kimi,
             Tool::Copilot,
             Tool::Pi,
+            Tool::Omp,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
@@ -1147,7 +1252,8 @@ mod tests {
         assert!(names.contains(&"cursor"));
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
-        assert_eq!(names.len(), 10);
+        assert!(names.contains(&"omp"));
+        assert_eq!(names.len(), 11);
     }
 
     #[test]

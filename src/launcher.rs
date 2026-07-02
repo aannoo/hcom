@@ -25,7 +25,7 @@ use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
     ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
-    OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
+    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -45,6 +45,7 @@ pub enum LaunchTool {
     Cursor,
     Kimi,
     Copilot,
+    Omp,
 }
 
 impl LaunchTool {
@@ -58,6 +59,7 @@ impl LaunchTool {
             "opencode" => Ok(LaunchTool::OpenCode),
             "kilo" | "kilocode" => Ok(LaunchTool::Kilo),
             "pi" | "pi-agent" => Ok(LaunchTool::Pi),
+            "omp" | "omp-agent" => Ok(LaunchTool::Omp),
             "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
@@ -75,6 +77,7 @@ impl LaunchTool {
             LaunchTool::OpenCode => "opencode",
             LaunchTool::Kilo => "kilo",
             LaunchTool::Pi => "pi",
+            LaunchTool::Omp => "omp",
             LaunchTool::Antigravity => "antigravity",
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
@@ -94,6 +97,7 @@ impl LaunchTool {
             LaunchTool::OpenCode => crate::tool::Tool::OpenCode,
             LaunchTool::Kilo => crate::tool::Tool::Kilo,
             LaunchTool::Pi => crate::tool::Tool::Pi,
+            LaunchTool::Omp => crate::tool::Tool::Omp,
             LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
@@ -132,7 +136,7 @@ impl LaunchTool {
 ///
 /// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
 /// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///   for gemini/codex/opencode and for default claude `--headless`.
+///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot and for default claude `--headless`.
 /// - `NativePrint`:       background, direct claude spawn in print mode
 ///   (`-p --output-format stream-json --verbose`). Claude only, opt-in via an
 ///   explicit `-p`/`--print`; kept alive across turns by hcom's stop-hook loop.
@@ -163,6 +167,7 @@ impl LaunchBackend {
             | LaunchTool::OpenCode
             | LaunchTool::Kilo
             | LaunchTool::Pi
+            | LaunchTool::Omp
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
             | LaunchTool::Kimi
@@ -398,6 +403,7 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::Codex => ".codex",
         crate::tool::Tool::Kilo => ".kilo",
         crate::tool::Tool::Pi => ".pi",
+        crate::tool::Tool::Omp => ".omp",
         crate::tool::Tool::Cursor => ".cursor",
         crate::tool::Tool::Kimi => ".kimi",
         crate::tool::Tool::Copilot => ".copilot",
@@ -584,6 +590,13 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup Pi plugin. Run: hcom hooks add pi\n{diag}");
+        }
+        LaunchTool::Omp => {
+            if crate::hooks::omp::ensure_omp_plugin_installed() {
+                return Ok(());
+            }
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
         }
         LaunchTool::Antigravity => {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
@@ -1196,6 +1209,23 @@ fn validate_launch_count(tool: &LaunchTool, count: usize) -> Result<()> {
     Ok(())
 }
 
+fn inject_omp_extension_args(tool: &LaunchTool, args: &mut Vec<String>) {
+    if !matches!(tool, LaunchTool::Omp) {
+        return;
+    }
+    let extension_args = crate::hooks::omp::extension_inject_args();
+    let plugin_path = extension_args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or_default();
+    let already_present = args
+        .windows(2)
+        .any(|window| matches!(window, [flag, path] if flag == "-e" && path == plugin_path));
+    if !already_present {
+        args.extend(extension_args);
+    }
+}
+
 fn append_initial_prompt_args(
     tool: &LaunchTool,
     args: &mut Vec<String>,
@@ -1395,15 +1425,34 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
 
+    // Scrub any hcom-managed OMP extension arg a previous hcom version may have
+    // baked into the stored args, from BOTH the live and the persisted vectors
+    // (the snapshot below prefers persisted_args, and resume supplies that
+    // historical vector separately). Without this, replaying an old session can
+    // pass a stale `-e <old hcom.ts>` alongside the freshly injected current
+    // path — failing startup or loading hcom twice. User extensions are kept.
+    if matches!(normalized, LaunchTool::Omp) {
+        crate::hooks::omp::strip_managed_extension_args(&mut params.args);
+        if let Some(persisted) = params.persisted_args.as_mut() {
+            crate::hooks::omp::strip_managed_extension_args(persisted);
+        }
+    }
+
     // Capture the persistable args BEFORE any hcom launch injection below.
     // Resume replays only user/config args; workspace-trust injection
-    // (gemini `--skip-trust`, codex `-c projects=…trust_level`) and the
-    // `--hcom-prompt` translation are session/path-specific and must not be
-    // baked into launch_args, or they would replay stale state on resume/fork.
+    // (gemini `--skip-trust`, codex `-c projects=…trust_level`), the OMP
+    // delivery-extension path (`-e <abs hcom.ts>`), and the `--hcom-prompt`
+    // translation are session/path-specific and must not be baked into
+    // launch_args, or they would replay stale state on resume/fork (e.g. a
+    // stale plugin path if PI_CODING_AGENT_DIR or the install location moves).
     let stored_launch_args = params
         .persisted_args
         .clone()
         .unwrap_or_else(|| params.args.clone());
+
+    // Injected after the snapshot so the internal plugin path is never persisted;
+    // resume re-injects the current path via the same call.
+    inject_omp_extension_args(&normalized, &mut params.args);
 
     inject_workspace_trust_args(
         &normalized,
@@ -1790,7 +1839,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     )
                 }
 
-                LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi => {
+                LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi | LaunchTool::Omp => {
                     opencode_preprocessing::preprocess_opencode_env(
                         &mut instance_env,
                         base_tool,
@@ -2036,6 +2085,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         }
         LaunchTool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
         LaunchTool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
+        LaunchTool::Omp => validate_rejected_args("Oh My Pi", "hcom omp", args, OMP_REJECTED_ARGS),
         LaunchTool::Antigravity => validate_rejected_args(
             "Antigravity",
             "hcom antigravity",
@@ -2270,6 +2320,18 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--print"));
         assert!(validate_tool_args(&LaunchTool::Pi, &["--fork".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn omp_extension_args_are_injected_once() {
+        let mut args = vec!["--model".to_string(), "opus".to_string()];
+        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
+        assert!(args.iter().any(|arg| arg == "-e"));
+        assert!(args.iter().any(|arg| arg.ends_with("hcom.ts")));
+
+        let once = args.clone();
+        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
+        assert_eq!(args, once);
     }
 
     #[test]

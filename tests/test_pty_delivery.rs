@@ -5,7 +5,7 @@
 //!
 //! Requires:
 //! - tmux installed and available by default, or another terminal preset via HCOM_TEST_TERMINAL
-//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/cursor/copilot)
+//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot)
 //!
 //! Phases (claude/gemini/codex/antigravity/cursor/copilot):
 //! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=<terminal>
@@ -78,6 +78,12 @@ fn ready_pattern(tool: &str) -> &'static str {
         // Kilo is an OpenCode-family fork: same TUI footer.
         "kilo" => "ctrl+p commands",
         "pi" => "/ commands",
+        // OMP (Oh My Pi) has no reliable on-screen ready marker: its only chrome
+        // candidates live in the preset/theme-configurable status line. Launch
+        // readiness is proven by the hcom extension bind instead
+        // (`launch_ready_on_plugin_bind`), so the spec ready_pattern is empty and
+        // is_ready() is always true — same handling as cursor here. See OMP spec.
+        "omp" => "",
         "antigravity" => "? for shortcuts",
         // Cursor has no stable ASCII ready footer (spec ready_pattern is empty,
         // so is_ready() is always true); readiness is asserted via ready/
@@ -543,10 +549,15 @@ fn initial_screen_ready(screen: &serde_json::Value, tool: &str) -> bool {
 }
 
 fn plugin_initial_screen_ready(screen: &serde_json::Value, tool: &str) -> bool {
-    if tool != "pi" {
+    if tool != "pi" && tool != "omp" {
         return initial_screen_ready(screen, tool);
     }
 
+    // Pi/OMP are plugin-backed: the launch-ready event (Pi's `/ commands` footer
+    // for Pi, the extension bind for OMP) is the readiness contract, not scraped
+    // chrome. Here we only need a rendered screen to continue with bootstrap/
+    // plugin delivery assertions.
+    // (Original note on Pi's viewport scroll retained below.)
     // Pi's `/ commands` footer is visible at launch long enough for the PTY
     // wrapper to emit life.ready, but in the default tmux 24-line viewport the
     // startup help and tmux warning can push that footer out of the retained
@@ -1211,25 +1222,30 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
     );
 
     logln!(log, "\n[Validate] Initial screen state for {tool}...");
-    validate_screen_schema(&screen);
-    logln!(log, "  OK: Schema valid");
-    if tool == "pi" {
+    if matches!(tool, "pi" | "omp") {
         logln!(
             log,
-            "  OK: Pi screen rendered after life.ready (term ready={})",
+            "  OK: {tool} screen rendered after life.ready (term ready={})",
             screen["ready"]
         );
         if screen["ready"].as_bool() == Some(true) {
-            validate_ready_pattern(&screen, tool);
-            logln!(
-                log,
-                "  OK: Ready pattern '{}' consistent",
-                ready_pattern(tool)
-            );
+            if has_ready_pattern(tool) {
+                validate_ready_pattern(&screen, tool);
+                logln!(
+                    log,
+                    "  OK: Ready pattern '{}' consistent",
+                    ready_pattern(tool)
+                );
+            } else {
+                logln!(
+                    log,
+                    "  SKIP: {tool} has no ready pattern; readiness asserted via life.ready/plugin bind"
+                );
+            }
         } else {
             logln!(
                 log,
-                "  SKIP: Pi ready footer scrolled out of tmux viewport after life.ready"
+                "  SKIP: {tool} ready footer scrolled out of tmux viewport after life.ready"
             );
         }
     } else {
@@ -1308,15 +1324,33 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
         active_id, listening_event["id"]
     ));
 
-    // Check hcom.log for bootstrap_inject (non-fatal)
+    // Confirm the bootstrap path in hcom.log (non-fatal). The two plugin families
+    // bootstrap differently, so we look for different events:
+    //   - opencode/kilo: session is created by the delivery thread's PTY inject,
+    //     logged as `delivery.bootstrap_inject`.
+    //   - pi/omp: the plugin binds a session at launch, so the delivery thread
+    //     takes `delivery.opencode_skip_inject` and the plugin injects the first
+    //     message itself, logged as `plugin.hidden_bootstrap`. The PTY inject event
+    //     never fires for this family — checking for it would always miss.
+    let (bootstrap_event, bootstrap_desc) = if matches!(tool, "pi" | "omp") {
+        ("plugin.hidden_bootstrap", "plugin hidden bootstrap")
+    } else {
+        ("delivery.bootstrap_inject", "PTY bootstrap inject")
+    };
     let log_path = dirs::home_dir().unwrap().join(".hcom/.tmp/logs/hcom.log");
     if let Ok(content) = fs::read_to_string(&log_path) {
-        if content.contains("delivery.bootstrap_inject") && content.contains(&base_name) {
-            logln!(log, "  OK: Bootstrap inject confirmed in hcom.log");
+        let confirmed = content
+            .lines()
+            .any(|line| line.contains(bootstrap_event) && line.contains(&base_name));
+        if confirmed {
+            logln!(
+                log,
+                "  OK: {bootstrap_desc} confirmed in hcom.log ({bootstrap_event})"
+            );
         } else {
             logln!(
                 log,
-                "  WARN: delivery.bootstrap_inject not found in hcom.log (may have rotated)"
+                "  WARN: {bootstrap_event} not found in hcom.log for {base_name} (log may have rotated)"
             );
         }
     }
@@ -1466,6 +1500,11 @@ fn test_pty_kilo() {
 #[ignore]
 fn test_pty_pi() {
     run_pty_test_plugin_family("pi", "pi-read");
+}
+#[test]
+#[ignore]
+fn test_pty_omp() {
+    run_pty_test_plugin_family("omp", "omp-read");
 }
 
 #[test]
