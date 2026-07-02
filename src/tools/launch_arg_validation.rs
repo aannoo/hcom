@@ -106,6 +106,15 @@ pub(crate) const OMP_REJECTED_ARGS: &[RejectedArg] = &[
         reason: "prevents hcom's delivery extension from loading",
         kind: RejectedArgKind::Flag,
     },
+    RejectedArg {
+        // `omp acp` forces mode=acp and starts an ACP stdio server with no TUI
+        // readiness marker — same class as OpenCode/Kilo `acp`. The `--mode`
+        // flag rejection above does not cover it because `acp` is a root
+        // subcommand, not a flag value.
+        token: "acp",
+        reason: "starts an ACP stdio server instead of the interactive TUI",
+        kind: RejectedArgKind::RootSubcommand,
+    },
 ];
 
 pub(crate) const GEMINI_REJECTED_ARGS: &[RejectedArg] = &[
@@ -255,6 +264,31 @@ mod tests {
                 "Oh My Pi",
                 "hcom omp",
                 &["--model".to_string(), "opus".to_string()],
+                OMP_REJECTED_ARGS,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn omp_rejects_acp_root_subcommand() {
+        // `omp acp` starts an ACP stdio server (no TUI); reject it as a root
+        // subcommand only.
+        let errors = validate_rejected_args(
+            "Oh My Pi",
+            "hcom omp",
+            &["acp".to_string()],
+            OMP_REJECTED_ARGS,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("acp"));
+
+        // `acp` as a flag value (not position 0) must still pass.
+        assert!(
+            validate_rejected_args(
+                "Oh My Pi",
+                "hcom omp",
+                &["--model".to_string(), "acp".to_string()],
                 OMP_REJECTED_ARGS,
             )
             .is_empty()

@@ -136,7 +136,7 @@ impl LaunchTool {
 ///
 /// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
 /// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///   for gemini/codex/opencode and for default claude `--headless`.
+///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot and for default claude `--headless`.
 /// - `NativePrint`:       background, direct claude spawn in print mode
 ///   (`-p --output-format stream-json --verbose`). Claude only, opt-in via an
 ///   explicit `-p`/`--print`; kept alive across turns by hcom's stop-hook loop.
@@ -1351,7 +1351,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
-    inject_omp_extension_args(&normalized, &mut params.args);
 
     // Build base environment for the current launch regime, then overlay
     // config.toml + ~/.hcom/env which win.
@@ -1426,15 +1425,34 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
 
+    // Scrub any hcom-managed OMP extension arg a previous hcom version may have
+    // baked into the stored args, from BOTH the live and the persisted vectors
+    // (the snapshot below prefers persisted_args, and resume supplies that
+    // historical vector separately). Without this, replaying an old session can
+    // pass a stale `-e <old hcom.ts>` alongside the freshly injected current
+    // path — failing startup or loading hcom twice. User extensions are kept.
+    if matches!(normalized, LaunchTool::Omp) {
+        crate::hooks::omp::strip_managed_extension_args(&mut params.args);
+        if let Some(persisted) = params.persisted_args.as_mut() {
+            crate::hooks::omp::strip_managed_extension_args(persisted);
+        }
+    }
+
     // Capture the persistable args BEFORE any hcom launch injection below.
     // Resume replays only user/config args; workspace-trust injection
-    // (gemini `--skip-trust`, codex `-c projects=…trust_level`) and the
-    // `--hcom-prompt` translation are session/path-specific and must not be
-    // baked into launch_args, or they would replay stale state on resume/fork.
+    // (gemini `--skip-trust`, codex `-c projects=…trust_level`), the OMP
+    // delivery-extension path (`-e <abs hcom.ts>`), and the `--hcom-prompt`
+    // translation are session/path-specific and must not be baked into
+    // launch_args, or they would replay stale state on resume/fork (e.g. a
+    // stale plugin path if PI_CODING_AGENT_DIR or the install location moves).
     let stored_launch_args = params
         .persisted_args
         .clone()
         .unwrap_or_else(|| params.args.clone());
+
+    // Injected after the snapshot so the internal plugin path is never persisted;
+    // resume re-injects the current path via the same call.
+    inject_omp_extension_args(&normalized, &mut params.args);
 
     inject_workspace_trust_args(
         &normalized,
