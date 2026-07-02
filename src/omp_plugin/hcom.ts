@@ -81,7 +81,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let notifyPort: number | null = null;
 	let currentCtx: ExtensionContext | null = null;
 	let pendingAckId: number | null = null;
+	let ackInFlight: Promise<boolean> | null = null;
+	let bindingGeneration = 0;
 	let deliveryInFlight = false;
+	let deliveryPending = false; // a wake arrived while delivery was gated; replay it once clear
+	let deliveryRetryScheduled = false; // dedup the queued replay pass
 	let reconcileTimer: ReturnType<typeof setInterval> | null = null;
 	let reconcileInFlight = false;
 	let bootstrapInjectedForSession: string | null = null;
@@ -201,7 +205,18 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		await bindIdentity(ctx);
 		if (!instanceName || !sessionId) return false;
 		if (!isBoundSession(ctx.sessionManager.getSessionId())) return false;
-		if (deliveryInFlight || pendingAckId !== null) return false;
+		if (deliveryInFlight || pendingAckId !== null) {
+			// A delivery is mid-flight or awaiting ack. Drop nothing: record the wake
+			// so it is replayed once clear, otherwise a message that arrives in this
+			// window stays unread until an unrelated later wake (reconcile is idle-gated).
+			deliveryPending = true;
+			log("DEBUG", "plugin.delivery_skipped", instanceName, {
+				reason: deliveryInFlight ? "delivery_in_flight" : "pending_ack_in_flight",
+				pending_ack: pendingAckId,
+				queued: true,
+			});
+			return false;
+		}
 		deliveryInFlight = true;
 		try {
 			const pending = await fetchPending();
@@ -231,15 +246,63 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			}
 		} finally {
 			deliveryInFlight = false;
+			drainPendingDelivery("delivery_in_flight_wake");
 		}
 	}
 
-	async function ackPending(source: string): Promise<void> {
-		if (!instanceName || pendingAckId === null) return;
+	// Replay a wake that was queued while delivery was gated. Re-armed once nothing
+	// is mid-flight and no ack is pending, so the same unread batch is not delivered
+	// twice. The microtask + dedup flag collapse a burst of queued wakes into one pass.
+	function schedulePendingDelivery(reason: string): void {
+		if (deliveryRetryScheduled) return;
+		deliveryRetryScheduled = true;
+		log("DEBUG", "plugin.delivery_retry_scheduled", instanceName, { reason });
+		queueMicrotask(() => {
+			deliveryRetryScheduled = false;
+			if (!instanceName || !currentCtx) return;
+			void deliverPending(currentCtx);
+		});
+	}
+
+	function drainPendingDelivery(reason: string): void {
+		if (deliveryPending && !deliveryInFlight && pendingAckId === null) {
+			deliveryPending = false;
+			schedulePendingDelivery(reason);
+		}
+	}
+
+	async function ackPending(source: string): Promise<boolean> {
+		if (ackInFlight) return ackInFlight;
+		if (!instanceName || pendingAckId === null) return false;
+		const ackInstance = instanceName;
 		const ackId = pendingAckId;
-		pendingAckId = null;
-		await hcom(["omp-read", "--name", instanceName, "--ack", "--up-to", String(ackId)]);
-		log("INFO", "plugin.deferred_ack", instanceName, { acked_to: ackId, source });
+		const generation = bindingGeneration;
+		const attempt = (async (): Promise<boolean> => {
+			const result = await hcom(["omp-read", "--name", ackInstance, "--ack", "--up-to", String(ackId)]);
+			if (result.code !== 0) {
+				log("WARN", "plugin.delivery_ack_failed", ackInstance, {
+					acked_to: ackId,
+					source,
+					exit_code: result.code,
+					stderr: result.stderr.slice(0, 300),
+				});
+				return false;
+			}
+			// Keep the delivery gate closed until the durable acknowledgement has
+			// succeeded. A reset/rebind invalidates this attempt's local state.
+			if (bindingGeneration === generation && instanceName === ackInstance && pendingAckId === ackId) {
+				pendingAckId = null;
+				log("INFO", "plugin.deferred_ack", ackInstance, { acked_to: ackId, source });
+				drainPendingDelivery("post_ack_wake");
+			}
+			return true;
+		})();
+		ackInFlight = attempt;
+		try {
+			return await attempt;
+		} finally {
+			if (ackInFlight === attempt) ackInFlight = null;
+		}
 	}
 
 	async function reportStatus(ctx: ExtensionContext, status: "active" | "listening", context = "", detail = ""): Promise<void> {
@@ -276,6 +339,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (reconcileInFlight || !currentCtx || !instanceName) return;
 		reconcileInFlight = true;
 		try {
+			if (pendingAckId !== null) await ackPending("reconcile");
 			if (currentCtx.isIdle()) {
 				await reportReconciledStatus(currentCtx);
 				await pollPendingIfDue(currentCtx);
@@ -293,12 +357,16 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	function resetBinding(): void {
 		stopNotifyServer();
+		bindingGeneration++;
 		instanceName = null;
 		sessionId = null;
 		bootstrapText = null;
 		bindingPromise = null;
 		pendingAckId = null;
+		ackInFlight = null;
 		deliveryInFlight = false;
+		deliveryPending = false;
+		deliveryRetryScheduled = false;
 		bootstrapInjectedForSession = null;
 		lastReportedStatusKey = null;
 		lastPendingPollAt = 0;
@@ -321,6 +389,18 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		currentCtx = ctx;
+		resetBinding();
+		await bindIdentity(ctx);
+	});
+
+	// OMP's /branch (and /btw's branched path) calls createBranchedSession(),
+	// which mints a NEW session id + file and emits only session_branch — not
+	// session_switch. Without rebinding here the cached sessionId stays stale,
+	// isBoundSession() fails against the new id, and every later deliverPending
+	// silently returns false (delivery dead after branch). Rebind like a switch.
+	// session_tree does NOT mint a new session id/file, so it needs no rebind.
+	pi.on("session_branch", async (_event, ctx) => {
 		currentCtx = ctx;
 		resetBinding();
 		await bindIdentity(ctx);
@@ -356,7 +436,17 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
-		if (!instanceName || !bootstrapText) return undefined;
+		if (!instanceName) return undefined;
+		// Ack the bodyless-wake transform here. The input handler sets pendingAckId
+		// and returns { text } for a bare <hcom>; omp applies that transform INLINE
+		// and submits it (input-controller.ts) — it never re-emits an input event
+		// with source "extension", so the input handler's extension-ack branch is
+		// dead for the transform path. before_agent_start fires for the submitted
+		// turn, so ack here; otherwise pendingAckId stays set and deliverPending
+		// early-returns forever, permanently jamming delivery. (For the
+		// sendUserMessage path deliverPending already acked, so this no-ops.)
+		if (pendingAckId !== null) await ackPending("before_agent_start");
+		if (!bootstrapText) return undefined;
 		const sid = ctx.sessionManager.getSessionId();
 		if (bootstrapInjectedForSession === sid) return undefined;
 		bootstrapInjectedForSession = sid;

@@ -37,7 +37,10 @@ fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
                 instance_name, e
             ),
         );
+        return;
     }
+
+    crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
 }
 
 fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
@@ -373,6 +376,69 @@ pub fn extension_inject_args() -> Vec<String> {
     ]
 }
 
+/// Remove hcom's managed OMP extension injection (`-e <hcom.ts>` /
+/// `--extension …`, incl. the `=` forms) from a stored or replayed launch-arg
+/// vector, preserving every user-supplied extension and its ordering. An entry
+/// is treated as managed when its path is the current plugin path, an existing
+/// hcom-owned file, or — for a moved/missing managed file — a narrow lexical
+/// match (basename `hcom.ts` directly under an `extensions` directory).
+///
+/// Idempotent. Callers strip stored args before snapshotting and reinjecting so
+/// a stale plugin path from an older hcom/config layout is not replayed
+/// alongside the freshly injected current path (which could fail startup or load
+/// hcom twice). A genuine `-e other.ts` user extension always survives.
+pub fn strip_managed_extension_args(args: &mut Vec<String>) {
+    let current = get_omp_plugin_path();
+    let is_managed = |value: &str| -> bool {
+        let path = std::path::Path::new(value);
+        if path == current.as_path() {
+            return true;
+        }
+        if is_hcom_owned(path) {
+            return true;
+        }
+        // Moved/missing managed file only: basename hcom.ts under an `extensions`
+        // dir. Gated on !exists so an EXISTING user `-e …/extensions/hcom.ts`
+        // with unrelated contents (which is_hcom_owned already rejected) is kept
+        // — only exact-current and hcom-owned files are removed when present.
+        !path.exists()
+            && path.file_name().and_then(|n| n.to_str()) == Some(PLUGIN_FILENAME)
+            && path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                == Some("extensions")
+    };
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        // Two-token forms: `-e PATH` / `--extension PATH`.
+        if (tok == "-e" || tok == "--extension") && i + 1 < args.len() {
+            if is_managed(&args[i + 1]) {
+                i += 2;
+                continue;
+            }
+            out.push(args[i].clone());
+            out.push(args[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        // Equals forms: `--extension=PATH` / `-e=PATH`.
+        if let Some(value) = tok
+            .strip_prefix("--extension=")
+            .or_else(|| tok.strip_prefix("-e="))
+            && is_managed(value)
+        {
+            i += 1;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    *args = out;
+}
+
 fn plugin_matches_source(path: &std::path::Path) -> bool {
     match std::fs::read_to_string(path) {
         Ok(content) => content == PLUGIN_SOURCE,
@@ -428,9 +494,10 @@ pub fn remove_omp_plugin() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::shared::{ST_ACTIVE, ST_LISTENING};
+    use std::io::ErrorKind;
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -465,6 +532,88 @@ mod tests {
         db.save_instance_named(name, &row).unwrap();
     }
 
+    fn bind_probe() -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    }
+
+    fn await_connect(listener: &TcpListener, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok(_) => return true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    #[test]
+    fn strip_managed_extension_removes_only_hcom_entry() {
+        let current = get_omp_plugin_path().to_string_lossy().to_string();
+
+        // Current managed path (two-token) is removed; user extension survives.
+        let mut args = vec![
+            "--model".into(),
+            "opus".into(),
+            "-e".into(),
+            current.clone(),
+            "-e".into(),
+            "/home/u/mine.ts".into(),
+        ];
+        strip_managed_extension_args(&mut args);
+        assert_eq!(
+            args,
+            vec!["--model", "opus", "-e", "/home/u/mine.ts"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+
+        // Idempotent.
+        let once = args.clone();
+        strip_managed_extension_args(&mut args);
+        assert_eq!(args, once);
+
+        // Legacy/moved managed path (missing file) via lexical fallback:
+        // basename hcom.ts under an `extensions` dir, incl. the `=` form.
+        let mut legacy = vec![
+            "--extension=/old/place/.omp/agent/extensions/hcom.ts".into(),
+            "--extension".into(),
+            "/old/place/extensions/hcom.ts".into(),
+            "--extension=/home/u/other.ts".into(),
+        ];
+        strip_managed_extension_args(&mut legacy);
+        assert_eq!(legacy, vec!["--extension=/home/u/other.ts".to_string()]);
+
+        // A user extension merely named hcom.ts but NOT under `extensions/` is
+        // preserved (narrow matcher).
+        let mut keep = vec!["-e".into(), "/home/u/project/hcom.ts".into()];
+        strip_managed_extension_args(&mut keep);
+        assert_eq!(
+            keep,
+            vec!["-e".to_string(), "/home/u/project/hcom.ts".to_string()]
+        );
+
+        // An EXISTING non-hcom file at extensions/hcom.ts must survive: the
+        // lexical fallback applies only to moved/missing files.
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("extensions");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let user_file = ext_dir.join("hcom.ts");
+        std::fs::write(&user_file, "export default () => {}; // not hcom").unwrap();
+        let user_arg = user_file.to_string_lossy().to_string();
+        let mut existing = vec!["-e".into(), user_arg.clone()];
+        strip_managed_extension_args(&mut existing);
+        assert_eq!(existing, vec!["-e".to_string(), user_arg]);
+    }
+
     #[test]
     fn plugin_bootstraps_via_hidden_message() {
         assert!(PLUGIN_SOURCE.contains("before_agent_start"));
@@ -488,6 +637,159 @@ mod tests {
     fn plugin_delivery_reports_active_edge() {
         assert!(PLUGIN_SOURCE.contains("reportStatus(ctx, \"active\""));
         assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));
+    }
+
+    // The embedded plugin is include_str!'d and never tsc'd, so these guard the
+    // delivery-correctness invariants that upstream API/lifecycle drift silently
+    // broke before (see PR review). They pin behavior, not just strings.
+
+    #[test]
+    fn plugin_acks_transform_submission_in_before_agent_start() {
+        // omp applies the bodyless-wake transform inline (no source:"extension"
+        // re-emit), so the transform-path ack must happen in before_agent_start.
+        // Without it pendingAckId stays set and deliverPending jams forever.
+        let idx = PLUGIN_SOURCE
+            .find("pi.on(\"before_agent_start\"")
+            .expect("before_agent_start handler present");
+        assert!(
+            PLUGIN_SOURCE[idx..].contains("ackPending(\"before_agent_start\")"),
+            "before_agent_start must ack the inline transform submission"
+        );
+        assert!(PLUGIN_SOURCE.contains("if (pendingAckId !== null) await ackPending"));
+    }
+
+    #[test]
+    fn plugin_replays_wakes_dropped_during_in_flight_window() {
+        // In-flight/pending-ack wakes must be queued and replayed, not dropped.
+        assert!(PLUGIN_SOURCE.contains("deliveryPending"));
+        assert!(PLUGIN_SOURCE.contains("schedulePendingDelivery"));
+        assert!(PLUGIN_SOURCE.contains("drainPendingDelivery"));
+        // ackPending drains so the transform-path ack replays queued wakes.
+        let idx = PLUGIN_SOURCE
+            .find("async function ackPending")
+            .expect("ackPending present");
+        assert!(PLUGIN_SOURCE[idx..].contains("drainPendingDelivery(\"post_ack_wake\")"));
+    }
+
+    #[test]
+    fn plugin_keeps_ack_gate_until_command_succeeds() {
+        let idx = PLUGIN_SOURCE
+            .find("async function ackPending")
+            .expect("ackPending present");
+        let ack = &PLUGIN_SOURCE[idx..];
+        let command = ack.find("await hcom([\"omp-read\"").expect("ack command");
+        let clear = ack.find("pendingAckId = null").expect("pending ack clear");
+        assert!(
+            command < clear,
+            "pendingAckId must remain set while the ack command is in flight"
+        );
+        assert!(ack.contains("if (result.code !== 0)"));
+        assert!(ack.contains("plugin.delivery_ack_failed"));
+        assert!(PLUGIN_SOURCE.contains("ackInFlight"));
+        assert!(PLUGIN_SOURCE.contains("await ackPending(\"reconcile\")"));
+    }
+
+    #[test]
+    fn plugin_rebinds_identity_on_session_branch() {
+        // /branch mints a new session id and emits only session_branch (not
+        // session_switch); the plugin must reset+rebind or delivery dies.
+        let idx = PLUGIN_SOURCE
+            .find("pi.on(\"session_branch\"")
+            .expect("session_branch handler present");
+        let handler = &PLUGIN_SOURCE[idx..];
+        assert!(handler.contains("resetBinding()"));
+        assert!(handler.contains("bindIdentity(ctx)"));
+    }
+
+    #[test]
+    fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
+        let (db, path) = setup_test_db();
+        let temp = tempfile::TempDir::new().unwrap();
+        save_test_instance(&db, "luna", ST_ACTIVE);
+        db.set_process_binding("pid-omp", "", "luna").unwrap();
+
+        let pty_listener = bind_probe();
+        let pty_port = pty_listener.local_addr().unwrap().port();
+        db.upsert_notify_endpoint("luna", "pty", pty_port).unwrap();
+
+        let plugin_listener = bind_probe();
+        let plugin_port = plugin_listener.local_addr().unwrap().port();
+
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".to_string(), "pid-omp".to_string()),
+            ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+            ("HCOM_TOOL".to_string(), "omp".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+
+        let (code, output) = handle_start(
+            &ctx,
+            &db,
+            &[
+                "--session-id".to_string(),
+                "sid-omp".to_string(),
+                "--notify-port".to_string(),
+                plugin_port.to_string(),
+                "--cwd".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ],
+        );
+
+        assert_eq!(code, 0);
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(response.get("name").and_then(|v| v.as_str()), Some("luna"));
+        assert!(db.has_notify_endpoint_kind("luna", "plugin"));
+
+        let stored_plugin_port: i64 = db
+            .conn()
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'luna' AND kind = 'plugin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_plugin_port, i64::from(plugin_port));
+        assert!(
+            await_connect(&pty_listener, Duration::from_millis(500)),
+            "successful plugin bind must wake the PTY delivery loop so launch readiness is observed promptly"
+        );
+
+        drop(plugin_listener);
+        cleanup(path);
+    }
+
+    #[test]
+    fn plugin_notify_registration_failure_does_not_wake_delivery_loop() {
+        let (db, path) = setup_test_db();
+        save_test_instance(&db, "luna", ST_ACTIVE);
+
+        let pty_listener = bind_probe();
+        let pty_port = pty_listener.local_addr().unwrap().port();
+        db.upsert_notify_endpoint("luna", "pty", pty_port).unwrap();
+
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_plugin_notify_insert
+                 BEFORE INSERT ON notify_endpoints
+                 WHEN NEW.kind = 'plugin'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'plugin registration blocked');
+                 END;",
+            )
+            .unwrap();
+
+        let plugin_listener = bind_probe();
+        let plugin_port = plugin_listener.local_addr().unwrap().port();
+        upsert_plugin_notify_endpoint(&db, "luna", plugin_port);
+
+        assert!(!db.has_notify_endpoint_kind("luna", "plugin"));
+        assert!(
+            !await_connect(&pty_listener, Duration::from_millis(100)),
+            "failed plugin bind must not wake delivery loops"
+        );
+
+        drop(plugin_listener);
+        cleanup(path);
     }
 
     #[test]
