@@ -106,7 +106,24 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     }
 
     let tool_str = &args[0];
-    let tool_args: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+
+    // Windows runner scripts pass tool args via a JSON sidecar file instead of
+    // inline argv (see create_runner_script_windows): the PowerShell →
+    // native-exe boundary corrupts arguments with embedded double quotes.
+    let sidecar_args: Vec<String>;
+    let tool_args: Vec<&str> = if args.get(1).map(String::as_str) == Some("--hcom-args-file") {
+        let Some(path) = args.get(2) else {
+            bail!("--hcom-args-file requires a path");
+        };
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read args file {path}"))?;
+        let _ = std::fs::remove_file(path);
+        sidecar_args = serde_json::from_str(&content)
+            .with_context(|| format!("Invalid JSON in args file {path}"))?;
+        sidecar_args.iter().map(|s| s.as_str()).collect()
+    } else {
+        args[1..].iter().map(|s| s.as_str()).collect()
+    };
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
