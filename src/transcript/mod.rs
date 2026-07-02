@@ -733,6 +733,10 @@ mod tests {
         }
     }
 
+    // Unix-only: PI_CODING_AGENT_DIR is set to a Unix-style absolute path
+    // (`/tmp/...`), which on Windows has no drive letter and resolves against
+    // the current drive, so it never matches the expected `PathBuf`.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn omp_disk_roots_include_pi_coding_agent_dir_sessions() {
@@ -786,6 +790,10 @@ mod tests {
         }
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn omp_disk_roots_ignore_uninitialized_xdg_root() {
@@ -805,6 +813,10 @@ mod tests {
         );
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn omp_disk_roots_honor_pi_config_dir_and_default_profile_sentinels() {
@@ -827,6 +839,10 @@ mod tests {
         assert_eq!(omp_profile_from_env(), None);
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn omp_agent_override_disables_xdg_and_is_ignored_by_named_profiles() {

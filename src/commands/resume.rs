@@ -2413,6 +2413,10 @@ mod tests {
         );
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn test_find_session_on_disk_prefers_omp_for_omp_paths() {
@@ -2529,6 +2533,10 @@ mod tests {
         }
     }
 
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, but on Windows `dirs::home_dir()` queries the OS profile folder
+    // directly and ignores it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn test_derive_omp_transcript_path_checks_named_profile() {
