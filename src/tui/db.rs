@@ -241,6 +241,7 @@ fn parse_tool(s: &str) -> Tool {
         Ok(crate::tool::Tool::OpenCode) => Tool::OpenCode,
         Ok(crate::tool::Tool::Kilo) => Tool::Kilo,
         Ok(crate::tool::Tool::Pi) => Tool::Pi,
+        Ok(crate::tool::Tool::Omp) => Tool::Omp,
         Ok(crate::tool::Tool::Antigravity) => Tool::Antigravity,
         Ok(crate::tool::Tool::Cursor) => Tool::Cursor,
         Ok(crate::tool::Tool::Kimi) => Tool::Kimi,

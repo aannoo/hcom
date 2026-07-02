@@ -21,6 +21,7 @@ pub enum Tool {
     Kimi,
     Copilot,
     Pi,
+    Omp,
     Adhoc,
 }
 
@@ -103,6 +104,7 @@ impl Tool {
                 crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
             }
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
+            Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
             Tool::Adhoc => false,
         }
     }
@@ -142,6 +144,11 @@ impl Tool {
                 Ok(false) => Err(String::new()),
                 Err(e) => Err(e.to_string()),
             },
+            Tool::Omp => match crate::hooks::omp::install_omp_plugin() {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(String::new()),
+                Err(e) => Err(e.to_string()),
+            },
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -167,6 +174,9 @@ impl Tool {
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
+            Tool::Omp => crate::hooks::omp::remove_omp_plugin()
+                .map(|_| true)
+                .map_err(|e| e.to_string()),
             Tool::Adhoc => Ok(false),
         }
     }
@@ -185,6 +195,7 @@ impl Tool {
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
             Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
             Tool::Pi => crate::hooks::pi::get_pi_plugin_path(),
+            Tool::Omp => crate::hooks::omp::get_omp_plugin_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()
@@ -230,19 +241,13 @@ mod tests {
 
     #[test]
     fn hook_names_are_disjoint() {
-        // Antigravity shares Gemini hooks, but every gemini-* name resolves to
-        // Gemini because Antigravity declares Gemini as the hook owner.
+        // Shared hooks are owned by their spec's `shared_hooks_with` declaration.
         let mut owners = HashMap::new();
-        for tool in [
-            Tool::Claude,
-            Tool::Gemini,
-            Tool::Codex,
-            Tool::OpenCode,
-            Tool::Cursor,
-            Tool::Kimi,
-            Tool::Copilot,
-            Tool::Pi,
-        ] {
+        for spec in crate::integration_spec::ALL {
+            if spec.hooks.shared_hooks_with.is_some() {
+                continue;
+            }
+            let tool = spec.tool;
             for hook in tool.hooks() {
                 assert_eq!(
                     owners.insert(*hook, tool),
@@ -293,6 +298,12 @@ mod tests {
     fn pi_from_str() {
         assert_eq!("pi".parse::<Tool>(), Ok(Tool::Pi));
         assert_eq!("pi-agent".parse::<Tool>(), Ok(Tool::Pi));
+    }
+
+    #[test]
+    fn omp_from_str() {
+        assert_eq!("omp".parse::<Tool>(), Ok(Tool::Omp));
+        assert_eq!("omp-agent".parse::<Tool>(), Ok(Tool::Omp));
     }
 
     #[test]

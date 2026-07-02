@@ -98,6 +98,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     ("HCOM_PI_ARGS", "Default args for pi on launch", "string"),
+    ("HCOM_OMP_ARGS", "Default args for omp on launch", "string"),
     (
         "HCOM_CURSOR_ARGS",
         "Default args for cursor-agent on launch",
@@ -209,6 +210,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "opencode_args" => Some("launch.opencode.args"),
         "kilo_args" => Some("launch.kilo.args"),
         "pi_args" => Some("launch.pi.args"),
+        "omp_args" => Some("launch.omp.args"),
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
         "copilot_args" => Some("launch.copilot.args"),
@@ -1480,7 +1482,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor/Kimi/Copilot auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1548,7 +1550,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/agy/cursor/kimi/copilot)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -2154,7 +2156,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor/Kimi/Copilot"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");

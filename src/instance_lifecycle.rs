@@ -564,8 +564,16 @@ pub fn set_status(
         crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
-    let is_pi = current_data.as_ref().map(|d| d.tool.as_str()) == Some("pi");
-    if is_pi && !status_event_changed && msg_ts.is_empty() {
+    // The pi-family plugins (pi, and its fork omp) structurally double-write tool
+    // status: the extension's tool_call handler calls reportStatus (omp/pi-status)
+    // AND the Rust beforetool hook calls update_tool_status, both with the same
+    // tool:<name>+detail. Suppress the redundant unchanged event for this family so
+    // it doesn't emit duplicate status events (~30% of events for omp otherwise).
+    let is_pi_family = matches!(
+        current_data.as_ref().map(|d| d.tool.as_str()),
+        Some("pi") | Some("omp")
+    );
+    if is_pi_family && !status_event_changed && msg_ts.is_empty() {
         return;
     }
 
@@ -797,6 +805,61 @@ mod tests {
         assert_eq!(result.status, ST_INACTIVE);
         assert_eq!(result.context, "launch_failed");
         cleanup(path);
+    }
+
+    fn assert_pi_family_skips_duplicate(tool: &str) {
+        let (db, path) = setup_test_db();
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("luna"));
+        row.insert("tool".into(), serde_json::json!(tool));
+        row.insert("status".into(), serde_json::json!(ST_ACTIVE));
+        row.insert("status_context".into(), serde_json::json!("tool:bash"));
+        row.insert("status_detail".into(), serde_json::json!("echo hi"));
+        row.insert("status_time".into(), serde_json::json!(1));
+        row.insert("last_stop".into(), serde_json::json!(0));
+        row.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("luna", &row).unwrap();
+
+        // Two identical unchanged writes (reportStatus + beforetool) → one event.
+        set_status(
+            &db,
+            "luna",
+            ST_ACTIVE,
+            "tool:bash",
+            StatusUpdate {
+                detail: "ls -la",
+                ..Default::default()
+            },
+        );
+        set_status(
+            &db,
+            "luna",
+            ST_ACTIVE,
+            "tool:bash",
+            StatusUpdate {
+                detail: "ls -la",
+                ..Default::default()
+            },
+        );
+        let event_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            event_count, 1,
+            "pi-family tool {tool} should dedup identical status events"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_set_status_dedup_covers_pi_family() {
+        assert_pi_family_skips_duplicate("pi");
+        assert_pi_family_skips_duplicate("omp");
     }
 
     #[test]

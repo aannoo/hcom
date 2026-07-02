@@ -375,6 +375,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "opencode" => preview.config.opencode_args.as_str(),
             "kilo" | "kilocode" => preview.config.kilo_args.as_str(),
             "pi" | "pi-agent" => preview.config.pi_args.as_str(),
+            "omp" | "omp-agent" => preview.config.omp_args.as_str(),
             "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
             "copilot" => preview.config.copilot_args.as_str(),
             "kimi" => preview.config.kimi_args.as_str(),
@@ -527,6 +528,7 @@ pub(crate) fn merge_tool_args(
         }
         LaunchTool::Copilot => append_config_args(&config.copilot_args, cli_args),
         LaunchTool::Pi => append_config_args(&config.pi_args, cli_args),
+        LaunchTool::Omp => append_config_args(&config.omp_args, cli_args),
         LaunchTool::OpenCode => append_config_args(&config.opencode_args, cli_args),
         LaunchTool::Kilo => append_config_args(&config.kilo_args, cli_args),
         LaunchTool::Kimi => append_config_args(&config.kimi_args, cli_args),
@@ -556,7 +558,8 @@ pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> boo
         | LaunchTool::Antigravity
         | LaunchTool::Cursor
         | LaunchTool::Kimi
-        | LaunchTool::Copilot => false,
+        | LaunchTool::Copilot
+        | LaunchTool::Omp => false,
     }
 }
 

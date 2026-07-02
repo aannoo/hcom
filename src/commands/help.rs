@@ -187,11 +187,11 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
+        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
     ),
     ("", "[AD-HOC]                              manual polling"),
 ];
@@ -443,7 +443,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .antigravity, .cursor, .kimi, .copilot",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -477,7 +477,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / cursor_args / kimi_args / copilot_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -648,7 +648,7 @@ const TERM_HELP: &[HelpEntry] = &[
     ("", "Logs: ~/.hcom/.tmp/logs/pty_debug/"),
 ];
 
-// ── Tool launch help (claude/gemini/codex/opencode) ─────────────────────
+// ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot) ─────────────────────
 
 /// Resolve the launch-help spec for a CLI name (`claude`, `agy`, …).
 fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::IntegrationSpec> {
@@ -852,6 +852,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "kilocode",
     "pi",
     "pi-agent",
+    "omp",
+    "omp-agent",
     "antigravity",
     "agy",
     "cursor",
@@ -925,12 +927,16 @@ Commands:\n\
 
 /// Flags accepted by both `hcom <tool>` (fresh launch) and `hcom r` / `hcom f`
 /// (resume/fork). Indented to 4 spaces for tool help, re-indented for resume.
+///
+/// NOTE: `--run-here` / `--no-run-here` are intentionally omitted from help.
+/// They still work — they're parsed in launch.rs and resume.rs — but they're
+/// an internal detail (TUI injects `--no-run-here`) and a power-user escape
+/// hatch (unsupported terminal emulators), not something to advertise.
 const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
     ("--headless", "Run in background"),
-    ("--run-here", "Run in current terminal"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
 ];
@@ -1244,12 +1250,14 @@ mod tests {
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
         assert!(
-            help.contains("claude|gemini|codex|opencode|kilo|pi|antigravity|cursor|kimi|copilot")
+            help.contains(
+                "claude|gemini|codex|opencode|kilo|pi|omp|antigravity|cursor|kimi|copilot"
+            )
         );
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi)"
+            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/omp)"
         ));
-        assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/kimi)"));
-        assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi");
+        assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
+        assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");
     }
 }

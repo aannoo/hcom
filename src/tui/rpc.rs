@@ -184,6 +184,7 @@ mod tests {
         for tool in [
             Tool::Gemini,
             Tool::Pi,
+            Tool::Omp,
             Tool::Antigravity,
             Tool::Codex,
             Tool::Cursor,

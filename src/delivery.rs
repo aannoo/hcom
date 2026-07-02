@@ -490,6 +490,9 @@ pub struct ToolConfig {
     /// `require_ready_prompt` so tools can disable runtime delivery gates and
     /// still demand the ready pattern at launch time (opencode).
     pub launch_requires_ready: bool,
+    /// Launch readiness is proven by the plugin's extension bind rather than the
+    /// on-screen ready pattern. See [`GatesSpec::launch_ready_on_plugin_bind`].
+    pub launch_ready_on_plugin_bind: bool,
 }
 
 impl ToolConfig {
@@ -506,6 +509,7 @@ impl ToolConfig {
             block_on_user_activity: g.block_on_user_activity,
             block_on_approval: g.block_on_approval,
             launch_requires_ready: g.launch_requires_ready,
+            launch_ready_on_plugin_bind: g.launch_ready_on_plugin_bind,
         }
     }
 
@@ -592,14 +596,21 @@ fn drive_launch_outcome(
 ) {
     match *launch_outcome {
         LaunchOutcome::Pending => {
-            if launch_ready_observed(config, state) {
+            if launch_ready_observed(db, current_name, config, state) {
                 emit_launch_ready_once(db, state, current_name, launch_outcome);
             } else {
-                maybe_emit_launch_blocked(db, state, current_name, current_status, launch_outcome);
+                maybe_emit_launch_blocked(
+                    db,
+                    state,
+                    current_name,
+                    current_status,
+                    config,
+                    launch_outcome,
+                );
             }
         }
         LaunchOutcome::Blocked => {
-            if launch_ready_observed(config, state) {
+            if launch_ready_observed(db, current_name, config, state) {
                 emit_launch_ready_once(db, state, current_name, launch_outcome);
             }
         }
@@ -771,10 +782,25 @@ pub(crate) fn evaluate_gate(
     }
 }
 
-fn launch_ready_observed(config: &ToolConfig, state: &DeliveryState) -> bool {
+fn launch_ready_observed(
+    db: &HcomDb,
+    name: &str,
+    config: &ToolConfig,
+    state: &DeliveryState,
+) -> bool {
     let screen = state.screen.read().unwrap();
     if config.block_on_approval && screen.approval {
         return false;
+    }
+    if config.launch_ready_on_plugin_bind {
+        // Authoritative readiness for plugin-driven tools (OMP): the extension's
+        // bind (a kind='plugin' notify endpoint) proves both TUI construction
+        // and extension load. It deliberately REPLACES on-screen scraping rather
+        // than OR-ing with it — OMP's visible chrome is theme/preset dependent
+        // (status-line presets omit the pi glyph), and a syntactically broken /
+        // non-running extension could still render default chrome and be falsely
+        // declared ready. Requiring the bind makes a dead extension block.
+        return db.has_notify_endpoint_kind(name, "plugin");
     }
     if config.launch_requires_ready && !screen.ready {
         return false;
@@ -903,9 +929,21 @@ fn maybe_emit_launch_blocked(
     state: &DeliveryState,
     current_name: &str,
     current_status: &str,
+    config: &ToolConfig,
     outcome: &mut LaunchOutcome,
 ) {
+    // Plugin-driven tools bind their extension slightly after the TUI settles;
+    // give that bind a generous grace so a slow-but-valid launch is not
+    // transient-blocked (drive_launch_outcome would recover it to Ready, but the
+    // spurious blocked event is noisy). A genuinely dead extension still blocks
+    // once the grace elapses with no kind='plugin' endpoint.
     const SETTLE_THRESHOLD: Duration = Duration::from_millis(1500);
+    const PLUGIN_BIND_GRACE: Duration = Duration::from_secs(10);
+    let settle_threshold = if config.launch_ready_on_plugin_bind {
+        PLUGIN_BIND_GRACE
+    } else {
+        SETTLE_THRESHOLD
+    };
 
     if !outcome.is_pending() || current_status == ST_ACTIVE {
         return;
@@ -917,7 +955,7 @@ fn maybe_emit_launch_blocked(
     // the settle heuristic. Its trust prompt is distinctive — fire immediately
     // when it appears rather than waiting for the banner animation to stop.
     let trust_prompt_visible = tail_text.contains("Do you trust the files in this folder?");
-    if !trust_prompt_visible && screen.last_output.elapsed() < SETTLE_THRESHOLD {
+    if !trust_prompt_visible && screen.last_output.elapsed() < settle_threshold {
         return;
     }
     let Some(tail) = screen
@@ -1152,7 +1190,7 @@ pub fn run_delivery_loop(
     use std::str::FromStr;
     if matches!(
         Tool::from_str(&config.tool),
-        Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi)
+        Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
     ) {
         log_info(
             "native",
@@ -1418,9 +1456,8 @@ pub fn run_delivery_loop(
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
-                            | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi) => {
-                                "<hcom>".to_string()
-                            }
+                            | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi)
+                            | Some(Tool::Omp) => "<hcom>".to_string(),
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
@@ -2317,30 +2354,91 @@ mod tests {
         assert_eq!(result.reason, "prompt_has_text");
     }
 
+    fn open_ready_test_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
     #[test]
     fn launch_ready_observed_follows_tool_gate_shape() {
+        let (_dir, db) = open_ready_test_db();
+        let n = "toli";
         let mut screen = safe_screen();
         screen.ready = false;
         screen.prompt_empty = true;
 
         let state = make_state(screen.clone(), 500);
-        assert!(launch_ready_observed(&ToolConfig::codex(), &state));
-        assert!(launch_ready_observed(&ToolConfig::claude(), &state));
-        assert!(!launch_ready_observed(&ToolConfig::opencode(), &state));
-        assert!(!launch_ready_observed(&ToolConfig::cursor(), &state));
+        assert!(launch_ready_observed(&db, n, &ToolConfig::codex(), &state));
+        assert!(launch_ready_observed(&db, n, &ToolConfig::claude(), &state));
+        assert!(!launch_ready_observed(
+            &db,
+            n,
+            &ToolConfig::opencode(),
+            &state
+        ));
+        assert!(!launch_ready_observed(
+            &db,
+            n,
+            &ToolConfig::cursor(),
+            &state
+        ));
 
         let state = make_state(screen.clone(), 500);
-        assert!(!launch_ready_observed(&ToolConfig::gemini(), &state));
+        assert!(!launch_ready_observed(
+            &db,
+            n,
+            &ToolConfig::gemini(),
+            &state
+        ));
 
         screen.ready = true;
         let state = make_state(screen.clone(), 500);
-        assert!(launch_ready_observed(&ToolConfig::opencode(), &state));
-        assert!(launch_ready_observed(&ToolConfig::cursor(), &state));
+        assert!(launch_ready_observed(
+            &db,
+            n,
+            &ToolConfig::opencode(),
+            &state
+        ));
+        assert!(launch_ready_observed(&db, n, &ToolConfig::cursor(), &state));
 
         screen.prompt_empty = false;
         let state = make_state(screen, 500);
-        assert!(!launch_ready_observed(&ToolConfig::codex(), &state));
-        assert!(!launch_ready_observed(&ToolConfig::cursor(), &state));
+        assert!(!launch_ready_observed(&db, n, &ToolConfig::codex(), &state));
+        assert!(!launch_ready_observed(
+            &db,
+            n,
+            &ToolConfig::cursor(),
+            &state
+        ));
+    }
+
+    #[test]
+    fn omp_launch_ready_requires_plugin_bind_not_screen() {
+        // OMP readiness is bind-driven: a rendered/ready screen must NOT be
+        // enough, and a kind='plugin' notify endpoint must flip it ready even
+        // with no on-screen marker.
+        let (_dir, db) = open_ready_test_db();
+        let config = ToolConfig::for_tool(crate::tool::Tool::Omp);
+        assert!(config.launch_ready_on_plugin_bind);
+
+        let mut screen = safe_screen();
+        screen.ready = true; // empty pattern => is_ready() always true
+        screen.prompt_empty = true;
+        let state = make_state(screen, 500);
+
+        // No plugin endpoint yet -> not ready despite the "ready" screen.
+        assert!(!launch_ready_observed(&db, "vupo", &config, &state));
+
+        // A pty endpoint (registered at launch, before the extension binds) must
+        // not count as readiness.
+        db.upsert_notify_endpoint("vupo", "pty", 4001).unwrap();
+        assert!(!launch_ready_observed(&db, "vupo", &config, &state));
+
+        // The extension bind is the authoritative signal.
+        db.upsert_notify_endpoint("vupo", "plugin", 4002).unwrap();
+        assert!(launch_ready_observed(&db, "vupo", &config, &state));
     }
 
     #[test]

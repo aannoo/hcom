@@ -469,7 +469,8 @@ pub fn get_bootstrap(
             || tool == "kilo"
             || tool == "antigravity"
             || tool == "kimi"
-            || tool == "pi")
+            || tool == "pi"
+            || tool == "omp")
             && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
@@ -833,6 +834,27 @@ mod tests {
         // agy uses the same auto-delivery section as the other managed tools.
         assert!(result.contains("Messages instantly and automatically arrive"));
         assert!(result.contains("hcom <command> --help"));
+    }
+
+    #[test]
+    fn test_get_bootstrap_omp_launched_gets_auto_delivery() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "nova",
+            "omp",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(result.contains("Messages instantly and automatically arrive"));
+        assert!(!result.contains("Messages do NOT arrive automatically"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code
+# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code + Pi + OMP + Antigravity + Cursor + Kimi + Copilot
 
 Verified behavior when mixing different AI coding tools via hcom.
 
