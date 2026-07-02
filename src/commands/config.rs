@@ -1482,7 +1482,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor/Kimi/Copilot auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1550,7 +1550,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/agy/cursor/kimi/copilot)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -2153,7 +2153,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor/Kimi/Copilot"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");

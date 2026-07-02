@@ -12,7 +12,7 @@ AI agents running in separate terminals are isolated. hcom connects them via hoo
 
 ```bash
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom agy, hcom cursor-agent
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot
 hcom              # TUI dashboard
 ```
 
@@ -173,7 +173,7 @@ with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
 | file | when to read |
 |------|-------------|
 | `references/patterns.md` | writing multi-agent scripts — 6 tested patterns with full code and real event JSON |
-| `references/cross-tool.md` | claude + codex + gemini + opencode collaboration details and per-tool quirks |
+| `references/cross-tool.md` | claude + codex + gemini + opencode + kilo + pi + omp + antigravity + cursor + kimi + copilot collaboration details and per-tool quirks |
 | `references/gotchas.md` | debugging scripts — timing, message delivery, intent system, cleanup |
 | `references/script-template.md` | writing a new script from scratch — full template with commentary |
 | `references/scripts/` | 6 tested, working example scripts |
