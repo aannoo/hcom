@@ -12,6 +12,28 @@ type PromptModel = {
   variant?: string
 }
 
+type PermissionAskedEvent = {
+  type: "permission.asked"
+  properties: {
+    id: string
+    sessionID: string
+    permission: string
+  }
+}
+
+type HcomEvent = Event | PermissionAskedEvent
+
+function eventSessionID(event: HcomEvent): string | undefined {
+  if (!event.properties || typeof event.properties !== "object") return undefined
+  const properties = event.properties as Record<string, unknown>
+  if (typeof properties.sessionID === "string") return properties.sessionID
+  const info = properties.info
+  if (info && typeof info === "object" && typeof (info as Record<string, unknown>).id === "string") {
+    return (info as Record<string, unknown>).id as string
+  }
+  return undefined
+}
+
 // Best-effort fallback for non-hcom/manual plugin runs.
 // Normal hcom launches seed launch agent/model through the `opencode-start`
 // response payload, since the plugin process does not inherit the outer
@@ -92,7 +114,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let bindingPromise: Promise<void> | null = null  // Prevents duplicate binding
   let reconcileTimer: ReturnType<typeof setInterval> | null = null  // Periodic status sync + delivery fallback
   let reconcileInFlight = false                 // Prevents concurrent reconcile calls from overlapping interval ticks
-  let notifyServer: ReturnType<typeof Bun.listen> | null = null  // TCP notify server for instant message wake
+  let notifyServer: Bun.TCPSocketListener | null = null  // TCP notify server for instant message wake
   let lastReportedStatus: string | null = null  // Skip redundant status updates
   let pendingAckId: number | null = null        // Deferred ack: set by deliverPendingToIdle, acked by transform
   let deliveryInFlight = false                  // Delivery guard flag set before the first await
@@ -387,10 +409,10 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   }
 
   return {
-    event: async ({ event }: { event: Event }) => {
+    event: async ({ event }: { event: HcomEvent }) => {
       try {
         if (!checkHcom()) return
-        const eventSessionId = event.properties?.sessionID ?? event.properties?.info?.id
+        const eventSessionId = eventSessionID(event)
         if (eventSessionId && !sessionId) {
           sessionId = eventSessionId as string
         }
@@ -570,7 +592,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             p.type === "text" && !p.synthetic && typeof p.text === "string" &&
             p.text.startsWith("<hcom>") && p.text.endsWith("</hcom>") && !p.text.includes(": ")
           )
-          if (textPart && pendingAckId === null) {
+          if (textPart?.type === "text" && pendingAckId === null) {
             const msgResult = await $.nothrow()`hcom opencode-read --name ${instanceName}`.quiet()
             if (msgResult.exitCode === 0) {
               let rawMessages: any[] = []
