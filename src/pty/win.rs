@@ -476,7 +476,14 @@ impl Proxy {
         // idle. Detached like the old single reader was: on the orphaned-
         // grandchild EOF-lag case (see run()) it may stay blocked in read(), but
         // it holds no lock and process::exit reaps it.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // Bounded so the producer blocks (SyncSender::send) when the consumer
+        // lags, restoring the child backpressure the pre-split single-thread
+        // reader had implicitly (read + stdout write on one thread). Unbounded
+        // here would let the producer drain the ConPTY into RAM without limit
+        // under sustained output or a stalled headless stdout. ~256 * 8KiB
+        // chunks (~2MiB) absorbs normal bursts; disconnect/recv_timeout
+        // semantics are identical to an unbounded channel.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(256);
         thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
