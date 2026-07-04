@@ -328,7 +328,7 @@ fn validate_config_args(field_name: &str, value: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let tokens = crate::tools::args_common::shell_split(value)
+    let tokens = crate::tools::args_common::shell_split(value, cfg!(windows))
         .map_err(|e| format!("invalid {field_name} from config: {e}"))?;
     let errors = validate_tool_args(&tool, &tokens);
     if errors.is_empty() {
