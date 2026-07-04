@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -466,13 +467,39 @@ impl Proxy {
         let writer = self.writer.clone();
         let (rows, cols) = (self.rows, self.cols);
 
-        Ok(thread::spawn(move || {
+        // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
+        // chunks over a channel. This exists so the consumer loop below can wait
+        // with a bounded timeout (`recv_timeout`) instead of blocking in read()
+        // forever — that bounded wait is what lets it render a trailing `hcom
+        // term` snapshot ~120ms after an idle agent's output stops (#4); a plain
+        // blocking read() could not, since it never returns while the child is
+        // idle. Detached like the old single reader was: on the orphaned-
+        // grandchild EOF-lag case (see run()) it may stay blocked in read(), but
+        // it holds no lock and process::exit reaps it.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
             let mut reader = reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF: child exited / PTY closed
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break; // consumer gone
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Dropping `tx` here signals EOF/read-error to the consumer, which
+            // then captures the launch-failure tail and does a final snapshot.
+        });
+
+        Ok(thread::spawn(move || {
             let mut screen =
                 ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
             let mut stdout = std::io::stdout();
             let mut filter = shared::OutputModeFilter::default();
-            let mut buf = [0u8; 8192];
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
 
             // In interactive mode stdout is a real console, so the outer terminal
@@ -482,19 +509,49 @@ impl Proxy {
             let headless = !std::io::stdout().is_terminal();
             let mut last_name = String::new();
             let mut last_status = String::new();
+
+            // `hcom term` snapshot refresh (see should_refresh_snapshot). Under
+            // sustained output we render at most once per SNAPSHOT_THROTTLE;
+            // chunks skipped by that throttle set `dirty`. When output then goes
+            // quiet, recv_timeout fires after SNAPSHOT_DEBOUNCE and we render one
+            // final dump, so an idle agent's last frame is current within ~120ms
+            // (#4). At most one extra dump per quiet period, zero under sustained
+            // output.
+            const SNAPSHOT_THROTTLE: Duration = Duration::from_millis(100);
+            const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(120);
             let mut last_snapshot = Instant::now();
+            let mut dirty = false;
+            let refresh = |screen: &ScreenTracker| {
+                if let Ok(mut s) = screen_snapshot.write() {
+                    *s = screen.get_screen_dump(target.name(), inject_port);
+                }
+            };
 
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        // EOF: capture the visible tail so run() can build the
-                        // launch-failure diagnostic before the screen is gone.
+                match rx.recv_timeout(SNAPSHOT_DEBOUNCE) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Output has been quiet for SNAPSHOT_DEBOUNCE. If a frame
+                        // was deferred by the throttle, render it now so an idle
+                        // agent's final frame is current for `hcom term`.
+                        if dirty {
+                            refresh(&screen);
+                            last_snapshot = Instant::now();
+                            dirty = false;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // EOF / read error: capture the visible tail so run() can
+                        // build the launch-failure diagnostic before the screen is
+                        // gone, and render the final frame for a late `hcom term`.
                         if let Ok(mut g) = last_tail.write() {
                             *g = screen.visible_tail(8, 1000);
                         }
+                        refresh(&screen);
                         break; // child exited / PTY closed
                     }
-                    Ok(n) => {
+                    Ok(data) => {
+                        let data = data.as_slice();
                         // A genuine keystroke / injected answer flagged a pending
                         // approval for clearing; the reader owns the tracker.
                         if approval_clear_requested.swap(false, Ordering::AcqRel) {
@@ -507,7 +564,6 @@ impl Proxy {
                             screen.resize(r, c);
                         }
 
-                        let data = &buf[..n];
                         // Strip the child's Win32-input/focus mode-set sequences
                         // before they reach the *outer* terminal (see
                         // OutputModeFilter); otherwise the outer terminal answers
@@ -534,15 +590,19 @@ impl Proxy {
                         screen.process(data);
 
                         // Refresh the `hcom term` snapshot, throttled to ≤10Hz so
-                        // heavy output doesn't spend the reader in screen dumps.
-                        // An idle agent keeps the last snapshot current, so its
-                        // reader being blocked in read() adds at most ~100ms of
-                        // staleness to a query answered by the inject thread (#4).
-                        if last_snapshot.elapsed() >= Duration::from_millis(100) {
-                            if let Ok(mut s) = screen_snapshot.write() {
-                                *s = screen.get_screen_dump(target.name(), inject_port);
-                            }
+                        // heavy output doesn't spend the reader in screen dumps
+                        // (~150µs each). A chunk skipped here is marked dirty and
+                        // captured by the trailing-edge Timeout branch above once
+                        // output stops.
+                        if shared::should_refresh_snapshot(
+                            last_snapshot.elapsed(),
+                            SNAPSHOT_THROTTLE,
+                        ) {
+                            refresh(&screen);
                             last_snapshot = Instant::now();
+                            dirty = false;
+                        } else {
+                            dirty = true;
                         }
 
                         let publish = |a: bool| {
@@ -587,7 +647,6 @@ impl Proxy {
                             last_status = status.clone();
                         }
                     }
-                    Err(_) => break,
                 }
             }
             // Do NOT store running=false here. Letting run() be the sole writer

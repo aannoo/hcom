@@ -478,8 +478,16 @@ pub(super) fn start_delivery_thread(
 ///
 /// Pure helper so the decision is host-testable (the coordinator itself needs a
 /// live ConPTY). Start once the tool is ready, once the start-timeout has
-/// elapsed, or when we are shutting down (so an in-flight `hcom deliver` still
-/// gets a consumer and the notify/inject ports registered).
+/// elapsed, or when we are shutting down.
+///
+/// The shutdown trigger only fires after the child has already exited — `run()`
+/// flips `running` false only once the reader has hit EOF and been joined — so
+/// there is no live child left to inject into and the delivery loop's `while
+/// running` body runs zero iterations (its `register_notify_port` never runs).
+/// This final start therefore exists so init-time registration (DB open, notify
+/// server, inject-port registration) and the loop's post-loop cleanup get a
+/// chance to run and settle the final DB status, not to hand an in-flight `hcom
+/// deliver` a live consumer.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn should_start_delivery(
     ready: bool,
@@ -488,6 +496,19 @@ pub(super) fn should_start_delivery(
     shutting_down: bool,
 ) -> bool {
     ready || elapsed > timeout || shutting_down
+}
+
+/// Leading-edge throttle for the `hcom term` screen snapshot the reader renders.
+///
+/// Rendering `get_screen_dump` costs ~150µs on a wide screen, so refreshing it on
+/// every ConPTY chunk would burn measurable CPU (and steal reader time from
+/// draining the pipe) under heavy output. Cap it at one render per `throttle`;
+/// any chunk skipped here is marked dirty and picked up by a single trailing-edge
+/// refresh once output goes quiet (see the reader loop's debounce). Pure so the
+/// decision is host-testable.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn should_refresh_snapshot(since_last_snapshot: Duration, throttle: Duration) -> bool {
+    since_last_snapshot >= throttle
 }
 
 /// Finalize a launch failure once the child has exited before binding.
@@ -821,8 +842,9 @@ mod tests {
 
     #[test]
     fn should_start_delivery_on_shutdown() {
-        // Shutting down forces a final start so an in-flight deliver has a
-        // consumer, even if never ready and still inside the timeout.
+        // Shutting down forces a final start (child already exited) so init-time
+        // registration and post-loop cleanup run, even if never ready and still
+        // inside the timeout.
         assert!(should_start_delivery(
             false,
             Duration::from_millis(1),
@@ -840,6 +862,26 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(10),
             false,
+        ));
+    }
+
+    #[test]
+    fn should_refresh_snapshot_only_after_throttle_elapsed() {
+        let throttle = Duration::from_millis(100);
+        // Fresh chunk right after a refresh: defer (mark dirty), don't re-render.
+        assert!(!should_refresh_snapshot(Duration::from_millis(0), throttle));
+        assert!(!should_refresh_snapshot(
+            Duration::from_millis(99),
+            throttle
+        ));
+        // At/after the throttle window: render now (leading edge).
+        assert!(should_refresh_snapshot(
+            Duration::from_millis(100),
+            throttle
+        ));
+        assert!(should_refresh_snapshot(
+            Duration::from_millis(250),
+            throttle
         ));
     }
 
