@@ -14,6 +14,13 @@ use crate::paths::scripts_dir;
 use crate::scripts;
 use crate::shared::CommandContext;
 
+#[cfg(windows)]
+fn bash_available() -> bool {
+    crate::terminal::which_bin("bash").is_some()
+}
+#[cfg(windows)]
+const BASH_MISSING_MSG: &str = "Git Bash required to run shell (.sh) workflow scripts — install it and ensure `bash` is on PATH.";
+
 #[derive(clap::Parser, Debug)]
 #[command(name = "run", about = "Run a bundled or user workflow script")]
 pub struct RunArgs {
@@ -347,6 +354,13 @@ pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32
                 c.args(&args);
                 c
             } else {
+                #[cfg(windows)]
+                {
+                    if !bash_available() {
+                        eprintln!("{BASH_MISSING_MSG}");
+                        return 1;
+                    }
+                }
                 let mut c = Command::new("bash");
                 c.arg(path);
                 c.args(&args);
@@ -376,6 +390,13 @@ pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32
                 }
             };
 
+            #[cfg(windows)]
+            {
+                if !bash_available() {
+                    eprintln!("{BASH_MISSING_MSG}");
+                    return 1;
+                }
+            }
             let mut cmd = Command::new("bash");
             cmd.arg(tmp.path());
             cmd.args(&args);

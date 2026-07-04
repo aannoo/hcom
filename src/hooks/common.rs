@@ -961,7 +961,10 @@ fn stop_instance_inner(
     if let Some(pid_val) = pid {
         let pid_u32 = pid_val as u32;
         if is_headless {
-            // SIGTERM → wait up to 2s → SIGKILL
+            // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
+            // Windows: forceful process-tree kill) → poll up to 2s for exit →
+            // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
+            // waits out Windows' asynchronous TerminateProcess.
             use crate::sys::process::GroupSignal;
             if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
                 let mut dead = false;
