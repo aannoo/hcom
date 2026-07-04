@@ -149,6 +149,23 @@ pub(crate) fn set_terminal_title(instance_name: &str) {
     }
 }
 
+/// Escape a filesystem path for embedding in a TOML basic (double-quoted) string.
+/// Backslashes are doubled first, then quotes — order matters: the quote escape
+/// itself introduces a backslash that must not be re-doubled.
+pub(crate) fn toml_escape_path(path: &str) -> String {
+    path.replace('\\', r"\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod escape_tests {
+    #[test]
+    fn toml_escape_path_doubles_backslashes_then_quotes() {
+        assert_eq!(super::toml_escape_path(r"C:\foo\bar"), r"C:\\foo\\bar");
+        assert_eq!(super::toml_escape_path(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(super::toml_escape_path(r#"C:\a"b"#), r#"C:\\a\"b"#);
+    }
+}
+
 // Unix-only: these assert $HOME resolution and POSIX path canonicalization
 // (Windows resolves USERPROFILE and prefixes canonical paths with \\?\).
 #[cfg(all(test, unix))]

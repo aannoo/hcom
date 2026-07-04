@@ -724,6 +724,29 @@ fn background_runner_env(
     runner_env
 }
 
+/// Non-HCOM ambient env to forward through the sidecar, with marker/identity/
+/// instance-state/terminal-color vars stripped. On Windows env names are
+/// case-insensitive (and the paired PowerShell `Remove-Item Env:` folds case),
+/// so `case_insensitive` folds case for the match; Unix keeps exact-case.
+fn sidecar_ambient_env<'a>(
+    env: &HashMap<String, String>,
+    strip_vars: impl Iterator<Item = &'a str>,
+    case_insensitive: bool,
+) -> HashMap<String, String> {
+    let norm = |k: &str| {
+        if case_insensitive {
+            k.to_ascii_lowercase()
+        } else {
+            k.to_string()
+        }
+    };
+    let strip: std::collections::HashSet<String> = strip_vars.map(&norm).collect();
+    env.iter()
+        .filter(|(k, _)| !k.starts_with("HCOM_") && !strip.contains(&norm(k)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Windows runner: a PowerShell script that launches the tool through the hcom
 /// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
 /// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
@@ -759,18 +782,16 @@ fn create_runner_script_windows(
 
     // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
     // that is dot-sourced then deleted, matching the bash runner.
-    let sidecar_strip: std::collections::HashSet<&str> = tool_marker_vars()
-        .iter()
-        .chain(HCOM_IDENTITY_VARS.iter())
-        .chain(instance_state_env.iter())
-        .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-        .copied()
-        .collect();
-    let ambient_env: HashMap<String, String> = env
-        .iter()
-        .filter(|(k, _)| !k.starts_with("HCOM_") && !sidecar_strip.contains(k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let ambient_env = sidecar_ambient_env(
+        env,
+        tool_marker_vars()
+            .iter()
+            .chain(HCOM_IDENTITY_VARS.iter())
+            .chain(instance_state_env.iter())
+            .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
+            .copied(),
+        true,
+    );
     let sidecar_source = if ambient_env.is_empty() {
         String::new()
     } else {
@@ -972,18 +993,16 @@ pub fn create_runner_script(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let sidecar_strip: std::collections::HashSet<&str> = tool_marker_vars()
-        .iter()
-        .chain(HCOM_IDENTITY_VARS.iter())
-        .chain(instance_state_env.iter())
-        .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-        .copied()
-        .collect();
-    let ambient_env: HashMap<String, String> = env
-        .iter()
-        .filter(|(k, _)| !k.starts_with("HCOM_") && !sidecar_strip.contains(k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let ambient_env = sidecar_ambient_env(
+        env,
+        tool_marker_vars()
+            .iter()
+            .chain(HCOM_IDENTITY_VARS.iter())
+            .chain(instance_state_env.iter())
+            .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
+            .copied(),
+        false,
+    );
     let env_block = terminal::build_env_string(&hcom_env, "bash_export");
     let sensitive_env_source = if ambient_env.is_empty() {
         String::new()
@@ -1421,7 +1440,7 @@ pub(crate) fn inject_workspace_trust_args(
                 // the projects table for this session only (file stays untouched).
                 // Escape backslashes before quotes: the quote escape introduces
                 // a backslash that must not itself be doubled.
-                let toml_escaped = simplified.replace('\\', r"\\").replace('"', "\\\"");
+                let toml_escaped = crate::runtime_env::toml_escape_path(&simplified);
                 let trust_override = format!(
                     "projects={{ \"{}\" = {{ trust_level = \"trusted\" }} }}",
                     toml_escaped
@@ -3364,5 +3383,20 @@ mod tests {
                 "{tool:?} args should be unchanged"
             );
         }
+    }
+
+    #[test]
+    fn sidecar_ambient_env_folds_case_on_windows_only() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("no_color".to_string(), "1".to_string());
+        env.insert("NO_COLOR".to_string(), "1".to_string());
+        env.insert("MY_SECRET".to_string(), "x".to_string());
+        env.insert("HCOM_X".to_string(), "y".to_string());
+        let strip = ["NO_COLOR"];
+        let win = sidecar_ambient_env(&env, strip.iter().copied(), true);
+        assert!(!win.contains_key("no_color") && !win.contains_key("NO_COLOR"));
+        assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
+        let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
+        assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
     }
 }

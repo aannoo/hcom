@@ -131,7 +131,7 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
 
     // TOML basic-string escaping (backslashes first, then quotes) — every
     // Windows path carries backslashes.
-    let toml_escaped = hcom_dir.replace('\\', r"\\").replace('"', "\\\"");
+    let toml_escaped = crate::runtime_env::toml_escape_path(&hcom_dir);
     let mut result = tokens.to_vec();
     result.extend([
         "-c".to_string(),

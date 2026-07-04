@@ -88,8 +88,16 @@ mod win {
     pub fn register(kind: Kind, flag: Arc<AtomicBool>) {
         if !INSTALLED.swap(true, Ordering::SeqCst) {
             // SAFETY: installs a process-wide console control handler once.
-            unsafe {
-                SetConsoleCtrlHandler(Some(handler), TRUE);
+            let ok = unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) };
+            if ok == FALSE {
+                crate::log::log_error(
+                    "signal",
+                    "console_ctrl_handler.install_failed",
+                    &format!(
+                        "SetConsoleCtrlHandler failed: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                );
             }
         }
         let flags = match kind {
