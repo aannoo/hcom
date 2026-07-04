@@ -903,7 +903,7 @@ impl Proxy {
                             self.inject_server.port(),
                             "Starting delivery thread (poll timeout)",
                         );
-                        let handle = shared::start_delivery_thread(
+                        match shared::start_delivery_thread(
                             self.config.instance_name.as_deref(),
                             self.running.clone(),
                             self.delivery_state.clone(),
@@ -913,9 +913,16 @@ impl Proxy {
                             self.notify_port.clone(),
                             self.current_name.clone(),
                             self.current_status.clone(),
-                        )?;
-                        if let Some(h) = handle {
-                            self.delivery_handle = Some(h);
+                        )? {
+                            shared::DeliveryStart::Started(h) => {
+                                self.delivery_handle = Some(h);
+                            }
+                            shared::DeliveryStart::Disabled => {}
+                            shared::DeliveryStart::Pending(_h) => {
+                                // Preserve the Unix behavior a delivery-init
+                                // timeout has always had here: abort the session.
+                                bail!("delivery start timed out");
+                            }
                         }
                         delivery_started = true;
                     }
@@ -1062,7 +1069,7 @@ impl Proxy {
                                     self.inject_server.port(),
                                     "Starting delivery thread",
                                 );
-                                let handle = shared::start_delivery_thread(
+                                match shared::start_delivery_thread(
                                     self.config.instance_name.as_deref(),
                                     self.running.clone(),
                                     self.delivery_state.clone(),
@@ -1072,9 +1079,17 @@ impl Proxy {
                                     self.notify_port.clone(),
                                     self.current_name.clone(),
                                     self.current_status.clone(),
-                                )?;
-                                if let Some(h) = handle {
-                                    self.delivery_handle = Some(h);
+                                )? {
+                                    shared::DeliveryStart::Started(h) => {
+                                        self.delivery_handle = Some(h);
+                                    }
+                                    shared::DeliveryStart::Disabled => {}
+                                    shared::DeliveryStart::Pending(_h) => {
+                                        // Preserve the Unix behavior a
+                                        // delivery-init timeout has always had
+                                        // here: abort the session.
+                                        bail!("delivery start timed out");
+                                    }
                                 }
                                 delivery_started = true;
                             }

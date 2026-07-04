@@ -10,8 +10,9 @@
 //! injects `<hcom>` text into the ConPTY input when a message arrives.
 
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use super::ProxyConfig;
-use super::inject::{InjectResult, InjectServer};
+use super::inject::{InjectResult, InjectServer, QueryCommand};
 use super::screen::ScreenTracker;
 use super::shared;
 
@@ -56,9 +57,18 @@ pub struct Proxy {
     rows: u16,
     cols: u16,
     /// Delivery thread handle. Wrapped in `Arc<Mutex<Option<_>>>` because the
-    /// reader thread starts delivery (ready-or-timeout gated) and stores the
-    /// handle, while `run()`/`Drop` take it to join.
+    /// delivery coordinator thread starts delivery (ready-or-timeout gated) and
+    /// stores the handle, while `run()`/`Drop` take it to join.
     delivery_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Latched by the reader thread once the tool's ready pattern is observed;
+    /// read by the delivery coordinator to start delivery early. A latch never
+    /// regresses, unlike reading the (non-latched) screen-state ready flag.
+    ready_signaled: Arc<AtomicBool>,
+    /// Eagerly-maintained screen dump for `hcom term` screen queries. The reader
+    /// owns the `ScreenTracker` and refreshes this (throttled) each chunk; the
+    /// inject thread serves it directly so an idle agent — whose reader is
+    /// blocked in `read()` — still answers immediately (#4).
+    screen_snapshot: Arc<RwLock<String>>,
     /// Set by the stdin/inject threads when a genuine keystroke (or injected
     /// answer) should clear a pending approval; consumed by the reader thread,
     /// which owns the `ScreenTracker` and calls `clear_approval()`.
@@ -166,6 +176,8 @@ impl Proxy {
             rows,
             cols,
             delivery_handle: Arc::new(Mutex::new(None)),
+            ready_signaled: Arc::new(AtomicBool::new(false)),
+            screen_snapshot: Arc::new(RwLock::new(String::new())),
             approval_clear_requested: Arc::new(AtomicBool::new(false)),
             pending_resize: Arc::new(RwLock::new(None)),
             last_tail: Arc::new(RwLock::new(None)),
@@ -185,10 +197,16 @@ impl Proxy {
         let inject_server = InjectServer::new()?;
         let inject_port = inject_server.port();
 
-        // The reader thread now owns delivery-thread startup (ready-or-timeout
-        // gated), so it needs the inject port. Keep its handle: run() joins it
-        // below so the EOF-captured launch-failure tail is available.
-        let reader_handle = self.spawn_reader_thread(inject_port);
+        // Spawn the reader first: it can fail (ConPTY reader clone), and a
+        // failure here must tear nothing half-up (#23), so it bails before any
+        // other thread exists. The already-spawned child is reaped by Drop. Keep
+        // its handle: run() joins it below so the EOF-captured launch-failure
+        // tail is available.
+        let reader_handle = self.spawn_reader_thread(inject_port)?;
+        // A dedicated coordinator owns delivery-thread startup (ready-or-timeout
+        // gated); the reader can't, since it blocks in read() and cannot run a
+        // timer while the child is idle.
+        let coordinator_handle = self.spawn_delivery_coordinator(inject_port);
         self.spawn_stdin_thread();
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
@@ -225,9 +243,7 @@ impl Proxy {
         // whole tree, which closes the pipe and lets the orphaned reader wind
         // down. The normal EOF lag is milliseconds, so this only trips on a
         // genuinely stuck grandchild.
-        if let Some(reader_handle) = reader_handle {
-            join_with_timeout(reader_handle, Duration::from_secs(2));
-        }
+        join_with_timeout(reader_handle, Duration::from_secs(2));
 
         // Record a precise launch-failure (exited-before-bind) BEFORE flipping
         // running=false, mirroring the Unix proxy: finalize records the real
@@ -251,6 +267,14 @@ impl Proxy {
         if port != 0 {
             let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         }
+
+        // Join the coordinator BEFORE taking `delivery_handle`. The coordinator
+        // is the sole writer of that handle; joining it establishes the
+        // happens-before that makes its store visible here. Its shutdown-time
+        // final start attempt can wait up to the 5s init recv_timeout, so bound
+        // the join at 6s (common case: coordinator already returned → instant).
+        join_with_timeout(coordinator_handle, Duration::from_secs(6));
+
         // Recover the guard even if the mutex was poisoned: a panic elsewhere
         // must not strand the delivery thread unjoined. The handle is the only
         // thing behind this lock, so the (possibly stale) inner value is safe to
@@ -270,8 +294,8 @@ impl Proxy {
         //
         // Unlike the Unix proxy — which propagates the error immediately via
         // `start_delivery_thread(...)?` and tears the child down at once — the
-        // reader thread here cannot return early or kill `child` (it does not
-        // own it), so it only sets `launch_failed`. The failure is therefore not
+        // coordinator here cannot return early or kill `child` (it does not own
+        // it), so it only sets `launch_failed`. The failure is therefore not
         // surfaced until the child exits on its own and `run()` reaches this
         // check: the returned Err matches Unix, but the report can lag by up to
         // the child's full lifetime. This is left as-is because delivery-init
@@ -283,6 +307,85 @@ impl Proxy {
         }
 
         Ok(exit_code)
+    }
+
+    /// Own the delivery-thread startup decision. Polls every 50ms and starts
+    /// delivery exactly once when the tool is ready, the start-timeout elapses,
+    /// or shutdown begins. The reader thread cannot own this: it blocks in
+    /// `read()` and so cannot run a timer while the child is idle (#8).
+    ///
+    /// Stores the delivery-thread handle (through a poisoned mutex too) so it is
+    /// never dropped where `run()` can't join it. On [`shared::DeliveryStart::
+    /// Pending`] it keeps the handle and stops retrying — a retry would spawn a
+    /// second delivery thread and double-deliver (#6). A transient up-front
+    /// `Err` sets `launch_failed` and retries on the next tick.
+    fn spawn_delivery_coordinator(&self, inject_port: u16) -> JoinHandle<()> {
+        let running = self.running.clone();
+        let ready_signaled = self.ready_signaled.clone();
+        let screen_state = self.screen_state.clone();
+        let launch_phase = self.launch_phase_active.clone();
+        let target = self.config.target.clone();
+        let instance = self.config.instance_name.clone();
+        let current_name = self.current_name.clone();
+        let current_status = self.current_status.clone();
+        let notify_port = self.notify_port.clone();
+        let delivery_handle = self.delivery_handle.clone();
+        let launch_failed = self.launch_failed.clone();
+        let timeout = self.config.target.delivery_start_timeout();
+        thread::spawn(move || {
+            let startup = Instant::now();
+            loop {
+                let shutting_down = !running.load(Ordering::Acquire);
+                let should_start = shared::should_start_delivery(
+                    ready_signaled.load(Ordering::Acquire),
+                    startup.elapsed(),
+                    timeout,
+                    shutting_down,
+                );
+                if should_start {
+                    match shared::start_delivery_thread(
+                        instance.as_deref(),
+                        running.clone(),
+                        screen_state.clone(),
+                        launch_phase.clone(),
+                        inject_port,
+                        target.clone(),
+                        notify_port.clone(),
+                        current_name.clone(),
+                        current_status.clone(),
+                    ) {
+                        Ok(shared::DeliveryStart::Started(h)) => {
+                            *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+                            // Clear any launch_failed from an earlier failed
+                            // attempt so a transient error doesn't poison the
+                            // exit code once a retry wins.
+                            launch_failed.store(false, Ordering::Release);
+                            return;
+                        }
+                        Ok(shared::DeliveryStart::Pending(h)) => {
+                            // Init timed out / channel disconnected: the thread
+                            // is detached and live. Keep the handle so run() can
+                            // join it; do NOT set launch_failed and do NOT retry.
+                            *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+                            return;
+                        }
+                        Ok(shared::DeliveryStart::Disabled) => return,
+                        Err(_transient) => {
+                            launch_failed.store(true, Ordering::Release);
+                            // A shutdown tick gets exactly one last attempt; a
+                            // running tick falls through to retry.
+                            if shutting_down {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if shutting_down {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
     }
 
     /// Poll the outer terminal size and forward changes to the ConPTY and the
@@ -325,32 +428,30 @@ impl Proxy {
     ///
     /// This thread also owns the Windows equivalents of the Unix poll loop's
     /// per-iteration work: refreshing the shared delivery state (via
-    /// `shared::update_delivery_state`), starting the delivery thread once the
-    /// tool is ready (or the start-timeout elapses), consuming approval-clear
-    /// requests from the stdin/inject threads, applying pending resizes, and
-    /// emitting title OSC updates on status/name changes.
+    /// `shared::update_delivery_state`), latching the ready signal for the
+    /// delivery coordinator, consuming approval-clear requests from the
+    /// stdin/inject threads, applying pending resizes, refreshing the screen
+    /// snapshot for `hcom term` queries, answering the child's cursor-position
+    /// query when headless, and emitting title OSC updates on status/name
+    /// changes.
     ///
     /// Returns the thread's `JoinHandle` so `run()` can join it after the child
     /// exits and before reading `last_tail` — the reader writes `last_tail` only
     /// at PTY EOF (`Ok(0)`), which on Windows can lag the child's exit, so the
-    /// join is what guarantees the launch-failure tail is populated. Returns
-    /// `None` if the reader could not be cloned (the proxy then runs without
-    /// screen tracking, exactly as before).
-    fn spawn_reader_thread(&self, inject_port: u16) -> Option<JoinHandle<()>> {
+    /// join is what guarantees the launch-failure tail is populated.
+    ///
+    /// Returns `Err` if the ConPTY reader can't be cloned (or the master mutex is
+    /// poisoned): without a reader there is no screen tracking, no delivery
+    /// coordination, and no launch-failure tail, so a silently degraded session
+    /// is worse than a loud failure (#23). `run()` calls this with `?` before
+    /// spawning any other thread, so an early bail tears nothing half-up.
+    fn spawn_reader_thread(&self, inject_port: u16) -> Result<JoinHandle<()>> {
         let reader = match self.master.lock() {
-            Ok(master) => match master.try_clone_reader() {
-                Ok(r) => r,
-                Err(e) => {
-                    log_error("native", "win.reader", &format!("try_clone_reader: {e}"));
-                    return None;
-                }
-            },
-            Err(e) => {
-                log_error("native", "win.reader", &format!("master lock: {e}"));
-                return None;
-            }
+            Ok(master) => master
+                .try_clone_reader()
+                .context("ConPTY try_clone_reader failed; cannot track screen")?,
+            Err(_) => anyhow::bail!("ConPTY master mutex poisoned; cannot spawn reader"),
         };
-        let running = self.running.clone();
         let screen_state = self.screen_state.clone();
         let launch_phase = self.launch_phase_active.clone();
         let target = self.config.target.clone();
@@ -361,70 +462,103 @@ impl Proxy {
         let approval_clear_requested = self.approval_clear_requested.clone();
         let pending_resize = self.pending_resize.clone();
         let last_tail = self.last_tail.clone();
-        let launch_failed = self.launch_failed.clone();
-        let delivery_handle = self.delivery_handle.clone();
-        let notify_port = self.notify_port.clone();
-        let delivery_start_timeout = self.config.target.delivery_start_timeout();
+        let ready_signaled = self.ready_signaled.clone();
+        let screen_snapshot = self.screen_snapshot.clone();
+        let writer = self.writer.clone();
         let (rows, cols) = (self.rows, self.cols);
 
-        Some(thread::spawn(move || {
+        // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
+        // chunks over a channel. This exists so the consumer loop below can wait
+        // with a bounded timeout (`recv_timeout`) instead of blocking in read()
+        // forever — that bounded wait is what lets it render a trailing `hcom
+        // term` snapshot ~120ms after an idle agent's output stops (#4); a plain
+        // blocking read() could not, since it never returns while the child is
+        // idle. Detached like the old single reader was: on the orphaned-
+        // grandchild EOF-lag case (see run()) it may stay blocked in read(), but
+        // it holds no lock and process::exit reaps it.
+        // Bounded so the producer blocks (SyncSender::send) when the consumer
+        // lags, restoring the child backpressure the pre-split single-thread
+        // reader had implicitly (read + stdout write on one thread). Unbounded
+        // here would let the producer drain the ConPTY into RAM without limit
+        // under sustained output or a stalled headless stdout. ~256 * 8KiB
+        // chunks (~2MiB) absorbs normal bursts; disconnect/recv_timeout
+        // semantics are identical to an unbounded channel.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(256);
+        thread::spawn(move || {
             let mut reader = reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF: child exited / PTY closed
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break; // consumer gone
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Dropping `tx` here signals EOF/read-error to the consumer, which
+            // then captures the launch-failure tail and does a final snapshot.
+        });
+
+        Ok(thread::spawn(move || {
             let mut screen =
                 ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
             let mut stdout = std::io::stdout();
-            let mut filter = OutputModeFilter::default();
-            let mut buf = [0u8; 8192];
+            let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
 
-            let mut delivery_started = false;
-            let mut ready_signaled = false;
-            let startup = Instant::now();
+            // In interactive mode stdout is a real console, so the outer terminal
+            // answers the child's cursor-position query itself — we must not also
+            // answer. Headless (piped/no console) there is no terminal to answer,
+            // so the reader replies on the child's behalf or startup hangs (#1).
+            let headless = !std::io::stdout().is_terminal();
             let mut last_name = String::new();
             let mut last_status = String::new();
 
-            // Attempt to start the delivery thread. Stores the handle through a
-            // poisoned mutex too, so it is never dropped here where run() can't
-            // join it. Returns `true` when delivery is settled (must not retry),
-            // `false` to retry on the next chunk; see the per-arm reasons below.
-            let start_delivery = || match shared::start_delivery_thread(
-                instance.as_deref(),
-                running.clone(),
-                screen_state.clone(),
-                launch_phase.clone(),
-                inject_port,
-                target.clone(),
-                notify_port.clone(),
-                current_name.clone(),
-                current_status.clone(),
-            ) {
-                Ok(Some(h)) => {
-                    *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
-                    // Clear any launch_failed from an earlier failed attempt so a
-                    // transient error doesn't poison the exit code once a retry wins.
-                    launch_failed.store(false, Ordering::Release);
-                    true
-                }
-                Ok(None) => true,
-                Err(e) => {
-                    launch_failed.store(true, Ordering::Release);
-                    // A timed-out start left a live detached thread; settle so we
-                    // do not spawn a duplicate. Any other init error is safe to
-                    // retry.
-                    e.downcast_ref::<shared::DeliveryStartTimeout>().is_some()
+            // `hcom term` snapshot refresh (see should_refresh_snapshot). Under
+            // sustained output we render at most once per SNAPSHOT_THROTTLE;
+            // chunks skipped by that throttle set `dirty`. When output then goes
+            // quiet, recv_timeout fires after SNAPSHOT_DEBOUNCE and we render one
+            // final dump, so an idle agent's last frame is current within ~120ms
+            // (#4). At most one extra dump per quiet period, zero under sustained
+            // output.
+            const SNAPSHOT_THROTTLE: Duration = Duration::from_millis(100);
+            const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(120);
+            let mut last_snapshot = Instant::now();
+            let mut dirty = false;
+            let refresh = |screen: &ScreenTracker| {
+                if let Ok(mut s) = screen_snapshot.write() {
+                    *s = screen.get_screen_dump(target.name(), inject_port);
                 }
             };
 
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        // EOF: capture the visible tail so run() can build the
-                        // launch-failure diagnostic before the screen is gone.
+                match rx.recv_timeout(SNAPSHOT_DEBOUNCE) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Output has been quiet for SNAPSHOT_DEBOUNCE. If a frame
+                        // was deferred by the throttle, render it now so an idle
+                        // agent's final frame is current for `hcom term`.
+                        if dirty {
+                            refresh(&screen);
+                            last_snapshot = Instant::now();
+                            dirty = false;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // EOF / read error: capture the visible tail so run() can
+                        // build the launch-failure diagnostic before the screen is
+                        // gone, and render the final frame for a late `hcom term`.
                         if let Ok(mut g) = last_tail.write() {
                             *g = screen.visible_tail(8, 1000);
                         }
+                        refresh(&screen);
                         break; // child exited / PTY closed
                     }
-                    Ok(n) => {
+                    Ok(data) => {
+                        let data = data.as_slice();
                         // A genuine keystroke / injected answer flagged a pending
                         // approval for clearing; the reader owns the tracker.
                         if approval_clear_requested.swap(false, Ordering::AcqRel) {
@@ -437,7 +571,6 @@ impl Proxy {
                             screen.resize(r, c);
                         }
 
-                        let data = &buf[..n];
                         // Strip the child's Win32-input/focus mode-set sequences
                         // before they reach the *outer* terminal (see
                         // OutputModeFilter); otherwise the outer terminal answers
@@ -447,7 +580,37 @@ impl Proxy {
                         filter.filter(data, &mut scratch);
                         let _ = stdout.write_all(&scratch);
                         let _ = stdout.flush();
+
+                        // Headless: no outer terminal saw the DSR query, so answer
+                        // it here (a canned cursor-at-1;1 report) to unblock the
+                        // child's console initialization. Interactive: the real
+                        // terminal already answered, so we never synthesize a
+                        // reply — the latch is simply left set and unread.
+                        if headless
+                            && filter.take_dsr()
+                            && let Ok(mut w) = writer.lock()
+                        {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
+
                         screen.process(data);
+
+                        // Refresh the `hcom term` snapshot, throttled to ≤10Hz so
+                        // heavy output doesn't spend the reader in screen dumps
+                        // (~150µs each). A chunk skipped here is marked dirty and
+                        // captured by the trailing-edge Timeout branch above once
+                        // output stops.
+                        if shared::should_refresh_snapshot(
+                            last_snapshot.elapsed(),
+                            SNAPSHOT_THROTTLE,
+                        ) {
+                            refresh(&screen);
+                            last_snapshot = Instant::now();
+                            dirty = false;
+                        } else {
+                            dirty = true;
+                        }
 
                         let publish = |a: bool| {
                             shared::publish_approval_status(a, instance.as_deref(), &current_status)
@@ -460,17 +623,11 @@ impl Proxy {
                             &publish,
                         );
 
-                        if !ready_signaled && screen.is_ready() {
-                            ready_signaled = true;
-                        }
-                        if !delivery_started
-                            && (ready_signaled || startup.elapsed() > delivery_start_timeout)
-                        {
-                            // Only latch as started when the attempt settled; a
-                            // transient init failure leaves this clear so the
-                            // next chunk retries instead of disabling delivery
-                            // for the rest of the session.
-                            delivery_started = start_delivery();
+                        // Latch the ready signal for the delivery coordinator. A
+                        // latch never regresses (unlike re-reading a screen flag
+                        // that can flicker during redraws).
+                        if !ready_signaled.load(Ordering::Acquire) && screen.is_ready() {
+                            ready_signaled.store(true, Ordering::Release);
                         }
 
                         // Title OSC update. Only safe to write between complete
@@ -497,19 +654,7 @@ impl Proxy {
                             last_status = status.clone();
                         }
                     }
-                    Err(_) => break,
                 }
-            }
-            // Fallback start: a child that exits with no output hits Ok(0) (or
-            // Err) on the first read and breaks before the in-loop start above
-            // ever runs. The old design called spawn_delivery_thread()
-            // unconditionally from run(); moving startup into this thread lost
-            // that guarantee. Start it here so an in-flight `hcom deliver`
-            // payload still has a consumer and notify/inject ports get
-            // registered, exactly as before — `run()` joins this thread before
-            // taking the handle, so the store is always visible to it.
-            if !delivery_started {
-                start_delivery();
             }
             // Do NOT store running=false here. Letting run() be the sole writer
             // ensures EXIT_WAS_KILLED is committed before the delivery thread
@@ -590,6 +735,7 @@ impl Proxy {
         let current_status = self.current_status.clone();
         let instance = self.config.instance_name.clone();
         let approval_clear_requested = self.approval_clear_requested.clone();
+        let screen_snapshot = self.screen_snapshot.clone();
         thread::spawn(move || {
             while running.load(Ordering::Acquire) {
                 // Drain the accept queue.
@@ -622,9 +768,20 @@ impl Proxy {
                                 approval_clear_requested.store(true, Ordering::Release);
                             }
                         }
-                        // Screen queries (`hcom term`) are not served by the
-                        // ConPTY proxy yet; answer empty so the client unblocks.
-                        Ok(InjectResult::Query(q)) => q.respond(""),
+                        // Screen queries (`hcom term`) are served from the
+                        // eagerly-maintained snapshot the reader refreshes, so an
+                        // idle agent (reader blocked in read()) still answers
+                        // immediately rather than hanging or returning "" (#4).
+                        Ok(InjectResult::Query(q)) => match q.command {
+                            QueryCommand::Screen => {
+                                let dump = screen_snapshot
+                                    .read()
+                                    .map(|s| s.clone())
+                                    .unwrap_or_default();
+                                q.respond(&dump);
+                            }
+                            QueryCommand::Unknown => q.respond("error: unknown command\n"),
+                        },
                         _ => {}
                     }
                 }
@@ -719,92 +876,9 @@ impl Drop for Proxy {
     }
 }
 
-/// Strips the child's DEC private-mode **sets** for Win32 input mode (`?9001`)
-/// and focus reporting (`?1004`) from the output stream, so the *outer*
-/// terminal is never switched into them.
-///
-/// A ConPTY wrapper sits between the child and the real terminal. If the child's
-/// `ESC[?9001h` reaches the outer terminal, that terminal starts encoding its
-/// input — including its automatic `ESC[6n` (cursor position) reply — as Win32
-/// input records. The child, which only understands a plain `ESC[15;1R`, then
-/// waits forever for a reply it can parse. Dropping these mode-sets keeps the
-/// outer terminal in normal VT mode so the DSR reply round-trips correctly.
-///
-/// Only complete `CSI ? 9001/1004 h|l` sequences are dropped; the parser is
-/// stateful so sequences split across reads are handled, and every other byte
-/// (including all other escape sequences) passes through unchanged.
-#[derive(Default)]
-struct OutputModeFilter {
-    state: FilterState,
-    buf: Vec<u8>,
-}
-
-#[derive(Default, PartialEq)]
-enum FilterState {
-    #[default]
-    Ground,
-    Esc,
-    Csi,
-}
-
-impl OutputModeFilter {
-    fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
-        for &b in input {
-            match self.state {
-                FilterState::Ground => {
-                    if b == 0x1b {
-                        self.buf.clear();
-                        self.buf.push(b);
-                        self.state = FilterState::Esc;
-                    } else {
-                        out.push(b);
-                    }
-                }
-                FilterState::Esc => {
-                    self.buf.push(b);
-                    if b == b'[' {
-                        self.state = FilterState::Csi;
-                    } else {
-                        // Not a CSI sequence — pass through untouched.
-                        out.extend_from_slice(&self.buf);
-                        self.buf.clear();
-                        self.state = FilterState::Ground;
-                    }
-                }
-                FilterState::Csi => {
-                    self.buf.push(b);
-                    if (0x40..=0x7e).contains(&b) {
-                        if !self.is_blocked() {
-                            out.extend_from_slice(&self.buf);
-                        }
-                        self.buf.clear();
-                        self.state = FilterState::Ground;
-                    } else if self.buf.len() > 32 {
-                        // Malformed/overlong — give up filtering, emit as-is.
-                        out.extend_from_slice(&self.buf);
-                        self.buf.clear();
-                        self.state = FilterState::Ground;
-                    }
-                }
-            }
-        }
-    }
-
-    fn is_blocked(&self) -> bool {
-        self.buf.starts_with(b"\x1b[?9001") || self.buf.starts_with(b"\x1b[?1004")
-    }
-
-    /// True when the filter is not mid-sequence (no incomplete ESC/CSI held).
-    /// The reader thread gates title-OSC writes on this so a title escape is
-    /// never interleaved into an incomplete sequence still being assembled.
-    fn at_ground(&self) -> bool {
-        self.state == FilterState::Ground
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{OutputModeFilter, is_cmd_script, wait_child_blocking};
+    use super::{is_cmd_script, wait_child_blocking};
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
@@ -918,38 +992,8 @@ mod tests {
         assert!(!is_cmd_script("noext."));
     }
 
-    fn run(chunks: &[&[u8]]) -> Vec<u8> {
-        let mut f = OutputModeFilter::default();
-        let mut out = Vec::new();
-        for c in chunks {
-            f.filter(c, &mut out);
-        }
-        out
-    }
-
-    #[test]
-    fn drops_win32_and_focus_mode_sets() {
-        // ESC[?9001h ESC[?1004h "hi" ESC[6n
-        let input = b"\x1b[?9001h\x1b[?1004h hi \x1b[6n";
-        assert_eq!(run(&[input]), b" hi \x1b[6n");
-    }
-
-    #[test]
-    fn passes_other_sequences_and_text() {
-        let input = b"\x1b[31mred\x1b[0m\x1b[2J plain";
-        assert_eq!(run(&[input]), input);
-    }
-
-    #[test]
-    fn handles_sequence_split_across_reads() {
-        // ESC[?9001h split mid-sequence must still be dropped.
-        assert_eq!(run(&[b"\x1b[?90", b"01h", b"X"]), b"X");
-    }
-
-    #[test]
-    fn drops_mode_reset_too() {
-        assert_eq!(run(&[b"\x1b[?9001l\x1b[?1004lY"]), b"Y");
-    }
+    // OutputModeFilter and its tests now live in `super::shared` so they run on
+    // the (non-Windows) host gate rather than being cross-compiled only.
 }
 
 /// A job object whose assigned processes are killed when the handle closes.

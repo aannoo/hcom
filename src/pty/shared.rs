@@ -275,37 +275,33 @@ pub(super) fn publish_approval_status(
     }
 }
 
-/// Marker error: the delivery thread was spawned, but its init result did not
-/// arrive within the timeout (or the channel disconnected).
+/// Outcome of [`start_delivery_thread`].
 ///
-/// The spawned thread is detached and still running — it may yet finish
-/// `initialize_delivery_components` and enter `run_delivery_loop`. A caller that
-/// retries `start_delivery_thread` on a plain init `Err` MUST NOT retry on this
-/// one, or it would spawn a *second* delivery thread alongside the first (no
-/// singleton guard in `run_delivery_loop`) and double-deliver. Callers detect it
-/// with `err.downcast_ref::<DeliveryStartTimeout>()`.
-#[derive(Debug)]
-pub(super) struct DeliveryStartTimeout;
-
-impl std::fmt::Display for DeliveryStartTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "delivery thread initialization timed out")
-    }
+/// `Result::Err` (distinct from every variant here) is an up-front init failure:
+/// the spawned thread already returned, so the attempt is safely **retryable**.
+pub(super) enum DeliveryStart {
+    /// Init succeeded (DB opened, notify server created). Join the handle at
+    /// shutdown.
+    Started(JoinHandle<()>),
+    /// No instance name (delivery disabled). No thread was spawned.
+    Disabled,
+    /// The thread was spawned but its init result was not observed within the
+    /// timeout (or the init channel disconnected). It is detached and may still
+    /// be initializing, so it MUST be joined at shutdown and MUST NOT be retried
+    /// — a retry would spawn a *second* delivery thread alongside it (there is no
+    /// singleton guard in `run_delivery_loop`) and double-deliver.
+    Pending(JoinHandle<()>),
 }
-
-impl std::error::Error for DeliveryStartTimeout {}
 
 /// Start the delivery thread (and transcript watcher for Codex).
 ///
-/// Returns `Ok(Some(handle))` when the delivery thread initialized successfully
-/// (DB opened, notify server created). Returns `Ok(None)` when there is no
-/// instance name (delivery disabled). Returns `Err` if initialization failed —
-/// the caller maps that to a launch failure.
-///
-/// The `Err` is a [`DeliveryStartTimeout`] when the thread was spawned but its
-/// init result timed out (the thread is detached and still live); any other
-/// `Err` means init failed up front and no thread is running. Retrying callers
-/// must distinguish the two — see [`DeliveryStartTimeout`].
+/// Returns [`DeliveryStart::Started`] when the delivery thread initialized
+/// successfully (DB opened, notify server created), [`DeliveryStart::Disabled`]
+/// when there is no instance name, and [`DeliveryStart::Pending`] when the thread
+/// was spawned but its init result timed out / the channel disconnected (the
+/// thread is detached and still live; non-retryable). Returns `Err` only on an
+/// up-front init failure, where no thread is left running — that case is
+/// retryable and the caller maps it to a launch failure.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_delivery_thread(
     instance_name_cfg: Option<&str>,
@@ -317,7 +313,7 @@ pub(super) fn start_delivery_thread(
     notify_port: Arc<AtomicU16>,
     current_name: Arc<RwLock<String>>,
     current_status: Arc<RwLock<String>>,
-) -> Result<Option<JoinHandle<()>>> {
+) -> Result<DeliveryStart> {
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
         None => {
@@ -333,24 +329,11 @@ pub(super) fn start_delivery_thread(
             "delivery.skip.no_instance_name",
             "No instance name - delivery disabled. Set config.instance_name or HCOM_INSTANCE_NAME env var.",
         );
-        return Ok(None);
+        return Ok(DeliveryStart::Disabled);
     }
 
     // Create oneshot channel for init result
     let (init_tx, init_rx) = mpsc::channel();
-
-    // For Codex: spawn transcript watcher thread
-    if matches!(target.known_tool(), Some(Tool::Codex)) {
-        let watcher_running = running.clone();
-        let watcher_name = instance_name.clone();
-        std::thread::spawn(move || {
-            crate::hooks::codex_file_edits::run_transcript_watcher(
-                watcher_running,
-                watcher_name,
-                Duration::from_secs(5),
-            );
-        });
-    }
 
     let handle = std::thread::spawn(move || {
         log_info(
@@ -389,6 +372,23 @@ pub(super) fn start_delivery_thread(
 
                 // Signal successful initialization to parent
                 let _ = init_tx.send(Ok(()));
+
+                // For Codex: spawn the transcript watcher only after delivery
+                // init has succeeded (#5). Spawning it before init meant a failed
+                // or timed-out init still left an orphan watcher running against a
+                // session that never came up. Init success is reached exactly once
+                // per live delivery thread, so the watcher starts exactly once.
+                if matches!(target.known_tool(), Some(Tool::Codex)) {
+                    let watcher_running = running.clone();
+                    let watcher_name = instance_name.clone();
+                    std::thread::spawn(move || {
+                        crate::hooks::codex_file_edits::run_transcript_watcher(
+                            watcher_running,
+                            watcher_name,
+                            Duration::from_secs(5),
+                        );
+                    });
+                }
                 (db, notify)
             }
             Err(e) => {
@@ -440,7 +440,7 @@ pub(super) fn start_delivery_thread(
                 "delivery.init.success",
                 "Delivery thread initialized successfully",
             );
-            Ok(Some(handle))
+            Ok(DeliveryStart::Started(handle))
         }
         Ok(Err(e)) => {
             log_error(
@@ -456,8 +456,9 @@ pub(super) fn start_delivery_thread(
                 "delivery.init.timeout",
                 "Delivery thread init timed out after 5s",
             );
-            // Detached thread is still running; flag as non-retryable.
-            Err(DeliveryStartTimeout.into())
+            // Detached thread is still running; keep the handle so shutdown can
+            // join it, and flag as non-retryable (Pending).
+            Ok(DeliveryStart::Pending(handle))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             log_error(
@@ -466,10 +467,48 @@ pub(super) fn start_delivery_thread(
                 "Delivery thread init channel disconnected",
             );
             // Sender dropped without sending: thread returned/panicked, possibly
-            // after partial registration. Non-retryable like a timeout.
-            Err(DeliveryStartTimeout.into())
+            // after partial registration. Non-retryable like a timeout; keep the
+            // handle so shutdown can join it.
+            Ok(DeliveryStart::Pending(handle))
         }
     }
+}
+
+/// Decide whether the delivery coordinator should start delivery this tick.
+///
+/// Pure helper so the decision is host-testable (the coordinator itself needs a
+/// live ConPTY). Start once the tool is ready, once the start-timeout has
+/// elapsed, or when we are shutting down.
+///
+/// The shutdown trigger only fires after the child has already exited — `run()`
+/// flips `running` false only once the reader has hit EOF and been joined — so
+/// there is no live child left to inject into and the delivery loop's `while
+/// running` body runs zero iterations (its `register_notify_port` never runs).
+/// This final start therefore exists so init-time registration (DB open, notify
+/// server, inject-port registration) and the loop's post-loop cleanup get a
+/// chance to run and settle the final DB status, not to hand an in-flight `hcom
+/// deliver` a live consumer.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn should_start_delivery(
+    ready: bool,
+    elapsed: Duration,
+    timeout: Duration,
+    shutting_down: bool,
+) -> bool {
+    ready || elapsed > timeout || shutting_down
+}
+
+/// Leading-edge throttle for the `hcom term` screen snapshot the reader renders.
+///
+/// Rendering `get_screen_dump` costs ~150µs on a wide screen, so refreshing it on
+/// every ConPTY chunk would burn measurable CPU (and steal reader time from
+/// draining the pipe) under heavy output. Cap it at one render per `throttle`;
+/// any chunk skipped here is marked dirty and picked up by a single trailing-edge
+/// refresh once output goes quiet (see the reader loop's debounce). Pure so the
+/// decision is host-testable.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn should_refresh_snapshot(since_last_snapshot: Duration, throttle: Duration) -> bool {
+    since_last_snapshot >= throttle
 }
 
 /// Finalize a launch failure once the child has exited before binding.
@@ -626,22 +665,307 @@ pub(super) fn build_early_launch_context() -> String {
     Value::Object(ctx).to_string()
 }
 
+/// True when `seq` is the terminal's cursor-position query (`ESC[6n`, a DSR
+/// with parameter 6). In headless mode there is no outer terminal to answer it,
+/// so the reader must reply on the child's behalf or startup hangs (#1).
+///
+/// Deliberately narrow: only the bare `ESC[6n` query matches. A CPR *reply*
+/// (`ESC[<r>;<c>R`), a private DSR (`ESC[?6n`), and a parameterless `ESC[n`
+/// must not match — we only synthesize a reply to the child's own query.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn csi_is_dsr_cpr(seq: &[u8]) -> bool {
+    seq == b"\x1b[6n"
+}
+
+/// Rebuild a DEC private mode-set (`ESC[? … h|l`), dropping only the Win32-input
+/// (`9001`) and focus-reporting (`1004`) parameters and keeping every other mode
+/// (#15).
+///
+/// The previous whole-prefix match (`starts_with(b"\x1b[?9001")`) dropped or kept
+/// the entire CSI, so `ESC[?9001;25h` lost mode 25 and `ESC[?25;9001h` leaked
+/// 9001 to the outer terminal. Filtering per parameter fixes both. Returns an
+/// empty `Vec` when every parameter was dropped (emit nothing).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn filter_dec_private_modes(seq: &[u8]) -> Vec<u8> {
+    let final_byte = *seq.last().unwrap();
+    let params = &seq[3..seq.len() - 1];
+    let kept: Vec<&[u8]> = params
+        .split(|&b| b == b';')
+        .filter(|p| *p != b"9001" && *p != b"1004")
+        .collect();
+    if kept.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(seq.len());
+    out.extend_from_slice(b"\x1b[?");
+    for (i, p) in kept.iter().enumerate() {
+        if i > 0 {
+            out.push(b';');
+        }
+        out.extend_from_slice(p);
+    }
+    out.push(final_byte);
+    out
+}
+
+/// Rewrites the child's DEC private-mode **sets** so the *outer* terminal is
+/// never switched into Win32 input mode (`?9001`) or focus reporting (`?1004`),
+/// and notices the child's cursor-position query (`ESC[6n`) so a headless reader
+/// can answer it.
+///
+/// A ConPTY wrapper sits between the child and the real terminal. If the child's
+/// `ESC[?9001h` reaches the outer terminal, that terminal starts encoding its
+/// input — including its automatic `ESC[6n` (cursor position) reply — as Win32
+/// input records. The child, which only understands a plain `ESC[15;1R`, then
+/// waits forever for a reply it can parse. Stripping those mode-sets keeps the
+/// outer terminal in normal VT mode so the DSR reply round-trips correctly.
+///
+/// The parser is stateful so sequences split across reads are handled, and every
+/// other byte (including all other escape sequences) passes through unchanged.
+/// DSR queries are still passed through: in interactive mode the real terminal
+/// must see them to answer; the headless reply is gated separately in win.rs.
+///
+/// Lives here (rather than in `win.rs`) so its correctness-critical parsing runs
+/// under the host test gate; `win.rs` owns only the headless DSR-reply write.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Default)]
+pub(super) struct OutputModeFilter {
+    state: FilterState,
+    buf: Vec<u8>,
+    dsr_seen: bool,
+}
+
+#[derive(Default, PartialEq)]
+enum FilterState {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl OutputModeFilter {
+    pub(super) fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        for &b in input {
+            match self.state {
+                FilterState::Ground => {
+                    if b == 0x1b {
+                        self.buf.clear();
+                        self.buf.push(b);
+                        self.state = FilterState::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                FilterState::Esc => {
+                    self.buf.push(b);
+                    if b == b'[' {
+                        self.state = FilterState::Csi;
+                    } else {
+                        // Not a CSI sequence — pass through untouched.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::Ground;
+                    }
+                }
+                FilterState::Csi => {
+                    self.buf.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        // Completed CSI. Notice the child's cursor-position query
+                        // (still pass it through — interactive needs the real
+                        // terminal to answer), and filter DEC private mode-sets
+                        // per-parameter.
+                        if csi_is_dsr_cpr(&self.buf) {
+                            self.dsr_seen = true;
+                        }
+                        if self.buf.starts_with(b"\x1b[?") && matches!(b, b'h' | b'l') {
+                            out.extend_from_slice(&filter_dec_private_modes(&self.buf));
+                        } else {
+                            out.extend_from_slice(&self.buf);
+                        }
+                        self.buf.clear();
+                        self.state = FilterState::Ground;
+                    } else if self.buf.len() > 32 {
+                        // Malformed/overlong — give up filtering, emit as-is.
+                        // Combined mode-sets are short, so this never trips on a
+                        // legitimate `?9001`/`?1004` sequence.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::Ground;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One-shot: returns `true` once after a cursor-position query (`ESC[6n`)
+    /// was seen, then resets. The reader uses it to reply on the child's behalf
+    /// when running headless.
+    pub(super) fn take_dsr(&mut self) -> bool {
+        std::mem::take(&mut self.dsr_seen)
+    }
+
+    /// True when the filter is not mid-sequence (no incomplete ESC/CSI held).
+    /// The reader thread gates title-OSC writes on this so a title escape is
+    /// never interleaved into an incomplete sequence still being assembled.
+    pub(super) fn at_ground(&self) -> bool {
+        self.state == FilterState::Ground
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::status_icon;
 
     #[test]
-    fn delivery_start_timeout_downcasts_through_anyhow() {
-        // The Windows reader gates its no-retry decision on downcasting the
-        // start_delivery_thread error to DeliveryStartTimeout. Guard that the
-        // marker survives the anyhow round-trip and that an ordinary error does
-        // not match it.
-        let timeout: anyhow::Error = DeliveryStartTimeout.into();
-        assert!(timeout.downcast_ref::<DeliveryStartTimeout>().is_some());
+    fn should_start_delivery_on_ready() {
+        // Ready alone starts delivery even well before the timeout.
+        assert!(should_start_delivery(
+            true,
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+            false,
+        ));
+    }
 
-        let other = anyhow::anyhow!("Failed to open database");
-        assert!(other.downcast_ref::<DeliveryStartTimeout>().is_none());
+    #[test]
+    fn should_start_delivery_on_timeout() {
+        // #8 regression: not ready, but elapsed exceeded the timeout → start.
+        assert!(should_start_delivery(
+            false,
+            Duration::from_secs(11),
+            Duration::from_secs(10),
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_start_delivery_on_shutdown() {
+        // Shutting down forces a final start (child already exited) so init-time
+        // registration and post-loop cleanup run, even if never ready and still
+        // inside the timeout.
+        assert!(should_start_delivery(
+            false,
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+            true,
+        ));
+    }
+
+    #[test]
+    fn should_not_start_delivery_before_ready_or_timeout() {
+        // #8 regression: not ready and still inside the timeout window while
+        // running → must NOT start yet (the old reader could start too early).
+        assert!(!should_start_delivery(
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_refresh_snapshot_only_after_throttle_elapsed() {
+        let throttle = Duration::from_millis(100);
+        // Fresh chunk right after a refresh: defer (mark dirty), don't re-render.
+        assert!(!should_refresh_snapshot(Duration::from_millis(0), throttle));
+        assert!(!should_refresh_snapshot(
+            Duration::from_millis(99),
+            throttle
+        ));
+        // At/after the throttle window: render now (leading edge).
+        assert!(should_refresh_snapshot(
+            Duration::from_millis(100),
+            throttle
+        ));
+        assert!(should_refresh_snapshot(
+            Duration::from_millis(250),
+            throttle
+        ));
+    }
+
+    #[test]
+    fn csi_is_dsr_cpr_matches_only_the_cursor_position_query() {
+        assert!(csi_is_dsr_cpr(b"\x1b[6n"));
+        // A CPR reply, a private DSR, and a bare DSR must not match.
+        assert!(!csi_is_dsr_cpr(b"\x1b[6;1R"));
+        assert!(!csi_is_dsr_cpr(b"\x1b[?6n"));
+        assert!(!csi_is_dsr_cpr(b"\x1b[n"));
+    }
+
+    fn filter_modes(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+        for c in chunks {
+            f.filter(c, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn filter_dec_private_modes_drops_only_targeted_params() {
+        // Whole-prefix regression (#15): a targeted param anywhere in the list
+        // must be dropped without losing the others, in either order.
+        assert_eq!(filter_dec_private_modes(b"\x1b[?9001;25h"), b"\x1b[?25h");
+        assert_eq!(filter_dec_private_modes(b"\x1b[?25;9001h"), b"\x1b[?25h");
+        assert_eq!(
+            filter_dec_private_modes(b"\x1b[?1004;2004h"),
+            b"\x1b[?2004h"
+        );
+        assert_eq!(filter_dec_private_modes(b"\x1b[?9001;1004h"), b"");
+        assert_eq!(
+            filter_dec_private_modes(b"\x1b[?9001;1004;25h"),
+            b"\x1b[?25h"
+        );
+        assert_eq!(filter_dec_private_modes(b"\x1b[?25;9001l"), b"\x1b[?25l");
+    }
+
+    #[test]
+    fn output_mode_filter_drops_win32_and_focus_mode_sets() {
+        // ESC[?9001h ESC[?1004h "hi" ESC[6n — mode-sets dropped, DSR passes.
+        let input = b"\x1b[?9001h\x1b[?1004h hi \x1b[6n";
+        assert_eq!(filter_modes(&[input]), b" hi \x1b[6n");
+    }
+
+    #[test]
+    fn output_mode_filter_passes_other_sequences_and_text() {
+        let input = b"\x1b[31mred\x1b[0m\x1b[2J plain";
+        assert_eq!(filter_modes(&[input]), input);
+    }
+
+    #[test]
+    fn output_mode_filter_keeps_other_modes_in_a_combined_set() {
+        // #15: mixed sets keep non-targeted modes and drop targeted ones,
+        // regardless of parameter order.
+        assert_eq!(filter_modes(&[b"\x1b[?9001;25h"]), b"\x1b[?25h");
+        assert_eq!(filter_modes(&[b"\x1b[?25;9001h"]), b"\x1b[?25h");
+        assert_eq!(filter_modes(&[b"\x1b[4h\x1b[?25h"]), b"\x1b[4h\x1b[?25h");
+    }
+
+    #[test]
+    fn output_mode_filter_handles_sequence_split_across_reads() {
+        // A combined set split mid-sequence still filters per-parameter.
+        assert_eq!(filter_modes(&[b"\x1b[?25;90", b"01h"]), b"\x1b[?25h");
+        // The pure Win32-input set split mid-sequence is still fully dropped.
+        assert_eq!(filter_modes(&[b"\x1b[?90", b"01h", b"X"]), b"X");
+    }
+
+    #[test]
+    fn output_mode_filter_drops_mode_reset_too() {
+        assert_eq!(filter_modes(&[b"\x1b[?9001l\x1b[?1004lY"]), b"Y");
+    }
+
+    #[test]
+    fn output_mode_filter_take_dsr_is_one_shot() {
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+        f.filter(b"\x1b[6n", &mut out);
+        // DSR passes through to the outer terminal...
+        assert_eq!(out, b"\x1b[6n");
+        // ...and is latched exactly once.
+        assert!(f.take_dsr());
+        assert!(!f.take_dsr());
     }
 
     #[test]
