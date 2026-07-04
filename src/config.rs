@@ -1700,8 +1700,14 @@ mod tests {
 
         config.terminal = "KITTY".to_string();
         let errors = config.collect_errors();
-        assert!(!errors.contains_key("terminal"));
-        assert_eq!(config.terminal, "kitty");
+        assert_eq!(config.terminal, "kitty"); // Normalized regardless of platform
+        // kitty is Darwin/Linux-only (DL); on Windows it's correctly rejected
+        // by the platform-availability check added for finding #17.
+        if crate::shared::platform::platform_name() == "Windows" {
+            assert!(errors.contains_key("terminal"));
+        } else {
+            assert!(!errors.contains_key("terminal"));
+        }
     }
 
     #[test]
