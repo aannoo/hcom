@@ -335,20 +335,28 @@ impl HcomConfig {
             errors.insert("terminal".into(), "terminal cannot be empty".into());
         } else if self.terminal != "default" && self.terminal != "print" && self.terminal != "here"
         {
-            // Check against built-in presets + user-defined TOML presets
-            let known =
-                is_known_terminal_preset(&self.terminal) || is_user_defined_preset(&self.terminal);
-            if !known {
-                // Not a known preset — must be a custom command with {script}
-                if !self.terminal.contains("{script}") {
+            let platform = crate::shared::platform::platform_name();
+            if is_user_defined_preset(&self.terminal) {
+                // User TOML presets declare no platform and override any built-in
+                // of the same name — exempt from the built-in platform gate.
+            } else if is_known_terminal_preset(&self.terminal) {
+                if !terminal_preset_supported_on(&self.terminal, platform) {
                     errors.insert(
                         "terminal".into(),
                         format!(
-                            "terminal must be 'default', preset name, or custom command with {{script}}, got '{}'",
-                            self.terminal
+                            "terminal preset '{}' is not available on {}",
+                            self.terminal, platform
                         ),
                     );
                 }
+            } else if !self.terminal.contains("{script}") {
+                errors.insert(
+                    "terminal".into(),
+                    format!(
+                        "terminal must be 'default', preset name, or custom command with {{script}}, got '{}'",
+                        self.terminal
+                    ),
+                );
             }
         }
 
@@ -985,6 +993,14 @@ fn is_known_terminal_preset(name: &str) -> bool {
         .any(|(p, _)| p.eq_ignore_ascii_case(name))
 }
 
+/// True if `name` is a built-in preset supported on `platform`
+/// ("Darwin"/"Linux"/"Windows", see `crate::shared::platform::platform_name`).
+pub fn terminal_preset_supported_on(name: &str, platform: &str) -> bool {
+    TERMINAL_PRESETS
+        .iter()
+        .any(|(p, preset)| p.eq_ignore_ascii_case(name) && preset.platforms.contains(&platform))
+}
+
 /// Resolve old casing to canonical preset name (e.g., "WezTerm" → "wezterm").
 /// Returns the canonical name if matched, otherwise returns the input unchanged.
 fn normalize_terminal_case(name: &str) -> String {
@@ -1158,7 +1174,7 @@ fn toml_val_to_argv(v: &toml::Value) -> Result<Option<Vec<String>>, String> {
                      use the array form to avoid shell tokenization issues on Windows: {s:?}"
                 );
             }
-            match crate::tools::args_common::shell_split(s) {
+            match crate::tools::args_common::shell_split(s, cfg!(windows)) {
                 Ok(argv) if !argv.is_empty() => Ok(Some(argv)),
                 Ok(_) => Ok(None),
                 Err(e) => Err(format!("invalid quoting in preset command: {e}")),
@@ -1685,8 +1701,14 @@ mod tests {
 
         config.terminal = "KITTY".to_string();
         let errors = config.collect_errors();
-        assert!(!errors.contains_key("terminal"));
-        assert_eq!(config.terminal, "kitty");
+        assert_eq!(config.terminal, "kitty"); // Normalized regardless of platform
+        // kitty is Darwin/Linux-only (DL); on Windows it's correctly rejected
+        // by the platform-availability check added for finding #17.
+        if crate::shared::platform::platform_name() == "Windows" {
+            assert!(errors.contains_key("terminal"));
+        } else {
+            assert!(!errors.contains_key("terminal"));
+        }
     }
 
     #[test]
@@ -1704,6 +1726,9 @@ mod tests {
 
     #[test]
     fn test_terminal_known_presets_accepted() {
+        // Finding 17: presets are now validated against the host platform, so
+        // only assert presets that are actually supported here.
+        let platform = crate::shared::platform::platform_name();
         let mut config = HcomConfig::default();
         for preset in &[
             "kitty",
@@ -1713,12 +1738,28 @@ mod tests {
             "terminal.app",
             "iterm",
         ] {
+            if !terminal_preset_supported_on(preset, platform) {
+                continue;
+            }
             config.terminal = preset.to_string();
             assert!(
                 !config.collect_errors().contains_key("terminal"),
-                "preset '{preset}' should be valid"
+                "preset '{preset}' should be valid on {platform}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn wrong_platform_builtin_preset_is_rejected() {
+        // Finding 17: a built-in preset not available on the host platform
+        // (here, "wttab" is Windows-only) must be rejected at validation time,
+        // not just silently accepted and left to fail at launch.
+        let mut config = HcomConfig {
+            terminal: "wttab".to_string(),
+            ..HcomConfig::default()
+        };
+        assert!(config.collect_errors().contains_key("terminal"));
     }
 
     #[test]
@@ -2200,6 +2241,51 @@ binary = "myterm"
         assert_eq!(
             toml_val_to_argv(&toml::Value::String(String::new())),
             Ok(None)
+        );
+    }
+
+    // B-1: a user-defined `[terminal.presets.<builtin>]` override declares no
+    // platform and takes precedence over the built-in, so it must be accepted
+    // even on a platform where the built-in itself is unavailable.
+    #[test]
+    #[serial]
+    fn user_defined_override_exempt_from_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        // A built-in preset NOT available on the current host platform.
+        let builtin = match platform {
+            // windows-terminal is Windows-only.
+            "Darwin" | "Linux" => "windows-terminal",
+            // iterm is Darwin-only.
+            _ => "iterm",
+        };
+
+        // Control: without any user override the wrong-platform built-in is
+        // rejected at validate time.
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "built-in {builtin} should be rejected on {platform} without a user override"
+        );
+
+        // Define a user preset with the SAME name — it must now be accepted.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!(
+                "[terminal.presets.{builtin}]\nopen = \"{builtin} -- powershell -File {{script}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !cfg.collect_errors().contains_key("terminal"),
+            "user-defined override of {builtin} must be accepted on {platform}"
         );
     }
 

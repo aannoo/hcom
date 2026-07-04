@@ -471,6 +471,13 @@ pub fn which_bin(name: &str) -> Option<String> {
     None
 }
 
+/// Resolve the `bash` command to run on Unix, preferring a `PATH` match and
+/// falling back to `/bin/bash`. Shared by the background and run-here launch
+/// paths so they can't drift on which `bash` gets invoked.
+fn resolve_bash_command() -> String {
+    which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string())
+}
+
 /// Check if a file has a node shebang (#!/usr/bin/env node or similar).
 /// Used on Termux to detect npm-installed tools that need `node <path>` rewrite.
 pub fn has_node_shebang(path: &str) -> bool {
@@ -593,33 +600,70 @@ fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) 
     }
 }
 
-/// Rewrite a `bash {script}` executor pair to PowerShell in a custom
-/// (non-preset) command argv, so the generated `.ps1` runs on Windows without
-/// requiring Git Bash on PATH. Matches an adjacent `bash` + `{script}` pair
-/// anywhere in the argv — not just at argv[0] — mirroring the old
-/// `windows_shellify_preset` substring replacement of `"bash {script}"`. A
-/// `bash` with intervening flags (e.g. `bash -c {script}`) has no adjacent
-/// `{script}` and is intentionally left untouched, avoiding a broken splice.
+/// True if `tok` names a bash-family interpreter — its file stem is `bash`
+/// (case-insensitive), covering `bash`, `bash.exe`, `/bin/bash`, and
+/// `C:\...\bash.exe`.
+#[cfg(any(windows, test))]
+fn is_bash_interp(tok: &str) -> bool {
+    std::path::Path::new(tok)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"))
+}
+
+/// Detect an unrunnable non-adjacent bash-family `{script}` custom template: a
+/// bash-family interpreter token (`bash`, `bash.exe`, `/bin/bash`, …) with a
+/// LATER (non-adjacent) `{script}`, so the generated `.ps1` would be handed to
+/// bash and can't be rewritten by a simple splice — e.g. `bash -c {script}`,
+/// `bash -x {script}`, `bash.exe -i {script}`. Returns the offending
+/// interpreter token. Adjacent `<interp> {script}` is handled by
+/// `shellify_bash_script_pair` and is NOT flagged.
+#[cfg(any(windows, test))]
+fn unsupported_bash_script_interp(argv: &[String]) -> Option<String> {
+    let interp = argv.iter().position(|a| is_bash_interp(a))?;
+    let script = argv.iter().position(|a| a.contains("{script}"))?;
+    if script <= interp + 1 {
+        return None;
+    }
+    Some(argv[interp].clone())
+}
+
+/// Rewrite an adjacent bash-family `{script}` executor pair to PowerShell in a
+/// custom (non-preset) command argv, so the generated `.ps1` runs on Windows
+/// without requiring Git Bash on PATH. Matches an adjacent `<interp>` +
+/// `{script}` pair anywhere in the argv — not just at argv[0] — where
+/// `<interp>` is any bash-family token (`bash`, `bash.exe`, `/bin/bash`, …).
+/// A bash-family token with a NON-adjacent `{script}` (e.g. `bash -c {script}`)
+/// can't be rewritten by a simple splice — it is rejected with a clear error
+/// instead of silently launching a broken command (see
+/// `unsupported_bash_script_interp`).
 ///
 /// Off Windows this is a passthrough (the generated script is a bash script).
 #[cfg(not(windows))]
-fn windows_shellify_custom_argv(argv: Vec<String>) -> Vec<String> {
-    argv
+fn windows_shellify_custom_argv(argv: Vec<String>) -> Result<Vec<String>> {
+    Ok(argv)
 }
 
 #[cfg(windows)]
-fn windows_shellify_custom_argv(argv: Vec<String>) -> Vec<String> {
-    shellify_bash_script_pair(argv)
+fn windows_shellify_custom_argv(argv: Vec<String>) -> Result<Vec<String>> {
+    if let Some(interp) = unsupported_bash_script_interp(&argv) {
+        bail!(
+            "custom terminal command runs `{interp}` with a non-adjacent `{{script}}` and \
+             cannot run the generated PowerShell script on Windows; use `{interp} {{script}}` \
+             (adjacent, no flags) or a native command"
+        );
+    }
+    Ok(shellify_bash_script_pair(argv))
 }
 
-/// Replace an adjacent `bash` + `{script}` pair with the PowerShell `.ps1`
+/// Replace an adjacent bash-family + `{script}` pair with the PowerShell `.ps1`
 /// launcher. Platform-agnostic so it can be unit-tested on any host; the
 /// `windows_shellify_custom_argv` wrapper only applies it on Windows.
 #[cfg(any(windows, test))]
 fn shellify_bash_script_pair(mut argv: Vec<String>) -> Vec<String> {
     if let Some(i) = argv
         .windows(2)
-        .position(|w| w[0] == "bash" && w[1] == "{script}")
+        .position(|w| is_bash_interp(&w[0]) && w[1] == "{script}")
     {
         argv.splice(
             i..i + 1,
@@ -1320,6 +1364,16 @@ fn write_warp_launch_config_at(
     Ok(yaml_path)
 }
 
+/// Human-readable name for the Windows default-terminal fallback, mirroring
+/// `windows_default_terminal_template`'s `has_wt` branch.
+fn windows_default_terminal_display_name(has_wt: bool) -> &'static str {
+    if has_wt {
+        "Windows Terminal"
+    } else {
+        "cmd.exe"
+    }
+}
+
 /// Return a human-readable name for the platform's built-in fallback terminal
 /// (used when `terminal = "default"` and no terminal is detected from env).
 pub fn get_default_fallback_terminal_name() -> &'static str {
@@ -1345,6 +1399,7 @@ pub fn get_default_fallback_terminal_name() -> &'static str {
                 "none"
             }
         }
+        "Windows" => windows_default_terminal_display_name(which_bin("wt").is_some()),
         _ => "unknown",
     }
 }
@@ -1387,17 +1442,18 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
     None
 }
 
-/// Default Windows terminal launch argv ({script} substituted by the caller).
+/// Default Windows terminal launch argv template ({script} substituted by
+/// the caller). Host-testable: takes `has_wt` explicitly instead of probing.
 ///
 /// Prefers Windows Terminal, which parses everything after `--` as a literal
 /// argv so a script path with spaces stays a single argument. Without it, opens
 /// a fresh console via cmd's `start` (the empty arg is start's window-title
-/// slot; the path is quoted so start keeps spaces together). Either way the
-/// shell runs the generated `.ps1` with the execution policy bypassed and stays
-/// open (`-NoExit`) for the new window.
-fn get_windows_terminal_argv() -> Vec<String> {
+/// slot; `{script}` is bare — `Command`'s Windows argv quoting adds quotes
+/// only when needed). Either way the shell runs the generated `.ps1` with the
+/// execution policy bypassed and stays open (`-NoExit`) for the new window.
+fn windows_default_terminal_template(has_wt: bool) -> Vec<String> {
     let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
-    if which_bin("wt").is_some() {
+    if has_wt {
         return to_vec(&[
             "wt",
             "--",
@@ -1419,8 +1475,13 @@ fn get_windows_terminal_argv() -> Vec<String> {
         "Bypass",
         "-NoExit",
         "-File",
-        "\"{script}\"",
+        "{script}",
     ])
+}
+
+/// Default Windows terminal launch argv ({script} substituted by the caller).
+fn get_windows_terminal_argv() -> Vec<String> {
+    windows_default_terminal_template(which_bin("wt").is_some())
 }
 
 /// Spawn terminal process, detached when inside AI tools.
@@ -1748,7 +1809,7 @@ pub fn launch_terminal(
             c.args(["-ExecutionPolicy", "Bypass", "-File"]);
             c
         } else {
-            Command::new("bash")
+            Command::new(resolve_bash_command())
         };
         cmd.arg(&script_file)
             .stdin(std::process::Stdio::null())
@@ -1792,7 +1853,7 @@ pub fn launch_terminal(
             c.args(["-ExecutionPolicy", "Bypass", "-File"]);
             c
         } else {
-            Command::new(which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string()))
+            Command::new(resolve_bash_command())
         };
         cmd.arg(script_file).env_clear().envs(&full_env);
         let err = crate::sys::process::exec_replace(cmd);
@@ -1803,6 +1864,22 @@ pub fn launch_terminal(
     let custom_cmd: Option<Vec<String>> = if terminal_mode == "default" {
         None
     } else if crate::config::get_merged_preset(&terminal_mode).is_some() {
+        // Built-in presets not available on this platform are rejected here too
+        // (not just at config-validation time) so HCOM_TERMINAL can't bypass the
+        // check. User-defined TOML presets declare no platform and are exempt.
+        if crate::config::is_known_terminal_preset_pub(&terminal_mode)
+            && !crate::config::is_user_defined_preset(&terminal_mode)
+            && !crate::config::terminal_preset_supported_on(
+                &terminal_mode,
+                platform::platform_name(),
+            )
+        {
+            bail!(
+                "terminal preset '{}' is not available on {}",
+                terminal_mode,
+                platform::platform_name()
+            );
+        }
         // Known preset — check kitty remote control requirements
         if terminal_mode == "kitty-tab" || terminal_mode == "kitty-split" {
             let listen_on = std::env::var("KITTY_LISTEN_ON")
@@ -1853,12 +1930,12 @@ pub fn launch_terminal(
         // Windows (instead of a POSIX escape), so Windows paths like
         // `C:\Tools\term.exe` supplied via HCOM_TERMINAL survive intact without
         // any pre-processing here.
-        let argv = match crate::tools::args_common::shell_split(&terminal_mode) {
+        let argv = match crate::tools::args_common::shell_split(&terminal_mode, cfg!(windows)) {
             Ok(argv) if !argv.is_empty() => argv,
             Ok(_) => bail!("custom terminal command is empty"),
             Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
         };
-        Some(windows_shellify_custom_argv(argv))
+        Some(windows_shellify_custom_argv(argv)?)
     };
 
     let script_str = script_file.to_string_lossy().to_string();
@@ -2312,6 +2389,21 @@ mod tests {
         let mut expected = vec!["myterm".to_string(), "--".to_string()];
         expected.extend(PS.iter().map(|s| s.to_string()));
         assert_eq!(shellify(&["myterm", "--", "bash", "{script}"]), expected);
+        // `gnome-terminal -- bash {script}` is adjacent → rewritten, not bailed.
+        let mut expected = vec!["gnome-terminal".to_string(), "--".to_string()];
+        expected.extend(PS.iter().map(|s| s.to_string()));
+        assert_eq!(
+            shellify(&["gnome-terminal", "--", "bash", "{script}"]),
+            expected
+        );
+    }
+
+    #[test]
+    fn shellify_rewrites_bash_family_interpreters() {
+        // B-3+B-4: any bash-family token (bash.exe, /bin/bash) adjacent to
+        // {script} is rewritten, not just the exact `bash`.
+        assert_eq!(shellify(&["bash.exe", "{script}"]), PS);
+        assert_eq!(shellify(&["/bin/bash", "{script}"]), PS);
     }
 
     #[test]
@@ -3321,5 +3413,90 @@ mod tests {
         } else {
             assert!(resolved.is_none());
         }
+    }
+
+    // Finding 22: the no-`wt` `cmd /c start` branch used to bake literal `"`
+    // quotes around `{script}`, which collided with `Command`'s own Windows
+    // argv quoting on spaced paths. `{script}` is now bare.
+    #[test]
+    fn windows_cmd_fallback_leaves_spaced_script_unquoted() {
+        let tmpl = windows_default_terminal_template(false);
+        let script = r"C:\Users\a b\hcom\s.ps1";
+        let out: Vec<String> = tmpl.iter().map(|a| a.replace("{script}", script)).collect();
+        assert_eq!(out.last().unwrap(), script);
+        assert!(!out.last().unwrap().contains('"'));
+        assert_eq!(out[3], "");
+    }
+
+    // Finding 19: `hcom status`'s default-terminal display name must track the
+    // same has_wt branch as the launch planner, instead of falling through to
+    // "unknown" on Windows.
+    #[test]
+    fn windows_status_name_tracks_launch_planner() {
+        assert_eq!(windows_default_terminal_template(true)[0], "wt");
+        assert_eq!(
+            windows_default_terminal_display_name(true),
+            "Windows Terminal"
+        );
+        assert_eq!(windows_default_terminal_template(false)[0], "cmd");
+        assert_eq!(windows_default_terminal_display_name(false), "cmd.exe");
+    }
+
+    // B-3+B-4: any bash-family interpreter with a NON-adjacent `{script}` (any
+    // flag, or none) can't be rewritten by `shellify_bash_script_pair`, so on
+    // Windows it must be rejected instead of silently handing a `.ps1` to bash.
+    // Adjacent `<interp> {script}` is rewritten, not flagged.
+    #[test]
+    fn detects_unsupported_bash_c_script() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Non-adjacent {script}, regardless of flag → flagged (returns interp).
+        assert_eq!(
+            unsupported_bash_script_interp(&v(&["bash", "-c", "{script}"])).as_deref(),
+            Some("bash")
+        );
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-x", "{script}"])).is_some());
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-i", "{script}"])).is_some());
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-lc", "{script}"])).is_some());
+        assert_eq!(
+            unsupported_bash_script_interp(&v(&["bash.exe", "-c", "{script}"])).as_deref(),
+            Some("bash.exe")
+        );
+        assert!(unsupported_bash_script_interp(&v(&["/bin/bash", "-c", "{script}"])).is_some());
+        // Adjacent bash-family + {script} → rewritten by shellify, not flagged.
+        assert!(unsupported_bash_script_interp(&v(&["bash", "{script}"])).is_none());
+        assert!(unsupported_bash_script_interp(&v(&["bash.exe", "{script}"])).is_none());
+        assert!(unsupported_bash_script_interp(&v(&["/bin/bash", "{script}"])).is_none());
+        assert!(
+            unsupported_bash_script_interp(&v(&["gnome-terminal", "--", "bash", "{script}"]))
+                .is_none()
+        );
+        // Non-bash command → untouched.
+        assert!(unsupported_bash_script_interp(&v(&["mypowershell", "{script}"])).is_none());
+    }
+
+    // Finding 25: background and run-here launches must resolve `bash` the
+    // same way (PATH match, falling back to `/bin/bash`) so they can't drift.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bash_command_prefers_path_then_fallback() {
+        let r = resolve_bash_command();
+        assert!(r.ends_with("bash"));
+        match which_bin("bash") {
+            Some(p) => assert_eq!(r, p),
+            None => assert_eq!(r, "/bin/bash"),
+        }
+    }
+
+    // Finding 17: built-in preset platform capability, checked against the
+    // real `TERMINAL_PRESETS` table (see src/shared/terminal_presets.rs).
+    #[test]
+    fn terminal_preset_platform_capability() {
+        use crate::config::terminal_preset_supported_on;
+        assert!(terminal_preset_supported_on("iterm", "Darwin"));
+        assert!(!terminal_preset_supported_on("iterm", "Windows"));
+        assert!(terminal_preset_supported_on("wttab", "Windows"));
+        assert!(!terminal_preset_supported_on("wttab", "Darwin"));
+        assert!(terminal_preset_supported_on("wezterm", "Windows"));
+        assert!(!terminal_preset_supported_on("nope", "Darwin"));
     }
 }

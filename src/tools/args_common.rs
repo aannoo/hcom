@@ -17,12 +17,13 @@ pub fn shell_quote(s: &str) -> String {
 /// Split a configured argument string while preserving quoted values.
 ///
 /// Outside quotes, `\` is a POSIX escape character (it consumes the next
-/// character verbatim) on every platform except Windows, where it's treated
-/// as a literal character instead — otherwise unquoted Windows paths like
-/// `C:\Tools\term.exe` get mangled. This only affects the *unquoted* branch:
-/// escapes inside quotes (`\"`, `\\`, `\$`, `` \` ``) are unchanged on every
-/// platform, so quoted strings behave identically everywhere.
-pub fn shell_split(s: &str) -> Result<Vec<String>, String> {
+/// character verbatim) unless `is_windows` is true, in which case it's
+/// treated as a literal character instead — otherwise unquoted Windows paths
+/// like `C:\Tools\term.exe` get mangled. This only affects the *unquoted*
+/// branch: escapes inside quotes (`\"`, `\\`, `\$`, `` \` ``) are unchanged
+/// regardless of `is_windows`, so quoted strings behave identically
+/// everywhere.
+pub fn shell_split(s: &str, is_windows: bool) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut chars = s.chars().peekable();
@@ -55,7 +56,7 @@ pub fn shell_split(s: &str) -> Result<Vec<String>, String> {
         } else if ch == '"' {
             in_double = true;
         } else if ch == '\\' {
-            if cfg!(windows) {
+            if is_windows {
                 current.push(ch);
             } else if let Some(next) = chars.next() {
                 current.push(next);
@@ -92,27 +93,32 @@ mod tests {
 
     #[test]
     fn shell_split_preserves_quoted_values() {
-        assert_eq!(
-            shell_split("--model opus --verbose").unwrap(),
-            vec!["--model", "opus", "--verbose"]
-        );
-        assert_eq!(
-            shell_split("'hello world' --flag").unwrap(),
-            vec!["hello world", "--flag"]
-        );
-        assert!(shell_split("'unterminated").is_err());
+        // Platform-independent: assert equal output for both `is_windows` values.
+        for is_windows in [true, false] {
+            assert_eq!(
+                shell_split("--model opus --verbose", is_windows).unwrap(),
+                vec!["--model", "opus", "--verbose"]
+            );
+            assert_eq!(
+                shell_split("'hello world' --flag", is_windows).unwrap(),
+                vec!["hello world", "--flag"]
+            );
+            assert!(shell_split("'unterminated", is_windows).is_err());
+        }
     }
 
     #[test]
     fn shell_split_unquoted_backslash_is_platform_aware() {
-        let result = shell_split(r"C:\Tools\term.exe --flag").unwrap();
-        if cfg!(windows) {
-            // Literal outside quotes on Windows, so real paths survive intact.
-            assert_eq!(result, vec![r"C:\Tools\term.exe", "--flag"]);
-        } else {
-            // POSIX escape: each `\` consumes the following character.
-            assert_eq!(result, vec!["C:Toolsterm.exe", "--flag"]);
-        }
+        // Literal outside quotes on Windows, so real paths survive intact.
+        assert_eq!(
+            shell_split(r"C:\Tools\term.exe --flag", true).unwrap(),
+            vec![r"C:\Tools\term.exe", "--flag"]
+        );
+        // POSIX escape: each `\` consumes the following character.
+        assert_eq!(
+            shell_split(r"C:\Tools\term.exe --flag", false).unwrap(),
+            vec!["C:Toolsterm.exe", "--flag"]
+        );
     }
 
     #[test]
@@ -122,20 +128,24 @@ mod tests {
         // corrupted quoted escapes like `\"` (they became `\\"`, closing the
         // quote early). The platform branch above only touches the *unquoted*
         // backslash case, so quoted escapes must behave identically everywhere.
-        assert_eq!(
-            shell_split(r#"myterm -e "say \"hi\"""#).unwrap(),
-            vec!["myterm", "-e", "say \"hi\""]
-        );
+        for is_windows in [true, false] {
+            assert_eq!(
+                shell_split(r#"myterm -e "say \"hi\"""#, is_windows).unwrap(),
+                vec!["myterm", "-e", "say \"hi\""]
+            );
+        }
     }
 
     #[test]
     fn shell_split_quoted_windows_path_unaffected_by_platform() {
         // The quoted-escape branch is untouched by the Windows change, so a
         // quoted Windows path was never broken and stays that way.
-        assert_eq!(
-            shell_split(r#""C:\Tools\term.exe" --flag"#).unwrap(),
-            vec![r"C:\Tools\term.exe", "--flag"]
-        );
+        for is_windows in [true, false] {
+            assert_eq!(
+                shell_split(r#""C:\Tools\term.exe" --flag"#, is_windows).unwrap(),
+                vec![r"C:\Tools\term.exe", "--flag"]
+            );
+        }
     }
 
     #[test]
@@ -146,11 +156,13 @@ mod tests {
         // quotes on Windows (see above) — low-impact, since Windows path APIs
         // tolerate redundant separators, and the common single-backslash case
         // now works directly without any workaround.
-        let result = shell_split(r"C:\\Tools\\term.exe").unwrap();
-        if cfg!(windows) {
-            assert_eq!(result, vec![r"C:\\Tools\\term.exe"]);
-        } else {
-            assert_eq!(result, vec![r"C:\Tools\term.exe"]);
-        }
+        assert_eq!(
+            shell_split(r"C:\\Tools\\term.exe", true).unwrap(),
+            vec![r"C:\\Tools\\term.exe"]
+        );
+        assert_eq!(
+            shell_split(r"C:\\Tools\\term.exe", false).unwrap(),
+            vec![r"C:\Tools\term.exe"]
+        );
     }
 }
