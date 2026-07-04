@@ -600,33 +600,43 @@ fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) 
     }
 }
 
-/// Detect an unsupported `bash -c/-lc {script}` custom template: a `bash`
-/// element with a LATER (non-adjacent) `{script}` and a command-string flag
-/// (a `-`-prefixed arg containing `c`, e.g. `-c`/`-lc`) between them. Returns
-/// the offending flag. Adjacent `bash {script}` is handled by
-/// `shellify_bash_script_pair` and is NOT flagged.
+/// True if `tok` names a bash-family interpreter — its file stem is `bash`
+/// (case-insensitive), covering `bash`, `bash.exe`, `/bin/bash`, and
+/// `C:\...\bash.exe`.
 #[cfg(any(windows, test))]
-fn unsupported_bash_c_script_flag(argv: &[String]) -> Option<String> {
-    let bash = argv.iter().position(|a| a == "bash")?;
-    let script = argv.iter().position(|a| a.contains("{script}"))?;
-    if script <= bash + 1 {
-        return None;
-    }
-    argv[bash + 1..script]
-        .iter()
-        .find(|a| a.starts_with('-') && a.trim_start_matches('-').contains('c'))
-        .cloned()
+fn is_bash_interp(tok: &str) -> bool {
+    std::path::Path::new(tok)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"))
 }
 
-/// Rewrite a `bash {script}` executor pair to PowerShell in a custom
-/// (non-preset) command argv, so the generated `.ps1` runs on Windows without
-/// requiring Git Bash on PATH. Matches an adjacent `bash` + `{script}` pair
-/// anywhere in the argv — not just at argv[0] — mirroring the old
-/// `windows_shellify_preset` substring replacement of `"bash {script}"`. A
-/// `bash` with an intervening command-string flag (e.g. `bash -c {script}`)
-/// has no adjacent `{script}` and can't be rewritten by a simple splice —
-/// this is rejected with a clear error instead of silently launching a
-/// broken command (see `unsupported_bash_c_script_flag`).
+/// Detect an unrunnable non-adjacent bash-family `{script}` custom template: a
+/// bash-family interpreter token (`bash`, `bash.exe`, `/bin/bash`, …) with a
+/// LATER (non-adjacent) `{script}`, so the generated `.ps1` would be handed to
+/// bash and can't be rewritten by a simple splice — e.g. `bash -c {script}`,
+/// `bash -x {script}`, `bash.exe -i {script}`. Returns the offending
+/// interpreter token. Adjacent `<interp> {script}` is handled by
+/// `shellify_bash_script_pair` and is NOT flagged.
+#[cfg(any(windows, test))]
+fn unsupported_bash_script_interp(argv: &[String]) -> Option<String> {
+    let interp = argv.iter().position(|a| is_bash_interp(a))?;
+    let script = argv.iter().position(|a| a.contains("{script}"))?;
+    if script <= interp + 1 {
+        return None;
+    }
+    Some(argv[interp].clone())
+}
+
+/// Rewrite an adjacent bash-family `{script}` executor pair to PowerShell in a
+/// custom (non-preset) command argv, so the generated `.ps1` runs on Windows
+/// without requiring Git Bash on PATH. Matches an adjacent `<interp>` +
+/// `{script}` pair anywhere in the argv — not just at argv[0] — where
+/// `<interp>` is any bash-family token (`bash`, `bash.exe`, `/bin/bash`, …).
+/// A bash-family token with a NON-adjacent `{script}` (e.g. `bash -c {script}`)
+/// can't be rewritten by a simple splice — it is rejected with a clear error
+/// instead of silently launching a broken command (see
+/// `unsupported_bash_script_interp`).
 ///
 /// Off Windows this is a passthrough (the generated script is a bash script).
 #[cfg(not(windows))]
@@ -636,23 +646,24 @@ fn windows_shellify_custom_argv(argv: Vec<String>) -> Result<Vec<String>> {
 
 #[cfg(windows)]
 fn windows_shellify_custom_argv(argv: Vec<String>) -> Result<Vec<String>> {
-    if let Some(flag) = unsupported_bash_c_script_flag(&argv) {
+    if let Some(interp) = unsupported_bash_script_interp(&argv) {
         bail!(
-            "custom terminal command `bash {flag} {{script}}` cannot run the generated \
-             PowerShell script on Windows; use `bash {{script}}` (no {flag}) or a native command"
+            "custom terminal command runs `{interp}` with a non-adjacent `{{script}}` and \
+             cannot run the generated PowerShell script on Windows; use `{interp} {{script}}` \
+             (adjacent, no flags) or a native command"
         );
     }
     Ok(shellify_bash_script_pair(argv))
 }
 
-/// Replace an adjacent `bash` + `{script}` pair with the PowerShell `.ps1`
+/// Replace an adjacent bash-family + `{script}` pair with the PowerShell `.ps1`
 /// launcher. Platform-agnostic so it can be unit-tested on any host; the
 /// `windows_shellify_custom_argv` wrapper only applies it on Windows.
 #[cfg(any(windows, test))]
 fn shellify_bash_script_pair(mut argv: Vec<String>) -> Vec<String> {
     if let Some(i) = argv
         .windows(2)
-        .position(|w| w[0] == "bash" && w[1] == "{script}")
+        .position(|w| is_bash_interp(&w[0]) && w[1] == "{script}")
     {
         argv.splice(
             i..i + 1,
@@ -1857,6 +1868,7 @@ pub fn launch_terminal(
         // (not just at config-validation time) so HCOM_TERMINAL can't bypass the
         // check. User-defined TOML presets declare no platform and are exempt.
         if crate::config::is_known_terminal_preset_pub(&terminal_mode)
+            && !crate::config::is_user_defined_preset(&terminal_mode)
             && !crate::config::terminal_preset_supported_on(
                 &terminal_mode,
                 platform::platform_name(),
@@ -2377,6 +2389,21 @@ mod tests {
         let mut expected = vec!["myterm".to_string(), "--".to_string()];
         expected.extend(PS.iter().map(|s| s.to_string()));
         assert_eq!(shellify(&["myterm", "--", "bash", "{script}"]), expected);
+        // `gnome-terminal -- bash {script}` is adjacent → rewritten, not bailed.
+        let mut expected = vec!["gnome-terminal".to_string(), "--".to_string()];
+        expected.extend(PS.iter().map(|s| s.to_string()));
+        assert_eq!(
+            shellify(&["gnome-terminal", "--", "bash", "{script}"]),
+            expected
+        );
+    }
+
+    #[test]
+    fn shellify_rewrites_bash_family_interpreters() {
+        // B-3+B-4: any bash-family token (bash.exe, /bin/bash) adjacent to
+        // {script} is rewritten, not just the exact `bash`.
+        assert_eq!(shellify(&["bash.exe", "{script}"]), PS);
+        assert_eq!(shellify(&["/bin/bash", "{script}"]), PS);
     }
 
     #[test]
@@ -3415,21 +3442,36 @@ mod tests {
         assert_eq!(windows_default_terminal_display_name(false), "cmd.exe");
     }
 
-    // Finding 21: `bash -c {script}` / `bash -lc {script}` in a custom terminal
-    // template has no ADJACENT `bash` + `{script}` pair for `shellify_bash_script_pair`
-    // to rewrite, so on Windows it must be rejected instead of silently launching
-    // a broken command.
+    // B-3+B-4: any bash-family interpreter with a NON-adjacent `{script}` (any
+    // flag, or none) can't be rewritten by `shellify_bash_script_pair`, so on
+    // Windows it must be rejected instead of silently handing a `.ps1` to bash.
+    // Adjacent `<interp> {script}` is rewritten, not flagged.
     #[test]
     fn detects_unsupported_bash_c_script() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(unsupported_bash_c_script_flag(&v(&["bash", "-c", "{script}"])).is_some());
-        assert!(unsupported_bash_c_script_flag(&v(&["bash", "-lc", "{script}"])).is_some());
-        assert!(unsupported_bash_c_script_flag(&v(&["bash", "{script}"])).is_none());
+        // Non-adjacent {script}, regardless of flag → flagged (returns interp).
+        assert_eq!(
+            unsupported_bash_script_interp(&v(&["bash", "-c", "{script}"])).as_deref(),
+            Some("bash")
+        );
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-x", "{script}"])).is_some());
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-i", "{script}"])).is_some());
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-lc", "{script}"])).is_some());
+        assert_eq!(
+            unsupported_bash_script_interp(&v(&["bash.exe", "-c", "{script}"])).as_deref(),
+            Some("bash.exe")
+        );
+        assert!(unsupported_bash_script_interp(&v(&["/bin/bash", "-c", "{script}"])).is_some());
+        // Adjacent bash-family + {script} → rewritten by shellify, not flagged.
+        assert!(unsupported_bash_script_interp(&v(&["bash", "{script}"])).is_none());
+        assert!(unsupported_bash_script_interp(&v(&["bash.exe", "{script}"])).is_none());
+        assert!(unsupported_bash_script_interp(&v(&["/bin/bash", "{script}"])).is_none());
         assert!(
-            unsupported_bash_c_script_flag(&v(&["gnome-terminal", "--", "bash", "{script}"]))
+            unsupported_bash_script_interp(&v(&["gnome-terminal", "--", "bash", "{script}"]))
                 .is_none()
         );
-        assert!(unsupported_bash_c_script_flag(&v(&["mypowershell", "{script}"])).is_none());
+        // Non-bash command → untouched.
+        assert!(unsupported_bash_script_interp(&v(&["mypowershell", "{script}"])).is_none());
     }
 
     // Finding 25: background and run-here launches must resolve `bash` the

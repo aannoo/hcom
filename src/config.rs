@@ -336,7 +336,10 @@ impl HcomConfig {
         } else if self.terminal != "default" && self.terminal != "print" && self.terminal != "here"
         {
             let platform = crate::shared::platform::platform_name();
-            if is_known_terminal_preset(&self.terminal) {
+            if is_user_defined_preset(&self.terminal) {
+                // User TOML presets declare no platform and override any built-in
+                // of the same name — exempt from the built-in platform gate.
+            } else if is_known_terminal_preset(&self.terminal) {
                 if !terminal_preset_supported_on(&self.terminal, platform) {
                     errors.insert(
                         "terminal".into(),
@@ -346,8 +349,6 @@ impl HcomConfig {
                         ),
                     );
                 }
-            } else if is_user_defined_preset(&self.terminal) {
-                // User TOML presets declare no platform — leave as-is.
             } else if !self.terminal.contains("{script}") {
                 errors.insert(
                     "terminal".into(),
@@ -2240,6 +2241,51 @@ binary = "myterm"
         assert_eq!(
             toml_val_to_argv(&toml::Value::String(String::new())),
             Ok(None)
+        );
+    }
+
+    // B-1: a user-defined `[terminal.presets.<builtin>]` override declares no
+    // platform and takes precedence over the built-in, so it must be accepted
+    // even on a platform where the built-in itself is unavailable.
+    #[test]
+    #[serial]
+    fn user_defined_override_exempt_from_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        // A built-in preset NOT available on the current host platform.
+        let builtin = match platform {
+            // windows-terminal is Windows-only.
+            "Darwin" | "Linux" => "windows-terminal",
+            // iterm is Darwin-only.
+            _ => "iterm",
+        };
+
+        // Control: without any user override the wrong-platform built-in is
+        // rejected at validate time.
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "built-in {builtin} should be rejected on {platform} without a user override"
+        );
+
+        // Define a user preset with the SAME name — it must now be accepted.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!(
+                "[terminal.presets.{builtin}]\nopen = \"{builtin} -- powershell -File {{script}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !cfg.collect_errors().contains_key("terminal"),
+            "user-defined override of {builtin} must be accepted on {platform}"
         );
     }
 

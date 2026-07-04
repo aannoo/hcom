@@ -233,7 +233,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     {
         true
     } else {
-        crate::config::is_known_terminal_preset_pub(&terminal_config)
+        let platform = crate::shared::platform::platform_name();
+        (crate::config::is_known_terminal_preset_pub(&terminal_config)
+            && crate::config::terminal_preset_supported_on(&terminal_config, platform))
+            || crate::config::is_user_defined_preset(&terminal_config)
     };
 
     // Relay — use proper status from relay module
@@ -367,7 +370,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     {
         println!("terminal:  {terminal_config}");
     } else {
-        let available = crate::config::is_known_terminal_preset_pub(&terminal_config);
+        let platform = crate::shared::platform::platform_name();
+        let available = (crate::config::is_known_terminal_preset_pub(&terminal_config)
+            && crate::config::terminal_preset_supported_on(&terminal_config, platform))
+            || crate::config::is_user_defined_preset(&terminal_config);
         let sym = if available { "✓" } else { "✗" };
         println!("terminal:  {terminal_config} {sym}");
     }
@@ -650,6 +656,46 @@ mod tests {
                 std::env::remove_var("HOME");
             }
         }
+    }
+
+    // B-2: preset availability must match the validate/launch platform gate —
+    // a wrong-platform built-in is NOT available, and a user-defined preset IS.
+    #[test]
+    #[serial]
+    fn terminal_availability_matches_platform_gate() {
+        use crate::hooks::test_helpers::isolated_test_env;
+
+        // Mirrors the `available` expression at both status sites.
+        let available = |name: &str| {
+            let platform = crate::shared::platform::platform_name();
+            (crate::config::is_known_terminal_preset_pub(name)
+                && crate::config::terminal_preset_supported_on(name, platform))
+                || crate::config::is_user_defined_preset(name)
+        };
+
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        let builtin = match platform {
+            "Darwin" | "Linux" => "windows-terminal",
+            _ => "iterm",
+        };
+
+        // Wrong-platform built-in with no user override: not available.
+        assert!(
+            !available(builtin),
+            "{builtin} must show unavailable on {platform}"
+        );
+
+        // A user-defined preset of the same name: available.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nopen = \"{builtin} {{script}}\"\n"),
+        )
+        .unwrap();
+        assert!(
+            available(builtin),
+            "user-defined {builtin} must show available on {platform}"
+        );
     }
 
     #[test]
