@@ -85,15 +85,17 @@ fn antigravity_hooks_path(gemini_dir: &Path) -> PathBuf {
 /// JSON's quotes (and any apostrophes) survive the nested `sh -c '...'` pass —
 /// naive interpolation gets stripped or mis-tokenized by the inner shell.
 ///
-/// This POSIX `sh -c` form was verified to work on real Windows (agy, this
-/// branch): the hook fires and a sent message is delivered into the live agy
-/// session. agy resolves `sh` through an installed Git Bash even when `sh`
-/// itself is not on the user's PATH, so no PowerShell variant is needed here.
-/// This is the same Git Bash dependency hcom already requires for workflow
-/// scripts on Windows; on a Windows box without Git Bash the hook would not
-/// fire.
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    if cfg!(windows) {
+        let invoke = format!("set \"ANTIGRAVITY_AGENT=1\" && {hcom_cmd} {subcmd}");
+        if fallback_json.is_empty() {
+            return format!("where {bin} >nul 2>nul && ({invoke}) || exit /b 0");
+        }
+        return format!(
+            "where {bin} >nul 2>nul && ({invoke}) || (echo {fallback_json} & exit /b 0)"
+        );
+    }
     if fallback_json.is_empty() {
         format!(
             "sh -c 'command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} {subcmd} || exit 0'"
@@ -1019,7 +1021,12 @@ mod tests {
     fn test_hook_sh_cmd_includes_subcmd_and_hcom() {
         let cmd = hook_sh_cmd("hcom gemini-beforeagent", "gemini-beforeagent", "");
         assert!(cmd.contains("gemini-beforeagent"));
-        assert!(cmd.contains("command -v hcom"));
+        if cfg!(windows) {
+            assert!(cmd.contains("where hcom"));
+            assert!(!cmd.contains("sh -c"));
+        } else {
+            assert!(cmd.contains("command -v hcom"));
+        }
         assert!(cmd.contains("ANTIGRAVITY_AGENT=1"));
         assert!(cmd.contains("hcom gemini-beforeagent"));
     }
@@ -1028,7 +1035,11 @@ mod tests {
     fn test_hook_sh_cmd_with_fallback_uses_base64_pipeline() {
         let cmd = hook_sh_cmd("hcom", "gemini-beforetool", "{\"decision\":\"allow\"}");
         assert!(cmd.contains("gemini-beforetool"));
-        assert!(cmd.contains("base64 -d"));
+        if cfg!(windows) {
+            assert!(cmd.contains("echo {\"decision\":\"allow\"}"));
+        } else {
+            assert!(cmd.contains("base64 -d"));
+        }
     }
 
     #[test]
@@ -1037,7 +1048,7 @@ mod tests {
         // no printf/echo when fallback is empty
         assert!(!cmd.contains("printf"));
         assert!(!cmd.contains("base64"));
-        assert!(cmd.contains("exit 0"));
+        assert!(cmd.contains(if cfg!(windows) { "exit /b 0" } else { "exit 0" }));
     }
 
     /// Actually execute the generated command with a missing binary and confirm
