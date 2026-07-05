@@ -88,8 +88,10 @@ pub enum GroupSignal {
     /// No such process/group exists (already gone).
     NotFound,
     /// The caller lacks permission to signal the group.
+    #[cfg(unix)]
     PermissionDenied,
     /// Any other failure.
+    #[cfg(unix)]
     Other,
 }
 
@@ -314,6 +316,68 @@ fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
         CloseHandle(snapshot);
     }
     Some(parents)
+}
+
+/// Spawn a detached child without leaking the caller's captured stdio handles.
+///
+/// On Windows, `Command` must enable handle inheritance for explicitly supplied
+/// child stdio (for example a background log file). Without an explicit handle
+/// list, that can also inherit the hcom CLI's own stdout/stderr pipes. A caller
+/// using `Command::output()` then waits forever for EOF after hcom exits because
+/// the long-lived agent still owns duplicate pipe handles.
+pub fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Child> {
+    detach_session(command);
+
+    #[cfg(not(windows))]
+    {
+        command.spawn()
+    }
+
+    #[cfg(windows)]
+    {
+        use std::sync::{Mutex, OnceLock};
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        static SPAWN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = SPAWN_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let mut restored = Vec::new();
+        for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle returns a borrowed process handle. We only
+            // query/change its inheritance flag and restore it before returning.
+            unsafe {
+                let handle = GetStdHandle(kind);
+                if handle.is_null() {
+                    continue;
+                }
+                let mut flags = 0;
+                if GetHandleInformation(handle, &mut flags) != 0
+                    && flags & HANDLE_FLAG_INHERIT != 0
+                    && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
+                {
+                    restored.push(handle);
+                }
+            }
+        }
+
+        let child = command.spawn();
+        for handle in restored {
+            // SAFETY: these are the same live borrowed standard handles whose
+            // inheritance flag was cleared above.
+            unsafe {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+        child
+    }
 }
 
 /// Number of extra re-scan rounds run after the initial kill pass, to catch

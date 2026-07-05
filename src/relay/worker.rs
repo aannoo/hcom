@@ -358,10 +358,11 @@ fn do_spawn() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    // Detach into own session so it survives parent terminal close (no SIGHUP)
-    crate::sys::process::detach_session(&mut cmd);
-
-    match cmd.spawn() {
+    // Detach into its own session so it survives parent terminal close (no
+    // SIGHUP) and, on Windows, doesn't inherit the parent's stdio handles
+    // (which would otherwise keep any caller piping hcom's output from ever
+    // observing EOF).
+    match crate::sys::process::spawn_detached(&mut cmd) {
         Ok(child) => {
             write_pid_file_for(child.id());
             log::log_info(

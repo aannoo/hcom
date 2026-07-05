@@ -355,6 +355,7 @@ impl ScreenTracker {
     }
 
     /// Check if debug mode is enabled
+    #[cfg(unix)]
     pub fn debug_enabled(&self) -> bool {
         self.debug_enabled
     }

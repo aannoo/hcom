@@ -132,7 +132,7 @@ impl Proxy {
         // scan (~11s), freezing input and swallowing ESC-ESC. hcom's own cwd is
         // already the launch dir, so pinning to it keeps Claude in-repo.
         if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
+            cmd.cwd(crate::shared::platform::child_process_path(&cwd));
         }
 
         let child = pair
@@ -211,11 +211,26 @@ impl Proxy {
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
 
-        // Wait for the child to exit. This blocks for the entire session —
-        // deliberately without a timeout (see wait_child_blocking) — and never
-        // propagates an error via `?`: the cleanup below (thread wake/join)
-        // must always run even if waiting on the child itself goes wrong.
-        let exit_code = wait_child_blocking(self.child.as_mut());
+        // Poll rather than blocking solely in child.wait(): a definitive
+        // delivery-init failure must terminate a long-lived child immediately.
+        let exit_code = loop {
+            if self.launch_failed.load(Ordering::Acquire) {
+                if let Some(pid) = self.child.process_id() {
+                    let _ = crate::sys::process::kill_group(pid);
+                } else {
+                    let _ = self.child.kill();
+                }
+                break wait_child_blocking(self.child.as_mut());
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status.exit_code() as i32,
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(error) => {
+                    log_error("native", "win.wait", &format!("child wait failed: {error}"));
+                    break 1;
+                }
+            }
+        };
 
         // Commit the exit reason before setting running=false. The delivery
         // thread reads EXIT_WAS_KILLED in cleanup; if we set running=false first
@@ -288,20 +303,7 @@ impl Proxy {
             let _ = handle.join();
         }
 
-        // If delivery initialization failed, surface it as a nonzero exit. main
-        // maps the returned Err to a nonzero process exit; Drop still runs after
-        // to reap the child.
-        //
-        // Unlike the Unix proxy — which propagates the error immediately via
-        // `start_delivery_thread(...)?` and tears the child down at once — the
-        // coordinator here cannot return early or kill `child` (it does not own
-        // it), so it only sets `launch_failed`. The failure is therefore not
-        // surfaced until the child exits on its own and `run()` reaches this
-        // check: the returned Err matches Unix, but the report can lag by up to
-        // the child's full lifetime. This is left as-is because delivery-init
-        // failure (DB open / notify-port registration) is rare and, when it
-        // happens, the delivery thread never started, so the delayed report is
-        // the only observable cost.
+        // If delivery initialization failed, surface it as a nonzero exit.
         if self.launch_failed.load(Ordering::Acquire) {
             anyhow::bail!("delivery initialization failed");
         }
@@ -362,11 +364,21 @@ impl Proxy {
                             launch_failed.store(false, Ordering::Release);
                             return;
                         }
-                        Ok(shared::DeliveryStart::Pending(h)) => {
-                            // Init timed out / channel disconnected: the thread
-                            // is detached and live. Keep the handle so run() can
-                            // join it; do NOT set launch_failed and do NOT retry.
+                        Ok(shared::DeliveryStart::Pending(h, init_rx)) => {
+                            // Keep the handle and wait (bounded) for the
+                            // timed-out initializer's eventual result. A
+                            // definitive failure wakes run(), which kills and
+                            // reaps the ConPTY child instead of waiting for its
+                            // session to end naturally. Bounded rather than a
+                            // plain recv() so a permanently stuck initializer
+                            // still resolves this thread instead of blocking it
+                            // forever.
                             *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+                            if !matches!(init_rx.recv_timeout(Duration::from_secs(30)), Ok(Ok(())))
+                            {
+                                launch_failed.store(true, Ordering::Release);
+                                running.store(false, Ordering::Release);
+                            }
                             return;
                         }
                         Ok(shared::DeliveryStart::Disabled) => return,
@@ -533,6 +545,8 @@ impl Proxy {
                     *s = screen.get_screen_dump(target.name(), inject_port);
                 }
             };
+            let publish =
+                |a: bool| shared::publish_approval_status(a, instance.as_deref(), &current_status);
 
             loop {
                 match rx.recv_timeout(SNAPSHOT_DEBOUNCE) {
@@ -545,6 +559,29 @@ impl Proxy {
                             last_snapshot = Instant::now();
                             dirty = false;
                         }
+                        // Mirror the Unix poll loop's idle-path hooks (src/pty/mod.rs):
+                        // without this, `update_delivery_state` on Windows only ever
+                        // runs from the `Ok(data)` branch above, so once output goes
+                        // quiet it never re-evaluates. A transient misread on the last
+                        // chunk before quiescence — e.g. a mid-redraw frame where the
+                        // gate sees leftover non-dim text on the prompt row — then
+                        // latches forever instead of self-correcting within one poll,
+                        // stalling delivery indefinitely until new output arrives.
+                        if ready_signaled.load(Ordering::Acquire) {
+                            shared::update_delivery_state(
+                                &screen_state,
+                                &screen,
+                                &target,
+                                &launch_phase,
+                                &publish,
+                            );
+                        }
+                        screen.check_debug_flag();
+                        screen.check_periodic_dump(
+                            target.name(),
+                            inject_port,
+                            "Periodic dump (win reader loop)",
+                        );
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -612,9 +649,6 @@ impl Proxy {
                             dirty = true;
                         }
 
-                        let publish = |a: bool| {
-                            shared::publish_approval_status(a, instance.as_deref(), &current_status)
-                        };
                         shared::update_delivery_state(
                             &screen_state,
                             &screen,
@@ -736,14 +770,23 @@ impl Proxy {
         let instance = self.config.instance_name.clone();
         let approval_clear_requested = self.approval_clear_requested.clone();
         let screen_snapshot = self.screen_snapshot.clone();
+        // A client stuck Pending past this long (connected but never sending
+        // EOF/erroring — e.g. a killed-without-cleanup peer) stops blocking
+        // later-queued clients such as independent `hcom term` screen queries.
+        const STALL_TIMEOUT: Duration = Duration::from_secs(2);
         thread::spawn(move || {
+            let mut stalled_since: Option<Instant> = None;
             while running.load(Ordering::Acquire) {
                 // Drain the accept queue.
                 while matches!(inject_server.accept(), Ok(true)) {}
-                // Process clients high-to-low so completed-client removal inside
-                // read_client doesn't shift indices we haven't visited.
-                for i in (0..inject_server.client_count()).rev() {
-                    match inject_server.read_client(i) {
+                // Preserve connection order. `hcom term inject --enter` sends
+                // text and Enter on two consecutive TCP connections; processing
+                // newest-first delivers Enter before the text and leaves the
+                // prompt filled but unsubmitted. Completed clients remove
+                // themselves, so keep the same index after completion.
+                let mut index = 0;
+                while index < inject_server.client_count() {
+                    let completed = match inject_server.read_client(index) {
                         Ok(InjectResult::Inject(text)) => {
                             if let Ok(mut w) = writer.lock() {
                                 let _ = w.write_all(text.as_bytes());
@@ -767,23 +810,47 @@ impl Proxy {
                             ) {
                                 approval_clear_requested.store(true, Ordering::Release);
                             }
+                            true
                         }
                         // Screen queries (`hcom term`) are served from the
                         // eagerly-maintained snapshot the reader refreshes, so an
                         // idle agent (reader blocked in read()) still answers
                         // immediately rather than hanging or returning "" (#4).
-                        Ok(InjectResult::Query(q)) => match q.command {
-                            QueryCommand::Screen => {
-                                let dump = screen_snapshot
-                                    .read()
-                                    .map(|s| s.clone())
-                                    .unwrap_or_default();
-                                q.respond(&dump);
+                        Ok(InjectResult::Query(q)) => {
+                            match q.command {
+                                QueryCommand::Screen => {
+                                    let dump = screen_snapshot
+                                        .read()
+                                        .map(|s| s.clone())
+                                        .unwrap_or_default();
+                                    q.respond(&dump);
+                                }
+                                QueryCommand::Unknown => q.respond("error: unknown command\n"),
                             }
-                            QueryCommand::Unknown => q.respond("error: unknown command\n"),
-                        },
-                        _ => {}
+                            true
+                        }
+                        Ok(InjectResult::Pending) => false,
+                        Err(_) => true,
+                    };
+                    if completed {
+                        stalled_since = None;
+                        // A completed client at `index` was removed, shifting
+                        // the next client into this slot; retry it here.
+                        continue;
                     }
+                    if index == 0 {
+                        let stalled = stalled_since.get_or_insert_with(Instant::now);
+                        if stalled.elapsed() < STALL_TIMEOUT {
+                            // Strict FIFO: do not let a later, already-complete
+                            // Enter frame overtake an earlier text frame that
+                            // has not exposed EOF yet.
+                            break;
+                        }
+                        // Client 0 has been stuck long enough that it's
+                        // unlikely to ever complete; stop enforcing strict
+                        // order so later, independent clients aren't starved.
+                    }
+                    index += 1;
                 }
                 thread::sleep(Duration::from_millis(10));
             }

@@ -918,7 +918,7 @@ impl Proxy {
                                 self.delivery_handle = Some(h);
                             }
                             shared::DeliveryStart::Disabled => {}
-                            shared::DeliveryStart::Pending(_h) => {
+                            shared::DeliveryStart::Pending(_h, _init_rx) => {
                                 // Preserve the Unix behavior a delivery-init
                                 // timeout has always had here: abort the session.
                                 bail!("delivery start timed out");
@@ -1084,7 +1084,7 @@ impl Proxy {
                                         self.delivery_handle = Some(h);
                                     }
                                     shared::DeliveryStart::Disabled => {}
-                                    shared::DeliveryStart::Pending(_h) => {
+                                    shared::DeliveryStart::Pending(_h, _init_rx) => {
                                         // Preserve the Unix behavior a
                                         // delivery-init timeout has always had
                                         // here: abort the session.

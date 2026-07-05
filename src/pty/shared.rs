@@ -290,7 +290,7 @@ pub(super) enum DeliveryStart {
     /// be initializing, so it MUST be joined at shutdown and MUST NOT be retried
     /// — a retry would spawn a *second* delivery thread alongside it (there is no
     /// singleton guard in `run_delivery_loop`) and double-deliver.
-    Pending(JoinHandle<()>),
+    Pending(JoinHandle<()>, mpsc::Receiver<Result<()>>),
 }
 
 /// Start the delivery thread (and transcript watcher for Codex).
@@ -458,7 +458,7 @@ pub(super) fn start_delivery_thread(
             );
             // Detached thread is still running; keep the handle so shutdown can
             // join it, and flag as non-retryable (Pending).
-            Ok(DeliveryStart::Pending(handle))
+            Ok(DeliveryStart::Pending(handle, init_rx))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             log_error(
@@ -469,7 +469,7 @@ pub(super) fn start_delivery_thread(
             // Sender dropped without sending: thread returned/panicked, possibly
             // after partial registration. Non-retryable like a timeout; keep the
             // handle so shutdown can join it.
-            Ok(DeliveryStart::Pending(handle))
+            Ok(DeliveryStart::Pending(handle, init_rx))
         }
     }
 }

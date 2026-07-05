@@ -176,8 +176,9 @@ impl InjectServer {
 
 #[cfg(test)]
 mod tests {
-    use super::InjectServer;
-    use std::net::TcpStream;
+    use super::{InjectResult, InjectServer};
+    use std::io::Write;
+    use std::net::{Shutdown, TcpStream};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -207,5 +208,36 @@ mod tests {
 
         assert!(accepted);
         assert_eq!(server.client_count(), 1);
+    }
+
+    #[test]
+    fn completed_clients_can_be_drained_in_connection_order() {
+        let mut server = InjectServer::new().unwrap();
+        let mut first = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        first.write_all(b"text").unwrap();
+        first.shutdown(Shutdown::Write).unwrap();
+        let mut second = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        second.write_all(b"\r").unwrap();
+        second.shutdown(Shutdown::Write).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.client_count() < 2 && Instant::now() < deadline {
+            let _ = server.accept();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.client_count(), 2);
+
+        let read_next = |server: &mut InjectServer| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let InjectResult::Inject(text) = server.read_client(0).unwrap() {
+                    break text;
+                }
+                assert!(Instant::now() < deadline, "client did not complete");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert_eq!(read_next(&mut server), "text");
+        assert_eq!(read_next(&mut server), "\r");
     }
 }

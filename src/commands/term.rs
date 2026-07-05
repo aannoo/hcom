@@ -89,7 +89,11 @@ pub fn inject_text_remote_result(
     }
     if enter {
         if !text.is_empty() {
-            std::thread::sleep(Duration::from_millis(100));
+            // The inject server preserves FIFO order, but the first non-blocking
+            // socket may not have reached EOF on its first poll. Leave enough
+            // time for the text frame to be written to ConPTY before sending
+            // the Enter key as a distinct terminal event.
+            std::thread::sleep(Duration::from_millis(300));
         }
         inject_raw(port, b"\r")?;
     }
