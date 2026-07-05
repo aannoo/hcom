@@ -15,6 +15,28 @@ use crate::shared::CommandContext;
 use crate::tool::Tool;
 use crate::transcript::{self, Exchange, ReadOptions, format_exchanges, summarize_action};
 
+fn run_search_tool(program: &str, args: &[&str]) -> Result<Option<std::process::Output>, String> {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => Ok(Some(output)),
+        Ok(output) if output.status.code() == Some(1) => Ok(None),
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "{program} failed{}",
+                if detail.trim().is_empty() {
+                    format!(" with {}", output.status)
+                } else {
+                    format!(": {}", detail.trim())
+                }
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "required search tool `{program}` was not found on PATH"
+        )),
+        Err(err) => Err(format!("could not run `{program}`: {err}")),
+    }
+}
+
 /// Parsed arguments for `hcom transcript`.
 #[derive(clap::Parser, Debug)]
 #[command(name = "transcript", about = "View and search transcripts")]
@@ -345,7 +367,22 @@ fn cmd_transcript_search(
                     .filter(|line| !line.is_empty())
                     .map(str::to_string)
                     .collect(),
-                _ => Vec::new(),
+                Ok(out) if out.status.code() == Some(1) => Vec::new(),
+                Ok(out) => {
+                    eprintln!(
+                        "Error: ripgrep failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    return 1;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("Error: transcript search --all requires `rg` (ripgrep) on PATH");
+                    return 1;
+                }
+                Err(err) => {
+                    eprintln!("Error: could not run `rg`: {err}");
+                    return 1;
+                }
             }
         };
 
@@ -408,20 +445,26 @@ fn cmd_transcript_search(
                 .unwrap_or_default();
 
             let remaining = limit - results.len();
-            let out = std::process::Command::new("rg")
-                .args([
+            let max_count = remaining.to_string();
+            let out = match run_search_tool(
+                "rg",
+                &[
                     "-n",
                     "--max-count",
-                    &remaining.to_string(),
+                    &max_count,
                     "--max-columns",
                     "500",
                     pattern,
                     file_path,
-                ])
-                .output();
-            if let Ok(out) = out
-                && out.status.success()
-            {
+                ],
+            ) {
+                Ok(output) => output,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return 1;
+                }
+            };
+            if let Some(out) = out {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let lines: Vec<&str> = stdout.lines().collect();
                 let match_count = lines.len();
@@ -580,26 +623,39 @@ fn cmd_transcript_search(
 
         // Use rg for line-level matches with context
         let remaining = limit - results.len();
-        let output = std::process::Command::new("rg")
-            .args([
+        let max_count = remaining.to_string();
+        let output = match run_search_tool(
+            "rg",
+            &[
                 "-n",
                 "--max-count",
-                &remaining.to_string(),
+                &max_count,
                 "--max-columns",
                 "500",
                 pattern,
                 path,
-            ])
-            .output()
-            .or_else(|_| {
-                std::process::Command::new("grep")
-                    .args(["-n", "-m", &remaining.to_string(), pattern, path])
-                    .output()
-            });
+            ],
+        ) {
+            Ok(output) => Ok(output),
+            Err(rg_err) if rg_err.contains("was not found on PATH") => run_search_tool(
+                "grep",
+                &["-n", "-m", &max_count, pattern, path],
+            )
+            .map_err(|grep_err| {
+                format!("transcript search requires `rg` or `grep` on PATH ({rg_err}; {grep_err})")
+            }),
+            Err(err) => Err(err),
+        };
 
-        if let Ok(out) = output
-            && out.status.success()
-        {
+        let output = match output {
+            Ok(output) => output,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+        };
+
+        if let Some(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let lines: Vec<&str> = stdout.lines().collect();
             let match_count = lines.len();
@@ -1823,5 +1879,12 @@ mod tests {
     #[test]
     fn test_transcript_rejects_bogus() {
         assert!(TranscriptArgs::try_parse_from(["transcript", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn missing_search_tool_is_an_error_not_an_empty_result() {
+        let err =
+            run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
+        assert!(err.contains("was not found on PATH"));
     }
 }
