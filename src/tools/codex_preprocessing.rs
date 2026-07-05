@@ -161,7 +161,7 @@ fn codex_supports_bypass_hook_trust() -> bool {
 
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        let output = match std::process::Command::new("codex")
+        let output = match crate::terminal::executable_command("codex")
             .arg("--version")
             .output()
         {
@@ -330,9 +330,14 @@ pub fn add_codex_developer_instructions(
         bootstrap_text.to_string()
     };
 
+    // `-c` values are TOML expressions. A raw multiline string happened to be
+    // accepted by older Codex builds but is ignored by current builds,
+    // silently dropping the hcom identity bootstrap. Serialize a real TOML
+    // string so quotes, backslashes, and newlines survive on every platform.
+    let encoded = toml::Value::String(combined).to_string();
     remaining.extend([
         "-c".to_string(),
-        format!("developer_instructions={combined}"),
+        format!("developer_instructions={encoded}"),
     ]);
     remaining
 }
@@ -810,7 +815,7 @@ mod tests {
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
         assert_eq!(
             result,
-            s(&["-m", "o3", "-c", "developer_instructions=BOOTSTRAP"])
+            s(&["-m", "o3", "-c", "developer_instructions=\"BOOTSTRAP\""])
         );
     }
 
@@ -820,7 +825,7 @@ mod tests {
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
         assert_eq!(result[0], "resume");
         assert_eq!(result[1], "-c");
-        assert_eq!(result[2], "developer_instructions=BOOTSTRAP");
+        assert_eq!(result[2], "developer_instructions=\"BOOTSTRAP\"");
     }
 
     #[test]
@@ -832,7 +837,7 @@ mod tests {
         assert_eq!(result[2], "--model");
         assert_eq!(result[3], "gpt-5");
         assert_eq!(result[4], "-c");
-        assert_eq!(result[5], "developer_instructions=BOOTSTRAP");
+        assert_eq!(result[5], "developer_instructions=\"BOOTSTRAP\"");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::io::Write;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 #[cfg(not(test))]
 use std::sync::mpsc;
@@ -943,7 +943,7 @@ fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // TODO: If Codex changes hooks/list discovery to depend on each launch
         // cwd, pass the target launch cwd through instead of using hcom's cwd.
-        let mut child = Command::new("codex")
+        let mut child = crate::terminal::executable_command("codex")
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1110,7 +1110,7 @@ fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
         static CACHE: OnceLock<Result<String, String>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
-                let output = Command::new("codex")
+                let output = crate::terminal::executable_command("codex")
                     .arg("--version")
                     .output()
                     .map_err(|e| {
@@ -1163,7 +1163,7 @@ fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
     }
 
     *CODEX_HOOKS_FEATURE_KEY_CACHE.get_or_init(|| {
-        let output = match std::process::Command::new("codex")
+        let output = match crate::terminal::executable_command("codex")
             .arg("--version")
             .output()
         {

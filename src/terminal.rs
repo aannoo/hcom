@@ -413,7 +413,7 @@ pub fn wezterm_reachable() -> bool {
 /// Candidate file names to probe for `name` in a PATH directory. On Windows an
 /// extension-less name is expanded with PATHEXT (`.exe`, `.cmd`, …); elsewhere
 /// the name is used verbatim.
-fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf> {
+pub(crate) fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf> {
     #[cfg(windows)]
     {
         if Path::new(name).extension().is_some() {
@@ -436,13 +436,16 @@ fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf> {
 
 /// Simple `which` implementation — find binary in PATH.
 pub fn which_bin(name: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
     // `split_paths` uses the platform separator (`;` on Windows, `:` elsewhere),
-    // which also avoids splitting Windows drive letters like `C:`.
-    for dir in std::env::split_paths(&path_var) {
-        for candidate in which_candidates(&dir, name) {
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().to_string());
+    // which also avoids splitting Windows drive letters like `C:`. PATH being
+    // entirely unset (rather than merely lacking `name`) still falls through
+    // to the well-known-location fallbacks below.
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for candidate in which_candidates(&dir, name) {
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
             }
         }
     }
@@ -468,7 +471,61 @@ pub fn which_bin(name: &str) -> Option<String> {
         }
     }
 
+    #[cfg(windows)]
+    if name.eq_ignore_ascii_case("agy")
+        && let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+    {
+        let fallback = Path::new(&local_app_data)
+            .join("agy")
+            .join("bin")
+            .join("agy.exe");
+        if fallback.is_file() {
+            return Some(fallback.to_string_lossy().into_owned());
+        }
+    }
+
     None
+}
+
+/// Build a command for a PATH-resolved executable, including Windows npm
+/// `.cmd`/`.bat` shims that CreateProcess cannot execute directly.
+pub fn executable_command(name: &str) -> Command {
+    let resolved = which_bin(name).unwrap_or_else(|| name.to_string());
+    #[cfg(windows)]
+    if Path::new(&resolved)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/d", "/c"]).arg(resolved);
+        return command;
+    }
+    Command::new(resolved)
+}
+
+/// Bypass npm's Windows `codex.cmd` shim when launching the interactive tool.
+///
+/// The shim expands `%*` through cmd.exe, which corrupts quote-bearing config
+/// values such as the multiline `developer_instructions` bootstrap. Invoking
+/// the package's Node entrypoint directly preserves Rust's argv boundaries.
+#[cfg(windows)]
+pub fn resolve_windows_tool_launcher(tool: &str, resolved: &str) -> Option<(String, Vec<String>)> {
+    if tool != "codex"
+        || !Path::new(resolved)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd"))
+    {
+        return None;
+    }
+    let prefix = Path::new(resolved).parent()?;
+    let entrypoint = prefix.join("node_modules/@openai/codex/bin/codex.js");
+    if !entrypoint.is_file() {
+        return None;
+    }
+    let node = which_bin("node")?;
+    Some((node, vec![entrypoint.to_string_lossy().into_owned()]))
 }
 
 /// Resolve the `bash` command to run on Unix, preferring a `PATH` match and
@@ -992,6 +1049,10 @@ pub fn create_powershell_script(
     let tool_name = launch_display_name(command_str, tool_name);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
+    // Windows PowerShell 5.1 decodes BOM-less scripts using the active ANSI
+    // code page. Force UTF-8 so non-ASCII paths, prompts, and environment
+    // values survive on stock Windows PowerShell.
+    f.write_all(&[0xEF, 0xBB, 0xBF])?;
 
     writeln!(
         f,
@@ -1602,6 +1663,36 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
     let launcher_env = get_launcher_env();
     let env_vec: Vec<(String, String)> = launcher_env.into_iter().collect();
 
+    #[cfg(windows)]
+    if argv.first().is_some_and(|arg| {
+        Path::new(arg)
+            .file_stem()
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("wezterm"))
+    }) && argv.get(1).is_some_and(|arg| arg == "start")
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .map_err(|err| {
+                anyhow!(maybe_append_ai_tool_launch_hint(
+                    format!("Failed to spawn terminal process: {err}"),
+                    argv,
+                    inside_ai_tool,
+                ))
+            })?;
+        return Ok((true, String::new()));
+    }
+
     if inside_ai_tool {
         // Fully detach: don't let AI tool's PTY capture our output
         let launch_dir = paths::hcom_path(&[paths::LAUNCH_DIR]);
@@ -1816,10 +1907,11 @@ pub fn launch_terminal(
             .stdout(log_handle.try_clone()?)
             .stderr(log_handle);
 
-        // Detach child into its own session so it survives parent exit (no SIGHUP)
-        crate::sys::process::detach_session(&mut cmd);
-
-        let child = cmd.spawn().context("Failed to launch background process")?;
+        // Detach child into its own session so it survives parent exit (no
+        // SIGHUP), without leaking a captured caller's stdout/stderr handles
+        // into the long-lived runner on Windows.
+        let child = crate::sys::process::spawn_detached(&mut cmd)
+            .context("Failed to launch background process")?;
 
         // Brief health check
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2268,8 +2360,11 @@ pub fn kill_process(
     use crate::sys::process::GroupSignal;
     let kill_result = match crate::sys::process::terminate_group(pid) {
         GroupSignal::Sent => KillResult::Sent,
+        #[cfg(unix)]
         GroupSignal::PermissionDenied => KillResult::PermissionDenied,
-        GroupSignal::NotFound | GroupSignal::Other => KillResult::AlreadyDead,
+        GroupSignal::NotFound => KillResult::AlreadyDead,
+        #[cfg(unix)]
+        GroupSignal::Other => KillResult::AlreadyDead,
     };
 
     (kill_result, pane_closed)
@@ -2679,6 +2774,11 @@ mod tests {
             true, // opens_new_window
         )
         .unwrap();
+        assert!(
+            std::fs::read(&script)
+                .unwrap()
+                .starts_with(&[0xEF, 0xBB, 0xBF])
+        );
         let content = std::fs::read_to_string(&script).unwrap();
         assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude Code...\""));
         assert!(content.contains("Write-Host \"Starting Claude Code...\""));
@@ -3370,6 +3470,27 @@ mod tests {
         let path = dir.path().join("tool.sh");
         std::fs::write(&path, "#!/bin/bash\necho hello\n").unwrap();
         assert!(!has_node_shebang(path.to_str().unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_npm_launcher_bypasses_cmd_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join("codex.cmd");
+        let entrypoint = temp.path().join("node_modules/@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        std::fs::write(&entrypoint, "").unwrap();
+
+        let (launcher, args) =
+            resolve_windows_tool_launcher("codex", shim.to_str().unwrap()).unwrap();
+        assert!(
+            Path::new(&launcher)
+                .file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("node"))
+        );
+        assert_eq!(args, vec![entrypoint.to_string_lossy().into_owned()]);
+        assert!(resolve_windows_tool_launcher("claude", shim.to_str().unwrap()).is_none());
     }
 
     #[test]

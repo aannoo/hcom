@@ -143,7 +143,14 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     // On Termux, some wrapped tools need a launcher override instead of direct exec.
     let (command, extra_args): (String, Vec<String>);
-    if let Some((launcher, prefix_args)) =
+    #[cfg(windows)]
+    let windows_launcher = terminal::resolve_windows_tool_launcher(tool_exe, &resolved);
+    #[cfg(not(windows))]
+    let windows_launcher: Option<(String, Vec<String>)> = None;
+    if let Some((launcher, prefix_args)) = windows_launcher {
+        command = launcher;
+        extra_args = prefix_args;
+    } else if let Some((launcher, prefix_args)) =
         terminal::resolve_termux_tool_launcher(tool_exe, &resolved)
     {
         command = launcher;
