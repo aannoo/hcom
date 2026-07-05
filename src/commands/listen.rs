@@ -108,6 +108,19 @@ fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64
     }
 }
 
+fn expand_sql_preset(sql: &str) -> Result<String, &'static str> {
+    let Some(name) = sql.strip_prefix("stopped:") else {
+        return Ok(sql.to_string());
+    };
+    if name.is_empty() {
+        return Err("stopped: preset requires an agent name");
+    }
+    let escaped = name.replace('\'', "''");
+    Ok(format!(
+        "type='life' AND instance='{escaped}' AND json_extract(data, '$.action')='stopped'"
+    ))
+}
+
 /// Main entry point for `hcom listen` command.
 ///
 /// Returns exit code (0 = success, 1 = error, 130 = interrupted).
@@ -188,7 +201,13 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         }
 
         if let Some(ref sql) = args.sql {
-            sql_parts.push(format!("({sql})"));
+            match expand_sql_preset(sql) {
+                Ok(expanded) => sql_parts.push(format!("({expanded})")),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    return 1;
+                }
+            }
         }
 
         if sql_parts.is_empty() {
@@ -668,5 +687,25 @@ fn filter_listen_loop(
         } else {
             std::thread::sleep(Duration::from_secs_f64(wait_time));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_sql_preset;
+
+    #[test]
+    fn stopped_sql_preset_expands_and_escapes_name() {
+        let sql = expand_sql_preset("stopped:win'probe").unwrap();
+        assert!(sql.contains("instance='win''probe'"));
+        assert!(sql.contains("json_extract(data, '$.action')='stopped'"));
+    }
+
+    #[test]
+    fn stopped_sql_preset_requires_name() {
+        assert_eq!(
+            expand_sql_preset("stopped:").unwrap_err(),
+            "stopped: preset requires an agent name"
+        );
     }
 }
