@@ -74,21 +74,26 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
 
     println!("Running: {}", info.cmd);
 
-    if cfg!(windows) && crate::update::is_shell_pipe_command(info.cmd) {
-        eprintln!(
-            "Automatic update isn't available for this install method on Windows yet. \
-             Update manually: pip install -U hcom  (or: uv tool upgrade hcom)"
-        );
-        return 1;
-    }
-
     let status = if cfg!(windows) {
-        // The commands get_update_cmd() returns here (pip/uv/brew) are a plain
-        // program + args and need no shell — avoid depending on `sh`, which
-        // doesn't exist on Windows.
-        match crate::update::split_program_args(info.cmd) {
-            Some((program, args)) => std::process::Command::new(program).args(args).status(),
-            None => Err(std::io::Error::other("empty update command")),
+        if crate::update::is_powershell_installer_command(info.cmd) {
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex",
+                ])
+                .status()
+        } else if crate::update::is_shell_pipe_command(info.cmd) {
+            Err(std::io::Error::other(
+                "POSIX shell update command selected on Windows",
+            ))
+        } else {
+            match crate::update::split_program_args(info.cmd) {
+                Some((program, args)) => std::process::Command::new(program).args(args).status(),
+                None => Err(std::io::Error::other("empty update command")),
+            }
         }
     } else {
         std::process::Command::new("sh")
