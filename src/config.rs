@@ -336,7 +336,12 @@ impl HcomConfig {
         } else if self.terminal != "default" && self.terminal != "print" && self.terminal != "here"
         {
             let platform = crate::shared::platform::platform_name();
-            if is_user_defined_preset(&self.terminal) {
+            if let Some(error) = user_defined_preset_error(&self.terminal) {
+                errors.insert(
+                    "terminal".into(),
+                    format!("invalid terminal preset '{}': {error}", self.terminal),
+                );
+            } else if is_user_defined_preset(&self.terminal) {
                 // User TOML presets declare no platform and override any built-in
                 // of the same name — exempt from the built-in platform gate.
             } else if is_known_terminal_preset(&self.terminal) {
@@ -1012,13 +1017,43 @@ fn normalize_terminal_case(name: &str) -> String {
     name.to_string()
 }
 
+fn user_defined_preset_error(name: &str) -> Option<String> {
+    let presets = load_toml_presets(&paths::config_toml_path())?;
+    let (_, value) = presets
+        .as_table()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))?;
+    let preset = match value.as_table() {
+        Some(preset) => preset,
+        None => return Some("expected a table".to_string()),
+    };
+    for field in ["open", "close"] {
+        if let Some(value) = preset.get(field)
+            && let Err(error) = toml_val_to_argv(value)
+        {
+            return Some(format!("{field}: {error}"));
+        }
+    }
+    None
+}
+
 /// Check if a terminal name matches a user-defined preset in config.toml.
 pub fn is_user_defined_preset(name: &str) -> bool {
     let toml_path = paths::config_toml_path();
     if let Some(presets_val) = load_toml_presets(&toml_path)
         && let Some(table) = presets_val.as_table()
     {
-        return table.keys().any(|k| k.eq_ignore_ascii_case(name));
+        return table.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(name)
+                && value.as_table().is_some_and(|preset| {
+                    preset.get("open").map(toml_val_to_argv).transpose().is_ok()
+                        && preset
+                            .get("close")
+                            .map(toml_val_to_argv)
+                            .transpose()
+                            .is_ok()
+                })
+        });
     }
     false
 }
@@ -2287,6 +2322,51 @@ binary = "myterm"
             !cfg.collect_errors().contains_key("terminal"),
             "user-defined override of {builtin} must be accepted on {platform}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_user_override_does_not_bypass_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let builtin = match crate::shared::platform::platform_name() {
+            "Darwin" | "Linux" => "windows-terminal",
+            _ => "iterm",
+        };
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nopen = \"powershell \\\"unterminated\"\n"),
+        )
+        .unwrap();
+
+        assert!(!is_user_defined_preset(builtin));
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "malformed override must not exempt {builtin} from the platform gate"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_user_override_rejected_for_supported_builtin() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let builtin = if cfg!(windows) { "cmd" } else { "tmux" };
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nclose = 42\n"),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+
+        let error = cfg.collect_errors().remove("terminal").unwrap();
+        assert!(error.contains("invalid terminal preset"));
+        assert!(error.contains("close:"));
     }
 
     #[test]

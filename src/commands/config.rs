@@ -1922,9 +1922,16 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
             println!("Terminal: {current} [{source}]");
         }
         println!("\nAvailable presets:");
-        for (name, _preset) in TERMINAL_PRESETS.iter() {
+        let platform = crate::shared::platform::platform_name();
+        for (name, preset) in TERMINAL_PRESETS.iter() {
             let marker = if *name == current { " ← current" } else { "" };
-            println!("  {}{}", name, marker);
+            let availability =
+                if preset.platforms.is_empty() || preset.platforms.contains(&platform) {
+                    ""
+                } else {
+                    " (unavailable on this platform)"
+                };
+            println!("  {name}{availability}{marker}");
         }
         // Include TOML-defined presets not in built-ins
         let toml_path = crate::paths::config_toml_path();
@@ -1962,11 +1969,29 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         }
     }
 
+    if argv.len() > 1 || preset_name.contains("{script}") {
+        let command = argv.join(" ");
+        if !command.contains("{script}") {
+            eprintln!("Error: Custom terminal command must contain {{script}}");
+            return 1;
+        }
+        return match config_set("HCOM_TERMINAL", &command) {
+            Ok(()) => {
+                println!("Terminal set to custom command");
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                1
+            }
+        };
+    }
+
     // Validate preset exists (built-in or user-defined in config.toml)
-    let valid = TERMINAL_PRESETS
+    let builtin = TERMINAL_PRESETS
         .iter()
-        .any(|(name, _)| *name == preset_name.as_str())
-        || crate::config::is_user_defined_preset(preset_name);
+        .find(|(name, _)| *name == preset_name.as_str());
+    let valid = builtin.is_some() || crate::config::is_user_defined_preset(preset_name);
 
     if !valid {
         let mut available: Vec<&str> = TERMINAL_PRESETS.iter().map(|(name, _)| *name).collect();
@@ -1979,6 +2004,14 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         let user_refs: Vec<&str> = user_names.iter().map(|s| s.as_str()).collect();
         available.extend(user_refs);
         eprintln!("Available: {}", available.join(", "));
+        return 1;
+    }
+    let platform = crate::shared::platform::platform_name();
+    if let Some((_, preset)) = builtin
+        && !preset.platforms.is_empty()
+        && !preset.platforms.contains(&platform)
+    {
+        eprintln!("Error: Terminal preset '{preset_name}' is not available on {platform}");
         return 1;
     }
 

@@ -341,10 +341,24 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("zellij"),
                 None,
-                argv(&["zellij", "action", "new-pane", "--", "bash", "{script}"]),
+                argv_win(
+                    &["zellij", "action", "new-pane", "--", "bash", "{script}"],
+                    &[
+                        "zellij",
+                        "action",
+                        "new-pane",
+                        "--",
+                        "powershell",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-NoExit",
+                        "-File",
+                        "{script}",
+                    ],
+                ),
                 argv(&["zellij", "action", "close-pane", "--pane-id", "{pane_id}"]),
                 Some("ZELLIJ_PANE_ID"),
-                DL,
+                DLW,
             ),
         ),
         (
@@ -555,6 +569,24 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
         ),
     ]
 });
+
+#[cfg(test)]
+mod windows_zellij_tests {
+    use super::TERMINAL_PRESETS;
+
+    #[test]
+    fn zellij_has_a_windows_powershell_open_command() {
+        let preset = TERMINAL_PRESETS
+            .iter()
+            .find(|(name, _)| *name == "zellij")
+            .map(|(_, preset)| preset)
+            .unwrap();
+        assert!(preset.platforms.contains(&"Windows"));
+        let argv = preset.open.select(true).unwrap();
+        assert!(argv.contains(&"powershell"));
+        assert!(argv.contains(&"{script}"));
+    }
+}
 
 /// Look up a terminal preset by name (case-sensitive).
 pub fn get_terminal_preset(name: &str) -> Option<&TerminalPreset> {
