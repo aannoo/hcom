@@ -431,6 +431,7 @@ mod tests {
         assert!(wait_for_process_exit(shell_pid));
     }
 
+    #[cfg(unix)]
     fn test_shell_path() -> PathBuf {
         ["/bin/sh", "/usr/bin/sh"]
             .into_iter()

@@ -84,7 +84,15 @@ impl ToolCase for CodexCase {
             |call_id: &str| body.contains("function_call_output") && body.contains(call_id);
         let has_custom =
             |call_id: &str| body.contains("custom_tool_call_output") && body.contains(call_id);
-        let write_cmd = format!("echo {} > {}", ids.initial, ids.shell_rel);
+        let write_cmd = if cfg!(windows) {
+            format!(
+                "node -e \"require('fs').writeFileSync('{}', '{}')\"",
+                ids.shell_rel.replace('\\', "\\\\").replace('\'', "\\'"),
+                ids.initial.replace('\\', "\\\\").replace('\'', "\\'")
+            )
+        } else {
+            format!("echo {} > {}", ids.initial, ids.shell_rel)
+        };
         let patch = format!(
             "*** Begin Patch\n*** Add File: {}\n+{}\n*** End Patch\n",
             ids.file_rel, ids.initial
@@ -116,21 +124,13 @@ impl ToolCase for CodexCase {
         } else if has_output("CALL1") {
             Reply::Sse(sse(&[
                 created("RESP2"),
-                function_call(
-                    "CALL2",
-                    "exec_command",
-                    &serde_json::json!({ "cmd": ids.send_cmd }).to_string(),
-                ),
+                shell_call("CALL2", &ids.send_cmd),
                 completed("RESP2"),
             ]))
         } else if has_custom("PATCH1") {
             Reply::Sse(sse(&[
                 created("RESP1B"),
-                function_call(
-                    "CALL1",
-                    "exec_command",
-                    &serde_json::json!({ "cmd": write_cmd }).to_string(),
-                ),
+                shell_call("CALL1", &write_cmd),
                 completed("RESP1B"),
             ]))
         } else if body.contains(&ids.initial) {
@@ -243,6 +243,23 @@ pub fn function_call(call_id: &str, name: &str, arguments: &str) -> (&'static st
             }
         }),
     )
+}
+
+/// Platform-specific shell function advertised by pinned Codex.
+pub fn shell_call(call_id: &str, command: &str) -> (&'static str, Value) {
+    if cfg!(windows) {
+        function_call(
+            call_id,
+            "shell_command",
+            &serde_json::json!({ "command": command }).to_string(),
+        )
+    } else {
+        function_call(
+            call_id,
+            "exec_command",
+            &serde_json::json!({ "cmd": command }).to_string(),
+        )
+    }
 }
 
 /// A freeform custom-tool call, used by Codex for `apply_patch`.

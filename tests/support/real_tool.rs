@@ -278,10 +278,18 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
 
     let suffix = unique_suffix();
     let recipient_process_id = format!("hcom-{tool}-recipient-{suffix}");
-    let recipient = h.start_with_process_id(&recipient_process_id);
+    let recipient = h.start_listening_with_process_id(&recipient_process_id);
 
     let canonical_workspace =
         fs::canonicalize(&h.workspace).unwrap_or_else(|_| h.workspace.clone());
+    // Windows canonicalize returns a `\\?\` verbatim path. That form is useful
+    // for filesystem syscalls but Claude's Write tool rejects it as a file URL.
+    // Model-visible paths must use the normal child-process representation.
+    #[cfg(windows)]
+    let canonical_workspace = {
+        let value = canonical_workspace.to_string_lossy();
+        std::path::PathBuf::from(value.strip_prefix(r"\\?\").unwrap_or(&value))
+    };
     let file_path = canonical_workspace.join("lifecycle-file.txt");
     let shell_path = canonical_workspace.join("lifecycle-shell.txt");
     let ids = ScenarioIds {
@@ -297,8 +305,20 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         send_cmd: String::new(), // filled below
     };
     let ids = ScenarioIds {
+        // PowerShell treats a bare @name as splatting syntax, so quote the
+        // hcom target on Windows. Unix shells accept the same target bare.
         send_cmd: format!(
-            "hcom send @{recipient} --intent inform -- {token}",
+            "{} send {} --intent inform -- {token}",
+            if cfg!(windows) && tool == "claude" {
+                h.bash_hcom_command()
+            } else {
+                h.shell_hcom_command()
+            },
+            if cfg!(windows) {
+                format!("'@{recipient}'")
+            } else {
+                format!("@{recipient}")
+            },
             token = ids.initial
         ),
         ..ids
@@ -347,11 +367,14 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     let name = launched_names[0].clone();
 
     wait_process_bound(&h, &case, &name, "process-bound launch");
-    // Clear any surfaced startup gate (Claude onboarding/trust) before readiness.
-    case.drive_startup(&h, &name);
-    let initial_pid = h.eventually("tracked process id", Duration::from_secs(10), || {
+    // Verify the placeholder's PID is tracked before hook/session binding
+    // replaces it below (this early-window registration is a separate code
+    // path from the later hook-bound PID, see `initial_pid` in Phase 2).
+    h.eventually("tracked process id", Duration::from_secs(10), || {
         h.instance_pid(&name).map(|pid| pid.filter(|p| *p > 1))
     });
+    // Clear any surfaced startup gate (Claude onboarding/trust) before readiness.
+    case.drive_startup(&h, &name);
     wait_pty_ready(&h, &name, "PTY inject endpoint");
 
     // --- Phase 2: first turn (file tool -> shell tool -> hcom send -> proof) ---
@@ -419,6 +442,14 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         .as_str()
         .expect("bound session id")
         .to_string();
+    // The launcher runner is initially process-bound; the native hook then
+    // replaces it with the actual tool PID. Snapshot the canonical PID only
+    // after hook/session binding so fork assertions compare like with like.
+    let initial_pid = h
+        .instance_pid(&name)
+        .expect("query hook-bound process id")
+        .filter(|pid| *pid > 1)
+        .expect("hook-bound process id");
     let initial_request = mock
         .requests()
         .into_iter()
@@ -513,27 +544,13 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     );
 
     // --- Phase 3: outgoing hcom message ---------------------------------------
-    h.eventually(
-        "message routed to the recipient",
+    let listen_stdout = h.eventually(
+        "message received by the live recipient",
         Duration::from_secs(40),
         || {
-            let list = h.list_json()?;
-            let unread = list
-                .iter()
-                .find(|v| v.get("base_name").and_then(Value::as_str) == Some(recipient.as_str()))
-                .and_then(|v| v.get("unread_count"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            Ok((unread > 0).then_some(()))
+            let output = h.recipient_output(&recipient_process_id);
+            Ok(output.contains(&ids.initial).then_some(output))
         },
-    );
-    let (listen_code, listen_stdout, listen_stderr) = h.run_as_process(
-        &recipient_process_id,
-        ["listen", "--timeout", "1", "--json"],
-    );
-    assert_eq!(
-        listen_code, 0,
-        "recipient listen failed: stdout={listen_stdout} stderr={listen_stderr}"
     );
     let delivered: Vec<Value> = listen_stdout
         .lines()

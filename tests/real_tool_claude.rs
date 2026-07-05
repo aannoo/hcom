@@ -53,16 +53,18 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
     let gated_token = format!("HCOM_CLAUDE_GATED_{suffix}");
     let held_token = format!("HCOM_CLAUDE_HELD_{suffix}");
     let sender_process_id = format!("hcom-claude-approver-{suffix}");
-    let sender = h.start_with_process_id(&sender_process_id);
+    let sender = h.start_listening_with_process_id(&sender_process_id);
 
     let approval_result = h.workspace.join("approval-result.txt");
     let approval_result_text = approval_result
         .to_str()
         .expect("UTF-8 approval result path")
-        .to_string();
+        .replace('\\', "/");
     // Append (not overwrite) so a duplicate execution is detectable as a second
     // line rather than an idempotent rewrite.
-    let gated_cmd = format!("echo {gated_token} >> {approval_result_text}");
+    let gated_cmd = format!(
+        "node -e \"require('fs').appendFileSync('{approval_result_text}', '{gated_token}\\\\n')\""
+    );
     const GATED_TOOL: &str = "toolu_claude_gated";
 
     // Two scripted turns, classified by the NEWEST turn (Claude resends full

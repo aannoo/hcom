@@ -22,6 +22,9 @@
 //!
 //! Run:
 //!     cargo test -p hcom --test test_relay_roundtrip -- --ignored --nocapture
+//!
+//! The harness uses platform-specific daemon cleanup where needed, but the
+//! relay contract itself runs unchanged on Unix and Windows.
 
 mod support;
 
@@ -29,7 +32,7 @@ use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -188,7 +191,62 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         command.env_remove(var);
     }
 
-    command.output().expect("failed to execute hcom")
+    run_command_with_timeout(command, cmd, Duration::from_secs(90))
+}
+
+/// Capture through files rather than `Command::output()` pipes. On Windows a
+/// detached relay worker can inherit the parent's anonymous pipe handles even
+/// though its own stdio is null, preventing `output()` from ever observing EOF
+/// after the short-lived CLI parent exits.
+fn run_command_with_timeout(mut command: Command, label: &str, timeout: Duration) -> Output {
+    let stdout_file = tempfile::tempfile().expect("create hcom stdout capture");
+    let stderr_file = tempfile::tempfile().expect("create hcom stderr capture");
+    command
+        .stdout(Stdio::from(
+            stdout_file.try_clone().expect("clone stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr_file.try_clone().expect("clone stderr capture"),
+        ));
+
+    let mut child = command.spawn().expect("failed to execute hcom");
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = read_capture(&stdout_file);
+                let stderr = read_capture(&stderr_file);
+                panic!(
+                    "hcom command timed out after {timeout:?}: {label}\n\
+                     -- stdout --\n{}\n-- stderr --\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => panic!("failed waiting for hcom command `{label}`: {error}"),
+        }
+    };
+
+    Output {
+        status,
+        stdout: read_capture(&stdout_file),
+        stderr: read_capture(&stderr_file),
+    }
+}
+
+fn read_capture(file: &std::fs::File) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file.try_clone().expect("clone command capture for reading");
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind command capture");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read command capture");
+    bytes
 }
 
 fn apply_env_passthrough(command: &mut Command, hcom_dir: &str) {
@@ -545,11 +603,15 @@ fn try_remote_launch_claude_headless(
     target_device: &str,
 ) -> Result<(String, String), String> {
     // Model pinning comes via HCOM_CLAUDE_ARGS set in hcom_with_dir.
-    // --dir is required for remote launches; use /tmp as cwd — it always
-    // exists on both sides of the local-machine test. --headless keeps the
+    // --dir is required for remote launches; use the platform temp directory,
+    // which exists on both sides of this local-machine test. --headless keeps the
     // launched Claude on hcom's detached PTY runner, preserving term screen /
     // inject coverage without requiring tmux or another terminal emulator.
-    let cmd = format!("1 claude --device {target_device} --headless --dir /tmp --go");
+    let launch_dir = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+    let cmd = format!(
+        "1 claude --device {target_device} --headless --dir {} --go",
+        shell_words::quote(&launch_dir)
+    );
     let out = hcom_with_dir(&cmd, hcom_dir);
     if !out.status.success() {
         return Err(format!(
@@ -677,6 +739,7 @@ fn ensure_relay_worker(hcom_dir: &str) {
 /// Without this, a stale daemon can hold MQTT connections and interfere with
 /// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
 /// PIDs once the old temp dir is deleted).
+#[cfg(unix)]
 fn kill_orphan_debug_daemons() {
     let Ok(output) = std::process::Command::new("pgrep")
         .args(["-f", "target/debug/hcom relay-worker"])
@@ -694,25 +757,19 @@ fn kill_orphan_debug_daemons() {
     }
 }
 
+#[cfg(windows)]
+fn kill_orphan_debug_daemons() {
+    // Windows has no built-in command-line process matcher equivalent to
+    // pgrep. Each run uses unique HCOM_DIRs and its PID-file-owned daemons are
+    // still cleaned by RelayGuard below.
+}
+
 fn kill_daemon(hcom_dir: &str) {
     let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
     if let Ok(content) = fs::read_to_string(&pid_path)
-        && let Ok(pid) = content.trim().parse::<i32>()
+        && let Ok(pid) = content.trim().parse::<i64>()
     {
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-        // Wait up to 3s
-        for _ in 0..30 {
-            thread::sleep(Duration::from_millis(100));
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                return;
-            }
-        }
-        // Still alive — SIGKILL
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        support::terminate_process_group(pid);
     }
 }
 
@@ -1081,10 +1138,12 @@ fn test_relay_roundtrip() {
     // ── Phase 7: Device A remotely launches on Device B ──────────
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
+    let claude_version =
+        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.185".to_string());
     assert_tool_pinned(
         "claude",
-        "2.1.185",
-        "scripts/install-mock-tools.sh @anthropic-ai/claude-code@2.1.185",
+        &claude_version,
+        &format!("scripts/install-mock-tools.sh @anthropic-ai/claude-code@{claude_version}"),
     );
 
     let baseline_event_b = last_event_id(&path_b);
@@ -1280,9 +1339,23 @@ fn test_relay_roundtrip() {
         Duration::from_secs(15),
         Duration::from_millis(500),
     );
+    // Clearing the input line only proves that Claude accepted the submitted
+    // marker. ConPTY can report that frame before the turn finishes, while
+    // delivery is still gated. Wait for the stable idle prompt before sending
+    // the Phase 10 message.
+    wait_for_screen_drawn(&path_b, &launched_name, Duration::from_secs(60));
+    poll_until(
+        || {
+            let instance = find_instance_by_base(&path_b, &launched_name)?;
+            (instance["status"].as_str() == Some("listening")).then_some(())
+        },
+        "Claude returned to listening after marker turn",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
     logln!(
         log,
-        "  OK: marker consumed from input after enter; both inject RPCs ok=true"
+        "  OK: marker turn finished and prompt returned idle; both inject RPCs ok=true"
     );
 
     // ── Phase 10: real send+reply round-trip via relay ───────────
@@ -1317,6 +1390,18 @@ fn test_relay_roundtrip() {
         log,
         "  OK: sent question from bigboss to @{launched_name}:{short_b}"
     );
+
+    poll_until(
+        || {
+            let out = hcom_with_dir("events --type message --last 20", &path_b);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.contains(question).then_some(())
+        },
+        "Device B received targeted Phase 10 message",
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+    );
+    logln!(log, "  OK: Device B received targeted Phase 10 message");
 
     // Step 1: Device B's claude received and processed (status round-trip).
     poll_until(
@@ -1507,19 +1592,14 @@ fn test_relay_roundtrip() {
 
     // Double-check directly against Device B's SQLite DB.
     let db_path_b = Path::new(&path_b).join("hcom.db");
-    let sql_out = Command::new("sqlite3")
-        .arg(&db_path_b)
-        .arg(format!(
-            "SELECT tag FROM instances WHERE name='{launched_name}'"
-        ))
-        .output()
-        .expect("failed to run sqlite3");
-    assert!(
-        sql_out.status.success(),
-        "sqlite3 failed: {}",
-        String::from_utf8_lossy(&sql_out.stderr)
-    );
-    let sql_tag = String::from_utf8_lossy(&sql_out.stdout).trim().to_string();
+    let db = rusqlite::Connection::open(&db_path_b).expect("open Device B database");
+    let sql_tag: String = db
+        .query_row(
+            "SELECT tag FROM instances WHERE name = ?1",
+            rusqlite::params![launched_name],
+            |row| row.get(0),
+        )
+        .expect("read Device B instance tag");
     assert_eq!(
         sql_tag, "test-relay-tag",
         "Device B DB tag column != test-relay-tag: {sql_tag:?}"

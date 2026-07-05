@@ -22,7 +22,7 @@ use serial_test::serial;
 use std::fs;
 use std::time::Duration;
 use support::codex_mock::{
-    CodexCase, MockResponses, Reply, completed, created, function_call, message, sse,
+    CodexCase, MockResponses, Reply, completed, created, message, shell_call, sse,
 };
 use support::real_tool::{inject_prompt_until, require_pinned};
 use support::{Hcom, parse_launch_names, unique_suffix};
@@ -63,14 +63,24 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
     let gated_token = format!("HCOM_CODEX_GATED_{suffix}");
     let message_token = format!("HCOM_CODEX_HELD_{suffix}");
     let sender_process_id = format!("hcom-codex-approver-{suffix}");
-    let sender = h.start_with_process_id(&sender_process_id);
+    let sender = h.start_listening_with_process_id(&sender_process_id);
 
     let approval_result = h.workspace.join("approval-result.txt");
     let approval_result_text = approval_result
         .to_str()
         .expect("UTF-8 approval result path")
         .to_string();
-    let gated_cmd = format!("echo {gated_token} > {approval_result_text}");
+    let gated_cmd = if cfg!(windows) {
+        format!(
+            "node -e \"require('fs').writeFileSync('{}', '{}')\"",
+            approval_result_text
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'"),
+            gated_token.replace('\\', "\\\\").replace('\'', "\\'")
+        )
+    } else {
+        format!("echo {gated_token} > {approval_result_text}")
+    };
 
     // Two scripted turns: the first requests a gated shell command; the second
     // (released only after Codex runs the approved command and POSTs its
@@ -87,11 +97,7 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
         } else if body.contains(&scenario_token) {
             Reply::Sse(sse(&[
                 created("RESP_A1"),
-                function_call(
-                    "CALLG",
-                    "exec_command",
-                    &serde_json::json!({ "cmd": scenario_gated }).to_string(),
-                ),
+                shell_call("CALLG", &scenario_gated),
                 completed("RESP_A1"),
             ]))
         } else {

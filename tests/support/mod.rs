@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -45,6 +45,7 @@ pub struct Hcom {
     /// wins, so Claude's `ANTHROPIC_BASE_URL` actually reaches the child.
     launch_env: RefCell<BTreeMap<String, String>>,
     cleanup_pids: RefCell<HashSet<i64>>,
+    cleanup_children: RefCell<Vec<Child>>,
 }
 
 impl Hcom {
@@ -96,6 +97,7 @@ impl Hcom {
             path_env,
             launch_env: RefCell::new(BTreeMap::new()),
             cleanup_pids: RefCell::new(HashSet::new()),
+            cleanup_children: RefCell::new(Vec::new()),
         }
     }
 
@@ -105,6 +107,23 @@ impl Hcom {
 
     pub fn root_path(&self) -> &Path {
         self.root.path()
+    }
+
+    /// Shell expression that invokes this test's exact hcom binary.
+    pub fn shell_hcom_command(&self) -> String {
+        let path = self.bin.to_string_lossy();
+        if cfg!(windows) {
+            format!("& '{}'", path.replace('\'', "''"))
+        } else {
+            format!("'{}'", path.replace('\'', "'\\''"))
+        }
+    }
+
+    /// Exact binary invocation for tools whose Windows shell is Git Bash
+    /// (not PowerShell), notably Claude's Bash tool.
+    pub fn bash_hcom_command(&self) -> String {
+        let path = self.bin.to_string_lossy().replace('\\', "/");
+        format!("'{}'", path.replace('\'', "'\\''"))
     }
 
     fn apply_isolated_env(&self, command: &mut Command) {
@@ -121,6 +140,24 @@ impl Hcom {
         command.env("CI", "1");
 
         command.env("HOME", &self.home);
+        command.env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"));
+        #[cfg(windows)]
+        {
+            // Windows PowerShell and cmd are OS components, not user state.
+            // Clearing SystemRoot/WINDIR can make powershell.exe fail before it
+            // reads the generated runner; PATHEXT/COMSPEC are required for npm
+            // .cmd shims. Keep user-writable profile/temp locations isolated.
+            for key in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            command.env("USERPROFILE", &self.home);
+            command.env("APPDATA", self.home.join("AppData/Roaming"));
+            command.env("LOCALAPPDATA", self.home.join("AppData/Local"));
+            command.env("TEMP", self.root.path().join("tmp"));
+            command.env("TMP", self.root.path().join("tmp"));
+        }
         command.env("HCOM_DIR", &self.hcom_dir);
         command.env("TMPDIR", self.root.path().join("tmp"));
         command.env("XDG_CONFIG_HOME", self.root.path().join("xdg/config"));
@@ -193,6 +230,31 @@ impl Hcom {
     /// Build a non-hcom command (for example `codex --version`) with the same
     /// credential-stripped, isolated environment.
     pub fn external_cmd<S: AsRef<OsStr>>(&self, program: S) -> Command {
+        #[cfg(windows)]
+        let mut command = {
+            let program = program.as_ref();
+            let resolved = std::env::split_paths(&self.path_env)
+                .flat_map(|dir| {
+                    [".COM", ".EXE", ".BAT", ".CMD", ""]
+                        .map(move |ext| dir.join(format!("{}{ext}", program.to_string_lossy())))
+                })
+                .find(|candidate| candidate.is_file());
+            match resolved {
+                Some(path)
+                    if matches!(
+                        path.extension().and_then(OsStr::to_str),
+                        Some(ext) if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                    ) =>
+                {
+                    let mut command = Command::new("cmd.exe");
+                    command.args(["/d", "/c"]).arg(path);
+                    command
+                }
+                Some(path) => Command::new(path),
+                None => Command::new(program),
+            }
+        };
+        #[cfg(not(windows))]
         let mut command = Command::new(program);
         self.apply_isolated_env(&mut command);
         command
@@ -204,7 +266,18 @@ impl Hcom {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let out = self.cmd().args(args).output().expect("spawn hcom binary");
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        if std::env::var_os("HCOM_TEST_TRACE_COMMANDS").is_some() {
+            eprintln!("hcom test command: {:?}", args);
+        }
+        let out = self
+            .cmd()
+            .args(&args)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn hcom binary for {:?}: {error}", args));
         let code = out.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -238,6 +311,46 @@ impl Hcom {
         );
         parse_hcom_marker(&stdout)
             .unwrap_or_else(|| panic!("no [hcom:NAME] marker in stdout:\n{stdout}"))
+    }
+
+    /// Start a manual identity and keep it genuinely live while a real tool
+    /// performs its comparatively slow startup. A bare `hcom start` identity
+    /// has no heartbeat source and is correctly considered stale after 30s.
+    pub fn start_listening_with_process_id(&self, process_id: &str) -> String {
+        let name = self.start_with_process_id(process_id);
+        let output_path = self.recipient_output_path(process_id);
+        let output = fs::File::create(&output_path).expect("create live recipient output");
+        let mut command = self.cmd();
+        command
+            .env("HCOM_PROCESS_ID", process_id)
+            .args(["listen", "--json", "--timeout", "600"])
+            .stdin(Stdio::null())
+            .stdout(output)
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("spawn live test recipient");
+        self.track_cleanup_pid(i64::from(child.id()));
+        self.cleanup_children.borrow_mut().push(child);
+        self.eventually(
+            "manual test recipient to enter listening state",
+            Duration::from_secs(10),
+            || {
+                let instance = self.instance_json(&name)?;
+                Ok(instance
+                    .filter(|value| {
+                        value.get("status").and_then(Value::as_str) == Some("listening")
+                    })
+                    .map(|_| ()))
+            },
+        );
+        name
+    }
+
+    pub fn recipient_output(&self, process_id: &str) -> String {
+        fs::read_to_string(self.recipient_output_path(process_id)).unwrap_or_default()
+    }
+
+    fn recipient_output_path(&self, process_id: &str) -> PathBuf {
+        self.hcom_dir.join(format!("recipient-{process_id}.jsonl"))
     }
 
     /// Run plain `hcom start` and return the auto-assigned identity name.
@@ -472,9 +585,10 @@ impl Hcom {
                     out.push_str(&format!(
                         "\n--- term {name} (exit {code}) ---\n{stdout}{stderr}"
                     ));
-                    let (code, stdout, stderr) = self.run(["transcript", name, "--full"]);
+                    let (code, stdout, stderr) =
+                        self.run(["transcript", name, "--full", "--detailed"]);
                     out.push_str(&format!(
-                        "\n--- transcript {name} --full (exit {code}) ---\n{stdout}{stderr}"
+                        "\n--- transcript {name} --full --detailed (exit {code}) ---\n{stdout}{stderr}"
                     ));
                 }
             }
@@ -513,6 +627,13 @@ impl Hcom {
 
 impl Drop for Hcom {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.root.disable_cleanup(true);
+            eprintln!(
+                "preserving failed real-tool test directory: {}",
+                self.root.path().display()
+            );
+        }
         // Capture pids before `hcom kill all` removes instance rows.
         let mut pids: HashSet<i64> = self.all_tracked_pids().into_iter().collect();
         pids.extend(self.cleanup_pids.borrow().iter().copied());
@@ -536,6 +657,10 @@ impl Drop for Hcom {
         }
         for pid in pids {
             let _ = self.terminate_process_group(pid);
+        }
+        for mut child in self.cleanup_children.borrow_mut().drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
