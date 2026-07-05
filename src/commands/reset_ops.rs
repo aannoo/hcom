@@ -32,9 +32,7 @@ pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
     };
 
     if !has_content {
-        let _ = fs::remove_file(&db_file);
-        let _ = fs::remove_file(&db_wal);
-        let _ = fs::remove_file(&db_shm);
+        remove_database_files(&db_file, &db_wal, &db_shm)?;
         return Ok(None);
     }
 
@@ -54,11 +52,31 @@ pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
         let _ = fs::copy(&db_shm, session_archive.join("hcom.db-shm"));
     }
 
-    let _ = fs::remove_file(&db_file);
-    let _ = fs::remove_file(&db_wal);
-    let _ = fs::remove_file(&db_shm);
+    remove_database_files(&db_file, &db_wal, &db_shm)?;
 
     Ok(Some(session_archive.to_string_lossy().to_string()))
+}
+
+fn remove_database_files(
+    db_file: &std::path::Path,
+    db_wal: &std::path::Path,
+    db_shm: &std::path::Path,
+) -> Result<(), String> {
+    // Remove sidecars first and the primary DB last. If a sidecar is locked,
+    // leave the primary database intact rather than creating a partial reset.
+    for path in [db_wal, db_shm, db_file] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "could not remove {}: {err}. Stop other hcom processes using this database and retry",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Clean temp files (launch scripts, prompts, old logs).
@@ -214,5 +232,18 @@ mod tests {
         assert!(ts.len() >= 15);
         assert!(ts.contains('-'));
         assert!(ts.contains('_'));
+    }
+
+    #[test]
+    fn remove_database_files_reports_failure_instead_of_claiming_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let wal_path = dir.path().join("hcom.db-wal");
+        let shm_path = dir.path().join("hcom.db-shm");
+        std::fs::create_dir(&db_path).unwrap();
+
+        let err = remove_database_files(&db_path, &wal_path, &shm_path).unwrap_err();
+        assert!(err.contains("could not remove"));
+        assert!(err.contains("Stop other hcom processes"));
     }
 }
