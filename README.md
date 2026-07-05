@@ -29,6 +29,11 @@ brew install aannoo/hcom/hcom
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
+```powershell
+# PowerShell installer for Windows
+irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
+```
+
 ```bash
 # With PyPI
 uv tool install hcom  # or: pip install hcom
@@ -426,6 +431,9 @@ cargo build && cargo test
 hcom config dev_root $(pwd)
 hcom status
 just ci  # run the CI gate locally
+
+# On native Windows (PowerShell)
+just ci-windows
 ```
 
 ---
