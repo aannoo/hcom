@@ -77,7 +77,7 @@ fn kimi_config_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    dirs::home_dir().unwrap_or_default().join(".kimi-code")
+    crate::runtime_env::tool_config_root().join(".kimi-code")
 }
 
 pub fn get_kimi_settings_path() -> PathBuf {
@@ -887,6 +887,31 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn config_path_is_project_local_unless_explicitly_overridden() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe {
+            std::env::remove_var("KIMI_CODE_HOME");
+        }
+        assert_eq!(
+            get_kimi_settings_path(),
+            hcom_dir
+                .parent()
+                .unwrap()
+                .join(".kimi-code")
+                .join("config.toml")
+        );
+
+        let explicit = hcom_dir.join("explicit-kimi");
+        unsafe {
+            std::env::set_var("KIMI_CODE_HOME", &explicit);
+        }
+        assert_eq!(get_kimi_settings_path(), explicit.join("config.toml"));
+    }
 
     fn rules(doc: &DocumentMut) -> &ArrayOfTables {
         match doc.get("permission").and_then(|p| p.get("rules")) {

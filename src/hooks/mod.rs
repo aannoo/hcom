@@ -46,6 +46,7 @@ pub mod test_helpers {
         saved_codex_home: Option<String>,
         saved_gemini_cli_home: Option<String>,
         saved_kilo_config_dir: Option<String>,
+        saved_kimi_code_home: Option<String>,
         saved_copilot_home: Option<String>,
         saved_test_codex_cli_version: Option<String>,
         saved_pi_coding_agent_dir: Option<String>,
@@ -76,6 +77,7 @@ pub mod test_helpers {
                 saved_codex_home: std::env::var("CODEX_HOME").ok(),
                 saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
                 saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
+                saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
                 saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
                 saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
@@ -123,6 +125,10 @@ pub mod test_helpers {
                 match &self.saved_kilo_config_dir {
                     Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
                     None => std::env::remove_var("KILO_CONFIG_DIR"),
+                }
+                match &self.saved_kimi_code_home {
+                    Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
+                    None => std::env::remove_var("KIMI_CODE_HOME"),
                 }
                 match &self.saved_copilot_home {
                     Some(v) => std::env::set_var("COPILOT_HOME", v),
