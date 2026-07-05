@@ -499,13 +499,24 @@ pub fn get_bootstrap(
 
     // Rewrite hcom references if using alternate command
     if ctx.hcom_cmd != "hcom" {
-        let sentinel = "__HCOM_CMD__";
-        result = result.replace(&ctx.hcom_cmd, sentinel);
+        let command_sentinel = "__HCOM_CMD__";
+        let marker_sentinel = "__HCOM_IDENTITY_MARKER__";
+        let open_tag_sentinel = "__HCOM_OPEN_TAG__";
+        let close_tag_sentinel = "__HCOM_CLOSE_TAG__";
+        result = result
+            .replace(&ctx.hcom_cmd, command_sentinel)
+            .replace("[hcom:", marker_sentinel)
+            .replace("<hcom>", open_tag_sentinel)
+            .replace("</hcom>", close_tag_sentinel);
         result = regex::Regex::new(r"\bhcom\b")
             .unwrap()
             .replace_all(&result, &ctx.hcom_cmd)
             .to_string();
-        result = result.replace(sentinel, &ctx.hcom_cmd);
+        result = result
+            .replace(command_sentinel, &ctx.hcom_cmd)
+            .replace(marker_sentinel, "[hcom:")
+            .replace(open_tag_sentinel, "<hcom>")
+            .replace(close_tag_sentinel, "</hcom>");
     }
 
     format!(
