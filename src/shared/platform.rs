@@ -4,6 +4,22 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+/// Convert Windows verbatim paths returned by `canonicalize` back to forms
+/// accepted as a working directory by `cmd.exe` and `.cmd` shims.
+pub fn child_process_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy();
+        if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(drive_path) = value.strip_prefix(r"\\?\") {
+            return PathBuf::from(drive_path);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Cached WSL detection result.
 static IS_WSL: LazyLock<bool> = LazyLock::new(detect_wsl);
 
@@ -76,6 +92,24 @@ pub fn shorten_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(all(test, windows))]
+mod child_process_path_tests {
+    use super::child_process_path;
+    use std::path::Path;
+
+    #[test]
+    fn child_process_path_removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            child_process_path(Path::new(r"\\?\C:\work\repo")),
+            Path::new(r"C:\work\repo")
+        );
+        assert_eq!(
+            child_process_path(Path::new(r"\\?\UNC\server\share\repo")),
+            Path::new(r"\\server\share\repo")
+        );
+    }
 }
 
 /// Shorten path and truncate to max_width, keeping the trailing portion visible.
@@ -179,8 +213,9 @@ fn cargo_target_dir(dev_root: &Path) -> PathBuf {
 /// neither binary exists.
 pub fn dev_root_binary(dev_root: &Path) -> Option<PathBuf> {
     let target_dir = cargo_target_dir(dev_root);
-    let release = target_dir.join("release/hcom");
-    let debug = target_dir.join("debug/hcom");
+    let binary = format!("hcom{}", std::env::consts::EXE_SUFFIX);
+    let release = target_dir.join("release").join(&binary);
+    let debug = target_dir.join("debug").join(&binary);
 
     let mtime = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
 
@@ -278,7 +313,10 @@ mod tests {
     fn test_dev_root_binary_uses_default_target_dir() {
         let _target_guard = CargoTargetDirGuard::new();
         let dir = TempDir::new().unwrap();
-        let release = dir.path().join("target/release/hcom");
+        let release = dir
+            .path()
+            .join("target/release")
+            .join(format!("hcom{}", std::env::consts::EXE_SUFFIX));
         touch_binary(&release);
 
         unsafe {
@@ -294,7 +332,9 @@ mod tests {
         let _target_guard = CargoTargetDirGuard::new();
         let dir = TempDir::new().unwrap();
         let custom_target = dir.path().join(".cargo-target");
-        let debug = custom_target.join("debug/hcom");
+        let debug = custom_target
+            .join("debug")
+            .join(format!("hcom{}", std::env::consts::EXE_SUFFIX));
         touch_binary(&debug);
 
         unsafe {
@@ -311,7 +351,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cargo_dir = dir.path().join(".cargo");
         let custom_target = dir.path().join(".hcom-build");
-        let release = custom_target.join("release/hcom");
+        let release = custom_target
+            .join("release")
+            .join(format!("hcom{}", std::env::consts::EXE_SUFFIX));
         touch_binary(&release);
         std::fs::create_dir_all(&cargo_dir).unwrap();
         std::fs::write(

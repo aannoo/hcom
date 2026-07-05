@@ -183,6 +183,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     bail!("--dir path does not exist or is not a directory: {}", dir);
                 }
                 path.canonicalize()
+                    .map(|p| crate::shared::platform::child_process_path(&p))
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| dir.clone())
             } else {

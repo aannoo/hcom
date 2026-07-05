@@ -3,6 +3,13 @@
 /// Cached hcom invocation prefix (computed once per process lifetime).
 static HCOM_PREFIX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     if std::env::var("HCOM_DEV_ROOT").is_ok() {
+        #[cfg(windows)]
+        if let Ok(exe) = std::env::current_exe()
+            && let Ok(resolved) = exe.canonicalize()
+        {
+            let resolved = crate::shared::platform::child_process_path(&resolved);
+            return vec![resolved.to_string_lossy().replace('\\', "/")];
+        }
         return vec!["hcom".into()];
     }
 
