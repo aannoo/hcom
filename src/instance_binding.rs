@@ -1906,8 +1906,20 @@ mod tests {
         let (db, path) = setup_test_db();
 
         let ok = initialize_instance_in_position_file(
-            &db, "luna", None, None, None, None, None, Some("claude"), false, None, None, None,
-            None, None,
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(ok);
 
@@ -1924,8 +1936,20 @@ mod tests {
         let (db, path) = setup_test_db();
 
         let ok = initialize_instance_in_position_file(
-            &db, "luna", None, None, None, None, None, Some("claude"), false, None, None, None,
-            None, None,
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(ok);
 
