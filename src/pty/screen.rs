@@ -103,6 +103,11 @@ fn is_block_border(line: &str) -> bool {
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
+    // Current terminal dimensions, tracked independently of the parser so a
+    // panicked parser can be rebuilt from scratch at the right size (see
+    // `process`/`resize`).
+    rows: u16,
+    cols: u16,
     ready_pattern: String,
     waiting_approval: bool,
     last_output: Instant,
@@ -138,6 +143,8 @@ impl ScreenTracker {
 
         let mut tracker = Self {
             parser: vt100::Parser::new(rows, cols, 0),
+            rows,
+            cols,
             ready_pattern: String::from_utf8_lossy(ready_pattern).into_owned(),
             waiting_approval: false,
             last_output: Instant::now(),
@@ -207,8 +214,30 @@ impl ScreenTracker {
             self.waiting_approval = title.contains(CODEX_ACTION_REQUIRED);
         }
 
-        // Feed to vt100 parser
-        self.parser.process(data);
+        // Feed to vt100 parser. vt100 has known panics on malformed/edge-case
+        // terminal frames (e.g. https://github.com/doy/vt100-rust/issues/28 —
+        // a wide character orphaned by a resize, then erased). Catch rather
+        // than let it unwind and kill the PTY wrapper (hcom issue #73); the
+        // panic hook still logs the underlying panic, so this just contains
+        // the blast radius. A parser that panicked mid-mutation may be left
+        // in an inconsistent state, so rebuild it from scratch rather than
+        // keep using it — this drops the current screen contents, but the
+        // next output chunk repopulates it.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.process(data);
+        }))
+        .is_err()
+        {
+            crate::log::log_warn(
+                "pty",
+                "screen.parser_panic",
+                &format!(
+                    "vt100 parser panicked processing output for {}; resetting screen state",
+                    self.instance_name.as_deref().unwrap_or("unknown")
+                ),
+            );
+            self.parser = vt100::Parser::new(self.rows, self.cols, 0);
+        }
 
         // Track output timing
         self.last_output = Instant::now();
@@ -223,7 +252,23 @@ impl ScreenTracker {
 
     /// Resize the screen
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.screen_mut().set_size(rows, cols);
+        }))
+        .is_err()
+        {
+            crate::log::log_warn(
+                "pty",
+                "screen.parser_panic",
+                &format!(
+                    "vt100 parser panicked resizing screen for {}; resetting screen state",
+                    self.instance_name.as_deref().unwrap_or("unknown")
+                ),
+            );
+            self.parser = vt100::Parser::new(rows, cols, 0);
+        }
+        self.rows = rows;
+        self.cols = cols;
     }
 
     /// Clear approval state immediately when the user responds.
@@ -995,6 +1040,8 @@ mod tests {
     fn make_tracker(rows: u16, cols: u16, ready_pattern: &str) -> ScreenTracker {
         ScreenTracker {
             parser: vt100::Parser::new(rows, cols, 0),
+            rows,
+            cols,
             ready_pattern: ready_pattern.to_string(),
             waiting_approval: false,
             last_output: Instant::now(),
@@ -1008,6 +1055,36 @@ mod tests {
             debug_flag_path: std::path::PathBuf::new(),
             instance_name: None,
         }
+    }
+
+    // ---- vt100 panic containment (issue #73) ----
+
+    #[test]
+    fn process_survives_vt100_wide_char_resize_panic() {
+        // A double-width (wide) character whose continuation cell gets
+        // truncated by a downward resize used to panic inside vt100
+        // (upstream doy/vt100-rust#28: `Row::clear_wide` indexes one past
+        // the row's new length) the next time that cell was erased. That
+        // panic used to unwind straight through `process`/`resize` and kill
+        // the PTY wrapper (hcom issue #73, observed as repeated
+        // `stopped by pty: closed` on real Codex sessions). It must now be
+        // contained: the tracker rebuilds its parser and stays usable.
+        let mut t = make_tracker(3, 10, "");
+
+        // Wide CJK char printed so it spans the last two columns (8, 9).
+        t.process(b"\x1b[1;9H");
+        t.process("\u{4e2d}".as_bytes());
+
+        // Shrink to 9 columns: the continuation cell (old col 9) is
+        // truncated away, orphaning the wide flag on the new last column.
+        t.resize(3, 9);
+
+        // Erase-in-line on that orphaned wide cell is what panicked upstream.
+        t.process(b"\x1b[1;9H\x1b[K");
+
+        // Tracker must have survived and still be fully usable.
+        assert_eq!(t.cols(), 9);
+        t.process(b"still alive\r\n");
     }
 
     // ---- is_ready ----

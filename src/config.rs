@@ -518,6 +518,14 @@ impl HcomConfig {
         Ok(())
     }
 
+    /// Effective HCOM_TIMEOUT (idle poll timeout for non-PTY instances), falling
+    /// back to 120s if config can't be loaded. Used both by the Stop-hook poll
+    /// fallback and by registration so freshly created rows already carry the
+    /// resolved value instead of relying on the (never-NULL) schema default.
+    pub fn effective_timeout() -> i64 {
+        Self::load(None).ok().map(|c| c.timeout).unwrap_or(120)
+    }
+
     /// Load config with precedence: env var → config.toml → defaults.
     ///
     /// `env_override`: If Some, use this map for env var lookups instead of std::env.

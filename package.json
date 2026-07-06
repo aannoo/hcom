@@ -1,0 +1,17 @@
+{
+  "name": "hcom-plugin-typecheck",
+  "private": true,
+  "description": "Type-checks the embedded agent plugins against their upstream SDK types.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.3",
+    "@oh-my-pi/pi-coding-agent": "16.2.13",
+    "@opencode-ai/plugin": "1.17.13",
+    "@opencode-ai/sdk": "1.17.13",
+    "@types/bun": "1.2.22",
+    "@types/node": "24.3.1",
+    "typescript": "6.0.3"
+  }
+}

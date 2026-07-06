@@ -3505,7 +3505,7 @@ mod tests {
             "--to".to_string(),
             "/tmp/O'Brien kitty.sock".to_string(),
         ]);
-        assert_eq!(command, "kitten @ --to '/tmp/O'\\''Brien kitty.sock'");
+        assert_eq!(command, "kitten '@' --to '/tmp/O'\\''Brien kitty.sock'");
     }
 
     #[test]

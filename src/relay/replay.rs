@@ -1,18 +1,17 @@
 //! Replay protection for relay envelopes.
 //!
-//! Two cheap layers stacked on top of the AEAD:
+//! Two replay policies stacked on top of the AEAD:
 //!
-//! 1. **Clock skew window** — drop envelopes whose `ts_secs` deviates from
-//!    local time by more than `MAX_SKEW_SECS`. The timestamp is bound into the
-//!    AAD, so an attacker cannot forge a fresher one without invalidating the
-//!    AEAD tag.
-//! 2. **Nonce LRU** — bounded set of `(device_short, nonce)` pairs. Drops exact
+//! 1. **Control freshness** — drop control envelopes whose `ts_secs` deviates
+//!    from local time by more than `MAX_SKEW_SECS`.
+//! 2. **State ordering** — accept state snapshots independently of receiver
+//!    wall time, but reject snapshots older than the sender watermark.
+//! 3. **Nonce LRU** — bounded set of `(device_short, nonce)` pairs. Drops exact
 //!    nonce replays inside the window. Capped so a chatty fleet cannot exhaust
 //!    memory; oldest entries are evicted first.
 //!
-//! The two layers together close the "replay later" and "replay-now-with-forged-
-//! timestamp" cases. The id-based dedup in `pull.rs` still runs for in-session
-//! ordering and remote-DB regression detection.
+//! The id-based dedup in `pull.rs` still runs for in-session ordering and
+//! remote-DB regression detection.
 
 use std::num::NonZeroUsize;
 
@@ -27,7 +26,7 @@ pub const NONCE_LRU_CAP: usize = 8192;
 pub enum ReplayError {
     /// Envelope timestamp is too far from `now`.
     ClockSkew { delta_secs: i64 },
-    /// Retained state envelope predates the newest state we've already accepted.
+    /// State envelope predates the newest state we've already accepted.
     OlderThanWatermark { ts_secs: u64, min_secs: u64 },
     /// Nonce already seen for this sender within the window.
     DuplicateNonce,
@@ -38,11 +37,7 @@ impl std::fmt::Display for ReplayError {
         match self {
             Self::ClockSkew { delta_secs } => write!(f, "clock skew {}s", delta_secs),
             Self::OlderThanWatermark { ts_secs, min_secs } => {
-                write!(
-                    f,
-                    "retained rollback ts={} < watermark={}",
-                    ts_secs, min_secs
-                )
+                write!(f, "state rollback ts={} < watermark={}", ts_secs, min_secs)
             }
             Self::DuplicateNonce => write!(f, "duplicate nonce"),
         }
@@ -89,10 +84,10 @@ impl ReplayGuard {
         self.check_inner(sender, nonce, ts_secs, now_secs, true)
     }
 
-    /// Retained MQTT state snapshots may legitimately be older than the live
-    /// skew window, but they must never roll back behind the newest state
+    /// State snapshots use sender ordering, not receiver wall time or MQTT
+    /// delivery metadata. They must never roll back behind the newest state
     /// already accepted for that sender.
-    pub fn check_retained(
+    pub fn check_state(
         &mut self,
         sender: &str,
         nonce: [u8; NONCE_LEN],
@@ -102,8 +97,7 @@ impl ReplayGuard {
     ) -> Result<(), ReplayError> {
         if let Some(min_secs) = min_accepted_ts {
             // Strict `<` preserves reconnect behavior: if the broker re-delivers
-            // the exact retained snapshot we already accepted, equal timestamps
-            // must still pass instead of looking like a rollback.
+            // the same snapshot, equal timestamps must still pass.
             if ts_secs < min_secs {
                 return Err(ReplayError::OlderThanWatermark { ts_secs, min_secs });
             }
@@ -142,8 +136,8 @@ impl ReplayGuard {
         self.record_nonce(sender, nonce, now_secs)
     }
 
-    /// Backwards-compatible helper for retained snapshots.
-    pub fn check_and_record_retained(
+    /// Helper for state snapshots.
+    pub fn check_and_record_state(
         &mut self,
         sender: &str,
         nonce: [u8; NONCE_LEN],
@@ -151,7 +145,7 @@ impl ReplayGuard {
         now_secs: u64,
         min_accepted_ts: Option<u64>,
     ) -> Result<(), ReplayError> {
-        self.check_retained(sender, nonce, ts_secs, now_secs, min_accepted_ts)?;
+        self.check_state(sender, nonce, ts_secs, now_secs, min_accepted_ts)?;
         self.record_nonce(sender, nonce, now_secs)
     }
 
@@ -270,21 +264,21 @@ mod tests {
     }
 
     #[test]
-    fn retained_accepts_old_snapshot_without_watermark() {
+    fn state_accepts_old_snapshot_without_watermark() {
         let mut g = ReplayGuard::default();
         let stale_now = 1000 + (MAX_SKEW_SECS as u64) + 120;
         assert!(
-            g.check_and_record_retained("a", nonce(9), 1000, stale_now, None)
+            g.check_and_record_state("a", nonce(9), 1000, stale_now, None)
                 .is_ok()
         );
     }
 
     #[test]
-    fn retained_rejects_rollback_behind_watermark() {
+    fn state_rejects_rollback_behind_watermark() {
         let mut g = ReplayGuard::default();
         let stale_now = 2000;
         let err = g
-            .check_and_record_retained("a", nonce(9), 1000, stale_now, Some(1500))
+            .check_and_record_state("a", nonce(9), 1000, stale_now, Some(1500))
             .unwrap_err();
         assert!(matches!(err, ReplayError::OlderThanWatermark { .. }));
     }
