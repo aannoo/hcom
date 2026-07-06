@@ -153,8 +153,9 @@ impl MqttRelay {
             mqttoptions.set_credentials("hcom", &config.relay_token);
         }
 
-        // LWT: publish empty retained payload on ungraceful disconnect so remote
-        // devices detect our absence and clean up our instances.
+        // An LWT cannot be freshly sealed when the broker emits it. Use an
+        // empty retained payload to clear the broker snapshot; peers ignore
+        // the unauthenticated payload and fall back to stale-device detection.
         let lwt_topic = state_topic(&relay_id, &device_uuid);
         let lwt = rumqttc::v5::mqttbytes::v5::LastWill {
             topic: lwt_topic.clone().into(),
@@ -485,7 +486,7 @@ impl MqttRelay {
                 Packet::Publish(publish) => {
                     let topic = String::from_utf8_lossy(&publish.topic).to_string();
                     let payload = publish.payload.to_vec();
-                    self.handle_incoming_message(&topic, &payload, publish.retain)
+                    self.handle_incoming_message(&topic, &payload)
                 }
                 Packet::Disconnect(_) => {
                     *connected = false;
@@ -500,11 +501,10 @@ impl MqttRelay {
 
     /// Handle an incoming MQTT publish message.
     ///
-    /// Topic layout: `{relay_id}/{device_uuid}` for state snapshots,
-    /// `{relay_id}/control` for control events. Empty payload on a state topic
-    /// means "device gone" (LWT or graceful cleanup) — special-cased before
-    /// any decrypt attempt because it carries no plaintext.
-    fn handle_incoming_message(&self, topic: &str, payload: &[u8], is_retained: bool) -> bool {
+    /// Topic layout: `{relay_id}/{device_uuid}` for state snapshots and
+    /// `{relay_id}/control` for control events. Empty state payloads may be an
+    /// ungraceful LWT, but are ignored because they are unauthenticated.
+    fn handle_incoming_message(&self, topic: &str, payload: &[u8]) -> bool {
         let prefix = format!("{}/", self.relay_id);
         if !topic.starts_with(&prefix) {
             return false; // Not our relay group
@@ -560,14 +560,9 @@ impl MqttRelay {
             if device_id == self.device_uuid {
                 return false; // Ignore own messages
             }
-            super::pull::handle_state_message(
-                &db,
-                device_id,
-                payload,
-                &self.device_uuid,
-                is_retained,
-                &mut ctx,
-            )
+            // MQTT RETAIN is delivery metadata, not authenticated state
+            // freshness. State ordering comes from the sealed timestamp.
+            super::pull::handle_state_message(&db, device_id, payload, &self.device_uuid, &mut ctx)
         }
     }
 
@@ -649,8 +644,8 @@ impl MqttRelay {
         }
     }
 
-    /// Graceful shutdown: publish empty retained message to clear device state,
-    /// wait for PUBACK, then disconnect.
+    /// Graceful shutdown: publish an authenticated retained tombstone, wait for
+    /// PUBACK, then disconnect.
     fn shutdown_graceful(
         &self,
         event_rx: &mpsc::Receiver<Result<Event, rumqttc::v5::ConnectionError>>,
@@ -659,17 +654,22 @@ impl MqttRelay {
         log::log_info(
             "relay",
             "relay.shutdown_graceful",
-            "clearing retained state",
+            "publishing authenticated state tombstone",
         );
 
-        // Publish empty retained to clear our state from broker
-        if let Err(e) = self.client.publish(
-            &topic,
-            QoS::AtLeastOnce,
-            true, // retain
-            vec![],
-        ) {
-            log::log_warn("relay", "relay.shutdown_publish_err", &format!("{}", e));
+        let tombstone = self
+            .psk
+            .lock()
+            .map_err(|e| format!("PSK lock poisoned: {e}"))
+            .and_then(|psk| seal_state_tombstone(&psk, &self.relay_id, &topic));
+
+        let publish_result = tombstone.and_then(|payload| {
+            self.client
+                .publish(&topic, QoS::AtLeastOnce, true, payload)
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = publish_result {
+            log::log_warn("relay", "relay.shutdown_publish_err", &e);
         } else {
             // Wait for PUBACK (up to 5s) by draining the event channel
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -713,6 +713,17 @@ fn ignore_unauthenticated_empty_state(_db: &HcomDb, device_id: &str) {
             super::device_id_prefix(device_id)
         ),
     );
+}
+
+fn seal_state_tombstone(psk: &[u8; 32], relay_id: &str, topic: &str) -> Result<Vec<u8>, String> {
+    let payload = serde_json::to_vec(&json!({
+        "state": serde_json::Value::Null,
+        "events": [],
+    }))
+    .map_err(|e| format!("failed to serialize state tombstone: {e}"))?;
+    let ts_secs = crate::shared::time::now_epoch_f64() as u64;
+    super::crypto::seal(psk, relay_id, topic, &payload, ts_secs)
+        .map_err(|e| format!("failed to seal state tombstone: {e}"))
 }
 
 /// Tracks PUBACK or connection error for an ephemeral publish.
@@ -871,15 +882,7 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
         Ok(psk) => psk,
         Err(_) => return false,
     };
-    let payload = match serde_json::to_vec(&json!({
-        "state": serde_json::Value::Null,
-        "events": [],
-    })) {
-        Ok(payload) => payload,
-        Err(_) => return false,
-    };
-    let ts_secs = crate::shared::time::now_epoch_f64() as u64;
-    let sealed = match super::crypto::seal(&psk, relay_id, &topic, &payload, ts_secs) {
+    let sealed = match seal_state_tombstone(&psk, relay_id, &topic) {
         Ok(sealed) => sealed,
         Err(_) => return false,
     };
@@ -922,5 +925,18 @@ mod tests {
         ignore_unauthenticated_empty_state(&db, "device-1234");
 
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_state_tombstone_is_authenticated_null_state() {
+        let psk = [0x42; 32];
+        let relay_id = "relay-test";
+        let topic = "relay-test/device-1234";
+        let sealed = seal_state_tombstone(&psk, relay_id, topic).unwrap();
+        let plaintext = crate::relay::crypto::open(&psk, relay_id, topic, &sealed).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+
+        assert!(payload["state"].is_null());
+        assert_eq!(payload["events"], json!([]));
     }
 }

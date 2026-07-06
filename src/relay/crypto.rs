@@ -95,16 +95,16 @@ pub fn seal(
     Ok(out)
 }
 
-/// Parsed envelope header. The `nonce` and `ts_secs` are exposed so the caller
-/// can run the replay guard before paying for `open`.
+/// Parsed envelope header. The `nonce` and `ts_secs` are exposed for replay
+/// checks after the full envelope authenticates.
 pub struct Envelope<'a> {
     pub nonce: [u8; NONCE_LEN],
     pub ts_secs: u64,
     pub ciphertext: &'a [u8],
 }
 
-/// Parse the wire header without decrypting. Lets the caller validate freshness
-/// and dedupe the nonce before spending CPU on the AEAD.
+/// Parse the wire header without decrypting. Callers must authenticate the full
+/// envelope before trusting these fields or applying replay policy.
 pub fn parse_envelope(buf: &[u8]) -> Result<Envelope<'_>, CryptoError> {
     if buf.len() < HEADER_LEN + TAG_LEN {
         return Err(CryptoError::BadEnvelope);
