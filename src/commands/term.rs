@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::db::HcomDb;
 
@@ -89,11 +89,7 @@ pub fn inject_text_remote_result(
     }
     if enter {
         if !text.is_empty() {
-            // The inject server preserves FIFO order, but the first non-blocking
-            // socket may not have reached EOF on its first poll. Leave enough
-            // time for the text frame to be written to ConPTY before sending
-            // the Enter key as a distinct terminal event.
-            std::thread::sleep(Duration::from_millis(300));
+            wait_for_text_rendered(port, text);
         }
         inject_raw(port, b"\r")?;
     }
@@ -104,6 +100,26 @@ pub fn inject_text_remote_result(
         (true, _) => format!("Injected enter to {}", name),
     };
     Ok(label)
+}
+
+/// Poll the screen until the injected text exclusively fills the input box
+/// before returning, so Enter is sent once the TUI has actually rendered it
+/// rather than after a guessed delay. Tools with no input-box parser (e.g.
+/// the OpenCode-family plugin-delivery tools) always report `input_text:
+/// null`, so this can never observe a match for them and simply falls
+/// through once the deadline passes — same best-effort behavior as before.
+const TEXT_RENDER_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn wait_for_text_rendered(port: i32, text: &str) {
+    let deadline = Instant::now() + TEXT_RENDER_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(screen) = query_screen(port)
+            && screen.get("input_text").and_then(|v| v.as_str()) == Some(text)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
 }
 
 /// Inject text into PTY via inject port (CLI wrapper).

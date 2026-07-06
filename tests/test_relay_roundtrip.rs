@@ -1642,12 +1642,24 @@ fn test_relay_roundtrip() {
         "  OK: Device A removed mirrored remote instance after kill"
     );
 
-    // After the kill, a remote term_screen must fail (no inject port).
-    let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
-    let post_kill_stdout = String::from_utf8_lossy(&post_kill_term.stdout).to_string();
-    assert!(
-        post_kill_stdout.contains("Remote term screen failed") || !post_kill_term.status.success(),
-        "term_screen should fail after kill, got stdout:\n{post_kill_stdout}"
+    // After the kill, a remote term_screen must eventually fail (no inject
+    // port). The killed instance's DB row clears as soon as its tracked child
+    // process dies, but the PTY manager process behind the inject port can
+    // legitimately outlive that by a couple of seconds — its reader thread
+    // joins the ConPTY pipe with a bounded 2s timeout before tearing itself
+    // down (see `join_with_timeout` in `src/pty/win.rs`) — so poll rather
+    // than asserting on the very first check.
+    poll_until(
+        || {
+            let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
+            let post_kill_stdout = String::from_utf8_lossy(&post_kill_term.stdout).to_string();
+            (post_kill_stdout.contains("Remote term screen failed")
+                || !post_kill_term.status.success())
+            .then_some(())
+        },
+        "term_screen should fail after kill",
+        Duration::from_secs(10),
+        Duration::from_millis(300),
     );
     logln!(log, "  OK: term_screen after kill fails as expected");
 
