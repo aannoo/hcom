@@ -501,14 +501,18 @@ impl ScreenTracker {
         let num_lines = lines.len();
 
         // Search bottom-to-top to find the actual current input box,
-        // not stale output lines that happen to match the ❯ + ─ border pattern
+        // not stale output lines that happen to match the ❯ + ─ border pattern.
+        // `bypassPermissions` mode (require_ready_prompt=false) renders the
+        // same bordered box with a plain `>` instead of the styled `❯` — try
+        // the styled glyph first since it's the common case and less prone to
+        // matching unrelated output.
         for row_idx in (1..num_lines).rev() {
             let line = &lines[row_idx];
-            // Find ❯ at start of line (Claude's prompt character)
             let trimmed = line.trim_start();
-            if !trimmed.starts_with('❯') {
+            let Some(prompt_char) = ['❯', '>'].into_iter().find(|c| trimmed.starts_with(*c))
+            else {
                 continue;
-            }
+            };
 
             // Check for borders above and below (input box frame)
             let line_above = &lines[row_idx - 1];
@@ -531,9 +535,9 @@ impl ScreenTracker {
                 continue;
             }
 
-            // Extract text after ❯ (trim NBSP too - Claude uses \xa0 after prompt)
-            let prompt_pos = line.find('❯')?;
-            let after_prompt = &line[prompt_pos + '❯'.len_utf8()..];
+            // Extract text after the prompt char (trim NBSP too - Claude uses \xa0 after prompt)
+            let prompt_pos = line.find(prompt_char)?;
+            let after_prompt = &line[prompt_pos + prompt_char.len_utf8()..];
             let text = trim_with_nbsp(after_prompt);
 
             if text.is_empty() {
@@ -542,7 +546,7 @@ impl ScreenTracker {
 
             // Dim text = placeholder, not real input
             let is_placeholder = self
-                .is_dim_after_prompt(row_idx as u16, "❯")
+                .is_dim_after_prompt(row_idx as u16, &prompt_char.to_string())
                 .unwrap_or(true); // Can't find prompt cell = treat as placeholder
             if is_placeholder {
                 return Some(String::new());
@@ -1557,6 +1561,41 @@ mod tests {
             "─────────────────────────────────────────────────────────────────────\r\n".as_bytes(),
         );
         // Real prompt is empty — parser should find this, not the stale one
+        assert_eq!(t.get_claude_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn claude_bypass_permissions_ascii_prompt_with_empty_text() {
+        // `--permission-mode bypassPermissions` renders the same bordered box
+        // with a plain `>` instead of the styled `❯`.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("────────────────────\r\n".as_bytes());
+        t.process("> \r\n".as_bytes());
+        t.process("────────────────────\r\n".as_bytes());
+        assert_eq!(t.get_claude_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn claude_bypass_permissions_ascii_prompt_with_non_dim_user_text() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("────────────────────\r\n".as_bytes());
+        t.process("> hello\r\n".as_bytes());
+        t.process("────────────────────\r\n".as_bytes());
+        assert_eq!(t.get_claude_input_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn claude_bypass_permissions_ascii_prompt_with_dim_placeholder() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("────────────────────\r\n".as_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice("> ".as_bytes());
+        data.extend_from_slice(b"\x1b[2m"); // SGR dim on
+        data.extend_from_slice(b"placeholder text");
+        data.extend_from_slice(b"\x1b[0m"); // SGR reset
+        data.extend_from_slice(b"\r\n");
+        t.process(&data);
+        t.process("────────────────────\r\n".as_bytes());
         assert_eq!(t.get_claude_input_text(), Some(String::new()));
     }
 

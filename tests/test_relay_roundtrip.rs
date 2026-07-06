@@ -462,10 +462,51 @@ fn poll_rpc_result_on_device(hcom_dir: &str, action: &str) -> serde_json::Value 
     )
 }
 
-/// Claude's input prompt marker — present whenever the TUI is rendered,
-/// independent of the dontAsk / accept-edits mode that hides the
-/// "? for shortcuts" status bar.
-const CLAUDE_PROMPT_MARKER: &str = "❯";
+/// True if `text` has Claude's input prompt marker at the start of a rendered
+/// screen line, present whenever the TUI is rendered, independent of the
+/// dontAsk / accept-edits mode that hides the "? for shortcuts" status bar.
+/// `--permission-mode bypassPermissions` (used by this test) renders a plain
+/// `>` instead of the styled `❯`. Requiring the marker to lead the line (not
+/// just appear anywhere) keeps this from matching an unrelated `>` in tips,
+/// diffs, or other screen content.
+fn screen_has_claude_prompt(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = strip_term_line_number_prefix(line).trim_start();
+        trimmed.starts_with('❯') || trimmed.starts_with('>')
+    })
+}
+
+/// Strip `hcom term`'s "  <N>: " row-index prefix (see `src/commands/term.rs`
+/// `format!("  {i:3}: {text}")`), if present, so line-start checks work on
+/// both `--json` line arrays (no prefix) and the default rendered output
+/// (prefixed).
+fn strip_term_line_number_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digits_end > 0 && trimmed[digits_end..].starts_with(": ") {
+        &trimmed[digits_end + 2..]
+    } else {
+        line
+    }
+}
+
+#[test]
+fn screen_has_claude_prompt_matches_styled_and_ascii_markers() {
+    assert!(screen_has_claude_prompt("❯ \n──────"));
+    assert!(screen_has_claude_prompt("> \n──────"));
+    assert!(screen_has_claude_prompt("  15: > \n  16: ──────"));
+}
+
+#[test]
+fn screen_has_claude_prompt_ignores_unrelated_greater_than() {
+    // A `>` appearing mid-line (a tip, a diff, redirected output) is not the
+    // input prompt and must not produce a false positive.
+    assert!(!screen_has_claude_prompt("Tip: pipe output > file.txt"));
+    assert!(!screen_has_claude_prompt("  12: some text > more text"));
+    assert!(!screen_has_claude_prompt("no prompt here at all"));
+}
 
 fn get_screen_local_json(hcom_dir: &str, name: &str) -> Option<serde_json::Value> {
     let out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
@@ -567,7 +608,7 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
     poll_until(
         || {
             let s = get_screen_local_json(hcom_dir, name)?;
-            let has_prompt = screen_lines_joined(&s).contains(CLAUDE_PROMPT_MARKER);
+            let has_prompt = screen_has_claude_prompt(&screen_lines_joined(&s));
             let prompt_empty = s["prompt_empty"].as_bool() == Some(true);
             if has_prompt && prompt_empty {
                 Some(s)
@@ -675,7 +716,7 @@ fn remote_term_screen_stdout(hcom_dir: &str, remote_name: &str) -> String {
         last_stderr = String::from_utf8_lossy(&out.stderr).to_string();
         if out.status.success()
             && !last_stdout.contains("Remote term screen failed")
-            && last_stdout.contains(CLAUDE_PROMPT_MARKER)
+            && screen_has_claude_prompt(&last_stdout)
         {
             return last_stdout;
         }
@@ -1242,7 +1283,7 @@ fn test_relay_roundtrip() {
     assert_eq!(initial_screen["prompt_empty"].as_bool(), Some(true));
     logln!(
         log,
-        "  OK: claude TUI drawn (prompt marker '{CLAUDE_PROMPT_MARKER}' present, prompt empty)"
+        "  OK: claude TUI drawn (prompt marker present, prompt empty)"
     );
 
     // ── Phase 8: term_screen on live instance ─────────────────────
@@ -1273,7 +1314,7 @@ fn test_relay_roundtrip() {
     );
     let rpc_content = rpc_screen["result"]["content"].as_str().unwrap_or("");
     assert!(
-        rpc_content.contains(CLAUDE_PROMPT_MARKER),
+        screen_has_claude_prompt(rpc_content),
         "term_screen rpc_result.content missing claude prompt marker: {rpc_content}"
     );
     logln!(
