@@ -28,11 +28,49 @@ pub struct KillTrackedResult {
     pub pid: u32,
     pub kill_result: terminal::KillResult,
     pub pane_closed: bool,
+    pub pane_retry_command: Option<String>,
     pub preset_name: String,
     pub pane_id: String,
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[derive(Clone, Copy)]
+enum PaneCleanupProcessState {
+    Terminated,
+    AlreadyDead,
+    NotTerminated,
+}
+
+impl From<terminal::KillResult> for PaneCleanupProcessState {
+    fn from(result: terminal::KillResult) -> Self {
+        match result {
+            terminal::KillResult::Sent => Self::Terminated,
+            terminal::KillResult::AlreadyDead => Self::AlreadyDead,
+            terminal::KillResult::PermissionDenied => Self::NotTerminated,
+        }
+    }
+}
+
+fn report_incomplete_pane_cleanup(
+    process_state: PaneCleanupProcessState,
+    retry_command: Option<&str>,
+) -> bool {
+    if matches!(process_state, PaneCleanupProcessState::NotTerminated) {
+        return false;
+    }
+    let Some(command) = retry_command else {
+        return false;
+    };
+    let process_message = match process_state {
+        PaneCleanupProcessState::Terminated => "Process terminated",
+        PaneCleanupProcessState::AlreadyDead => "Process was already terminated",
+        PaneCleanupProcessState::NotTerminated => unreachable!(),
+    };
+    eprintln!("{process_message}, but pane remains. Retry this command with approval/escalation:");
+    eprintln!("{command}");
+    true
+}
 
 /// Resolve who initiated the kill
 fn resolve_initiator(db: &HcomDb, explicit_name: Option<&str>) -> String {
@@ -102,7 +140,7 @@ pub fn kill_tracked_instance(
         .pid
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
     let is_headless = inst.background != 0;
-    let (result, pane_closed, preset_name, pane_id) =
+    let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless);
     stop_instance(db, name, initiator, "killed");
 
@@ -111,6 +149,7 @@ pub fn kill_tracked_instance(
         pid,
         kill_result: result,
         pane_closed,
+        pane_retry_command,
         preset_name,
         pane_id,
     })
@@ -132,6 +171,7 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
     let pane_closed = result["pane_closed"].as_bool().unwrap_or(false);
     let preset_name = result["preset_name"].as_str().unwrap_or("");
     let pane_id = result["pane_id"].as_str().unwrap_or("");
+    let pane_retry_command = result["pane_retry_command"].as_str();
     let pane_info = pane_info_str(pane_closed, preset_name, pane_id);
 
     if kill_result == "permission_denied" {
@@ -146,7 +186,25 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
     for line in lines {
         println!("{line}");
     }
-    Ok(0)
+    if pane_retry_command.is_some()
+        && let Some((_, device)) = crate::relay::control::split_device_suffix(name)
+    {
+        eprintln!("Run the pane-close retry command on remote device {device}.");
+    }
+    Ok(
+        if report_incomplete_pane_cleanup(
+            match kill_result {
+                "sent" => PaneCleanupProcessState::Terminated,
+                "already_dead" => PaneCleanupProcessState::AlreadyDead,
+                _ => PaneCleanupProcessState::NotTerminated,
+            },
+            pane_retry_command,
+        ) {
+            1
+        } else {
+            0
+        },
+    )
 }
 
 fn render_remote_kill_feedback(
@@ -263,6 +321,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     let instances = db.iter_instances_full()?;
     let mut killed = 0;
     let mut failed = 0;
+    let mut incomplete = 0;
 
     // Collect active PIDs for orphan filtering
     let mut active_pids = HashSet::new();
@@ -276,7 +335,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
-            let (result, pane_closed, preset_name, pane_id) =
+            let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
@@ -302,6 +361,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                     failed += 1;
                 }
             }
+            incomplete +=
+                report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
             // Clean up instance
             stop_instance(db, &inst.name, initiator, "killed");
             println!("  To resume: hcom r {}", inst.name);
@@ -314,7 +375,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     // Kill orphans too
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     for orphan in &orphans {
-        let (result, pane_closed) = terminal::kill_process(
+        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
             &orphan.terminal_preset,
             &orphan.pane_id,
@@ -350,18 +411,23 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 failed += 1;
             }
         }
+        incomplete +=
+            report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
         pidtrack::remove_pid(hcom_dir, orphan.pid);
     }
 
     if killed == 0 && failed == 0 {
         println!("No processes with tracked PIDs found");
-    } else if failed > 0 {
-        println!("Killed {}, {} failed", killed, failed);
+    } else if failed > 0 || incomplete > 0 {
+        println!(
+            "Killed {}, {} failed, {} with incomplete pane cleanup",
+            killed, failed, incomplete
+        );
     } else {
         println!("Killed {}", killed);
     }
 
-    Ok(if failed > 0 { 1 } else { 0 })
+    Ok(if failed > 0 || incomplete > 0 { 1 } else { 0 })
 }
 
 /// Kill instances by tag.
@@ -374,12 +440,13 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
 
     let mut killed = 0;
     let mut failed = 0;
+    let mut incomplete = 0;
 
     // Kill active instances with this tag
     for inst in &tagged {
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
-            let (result, pane_closed, preset_name, pane_id) =
+            let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
@@ -405,6 +472,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
                     failed += 1;
                 }
             }
+            incomplete +=
+                report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
             stop_instance(db, &inst.name, initiator, "killed");
         } else {
             // No PID tracked — clean up DB entry
@@ -422,7 +491,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
     for orphan in &tagged_orphans {
         let names = orphan.names.join(", ");
-        let (result, pane_closed) = terminal::kill_process(
+        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
             &orphan.terminal_preset,
             &orphan.pane_id,
@@ -452,6 +521,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
                 failed += 1;
             }
         }
+        incomplete +=
+            report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
         pidtrack::remove_pid(hcom_dir, orphan.pid);
     }
 
@@ -461,7 +532,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     }
 
     println!("Killed {} (tag:{})", killed, tag);
-    Ok(if failed > 0 { 1 } else { 0 })
+    Ok(if failed > 0 || incomplete > 0 { 1 } else { 0 })
 }
 
 /// Kill a single instance by name.
@@ -486,7 +557,7 @@ fn kill_single(
                     || o.process_id == target
                     || target_pid == Some(o.pid)
             }) {
-                let (result, pane_closed) = terminal::kill_process(
+                let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
                     &orphan.terminal_preset,
                     &orphan.pane_id,
@@ -517,7 +588,14 @@ fn kill_single(
                     }
                 }
                 pidtrack::remove_pid(hcom_dir, orphan.pid);
-                return Ok(0);
+                return Ok(
+                    if report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref())
+                    {
+                        1
+                    } else {
+                        0
+                    },
+                );
             }
             bail!("Agent '{}' not found", target);
         }
@@ -553,17 +631,18 @@ fn kill_single(
     let pane_closed = kill_result.pane_closed;
     let preset_name = kill_result.preset_name;
     let pane_id = kill_result.pane_id;
+    let pane_retry_command = kill_result.pane_retry_command;
     let result = kill_result.kill_result;
 
     let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
-    match result {
+    let exit = match result {
         terminal::KillResult::Sent => {
             println!(
                 "Sent SIGTERM to process group {} for '{}'{}",
                 pid, name, pane_info
             );
             println!("  To resume: hcom r {}", name);
-            Ok(0)
+            0
         }
         terminal::KillResult::AlreadyDead => {
             println!(
@@ -571,30 +650,38 @@ fn kill_single(
                 pid, name, pane_info
             );
             println!("  To resume: hcom r {}", name);
-            Ok(0)
+            0
         }
         terminal::KillResult::PermissionDenied => {
             eprintln!(
                 "Permission denied to kill process group {} for '{}'",
                 pid, name
             );
-            Ok(1)
+            1
         }
-    }
+    };
+    Ok(
+        if report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) {
+            1
+        } else {
+            exit
+        },
+    )
 }
 
 /// Kill a process and close its terminal pane.
-/// Returns (KillResult, pane_closed, preset_name, pane_id).
+/// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
 fn kill_instance(
     _db: &HcomDb,
     name: &str,
     pid: u32,
     instance: &crate::db::InstanceRow,
     is_headless: bool,
-) -> (terminal::KillResult, bool, String, String) {
+) -> (terminal::KillResult, bool, Option<String>, String, String) {
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
-        let (result, pane_closed) = terminal::kill_process(pid, "", "", "", "", "", "");
+        let (result, pane_closed, pane_retry_command) =
+            terminal::kill_process(pid, "", "", "", "", "", "");
         let result = normalize_kill_result(name, pid, result, pane_closed);
         log_info(
             "kill",
@@ -604,7 +691,13 @@ fn kill_instance(
                 name, pid, result, pane_closed
             ),
         );
-        return (result, pane_closed, String::new(), String::new());
+        return (
+            result,
+            pane_closed,
+            pane_retry_command,
+            String::new(),
+            String::new(),
+        );
     }
 
     let ti = terminal::resolve_terminal_info(
@@ -612,7 +705,7 @@ fn kill_instance(
         instance.launch_context.as_deref(),
     );
 
-    let (result, pane_closed) = terminal::kill_process(
+    let (result, pane_closed, pane_retry_command) = terminal::kill_process(
         pid,
         &ti.preset_name,
         &ti.pane_id,
@@ -635,6 +728,7 @@ fn kill_instance(
     (
         result,
         pane_closed,
+        pane_retry_command,
         ti.preset_name.clone(),
         ti.pane_id.clone(),
     )
@@ -680,6 +774,22 @@ mod tests {
         let result =
             normalize_kill_result("luna", 42, terminal::KillResult::PermissionDenied, true);
         assert_eq!(result, terminal::KillResult::AlreadyDead);
+    }
+
+    #[test]
+    fn test_incomplete_cleanup_requires_terminated_process_and_retry_command() {
+        assert!(report_incomplete_pane_cleanup(
+            PaneCleanupProcessState::Terminated,
+            Some("wezterm cli kill-pane --pane-id 123")
+        ));
+        assert!(!report_incomplete_pane_cleanup(
+            PaneCleanupProcessState::NotTerminated,
+            Some("wezterm cli kill-pane --pane-id 123")
+        ));
+        assert!(!report_incomplete_pane_cleanup(
+            PaneCleanupProcessState::AlreadyDead,
+            None
+        ));
     }
 
     #[test]

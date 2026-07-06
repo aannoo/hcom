@@ -4,18 +4,17 @@ Common issues and fixes discovered during real testing.
 
 ## Script Hangs Forever
 
-**Cause:** Missing `--go` flag on `hcom 1 claude`, `hcom kill`, or any command that normally prompts for confirmation.
+**Cause:** Missing `--go` flag on launch commands such as `hcom 1 claude`.
 
-**Fix:** Always include `--go` on every hcom launch and kill command in scripts.
+**Fix:** Include `--go` on launch commands in scripts. `hcom kill` does not
+prompt, so `--go` is optional for kill commands.
 
 ```bash
 # WRONG - hangs waiting for user confirmation
 hcom 1 claude --tag worker --headless --hcom-prompt "..."
-hcom kill luna
 
 # RIGHT
 hcom 1 claude --tag worker --go --headless --hcom-prompt "..."
-hcom kill luna --go
 ```
 
 ## Agent Not Receiving Messages

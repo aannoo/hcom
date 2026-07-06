@@ -141,7 +141,7 @@ place scripts in `~/.hcom/scripts/` as `.sh` or `.py`. run with `hcom run <name>
 - **always use `trap cleanup ERR INT TERM`** — orphan headless agents run indefinitely
 - **always use `hcom kill` for cleanup** (not `stop`) — kill also closes the terminal pane
 - **always forward `--name`** — hcom injects it, scripts must propagate it
-- **always use `--go`** on launch/kill — without it, scripts hang on confirmation prompt
+- **always use `--go`** on launch commands — without it, scripts hang on confirmation prompt (`hcom kill` never prompts, so `--go` is optional there)
 
 ### agent topologies
 
