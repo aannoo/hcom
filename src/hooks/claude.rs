@@ -1115,12 +1115,7 @@ fn handle_poll(
 
     // Non-PTY: poll for messages
     let wait_timeout = instance_data.wait_timeout;
-    let timeout = wait_timeout.unwrap_or_else(|| {
-        HcomConfig::load(None)
-            .ok()
-            .map(|c| c.timeout)
-            .unwrap_or(120)
-    });
+    let timeout = wait_timeout.unwrap_or_else(HcomConfig::effective_timeout);
 
     // Persist effective timeout
     let mut updates = serde_json::Map::new();
