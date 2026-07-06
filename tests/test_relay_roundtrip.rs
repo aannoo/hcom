@@ -1445,6 +1445,11 @@ fn test_relay_roundtrip() {
     // Watermark Device A's events so we only count relayed replies that
     // arrive AFTER the question goes out.
     let pre_send_event_a = last_event_id(&path_a);
+    // Same for Device B's own status events: without this, a stale
+    // delivery→listening cycle already sitting in the last-20 window (e.g.
+    // Phase 9's inject turn) could satisfy the Step 1 scan below by
+    // coincidence rather than by actually observing this message's turn.
+    let pre_send_event_b = last_event_id(&path_b);
 
     // Send from bigboss (`-b`) rather than a synthetic `--from` label.
     // `--from <name>` is a CLI-only sender stamp with no return route on
@@ -1479,9 +1484,20 @@ fn test_relay_roundtrip() {
     );
     logln!(log, "  OK: Device B received targeted Phase 10 message");
 
+    // Re-arm Device A's worker *before* Device B's turn can run, not after.
+    // Device B's claude executes its `hcom send ... PONG` reply as part of
+    // the delivery→listening turn polled below, which can take a while — if
+    // A's worker is still down (or auto-exits mid-wait, watchdog ~60s with no
+    // local instances) when B publishes, a non-retained MQTT publish with no
+    // subscriber present is simply lost, and Step 2 waits forever for an
+    // event that already came and went. Keep re-arming every iteration so
+    // it's guaranteed to be listening whenever B actually replies.
+    ensure_relay_worker(&path_a);
+
     // Step 1: Device B's claude received and processed (status round-trip).
     poll_until(
         || {
+            ensure_relay_worker(&path_a);
             let out = hcom_with_dir(
                 &format!("events --type status --agent {launched_name} --last 20"),
                 &path_b,
@@ -1496,6 +1512,12 @@ fn test_relay_roundtrip() {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Events are returned oldest-first; ignore anything at or
+                // before the pre-send watermark so a stale delivery→listening
+                // cycle already in the last-20 window can't false-match.
+                if ev["id"].as_i64().unwrap_or(0) <= pre_send_event_b {
+                    continue;
+                }
                 let data = &ev["data"];
                 let ctx = data["context"].as_str().unwrap_or("");
                 let status = data["status"].as_str().unwrap_or("");
@@ -1522,9 +1544,8 @@ fn test_relay_roundtrip() {
         "  OK: {launched_name} processed the message and returned to listening"
     );
 
-    // Device A's worker may have auto-exited during the long status wait
-    // (watchdog exits after ~60s with no local instances). Re-arm so the
-    // PONG reply event can land here.
+    // Belt-and-suspenders: the Step 1 poll above already keeps Device A's
+    // worker re-armed throughout, but confirm it's up before Step 2 too.
     ensure_relay_worker(&path_a);
 
     // Step 2: the real round-trip — claude's PONG reply must reach
@@ -1575,18 +1596,32 @@ fn test_relay_roundtrip() {
         }
         if Instant::now() >= pong_deadline {
             // The generic poll_until panic ("Timeout: description") gives no
-            // insight into *why* the PONG never arrived. Pull Device B's live
-            // screen and recent events so a CI failure here is diagnosable
-            // without another round-trip.
+            // insight into *why* the PONG never arrived. Pull the state on
+            // both sides plus what the mock actually saw so a CI failure
+            // here is diagnosable without another round-trip.
             let device_b_screen = get_screen_local_json(&path_b, &launched_name)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "<no screen>".to_string());
             let device_b_events = hcom_with_dir("events --last 20", &path_b);
+            let relay_status_a = hcom_with_dir("relay status", &path_a);
+            let relay_status_b = hcom_with_dir("relay status", &path_b);
+            let recent_mock_requests: String = claude_mock
+                .requests()
+                .iter()
+                .rev()
+                .take(3)
+                .map(|r| format!("  {} {}\n  body: {}\n", r.method, r.path, r.body))
+                .collect();
             panic!(
                 "Timeout (90s): Device A receives PONG reply event from {expected_from}\n\
+                 Device A relay status:\n{}\n\
+                 Device B relay status:\n{}\n\
                  Device B screen: {device_b_screen}\n\
-                 Device B recent events:\n{}",
-                String::from_utf8_lossy(&device_b_events.stdout)
+                 Device B recent events:\n{}\n\
+                 Last mock requests (newest first):\n{recent_mock_requests}",
+                String::from_utf8_lossy(&relay_status_a.stdout),
+                String::from_utf8_lossy(&relay_status_b.stdout),
+                String::from_utf8_lossy(&device_b_events.stdout),
             );
         }
         thread::sleep(Duration::from_secs(2));
