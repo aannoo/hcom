@@ -1533,12 +1533,11 @@ fn test_relay_roundtrip() {
     // claude wrote something locally on Device B.
     let expected_from = format!("{launched_name}:{short_b}");
     let mut last_log_count = 0usize;
-    let pong_event = poll_until(
-        || {
-            let out = hcom_with_dir("events --type message --last 50", &path_a);
-            if !out.status.success() {
-                return None;
-            }
+    let pong_deadline = Instant::now() + Duration::from_secs(90);
+    let pong_event = loop {
+        let out = hcom_with_dir("events --type message --last 50", &path_a);
+        let mut found = None;
+        if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let mut new_count = 0usize;
             for line in stdout.lines() {
@@ -1560,21 +1559,38 @@ fn test_relay_roundtrip() {
                 let from = data["from"].as_str().unwrap_or("");
                 let text = data["text"].as_str().unwrap_or("");
                 if from == expected_from && text.to_uppercase().contains("PONG") {
-                    return Some(ev);
+                    found = Some(ev);
+                    break;
                 }
             }
-            if new_count != last_log_count {
+            if found.is_none() && new_count != last_log_count {
                 last_log_count = new_count;
                 eprintln!(
                     "    {new_count} new message events on A, none from {expected_from} with PONG yet"
                 );
             }
-            None
-        },
-        &format!("Device A receives PONG reply event from {expected_from}"),
-        Duration::from_secs(90),
-        Duration::from_secs(2),
-    );
+        }
+        if let Some(ev) = found {
+            break ev;
+        }
+        if Instant::now() >= pong_deadline {
+            // The generic poll_until panic ("Timeout: description") gives no
+            // insight into *why* the PONG never arrived. Pull Device B's live
+            // screen and recent events so a CI failure here is diagnosable
+            // without another round-trip.
+            let device_b_screen = get_screen_local_json(&path_b, &launched_name)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "<no screen>".to_string());
+            let device_b_events = hcom_with_dir("events --last 20", &path_b);
+            panic!(
+                "Timeout (90s): Device A receives PONG reply event from {expected_from}\n\
+                 Device B screen: {device_b_screen}\n\
+                 Device B recent events:\n{}",
+                String::from_utf8_lossy(&device_b_events.stdout)
+            );
+        }
+        thread::sleep(Duration::from_secs(2));
+    };
     logln!(
         log,
         "  OK: Device A received PONG reply event (id={}, from={expected_from})",

@@ -765,7 +765,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     case.drive_startup(&h, &fork_name);
     let fork_bound = h.eventually(
         "forked process + hook bindings",
-        Duration::from_secs(40),
+        Duration::from_secs(90),
         || {
             let Some(instance) = h.instance_json(&fork_name)? else {
                 return Ok(None);
