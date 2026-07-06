@@ -1,6 +1,6 @@
 [package]
 name = "hcom"
-version = "0.7.22"
+version = "0.7.23"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, and Copilot so agents can message, watch, and spawn each other across terminals"

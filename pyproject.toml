@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hcom"
-version = "0.7.22"
+version = "0.7.23"
 description = "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot."
 readme = "README.md"
 license = "MIT"
