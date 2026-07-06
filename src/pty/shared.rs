@@ -733,6 +733,7 @@ pub(super) struct OutputModeFilter {
     state: FilterState,
     buf: Vec<u8>,
     dsr_seen: bool,
+    pending_utf8: u8,
 }
 
 #[derive(Default, PartialEq)]
@@ -741,11 +742,21 @@ enum FilterState {
     Ground,
     Esc,
     Csi,
+    OscStart,
+    OscDigit(u8),
+    StringSeq {
+        strip: bool,
+        saw_esc: bool,
+        discarded: usize,
+    },
+    SingleShift,
+    Nf,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
 impl OutputModeFilter {
     pub(super) fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        let output_start = out.len();
         for &b in input {
             match self.state {
                 FilterState::Ground => {
@@ -759,13 +770,34 @@ impl OutputModeFilter {
                 }
                 FilterState::Esc => {
                     self.buf.push(b);
-                    if b == b'[' {
-                        self.state = FilterState::Csi;
-                    } else {
-                        // Not a CSI sequence — pass through untouched.
-                        out.extend_from_slice(&self.buf);
-                        self.buf.clear();
-                        self.state = FilterState::Ground;
+                    match b {
+                        b'[' => self.state = FilterState::Csi,
+                        b']' => self.state = FilterState::OscStart,
+                        b'P' | b'^' | b'_' | b'X' => {
+                            out.extend_from_slice(&self.buf);
+                            self.buf.clear();
+                            self.state = FilterState::StringSeq {
+                                strip: false,
+                                saw_esc: false,
+                                discarded: 0,
+                            };
+                        }
+                        b'N' | b'O' => {
+                            out.extend_from_slice(&self.buf);
+                            self.buf.clear();
+                            self.state = FilterState::SingleShift;
+                        }
+                        0x20..=0x2f => {
+                            out.extend_from_slice(&self.buf);
+                            self.buf.clear();
+                            self.state = FilterState::Nf;
+                        }
+                        _ => {
+                            // A complete two-byte escape: pass through untouched.
+                            out.extend_from_slice(&self.buf);
+                            self.buf.clear();
+                            self.state = FilterState::Ground;
+                        }
                     }
                 }
                 FilterState::Csi => {
@@ -794,7 +826,89 @@ impl OutputModeFilter {
                         self.state = FilterState::Ground;
                     }
                 }
+                FilterState::OscStart => {
+                    self.buf.push(b);
+                    if matches!(b, b'0' | b'1' | b'2') {
+                        self.state = FilterState::OscDigit(b);
+                    } else {
+                        // Not a title OSC. Emit its prefix immediately and keep
+                        // tracking until BEL/ST so title writes cannot split it.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::StringSeq {
+                            strip: false,
+                            saw_esc: b == 0x1b,
+                            discarded: 0,
+                        };
+                        if b == 0x07 {
+                            self.state = FilterState::Ground;
+                        }
+                    }
+                }
+                FilterState::OscDigit(_digit) => {
+                    self.buf.push(b);
+                    if b == b';' {
+                        // Confirmed OSC 0/1/2: discard the complete title,
+                        // including a terminator that may arrive in a later read.
+                        self.buf.clear();
+                        self.state = FilterState::StringSeq {
+                            strip: true,
+                            saw_esc: false,
+                            discarded: 0,
+                        };
+                    } else {
+                        // Multi-digit/non-title OSC. Preserve it while tracking
+                        // its boundary for safe insertion of hcom's title.
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::StringSeq {
+                            strip: false,
+                            saw_esc: b == 0x1b,
+                            discarded: 0,
+                        };
+                        if b == 0x07 {
+                            self.state = FilterState::Ground;
+                        }
+                    }
+                }
+                FilterState::StringSeq {
+                    strip,
+                    saw_esc,
+                    discarded,
+                } => {
+                    if !strip {
+                        out.push(b);
+                    }
+                    if b == 0x07 || (saw_esc && b == b'\\') {
+                        self.state = FilterState::Ground;
+                    } else if strip && discarded >= 256 {
+                        // Match the Unix title filter's fail-open bound: a
+                        // malformed title must not swallow unbounded real output.
+                        self.state = FilterState::Ground;
+                    } else {
+                        self.state = FilterState::StringSeq {
+                            strip,
+                            saw_esc: b == 0x1b,
+                            discarded: discarded + usize::from(strip),
+                        };
+                    }
+                }
+                FilterState::SingleShift => {
+                    out.push(b);
+                    self.state = FilterState::Ground;
+                }
+                FilterState::Nf => {
+                    out.push(b);
+                    if (0x30..=0x7e).contains(&b) {
+                        self.state = FilterState::Ground;
+                    }
+                }
             }
+        }
+        // If this read contained only a stripped title OSC, retain the previous
+        // UTF-8 state: no real output arrived to complete the pending character.
+        if out.len() > output_start {
+            self.pending_utf8 = advance_pending_utf8(self.pending_utf8, &out[output_start..]);
         }
     }
 
@@ -805,12 +919,32 @@ impl OutputModeFilter {
         std::mem::take(&mut self.dsr_seen)
     }
 
-    /// True when the filter is not mid-sequence (no incomplete ESC/CSI held).
-    /// The reader thread gates title-OSC writes on this so a title escape is
-    /// never interleaved into an incomplete sequence still being assembled.
-    pub(super) fn at_ground(&self) -> bool {
-        self.state == FilterState::Ground
+    /// True when an hcom title OSC can be appended without splitting a control
+    /// sequence or a multi-byte UTF-8 character.
+    pub(super) fn title_write_safe(&self) -> bool {
+        self.state == FilterState::Ground && self.pending_utf8 == 0
     }
+}
+
+/// Advance the number of expected UTF-8 continuation bytes across arbitrary
+/// read boundaries. Invalid input resets the guard and is otherwise untouched.
+fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
+    for &byte in data {
+        if pending > 0 && byte & 0xc0 == 0x80 {
+            pending -= 1;
+            continue;
+        }
+        pending = if byte & 0xf8 == 0xf0 {
+            3
+        } else if byte & 0xf0 == 0xe0 {
+            2
+        } else if byte & 0xe0 == 0xc0 {
+            1
+        } else {
+            0
+        };
+    }
+    pending
 }
 
 #[cfg(test)]
@@ -966,6 +1100,79 @@ mod tests {
         // ...and is latched exactly once.
         assert!(f.take_dsr());
         assert!(!f.take_dsr());
+    }
+
+    #[test]
+    fn output_mode_filter_strips_title_osc_split_across_reads() {
+        assert_eq!(
+            filter_modes(&[b"before\x1b]2;Clau", b"de Code\x07after"]),
+            b"beforeafter"
+        );
+        assert_eq!(
+            filter_modes(&[b"\x1b", b"]1", b";icon\x1b", b"\\text"]),
+            b"text"
+        );
+    }
+
+    #[test]
+    fn output_mode_filter_preserves_non_title_osc_and_tracks_its_boundary() {
+        let chunks: &[&[u8]] = &[b"\x1b]8;;https://exam", b"ple.test\x1b\\link"];
+        assert_eq!(filter_modes(chunks), chunks.concat());
+
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+        f.filter(chunks[0], &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(chunks[1], &mut out);
+        assert!(f.title_write_safe());
+    }
+
+    #[test]
+    fn output_mode_filter_defers_title_across_split_utf8() {
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+        f.filter(&[0xe2], &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(&[0x94], &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(&[0x80], &mut out);
+        assert!(f.title_write_safe());
+        assert_eq!(out, "─".as_bytes());
+    }
+
+    #[test]
+    fn output_mode_filter_title_only_read_preserves_pending_utf8() {
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+        f.filter(&[0xe2, 0x94], &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(b"\x1b]2;Claude Code\x07", &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(&[0x80], &mut out);
+        assert!(f.title_write_safe());
+    }
+
+    #[test]
+    fn output_mode_filter_tracks_other_split_escape_boundaries() {
+        let mut f = OutputModeFilter::default();
+        let mut out = Vec::new();
+
+        f.filter(b"\x1bPpayload", &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(b"\x1b\\", &mut out);
+        assert!(f.title_write_safe());
+
+        f.filter(b"\x1bN", &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(b"x", &mut out);
+        assert!(f.title_write_safe());
+
+        f.filter(b"\x1b(", &mut out);
+        assert!(!f.title_write_safe());
+        f.filter(b"B", &mut out);
+        assert!(f.title_write_safe());
+
+        assert_eq!(out, b"\x1bPpayload\x1b\\\x1bNx\x1b(B");
     }
 
     #[test]

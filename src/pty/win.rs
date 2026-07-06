@@ -664,10 +664,10 @@ impl Proxy {
                             ready_signaled.store(true, Ordering::Release);
                         }
 
-                        // Title OSC update. Only safe to write between complete
-                        // sequences — the OutputModeFilter exposes Ground state
-                        // for exactly that. The delivery thread updates the name
-                        // and status Arcs; mirror them into the window title.
+                        // Title OSC update. The output filter tracks complete
+                        // CSI/OSC/DCS/UTF-8 boundaries, so this cannot split the
+                        // child's byte stream. Never emit terminal metadata into
+                        // redirected/headless stdout.
                         //
                         // Compare under the read guards against the last-written
                         // values and only build/clone when something actually
@@ -675,7 +675,8 @@ impl Proxy {
                         // under heavy output) and name/status rarely change, so
                         // the common path holds the two read locks briefly but
                         // allocates nothing.
-                        if filter.at_ground()
+                        if !headless
+                            && filter.title_write_safe()
                             && let (Ok(name), Ok(status)) =
                                 (current_name.read(), current_status.read())
                             && !name.is_empty()
