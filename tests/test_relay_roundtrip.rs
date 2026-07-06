@@ -345,8 +345,43 @@ fn parse_names(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Build a command for `tool` resolved against the real process `PATH`,
+/// following npm's Windows `.cmd`/`.bat` shims that `CreateProcess` cannot
+/// execute directly (mirrors `support::Hcom::external_cmd`, which resolves
+/// against an isolated PATH instead of the real environment).
+fn external_tool_command(tool: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let resolved = std::env::split_paths(&path_var)
+            .flat_map(|dir| {
+                [".COM", ".EXE", ".BAT", ".CMD", ""]
+                    .map(move |ext| dir.join(format!("{tool}{ext}")))
+            })
+            .find(|candidate| candidate.is_file());
+        match resolved {
+            Some(path)
+                if matches!(
+                    path.extension().and_then(std::ffi::OsStr::to_str),
+                    Some(ext) if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                ) =>
+            {
+                let mut command = Command::new("cmd.exe");
+                command.args(["/d", "/c"]).arg(path);
+                command
+            }
+            Some(path) => Command::new(path),
+            None => Command::new(tool),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(tool)
+    }
+}
+
 fn assert_tool_pinned(tool: &str, expected_version: &str, install_hint: &str) {
-    let output = Command::new(tool)
+    let output = external_tool_command(tool)
         .arg("--version")
         .output()
         .unwrap_or_else(|e| {

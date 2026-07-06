@@ -146,7 +146,7 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
 
     h.eventually(
         "Codex process-bound launch",
-        Duration::from_secs(40),
+        Duration::from_secs(90),
         || {
             let Some(instance) = h.instance_json(&name)? else {
                 return Ok(None);
@@ -162,7 +162,7 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
             }
         },
     );
-    h.eventually("Codex PTY inject endpoint", Duration::from_secs(40), || {
+    h.eventually("Codex PTY inject endpoint", Duration::from_secs(90), || {
         let (code, stdout, _stderr) = h.run(["term", &name, "--json"]);
         if code == 0 && stdout.contains("\"ready\":true") {
             Ok(Some(()))

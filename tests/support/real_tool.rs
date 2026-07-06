@@ -232,8 +232,13 @@ fn instance_status_context(h: &Hcom, name: &str) -> Option<String> {
 }
 
 /// Wait until a tool instance is process-bound; return its canonical name.
+///
+/// 90s (not 40s): on Windows CI, npm-shimmed tools (codex in particular, whose
+/// launcher bypasses the shim to invoke node directly, see
+/// `terminal::resolve_windows_tool_launcher`) cold-start slower than on Unix
+/// runners and have been observed landing just past a 40s deadline.
 fn wait_process_bound<C: ToolCase>(h: &Hcom, case: &C, name: &str, what: &str) -> Value {
-    h.eventually(what, Duration::from_secs(40), || {
+    h.eventually(what, Duration::from_secs(90), || {
         let Some(instance) = h.instance_json(name)? else {
             return Ok(None);
         };
@@ -251,7 +256,7 @@ fn wait_process_bound<C: ToolCase>(h: &Hcom, case: &C, name: &str, what: &str) -
 }
 
 fn wait_pty_ready(h: &Hcom, name: &str, what: &str) {
-    h.eventually(what, Duration::from_secs(40), || {
+    h.eventually(what, Duration::from_secs(90), || {
         let (code, stdout, _stderr) = h.run(["term", name, "--json"]);
         // `ready` matches the tool's ready pattern (Codex), but tools whose
         // status bar hides that pattern at an idle prompt (Claude in
