@@ -171,6 +171,18 @@ impl ToolCase for ClaudeCase {
     }
 
     fn prepare(&self, h: &Hcom, base_url: &str) {
+        // Skip Claude's global first-run theme picker. On Windows, hcom's
+        // synchronous launch can remain inside that picker until its readiness
+        // timeout, after which the test no longer has an inject endpoint to
+        // drive it. Workspace trust is project-scoped and still starts fresh,
+        // so the tests continue to exercise the trust gate required for hooks.
+        std::fs::write(
+            h.claude_home.join(".claude.json"),
+            serde_json::to_vec(&json!({"hasCompletedOnboarding": true}))
+                .expect("serialize Claude onboarding state"),
+        )
+        .expect("seed Claude onboarding state");
+
         // Provider routing + isolated config must survive hcom's CI=1 clean-shell
         // launch rebuild, so they go through the `$HCOM_DIR/env` passthrough.
         let claude_home = h
@@ -219,12 +231,12 @@ impl ToolCase for ClaudeCase {
     }
 
     fn drive_startup(&self, h: &Hcom, name: &str) {
-        // With onboarding NOT suppressed (no IS_DEMO), a fresh CLAUDE_CONFIG_DIR
-        // makes Claude surface its theme picker then its workspace-trust dialog,
-        // which hcom reports as `launch_blocked`. Accepting trust here is what
-        // lets Claude register hooks at all ("Skipping ... hook execution -
-        // workspace trust not accepted" otherwise). Drive each surfaced prompt's
-        // default (theme=dark, trust=Yes) until the empty input prompt appears.
+        // Global onboarding is pre-seeded in prepare(), but the fresh workspace
+        // still surfaces its trust dialog, which hcom reports as
+        // `launch_blocked`. Accepting trust here is what lets Claude register
+        // hooks at all ("Skipping ... hook execution - workspace trust not
+        // accepted" otherwise). Keep the theme handling as a compatibility
+        // fallback for Claude versions that ignore the seeded state.
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut last_screen = String::new();
         while Instant::now() < deadline {
