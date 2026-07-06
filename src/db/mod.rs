@@ -232,7 +232,7 @@ impl HcomDb {
                 created_at REAL NOT NULL,
                 transcript_path TEXT DEFAULT '',
                 tcp_mode INTEGER DEFAULT 0,
-                wait_timeout INTEGER DEFAULT 86400,
+                wait_timeout INTEGER,
                 background INTEGER DEFAULT 0,
                 background_log_file TEXT DEFAULT '',
                 name_announced INTEGER DEFAULT 0,

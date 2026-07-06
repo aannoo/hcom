@@ -2530,8 +2530,9 @@ mod tests {
         //   - name: base name (no tag prefix)
         //   - full_name: tag-prefixed display name
         //   - tag / hints: null when empty or unset (not "")
-        //   - timeout: number when set (schema default 86400); null when the
-        //     row has an explicit NULL (legacy/migrated rows)
+        //   - timeout: null when the row has no explicit value (registration
+        //     paths write the resolved HCOM_TIMEOUT explicitly; a bare INSERT
+        //     that skips the column, as here, has nothing to fall back on)
         //   - subagent_timeout: null when unset
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
@@ -2546,8 +2547,10 @@ mod tests {
         assert_eq!(config["name"], "luna");
         assert_eq!(config["full_name"], "team-luna");
         assert_eq!(config["tag"], "team");
-        // Schema default kicks in on INSERT without an explicit value.
-        assert_eq!(config["timeout"], 86400);
+        assert!(
+            config["timeout"].is_null(),
+            "unset timeout must serialize as null (no schema default; issue #71)"
+        );
         assert!(
             config["hints"].is_null(),
             "unset hints must serialize as null"

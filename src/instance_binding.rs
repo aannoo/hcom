@@ -766,9 +766,15 @@ pub fn initialize_instance_in_position_file(
                 data.insert("tag".into(), serde_json::json!(hcom_config.tag));
             }
 
-            if let Some(wt) = wait_timeout {
-                data.insert("wait_timeout".into(), serde_json::json!(wt));
-            }
+            // Resolve HCOM_TIMEOUT explicitly rather than leaving the column
+            // unset — the schema's DEFAULT 86400 would otherwise silently
+            // mask the configured value for every non-PTY instance (issue #71).
+            let effective_wait_timeout =
+                wait_timeout.unwrap_or_else(crate::config::HcomConfig::effective_timeout);
+            data.insert(
+                "wait_timeout".into(),
+                serde_json::json!(effective_wait_timeout),
+            );
             if let Some(st) = subagent_timeout {
                 data.insert("subagent_timeout".into(), serde_json::json!(st));
             }
@@ -982,6 +988,13 @@ mod tests {
             let previous = std::env::var(key).ok();
             // SAFETY: tests using this guard are marked #[serial].
             unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -1878,6 +1891,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(collision_sub_count, 1);
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn new_row_honors_configured_hcom_timeout() {
+        // Regression test for issue #71: a brand-new instance row (the path
+        // used by vanilla `hcom start`, launched, and resumed sessions) must
+        // carry the effective HCOM_TIMEOUT rather than silently falling back
+        // to the old always-86400 schema default.
+        let _env = EnvVarGuard::set("HCOM_TIMEOUT", "30");
+        let (db, path) = setup_test_db();
+
+        let ok = initialize_instance_in_position_file(
+            &db, "luna", None, None, None, None, None, Some("claude"), false, None, None, None,
+            None, None,
+        );
+        assert!(ok);
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.wait_timeout, Some(30));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn new_row_falls_back_to_120_without_config() {
+        let _env = EnvVarGuard::unset("HCOM_TIMEOUT");
+        let (db, path) = setup_test_db();
+
+        let ok = initialize_instance_in_position_file(
+            &db, "luna", None, None, None, None, None, Some("claude"), false, None, None, None,
+            None, None,
+        );
+        assert!(ok);
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        // Default HcomConfig::timeout is 86400 (schema-equivalent default),
+        // preserved for anyone who hasn't set HCOM_TIMEOUT.
+        assert_eq!(row.wait_timeout, Some(86400));
 
         cleanup(path);
     }

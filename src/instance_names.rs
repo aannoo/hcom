@@ -352,6 +352,10 @@ pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
         );
         data.insert("created_at".into(), serde_json::json!(now));
         data.insert("last_event_id".into(), serde_json::json!(last_event_id));
+        data.insert(
+            "wait_timeout".into(),
+            serde_json::json!(crate::config::HcomConfig::effective_timeout()),
+        );
         db.save_instance_reservation(&name, &data)?;
 
         Ok(name)
@@ -591,5 +595,95 @@ mod subagent_alloc_tests {
         assert_eq!(status, "inactive");
         assert_eq!(ctx, "subagent:dormant");
         assert_eq!(parent.as_deref(), Some("luna"));
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn setup_db() -> (TempDir, HcomDb) {
+        let tmp = TempDir::new().unwrap();
+        let db = HcomDb::open_raw(&tmp.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (tmp, db)
+    }
+
+    #[test]
+    #[serial]
+    fn placeholder_row_honors_configured_hcom_timeout() {
+        // Regression test for issue #71: the generated-name placeholder row
+        // must carry the effective HCOM_TIMEOUT, not silently fall back to
+        // the old always-86400 schema default.
+        let _env = EnvVarGuard::set("HCOM_TIMEOUT", "45");
+        let (_tmp, db) = setup_db();
+
+        let name = reserve_generated_name(&db).unwrap();
+
+        let wait_timeout: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT wait_timeout FROM instances WHERE name = ?",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wait_timeout, Some(45));
+    }
+
+    #[test]
+    #[serial]
+    fn placeholder_row_falls_back_to_120_without_config() {
+        let _env = EnvVarGuard::unset("HCOM_TIMEOUT");
+        let (_tmp, db) = setup_db();
+
+        let name = reserve_generated_name(&db).unwrap();
+
+        let wait_timeout: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT wait_timeout FROM instances WHERE name = ?",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Default HcomConfig::timeout is 86400 (schema-equivalent default),
+        // preserved for anyone who hasn't set HCOM_TIMEOUT.
+        assert_eq!(wait_timeout, Some(86400));
     }
 }
