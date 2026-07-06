@@ -54,6 +54,14 @@ lru = "0.16"
 [dev-dependencies]
 serial_test = "3"
 
+# vt100 0.16.2 panics when a downward resize orphans a double-width character's
+# "wide" flag and it's later erased (index out of bounds in Row::clear_wide).
+# Pinned to the fix from the still-open upstream PR until a release ships it:
+# https://github.com/doy/vt100-rust/issues/28
+# https://github.com/doy/vt100-rust/pull/30
+[patch.crates-io]
+vt100 = { git = "https://github.com/Junyi-99/vt100-rust", rev = "131a75e72d9da43d503772578dc1f1c332befbba" }
+
 [profile.release]
 opt-level = 3
 lto = true
