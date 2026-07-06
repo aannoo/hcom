@@ -111,6 +111,17 @@ fn hcom_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hcom"))
 }
 
+/// The hcom test binary as a Git-Bash-safe, forward-slash, single-quoted
+/// path, for embedding in a Bash tool command string. Claude's Bash tool runs
+/// under Git Bash on Windows, whose PATH does not reliably carry this test
+/// binary's directory through relay-worker → ConPTY-child → Bash-tool
+/// process inheritance — reference the exact binary rather than relying on
+/// bare `hcom` resolving via PATH. Mirrors `support::Hcom::bash_hcom_command`.
+fn bash_hcom_command() -> String {
+    let path = hcom_bin().to_string_lossy().replace('\\', "/");
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
     let bin = hcom_bin();
     let mut command = Command::new(&bin);
@@ -786,7 +797,7 @@ fn relay_claude_mock_response(req: &RecordedRequest) -> Reply {
             TOOL_RELAY_PONG,
             "Bash",
             &serde_json::json!({
-                "command": "hcom send @bigboss --intent inform -- PONG",
+                "command": format!("{} send @bigboss --intent inform -- PONG", bash_hcom_command()),
                 "description": "send the relay roundtrip PONG response",
             }),
         ));
@@ -794,12 +805,11 @@ fn relay_claude_mock_response(req: &RecordedRequest) -> Reply {
     Reply::Sse(claude_text("msg_relay_roundtrip", "OK"))
 }
 
-/// Device A has no *local* instances (the one we launched is on Device B
-/// and appears as an origin_device_id-tagged mirror row). The relay
-/// worker's auto-exit watchdog checks every 30s and shuts the worker down
-/// after 2 consecutive empty checks — so Device A's worker dies ~60s
-/// after Phase 7, right before we need it for the long Phase 10 / 14
-/// polling. Re-arm it before each long-running RPC on Device A.
+/// `hcom relay on` is idempotent — a no-op if the worker is already running.
+/// The worker's auto-exit watchdog only fires when relay is *not* enabled in
+/// config (see `auto_exit_watchdog` in src/relay/worker.rs); both test
+/// devices enable relay in Phases 1/3, so this call is cheap insurance
+/// before an RPC rather than a fix for a known auto-exit race.
 fn ensure_relay_worker(hcom_dir: &str) {
     let out = hcom_with_dir("relay on", hcom_dir);
     if !out.status.success() {
@@ -809,6 +819,43 @@ fn ensure_relay_worker(hcom_dir: &str) {
     }
     // Brief settle so the daemon is actually listening before the next RPC.
     thread::sleep(Duration::from_millis(500));
+}
+
+/// Diagnostic snapshot for a Phase 10 timeout (either step): both devices'
+/// relay status, Device B's live screen and recent events, and the last few
+/// requests the Claude mock actually received. A bare "timed out" panic gives
+/// no way to tell a relay-delivery problem from a stuck turn from a Bash tool
+/// call failing outright — this makes a CI failure here diagnosable without
+/// another round-trip.
+fn phase10_diagnostics(
+    path_a: &str,
+    path_b: &str,
+    launched_name: &str,
+    claude_mock: &MockHttp,
+) -> String {
+    let device_b_screen = get_screen_local_json(path_b, launched_name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "<no screen>".to_string());
+    let device_b_events = hcom_with_dir("events --last 20", path_b);
+    let relay_status_a = hcom_with_dir("relay status", path_a);
+    let relay_status_b = hcom_with_dir("relay status", path_b);
+    let recent_mock_requests: String = claude_mock
+        .requests()
+        .iter()
+        .rev()
+        .take(3)
+        .map(|r| format!("  {} {}\n  body: {}\n", r.method, r.path, r.body))
+        .collect();
+    format!(
+        "Device A relay status:\n{}\n\
+         Device B relay status:\n{}\n\
+         Device B screen: {device_b_screen}\n\
+         Device B recent events:\n{}\n\
+         Last mock requests (newest first):\n{recent_mock_requests}",
+        String::from_utf8_lossy(&relay_status_a.stdout),
+        String::from_utf8_lossy(&relay_status_b.stdout),
+        String::from_utf8_lossy(&device_b_events.stdout),
+    )
 }
 
 /// Kill orphan debug relay-worker processes from previous failed test runs.
@@ -1484,29 +1531,16 @@ fn test_relay_roundtrip() {
     );
     logln!(log, "  OK: Device B received targeted Phase 10 message");
 
-    // Re-arm Device A's worker *before* Device B's turn can run, not after.
-    // Device B's claude executes its `hcom send ... PONG` reply as part of
-    // the delivery→listening turn polled below, which can take a while — if
-    // A's worker is still down (or auto-exits mid-wait, watchdog ~60s with no
-    // local instances) when B publishes, a non-retained MQTT publish with no
-    // subscriber present is simply lost, and Step 2 waits forever for an
-    // event that already came and went. Keep re-arming every iteration so
-    // it's guaranteed to be listening whenever B actually replies.
-    ensure_relay_worker(&path_a);
-
     // Step 1: Device B's claude received and processed (status round-trip).
-    poll_until(
-        || {
-            ensure_relay_worker(&path_a);
-            let out = hcom_with_dir(
-                &format!("events --type status --agent {launched_name} --last 20"),
-                &path_b,
-            );
-            if !out.status.success() {
-                return None;
-            }
-            let mut saw_delivery = false;
-            let mut saw_listening_after = false;
+    let step1_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = hcom_with_dir(
+            &format!("events --type status --agent {launched_name} --last 20"),
+            &path_b,
+        );
+        let mut saw_delivery = false;
+        let mut saw_listening_after = false;
+        if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let ev: serde_json::Value = match serde_json::from_str(line.trim()) {
                     Ok(v) => v,
@@ -1529,23 +1563,27 @@ fn test_relay_roundtrip() {
                     saw_listening_after = true;
                 }
             }
-            if saw_delivery && saw_listening_after {
-                Some(())
-            } else {
-                None
-            }
-        },
-        &format!("{launched_name} processed message (delivery → listening)"),
-        Duration::from_secs(120),
-        Duration::from_secs(2),
-    );
+        }
+        if saw_delivery && saw_listening_after {
+            break;
+        }
+        if Instant::now() >= step1_deadline {
+            panic!(
+                "Timeout (120s): {launched_name} processed message (delivery → listening)\n{}",
+                phase10_diagnostics(&path_a, &path_b, &launched_name, &claude_mock)
+            );
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
     logln!(
         log,
         "  OK: {launched_name} processed the message and returned to listening"
     );
 
-    // Belt-and-suspenders: the Step 1 poll above already keeps Device A's
-    // worker re-armed throughout, but confirm it's up before Step 2 too.
+    // Device A's worker auto-exits only when relay is *not* enabled in its
+    // config (see `auto_exit_watchdog` in src/relay/worker.rs) — both devices
+    // enabled relay in Phases 1/3, so this is just cheap insurance, not a
+    // known race fix.
     ensure_relay_worker(&path_a);
 
     // Step 2: the real round-trip — claude's PONG reply must reach
@@ -1595,33 +1633,9 @@ fn test_relay_roundtrip() {
             break ev;
         }
         if Instant::now() >= pong_deadline {
-            // The generic poll_until panic ("Timeout: description") gives no
-            // insight into *why* the PONG never arrived. Pull the state on
-            // both sides plus what the mock actually saw so a CI failure
-            // here is diagnosable without another round-trip.
-            let device_b_screen = get_screen_local_json(&path_b, &launched_name)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "<no screen>".to_string());
-            let device_b_events = hcom_with_dir("events --last 20", &path_b);
-            let relay_status_a = hcom_with_dir("relay status", &path_a);
-            let relay_status_b = hcom_with_dir("relay status", &path_b);
-            let recent_mock_requests: String = claude_mock
-                .requests()
-                .iter()
-                .rev()
-                .take(3)
-                .map(|r| format!("  {} {}\n  body: {}\n", r.method, r.path, r.body))
-                .collect();
             panic!(
-                "Timeout (90s): Device A receives PONG reply event from {expected_from}\n\
-                 Device A relay status:\n{}\n\
-                 Device B relay status:\n{}\n\
-                 Device B screen: {device_b_screen}\n\
-                 Device B recent events:\n{}\n\
-                 Last mock requests (newest first):\n{recent_mock_requests}",
-                String::from_utf8_lossy(&relay_status_a.stdout),
-                String::from_utf8_lossy(&relay_status_b.stdout),
-                String::from_utf8_lossy(&device_b_events.stdout),
+                "Timeout (90s): Device A receives PONG reply event from {expected_from}\n{}",
+                phase10_diagnostics(&path_a, &path_b, &launched_name, &claude_mock)
             );
         }
         thread::sleep(Duration::from_secs(2));
