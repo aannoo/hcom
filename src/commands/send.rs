@@ -105,6 +105,11 @@ pub struct SendArgs {
     #[arg(long)]
     pub quiet: bool,
 
+    /// Explicitly confirm broadcasting to everyone (required for no-@target
+    /// sends from inside AI tools; --go no longer authorizes broadcasts)
+    #[arg(long)]
+    pub broadcast: bool,
+
     // ── Inline bundle ──
     /// Bundle title (creates inline bundle)
     #[arg(long)]
@@ -368,8 +373,8 @@ fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
     println!("Recipients:\n  {recipient_list}\n");
     println!("Did you mean to send this to everyone?");
     println!("Broadcasts can wake many terminals and spend many agents' context/tools.");
-    println!("\nAdd --go after send and run again to proceed:");
-    println!("  hcom send --go ...\n");
+    println!("\nIf you really mean everyone, add --broadcast and run again:");
+    println!("  hcom send --broadcast ...\n");
 }
 
 ///
@@ -897,11 +902,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
+    // Broadcast from inside an AI tool requires an explicit --broadcast.
+    // Neither --go nor a small recipient count authorizes it: accidental
+    // no-@target sends (empty shell var, dropped arg) must fail loudly
+    // instead of waking every agent.
     if is_inside_ai_tool()
-        && !ctx.map(|c| c.go).unwrap_or(false)
+        && !args.broadcast
         && preview_delivery.original_scope == MessageScope::Broadcast
         && !preview_delivery.is_thread_resolved
-        && preview_delivery.delivered_to.len() > 3
     {
         print_broadcast_preview(db, &preview_delivery.delivered_to);
         return 1;
@@ -1212,6 +1220,15 @@ mod tests {
         let args = SendArgs::try_parse_from(["send", "--", "broadcast", "msg"]).unwrap();
         assert!(args.positionals.is_empty());
         assert_eq!(args.message, vec!["broadcast", "msg"]);
+    }
+
+    #[test]
+    fn parse_broadcast_flag_defaults_off() {
+        // Broadcast authorization is a dedicated opt-in flag, never implied.
+        let args = SendArgs::try_parse_from(["send", "--", "hello"]).unwrap();
+        assert!(!args.broadcast);
+        let args = SendArgs::try_parse_from(["send", "--broadcast", "--", "hello"]).unwrap();
+        assert!(args.broadcast);
     }
 
     #[test]

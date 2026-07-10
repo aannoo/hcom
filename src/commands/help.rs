@@ -199,7 +199,7 @@ const LIST_HELP: &[HelpEntry] = &[
 const SEND_HELP: &[HelpEntry] = &[
     ("  send @name -- message text", "Direct message"),
     ("  send @name1 @name2 -- message", "Multiple targets"),
-    ("  send -- message text", "Broadcast to all"),
+    ("  send --broadcast -- message", "Broadcast to all"),
     ("  send @name", "Message from stdin (pipe or heredoc)"),
     ("  send @name --file <path>", "Message from file"),
     (
@@ -209,6 +209,16 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", ""),
     ("", "Everything after -- is the message (no quotes needed)."),
     ("", "All flags must come before --."),
+    ("", ""),
+    (
+        "  --broadcast",
+        "Confirm broadcast to everyone (no @target)",
+    ),
+    (
+        "",
+        "  Required inside AI tool sessions; without it a no-@target",
+    ),
+    ("", "  send is rejected and prints a preview instead."),
     ("", ""),
     ("Target matching:", ""),
     ("  @luna", "exact base name"),
@@ -260,7 +270,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  hcom send @luna @nova --intent request -- Can you help?",
         "",
     ),
-    ("  hcom send -- Broadcast message to everyone", ""),
+    (
+        "  hcom send --broadcast -- Broadcast message to everyone",
+        "",
+    ),
     ("  echo 'Complex message' | hcom send @luna", ""),
     ("  hcom send @luna <<'EOF'", ""),
     ("  Multi-line message with special chars", ""),
