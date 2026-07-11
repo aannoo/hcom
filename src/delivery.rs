@@ -1107,9 +1107,25 @@ fn grok_inject_settle(len: usize) -> Duration {
     Duration::from_millis(scaled.min(MAX_MS))
 }
 
-/// After force-Enter, how long to wait for Grok to leave `listening` before
-/// re-sending Enter (Enter often dropped mid-paste on slow WSL).
-const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(1500);
+/// After force-Enter, how long to wait for a *real* submit signal before
+/// re-sending Enter. Must not treat `commit_delivery_ack`'s ST_ACTIVE as success
+/// (that was a false positive that skipped retries while the composer still
+/// held unsent text).
+const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(1200);
+
+/// True when Grok has actually started a user turn (UPS / stop cycle), not when
+/// we merely acked the bus. `deliver:*` is our own premature-ack context and
+/// must NOT count as submit.
+fn grok_turn_started(status: &str, context: &str) -> bool {
+    if status != ST_ACTIVE && status != "active" {
+        // Allow any non-listening non-active that clearly means mid-turn tools.
+        // Primary success path is ST_ACTIVE + prompt/trigger from UPS.
+        return false;
+    }
+    matches!(context, "prompt" | "trigger")
+        || context.starts_with("tool:")
+        || context.starts_with("approved:")
+}
 
 /// Inject raw bytes (including control characters) to the PTY.
 fn inject_bytes(port: u16, bytes: &[u8]) -> bool {
@@ -1797,24 +1813,54 @@ pub fn run_delivery_loop(
 
                     // Grok's input box is unscrapeable (`input_text` stays None), so
                     // exclusive-ownership phase-1 never succeeds and previously
-                    // re-injected `<hcom>` hundreds of times. After a length-scaled
-                    // settle, force Enter; if status stays `listening` (Enter often
-                    // dropped mid-paste under slow WSL), re-Enter a few times.
+                    // re-injected `<hcom>` hundreds of times.
+                    //
+                    // Flow:
+                    //   1) paced full-body inject + length-scaled settle
+                    //   2) force Enter *without* bus-ack (ack sets ST_ACTIVE and
+                    //      used to false-confirm submit, killing Enter retries)
+                    //   3) wait for real UPS (`status_context` prompt|trigger) or
+                    //      pending cleared by the UPS skip-followup ack path
+                    //   4) re-Enter while still pending (WSL often drops first \r)
                     if config.tool == "grok" {
                         // --- post-Enter confirm / retry path ---
                         if enter_attempt > 0 {
-                            let submitted = match db.get_status(&current_name) {
-                                Ok(Some((status, _))) => status != ST_LISTENING,
+                            let still_pending = db.has_pending(&current_name);
+                            let turn_started = match db.get_status(&current_name) {
+                                Ok(Some((status, ctx))) => grok_turn_started(&status, &ctx),
                                 _ => false,
                             };
+                            // UPS skip-followup acks when prompt already carries body.
+                            let submitted = turn_started || !still_pending;
+
                             if submitted {
                                 log_info(
                                     "native",
                                     "delivery.grok_submit_confirmed",
                                     &format!(
-                                        "Grok left listening after Enter (enter_attempt={enter_attempt})"
+                                        "Grok submit confirmed (enter_attempt={enter_attempt}, turn_started={turn_started}, pending={still_pending})"
                                     ),
                                 );
+                                // If UPS already acked, nothing to do. If turn started
+                                // but pending remains (race), ack now without followup risk
+                                // only when prompt path owns the body — UPS should win first.
+                                if still_pending
+                                    && let Some(prepared) =
+                                        crate::hooks::common::prepare_pending_messages(
+                                            db,
+                                            &current_name,
+                                        )
+                                {
+                                    crate::hooks::common::commit_delivery_ack(db, &prepared.ack);
+                                    log_info(
+                                        "native",
+                                        "delivery.grok_acked",
+                                        &format!(
+                                            "Acked after turn start (last_event_id={})",
+                                            prepared.ack.last_event_id
+                                        ),
+                                    );
+                                }
                                 inject_attempt = 0;
                                 attempt = 0;
                                 if db.has_pending(&current_name) {
@@ -1836,19 +1882,18 @@ pub fn run_delivery_loop(
                                 let approval =
                                     state.screen.read().map(|s| s.approval).unwrap_or(false);
                                 if user_active || approval {
-                                    // Don't stampede Enter over a real user; wait.
                                     if elapsed > PHASE1_TIMEOUT {
                                         log_warn(
                                             "native",
                                             "delivery.grok_enter_retry_blocked",
                                             &format!(
-                                                "Grok Enter retry blocked (user_active={user_active}, approval={approval})"
+                                                "Grok Enter retry blocked (user_active={user_active}, approval={approval}); pending kept"
                                             ),
                                         );
-                                        // Already acked — give up rather than re-inject.
-                                        delivery_state = State::Idle;
-                                        inject_attempt = 0;
-                                        attempt = 0;
+                                        // Keep pending so a later idle cycle can retry.
+                                        delivery_state = State::Pending;
+                                        inject_attempt += 1;
+                                        attempt += 1;
                                     } else {
                                         std::thread::sleep(Duration::from_millis(50));
                                     }
@@ -1858,12 +1903,17 @@ pub fn run_delivery_loop(
                                     "native",
                                     "delivery.grok_retry_enter",
                                     &format!(
-                                        "Grok still listening after {:?}; re-Enter (attempt={}/{})",
+                                        "Grok still pending after {:?}; re-Enter (attempt={}/{})",
                                         elapsed,
                                         enter_attempt + 1,
                                         MAX_ENTER_ATTEMPTS
                                     ),
                                 );
+                                // Plain \r only (see first Enter). Burst of two with a
+                                // short gap: first often lands as "consumed by paste
+                                // digest" on slow WSL, second actually submits.
+                                inject_enter(state.inject_port);
+                                std::thread::sleep(Duration::from_millis(120));
                                 inject_enter(state.inject_port);
                                 enter_attempt += 1;
                                 phase_started_at = Instant::now();
@@ -1874,12 +1924,16 @@ pub fn run_delivery_loop(
                                 "native",
                                 "delivery.grok_submit_unconfirmed",
                                 &format!(
-                                    "Grok still listening after {MAX_ENTER_ATTEMPTS} Enters (bytes={}); leaving idle (already acked)",
+                                    "Grok still pending after {MAX_ENTER_ATTEMPTS} Enters (bytes={}); force-ack so bus does not loop-reinject",
                                     injected_text.len()
                                 ),
                             );
-                            // Text may still sit in the composer — user can press Enter.
-                            // We already acked to avoid dual-UPS duplicates; do not re-inject.
+                            // Last resort: clear bus (composer may still need manual Enter).
+                            if let Some(prepared) =
+                                crate::hooks::common::prepare_pending_messages(db, &current_name)
+                            {
+                                crate::hooks::common::commit_delivery_ack(db, &prepared.ack);
+                            }
                             delivery_state = State::Idle;
                             inject_attempt = 0;
                             attempt = 0;
@@ -1916,40 +1970,20 @@ pub fn run_delivery_loop(
                             "native",
                             "delivery.grok_force_enter",
                             &format!(
-                                "Forcing Enter after unscrapeable inject (bytes={}, settle_ms={})",
+                                "Forcing Enter after unscrapeable inject (bytes={}, settle_ms={}) — defer ack until UPS",
                                 injected_text.len(),
                                 settle.as_millis()
                             ),
                         );
-                        // Single plain Enter only. Do NOT also send Ctrl+Enter /
-                        // CSI-u: Grok treats Enter as submit and Ctrl+Enter as
-                        // send-now, so sending both can leave a duplicate in the
-                        // composer queue; CSI sequences also confuse WT into
-                        // pasting Pictures\*.png paths.
+                        // Plain Enter only. Do NOT ack here: commit_delivery_ack sets
+                        // ST_ACTIVE which previously false-confirmed submit and skipped
+                        // retries while the body sat unsent in the composer.
+                        // UPS (claude-compat + native) acks when prompt already carries
+                        // the full body and skips followup_message — no duplicate queue.
+                        inject_enter(state.inject_port);
+                        std::thread::sleep(Duration::from_millis(120));
                         inject_enter(state.inject_port);
                         enter_attempt = 1;
-
-                        // Full-body inject: the composer text *is* the user turn.
-                        // Ack immediately so UserPromptSubmit hooks (Claude +
-                        // native Grok both fire) see no pending and do not emit
-                        // followup_message — that was a second copy in the queue.
-                        if let Some(prepared) =
-                            crate::hooks::common::prepare_pending_messages(db, &current_name)
-                        {
-                            crate::hooks::common::commit_delivery_ack(db, &prepared.ack);
-                            log_info(
-                                "native",
-                                "delivery.grok_acked",
-                                &format!(
-                                    "Acked after full-body inject (last_event_id={})",
-                                    prepared.ack.last_event_id
-                                ),
-                            );
-                        }
-
-                        // Stay in WaitTextRender to confirm submit / retry Enter.
-                        // Do not post-clear the composer: Ctrl sequences after
-                        // submit have been seen to re-paste garbage under WT.
                         phase_started_at = Instant::now();
                         continue;
                     }
@@ -2478,6 +2512,17 @@ mod tests {
         assert_eq!(grok_inject_settle(100), Duration::from_millis(650));
         // Cap at 4s even for huge pastes.
         assert_eq!(grok_inject_settle(10_000), Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn grok_turn_started_ignores_premature_deliver_ack() {
+        // commit_delivery_ack sets active + deliver:sender — must NOT count.
+        assert!(!grok_turn_started(ST_ACTIVE, "deliver:vomu"));
+        assert!(!grok_turn_started(ST_LISTENING, ""));
+        // Real UPS contexts.
+        assert!(grok_turn_started(ST_ACTIVE, "prompt"));
+        assert!(grok_turn_started(ST_ACTIVE, "trigger"));
+        assert!(grok_turn_started(ST_ACTIVE, "tool:Bash"));
     }
 
     #[test]
