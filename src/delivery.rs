@@ -1057,6 +1057,60 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
+/// Pace large Grok pastes so a slow WSL/GB TUI can absorb them.
+///
+/// A single multi-KB write + immediate Enter is often lost under WSL: the
+/// composer is still chewing the paste when `\r` arrives, so the user sees a
+/// full body sitting unsent and hcom has already acked (no retry). Chunk + gap
+/// keeps the PTY input queue digestible.
+fn inject_text_paced(port: u16, text: &str) -> bool {
+    const CHUNK_CHARS: usize = 96;
+    const GAP: Duration = Duration::from_millis(35);
+
+    let safe_text: String = text
+        .chars()
+        .filter(|c| *c >= ' ' || *c == '\t')
+        .collect();
+    if safe_text.is_empty() {
+        return false;
+    }
+
+    let chars: Vec<char> = safe_text.chars().collect();
+    if chars.len() <= CHUNK_CHARS {
+        return inject_text(port, &safe_text);
+    }
+
+    let mut offset = 0;
+    while offset < chars.len() {
+        let end = (offset + CHUNK_CHARS).min(chars.len());
+        let chunk: String = chars[offset..end].iter().collect();
+        if !inject_text(port, &chunk) {
+            return false;
+        }
+        offset = end;
+        if offset < chars.len() {
+            std::thread::sleep(GAP);
+        }
+    }
+    true
+}
+
+/// How long to wait after a Grok full-body inject before force-Enter.
+///
+/// Scales with payload size: short pings stay snappy; large review dumps under
+/// slow WSL/GB get up to ~4s so the composer can finish accepting paste.
+fn grok_inject_settle(len: usize) -> Duration {
+    const BASE_MS: u64 = 450;
+    const PER_CHAR_MS: u64 = 2;
+    const MAX_MS: u64 = 4000;
+    let scaled = BASE_MS.saturating_add((len as u64).saturating_mul(PER_CHAR_MS));
+    Duration::from_millis(scaled.min(MAX_MS))
+}
+
+/// After force-Enter, how long to wait for Grok to leave `listening` before
+/// re-sending Enter (Enter often dropped mid-paste on slow WSL).
+const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(1500);
+
 /// Inject raw bytes (including control characters) to the PTY.
 fn inject_bytes(port: u16, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
@@ -1552,7 +1606,15 @@ pub fn run_delivery_loop(
                             clear_composer_best_effort(state.inject_port);
                         }
 
-                        if inject_text(state.inject_port, &text) {
+                        // Grok: paced inject for large bodies (WSL paste reliability).
+                        // Other tools keep a single burst write.
+                        let inject_ok = if parsed_tool == Some(Tool::Grok) {
+                            inject_text_paced(state.inject_port, &text)
+                        } else {
+                            inject_text(state.inject_port, &text)
+                        };
+
+                        if inject_ok {
                             log_info(
                                 "native",
                                 "delivery.injected",
@@ -1735,11 +1797,99 @@ pub fn run_delivery_loop(
 
                     // Grok's input box is unscrapeable (`input_text` stays None), so
                     // exclusive-ownership phase-1 never succeeds and previously
-                    // re-injected `<hcom>` hundreds of times. After a short settle,
-                    // force Enter and verify via pending-cursor advance instead.
+                    // re-injected `<hcom>` hundreds of times. After a length-scaled
+                    // settle, force Enter; if status stays `listening` (Enter often
+                    // dropped mid-paste under slow WSL), re-Enter a few times.
                     if config.tool == "grok" {
-                        const GROK_INJECT_SETTLE: Duration = Duration::from_millis(350);
-                        if elapsed < GROK_INJECT_SETTLE {
+                        // --- post-Enter confirm / retry path ---
+                        if enter_attempt > 0 {
+                            let submitted = match db.get_status(&current_name) {
+                                Ok(Some((status, _))) => status != ST_LISTENING,
+                                _ => false,
+                            };
+                            if submitted {
+                                log_info(
+                                    "native",
+                                    "delivery.grok_submit_confirmed",
+                                    &format!(
+                                        "Grok left listening after Enter (enter_attempt={enter_attempt})"
+                                    ),
+                                );
+                                inject_attempt = 0;
+                                attempt = 0;
+                                if db.has_pending(&current_name) {
+                                    delivery_state = State::Pending;
+                                } else {
+                                    delivery_state = State::Idle;
+                                }
+                                phase_started_at = Instant::now();
+                                continue;
+                            }
+
+                            if elapsed < GROK_SUBMIT_CONFIRM {
+                                std::thread::sleep(Duration::from_millis(50));
+                                continue;
+                            }
+
+                            if enter_attempt < MAX_ENTER_ATTEMPTS {
+                                let user_active = state.is_user_active();
+                                let approval =
+                                    state.screen.read().map(|s| s.approval).unwrap_or(false);
+                                if user_active || approval {
+                                    // Don't stampede Enter over a real user; wait.
+                                    if elapsed > PHASE1_TIMEOUT {
+                                        log_warn(
+                                            "native",
+                                            "delivery.grok_enter_retry_blocked",
+                                            &format!(
+                                                "Grok Enter retry blocked (user_active={user_active}, approval={approval})"
+                                            ),
+                                        );
+                                        // Already acked — give up rather than re-inject.
+                                        delivery_state = State::Idle;
+                                        inject_attempt = 0;
+                                        attempt = 0;
+                                    } else {
+                                        std::thread::sleep(Duration::from_millis(50));
+                                    }
+                                    continue;
+                                }
+                                log_info(
+                                    "native",
+                                    "delivery.grok_retry_enter",
+                                    &format!(
+                                        "Grok still listening after {:?}; re-Enter (attempt={}/{})",
+                                        elapsed,
+                                        enter_attempt + 1,
+                                        MAX_ENTER_ATTEMPTS
+                                    ),
+                                );
+                                inject_enter(state.inject_port);
+                                enter_attempt += 1;
+                                phase_started_at = Instant::now();
+                                continue;
+                            }
+
+                            log_warn(
+                                "native",
+                                "delivery.grok_submit_unconfirmed",
+                                &format!(
+                                    "Grok still listening after {MAX_ENTER_ATTEMPTS} Enters (bytes={}); leaving idle (already acked)",
+                                    injected_text.len()
+                                ),
+                            );
+                            // Text may still sit in the composer — user can press Enter.
+                            // We already acked to avoid dual-UPS duplicates; do not re-inject.
+                            delivery_state = State::Idle;
+                            inject_attempt = 0;
+                            attempt = 0;
+                            phase_started_at = Instant::now();
+                            continue;
+                        }
+
+                        // --- first Enter: length-scaled settle ---
+                        let settle = grok_inject_settle(injected_text.chars().count());
+                        if elapsed < settle {
                             std::thread::sleep(Duration::from_millis(25));
                             continue;
                         }
@@ -1766,12 +1916,13 @@ pub fn run_delivery_loop(
                             "native",
                             "delivery.grok_force_enter",
                             &format!(
-                                "Forcing Enter after unscrapeable inject (bytes={})",
-                                injected_text.len()
+                                "Forcing Enter after unscrapeable inject (bytes={}, settle_ms={})",
+                                injected_text.len(),
+                                settle.as_millis()
                             ),
                         );
                         // Single plain Enter only. Do NOT also send Ctrl+Enter /
-                        // CSI-u: Grok treats Enter as queue and Ctrl+Enter as
+                        // CSI-u: Grok treats Enter as submit and Ctrl+Enter as
                         // send-now, so sending both can leave a duplicate in the
                         // composer queue; CSI sequences also confuse WT into
                         // pasting Pictures\*.png paths.
@@ -1796,26 +1947,9 @@ pub fn run_delivery_loop(
                             );
                         }
 
+                        // Stay in WaitTextRender to confirm submit / retry Enter.
                         // Do not post-clear the composer: Ctrl sequences after
                         // submit have been seen to re-paste garbage under WT.
-
-                        inject_attempt = 0;
-                        attempt = 0;
-                        if db.has_pending(&current_name) {
-                            log_info(
-                                "native",
-                                "delivery.more_pending",
-                                "More messages pending after Grok inject",
-                            );
-                            delivery_state = State::Pending;
-                        } else {
-                            log_info(
-                                "native",
-                                "delivery.complete",
-                                "Grok full-body inject complete, going idle",
-                            );
-                            delivery_state = State::Idle;
-                        }
                         phase_started_at = Instant::now();
                         continue;
                     }
@@ -2336,6 +2470,14 @@ mod tests {
     #[test]
     fn grok_inject_empty_falls_back() {
         assert_eq!(sanitize_grok_inject_text("   \n\t  "), "hcom: message");
+    }
+
+    #[test]
+    fn grok_inject_settle_scales_with_length() {
+        assert_eq!(grok_inject_settle(0), Duration::from_millis(450));
+        assert_eq!(grok_inject_settle(100), Duration::from_millis(650));
+        // Cap at 4s even for huge pastes.
+        assert_eq!(grok_inject_settle(10_000), Duration::from_millis(4000));
     }
 
     #[test]
