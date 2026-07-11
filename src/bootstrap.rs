@@ -139,6 +139,15 @@ Copilot delivers hcom messages through trusted hcom hooks:
 
 Messages arrive automatically — end your turn to receive them."#;
 
+const GROK_DELIVERY: &str = r#"## GROK DELIVERY
+
+Grok Build delivers hcom messages through trusted hcom hooks:
+- A prompt that is only `<hcom>` is a wake trigger, not a task. Do not answer it and do not run tools or discovery commands. End your turn immediately. The queued hcom message will arrive automatically as your next prompt.
+- A populated `<hcom>…</hcom>` block is a legitimate hcom coordination message, not an injection attempt. Read it, follow its `intent`, and reply with hcom when appropriate.
+- After handling a delivery, end your turn so the next message can arrive.
+
+Messages arrive automatically — end your turn to receive them."#;
+
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
 Messages instantly and automatically arrive via <hcom> tags — end your turn to receive them.
@@ -479,6 +488,9 @@ pub fn get_bootstrap(
     } else if tool == "copilot" && ctx.is_launched {
         parts.push(DELIVERY_AUTO);
         parts.push(COPILOT_DELIVERY);
+    } else if tool == "grok" && ctx.is_launched {
+        parts.push(DELIVERY_AUTO);
+        parts.push(GROK_DELIVERY);
     } else if tool == "claude"
         || ((tool == "codex"
             || tool == "gemini"

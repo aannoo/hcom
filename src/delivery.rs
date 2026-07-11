@@ -364,6 +364,61 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
+/// Build the PTY inject payload for Grok Build.
+///
+/// Grok cannot use the Claude/Cursor wake-trigger pattern (`<hcom>` only):
+/// - its input box is unscrapeable, so phase-1 never confirms render and hcom
+///   re-injects hundreds of times;
+/// - angle brackets are mis-handled in the Grok composer under WT/WSL (users
+///   see Windows image paths instead of the trigger);
+/// - hook `additionalContext` / `followup_message` are not reliably merged into
+///   the request body when the user prompt is only a bare trigger.
+///
+/// So inject the **full plain-text message body**. When Enter is forced, that
+/// text *is* the user turn the model receives.
+pub(crate) fn build_grok_inject_text(db: &HcomDb, recipient: &str) -> String {
+    let messages = db.get_unread_messages(recipient);
+    if messages.is_empty() {
+        return "hcom: wake".to_string();
+    }
+    let values: Vec<serde_json::Value> = messages
+        .iter()
+        .map(crate::hooks::common::message_to_value)
+        .collect();
+    let body = crate::hooks::common::format_hook_messages_for_instance(db, &values, recipient);
+    sanitize_grok_inject_text(&body)
+}
+
+/// Strip characters that break Grok's composer / PTY inject path.
+fn sanitize_grok_inject_text(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| match c {
+            // Angle brackets confuse Grok/WT (path/image paste artifacts).
+            '<' => '[',
+            '>' => ']',
+            c if c >= ' ' || c == '\t' => c,
+            // inject_text also drops non-printables; keep spaces for newlines.
+            '\n' | '\r' => ' ',
+            _ => ' ',
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        "hcom: message".to_string()
+    } else {
+        // Soft cap so we do not flood the composer; full body still arrives via
+        // UserPromptSubmit hooks when present.
+        const MAX: usize = 2000;
+        if collapsed.chars().count() > MAX {
+            let truncated: String = collapsed.chars().take(MAX).collect();
+            format!("{truncated}…")
+        } else {
+            collapsed
+        }
+    }
+}
+
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
 /// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
@@ -1002,6 +1057,27 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
+/// Inject raw bytes (including control characters) to the PTY.
+fn inject_bytes(port: u16, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+        Ok(mut stream) => stream.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Best-effort clear of the current composer line before a Grok inject.
+///
+/// Only Ctrl-U (kill line). Avoid Ctrl-A/K and CSI sequences: under Windows
+/// Terminal they have been observed to paste stale clipboard / image paths
+/// (`C:\Users\...\Pictures\*.png`) into the Grok composer.
+fn clear_composer_best_effort(port: u16) {
+    let _ = inject_bytes(port, b"\x15"); // Ctrl-U
+    std::thread::sleep(Duration::from_millis(40));
+}
+
 /// Inject Enter key to PTY via TCP
 pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
@@ -1464,11 +1540,17 @@ pub fn run_delivery_loop(
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
+                            // Grok: full plain-text body (see build_grok_inject_text).
+                            Some(Tool::Grok) => build_grok_inject_text(db, &current_name),
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
                             | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi)
                             | Some(Tool::Omp) => "<hcom>".to_string(),
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
+
+                        if parsed_tool == Some(Tool::Grok) {
+                            clear_composer_best_effort(state.inject_port);
+                        }
 
                         if inject_text(state.inject_port, &text) {
                             log_info(
@@ -1650,6 +1732,93 @@ pub fn run_delivery_loop(
 
                 State::WaitTextRender => {
                     let elapsed = phase_started_at.elapsed();
+
+                    // Grok's input box is unscrapeable (`input_text` stays None), so
+                    // exclusive-ownership phase-1 never succeeds and previously
+                    // re-injected `<hcom>` hundreds of times. After a short settle,
+                    // force Enter and verify via pending-cursor advance instead.
+                    if config.tool == "grok" {
+                        const GROK_INJECT_SETTLE: Duration = Duration::from_millis(350);
+                        if elapsed < GROK_INJECT_SETTLE {
+                            std::thread::sleep(Duration::from_millis(25));
+                            continue;
+                        }
+                        let user_active = state.is_user_active();
+                        let approval = state.screen.read().map(|s| s.approval).unwrap_or(false);
+                        if user_active || approval {
+                            if elapsed > PHASE1_TIMEOUT {
+                                log_warn(
+                                    "native",
+                                    "delivery.grok_enter_blocked",
+                                    &format!(
+                                        "Grok force-Enter blocked (user_active={user_active}, approval={approval})"
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                inject_attempt += 1;
+                                attempt += 1;
+                            } else {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            continue;
+                        }
+                        log_info(
+                            "native",
+                            "delivery.grok_force_enter",
+                            &format!(
+                                "Forcing Enter after unscrapeable inject (bytes={})",
+                                injected_text.len()
+                            ),
+                        );
+                        // Single plain Enter only. Do NOT also send Ctrl+Enter /
+                        // CSI-u: Grok treats Enter as queue and Ctrl+Enter as
+                        // send-now, so sending both can leave a duplicate in the
+                        // composer queue; CSI sequences also confuse WT into
+                        // pasting Pictures\*.png paths.
+                        inject_enter(state.inject_port);
+                        enter_attempt = 1;
+
+                        // Full-body inject: the composer text *is* the user turn.
+                        // Ack immediately so UserPromptSubmit hooks (Claude +
+                        // native Grok both fire) see no pending and do not emit
+                        // followup_message — that was a second copy in the queue.
+                        if let Some(prepared) =
+                            crate::hooks::common::prepare_pending_messages(db, &current_name)
+                        {
+                            crate::hooks::common::commit_delivery_ack(db, &prepared.ack);
+                            log_info(
+                                "native",
+                                "delivery.grok_acked",
+                                &format!(
+                                    "Acked after full-body inject (last_event_id={})",
+                                    prepared.ack.last_event_id
+                                ),
+                            );
+                        }
+
+                        // Do not post-clear the composer: Ctrl sequences after
+                        // submit have been seen to re-paste garbage under WT.
+
+                        inject_attempt = 0;
+                        attempt = 0;
+                        if db.has_pending(&current_name) {
+                            log_info(
+                                "native",
+                                "delivery.more_pending",
+                                "More messages pending after Grok inject",
+                            );
+                            delivery_state = State::Pending;
+                        } else {
+                            log_info(
+                                "native",
+                                "delivery.complete",
+                                "Grok full-body inject complete, going idle",
+                            );
+                            delivery_state = State::Idle;
+                        }
+                        phase_started_at = Instant::now();
+                        continue;
+                    }
 
                     // Inspect the latest screen before applying the deadline. This
                     // avoids rejecting a render that completed at the timeout edge.
@@ -2157,6 +2326,19 @@ mod tests {
     // ---- phase-1 ownership tests ----
 
     #[test]
+    #[test]
+    fn grok_inject_strips_angle_brackets() {
+        let cleaned = sanitize_grok_inject_text("<hcom>hello → world</hcom>");
+        assert!(!cleaned.contains('<'), "cleaned={cleaned}");
+        assert!(!cleaned.contains('>'), "cleaned={cleaned}");
+        assert!(cleaned.contains("hello"), "cleaned={cleaned}");
+    }
+
+    #[test]
+    fn grok_inject_empty_falls_back() {
+        assert_eq!(sanitize_grok_inject_text("   \n\t  "), "hcom: message");
+    }
+
     fn phase1_timeout_is_ten_seconds() {
         assert_eq!(PHASE1_TIMEOUT, Duration::from_secs(10));
     }

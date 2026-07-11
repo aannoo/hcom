@@ -214,6 +214,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
         "copilot_args" => Some("launch.copilot.args"),
+        "grok_args" => Some("launch.grok.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -1482,7 +1483,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Grok auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1591,6 +1592,16 @@ HCOM_CURSOR_ARGS - Default args passed to cursor-agent on launch
 
 Example: hcom config cursor_args \"--model auto\"
 Clear:   hcom config cursor_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_GROK_ARGS" => Some(
+            "\
+HCOM_GROK_ARGS - Default args passed to grok on launch
+
+Example: hcom config grok_args \"--model grok-build --always-approve\"
+Clear:   hcom config grok_args \"\"
 
 Prepended to launch-time cli args.",
         ),

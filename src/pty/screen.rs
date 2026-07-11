@@ -497,6 +497,9 @@ impl ScreenTracker {
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
+            // Grok: prompt-empty gate uses generic scrape when available; no
+            // tool-specific VT100 input parser yet.
+            Ok(Tool::Grok) => None,
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }

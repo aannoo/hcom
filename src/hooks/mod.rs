@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Grok).
 
 pub mod antigravity;
 pub mod claude;
@@ -9,6 +9,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod family;
 pub mod gemini;
+pub mod grok;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
@@ -213,7 +214,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -428,6 +429,51 @@ impl HookPayload {
                 None => String::new(),
             },
             notification_type: None,
+            raw,
+        }
+    }
+
+    /// Build from Grok Build native hook JSON.
+    ///
+    /// Grok stdin uses camelCase (`sessionId`, `toolName`, `toolInput`) and also
+    /// sets `GROK_SESSION_ID` / `GROK_HOOK_EVENT` env vars. Accept both cases.
+    pub fn from_grok(hook_type: &str, raw: Value) -> Self {
+        let tool_result = raw
+            .get("tool_result")
+            .or_else(|| raw.get("toolResult"))
+            .or_else(|| raw.get("tool_response"))
+            .or_else(|| raw.get("toolResponse"))
+            .map(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_default();
+
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id", "sessionId"]),
+            transcript_path: Self::opt_str_field(
+                &raw,
+                &[
+                    "transcript_path",
+                    "transcriptPath",
+                    "session_path",
+                    "sessionPath",
+                ],
+            ),
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name", "hookEventName"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "grok".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name", "toolName"]),
+            tool_input: Self::obj_field(&raw, &["tool_input", "toolInput"]),
+            tool_result,
+            notification_type: Self::opt_str_field(
+                &raw,
+                &["notification_type", "notificationType"],
+            ),
             raw,
         }
     }
