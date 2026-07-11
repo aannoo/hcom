@@ -2326,7 +2326,6 @@ mod tests {
     // ---- phase-1 ownership tests ----
 
     #[test]
-    #[test]
     fn grok_inject_strips_angle_brackets() {
         let cleaned = sanitize_grok_inject_text("<hcom>hello → world</hcom>");
         assert!(!cleaned.contains('<'), "cleaned={cleaned}");
@@ -2339,6 +2338,7 @@ mod tests {
         assert_eq!(sanitize_grok_inject_text("   \n\t  "), "hcom: message");
     }
 
+    #[test]
     fn phase1_timeout_is_ten_seconds() {
         assert_eq!(PHASE1_TIMEOUT, Duration::from_secs(10));
     }
