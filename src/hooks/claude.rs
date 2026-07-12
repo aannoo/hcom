@@ -1241,15 +1241,17 @@ fn handle_userpromptsubmit(
             common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
 
         if common::is_grok_host() {
+            // Grok loads Claude-compat UPS *and* native grok-userpromptsubmit.
+            // Emitting followup from both races into two queued turns. Native
+            // grok owns delivery (full-body skip-ack or bare-wake followup).
+            // Claude-compat only acks when the PTY full-body path already put
+            // the payload in the user prompt (safe no-op if native acked first).
             let prompt = _payload
                 .raw
                 .get("prompt")
                 .and_then(|v| v.as_str())
                 .or_else(|| _payload.raw.get("userPrompt").and_then(|v| v.as_str()))
                 .unwrap_or("");
-            // PTY full-body path already put the message in the user turn.
-            // Emitting followup_message here queues a second copy in Grok's
-            // composer (user sees duplicate hcom text).
             if common::prompt_already_carries_hcom_body(prompt, &model_context)
                 || common::prompt_already_carries_hcom_body(prompt, &user_display)
             {
@@ -1262,23 +1264,20 @@ fn handle_userpromptsubmit(
                         prompt.len()
                     ),
                 );
-                // Ack only — empty object so dispatcher still flushes + commits.
                 return (0, "{}".to_string(), Some(prepared.ack));
             }
-            // Bare / empty prompt: need a followup turn with the body.
             log::log_info(
                 "hooks",
-                "userpromptsubmit.grok_delivery",
-                &format!("instance={} bytes={}", instance_name, model_context.len()),
+                "userpromptsubmit.grok_defer_to_native",
+                &format!(
+                    "instance={} bare/wake prompt — native grok UPS owns followup",
+                    instance_name
+                ),
             );
-            let output = serde_json::json!({
-                "followup_message": model_context,
-            });
-            return (
-                0,
-                serde_json::to_string(&output).unwrap_or_default(),
-                Some(prepared.ack),
-            );
+            // Do not prepare-ack here: leave pending for native grok UPS.
+            // We already called prepare_pending_messages above — that does NOT
+            // advance cursor; only commit_delivery_ack does. Drop ack.
+            return (0, "{}".to_string(), None);
         }
 
         let output = serde_json::json!({
