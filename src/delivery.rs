@@ -1095,10 +1095,7 @@ fn inject_text_paced(port: u16, text: &str) -> bool {
     const CHUNK_CHARS: usize = 96;
     const GAP: Duration = Duration::from_millis(35);
 
-    let safe_text: String = text
-        .chars()
-        .filter(|c| *c >= ' ' || *c == '\t')
-        .collect();
+    let safe_text: String = text.chars().filter(|c| *c >= ' ' || *c == '\t').collect();
     if safe_text.is_empty() {
         return false;
     }
