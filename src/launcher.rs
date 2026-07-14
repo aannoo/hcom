@@ -315,6 +315,33 @@ pub fn build_launch_env(
     build_launch_env_with_resolver(hcom_config, regime, crate::shell_env::resolved_shell_env)
 }
 
+fn build_codex_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+    tag: &str,
+    relay_enabled: bool,
+) -> String {
+    let notes = instance_env
+        .get("HCOM_NOTES")
+        .map(String::as_str)
+        .unwrap_or("");
+    crate::bootstrap::get_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "codex",
+        background,
+        true,
+        notes,
+        tag,
+        relay_enabled,
+        None,
+    )
+}
+
 fn build_launch_env_with_resolver<F>(
     hcom_config: &HcomConfig,
     regime: LaunchEnvRegime,
@@ -2044,17 +2071,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     }
 
                     // Generate bootstrap text for preprocessing
-                    let bootstrap = crate::bootstrap::get_bootstrap(
+                    let bootstrap = build_codex_bootstrap(
                         db,
                         &paths::hcom_dir(),
                         &instance_name,
-                        "codex",
                         params.background,
-                        true, // is_launched
-                        "",
+                        &instance_env,
                         &effective_tag,
                         hcom_config.relay_enabled,
-                        None,
                     );
 
                     let sandbox_mode = instance_env
@@ -2975,6 +2999,47 @@ mod tests {
         assert_eq!(env.get("HCOM_TAG").map(String::as_str), Some("config-tag"));
 
         unsafe { std::env::remove_var("HCOM_TAG") }
+    }
+
+    #[test]
+    fn test_codex_bootstrap_includes_notes_from_effective_instance_env() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let instance_env = HashMap::from([(
+            "HCOM_NOTES".to_string(),
+            "instance-specific notes".to_string(),
+        )]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        assert!(bootstrap.contains("## NOTES"));
+        assert!(bootstrap.contains("instance-specific notes"));
+    }
+
+    #[test]
+    fn test_codex_bootstrap_omits_notes_section_when_effective_env_has_none() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &HashMap::new(),
+            "",
+            false,
+        );
+
+        assert!(!bootstrap.contains("## NOTES"));
     }
 
     #[test]
