@@ -271,10 +271,12 @@ fn route_claude_hook(
     //
     // This is scoped to PostToolUse because that is the only suppressed hook
     // that carries a parent message delivery. It is safe against genuine
-    // freezes: a live subagent keeps its `instances` row, so
-    // `check_dead_subagents` never reaps it, `active` stays true, and parent
-    // messages are still deferred to `end_task` rather than mis-injected into
-    // the subagent's own context.
+    // freezes because the reap is restricted to deterministic death signals
+    // (`DeathSignals::DefinitiveOnly`): a live subagent keeps its `instances`
+    // row and carries no interrupt marker, so it is never reaped — even if
+    // its transcript mtime crosses the stale threshold during a long tool
+    // call. `active` stays true and parent messages remain deferred to
+    // `end_task` rather than mis-injected into the subagent's own context.
     if is_in_subagent_ctx && hook_type == HOOK_POST {
         is_in_subagent_ctx = reconcile_stale_subagent_freeze(
             db,
@@ -288,7 +290,7 @@ fn route_claude_hook(
 
         if hook_type == HOOK_USERPROMPTSUBMIT {
             let transcript_path = payload.transcript_path.as_deref().unwrap_or("");
-            cleanup_dead_subagents(db, &session_id, transcript_path);
+            cleanup_dead_subagents(db, &session_id, transcript_path, DeathSignals::All);
             // Fall through to parent handler for PTY message delivery
         }
 
@@ -1456,12 +1458,30 @@ fn find_subagent_transcript_impl(dir: &Path, target: &str, depth: u32) -> Option
     None
 }
 
+/// Which death signals a dead-subagent sweep is allowed to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeathSignals {
+    /// All signals: DB row missing, stale transcript-mtime heuristic, and
+    /// interrupt marker. Used at UserPromptSubmit — the user is present, and
+    /// a heuristic false positive is recoverable on the next turn.
+    All,
+    /// Deterministic signals only: DB row missing or interrupt marker.
+    /// Excludes the transcript-mtime heuristic: a live subagent that simply
+    /// has not written its transcript for a while (long tool call, waiting on
+    /// I/O) crosses the stale threshold without being dead. Used by the
+    /// PostToolUse stale-freeze reconciliation, where a false positive would
+    /// unfreeze the parent mid-Task and the very next subagent tool call
+    /// would inject the parent's messages into the subagent's context.
+    DefinitiveOnly,
+}
+
 /// Check for dead subagents by checking multiple death signals.
 fn check_dead_subagents(
     db: &HcomDb,
     transcript_path: &str,
     running_tasks: &instances::RunningTasks,
     subagent_timeout: Option<i64>,
+    signals: DeathSignals,
 ) -> Vec<String> {
     let timeout = subagent_timeout.unwrap_or_else(|| {
         HcomConfig::load(None)
@@ -1531,8 +1551,10 @@ fn check_dead_subagents(
                 continue;
             }
             Ok(meta) => {
-                // Stale check
-                if let Ok(modified) = meta.modified() {
+                // Stale check (heuristic — only when all signals are allowed)
+                if signals == DeathSignals::All
+                    && let Ok(modified) = meta.modified()
+                {
                     let mtime = modified
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -1564,7 +1586,12 @@ fn check_dead_subagents(
 }
 
 /// Clean up dead subagents from parent's running_tasks.
-fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) {
+fn cleanup_dead_subagents(
+    db: &HcomDb,
+    session_id: &str,
+    transcript_path: &str,
+    signals: DeathSignals,
+) {
     let instance_name = match db.get_session_binding(session_id) {
         Ok(Some(name)) => name,
         _ => return,
@@ -1585,6 +1612,7 @@ fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) 
         transcript_path,
         &running_tasks,
         instance_data.subagent_timeout,
+        signals,
     );
     if dead_ids.is_empty() {
         return;
@@ -1610,14 +1638,20 @@ fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) 
 /// Reap dead subagents from a possibly-stale Task freeze, then report the
 /// post-reconciliation subagent-context verdict.
 ///
-/// Runs `cleanup_dead_subagents` (which removes tracked subagents whose
-/// `instances` row is gone, whose transcript went stale, or that were
-/// interrupted, resetting `running_tasks.active` to false once none remain)
-/// and re-reads `in_subagent_context`. Returns true if the parent is still
+/// Runs `cleanup_dead_subagents` restricted to deterministic death signals
+/// (`instances` row gone, or interrupt marker in the transcript — NOT the
+/// stale-mtime heuristic, see `DeathSignals::DefinitiveOnly`), resetting
+/// `running_tasks.active` to false once no tracked subagents remain, then
+/// re-reads `in_subagent_context`. Returns true if the parent is still
 /// genuinely inside a subagent freeze, false if the freeze was stale and has
 /// now been cleared. See the PostToolUse call site for the full rationale.
 fn reconcile_stale_subagent_freeze(db: &HcomDb, session_id: &str, transcript_path: &str) -> bool {
-    cleanup_dead_subagents(db, session_id, transcript_path);
+    cleanup_dead_subagents(
+        db,
+        session_id,
+        transcript_path,
+        DeathSignals::DefinitiveOnly,
+    );
     instances::in_subagent_context(db, session_id)
 }
 
@@ -2836,6 +2870,91 @@ mod tests {
             "a live subagent (instances row present) must keep the parent frozen"
         );
         assert!(instances::in_subagent_context(&db, "sess-1"));
+    }
+
+    // Mis-kill guard: a live subagent whose transcript mtime has crossed the
+    // stale threshold (long tool call, no transcript writes) trips the mtime
+    // heuristic — which is exactly why reconciliation must not use it. The
+    // stale-mtime signal must reap under DeathSignals::All (UserPromptSubmit
+    // behavior preserved) but must NOT unfreeze the parent via
+    // reconcile_stale_subagent_freeze (DefinitiveOnly).
+    #[test]
+    fn test_reconcile_ignores_stale_mtime_of_live_subagent() {
+        let (dir, db) = make_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, agent_id)
+                 VALUES ('sub-b', 'claude', 'active', 'subagent', 0, 0, 0, 'live-agent-2')",
+                [],
+            )
+            .unwrap();
+        let rt_json =
+            r#"{"active":true,"subagents":[{"agent_id":"live-agent-2","type":"general"}]}"#;
+        db.conn()
+            .execute(
+                "UPDATE instances SET running_tasks = ?, subagent_timeout = 1 WHERE name = 'nova'",
+                rusqlite::params![rt_json],
+            )
+            .unwrap();
+
+        // Parent transcript at {dir}/sess.jsonl → subagent transcript at
+        // {dir}/sess/subagents/agent-live-agent-2.jsonl, with an mtime far
+        // beyond the stale threshold (subagent_timeout=1 → threshold 2s) and
+        // no interrupt marker.
+        let parent_transcript = dir.path().join("sess.jsonl");
+        let subagent_dir = dir.path().join("sess").join("subagents");
+        std::fs::create_dir_all(&subagent_dir).unwrap();
+        let sub_transcript = subagent_dir.join("agent-live-agent-2.jsonl");
+        std::fs::write(&sub_transcript, "{\"type\":\"assistant\"}\n").unwrap();
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&sub_transcript)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+        let transcript_path = parent_transcript.to_string_lossy().to_string();
+
+        // Fixture sanity: the full signal set DOES flag it stale-dead, so the
+        // assertions below cannot pass vacuously.
+        let running_tasks = instances::parse_running_tasks(Some(rt_json));
+        let all_dead = check_dead_subagents(
+            &db,
+            &transcript_path,
+            &running_tasks,
+            Some(1),
+            DeathSignals::All,
+        );
+        assert_eq!(
+            all_dead,
+            vec!["live-agent-2".to_string()],
+            "fixture must cross the stale-mtime threshold under DeathSignals::All"
+        );
+
+        // Reconciliation (definitive signals only) must not reap it: the
+        // freeze holds and running_tasks keeps tracking the live subagent.
+        let still_frozen = reconcile_stale_subagent_freeze(&db, "sess-1", &transcript_path);
+        assert!(
+            still_frozen,
+            "stale mtime alone must not unfreeze the parent during reconciliation"
+        );
+        assert!(instances::in_subagent_context(&db, "sess-1"));
+        let rt_after: String = db
+            .conn()
+            .query_row(
+                "SELECT running_tasks FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed = instances::parse_running_tasks(Some(&rt_after));
+        assert!(parsed.active);
+        assert_eq!(parsed.subagents.len(), 1);
+        assert_eq!(
+            parsed.subagents[0].get("agent_id").and_then(|v| v.as_str()),
+            Some("live-agent-2")
+        );
     }
 
     #[test]
