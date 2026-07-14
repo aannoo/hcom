@@ -255,8 +255,33 @@ fn route_claude_hook(
 
     // Subagent context check
     let subagent_check_start = Instant::now();
-    let is_in_subagent_ctx = instances::in_subagent_context(db, &session_id);
+    let mut is_in_subagent_ctx = instances::in_subagent_context(db, &session_id);
     timing.subagent_check_ms = Some(subagent_check_start.elapsed().as_secs_f64() * 1000.0);
+
+    // Stale-freeze reconciliation (fork patch).
+    //
+    // A Task subagent that dies without a clean SubagentStop leaves the
+    // parent's `running_tasks.active` stuck true. While it is stuck, every
+    // parent PostToolUse short-circuits in the block below and delivers
+    // nothing, so hcom messages addressed to a busy parent are withheld until
+    // the user happens to type a prompt (UserPromptSubmit runs the same
+    // cleanup). Reap dead subagents on the parent's own PostToolUse and
+    // re-evaluate, so a resumed parent resumes delivery on its very next tool
+    // call instead of waiting for manual input.
+    //
+    // This is scoped to PostToolUse because that is the only suppressed hook
+    // that carries a parent message delivery. It is safe against genuine
+    // freezes: a live subagent keeps its `instances` row, so
+    // `check_dead_subagents` never reaps it, `active` stays true, and parent
+    // messages are still deferred to `end_task` rather than mis-injected into
+    // the subagent's own context.
+    if is_in_subagent_ctx && hook_type == HOOK_POST {
+        is_in_subagent_ctx = reconcile_stale_subagent_freeze(
+            db,
+            &session_id,
+            payload.transcript_path.as_deref().unwrap_or(""),
+        );
+    }
 
     if is_in_subagent_ctx {
         timing.context = Some("subagent");
@@ -1582,6 +1607,20 @@ fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) 
     }
 }
 
+/// Reap dead subagents from a possibly-stale Task freeze, then report the
+/// post-reconciliation subagent-context verdict.
+///
+/// Runs `cleanup_dead_subagents` (which removes tracked subagents whose
+/// `instances` row is gone, whose transcript went stale, or that were
+/// interrupted, resetting `running_tasks.active` to false once none remain)
+/// and re-reads `in_subagent_context`. Returns true if the parent is still
+/// genuinely inside a subagent freeze, false if the freeze was stale and has
+/// now been cleared. See the PostToolUse call site for the full rationale.
+fn reconcile_stale_subagent_freeze(db: &HcomDb, session_id: &str, transcript_path: &str) -> bool {
+    cleanup_dead_subagents(db, session_id, transcript_path);
+    instances::in_subagent_context(db, session_id)
+}
+
 /// SubagentStart: surface agent_id to subagent.
 fn subagent_start(raw: &Value) -> Option<Value> {
     let agent_id = raw.get("agent_id").and_then(|v| v.as_str())?;
@@ -2731,6 +2770,72 @@ mod tests {
     fn test_subagent_start_empty_agent_id() {
         let raw = serde_json::json!({"agent_id": ""});
         assert!(subagent_start(&raw).is_none());
+    }
+
+    // Stale Task freeze: a subagent that died without a clean SubagentStop
+    // leaves running_tasks.active stuck true, which otherwise withholds every
+    // parent PostToolUse delivery. Reconciliation must reap it and let the
+    // parent's pending message flow again.
+    #[test]
+    fn test_reconcile_clears_stale_freeze_and_delivers_to_parent() {
+        let (_dir, db) = make_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET running_tasks = ? WHERE name = 'nova'",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"dead-agent-1","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+
+        // Precondition: the parent looks frozen inside a subagent context.
+        assert!(instances::in_subagent_context(&db, "sess-1"));
+
+        // Reconciliation reaps the dead subagent (no instances row) and clears
+        // the freeze.
+        let still_frozen = reconcile_stale_subagent_freeze(&db, "sess-1", "");
+        assert!(
+            !still_frozen,
+            "stale freeze must clear once the dead subagent is reaped"
+        );
+        assert!(!instances::in_subagent_context(&db, "sess-1"));
+
+        // The parent's pending message is now deliverable at PostToolUse.
+        let (output, _ack) = get_posttooluse_messages(&db, "nova").unwrap();
+        let system_message = output["systemMessage"].as_str().unwrap();
+        assert!(system_message.contains("hello"));
+    }
+
+    // A genuine, live subagent must keep the parent frozen. Reconciliation
+    // must NOT reap it, so parent messages stay deferred to end_task rather
+    // than being mis-injected into the subagent's own context.
+    #[test]
+    fn test_reconcile_preserves_live_subagent_freeze() {
+        let (_dir, db) = make_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, agent_id)
+                 VALUES ('sub-a', 'claude', 'active', 'subagent', 0, 0, 0, 'live-agent-1')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET running_tasks = ? WHERE name = 'nova'",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"live-agent-1","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+
+        let still_frozen = reconcile_stale_subagent_freeze(&db, "sess-1", "");
+        assert!(
+            still_frozen,
+            "a live subagent (instances row present) must keep the parent frozen"
+        );
+        assert!(instances::in_subagent_context(&db, "sess-1"));
     }
 
     #[test]
