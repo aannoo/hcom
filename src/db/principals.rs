@@ -17,6 +17,11 @@ pub enum PrincipalLookup {
     Unresolved {
         instance_name: String,
     },
+    /// One or more instance rows claim the principal, but the authoritative
+    /// binding row is absent. Claims are diagnostic only and never routable.
+    MissingBinding {
+        claiming_instances: Vec<String>,
+    },
     Unknown,
 }
 
@@ -26,6 +31,7 @@ impl PrincipalLookup {
             Self::Resolved { instance_name, .. } | Self::Unresolved { instance_name } => {
                 Some(instance_name)
             }
+            Self::MissingBinding { .. } => None,
             Self::Unknown => None,
         }
     }
@@ -35,7 +41,7 @@ impl PrincipalLookup {
     }
 
     pub fn is_unresolved(&self) -> bool {
-        matches!(self, Self::Unresolved { .. })
+        matches!(self, Self::Unresolved { .. } | Self::MissingBinding { .. })
     }
 }
 
@@ -69,6 +75,19 @@ impl HcomDb {
             let Some(column) = column else {
                 bail!("cannot bind principal to missing instance '{instance_name}'");
             };
+            let foreign_claim: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT name FROM instances WHERE principal=? AND name!=? LIMIT 1",
+                    params![principal, instance_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(claiming_instance) = foreign_claim {
+                bail!(
+                    "principal '{principal}' is already claimed by instance '{claiming_instance}' without a consistent binding"
+                );
+            }
             if let Some(bound) = binding {
                 if bound == instance_name && column.as_deref() == Some(principal) {
                     return Ok(false);
@@ -134,8 +153,19 @@ impl HcomDb {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
+        if row.is_none() {
+            let claiming_instances: Vec<String> = self
+                .conn
+                .prepare("SELECT name FROM instances WHERE principal=? ORDER BY name")?
+                .query_map(params![principal], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            return Ok(if claiming_instances.is_empty() {
+                PrincipalLookup::Unknown
+            } else {
+                PrincipalLookup::MissingBinding { claiming_instances }
+            });
+        }
         Ok(match row {
-            None => PrincipalLookup::Unknown,
             Some((instance_name, Some(column), session_id, false)) if column == principal => {
                 PrincipalLookup::Resolved {
                     instance_name,
@@ -143,6 +173,7 @@ impl HcomDb {
                 }
             }
             Some((instance_name, _, _, _)) => PrincipalLookup::Unresolved { instance_name },
+            None => unreachable!("missing binding handled above"),
         })
     }
 }
@@ -233,6 +264,52 @@ mod tests {
         let unresolved = db.lookup_principal("p-1").unwrap();
         assert_eq!(unresolved.instance_name(), Some("luna"));
         assert!(unresolved.is_unresolved());
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn principal_lookup_reports_missing_binding_as_unresolved_without_guessing() {
+        let (db, path) = setup_full_test_db();
+        insert_instance(&db, "luna");
+        db.create_principal_binding("p-1", "luna").unwrap();
+        db.conn()
+            .execute("DELETE FROM principal_bindings WHERE principal='p-1'", [])
+            .unwrap();
+
+        let missing_binding = db.lookup_principal("p-1").unwrap();
+        assert!(missing_binding.is_unresolved());
+        assert_eq!(
+            missing_binding.instance_name(),
+            None,
+            "an instance-side claim is diagnostic evidence, not a routing target"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn create_binding_rejects_foreign_instance_claim_and_preserves_state() {
+        let (db, path) = setup_full_test_db();
+        insert_instance(&db, "luna");
+        insert_instance(&db, "nova");
+        db.conn()
+            .execute("UPDATE instances SET principal='p-1' WHERE name='luna'", [])
+            .unwrap();
+
+        assert!(db.create_principal_binding("p-1", "nova").is_err());
+        let bindings: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM principal_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(bindings, 0);
+        assert_eq!(
+            db.principal_for_instance("luna").unwrap().as_deref(),
+            Some("p-1")
+        );
+        assert_eq!(db.principal_for_instance("nova").unwrap(), None);
 
         cleanup_test_db(path);
     }

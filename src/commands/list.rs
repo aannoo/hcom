@@ -170,6 +170,24 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                         );
                         return 1;
                     }
+                    Ok(crate::db::PrincipalLookup::MissingBinding { claiming_instances }) => {
+                        let payload = serde_json::json!({
+                            "name": null,
+                            "principal": target,
+                            "session_id": null,
+                            "status": "unresolved",
+                            "reason": "missing_binding",
+                            "claiming_instances": claiming_instances,
+                        });
+                        if json_output {
+                            println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+                            return 0;
+                        }
+                        eprintln!(
+                            "Principal {target} is unresolved (binding missing; instance claims are diagnostic only)"
+                        );
+                        return 1;
+                    }
                     Ok(crate::db::PrincipalLookup::Unknown) if principal_target.is_some() => {
                         eprintln!("Error: unknown principal: {target}");
                         return 1;
