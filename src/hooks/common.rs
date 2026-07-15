@@ -1079,6 +1079,7 @@ fn stop_instance_inner(
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
+        "principal": instance_data.principal,
     });
 
     // Clean session bindings + process bindings + stop subagents for this session
@@ -1226,6 +1227,7 @@ pub fn soft_finalize_session(
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
+        "principal": instance_data.principal,
     });
 
     if let Some(ref session_id) = instance_data.session_id {

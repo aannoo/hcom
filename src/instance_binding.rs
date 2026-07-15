@@ -874,6 +874,20 @@ pub fn create_orphaned_pty_identity(
         return None;
     }
 
+    // A fresh orphaned PTY session is a new lifecycle. Mint its durable identity
+    // before changing any routing bindings so principal failure can leave the
+    // prior process/session routes untouched.
+    let principal = crate::launcher::generate_principal_id();
+    if let Err(e) = db.create_principal_binding(&principal, &name) {
+        crate::log::log_error(
+            "instances",
+            "create_orphaned_pty_identity.principal",
+            &e.to_string(),
+        );
+        let _ = db.delete_instance(&name);
+        return None;
+    }
+
     if let Err(e) = db.rebind_session(session_id, &name) {
         eprintln!("[hcom] warn: rebind_session failed for {name}: {e}");
     }
@@ -1272,6 +1286,17 @@ mod tests {
         let inst = db.get_instance_full(&name).unwrap().unwrap();
         assert_eq!(inst.session_id.as_deref(), Some("sess-orphan"));
         assert_eq!(inst.tool, "claude");
+        let principal = inst
+            .principal
+            .as_deref()
+            .expect("orphaned PTY lifecycle should carry a principal");
+        assert_eq!(
+            db.lookup_principal(principal).unwrap(),
+            crate::db::PrincipalLookup::Resolved {
+                instance_name: name.clone(),
+                session_id: Some("sess-orphan".to_string()),
+            }
+        );
 
         assert_eq!(
             db.get_session_binding("sess-orphan").unwrap(),
@@ -1293,7 +1318,80 @@ mod tests {
         let name = result.unwrap();
         let inst = db.get_instance_full(&name).unwrap().unwrap();
         assert_eq!(inst.tool, "gemini");
+        let principal = inst
+            .principal
+            .as_deref()
+            .expect("orphaned PTY lifecycle should carry a principal");
+        assert_eq!(
+            db.lookup_principal(principal).unwrap(),
+            crate::db::PrincipalLookup::Resolved {
+                instance_name: name.clone(),
+                session_id: Some("sess-orphan2".to_string()),
+            }
+        );
         assert_eq!(db.get_session_binding("sess-orphan2").unwrap(), Some(name));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_create_orphaned_pty_identity_mints_a_new_principal_per_lifecycle() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let first = create_orphaned_pty_identity(&db, "sess-first", None, "claude").unwrap();
+        let second = create_orphaned_pty_identity(&db, "sess-second", None, "claude").unwrap();
+
+        let first_principal = db.principal_for_instance(&first).unwrap().unwrap();
+        let second_principal = db.principal_for_instance(&second).unwrap().unwrap();
+        assert_ne!(first_principal, second_principal);
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_create_orphaned_pty_identity_principal_failure_rolls_back_new_identity() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)\
+                 VALUES ('pid-orphan', 'sess-old', 'old-name', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_orphan_principal
+                 BEFORE INSERT ON principal_bindings
+                 BEGIN SELECT RAISE(ABORT, 'injected principal failure'); END;",
+            )
+            .unwrap();
+
+        let result = create_orphaned_pty_identity(&db, "sess-failed", Some("pid-orphan"), "claude");
+
+        assert_eq!(result, None);
+        assert_eq!(db.get_session_binding("sess-failed").unwrap(), None);
+        assert_eq!(
+            db.get_process_binding_full("pid-orphan").unwrap(),
+            Some((Some("sess-old".to_string()), "old-name".to_string()))
+        );
+        let new_instances: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE session_id='sess-failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let principals: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM principal_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(new_instances, 0);
+        assert_eq!(principals, 0);
 
         cleanup(path);
     }

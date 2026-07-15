@@ -16,7 +16,7 @@
 //! - Reading instance status
 //! - Registering notify endpoints
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::Connection;
 
@@ -26,6 +26,7 @@ mod events;
 mod instances;
 mod kv;
 mod notify;
+mod principals;
 pub(crate) mod reqwatch_policy;
 mod sessions;
 pub(crate) mod subscriptions;
@@ -34,18 +35,33 @@ pub use events::Message;
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
+pub use principals::PrincipalLookup;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
      ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
      UPDATE instances
      SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
      WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+    ),
+    (
+        18,
+        "ALTER TABLE instances ADD COLUMN principal TEXT;
+         CREATE TABLE principal_bindings (
+             principal TEXT PRIMARY KEY,
+             instance_name TEXT NOT NULL,
+             epoch INTEGER NOT NULL DEFAULT 0,
+             created_at REAL NOT NULL,
+             updated_at REAL NOT NULL
+         );
+         CREATE INDEX idx_principal_bindings_instance ON principal_bindings(instance_name);",
+    ),
+];
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -205,6 +221,17 @@ impl HcomDb {
             CREATE INDEX IF NOT EXISTS idx_process_bindings_instance ON process_bindings(instance_name);
             CREATE INDEX IF NOT EXISTS idx_process_bindings_session ON process_bindings(session_id);
 
+            -- Durable hcom-owned identity. No foreign key: a stale binding must
+            -- remain observable as unresolved rather than disappearing by cascade.
+            CREATE TABLE IF NOT EXISTS principal_bindings (
+                principal TEXT PRIMARY KEY,
+                instance_name TEXT NOT NULL,
+                epoch INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_principal_bindings_instance ON principal_bindings(instance_name);
+
             -- Session bindings
             CREATE TABLE IF NOT EXISTS session_bindings (
                 session_id TEXT PRIMARY KEY,
@@ -247,6 +274,7 @@ impl HcomDb {
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
+                principal TEXT,
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
 
@@ -333,7 +361,22 @@ impl HcomDb {
     /// Checks schema version, archives DB if mismatched, reconnects, and reinitializes.
     /// Call after open() for production use.
     pub fn ensure_schema(&mut self) -> Result<()> {
-        match self.check_schema_compat()? {
+        let version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if version == SCHEMA_VERSION {
+            self.require_principal_schema()?;
+        }
+        let compat = self.check_schema_compat()?;
+        if version == SCHEMA_VERSION
+            && let SchemaCompat::NeedsArchive(reason, _) = &compat
+        {
+            bail!(
+                "DB v18 schema is incompatible ({reason}); refusing to archive or rebuild durable principal data"
+            );
+        }
+        match compat {
             SchemaCompat::Ok => {
                 self.init_db()?;
                 Ok(())
@@ -412,6 +455,53 @@ impl HcomDb {
         }
     }
 
+    /// A database already stamped v18 may contain durable principal rows from
+    /// another build. Never archive or reconstruct it: accept the exact contract,
+    /// otherwise fail explicitly and leave every byte in place.
+    fn require_principal_schema(&self) -> Result<()> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='principal_bindings')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            bail!(
+                "DB v18 is missing required table principal_bindings; refusing to archive or rebuild durable principal data"
+            );
+        }
+
+        let instance_columns: std::collections::HashSet<String> = self
+            .conn
+            .prepare("PRAGMA table_info(instances)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !instance_columns.contains("principal") {
+            bail!(
+                "DB v18 is missing required column instances.principal; refusing to archive or rebuild durable principal data"
+            );
+        }
+
+        let binding_columns: std::collections::HashSet<String> = self
+            .conn
+            .prepare("PRAGMA table_info(principal_bindings)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        for required in [
+            "principal",
+            "instance_name",
+            "epoch",
+            "created_at",
+            "updated_at",
+        ] {
+            if !binding_columns.contains(required) {
+                bail!(
+                    "DB v18 principal_bindings is missing required column {required}; refusing to archive or rebuild durable principal data"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Internal: check schema compatibility without taking action.
     fn check_schema_compat(&self) -> Result<SchemaCompat> {
         let version: i32 = self
@@ -433,6 +523,7 @@ impl HcomDb {
             "instances",
             "kv",
             "notify_endpoints",
+            "principal_bindings",
             "session_bindings",
         ]
         .into_iter()
@@ -541,6 +632,7 @@ impl HcomDb {
                     "tool",
                     "terminal_preset_requested",
                     "terminal_preset_effective",
+                    "principal",
                 ];
                 Ok(required
                     .iter()
@@ -881,6 +973,7 @@ pub(super) mod tests {
         assert!(tables.contains(&"kv".to_string()));
         assert!(tables.contains(&"notify_endpoints".to_string()));
         assert!(tables.contains(&"process_bindings".to_string()));
+        assert!(tables.contains(&"principal_bindings".to_string()));
         assert!(tables.contains(&"session_bindings".to_string()));
 
         cleanup_test_db(db_path);
@@ -1139,27 +1232,147 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_ensure_schema_column_guard() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(3000);
+    fn test_ensure_schema_migrates_v17_to_v18_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (name TEXT PRIMARY KEY, tool TEXT DEFAULT 'claude', created_at REAL NOT NULL, launch_context TEXT DEFAULT '', terminal_preset_requested TEXT DEFAULT '', terminal_preset_effective TEXT DEFAULT '');
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 17;
+                 INSERT INTO instances (name, tool, created_at) VALUES ('luna', 'claude', 1.0);",
+            )
+            .unwrap();
+        }
 
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_colguard_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let (version, name, principal): (i32, String, Option<String>) = (
+            db.conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            db.conn
+                .query_row("SELECT name FROM instances", [], |row| row.get(0))
+                .unwrap(),
+            db.conn
+                .query_row("SELECT principal FROM instances", [], |row| row.get(0))
+                .unwrap(),
+        );
+        assert_eq!(version, 18);
+        assert_eq!(name, "luna");
+        assert_eq!(
+            principal, None,
+            "migration must not invent identity for old rows"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_existing_v18_principal_rows_are_preserved_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (name TEXT PRIMARY KEY, tool TEXT DEFAULT 'claude', created_at REAL NOT NULL, launch_context TEXT DEFAULT '', terminal_preset_requested TEXT DEFAULT '', terminal_preset_effective TEXT DEFAULT '', principal TEXT);
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE principal_bindings (principal TEXT PRIMARY KEY, instance_name TEXT NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+                 PRAGMA user_version = 18;
+                 INSERT INTO instances (name, tool, created_at, principal) VALUES ('luna', 'claude', 1.0, 'p-existing');
+                 INSERT INTO principal_bindings (principal, instance_name, epoch, created_at, updated_at) VALUES ('p-existing', 'luna', 7, 2.0, 3.0);",
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        let row: (String, String, i64, f64, f64) = db
+            .conn
+            .query_row(
+                "SELECT principal, instance_name, epoch, created_at, updated_at FROM principal_bindings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("p-existing".into(), "luna".into(), 7, 2.0, 3.0));
+
+        // An older writer that names only its known columns remains compatible.
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('nova', 'codex', 4.0)",
+                [],
+            )
+            .unwrap();
+        let nova: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT principal FROM instances WHERE name='nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nova, None);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_malformed_v18_fails_without_archiving_or_deleting_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (name TEXT PRIMARY KEY, tool TEXT DEFAULT 'claude', created_at REAL NOT NULL, launch_context TEXT DEFAULT '', terminal_preset_requested TEXT DEFAULT '', terminal_preset_effective TEXT DEFAULT '', principal TEXT);
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 18;
+                 INSERT INTO instances (name, tool, created_at, principal) VALUES ('luna', 'claude', 1.0, 'p-existing');",
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        let err = db.ensure_schema().unwrap_err();
+        assert!(err.to_string().contains("principal_bindings"), "{err:#}");
+        assert_eq!(
+            db.conn
+                .query_row("SELECT name FROM instances", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "luna"
+        );
+        assert!(!db_path.parent().unwrap().join("archive").exists());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_ensure_schema_column_guard() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("hcom.db");
 
         // Create a DB at current version but missing 'tool' column
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(&format!(
                 "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
-                 CREATE TABLE instances (name TEXT PRIMARY KEY, created_at REAL NOT NULL);
+                 CREATE TABLE instances (name TEXT PRIMARY KEY, created_at REAL NOT NULL, principal TEXT);
                  CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
                  CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
                  CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE principal_bindings (principal TEXT PRIMARY KEY, instance_name TEXT NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL);
                  PRAGMA user_version = {};",
                 SCHEMA_VERSION
             ))
@@ -1176,21 +1389,16 @@ pub(super) mod tests {
             _ => panic!("Expected NeedsArchive for missing tool column"),
         }
 
-        // ensure_schema should fix it
-        db.ensure_schema().unwrap();
-
-        let version: i32 = db
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        // Once durable principal data exists, current-version damage is never
+        // repaired by archiving the database.
+        assert!(db.ensure_schema().is_err());
+        assert!(!db_path.parent().unwrap().join("archive").exists());
 
         cleanup_test_db(db_path);
     }
 
-    /// Regression test for issue #16: init_db() stamped user_version=17 without
-    /// actually adding the terminal_preset_* columns. ensure_schema must repair
-    /// this via migration instead of archiving (which would lose data).
+    /// Regression test for issue #16's one-version repair path: a database
+    /// stamped one version behind gains only the latest principal schema in place.
     #[test]
     fn test_ensure_schema_repairs_stamped_but_not_migrated_db() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1204,9 +1412,7 @@ pub(super) mod tests {
             test_id
         ));
 
-        // Simulate the bug: create a v16-style DB but stamp it as v17
-        // (this is what init_db() did — CREATE IF NOT EXISTS is a no-op on
-        // existing tables, then it unconditionally set user_version = 17)
+        // Complete v17 shape, without v18's principal column/table.
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -1238,6 +1444,8 @@ pub(super) mod tests {
                      subagent_timeout INTEGER,
                      tool TEXT DEFAULT 'claude',
                      launch_args TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
                      idle_since TEXT DEFAULT '',
                      pid INTEGER DEFAULT NULL,
                      launch_context TEXT DEFAULT ''
@@ -1257,7 +1465,7 @@ pub(super) mod tests {
             .unwrap();
         }
 
-        // Verify columns are missing before repair
+        // Verify the latest column is missing before repair.
         {
             let conn = Connection::open(&db_path).unwrap();
             let cols: Vec<String> = conn
@@ -1268,7 +1476,7 @@ pub(super) mod tests {
                 .filter_map(|r| r.ok())
                 .collect();
             assert!(
-                !cols.contains(&"terminal_preset_requested".to_string()),
+                !cols.contains(&"principal".to_string()),
                 "column should be missing before repair"
             );
         }
@@ -1283,7 +1491,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        // Columns should now exist
+        // Latest column/table should now exist.
         let cols: Vec<String> = db
             .conn
             .prepare("PRAGMA table_info(instances)")
@@ -1293,12 +1501,8 @@ pub(super) mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(
-            cols.contains(&"terminal_preset_requested".to_string()),
-            "terminal_preset_requested column should exist after repair"
-        );
-        assert!(
-            cols.contains(&"terminal_preset_effective".to_string()),
-            "terminal_preset_effective column should exist after repair"
+            cols.contains(&"principal".to_string()),
+            "principal column should exist after repair"
         );
 
         // Test data should have survived (not archived)
