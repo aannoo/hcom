@@ -109,6 +109,40 @@ fn list_json_exposes_principal_and_accepts_exact_principal_lookup() {
 }
 
 #[test]
+fn subagent_start_fallback_mints_a_principal() {
+    let h = Hcom::new();
+    let parent = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "UPDATE instances SET running_tasks=? WHERE name=?",
+        rusqlite::params![
+            serde_json::json!({
+                "active": true,
+                "subagents": [{"agent_id": "agent-77", "type": "general"}]
+            })
+            .to_string(),
+            parent
+        ],
+    )
+    .unwrap();
+
+    let (code, _stdout, stderr) = h.run(["start", "--name", "agent-77"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let (name, principal): (String, Option<String>) = db
+        .query_row(
+            "SELECT name, principal FROM instances WHERE agent_id='agent-77'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(name.starts_with(&format!("{parent}_general_")));
+    assert!(
+        principal.as_ref().is_some_and(|value| !value.is_empty()),
+        "successful subagent fallback must not leave a principal-less row"
+    );
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

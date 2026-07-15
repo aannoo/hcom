@@ -1662,7 +1662,7 @@ fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, age
     }
 }
 
-fn ensure_subagent_principal(db: &HcomDb, instance_name: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_subagent_principal(db: &HcomDb, instance_name: &str) -> anyhow::Result<()> {
     if db.principal_for_instance(instance_name)?.is_some() {
         return Ok(());
     }

@@ -241,8 +241,8 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
         )
         .ok();
 
-    let (subagent_name, was_announced) = match existing {
-        Some((name, announced)) => (name, announced != 0),
+    let (subagent_name, was_announced, created_fallback) = match existing {
+        Some((name, announced)) => (name, announced != 0, false),
         None => {
             let alloc = instance_names::SubagentAllocation {
                 agent_id: &info.agent_id,
@@ -254,9 +254,16 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
                 status_context: Some("tool:start"),
             };
             let name = instance_names::allocate_subagent_instance(db, &alloc)?;
-            (name, false)
+            (name, false, true)
         }
     };
+
+    if let Err(error) = crate::hooks::claude::ensure_subagent_principal(db, &subagent_name) {
+        if created_fallback {
+            let _ = db.delete_instance(&subagent_name);
+        }
+        return Err(error);
+    }
 
     // Flip to active + emit life event so TUI/watchers see the state change.
     lifecycle::set_status(
@@ -362,7 +369,10 @@ fn start_from_orphan(
     };
 
     // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    pidtrack::recover_single_orphan_to_db(db, orphan, &name).map_err(anyhow::Error::msg)?;
+    let principal = db
+        .principal_for_instance(&name)?
+        .ok_or_else(|| anyhow::anyhow!("recovered orphan '{name}' has no principal"))?;
 
     db.log_event(
         "life",
@@ -372,6 +382,7 @@ fn start_from_orphan(
             "by": "cli",
             "reason": "orphan_recover",
             "orphan_pid": pid,
+            "principal": principal,
         }),
     )
     .ok();
