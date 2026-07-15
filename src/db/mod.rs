@@ -1360,16 +1360,8 @@ pub(super) mod tests {
 
     #[test]
     fn test_ensure_schema_column_guard() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(3000);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_colguard_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("hcom.db");
 
         // Create a DB at current version but missing 'tool' column
         {
