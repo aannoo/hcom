@@ -1015,6 +1015,32 @@ mod tests {
 
     #[test]
     #[serial]
+    fn name_reclaim_route_mints_a_principal_distinct_from_prior_lifecycle() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, directory, created_at)
+                 VALUES ('nova', 'claude', '/tmp/reclaim', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.create_principal_binding("p-prior", "nova").unwrap();
+        db.delete_instance("nova").unwrap();
+        log_stopped_snapshot(&db, "nova", "claude", "/tmp/reclaim", "sid-nova", 77);
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/reclaim");
+
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        let current = db
+            .principal_for_instance("nova")
+            .unwrap()
+            .expect("reclaimed principal");
+        assert_ne!(current, "p-prior");
+        assert!(db.lookup_principal("p-prior").unwrap().is_unresolved());
+    }
+
+    #[test]
+    #[serial]
     fn bare_start_reuses_only_complete_launch_envelope_principal() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();

@@ -453,7 +453,7 @@ pub(crate) fn generate_principal_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn attach_launch_principal(
+pub(crate) fn attach_launch_principal(
     db: &HcomDb,
     instance_name: &str,
     env: &mut HashMap<String, String>,
