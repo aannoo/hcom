@@ -139,12 +139,26 @@ pub fn ensure_hcom_directories() -> bool {
 
 /// Ensure directories under a given base (testable without global config).
 pub fn ensure_hcom_directories_at(base: &Path) -> bool {
+    if ensure_private_directory(base).is_err() {
+        return false;
+    }
     for dir_name in [LOGS_DIR, LAUNCH_DIR, FLAGS_DIR, LAUNCHES_DIR, ARCHIVE_DIR] {
         if fs::create_dir_all(base.join(dir_name)).is_err() {
             return false;
         }
     }
     true
+}
+
+/// Create an hcom-owned directory and keep its contents private on POSIX.
+pub(crate) fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Write content to file atomically (temp file + rename).
@@ -242,6 +256,36 @@ mod tests {
 
         // Idempotent — second call succeeds too
         assert!(ensure_hcom_directories_at(tmp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_hcom_directories_creates_private_base_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("state").join(".hcom");
+
+        assert!(ensure_hcom_directories_at(&base));
+
+        let mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_hcom_directories_restricts_existing_base_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".hcom");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(ensure_hcom_directories_at(&base));
+
+        let mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]
