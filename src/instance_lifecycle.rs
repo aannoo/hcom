@@ -736,6 +736,7 @@ mod tests {
     fn default_instance() -> InstanceRow {
         InstanceRow {
             name: String::new(),
+            principal: None,
             session_id: None,
             parent_session_id: None,
             parent_name: None,
