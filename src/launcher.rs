@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rand::RngExt;
 use serde_json::json;
 
@@ -462,6 +462,27 @@ fn attach_launch_principal(
     db.create_principal_binding(&principal, instance_name)?;
     env.insert("HCOM_PRINCIPAL_ID".to_string(), principal.clone());
     Ok(principal)
+}
+
+fn attach_provisional_launch_identity(
+    db: &HcomDb,
+    instance_name: &str,
+    process_id: &str,
+    env: &mut HashMap<String, String>,
+) -> Result<String> {
+    if let Err(error) = db.set_process_binding(process_id, "", instance_name) {
+        let _ = db.delete_instance(instance_name);
+        return Err(error);
+    }
+    match attach_launch_principal(db, instance_name, env) {
+        Ok(principal) => Ok(principal),
+        Err(error) => {
+            let _ = db.delete_process_binding(process_id);
+            let _ = db.delete_instance(instance_name);
+            env.remove("HCOM_PRINCIPAL_ID");
+            Err(error)
+        }
+    }
 }
 
 fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)]) -> String {
@@ -1854,6 +1875,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
 
         // Pre-register instance
+        let mut provisional_principal = None;
         if let Err(e) = (|| -> Result<()> {
             instance_binding::initialize_instance_in_position_file(
                 db,
@@ -1875,13 +1897,23 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 None,              // hints
                 Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
             );
-            if let Err(error) = attach_launch_principal(db, &instance_name, &mut instance_env) {
-                let _ = db.delete_instance(&instance_name);
-                bail!("principal setup failed for '{instance_name}': {error}");
-            }
-            db.set_process_binding(&process_id, "", &instance_name)?;
+            provisional_principal = Some(
+                attach_provisional_launch_identity(
+                    db,
+                    &instance_name,
+                    &process_id,
+                    &mut instance_env,
+                )
+                .with_context(|| format!("principal setup failed for '{instance_name}'"))?,
+            );
             Ok(())
         })() {
+            cleanup_instance(
+                db,
+                &instance_name,
+                &process_id,
+                provisional_principal.as_deref(),
+            );
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
         }
@@ -2271,10 +2303,20 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         match launch_result {
             Ok(true) => launched += 1,
             Ok(false) => {
-                cleanup_instance(db, &instance_name, &process_id);
+                cleanup_instance(
+                    db,
+                    &instance_name,
+                    &process_id,
+                    provisional_principal.as_deref(),
+                );
             }
             Err(e) => {
-                cleanup_instance(db, &instance_name, &process_id);
+                cleanup_instance(
+                    db,
+                    &instance_name,
+                    &process_id,
+                    provisional_principal.as_deref(),
+                );
                 errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             }
         }
@@ -2375,7 +2417,21 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
 }
 
 /// Clean up instance and process binding on failure.
-fn cleanup_instance(db: &HcomDb, name: &str, process_id: &str) {
+fn cleanup_instance(
+    db: &HcomDb,
+    name: &str,
+    process_id: &str,
+    provisional_principal: Option<&str>,
+) {
+    if let Some(principal) = provisional_principal
+        && let Err(error) = db.rollback_provisional_principal_binding(principal, name)
+    {
+        crate::log::log_warn(
+            "launcher",
+            "principal.rollback_failed",
+            &format!("name={name} principal={principal} err={error}"),
+        );
+    }
     db.delete_instance(name).ok();
     db.delete_process_binding(process_id).ok();
 }
@@ -3225,6 +3281,61 @@ mod tests {
         assert_eq!(first_env.get("HCOM_PRINCIPAL_ID"), Some(&first));
         assert_eq!(second_env.get("HCOM_PRINCIPAL_ID"), Some(&second));
         assert_eq!(db.principal_for_instance("luna").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn provisional_launch_identity_rolls_back_when_process_binding_fails() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_process_binding BEFORE INSERT ON process_bindings
+                 BEGIN SELECT RAISE(ABORT, 'reject process binding'); END;",
+            )
+            .unwrap();
+        let mut env = HashMap::new();
+
+        assert!(attach_provisional_launch_identity(&db, "luna", "proc-1", &mut env).is_err());
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM principal_bindings", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(!env.contains_key("HCOM_PRINCIPAL_ID"));
+    }
+
+    #[test]
+    fn failed_backend_cleanup_removes_only_provisional_launch_identity() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+        let mut env = HashMap::new();
+        let principal = attach_launch_principal(&db, "luna", &mut env).unwrap();
+        db.set_process_binding("proc-1", "", "luna").unwrap();
+
+        cleanup_instance(&db, "luna", "proc-1", Some(&principal));
+
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM principal_bindings", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.get_process_binding("proc-1").unwrap(), None);
     }
 
     fn insert_test_instance(db: &crate::db::HcomDb, name: &str, status: &str) {

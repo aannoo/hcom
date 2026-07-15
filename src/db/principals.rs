@@ -139,6 +139,27 @@ impl HcomDb {
             .filter(|value| !value.is_empty()))
     }
 
+    /// Roll back an identity minted for a launch that never became live.
+    /// Normal stop paths deliberately do not call this: once a launch succeeds,
+    /// its durable binding survives instance-row deletion for exact lookup.
+    pub(crate) fn rollback_provisional_principal_binding(
+        &self,
+        principal: &str,
+        instance_name: &str,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM principal_bindings WHERE principal=? AND instance_name=?",
+            params![principal, instance_name],
+        )?;
+        let cleared = tx.execute(
+            "UPDATE instances SET principal=NULL WHERE name=? AND principal=?",
+            params![instance_name, principal],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0 || cleared > 0)
+    }
+
     /// Resolve only the stored principal row and its exact claimed instance.
     pub fn lookup_principal(&self, principal: &str) -> Result<PrincipalLookup> {
         let row: Option<(String, Option<String>, Option<String>, bool)> = self
