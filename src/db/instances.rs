@@ -362,7 +362,8 @@ impl HcomDb {
         let mut stmt = self.conn.prepare_cached(
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
-                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id
+                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id,
+                    principal
              FROM instances WHERE name = ?",
         )?;
 
@@ -385,6 +386,7 @@ impl HcomDb {
                 "origin_device_id": row.get::<_, String>(14).unwrap_or_default(),
                 "background_log_file": row.get::<_, String>(15).unwrap_or_default(),
                 "last_event_id": row.get::<_, i64>(16).unwrap_or(0),
+                "principal": row.get::<_, String>(17).unwrap_or_default(),
             }))
         }) {
             Ok(snapshot) => Ok(Some(snapshot)),
@@ -954,6 +956,23 @@ mod tests {
             err.to_string().contains("instances"),
             "expected missing instances table error, got: {err:#}"
         );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_get_instance_snapshot_carries_principal_lifecycle_evidence() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, principal)
+                 VALUES ('luna', 'codex', 1.0, 'p-luna')",
+                [],
+            )
+            .unwrap();
+
+        let snapshot = db.get_instance_snapshot("luna").unwrap().expect("snapshot");
+        assert_eq!(snapshot["principal"], "p-luna");
+
         cleanup_test_db(db_path);
     }
 

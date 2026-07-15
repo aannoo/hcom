@@ -173,6 +173,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             args: merged_args,
             persisted_args: None,
             prior_session_id: None,
+            retained_principal: None,
             tag,
             system_prompt,
             initial_prompt,

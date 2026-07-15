@@ -186,6 +186,9 @@ pub struct LaunchParams {
     /// Session id being resumed, inherited by the recreated instance row so a
     /// kill before the tool's first turn (no hook re-bind yet) stays resumable.
     pub prior_session_id: Option<String>,
+    /// Existing durable principal retained only by a tracked named resume.
+    /// All ordinary launch, adoption, fork, and reclaim paths leave this unset.
+    pub(crate) retained_principal: Option<String>,
     pub tag: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
@@ -209,6 +212,7 @@ impl Default for LaunchParams {
             args: Vec::new(),
             persisted_args: None,
             prior_session_id: None,
+            retained_principal: None,
             tag: None,
             system_prompt: None,
             initial_prompt: None,
@@ -469,12 +473,20 @@ fn attach_provisional_launch_identity(
     instance_name: &str,
     process_id: &str,
     env: &mut HashMap<String, String>,
+    retained_principal: Option<&str>,
 ) -> Result<String> {
+    if let Some(principal) = retained_principal {
+        db.claim_tracked_resume_principal(instance_name, principal, process_id)?;
+        env.insert("HCOM_PRINCIPAL_ID".to_string(), principal.to_string());
+        return Ok(principal.to_string());
+    }
+
     if let Err(error) = db.set_process_binding(process_id, "", instance_name) {
         let _ = db.delete_instance(instance_name);
         return Err(error);
     }
-    match attach_launch_principal(db, instance_name, env) {
+    let attached = attach_launch_principal(db, instance_name, env);
+    match attached {
         Ok(principal) => Ok(principal),
         Err(error) => {
             let _ = db.delete_process_binding(process_id);
@@ -1693,7 +1705,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.count
             );
         }
-        resolve_explicit_name_conflict(db, name)?;
+        if params.retained_principal.is_none() {
+            resolve_explicit_name_conflict(db, name)?;
+        }
     }
 
     // System prompt file for Gemini/Codex
@@ -1877,6 +1891,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         // Pre-register instance
         let mut provisional_principal = None;
         if let Err(e) = (|| -> Result<()> {
+            if let Some(principal) = params.retained_principal.as_deref() {
+                db.reserve_tracked_resume_principal(&instance_name, principal, &process_id)?;
+            }
             instance_binding::initialize_instance_in_position_file(
                 db,
                 &instance_name,
@@ -1903,6 +1920,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     &instance_name,
                     &process_id,
                     &mut instance_env,
+                    params.retained_principal.as_deref(),
                 )
                 .with_context(|| format!("principal setup failed for '{instance_name}'"))?,
             );
@@ -1913,6 +1931,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 &instance_name,
                 &process_id,
                 provisional_principal.as_deref(),
+                params.retained_principal.as_deref(),
             );
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
@@ -2308,6 +2327,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     &instance_name,
                     &process_id,
                     provisional_principal.as_deref(),
+                    params.retained_principal.as_deref(),
                 );
             }
             Err(e) => {
@@ -2316,6 +2336,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     &instance_name,
                     &process_id,
                     provisional_principal.as_deref(),
+                    params.retained_principal.as_deref(),
                 );
                 errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             }
@@ -2422,7 +2443,19 @@ fn cleanup_instance(
     name: &str,
     process_id: &str,
     provisional_principal: Option<&str>,
+    retained_principal: Option<&str>,
 ) {
+    if let Some(principal) = retained_principal {
+        if let Err(error) = db.cleanup_tracked_resume_reservation(name, principal, process_id) {
+            crate::log::log_warn(
+                "launcher",
+                "principal.resume_cleanup_failed",
+                &format!("name={name} err={error}"),
+            );
+        }
+        return;
+    }
+
     if let Some(principal) = provisional_principal
         && let Err(error) = db.rollback_provisional_principal_binding(principal, name)
     {
@@ -3300,7 +3333,7 @@ mod tests {
             .unwrap();
         let mut env = HashMap::new();
 
-        assert!(attach_provisional_launch_identity(&db, "luna", "proc-1", &mut env).is_err());
+        assert!(attach_provisional_launch_identity(&db, "luna", "proc-1", &mut env, None).is_err());
         assert!(db.get_instance_full("luna").unwrap().is_none());
         assert_eq!(
             db.conn()
@@ -3325,7 +3358,7 @@ mod tests {
         let principal = attach_launch_principal(&db, "luna", &mut env).unwrap();
         db.set_process_binding("proc-1", "", "luna").unwrap();
 
-        cleanup_instance(&db, "luna", "proc-1", Some(&principal));
+        cleanup_instance(&db, "luna", "proc-1", Some(&principal), None);
 
         assert!(db.get_instance_full("luna").unwrap().is_none());
         assert_eq!(
@@ -3336,6 +3369,239 @@ mod tests {
             0
         );
         assert_eq!(db.get_process_binding("proc-1").unwrap(), None);
+    }
+
+    #[test]
+    fn tracked_resume_reuses_principal_and_remints_process_binding() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('luna', 'inactive', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.create_principal_binding("p-luna", "luna").unwrap();
+
+        for process_id in ["proc-first", "proc-second"] {
+            db.reserve_tracked_resume_principal("luna", "p-luna", process_id)
+                .unwrap();
+            assert!(instance_binding::initialize_instance_in_position_file(
+                &db,
+                "luna",
+                Some("session-1"),
+                None,
+                None,
+                None,
+                None,
+                Some("codex"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                Some("/tmp"),
+            ));
+            let mut env = HashMap::new();
+            let principal = attach_provisional_launch_identity(
+                &db,
+                "luna",
+                process_id,
+                &mut env,
+                Some("p-luna"),
+            )
+            .unwrap();
+            assert_eq!(principal, "p-luna");
+            assert_eq!(
+                env.get("HCOM_PRINCIPAL_ID").map(String::as_str),
+                Some("p-luna")
+            );
+            assert_eq!(
+                db.get_process_binding(process_id).unwrap().as_deref(),
+                Some("luna")
+            );
+
+            let created_at = db
+                .get_instance_full("luna")
+                .unwrap()
+                .expect("resumed row")
+                .created_at;
+            db.log_event(
+                "life",
+                "luna",
+                &serde_json::json!({
+                    "action": "stopped",
+                    "snapshot": {
+                        "created_at": created_at,
+                        "principal": "p-luna"
+                    }
+                }),
+            )
+            .unwrap();
+            db.delete_process_binding(process_id).unwrap();
+            db.delete_instance("luna").unwrap();
+        }
+
+        let binding_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM principal_bindings WHERE principal='p-luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_count, 1);
+    }
+
+    #[test]
+    fn failed_tracked_resume_cleanup_keeps_durable_binding() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('luna', 'inactive', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.create_principal_binding("p-luna", "luna").unwrap();
+        db.reserve_tracked_resume_principal("luna", "p-luna", "proc-resume")
+            .unwrap();
+        let mut env = HashMap::new();
+        let principal = attach_provisional_launch_identity(
+            &db,
+            "luna",
+            "proc-resume",
+            &mut env,
+            Some("p-luna"),
+        )
+        .unwrap();
+
+        cleanup_instance(&db, "luna", "proc-resume", Some(&principal), Some("p-luna"));
+
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        assert_eq!(
+            db.lookup_principal("p-luna").unwrap().instance_name(),
+            Some("luna")
+        );
+        assert_eq!(db.get_process_binding("proc-resume").unwrap(), None);
+    }
+
+    #[test]
+    fn stale_tracked_resume_cannot_claim_or_cleanup_a_replacement_reservation() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, principal, status, created_at)
+                 VALUES ('luna', 'p-luna', 'inactive', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO principal_bindings
+                 (principal, instance_name, epoch, created_at, updated_at)
+                 VALUES ('p-luna', 'luna', 0, 1.0, 1.0)",
+                [],
+            )
+            .unwrap();
+
+        db.reserve_tracked_resume_principal("luna", "p-luna", "proc-stale")
+            .unwrap();
+        db.delete_instance("luna").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, principal, status, created_at)
+                 VALUES ('luna', 'p-luna', 'inactive', 2.0)",
+                [],
+            )
+            .unwrap();
+        db.reserve_tracked_resume_principal("luna", "p-luna", "proc-replacement")
+            .unwrap();
+
+        let mut stale_env = HashMap::new();
+        assert!(
+            attach_provisional_launch_identity(
+                &db,
+                "luna",
+                "proc-stale",
+                &mut stale_env,
+                Some("p-luna"),
+            )
+            .is_err(),
+            "a stale launch must not claim a replacement reservation"
+        );
+        cleanup_instance(&db, "luna", "proc-stale", None, Some("p-luna"));
+
+        assert_eq!(
+            db.principal_for_instance("luna").unwrap().as_deref(),
+            Some("p-luna"),
+            "stale cleanup must leave the replacement reservation intact"
+        );
+        let mut replacement_env = HashMap::new();
+        assert_eq!(
+            attach_provisional_launch_identity(
+                &db,
+                "luna",
+                "proc-replacement",
+                &mut replacement_env,
+                Some("p-luna"),
+            )
+            .unwrap(),
+            "p-luna"
+        );
+        assert_eq!(
+            db.get_process_binding("proc-replacement")
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+    }
+
+    #[test]
+    fn stale_tracked_resume_cleanup_does_not_delete_a_reclaimed_lifecycle() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, principal, status, created_at)
+                 VALUES ('luna', 'p-old', 'inactive', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO principal_bindings
+                 (principal, instance_name, epoch, created_at, updated_at)
+                 VALUES ('p-old', 'luna', 0, 1.0, 1.0)",
+                [],
+            )
+            .unwrap();
+        db.reserve_tracked_resume_principal("luna", "p-old", "proc-stale")
+            .unwrap();
+
+        db.delete_instance("luna").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, principal, status, created_at)
+                 VALUES ('luna', 'p-new', 'listening', 2.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO principal_bindings
+                 (principal, instance_name, epoch, created_at, updated_at)
+                 VALUES ('p-new', 'luna', 0, 2.0, 2.0)",
+                [],
+            )
+            .unwrap();
+
+        cleanup_instance(&db, "luna", "proc-stale", None, Some("p-old"));
+
+        assert_eq!(
+            db.principal_for_instance("luna").unwrap().as_deref(),
+            Some("p-new"),
+            "stale cleanup must not delete a concurrently reclaimed lifecycle"
+        );
     }
 
     fn insert_test_instance(db: &crate::db::HcomDb, name: &str, status: &str) {

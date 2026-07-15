@@ -779,6 +779,7 @@ fn handle_remote_launch(
             args: prepared.args,
             persisted_args: None,
             prior_session_id: None,
+            retained_principal: None,
             tag: request.tag,
             system_prompt: request.system_prompt,
             initial_prompt: request.initial_prompt,

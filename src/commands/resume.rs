@@ -512,6 +512,19 @@ fn prepare_resume_plan_from_source(
     } else {
         Some(display_name.clone())
     };
+    let retained_principal = if !fork && !is_adoption {
+        Some(
+            db.principal_for_tracked_resume(&display_name)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot retain tracked resume identity for '{}': {error}",
+                        display_name
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let tracked_fork_identity = if fork && !is_adoption {
         Some(TrackedForkIdentity {
             parent_name: display_name.clone(),
@@ -541,6 +554,7 @@ fn prepare_resume_plan_from_source(
             // Forks start a new session on first turn; only plain resume
             // inherits the prior id so kill-before-bind stays resumable.
             prior_session_id: (!fork).then(|| session_id.clone()),
+            retained_principal,
             tag: launch_tag,
             system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
@@ -2831,6 +2845,7 @@ mod tests {
         data.insert("status".into(), json!(ST_INACTIVE));
         data.insert("created_at".into(), json!(1.0));
         db.save_instance_named("zeno", &data).unwrap();
+        db.create_principal_binding("p-zeno", "zeno").unwrap();
 
         // Emit a stopped life event so load_stopped_snapshot can find the snapshot
         let snapshot = serde_json::json!({
@@ -3199,6 +3214,7 @@ mod tests {
         data.insert("status".into(), json!(ST_INACTIVE));
         data.insert("created_at".into(), json!(1.0));
         db.save_instance_named("luna", &data).unwrap();
+        db.create_principal_binding("p-luna", "luna").unwrap();
 
         // Inactive rows resolve via the stopped-snapshot life event.
         let snapshot = serde_json::json!({
@@ -3222,6 +3238,11 @@ mod tests {
 
         let resume = prepare_resume_plan(&db, "luna", false, &[], &GlobalFlags::default()).unwrap();
         assert_eq!(
+            resume.launch.retained_principal.as_deref(),
+            Some("p-luna"),
+            "tracked resume must carry the prior lifecycle principal into launch"
+        );
+        assert_eq!(
             resume.launch.prior_session_id.as_deref(),
             Some("session-123"),
             "plain resume must pre-seed the recreated row with the prior session id \
@@ -3229,6 +3250,7 @@ mod tests {
         );
 
         let fork = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        assert_eq!(fork.launch.retained_principal, None);
         assert_eq!(
             fork.launch.prior_session_id, None,
             "forks bind a fresh session on first turn; must not inherit the parent's"
