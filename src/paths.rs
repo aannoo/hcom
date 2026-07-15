@@ -52,6 +52,33 @@ pub fn resolve_hcom_dir_from_env(env: &HashMap<String, String>, cwd: &Path) -> (
     (resolved, hcom_dir.is_some())
 }
 
+/// Whether a unit-test path resolves beneath the system temporary directory.
+///
+/// Both sides are canonicalized through their deepest existing ancestor. This
+/// makes the decision safe for paths whose final components do not exist yet
+/// and rejects a lexical temp path that crosses a symlink to a non-temp target.
+#[cfg(test)]
+pub(crate) fn is_test_temp_path(path: &Path) -> bool {
+    fn resolve_deepest_existing(path: &Path) -> Option<PathBuf> {
+        let mut current = path;
+        loop {
+            if let Ok(existing) = current.canonicalize() {
+                let rest = path.strip_prefix(current).ok()?;
+                return Some(existing.join(rest));
+            }
+            current = current.parent()?;
+        }
+    }
+
+    let Some(temp_dir) = resolve_deepest_existing(&std::env::temp_dir()) else {
+        return false;
+    };
+    let Some(resolved) = resolve_deepest_existing(path) else {
+        return false;
+    };
+    resolved.starts_with(temp_dir)
+}
+
 /// Directory components that some AI tools (codex, claude, gemini) treat as
 /// protected metadata under any writable root. Placing HCOM_DIR beneath one of
 /// these means the parent tool's sandbox/permission layer will block writes to

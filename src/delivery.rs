@@ -315,10 +315,9 @@ mod host_label {
         use serial_test::serial;
 
         #[test]
+        #[serial]
         fn pane_title_label_skips_when_tool_empty() {
-            let dir = tempfile::tempdir().unwrap();
-            // SAFETY: test-local HCOM_DIR.
-            unsafe { std::env::set_var("HCOM_DIR", dir.path()) };
+            let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
             let db = crate::db::HcomDb::open().unwrap();
 
             assert_eq!(pane_title_label(&db, "luna", ST_LISTENING, ""), "");

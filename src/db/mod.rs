@@ -68,6 +68,23 @@ fn get_inode(path: &std::path::Path) -> u64 {
     crate::sys::fs::file_id(path)
 }
 
+/// Reject filesystem-backed unit-test databases outside the system temp tree.
+/// This is a last-resort tripwire for code paths that bypass Config entirely.
+#[cfg(test)]
+fn assert_isolated_db_path(db_path: &std::path::Path) {
+    if db_path == std::path::Path::new(":memory:") {
+        return;
+    }
+
+    assert!(
+        crate::paths::is_test_temp_path(db_path),
+        "test tried to open the real hcom DB at {} (outside the canonical system temp tree).\n\
+         Tests must install an isolated environment first:\n    \
+         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();",
+        db_path.display(),
+    );
+}
+
 impl HcomDb {
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
@@ -94,6 +111,8 @@ impl HcomDb {
 
     /// Open DB connection without schema checks (for testing only).
     pub fn open_raw(db_path: &std::path::Path) -> Result<Self> {
+        #[cfg(test)]
+        assert_isolated_db_path(db_path);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create db directory: {}", parent.display()))?;
@@ -830,6 +849,39 @@ pub(super) mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
         let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    #[test]
+    #[should_panic(expected = "test tried to open the real hcom DB")]
+    fn test_open_raw_rejects_non_temp_path() {
+        let db_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".hcom-unsafe-test")
+            .join("hcom.db");
+        let _ = HcomDb::open_raw(&db_path);
+    }
+
+    #[test]
+    fn test_open_raw_allows_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("allowed.db");
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+
+        assert_eq!(db.path(), db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "test tried to open the real hcom DB")]
+    fn test_open_raw_rejects_temp_symlink_to_non_temp_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("outside");
+        symlink(env!("CARGO_MANIFEST_DIR"), &link).unwrap();
+        let db_path = link.join(".hcom").join("hcom.db");
+
+        let _ = HcomDb::open_raw(&db_path);
     }
 
     #[test]
