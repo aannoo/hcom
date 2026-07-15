@@ -83,6 +83,32 @@ fn list_json_empty() {
 }
 
 #[test]
+fn list_json_exposes_principal_and_accepts_exact_principal_lookup() {
+    let h = Hcom::new();
+    let name = h.start();
+
+    let (code, stdout, stderr) = h.run(["list", &name, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let by_name: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let principal = by_name["principal"]
+        .as_str()
+        .expect("new instance principal");
+
+    let (code, stdout, stderr) = h.run(["list", "--principal", principal, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let by_principal: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(by_principal["name"], name);
+    assert_eq!(by_principal["principal"], principal);
+
+    assert_eq!(h.run(["stop", &name]).0, 0);
+    let (code, stdout, stderr) = h.run(["list", "--principal", principal, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let stopped: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(stopped["status"], "unresolved");
+    assert_eq!(stopped["name"], name);
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

@@ -449,6 +449,21 @@ fn generate_process_id() -> String {
     format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a, b, c, d, e)
 }
 
+pub(crate) fn generate_principal_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn attach_launch_principal(
+    db: &HcomDb,
+    instance_name: &str,
+    env: &mut HashMap<String, String>,
+) -> Result<String> {
+    let principal = generate_principal_id();
+    db.create_principal_binding(&principal, instance_name)?;
+    env.insert("HCOM_PRINCIPAL_ID".to_string(), principal.clone());
+    Ok(principal)
+}
+
 fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1860,6 +1875,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 None,              // hints
                 Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
             );
+            if let Err(error) = attach_launch_principal(db, &instance_name, &mut instance_env) {
+                let _ = db.delete_instance(&instance_name);
+                bail!("principal setup failed for '{instance_name}': {error}");
+            }
             db.set_process_binding(&process_id, "", &instance_name)?;
             Ok(())
         })() {
@@ -3181,6 +3200,31 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
         db
+    }
+
+    #[test]
+    fn launch_principal_is_fresh_per_lifecycle_and_matches_child_env() {
+        let db = launcher_test_db();
+        for name in ["luna", "nova"] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, created_at) VALUES (?, 1.0)",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+        }
+        let mut first_env = HashMap::new();
+        let first = attach_launch_principal(&db, "luna", &mut first_env).unwrap();
+        let mut second_env = HashMap::new();
+        let second = attach_launch_principal(&db, "nova", &mut second_env).unwrap();
+
+        assert_ne!(
+            first, second,
+            "fork/adoption/reclaim launches are new lifecycles"
+        );
+        assert_eq!(first_env.get("HCOM_PRINCIPAL_ID"), Some(&first));
+        assert_eq!(second_env.get("HCOM_PRINCIPAL_ID"), Some(&second));
+        assert_eq!(db.principal_for_instance("luna").unwrap(), Some(first));
     }
 
     fn insert_test_instance(db: &crate::db::HcomDb, name: &str, status: &str) {

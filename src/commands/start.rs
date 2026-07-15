@@ -481,7 +481,7 @@ fn start_rebind(
     // Create fresh instance with the target name
     let tool = ctx.tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    instance_binding::initialize_instance_in_position_file(
+    if !instance_binding::initialize_instance_in_position_file(
         db,
         &target_name,
         session_id.as_deref(),
@@ -496,7 +496,16 @@ fn start_rebind(
         None,  // subagent_timeout
         None,  // hints
         Some(&cwd_override),
-    );
+    ) {
+        bail!("failed to initialize reclaimed instance '{target_name}'");
+    }
+
+    let principal = crate::launcher::generate_principal_id();
+    if let Err(error) = db.create_principal_binding(&principal, &target_name) {
+        eprintln!("[hcom] warn: principal setup failed for {target_name}: {error}");
+        let _ = db.delete_instance(&target_name);
+        return Err(error);
+    }
 
     // Restore cursor position + mark as announced
     {
@@ -652,6 +661,16 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
     bail!("No rebind metadata found for '{}'", name)
 }
 
+fn reusable_launch_principal(ctx: &HcomContext) -> Option<String> {
+    if !ctx.is_launched
+        || ctx.process_id.as_deref().is_none_or(str::is_empty)
+        || ctx.launch_batch_id.as_deref().is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    ctx.principal_id.clone().filter(|value| !value.is_empty())
+}
+
 /// Path C: Bare start — detect tool or create adhoc instance.
 fn start_bare(
     db: &HcomDb,
@@ -735,7 +754,7 @@ fn start_bare(
         return Ok(0);
     }
 
-    instance_binding::initialize_instance_in_position_file(
+    if !instance_binding::initialize_instance_in_position_file(
         db,
         &name,
         None, // session_id
@@ -750,7 +769,17 @@ fn start_bare(
         None,  // subagent_timeout
         None,  // hints
         None,  // cwd_override
-    );
+    ) {
+        bail!("failed to initialize instance '{name}'");
+    }
+
+    let principal =
+        reusable_launch_principal(ctx).unwrap_or_else(crate::launcher::generate_principal_id);
+    if let Err(error) = db.create_principal_binding(&principal, &name) {
+        eprintln!("[hcom] warn: principal setup failed for {name}: {error}");
+        let _ = db.delete_instance(&name);
+        return Err(error);
+    }
 
     // Bind process if we have a process_id
     if let Some(ref process_id) = ctx.process_id
@@ -791,6 +820,7 @@ fn start_bare(
             "action": "started",
             "tool": tool,
             "name": name,
+            "principal": principal,
         }),
     )
     .ok();
@@ -965,6 +995,53 @@ mod tests {
             "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes"
         );
         assert_eq!(inst.last_event_id, 77);
+        assert!(
+            inst.principal
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn bare_start_reuses_only_complete_launch_envelope_principal() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let launched = make_ctx(
+            &[
+                ("HCOM_LAUNCHED", "1"),
+                ("HCOM_PROCESS_ID", "proc-1"),
+                ("HCOM_LAUNCH_BATCH_ID", "batch-1"),
+                ("HCOM_PRINCIPAL_ID", "p-from-launch"),
+            ],
+            "/tmp",
+        );
+        assert_eq!(
+            start_bare(&db, &paths::hcom_dir(), &launched, Some("mira")).unwrap(),
+            0
+        );
+        assert_eq!(
+            db.principal_for_instance("mira").unwrap().as_deref(),
+            Some("p-from-launch")
+        );
+
+        let incomplete = make_ctx(
+            &[
+                ("HCOM_LAUNCHED", "1"),
+                ("HCOM_PROCESS_ID", "proc-2"),
+                ("HCOM_LAUNCH_BATCH_ID", ""),
+                ("HCOM_PRINCIPAL_ID", "p-spoofed"),
+            ],
+            "/tmp",
+        );
+        assert_eq!(
+            start_bare(&db, &paths::hcom_dir(), &incomplete, Some("kira")).unwrap(),
+            0
+        );
+        assert_ne!(
+            db.principal_for_instance("kira").unwrap().as_deref(),
+            Some("p-spoofed")
+        );
     }
 
     #[test]

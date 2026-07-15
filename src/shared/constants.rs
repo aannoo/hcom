@@ -53,6 +53,7 @@ pub static BIND_MARKER_RE: LazyLock<Regex> =
 /// HCOM identity vars — set per-instance, cleared to prevent parent identity leakage.
 pub const HCOM_IDENTITY_VARS: &[&str] = &[
     "HCOM_PROCESS_ID",
+    "HCOM_PRINCIPAL_ID",
     "HCOM_LAUNCHED",
     // HCOM_LAUNCHED_PRESET excluded — must survive into Rust binary for hook forwarding
     "HCOM_PTY_MODE",

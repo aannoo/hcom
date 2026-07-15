@@ -21,6 +21,8 @@ pub struct HcomContext {
     // === Identity ===
     /// HCOM_PROCESS_ID — identifies launched instances.
     pub process_id: Option<String>,
+    /// HCOM_PRINCIPAL_ID — durable hcom-owned identity for this lifecycle.
+    pub principal_id: Option<String>,
     /// HCOM_LAUNCHED=1 — true if launched by hcom.
     pub is_launched: bool,
     /// HCOM_PTY_MODE=1 — running in PTY wrapper.
@@ -89,6 +91,7 @@ impl HcomContext {
 
         Self {
             process_id: get_nonempty("HCOM_PROCESS_ID"),
+            principal_id: get_nonempty("HCOM_PRINCIPAL_ID"),
             is_launched: is_eq("HCOM_LAUNCHED", "1"),
             is_pty_mode: is_eq("HCOM_PTY_MODE", "1"),
             is_background: get_nonempty("HCOM_BACKGROUND").is_some(),

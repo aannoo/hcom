@@ -26,6 +26,9 @@ pub struct ListArgs {
     pub name: Option<String>,
     /// Field to extract (used with name)
     pub field: Option<String>,
+    /// Look up the exact instance recorded for a durable principal ID
+    #[arg(long, value_name = "ID", conflicts_with = "name")]
+    pub principal: Option<String>,
     /// Show recently stopped agents
     #[arg(long)]
     pub stopped: bool,
@@ -99,7 +102,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     let names_output = args.names;
     let sh_output = args.sh;
     let format_template = args.format.clone();
-    let target_name = args.name.as_deref();
+    let principal_target = args.principal.as_deref();
+    let target_name = principal_target.or(args.name.as_deref());
     let field_name = args.field.as_deref();
 
     // Resolve current instance identity
@@ -134,11 +138,49 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
 
+        let mut queried_principal = None;
         let lookup_name = if is_self {
             current_name.clone().unwrap_or_default()
         } else {
-            let resolved = resolve_display_name(db, target);
-            resolved.unwrap_or_else(|| target.to_string())
+            let resolved = principal_target
+                .is_none()
+                .then(|| resolve_display_name(db, target))
+                .flatten();
+            if let Some(name) = resolved {
+                name
+            } else {
+                match db.lookup_principal(target) {
+                    Ok(crate::db::PrincipalLookup::Resolved { instance_name, .. }) => {
+                        queried_principal = Some(target.to_string());
+                        instance_name
+                    }
+                    Ok(crate::db::PrincipalLookup::Unresolved { instance_name }) => {
+                        let payload = serde_json::json!({
+                            "name": instance_name,
+                            "principal": target,
+                            "session_id": null,
+                            "status": "unresolved",
+                        });
+                        if json_output {
+                            println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+                            return 0;
+                        }
+                        eprintln!(
+                            "Principal {target} is unresolved (recorded instance: {instance_name})"
+                        );
+                        return 1;
+                    }
+                    Ok(crate::db::PrincipalLookup::Unknown) if principal_target.is_some() => {
+                        eprintln!("Error: unknown principal: {target}");
+                        return 1;
+                    }
+                    Ok(crate::db::PrincipalLookup::Unknown) => target.to_string(),
+                    Err(error) => {
+                        eprintln!("Error: principal lookup failed: {error}");
+                        return 1;
+                    }
+                }
+            }
         };
 
         if lookup_name.is_empty() {
@@ -150,6 +192,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             Ok(Some(data)) => {
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
+                    "principal": queried_principal.as_deref().or(data.principal.as_deref()),
                     "session_id": data.session_id,
                     "status": data.status,
                     "directory": data.directory,
@@ -181,6 +224,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 if is_self {
                     let payload = serde_json::json!({
                         "name": lookup_name,
+                        "principal": null,
                         "session_id": sender_identity.as_ref().and_then(|id| id.session_id.as_deref()).unwrap_or(""),
                     });
                     if let Some(field) = field_name {
@@ -250,6 +294,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "unread_count": unread_counts.get(&data.name).copied().unwrap_or(0),
                 "headless": data.background != 0,
                 "session_id": data.session_id.as_deref().unwrap_or(""),
+                "principal": data.principal,
                 "directory": data.directory,
                 "parent_name": data.parent_name,
                 "agent_id": data.agent_id,

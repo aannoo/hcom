@@ -1634,6 +1634,15 @@ fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, age
 
     match instance_names::allocate_subagent_instance(db, &alloc) {
         Ok(name) => {
+            if let Err(error) = ensure_subagent_principal(db, &name) {
+                let _ = db.delete_instance(&name);
+                log::log_warn(
+                    "hooks",
+                    "subagent.principal_failed",
+                    &format!("name={name} agent_id={agent_id} err={error}"),
+                );
+                return;
+            }
             log::log_info(
                 "hooks",
                 "subagent.row.ensured",
@@ -1651,6 +1660,14 @@ fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, age
             );
         }
     }
+}
+
+fn ensure_subagent_principal(db: &HcomDb, instance_name: &str) -> anyhow::Result<()> {
+    if db.principal_for_instance(instance_name)?.is_some() {
+        return Ok(());
+    }
+    db.create_principal_binding(&crate::launcher::generate_principal_id(), instance_name)?;
+    Ok(())
 }
 
 /// SubagentStop: message polling using agent_id, cleanup on exit.
@@ -2650,6 +2667,48 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn dormant_subagent_gets_one_flat_principal_across_replay() {
+        let (_dir, db) = make_delivery_test_db();
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id='sess-parent' WHERE name='nova'",
+                [],
+            )
+            .unwrap();
+        db.rebind_session("sess-parent", "nova").unwrap();
+        db.create_principal_binding("p-parent", "nova").unwrap();
+
+        ensure_subagent_row(&db, "sess-parent", "agent-77", "general");
+        let first: String = db
+            .conn()
+            .query_row(
+                "SELECT principal FROM instances WHERE agent_id='agent-77'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        ensure_subagent_row(&db, "sess-parent", "agent-77", "general");
+        let second: String = db
+            .conn()
+            .query_row(
+                "SELECT principal FROM instances WHERE agent_id='agent-77'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "SubagentStart replay must not rotate identity"
+        );
+        assert_ne!(
+            first, "p-parent",
+            "child identity is not derived or inherited"
+        );
+        assert!(!first.contains("agent-77"));
     }
 
     struct FailingWriter;
