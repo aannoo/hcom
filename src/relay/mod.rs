@@ -678,6 +678,32 @@ pub fn notify_relay_daemon() -> bool {
         .unwrap_or(false)
 }
 
+/// Fire-and-forget `hcom relay push` in a detached subprocess so remote devices
+/// see local changes (session end, launch) without waiting for the worker's next
+/// periodic cycle. Best-effort: spawn failures are ignored.
+///
+/// Unit tests must not spawn the real hcom binary: a child process can outlive
+/// the test's temporary environment and fall back to the developer's `~/.hcom`.
+pub fn spawn_background_push() {
+    let prefix = crate::runtime_env::get_hcom_prefix();
+    spawn_background_push_with(&prefix);
+}
+
+fn spawn_background_push_with(prefix: &[String]) {
+    #[cfg(not(test))]
+    if let Some((cmd, prefix_args)) = prefix.split_first() {
+        let _ = std::process::Command::new(cmd)
+            .args(prefix_args)
+            .args(["relay", "push"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    #[cfg(test)]
+    let _ = prefix;
+}
+
 /// Notify the relay daemon to push immediately.
 /// Handles three cases:
 ///  - Daemon running and ready: TCP notify succeeds, returns immediately.
@@ -746,6 +772,28 @@ pub fn set_relay_status(db: &HcomDb, status: &str, error: Option<&str>, is_worke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_background_push_is_disabled_in_unit_tests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("spawned");
+        let shim = temp.path().join("hcom-shim");
+        std::fs::write(&shim, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).unwrap();
+
+        spawn_background_push_with(&[shim.to_string_lossy().into_owned()]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(
+            !marker.exists(),
+            "unit tests must never spawn a real hcom relay push subprocess"
+        );
+    }
 
     #[test]
     fn test_parse_broker_url_mqtts() {

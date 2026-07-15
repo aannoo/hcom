@@ -2306,15 +2306,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     .ok();
 
     // Push launch event to relay (best-effort)
-    let prefix = crate::runtime_env::get_hcom_prefix();
-    if let Some((cmd, prefix_args)) = prefix.split_first() {
-        let _ = std::process::Command::new(cmd)
-            .args(prefix_args)
-            .args(["relay", "push"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    crate::relay::spawn_background_push();
 
     Ok(LaunchResult {
         // User-facing identity. The PTY-vs-print backend distinction lives in
