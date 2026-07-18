@@ -602,19 +602,31 @@ pub(super) fn build_early_launch_context() -> String {
         ctx.insert("kitty_listen_on".into(), Value::String(listen));
     }
 
-    // Capture pane_id from terminal env vars for same-window launches.
-    let pane_id_vars: &[&str] = &[
-        "WEZTERM_PANE",
-        "TMUX_PANE",
-        "KITTY_WINDOW_ID",
-        "ZELLIJ_PANE_ID",
-    ];
-    for &var in pane_id_vars {
-        if let Ok(val) = std::env::var(var)
-            && !val.is_empty()
-        {
-            ctx.insert("pane_id".into(), Value::String(val));
-            break;
+    // Preset-declared pane-id env var wins over generic terminal vars.
+    if let Ok(preset) = std::env::var("HCOM_LAUNCHED_PRESET")
+        && !preset.is_empty()
+        && let Some(var) = crate::config::get_merged_preset_pane_id_env(&preset)
+        && let Ok(val) = std::env::var(&var)
+        && !val.is_empty()
+    {
+        ctx.insert("pane_id".into(), Value::String(val));
+    }
+
+    // Fallback: capture pane_id from generic terminal env vars (same-window launches).
+    if !ctx.contains_key("pane_id") {
+        let pane_id_vars: &[&str] = &[
+            "WEZTERM_PANE",
+            "TMUX_PANE",
+            "KITTY_WINDOW_ID",
+            "ZELLIJ_PANE_ID",
+        ];
+        for &var in pane_id_vars {
+            if let Ok(val) = std::env::var(var)
+                && !val.is_empty()
+            {
+                ctx.insert("pane_id".into(), Value::String(val));
+                break;
+            }
         }
     }
 
@@ -1298,6 +1310,8 @@ mod tests {
             std::env::remove_var("TMUX_PANE");
             std::env::remove_var("KITTY_WINDOW_ID");
             std::env::remove_var("ZELLIJ_PANE_ID");
+            std::env::remove_var("HCOM_LAUNCHED_PRESET");
+            std::env::remove_var("HERDR_PANE_ID");
         }
     }
 
@@ -1355,5 +1369,21 @@ mod tests {
         clear_launch_context_env();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["pane_id"], "kitty-window-1");
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_preset_pane_id_env_wins_over_generic_vars() {
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("HCOM_LAUNCHED_PRESET", "herdr");
+            std::env::set_var("HERDR_PANE_ID", "w2:p1A");
+            std::env::set_var("WEZTERM_PANE", "0");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["pane_id"], "w2:p1A");
     }
 }
