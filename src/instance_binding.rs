@@ -632,6 +632,44 @@ pub fn bind_session_to_process(
     None
 }
 
+/// Rebind process/session after soft-finalize cleared bindings but left the
+/// instance row (typically inactive). Used when `bind_session_to_process` finds
+/// no process binding, but the caller still knows the instance name (e.g. via
+/// `HCOM_INSTANCE_NAME` / `HCOM_NAME` in a live OMP process).
+pub fn recover_process_binding_for_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    session_id: &str,
+    process_id: &str,
+) -> Option<String> {
+    if instance_name.is_empty() || session_id.is_empty() || process_id.is_empty() {
+        return None;
+    }
+    db.get_instance_full(instance_name).ok().flatten()?;
+
+    if let Err(e) = db.clear_session_id_from_other_instances(session_id, instance_name) {
+        crate::log::log_error("binding", "recover.clear_session", &format!("{e}"));
+    }
+    let mut updates = serde_json::Map::new();
+    updates.insert("session_id".into(), serde_json::json!(session_id));
+    update_instance_position(db, instance_name, &updates);
+    if let Err(e) = db.rebind_session(session_id, instance_name) {
+        crate::log::log_error("binding", "recover.rebind_session", &format!("{e}"));
+    }
+    if let Err(e) = db.set_process_binding(process_id, session_id, instance_name) {
+        crate::log::log_error("binding", "recover.set_process_binding", &format!("{e}"));
+    }
+    crate::log::log_info(
+        "binding",
+        "recover_process_binding_for_instance",
+        &format!(
+            "instance={} session_id={} process_id={}",
+            instance_name, session_id, process_id
+        ),
+    );
+    Some(instance_name.to_string())
+}
+
 /// Initialize the DB row and default bindings for an instance identity.
 ///
 /// This is the shared setup path used by launch, resume, and orphan recovery.
