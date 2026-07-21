@@ -461,13 +461,19 @@ fn route_subagent_actor_hook(
                 &agent_owner_kv_key(session_id, agent_id),
                 Some(&parent_instance),
             );
-            track_subagent(db, &parent_instance, agent_id, agent_type);
-            // Eagerly allocate an instance row so the subagent shows up
-            // in the TUI and is a valid `hcom send` target from birth —
-            // without injecting any hcom context into the subagent itself.
-            // The subagent stays dormant (name_announced=0) until either a
-            // message arrives at SubagentStop or it runs `hcom start`.
+            // Allocate the instance row BEFORE tracking it in the parent's
+            // running_tasks. Row-first means a tracked subagent always has a
+            // real, addressable row: the reverse order can leave a
+            // tracked-but-rowless entry (parent thinks a child is active, but
+            // every one of that child's actor hooks silently no-ops as an
+            // unknown actor and it can never receive a message). Eager
+            // allocation also makes the subagent show up in the TUI and be a
+            // valid `hcom send` target from birth, without injecting any hcom
+            // context into the subagent itself. It stays dormant
+            // (name_announced=0) until a message arrives at SubagentStop or it
+            // runs `hcom start`.
             ensure_subagent_row(db, &parent_instance, session_id, agent_id, agent_type);
+            track_subagent(db, &parent_instance, agent_id, agent_type);
         }
         let output = subagent_start(&payload.raw);
         if let Some(out) = output {
@@ -1988,28 +1994,61 @@ fn subagent_stop_claim_prefix(root_session_id: &str) -> String {
     format!("subagent_stop_claimed:{root_session_id}:")
 }
 
-/// Atomically claim one SubagentStop invocation for processing — true if
-/// this call is the first to claim it, false if a duplicate hook delivery of
-/// the identical invocation already did. Must be checked before *any*
-/// processing of the invocation (idle-gate, `poll_messages`, teardown), not
-/// only before teardown: with duplicate hook registrations, both
-/// invocations otherwise enter `poll_messages` independently — one can
-/// receive a delivered message (exit_code=2) while the other times out
-/// (exit_code=0) and tears the row down while Claude is still acting on the
-/// delivery, so the reply fails because the identity is gone. `INSERT OR
-/// IGNORE` is a single statement, so SQLite's own write lock makes the claim
-/// atomic across concurrent processes without needing an explicit
+/// Atomically claim one SubagentStop invocation for processing — true if this
+/// call won the claim, false if a *concurrent* duplicate delivery of the
+/// identical invocation is already holding it. Must be checked before *any*
+/// processing (idle-gate, `poll_messages`, teardown), not only before
+/// teardown: with duplicate hook registrations, both invocations otherwise
+/// enter `poll_messages` independently — one can receive a delivered message
+/// (exit_code=2) while the other times out (exit_code=0) and tears the row
+/// down while Claude is still acting on the delivery, so the reply fails
+/// because the identity is gone.
+///
+/// The claim is a *concurrency guard*, held only for the duration of one
+/// invocation's processing and released by `StopClaimGuard` on completion —
+/// NOT a session-long tombstone. That distinction is load-bearing: the raw
+/// payload is only a content fingerprint, and two *genuinely distinct* stops
+/// can be byte-for-byte identical (stable `prompt_id`, repeated
+/// `last_assistant_message`, same transcript path — observed live: a subagent
+/// that ends two separate message turns with the same final text produces
+/// identical payloads). A permanent claim would silently suppress the second
+/// such stop (no poll, no delivery, no teardown). Because Claude blocks the
+/// subagent until its SubagentStop hook returns, two same-payload stops can
+/// only overlap in time when they are the *same* logical stop dispatched to
+/// two registered hooks — exactly the case a release-on-completion claim still
+/// dedups, while a later sequential re-fire re-claims cleanly.
+///
+/// `INSERT OR IGNORE` is a single statement, so SQLite's own write lock makes
+/// the claim atomic across concurrent processes without an explicit
 /// transaction.
-fn claim_subagent_stop(db: &HcomDb, root_session_id: &str, agent_id: &str, raw: &Value) -> bool {
+fn claim_subagent_stop(db: &HcomDb, claim_key: &str) -> bool {
     db.conn()
         .execute(
             "INSERT OR IGNORE INTO kv (key, value) VALUES (?, '1')",
-            rusqlite::params![subagent_stop_claim_key(root_session_id, agent_id, raw)],
+            rusqlite::params![claim_key],
         )
         // DB error: fail open (proceed with processing) rather than risk
         // wedging a dead subagent forever over an unrelated I/O hiccup.
         .map(|n| n > 0)
         .unwrap_or(true)
+}
+
+/// Releases a won SubagentStop claim when the invocation's processing ends, so
+/// a later, genuinely distinct stop with a byte-identical payload can re-claim
+/// and be processed instead of being suppressed forever. See
+/// `claim_subagent_stop` for why the claim must be transient, not permanent.
+struct StopClaimGuard<'a> {
+    db: &'a HcomDb,
+    key: String,
+}
+
+impl Drop for StopClaimGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .db
+            .conn()
+            .execute("DELETE FROM kv WHERE key = ?", rusqlite::params![self.key]);
+    }
 }
 
 /// SubagentStop: message polling using agent_id, cleanup on exit.
@@ -2054,9 +2093,13 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
     // Claim this exact invocation before any further processing — see
     // `claim_subagent_stop` for why this can't wait until the teardown
     // decision: a duplicate delivery must not even enter `poll_messages`.
-    if !claim_subagent_stop(db, root_session_id, agent_id, raw) {
+    // `_claim_guard` releases the claim on every return path below, so a
+    // later distinct stop with a byte-identical payload is not suppressed.
+    let claim_key = subagent_stop_claim_key(root_session_id, agent_id, raw);
+    if !claim_subagent_stop(db, &claim_key) {
         return (0, String::new());
     }
+    let _claim_guard = StopClaimGuard { db, key: claim_key };
 
     // Store transcript_path if not already set
     if existing_transcript.is_empty()
@@ -5211,29 +5254,111 @@ mod tests {
         );
     }
 
-    /// Property: `claim_subagent_stop` is a true exactly-once latch — first
-    /// call wins, an identical repeat loses, and a same-prompt-but-different
-    /// payload (a legitimate re-fire, not a duplicate) gets its own claim.
+    /// Property: while a claim is held, an identical repeat loses (concurrency
+    /// guard), and a same-prompt-but-different payload gets its own claim.
     #[test]
     #[serial]
     fn test_claim_subagent_stop_collapses_duplicate_invocation() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+        let key = subagent_stop_claim_key("sess-1", "agent-x", &raw);
+        assert!(claim_subagent_stop(&db, &key), "first claim must succeed");
         assert!(
-            claim_subagent_stop(&db, "sess-1", "agent-x", &raw),
-            "first claim must succeed"
-        );
-        assert!(
-            !claim_subagent_stop(&db, "sess-1", "agent-x", &raw),
-            "duplicate identical invocation must not re-claim"
+            !claim_subagent_stop(&db, &key),
+            "duplicate identical invocation must not re-claim while held"
         );
 
         let raw_different_payload =
             serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1", "note": "different"});
         assert!(
-            claim_subagent_stop(&db, "sess-1", "agent-x", &raw_different_payload),
+            claim_subagent_stop(
+                &db,
+                &subagent_stop_claim_key("sess-1", "agent-x", &raw_different_payload)
+            ),
             "same prompt_id but different payload content must be its own claim"
+        );
+    }
+
+    /// Regression (finding #1): the claim is a transient concurrency guard, not
+    /// a session-long tombstone. Two *genuinely distinct* SubagentStop
+    /// invocations can carry byte-identical payloads (stable prompt_id +
+    /// repeated last_assistant_message — reproduced live). While one is
+    /// in-flight the identical duplicate must lose (concurrency dedup), but
+    /// once `StopClaimGuard` releases it, a later identical stop must be able
+    /// to re-claim and be processed — not suppressed forever.
+    #[test]
+    #[serial]
+    fn test_stop_claim_released_lets_later_identical_stop_reclaim() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let raw = serde_json::json!({
+            "agent_id": "agent-x",
+            "prompt_id": "p1",
+            "last_assistant_message": "Done.",
+        });
+        let key = subagent_stop_claim_key("sess-1", "agent-x", &raw);
+
+        assert!(claim_subagent_stop(&db, &key), "first invocation claims");
+        assert!(
+            !claim_subagent_stop(&db, &key),
+            "a concurrent duplicate still in-flight must lose the claim"
+        );
+        // First invocation finishes -> guard releases.
+        {
+            let _guard = StopClaimGuard {
+                db: &db,
+                key: key.clone(),
+            };
+        }
+        assert!(
+            db.kv_get(&key).unwrap().is_none(),
+            "guard drop must release the claim key"
+        );
+        assert!(
+            claim_subagent_stop(&db, &key),
+            "a later, genuinely distinct stop with a byte-identical payload must re-claim, not be suppressed"
+        );
+    }
+
+    /// Integration guard for finding #1: `subagent_stop` itself must release
+    /// the claim it took, so the tombstone can't outlive the invocation. Uses
+    /// a zero timeout so the poll returns immediately without blocking.
+    #[test]
+    #[serial]
+    fn test_subagent_stop_releases_its_claim_on_completion() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, subagent_timeout)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        // name_announced=1 -> skip the dormant idle gate and go straight to the
+        // poll, which returns immediately (timeout 0) with no message.
+        insert_subagent_row(&db, "nova_task_1", "agent-x", "nova", "sess-1");
+        db.conn()
+            .execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = 'nova_task_1'",
+                [],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "prompt_id": "p1",
+            "last_assistant_message": "Done.",
+        });
+        let _ = subagent_stop(&db, "sess-1", &raw);
+
+        assert!(
+            db.kv_get(&subagent_stop_claim_key("sess-1", "agent-x", &raw))
+                .unwrap()
+                .is_none(),
+            "subagent_stop must not leave its claim behind as a permanent tombstone"
         );
     }
 
@@ -5264,8 +5389,11 @@ mod tests {
             "prompt_id": "p1",
         });
         // Simulate a concurrent duplicate having already claimed this exact
-        // invocation.
-        assert!(claim_subagent_stop(&db, "sess-1", "agent-x", &raw));
+        // invocation (and still in-flight, so the claim is unreleased).
+        assert!(claim_subagent_stop(
+            &db,
+            &subagent_stop_claim_key("sess-1", "agent-x", &raw)
+        ));
 
         let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0);

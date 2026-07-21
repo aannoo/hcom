@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
@@ -407,60 +408,67 @@ pub struct SubagentAllocation<'a> {
 /// If an instance row already exists for `agent_id`, returns its name without
 /// re-inserting (so SubagentStart can run before `hcom start --name` without
 /// creating duplicates, and vice versa). Otherwise computes the next free
-/// suffix, INSERTs the row with `SQLite UNIQUE(name)` as the collision guard,
-/// and retries once with `max_n + 2` on constraint violation.
+/// suffix and INSERTs the row.
+///
+/// The whole idempotency-check + suffix-scan + INSERT runs inside one
+/// `BEGIN IMMEDIATE` transaction. Each SubagentStart is a separate process
+/// with its own DB connection, so parallel same-type siblings of one parent
+/// would otherwise each read the same `max_n` and pick the same `_N` suffix:
+/// the first INSERT wins, every other loses on `UNIQUE(name)`. A single
+/// `max_n + 2` retry only rescues the second racer — a third-plus sibling is
+/// dropped entirely (no row → every later actor hook silently no-ops as an
+/// unknown actor). `BEGIN IMMEDIATE` takes the write lock up front, so the
+/// scan and the INSERT are atomic with respect to other processes and each
+/// racer computes its suffix against the rows the winners already committed.
 pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Result<String> {
-    // Return early if a row already exists for this agent_id.
-    let existing: Option<String> = db
-        .conn()
-        .query_row(
-            "SELECT name FROM instances WHERE agent_id = ?",
-            rusqlite::params![info.agent_id],
-            |row| row.get(0),
-        )
-        .ok();
-    if let Some(name) = existing {
-        return Ok(name);
-    }
-
     let sanitized = sanitize_subagent_type(info.agent_type);
     let pattern = format!("{}_{}_", info.parent_name, sanitized);
     let like_pattern = format!("{pattern}%");
-    let names: Vec<String> = {
-        let mut stmt = db
-            .conn()
-            .prepare("SELECT name FROM instances WHERE name LIKE ?")?;
-        stmt.query_map(rusqlite::params![like_pattern], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect()
-    };
-
-    let mut max_n: u32 = 0;
-    for name in &names {
-        if let Some(suffix) = name.strip_prefix(&pattern)
-            && let Ok(n) = suffix.parse::<u32>()
-        {
-            max_n = max_n.max(n);
-        }
-    }
-
-    let candidate = format!("{pattern}{}", max_n + 1);
     let initial_event_id = db.get_last_event_id();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let now = crate::shared::time::now_epoch_f64();
 
-    let insert_sql = "INSERT INTO instances \
-         (name, session_id, parent_session_id, parent_name, tag, agent_id, \
-          created_at, last_event_id, directory, last_stop, status, status_context) \
-         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)";
+    db.with_transaction(|txn| {
+        // Idempotency check must live inside the transaction too: otherwise a
+        // concurrent SubagentStart and `hcom start --name <agent_id>` for the
+        // same agent_id could both miss it and insert two rows.
+        let existing: Option<String> = txn
+            .query_row(
+                "SELECT name FROM instances WHERE agent_id = ?",
+                rusqlite::params![info.agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(name) = existing {
+            return Ok(name);
+        }
 
-    let do_insert = |name: &str| -> rusqlite::Result<usize> {
-        db.conn().execute(
-            insert_sql,
+        let names: Vec<String> = {
+            let mut stmt = txn.prepare("SELECT name FROM instances WHERE name LIKE ?")?;
+            stmt.query_map(rusqlite::params![like_pattern], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        let mut max_n: u32 = 0;
+        for name in &names {
+            if let Some(suffix) = name.strip_prefix(&pattern)
+                && let Ok(n) = suffix.parse::<u32>()
+            {
+                max_n = max_n.max(n);
+            }
+        }
+
+        let candidate = format!("{pattern}{}", max_n + 1);
+        txn.execute(
+            "INSERT INTO instances \
+             (name, session_id, parent_session_id, parent_name, tag, agent_id, \
+              created_at, last_event_id, directory, last_stop, status, status_context) \
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
             rusqlite::params![
-                name,
+                candidate,
                 info.parent_session_id,
                 info.parent_name,
                 info.parent_tag,
@@ -471,22 +479,9 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
                 info.status,
                 info.status_context,
             ],
-        )
-    };
-
-    match do_insert(&candidate) {
-        Ok(_) => Ok(candidate),
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            let retry = format!("{pattern}{}", max_n + 2);
-            do_insert(&retry).map_err(|e| {
-                anyhow::anyhow!("Failed to create unique subagent name after retry: {e}")
-            })?;
-            Ok(retry)
-        }
-        Err(e) => Err(anyhow::anyhow!("Failed to insert subagent instance: {e}")),
-    }
+        )?;
+        Ok(candidate)
+    })
 }
 
 #[cfg(test)]
@@ -577,6 +572,66 @@ mod subagent_alloc_tests {
         // The seeded row has no suffix-N parsable from agent_id lookup, but
         // it does match the LIKE pattern and parses as N=1 → next is _2.
         assert_eq!(name, "luna_reviewer_2");
+    }
+
+    #[test]
+    fn allocate_concurrent_siblings_all_get_rows() {
+        // Repro for the concurrent-sibling allocation race: N separate
+        // processes (here: threads with their own connections to the same
+        // file DB, mirroring separate hook invocations) each allocate a
+        // subagent of the SAME type under the SAME parent at once. Every one
+        // must end up with its own instance row — none may be dropped.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("race.db");
+        {
+            let db = HcomDb::open_raw(&path).unwrap();
+            db.init_db().unwrap();
+        }
+
+        const N: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    let agent_id = format!("aid-{i}");
+                    barrier.wait();
+                    allocate_subagent_instance(
+                        &db,
+                        &SubagentAllocation {
+                            agent_id: &agent_id,
+                            agent_type: "reviewer",
+                            parent_name: "luna",
+                            parent_session_id: None,
+                            parent_tag: None,
+                            status: "inactive",
+                            status_context: Some("subagent:dormant"),
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let mut ok = 0;
+        for h in handles {
+            if h.join().unwrap().is_ok() {
+                ok += 1;
+            }
+        }
+
+        let db = HcomDb::open_raw(&path).unwrap();
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE parent_name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ok, N, "every concurrent allocation must succeed");
+        assert_eq!(rows, N as i64, "every subagent must get its own row");
     }
 
     #[test]
