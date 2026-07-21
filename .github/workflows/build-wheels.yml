@@ -80,12 +80,6 @@ jobs:
 
           maturin build --release --target aarch64-linux-android --out dist
 
-      - name: Fix wheel platform tag for Termux
-        run: |
-          cd dist && for f in *.whl; do
-            mv "$f" "$(echo "$f" | sed 's/-[^-]*\.whl$/-linux_aarch64.whl/')"
-          done
-
       - name: Upload wheel
         uses: actions/upload-artifact@v7
         with:

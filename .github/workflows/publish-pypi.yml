@@ -2,20 +2,13 @@ name: Publish PyPI
 
 on:
   workflow_call:
-    inputs:
-      plan:
-        required: true
-        type: string
 
 permissions:
   id-token: write
-  contents: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      PLAN: ${{ inputs.plan }}
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v8
@@ -27,19 +20,7 @@ jobs:
       - name: List wheels
         run: ls -la dist/
 
-      - name: Separate Android wheel
-        run: |
-          mkdir -p android-dist
-          mv dist/*-linux_aarch64.whl android-dist/ || true
-
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-
-      - name: Attach Android wheel to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="$(printf '%s' "$PLAN" | jq -r '.announcement_tag')"
-          gh release upload "$TAG" -R aannoo/hcom android-dist/*.whl --clobber
