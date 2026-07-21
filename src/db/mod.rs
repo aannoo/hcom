@@ -68,17 +68,28 @@ fn get_inode(path: &std::path::Path) -> u64 {
     crate::sys::fs::file_id(path)
 }
 
-/// Reject filesystem-backed unit-test databases outside the system temp tree.
+/// Reject filesystem-backed unit-test databases that are not disposable state.
 /// This is a last-resort tripwire for code paths that bypass Config entirely.
+///
+/// A path is disposable if a fixture registered its root, or if it sits under
+/// the system temp tree — the backstop for ad-hoc `tempfile` DBs opened by
+/// explicit path. Unlike the Config redirect, this stays lenient about temp
+/// geography because tests only ever hand `open_raw` their own throwaway paths;
+/// the inherited-real-DB threat flows through Config, which is registry-gated.
 #[cfg(test)]
 fn assert_isolated_db_path(db_path: &std::path::Path) {
     if db_path == std::path::Path::new(":memory:") {
         return;
     }
 
+    if crate::paths::test_roots::is_registered(db_path) {
+        return;
+    }
+
     assert!(
         crate::paths::is_test_temp_path(db_path),
-        "test tried to open the real hcom DB at {} (outside the canonical system temp tree).\n\
+        "test refused to open a DB at {} (not a registered or temp-tree path).\n\
+         This path is not disposable test state, so open_raw fails closed.\n\
          Tests must install an isolated environment first:\n    \
          let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();",
         db_path.display(),
@@ -852,7 +863,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "test tried to open the real hcom DB")]
+    #[should_panic(expected = "not a registered or temp-tree path")]
     fn test_open_raw_rejects_non_temp_path() {
         let db_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(".hcom-unsafe-test")
@@ -872,7 +883,7 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[should_panic(expected = "test tried to open the real hcom DB")]
+    #[should_panic(expected = "not a registered or temp-tree path")]
     fn test_open_raw_rejects_temp_symlink_to_non_temp_path() {
         use std::os::unix::fs::symlink;
 

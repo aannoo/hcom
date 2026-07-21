@@ -1428,7 +1428,9 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_notify_hook_instance_no_db() {
+    fn test_notify_hook_instance_missing_instance() {
+        // Best-effort wake must not panic when the DB opens but the named
+        // instance has no row (the common case for a stale notify target).
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         notify_hook_instance("nonexistent");
     }

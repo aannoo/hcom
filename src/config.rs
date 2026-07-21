@@ -65,12 +65,19 @@ impl Config {
         let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&env_map, &cwd);
 
         // Unit tests must never inherit a real hcom data directory. Raw path
-        // semantics are tested through `resolve_hcom_dir_from_env` directly;
-        // global Config only accepts paths that canonically resolve beneath the
-        // system temp directory. Production builds do not compile this branch.
+        // semantics are tested through `resolve_hcom_dir_from_env` directly, so
+        // global Config accepts only roots a test fixture explicitly registered
+        // as disposable — not merely "it lives under $TMPDIR", since a real DB
+        // can sit under the temp tree too. Anything else redirects to a
+        // process-local throwaway. Production builds do not compile this branch.
+        //
+        // Redirect rather than panic on an unregistered dir: countless tests
+        // read Config with no HCOM_DIR set and no isolation installed, and must
+        // land on a safe throwaway instead of aborting. Every explicit consumer
+        // registers its root, so the fallback is a backstop, never the norm.
         #[cfg(test)]
         let hcom_dir = {
-            if paths::is_test_temp_path(&hcom_dir) {
+            if paths::test_roots::is_registered(&hcom_dir) {
                 hcom_dir
             } else {
                 test_default_hcom_dir()
@@ -93,18 +100,23 @@ impl Config {
 
 /// Process-local fallback for unit tests that do not install an isolated
 /// `HCOM_DIR`. Reusing one directory per test binary preserves Config's normal
-/// process-wide semantics while keeping all writes under the system temp root.
+/// process-wide semantics. Backed by a retained `TempDir` so it gets a unique,
+/// uncontended name and is registered as a disposable root for the redirect.
 #[cfg(test)]
 fn test_default_hcom_dir() -> PathBuf {
     use std::sync::OnceLock;
 
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("hcom-test-default-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-test-default-")
+            .tempdir()
+            .expect("create test-default hcom dir");
+        paths::test_roots::register(dir.path());
         dir
     })
-    .clone()
+    .path()
+    .to_path_buf()
 }
 
 /// Bidirectional mapping: HcomConfig field name <-> TOML dotted path.
@@ -1563,10 +1575,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_guard_allows_temp_hcom_dir() {
+    fn test_guard_allows_registered_hcom_dir() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let expected = temp.path().join(".hcom");
+        // A fixture must claim the root before Config will keep it.
+        paths::test_roots::register(temp.path());
         unsafe {
             env::set_var("HCOM_DIR", &expected);
         }
@@ -1574,6 +1588,25 @@ mod tests {
         Config::init();
 
         assert_eq!(Config::get().hcom_dir, expected);
+    }
+
+    #[test]
+    #[serial]
+    fn test_guard_redirects_unregistered_temp_hcom_dir() {
+        // Geography is not ownership: a temp path no fixture registered is not
+        // trusted, even though it sits under $TMPDIR. This is the finding-3
+        // guarantee that a real hcom DB happening to live under /tmp is not
+        // waved through.
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let unregistered = temp.path().join(".hcom");
+        unsafe {
+            env::set_var("HCOM_DIR", &unregistered);
+        }
+        Config::reset();
+        Config::init();
+
+        assert_ne!(Config::get().hcom_dir, unregistered);
     }
 
     #[cfg(unix)]
