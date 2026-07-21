@@ -106,6 +106,24 @@ pub fn set_private(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Restrict a directory to owner-only access (`0o700` on Unix).
+///
+/// No-op on Windows, where Unix mode bits do not apply. Same caveat as
+/// `set_private`: a shared `HCOM_DIR`/`HOME` location isn't actually locked
+/// down on Windows until real ACL restriction is implemented.
+pub fn set_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Mark a file as executable (`0o755` on Unix).
 ///
 /// No-op on Windows, where executability is determined by file extension rather

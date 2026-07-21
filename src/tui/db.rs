@@ -60,6 +60,16 @@ impl DbDataSource {
     /// Lazy-open persistent connection; reconnects on failure.
     fn ensure_conn(&mut self) -> Option<&Connection> {
         if self.conn.is_none() {
+            // Harden before opening: the TUI is the no-arg default entry point,
+            // so it must apply the same owner-only permission boundary as the
+            // CLI rather than letting SQLite create/leave a broad db.
+            let hcom_dir = paths::hcom_dir();
+            if let Err(e) = paths::ensure_private_directory(&hcom_dir)
+                .and_then(|()| paths::ensure_private_db(&self.db_path))
+            {
+                self.last_error = Some(format!("secure {}: {}", self.db_path.display(), e));
+                return None;
+            }
             let conn = match Connection::open(&self.db_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1427,6 +1437,26 @@ mod tests {
         ActivityKind, Agent, AgentStatus, EventKind, MessageScope, SenderKind, Tool,
     };
     use rusqlite::Connection;
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_conn_secures_directory_and_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // Legacy broad install opened only through the no-arg TUI.
+        std::fs::set_permissions(&hcom_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db_path = hcom_dir.join("hcom.db");
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut ds = super::DbDataSource::new();
+        assert!(ds.ensure_conn().is_some());
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&hcom_dir), 0o700);
+        assert_eq!(mode(&db_path), 0o600);
+    }
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
