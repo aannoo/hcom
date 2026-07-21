@@ -1316,6 +1316,8 @@ pub fn update_tool_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use serial_test::serial;
     use std::io::Write;
 
     #[test]
@@ -1425,9 +1427,11 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_hook_instance_no_db() {
-        // Best-effort function should not panic even with no DB
-        // (HcomDb::open() will fail in test env without ~/.hcom)
+    #[serial]
+    fn test_notify_hook_instance_missing_instance() {
+        // Best-effort wake must not panic when the DB opens but the named
+        // instance has no row (the common case for a stale notify target).
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         notify_hook_instance("nonexistent");
     }
 

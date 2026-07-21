@@ -172,6 +172,9 @@ pub mod test_helpers {
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
         std::fs::create_dir_all(&hcom_dir).unwrap();
+        // Claim this tempdir as a disposable root so Config trusts it (temp-tree
+        // geography alone is not enough — see paths::test_roots).
+        crate::paths::test_roots::register(&test_home);
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
