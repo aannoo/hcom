@@ -315,6 +315,33 @@ pub fn build_launch_env(
     build_launch_env_with_resolver(hcom_config, regime, crate::shell_env::resolved_shell_env)
 }
 
+fn build_codex_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+    tag: &str,
+    relay_enabled: bool,
+) -> String {
+    let notes = instance_env
+        .get("HCOM_NOTES")
+        .map(String::as_str)
+        .unwrap_or("");
+    crate::bootstrap::get_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "codex",
+        background,
+        true,
+        notes,
+        tag,
+        relay_enabled,
+        None,
+    )
+}
+
 fn build_launch_env_with_resolver<F>(
     hcom_config: &HcomConfig,
     regime: LaunchEnvRegime,
@@ -2112,17 +2139,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     }
 
                     // Generate bootstrap text for preprocessing
-                    let bootstrap = crate::bootstrap::get_bootstrap(
+                    let bootstrap = build_codex_bootstrap(
                         db,
                         &paths::hcom_dir(),
                         &instance_name,
-                        "codex",
                         params.background,
-                        true, // is_launched
-                        "",
+                        &instance_env,
                         &effective_tag,
                         hcom_config.relay_enabled,
-                        None,
                     );
 
                     let sandbox_mode = instance_env
@@ -3076,6 +3100,113 @@ mod tests {
         assert_eq!(env.get("HCOM_TAG").map(String::as_str), Some("config-tag"));
 
         unsafe { std::env::remove_var("HCOM_TAG") }
+    }
+
+    #[test]
+    fn test_codex_bootstrap_includes_notes_from_effective_instance_env() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let instance_env = HashMap::from([(
+            "HCOM_NOTES".to_string(),
+            "instance-specific notes".to_string(),
+        )]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        assert!(bootstrap.contains("## NOTES"));
+        assert!(bootstrap.contains("instance-specific notes"));
+    }
+
+    #[test]
+    fn test_codex_bootstrap_omits_notes_section_when_effective_env_has_none() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &HashMap::new(),
+            "",
+            false,
+        );
+
+        assert!(!bootstrap.contains("## NOTES"));
+    }
+
+    #[test]
+    fn test_codex_bootstrap_omits_notes_section_for_empty_env_value() {
+        // `HCOM_NOTES=""` is the documented way to clear notes; it is
+        // structurally different from a missing key and must still produce no
+        // `## NOTES` section.
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let instance_env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        assert!(!bootstrap.contains("## NOTES"));
+    }
+
+    #[test]
+    fn test_codex_notes_survive_developer_instructions_toml_transport() {
+        // The helper only produces the intermediate bootstrap string. Notes
+        // actually reach Codex through `preprocess_codex_args`, which
+        // TOML-encodes the bootstrap into `-c developer_instructions=...`.
+        // Assert on the final, TOML-decoded argument so quotes, backslashes,
+        // braces, and newlines are proven to survive the real transport.
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let notes =
+            "Use \"review mode\".\nWindows path: C:\\work\\repo\n{literal braces}\nSecond line";
+        let instance_env = HashMap::from([("HCOM_NOTES".to_string(), notes.to_string())]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        let args =
+            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
+
+        // Locate the `-c developer_instructions=<TOML>` value and decode it.
+        // preprocess also injects sandbox `-c` args, so match by prefix rather
+        // than by the first `-c` position.
+        let encoded = args
+            .iter()
+            .find_map(|a| a.strip_prefix("developer_instructions="))
+            .expect("developer_instructions arg present");
+        let decoded: toml::Table = toml::from_str(&format!("x = {encoded}"))
+            .expect("developer_instructions is valid TOML");
+        let dev_instructions = decoded["x"].as_str().expect("string value");
+
+        assert!(dev_instructions.contains("## NOTES"));
+        assert!(dev_instructions.contains("Use \"review mode\"."));
+        assert!(dev_instructions.contains("C:\\work\\repo"));
+        assert!(dev_instructions.contains("{literal braces}"));
+        assert!(dev_instructions.contains("Second line"));
     }
 
     #[test]
