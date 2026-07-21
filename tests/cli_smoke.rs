@@ -83,6 +83,66 @@ fn list_json_empty() {
 }
 
 #[test]
+fn list_json_exposes_principal_and_accepts_exact_principal_lookup() {
+    let h = Hcom::new();
+    let name = h.start();
+
+    let (code, stdout, stderr) = h.run(["list", &name, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let by_name: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let principal = by_name["principal"]
+        .as_str()
+        .expect("new instance principal");
+
+    let (code, stdout, stderr) = h.run(["list", "--principal", principal, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let by_principal: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(by_principal["name"], name);
+    assert_eq!(by_principal["principal"], principal);
+
+    assert_eq!(h.run(["stop", &name]).0, 0);
+    let (code, stdout, stderr) = h.run(["list", "--principal", principal, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let stopped: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(stopped["status"], "unresolved");
+    assert_eq!(stopped["name"], name);
+}
+
+#[test]
+fn subagent_start_fallback_mints_a_principal() {
+    let h = Hcom::new();
+    let parent = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "UPDATE instances SET running_tasks=? WHERE name=?",
+        rusqlite::params![
+            serde_json::json!({
+                "active": true,
+                "subagents": [{"agent_id": "agent-77", "type": "general"}]
+            })
+            .to_string(),
+            parent
+        ],
+    )
+    .unwrap();
+
+    let (code, _stdout, stderr) = h.run(["start", "--name", "agent-77"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let (name, principal): (String, Option<String>) = db
+        .query_row(
+            "SELECT name, principal FROM instances WHERE agent_id='agent-77'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(name.starts_with(&format!("{parent}_general_")));
+    assert!(
+        principal.as_ref().is_some_and(|value| !value.is_empty()),
+        "successful subagent fallback must not leave a principal-less row"
+    );
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

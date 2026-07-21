@@ -332,6 +332,15 @@ pub fn recover_single_orphan_to_db(
         )
         .map_err(|e| format!("failed to insert instance '{}': {}", instance_name, e))?;
 
+    if db
+        .principal_for_instance(instance_name)
+        .map_err(|e| format!("failed to read principal: {e}"))?
+        .is_none()
+    {
+        db.create_principal_binding(&crate::launcher::generate_principal_id(), instance_name)
+            .map_err(|e| format!("failed to create principal: {e}"))?;
+    }
+
     // Update PID and directory
     let mut updates = serde_json::Map::new();
     updates.insert("pid".into(), serde_json::json!(orphan.pid));
@@ -616,6 +625,48 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error when DB has no instances table"
+        );
+    }
+
+    #[test]
+    fn test_recover_single_orphan_mints_one_stable_principal_across_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let orphan = OrphanProcess {
+            pid: std::process::id(),
+            tool: "claude".into(),
+            names: vec!["luna".into()],
+            directory: "/tmp".into(),
+            process_id: "pid-1".into(),
+            terminal_preset: String::new(),
+            pane_id: String::new(),
+            terminal_id: String::new(),
+            kitty_listen_on: String::new(),
+            zellij_session_name: String::new(),
+            session_id: String::new(),
+            notify_port: 0,
+            inject_port: 0,
+            tag: String::new(),
+        };
+
+        recover_single_orphan_to_db(&db, &orphan, "luna").unwrap();
+        let first = db
+            .principal_for_instance("luna")
+            .unwrap()
+            .expect("recovered orphan principal");
+        recover_single_orphan_to_db(&db, &orphan, "luna").unwrap();
+        assert_eq!(
+            db.principal_for_instance("luna").unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM principal_bindings", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 }

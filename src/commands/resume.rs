@@ -3126,6 +3126,71 @@ mod tests {
     }
 
     #[test]
+    fn tracked_fork_route_mints_a_principal_distinct_from_parent() {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("session-123"));
+        data.insert("tool".into(), json!("codex"));
+        data.insert("status".into(), json!("listening"));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("luna", &data).unwrap();
+        db.create_principal_binding("p-parent", "luna").unwrap();
+
+        let plan = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        let launch = prepare_launch_for_execution(&db, &plan).unwrap();
+        let child_name = launch.name.expect("tracked fork reserved child name");
+        let mut child_env = std::collections::HashMap::new();
+        let child_principal =
+            crate::launcher::attach_launch_principal(&db, &child_name, &mut child_env).unwrap();
+
+        assert_ne!(child_principal, "p-parent");
+        assert_eq!(
+            db.principal_for_instance(&child_name).unwrap().as_deref(),
+            Some(child_principal.as_str())
+        );
+    }
+
+    #[test]
+    fn adoption_route_mints_a_new_principal_for_each_lifecycle() {
+        let db = test_db();
+        let source = || ResumeSource::Disk {
+            session_id: "019f6550-1111-7222-8333-123456789abc".to_string(),
+            tool: "codex".to_string(),
+            cwd_hint: Some("/tmp".to_string()),
+        };
+
+        let first_plan =
+            prepare_resume_plan_from_source(&db, source(), false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert!(
+            first_plan.launch.name.is_none(),
+            "adoption allocates at launch"
+        );
+        let first_name = crate::instance_names::generate_unique_name(&db).unwrap();
+        let first = crate::launcher::attach_launch_principal(
+            &db,
+            &first_name,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        let second_plan =
+            prepare_resume_plan_from_source(&db, source(), false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert!(second_plan.launch.name.is_none());
+        let second_name = crate::instance_names::generate_unique_name(&db).unwrap();
+        let second = crate::launcher::attach_launch_principal(
+            &db,
+            &second_name,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        assert_ne!(first_name, second_name);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn test_resume_inherits_prior_session_id_fork_does_not() {
         let db = test_db();
         let mut data = serde_json::Map::new();

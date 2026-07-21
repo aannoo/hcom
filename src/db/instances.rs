@@ -19,6 +19,7 @@ pub struct InstanceStatus {
 #[derive(Debug, Clone)]
 pub struct InstanceRow {
     pub name: String,
+    pub principal: Option<String>,
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub parent_name: Option<String>,
@@ -55,6 +56,9 @@ impl InstanceRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             name: row.get("name")?,
+            principal: row
+                .get::<_, Option<String>>("principal")?
+                .filter(|s| !s.is_empty()),
             session_id: row
                 .get::<_, Option<String>>("session_id")?
                 .filter(|s| !s.is_empty()),
@@ -786,6 +790,7 @@ impl HcomDb {
             "idle_since",
             "terminal_preset_requested",
             "terminal_preset_effective",
+            "principal",
         ];
         if VALID_COLUMNS.contains(&key) {
             Ok(key)
