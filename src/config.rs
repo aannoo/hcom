@@ -64,6 +64,26 @@ impl Config {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&env_map, &cwd);
 
+        // Unit tests must never inherit a real hcom data directory. Raw path
+        // semantics are tested through `resolve_hcom_dir_from_env` directly, so
+        // global Config accepts only roots a test fixture explicitly registered
+        // as disposable — not merely "it lives under $TMPDIR", since a real DB
+        // can sit under the temp tree too. Anything else redirects to a
+        // process-local throwaway. Production builds do not compile this branch.
+        //
+        // Redirect rather than panic on an unregistered dir: countless tests
+        // read Config with no HCOM_DIR set and no isolation installed, and must
+        // land on a safe throwaway instead of aborting. Every explicit consumer
+        // registers its root, so the fallback is a backstop, never the norm.
+        #[cfg(test)]
+        let hcom_dir = {
+            if paths::test_roots::is_registered(&hcom_dir) {
+                hcom_dir
+            } else {
+                test_default_hcom_dir()
+            }
+        };
+
         let instance_name = env::var("HCOM_INSTANCE_NAME")
             .ok()
             .filter(|s| !s.is_empty());
@@ -76,6 +96,27 @@ impl Config {
             process_id,
         }
     }
+}
+
+/// Process-local fallback for unit tests that do not install an isolated
+/// `HCOM_DIR`. Reusing one directory per test binary preserves Config's normal
+/// process-wide semantics. Backed by a retained `TempDir` so it gets a unique,
+/// uncontended name and is registered as a disposable root for the redirect.
+#[cfg(test)]
+fn test_default_hcom_dir() -> PathBuf {
+    use std::sync::OnceLock;
+
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-test-default-")
+            .tempdir()
+            .expect("create test-default hcom dir");
+        paths::test_roots::register(dir.path());
+        dir
+    })
+    .path()
+    .to_path_buf()
 }
 
 /// Bidirectional mapping: HcomConfig field name <-> TOML dotted path.
@@ -1071,6 +1112,38 @@ pub fn get_merged_preset_pane_id_env(name: &str) -> Option<String> {
     get_merged_preset(name).and_then(|p| p.pane_id_env)
 }
 
+/// Environment variables that identify a terminal-local pane/window/workspace.
+///
+/// New-window runner sidecars must not replay these values from the parent:
+/// the terminal backend supplies fresh identity to the child. Include both
+/// built-in detection variables and user-configured `pane_id_env` values.
+pub fn pane_identity_env_vars() -> std::collections::HashSet<String> {
+    pane_identity_env_vars_from_path(&paths::config_toml_path())
+}
+
+fn pane_identity_env_vars_from_path(
+    toml_path: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let mut vars = crate::shared::terminal_presets::TERMINAL_ENV_MAP
+        .iter()
+        .map(|(env_var, _)| (*env_var).to_string())
+        .collect::<std::collections::HashSet<_>>();
+
+    if let Some(presets) = load_toml_presets(toml_path).and_then(|value| value.as_table().cloned())
+    {
+        vars.extend(presets.values().filter_map(|value| {
+            value
+                .as_table()
+                .and_then(|preset| preset.get("pane_id_env"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }));
+    }
+
+    vars
+}
+
 /// Get a fully merged terminal preset: TOML overrides on top of built-in defaults.
 ///
 /// Returns None if the name matches neither a TOML preset nor a built-in preset.
@@ -1474,7 +1547,7 @@ fn lock_down_config_permissions(_path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::test_helpers::isolated_test_env;
+    use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
     use std::env;
 
@@ -1516,31 +1589,133 @@ mod tests {
 
     // Unix-only: asserts against $HOME and POSIX absolute paths; Windows
     // resolves the base dir from USERPROFILE and treats "/x" as drive-relative.
-    #[cfg(unix)]
     #[test]
     #[serial]
-    fn test_default_config_uses_home_hcom() {
+    fn test_guard_redirects_non_temp_hcom_dir() {
+        let _guard = EnvGuard::new();
+        let unsafe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".hcom-unsafe-test");
+        unsafe {
+            env::set_var("HCOM_DIR", &unsafe_dir);
+        }
         Config::reset();
-        without_env(&["HCOM_DIR"], || {
-            Config::init();
-            let config = Config::get();
-            let expected = env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".hcom"))
-                .unwrap();
-            assert_eq!(config.hcom_dir, expected);
-        });
+        Config::init();
+
+        let actual = Config::get().hcom_dir;
+        assert_ne!(actual, unsafe_dir);
+        assert!(actual.starts_with(env::temp_dir()), "actual={actual:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_guard_allows_registered_hcom_dir() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let expected = temp.path().join(".hcom");
+        // A fixture must claim the root before Config will keep it.
+        paths::test_roots::register(temp.path());
+        unsafe {
+            env::set_var("HCOM_DIR", &expected);
+        }
+        Config::reset();
+        Config::init();
+
+        assert_eq!(Config::get().hcom_dir, expected);
+    }
+
+    #[test]
+    #[serial]
+    fn test_guard_redirects_unregistered_temp_hcom_dir() {
+        // Geography is not ownership: a temp path no fixture registered is not
+        // trusted, even though it sits under $TMPDIR. This is the finding-3
+        // guarantee that a real hcom DB happening to live under /tmp is not
+        // waved through.
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let unregistered = temp.path().join(".hcom");
+        unsafe {
+            env::set_var("HCOM_DIR", &unregistered);
+        }
+        Config::reset();
+        Config::init();
+
+        assert_ne!(Config::get().hcom_dir, unregistered);
     }
 
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn test_hcom_dir_overrides_home() {
+    fn test_guard_rejects_temp_symlink_to_non_temp_hcom_dir() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("outside");
+        symlink(env!("CARGO_MANIFEST_DIR"), &link).unwrap();
+        let unsafe_dir = link.join(".hcom");
+        unsafe {
+            env::set_var("HCOM_DIR", &unsafe_dir);
+        }
         Config::reset();
-        with_env("HCOM_DIR", "/custom/hcom", || {
-            Config::init();
-            let config = Config::get();
-            assert_eq!(config.hcom_dir, PathBuf::from("/custom/hcom"));
+        Config::init();
+
+        let actual = Config::get().hcom_dir;
+        assert_ne!(actual, unsafe_dir);
+        assert!(actual.starts_with(env::temp_dir()), "actual={actual:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_raw_resolution_and_db_open_do_not_share_mutable_escape_state() {
+        use std::sync::{Arc, Barrier};
+
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let barrier = Arc::new(Barrier::new(2));
+        let raw_barrier = Arc::clone(&barrier);
+        let db_barrier = Arc::clone(&barrier);
+        let raw_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".hcom-resolution-test");
+        let expected_db = hcom_dir.join("hcom.db");
+
+        let resolver = std::thread::spawn(move || {
+            let env = HashMap::from([(
+                "HCOM_DIR".to_string(),
+                raw_path.to_string_lossy().into_owned(),
+            )]);
+            raw_barrier.wait();
+            let (resolved, explicit) =
+                paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+            assert_eq!(resolved, raw_path);
+            assert!(explicit);
         });
+        let db_open = std::thread::spawn(move || {
+            db_barrier.wait();
+            let db = crate::db::HcomDb::open().unwrap();
+            assert_eq!(db.path(), expected_db);
+        });
+
+        resolver.join().unwrap();
+        db_open.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_default_config_uses_home_hcom() {
+        let env = HashMap::from([("HOME".to_string(), "/home/test".to_string())]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, PathBuf::from("/home/test/.hcom"));
+        assert!(!explicit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hcom_dir_overrides_home() {
+        let env = HashMap::from([("HCOM_DIR".to_string(), "/custom/hcom".to_string())]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, PathBuf::from("/custom/hcom"));
+        assert!(explicit);
     }
 
     #[test]
@@ -1604,40 +1779,38 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_hcom_dir_tilde_expansion() {
-        Config::reset();
-        with_env("HCOM_DIR", "~/.hcom", || {
-            Config::init();
-            let config = Config::get();
-            assert!(config.hcom_dir.is_absolute());
-            assert!(config.hcom_dir.ends_with(".hcom"));
-        });
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let env = HashMap::from([
+            ("HOME".to_string(), home.to_string_lossy().into_owned()),
+            ("HCOM_DIR".to_string(), "~/.hcom".to_string()),
+        ]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, home.join(".hcom"));
+        assert!(explicit);
     }
 
     #[test]
-    #[serial]
     fn test_hcom_dir_relative_resolved_to_absolute() {
-        Config::reset();
-        with_env("HCOM_DIR", "relative/path", || {
-            Config::init();
-            let config = Config::get();
-            // Should be resolved relative to CWD
-            assert!(config.hcom_dir.is_absolute());
-            assert!(config.hcom_dir.ends_with("relative/path"));
-        });
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let env = HashMap::from([("HCOM_DIR".to_string(), "relative/path".to_string())]);
+        let (actual, explicit) = paths::resolve_hcom_dir_from_env(&env, &cwd);
+
+        assert_eq!(actual, cwd.join("relative/path"));
+        assert!(explicit);
     }
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_hcom_dir_absolute_stays_absolute() {
-        Config::reset();
-        with_env("HCOM_DIR", "/absolute/hcom", || {
-            Config::init();
-            let config = Config::get();
-            assert_eq!(config.hcom_dir, PathBuf::from("/absolute/hcom"));
-        });
+        let env = HashMap::from([("HCOM_DIR".to_string(), "/absolute/hcom".to_string())]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, PathBuf::from("/absolute/hcom"));
+        assert!(explicit);
     }
 
     #[test]
@@ -2226,6 +2399,27 @@ binary = "myterm"
         assert!(presets.is_some());
         let presets = presets.unwrap();
         assert!(presets.as_table().unwrap().contains_key("myterm"));
+    }
+
+    #[test]
+    fn test_pane_identity_env_vars_include_builtin_and_custom_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[terminal.presets.myterm]
+open = "myterm spawn -- bash {script}"
+close = "myterm close {pane_id}"
+pane_id_env = "MYTERM_PANE_ID"
+"#,
+        )
+        .unwrap();
+
+        let vars = pane_identity_env_vars_from_path(&path);
+        assert!(vars.contains("HERDR_PANE_ID"));
+        assert!(vars.contains("KITTY_WINDOW_ID"));
+        assert!(vars.contains("MYTERM_PANE_ID"));
     }
 
     #[test]

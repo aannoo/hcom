@@ -227,6 +227,7 @@ pub(crate) fn parse_cursor_jsonl(
                             is_error: false,
                             file,
                             command,
+                            output: Some("(output not recorded by cursor)".to_string()),
                         });
                     }
                 }

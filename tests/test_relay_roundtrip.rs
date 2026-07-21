@@ -36,7 +36,10 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use support::claude_mock::{MODEL, claude_text, claude_tool_use, latest_user_turn};
+use support::claude_mock::{
+    ClaudeStartupAnswers, MODEL, claude_startup_gate, claude_text, claude_tool_use,
+    latest_user_turn,
+};
 use support::mock_http::{MockHttp, RecordedRequest, Reply};
 
 // ── Logging ────────────────────────────────────────────────────────────
@@ -135,7 +138,9 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         // (tmux/kitty/etc.) is required in CI.
         .env(
             "HCOM_CLAUDE_ARGS",
-            format!("--model {MODEL} --permission-mode bypassPermissions --setting-sources user"),
+            format!(
+                "--model {MODEL} --permission-mode dontAsk --allowedTools Write,Bash --setting-sources user"
+            ),
         );
 
     let mut path_entries = Vec::new();
@@ -476,10 +481,8 @@ fn poll_rpc_result_on_device(hcom_dir: &str, action: &str) -> serde_json::Value 
 /// True if `text` has Claude's input prompt marker at the start of a rendered
 /// screen line, present whenever the TUI is rendered, independent of the
 /// dontAsk / accept-edits mode that hides the "? for shortcuts" status bar.
-/// `--permission-mode bypassPermissions` (used by this test) renders a plain
-/// `>` instead of the styled `❯`. Requiring the marker to lead the line (not
-/// just appear anywhere) keeps this from matching an unrelated `>` in tips,
-/// diffs, or other screen content.
+/// Requiring the marker to lead the line (not just appear anywhere) keeps this
+/// from matching an unrelated `>` in tips, diffs, or other screen content.
 fn screen_has_claude_prompt(text: &str) -> bool {
     text.lines().any(|line| {
         let trimmed = strip_term_line_number_prefix(line).trim_start();
@@ -636,28 +639,23 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
 fn drive_claude_startup(hcom_dir: &str, name: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     let mut last_screen = String::new();
+    let mut answers = ClaudeStartupAnswers::default();
     while Instant::now() < deadline {
         let json_out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
         let screen_out = hcom_with_dir(&format!("term {name}"), hcom_dir);
         last_screen = String::from_utf8_lossy(&screen_out.stdout).to_string();
-        let low = last_screen.to_lowercase();
-        let bypass_confirm = low.contains("yes, i accept") && low.contains("bypass permissions");
-        let onboarding = bypass_confirm
-            || low.contains("text style")
-            || low.contains("i trust this folder")
-            || low.contains("is this a project")
-            || low.contains("accessing workspace")
-            || low.contains("do you trust")
-            || low.contains("press enter to continue");
+        let gate = claude_startup_gate(&last_screen);
         if screen_out.status.success()
             && String::from_utf8_lossy(&json_out.stdout).contains("\"prompt_empty\":true")
-            && !onboarding
+            && gate.is_none()
         {
             return;
         }
-        if bypass_confirm || onboarding {
-            let key = if bypass_confirm { "2 " } else { "" };
-            let inject = hcom_with_dir(&format!("term inject {name} {key}--enter"), hcom_dir);
+        if gate.is_some_and(|gate| answers.answer_once(gate)) {
+            // A successful inject delivered Enter to the PTY. Do not repeat it
+            // while a stale frame still shows the gate: the next Enter could
+            // land in Claude's ready prompt.
+            let inject = hcom_with_dir(&format!("term inject {name} --enter"), hcom_dir);
             assert!(
                 inject.status.success(),
                 "drive startup inject failed\nstdout: {}\nstderr: {}",

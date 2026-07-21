@@ -21,12 +21,18 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Hard ceiling on a single hcom CLI invocation. Real commands finish in well
+/// under a second; this only trips when one is genuinely wedged, converting an
+/// unbounded hang into a fast, labelled failure instead of a CI job timeout.
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Hcom {
     pub root: TempDir,
@@ -273,15 +279,9 @@ impl Hcom {
         if std::env::var_os("HCOM_TEST_TRACE_COMMANDS").is_some() {
             eprintln!("hcom test command: {:?}", args);
         }
-        let out = self
-            .cmd()
-            .args(&args)
-            .output()
-            .unwrap_or_else(|error| panic!("spawn hcom binary for {:?}: {error}", args));
-        let code = out.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        (code, stdout, stderr)
+        let mut command = self.cmd();
+        command.args(&args);
+        self.output_bounded(command, &args)
     }
 
     /// Run a command as a manually-started identity.
@@ -290,15 +290,73 @@ impl Hcom {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let out = self
-            .cmd()
-            .env("HCOM_PROCESS_ID", process_id)
-            .args(args)
-            .output()
-            .expect("spawn hcom binary with HCOM_PROCESS_ID");
-        let code = out.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        let mut command = self.cmd();
+        command.env("HCOM_PROCESS_ID", process_id).args(&args);
+        self.output_bounded(command, &args)
+    }
+
+    /// Spawn `command` and collect its output under a hard deadline.
+    ///
+    /// `Command::output` waits for stdout+stderr to reach EOF, which needs every
+    /// process holding an inherited copy of those pipe handles to exit —
+    /// including a detached launch grandchild that keeps the write end open long
+    /// after the direct child returns. That turns one wedged invocation into an
+    /// unbounded hang (the `eventually` poll only checks its own deadline
+    /// *between* calls), and CI can only end it with a job timeout.
+    ///
+    /// Instead we drain both pipes on background threads into shared buffers and
+    /// wait for the *direct* child alone. On exit (or [`RUN_TIMEOUT`]) we
+    /// snapshot whatever the readers captured rather than joining them, so a
+    /// grandchild holding the pipe never blocks the call. A timeout kills the
+    /// child, reports a non-zero code, and prints a labelled marker so the wedged
+    /// subcommand is named in the log.
+    fn output_bounded(&self, mut command: Command, args: &[OsString]) -> (i32, String, String) {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn hcom binary for {args:?}: {error}"));
+        let stdout_buf = drain_stream(child.stdout.take());
+        let stderr_buf = drain_stream(child.stderr.take());
+
+        let deadline = Instant::now() + RUN_TIMEOUT;
+        let (code, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status.code().unwrap_or(-1), false),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (-1, true);
+                }
+                Ok(None) => std::thread::sleep(POLL_INTERVAL),
+                Err(error) => panic!("wait on hcom binary for {args:?}: {error}"),
+            }
+        };
+        // Grace for the readers to drain bytes already buffered in the pipe. We
+        // snapshot instead of joining: a detached grandchild can hold the write
+        // end open, so a reader may never observe EOF.
+        std::thread::sleep(Duration::from_millis(200));
+        let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
+        let mut stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+        if timed_out {
+            let marker = format!(
+                "<hcom test: `hcom {}` exceeded {}s and was killed>",
+                args.iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                RUN_TIMEOUT.as_secs()
+            );
+            eprintln!("{marker}");
+            stderr.push_str(&marker);
+            stderr.push('\n');
+        }
         (code, stdout, stderr)
     }
 
@@ -769,6 +827,27 @@ pub fn unique_suffix() -> String {
         .unwrap_or_default()
         .as_nanos()
         .to_string()
+}
+
+/// Drain a child pipe on a background thread into a shared buffer, appending as
+/// bytes arrive. The caller snapshots the buffer under its own deadline instead
+/// of joining, so a pipe the child never closes (a detached grandchild holds the
+/// write end) can't wedge the read. A leaked reader dies with the test process.
+fn drain_stream<R: Read + Send + 'static>(stream: Option<R>) -> Arc<Mutex<Vec<u8>>> {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    if let Some(mut stream) = stream {
+        let sink = Arc::clone(&buffer);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+    }
+    buffer
 }
 
 fn poll_until<F>(timeout: Duration, mut predicate: F) -> bool

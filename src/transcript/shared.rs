@@ -26,6 +26,7 @@ pub struct ToolUse {
     pub is_error: bool,
     pub file: Option<String>,
     pub command: Option<String>,
+    pub output: Option<String>,
 }
 
 /// Lazy-initialized error detection regex.
@@ -175,6 +176,18 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+const TOOL_OUTPUT_CAPTURE_MAX: usize = 1000;
+
+/// Keep transcript parsing memory-bounded while preserving enough tool output
+/// for the detailed renderer's shorter preview.
+pub(crate) fn capture_tool_output(output: &str) -> Option<String> {
+    if output.trim().is_empty() {
+        None
+    } else {
+        Some(truncate_str(output, TOOL_OUTPUT_CAPTURE_MAX).to_string())
+    }
 }
 
 /// Normalize tool names across agents to canonical Claude names.
@@ -447,7 +460,7 @@ pub fn format_exchanges(
             lines.push(format!("FILES: {}", ex.files.join(", ")));
         }
 
-        if detailed && !ex.tools.is_empty() {
+        if detailed {
             for tool in &ex.tools {
                 let marker = if tool.is_error { "  ✗" } else { "  ├─" };
                 let detail = tool
@@ -456,6 +469,61 @@ pub fn format_exchanges(
                     .or(tool.command.as_deref())
                     .unwrap_or("");
                 lines.push(format!("{marker} {} {detail}", tool.name));
+                if let Some(output) = &tool.output
+                    && !output.trim().is_empty()
+                {
+                    let duplicated_error = tool.is_error
+                        && ex.errors.iter().any(|error| {
+                            error.get("tool").and_then(Value::as_str) == Some(tool.name.as_str())
+                                && error
+                                    .get("content")
+                                    .or_else(|| error.get("error"))
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|content| {
+                                        let content = content.trim();
+                                        let output = output.trim();
+                                        !content.is_empty()
+                                            && (content == output
+                                                || (content.len() >= 300
+                                                    && output.starts_with(content)))
+                                    })
+                        });
+                    if duplicated_error {
+                        continue;
+                    }
+                    lines.push(format!(
+                        "  │  OUTPUT: {}",
+                        single_line_ellipsized(output, 400)
+                    ));
+                }
+            }
+
+            for edit in &ex.edits {
+                let file = edit
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let diff = edit.get("diff").and_then(Value::as_str).unwrap_or("");
+                lines.push(format!(
+                    "  Δ EDIT {file}: {}",
+                    single_line_ellipsized(diff, 400)
+                ));
+            }
+
+            for error in &ex.errors {
+                let tool = error
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let content = error
+                    .get("content")
+                    .or_else(|| error.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                lines.push(format!(
+                    "  ✗ ERROR {tool}: {}",
+                    single_line_ellipsized(content, 400)
+                ));
             }
         }
 
@@ -464,17 +532,35 @@ pub fn format_exchanges(
 
     // Trailing hint
     if !exchanges.is_empty() {
-        if !full {
-            lines.push("Note: Output truncated. Use --full for full text.".to_string());
-        } else {
-            lines.push(
-                "Note: Tool outputs & file edits hidden. Use --detailed for full details."
+        match (full, detailed) {
+            (false, false) => lines.push(
+                "Note: Conversation text truncated. Use --full for full text; use --detailed for tool outputs, file edits, and errors."
                     .to_string(),
-            );
+            ),
+            (false, true) => lines.push(
+                "Note: Conversation text truncated. Use --full for full text.".to_string(),
+            ),
+            (true, false) => lines.push(
+                "Note: Tool outputs, file edits, and errors hidden. Use --detailed to show them."
+                    .to_string(),
+            ),
+            (true, true) => {}
         }
     }
 
     lines.join("\n")
+}
+
+fn single_line_ellipsized(text: &str, max: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "(empty)".to_string();
+    }
+    if one_line.len() <= max {
+        one_line
+    } else {
+        format!("{}…", truncate_str(&one_line, max.saturating_sub(1)))
+    }
 }
 
 /// Summarize action text (first 3 lines, strip prefixes).
@@ -505,5 +591,70 @@ pub fn summarize_action(text: &str) -> String {
         format!("{summary} ...")
     } else {
         summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exchange() -> Exchange {
+        Exchange {
+            position: 1,
+            user: "question".to_string(),
+            action: "answer".to_string(),
+            files: vec!["a.rs".to_string()],
+            timestamp: String::new(),
+            tools: vec![ToolUse {
+                name: "Bash".to_string(),
+                is_error: true,
+                file: None,
+                command: Some("cargo test".to_string()),
+                output: Some("line one\nline two".to_string()),
+            }],
+            edits: vec![json!({"file": "a.rs", "diff": "-old\n+new"})],
+            errors: vec![json!({"tool": "Bash", "content": "exit 1"})],
+            ended_on_error: true,
+        }
+    }
+
+    #[test]
+    fn detailed_renders_outputs_edits_errors_and_no_active_flag_hint() {
+        let rendered = format_exchanges(&[exchange()], "agent", true, true);
+        assert!(rendered.contains("OUTPUT: line one line two"));
+        assert!(rendered.contains("Δ EDIT a.rs: -old +new"));
+        assert!(rendered.contains("✗ ERROR Bash: exit 1"));
+        assert!(!rendered.contains("Use --detailed"));
+    }
+
+    #[test]
+    fn detailed_without_full_only_hints_about_conversation_text() {
+        let rendered = format_exchanges(&[exchange()], "agent", false, true);
+        assert!(rendered.contains("Use --full for full text"));
+        assert!(!rendered.contains("Use --detailed"));
+    }
+
+    #[test]
+    fn detailed_skips_empty_outputs_and_duplicate_error_output() {
+        let mut ex = exchange();
+        ex.tools[0].output = Some("exit 1".to_string());
+        ex.tools.push(ToolUse {
+            name: "Wait".to_string(),
+            is_error: false,
+            file: None,
+            command: None,
+            output: Some(String::new()),
+        });
+        let rendered = format_exchanges(&[ex], "agent", true, true);
+        assert!(!rendered.contains("OUTPUT: (empty)"));
+        assert!(!rendered.contains("OUTPUT: exit 1"));
+        assert_eq!(rendered.matches("ERROR Bash: exit 1").count(), 1);
+    }
+
+    #[test]
+    fn capture_tool_output_skips_empty_and_caps_large_results() {
+        assert_eq!(capture_tool_output("  \n"), None);
+        let captured = capture_tool_output(&"x".repeat(2_000)).unwrap();
+        assert_eq!(captured.len(), TOOL_OUTPUT_CAPTURE_MAX);
     }
 }

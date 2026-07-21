@@ -5,9 +5,10 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, collapse_codex_duplicate_exchanges, dedup_sorted_capped,
-    extract_content_text, extract_edit_info, extract_text_content, finalize_action_text,
-    has_user_text, is_error_result, normalize_tool_name, read_file_lossy, truncate_str,
+    Exchange, ToolUse, capture_tool_output, collapse_codex_duplicate_exchanges,
+    dedup_sorted_capped, extract_content_text, extract_edit_info, extract_text_content,
+    finalize_action_text, has_user_text, is_error_result, normalize_tool_name, read_file_lossy,
+    truncate_str,
 };
 
 fn extract_antigravity_entry_text(entry: &Value) -> String {
@@ -233,6 +234,7 @@ pub(crate) fn parse_claude_jsonl(
 
                                 let is_err = is_error_result(block);
                                 let normalized = normalize_tool_name(&tool_name);
+                                let output = extract_content_text(block.get("content"));
 
                                 let file = if normalized == "Edit" {
                                     tool_use_result
@@ -269,6 +271,7 @@ pub(crate) fn parse_claude_jsonl(
                                     is_error: is_err,
                                     file,
                                     command,
+                                    output: capture_tool_output(&output),
                                 });
 
                                 // Extract edit info for Edit tools
@@ -280,8 +283,7 @@ pub(crate) fn parse_claude_jsonl(
                                 }
 
                                 if is_err {
-                                    let raw_content = extract_content_text(block.get("content"));
-                                    let truncated = truncate_str(&raw_content, 300);
+                                    let truncated = truncate_str(&output, 300);
                                     current_errors.push(json!({
                                         "tool": normalized,
                                         "content": truncated,
@@ -390,6 +392,7 @@ pub(crate) fn parse_claude_jsonl(
                                         is_error: false,
                                         file,
                                         command,
+                                        output: None,
                                     });
                                 }
                             }
@@ -433,4 +436,48 @@ pub(crate) fn parse_claude_jsonl(
     }
 
     Ok(exchanges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detailed_captures_tool_result_output() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let lines = [
+            json!({
+                "type": "user",
+                "sessionId": "s1",
+                "message": {"role": "user", "content": "run pwd"}
+            }),
+            json!({
+                "type": "assistant",
+                "sessionId": "s1",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "t1", "name": "Bash",
+                    "input": {"command": "pwd"}
+                }]}
+            }),
+            json!({
+                "type": "user",
+                "sessionId": "s1",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "t1", "content": "/work"
+                }]}
+            }),
+        ];
+        std::fs::write(
+            file.path(),
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let exchanges = parse_claude_jsonl(file.path(), 10, true).unwrap();
+        assert_eq!(exchanges[0].tools[0].output.as_deref(), Some("/work"));
+    }
 }

@@ -1154,15 +1154,7 @@ fn stop_instance_inner(
     crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
 
     // Trigger relay push (best-effort)
-    let prefix = crate::runtime_env::get_hcom_prefix();
-    if let Some((cmd, prefix_args)) = prefix.split_first() {
-        let _ = std::process::Command::new(cmd)
-            .args(prefix_args)
-            .args(["relay", "push"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    crate::relay::spawn_background_push();
 }
 
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
@@ -1324,6 +1316,8 @@ pub fn update_tool_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use serial_test::serial;
     use std::io::Write;
 
     #[test]
@@ -1433,9 +1427,11 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_hook_instance_no_db() {
-        // Best-effort function should not panic even with no DB
-        // (HcomDb::open() will fail in test env without ~/.hcom)
+    #[serial]
+    fn test_notify_hook_instance_missing_instance() {
+        // Best-effort wake must not panic when the DB opens but the named
+        // instance has no row (the common case for a stale notify target).
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         notify_hook_instance("nonexistent");
     }
 
