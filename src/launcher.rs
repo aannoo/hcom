@@ -3144,6 +3144,72 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_bootstrap_omits_notes_section_for_empty_env_value() {
+        // `HCOM_NOTES=""` is the documented way to clear notes; it is
+        // structurally different from a missing key and must still produce no
+        // `## NOTES` section.
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let instance_env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        assert!(!bootstrap.contains("## NOTES"));
+    }
+
+    #[test]
+    fn test_codex_notes_survive_developer_instructions_toml_transport() {
+        // The helper only produces the intermediate bootstrap string. Notes
+        // actually reach Codex through `preprocess_codex_args`, which
+        // TOML-encodes the bootstrap into `-c developer_instructions=...`.
+        // Assert on the final, TOML-decoded argument so quotes, backslashes,
+        // braces, and newlines are proven to survive the real transport.
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let notes =
+            "Use \"review mode\".\nWindows path: C:\\work\\repo\n{literal braces}\nSecond line";
+        let instance_env = HashMap::from([("HCOM_NOTES".to_string(), notes.to_string())]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        let args =
+            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
+
+        // Locate the `-c developer_instructions=<TOML>` value and decode it.
+        // preprocess also injects sandbox `-c` args, so match by prefix rather
+        // than by the first `-c` position.
+        let encoded = args
+            .iter()
+            .find_map(|a| a.strip_prefix("developer_instructions="))
+            .expect("developer_instructions arg present");
+        let decoded: toml::Table = toml::from_str(&format!("x = {encoded}"))
+            .expect("developer_instructions is valid TOML");
+        let dev_instructions = decoded["x"].as_str().expect("string value");
+
+        assert!(dev_instructions.contains("## NOTES"));
+        assert!(dev_instructions.contains("Use \"review mode\"."));
+        assert!(dev_instructions.contains("C:\\work\\repo"));
+        assert!(dev_instructions.contains("{literal braces}"));
+        assert!(dev_instructions.contains("Second line"));
+    }
+
+    #[test]
     #[serial]
     fn test_background_runner_env_uses_upstream_resolved_base() {
         let _guard = EnvVarGuard::remove(vec!["RORI_BACKGROUND_CONTAMINATION".to_string()]);
