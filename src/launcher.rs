@@ -479,6 +479,31 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
     out
 }
 
+fn format_plugin_install_error(
+    label: &str,
+    tool: &str,
+    target: &std::path::Path,
+    error: &std::io::Error,
+    diag: &str,
+) -> String {
+    use std::io::ErrorKind;
+
+    let mut message = format!(
+        "Failed to install {label} plugin at {}: {error}",
+        target.display()
+    );
+    if matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+    ) {
+        message.push_str(
+            "\nThe current process cannot write to the tool's config directory. If an AI agent ran this command inside a sandbox, retry the original hcom launch with approval or elevated permission to write this path.",
+        );
+    }
+    message.push_str(&format!("\nManual retry: hcom hooks add {tool}\n{diag}"));
+    message
+}
+
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
@@ -570,17 +595,47 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::OpenCode => {
-            if crate::hooks::opencode::ensure_plugin_installed("opencode") {
-                return Ok(());
+            match crate::hooks::opencode::ensure_plugin_installed("opencode") {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    let target = crate::hooks::opencode::get_opencode_plugin_path();
+                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
+                    bail!(
+                        "{}",
+                        format_plugin_install_error("OpenCode", "opencode", &target, &error, &diag,)
+                    );
+                }
             }
-            let diag = install_diag_context(tool, &[]);
+            let diag = install_diag_context(
+                tool,
+                &[(
+                    "plugin_path",
+                    crate::hooks::opencode::get_opencode_plugin_path(),
+                )],
+            );
             bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
         }
         LaunchTool::Kilo => {
-            if crate::hooks::opencode::ensure_plugin_installed("kilo") {
-                return Ok(());
+            match crate::hooks::opencode::ensure_plugin_installed("kilo") {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    let target = crate::hooks::opencode::get_kilo_plugin_path();
+                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
+                    bail!(
+                        "{}",
+                        format_plugin_install_error("Kilo Code", "kilo", &target, &error, &diag,)
+                    );
+                }
             }
-            let diag = install_diag_context(tool, &[]);
+            let diag = install_diag_context(
+                tool,
+                &[(
+                    "plugin_path",
+                    crate::hooks::opencode::get_kilo_plugin_path(),
+                )],
+            );
             bail!("Failed to setup Kilo Code plugin. Run: hcom hooks add kilo\n{diag}");
         }
         LaunchTool::Pi => {
@@ -2463,6 +2518,39 @@ mod tests {
             LaunchTool::Copilot
         );
         assert!(LaunchTool::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn plugin_permission_error_tells_sandboxed_agents_how_to_retry() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sandbox denied");
+        let message = format_plugin_install_error(
+            "OpenCode",
+            "opencode",
+            std::path::Path::new("/home/test/.config/opencode/plugins/hcom.ts"),
+            &error,
+            "Diagnostic context:\n",
+        );
+
+        assert!(message.contains("sandbox denied"));
+        assert!(
+            message.contains("retry the original hcom launch with approval or elevated permission")
+        );
+        assert!(message.contains("Manual retry: hcom hooks add opencode"));
+    }
+
+    #[test]
+    fn plugin_non_permission_error_preserves_cause_without_sandbox_advice() {
+        let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad plugin data");
+        let message = format_plugin_install_error(
+            "OpenCode",
+            "opencode",
+            std::path::Path::new("/tmp/hcom.ts"),
+            &error,
+            "Diagnostic context:\n",
+        );
+
+        assert!(message.contains("bad plugin data"));
+        assert!(!message.contains("run outside the sandbox"));
     }
 
     #[test]
