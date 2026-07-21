@@ -106,8 +106,12 @@ impl HcomDb {
 
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+        // busy_timeout first: converting a fresh db to WAL takes a brief
+        // exclusive lock, so with a 0 timeout a concurrent first-open (or heavy
+        // load) fails instantly with SQLITE_BUSY. Setting the timeout up front
+        // makes the WAL conversion retry instead.
         conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
         )?;
 
         Ok(conn)
@@ -178,7 +182,7 @@ impl HcomDb {
         match Connection::open(&self.db_path) {
             Ok(new_conn) => {
                 if let Err(e) = new_conn.execute_batch(
-                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+                    "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
                 ) {
                     use crate::log::log_warn;
                     log_warn(

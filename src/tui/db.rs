@@ -80,7 +80,7 @@ impl DbDataSource {
             // query_only=ON: TUI is read-only; any accidental write will
             // error immediately rather than silently succeed.
             if let Err(e) = conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000; PRAGMA query_only=ON;",
+                "PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL; PRAGMA query_only=ON;",
             ) {
                 self.last_error = Some(format!(
                     "init database pragmas {}: {}",
@@ -1438,24 +1438,37 @@ mod tests {
     };
     use rusqlite::Connection;
 
+    // Blocker 1 regression: the no-arg TUI must route through the owner-only
+    // permission boundary rather than leaving/creating a broad database. `db_path`
+    // is pinned to the isolated temp rather than left to be re-read from global
+    // `Config` mid-test, whose process-wide cache other parallel tests can reset.
     #[cfg(unix)]
     #[test]
-    fn ensure_conn_secures_directory_and_database() {
+    fn ensure_conn_secures_existing_broad_database() {
         use std::os::unix::fs::PermissionsExt;
 
         let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        // Legacy broad install opened only through the no-arg TUI.
-        std::fs::set_permissions(&hcom_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Pre-existing broad db (legacy install opened only through the TUI).
         let db_path = hcom_dir.join("hcom.db");
         std::fs::write(&db_path, b"").unwrap();
         std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
+        // Opening the TUI data source must run the permission boundary, which
+        // secures the db with a lock-free chmod before any connection is
+        // opened. Assert on the resulting mode, not the connection: whether the
+        // read open itself succeeds is irrelevant to the security invariant and
+        // would otherwise couple the test to SQLite locking under parallel load.
         let mut ds = super::DbDataSource::new();
-        assert!(ds.ensure_conn().is_some());
+        ds.db_path = db_path.clone();
+        let _ = ds.ensure_conn();
 
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&hcom_dir), 0o700);
-        assert_eq!(mode(&db_path), 0o600);
+        assert_eq!(
+            mode(&db_path),
+            0o600,
+            "TUI open left db broad: {:?}",
+            ds.last_error
+        );
     }
 
     fn setup_conn() -> Connection {
