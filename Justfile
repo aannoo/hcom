@@ -47,8 +47,8 @@ ci: mock-tools typecheck
     ulimit -Su "$(ulimit -Hu)" && TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
     ulimit -Su "$(ulimit -Hu)" && TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
 
-# Match the native Windows CI gate. The package smoke copy is deliberately
-# renamed instead of using a second Cargo target directory.
+# Run every normal Windows CI check locally. The release-package smoke remains
+# available separately for release validation.
 [windows]
 mock-tools-windows:
     & "{{justfile_directory()}}/scripts/install-mock-tools.ps1"
@@ -64,15 +64,14 @@ ci-windows:
     cargo fmt --all -- --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo test --all-targets --locked
-    just package-smoke-windows
     just real-tool-tests-windows
 
 [windows]
 package-smoke-windows:
     cargo build --release --locked
     New-Item -ItemType Directory -Force target/package-smoke | Out-Null
-    # Move (not copy): real-tool-tests-windows runs next and every test-spawned
-    # hcom process sets HCOM_DEV_ROOT, which makes dev_root_binary() pick
+    # Move (not copy): if real-tool-tests-windows runs after this, every
+    # test-spawned hcom process sets HCOM_DEV_ROOT, which makes dev_root_binary() pick
     # whichever of target/release or target/debug has the newer mtime. Leaving
     # a freshly-built target/release/hcom.exe behind would make it win over the
     # debug binary cargo test just built, so tests would silently re-exec into

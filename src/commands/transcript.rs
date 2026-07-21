@@ -56,7 +56,7 @@ pub struct TranscriptArgs {
     /// Full output (no streamlining)
     #[arg(long)]
     pub full: bool,
-    /// Detailed output (include tool details)
+    /// Show tool inputs/outputs, file edits, and errors
     #[arg(long)]
     pub detailed: bool,
     /// Last N exchanges
@@ -127,6 +127,69 @@ fn truncate_str(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Snippet width (bytes) for transcript search matches, centered on the hit.
+const SEARCH_SNIPPET_WIDTH: usize = 160;
+
+/// Build a snippet of ~`width` bytes centered on a match.
+///
+/// Transcript lines are whole JSON message objects (thousands of bytes), so a
+/// start-anchored truncation only ever shows leading metadata (`parentUuid`…),
+/// never the match. `col` is ripgrep's 1-based byte column of the match start;
+/// we window around it so the matched text is actually visible, with `…`
+/// markers when content is elided on either side. All slice points are snapped
+/// to UTF-8 char boundaries.
+fn centered_snippet(line_text: &str, col: usize, width: usize) -> String {
+    if line_text.len() <= width {
+        return line_text.to_string();
+    }
+    let match_start = col.saturating_sub(1).min(line_text.len());
+    let half = width / 2;
+    let mut start = match_start.saturating_sub(half);
+    while start > 0 && !line_text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + width).min(line_text.len());
+    while end < line_text.len() && !line_text.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(line_text[start..end].trim());
+    if end < line_text.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Parse one search-tool output line into `(line_number, centered_snippet)`.
+///
+/// `has_column` is true for ripgrep run with `--column` (`LINE:COL:TEXT`) and
+/// false for the `grep` fallback (`LINE:TEXT`), where we locate the pattern
+/// literally to center on it and fall back to the line start otherwise.
+fn parse_match_line(raw: &str, has_column: bool, pattern: &str) -> (usize, String) {
+    let Some((line_str, rest)) = raw.split_once(':') else {
+        return (0, centered_snippet(raw, 1, SEARCH_SNIPPET_WIDTH));
+    };
+    let line_num = line_str.parse::<usize>().unwrap_or(0);
+
+    if has_column
+        && let Some((col_str, text)) = rest.split_once(':')
+        && let Ok(col) = col_str.parse::<usize>()
+    {
+        return (line_num, centered_snippet(text, col, SEARCH_SNIPPET_WIDTH));
+    }
+
+    // grep fallback (or malformed rg line): best-effort literal locate.
+    let col = rest
+        .to_lowercase()
+        .find(&pattern.to_lowercase())
+        .map(|byte| byte + 1)
+        .unwrap_or(1);
+    (line_num, centered_snippet(rest, col, SEARCH_SNIPPET_WIDTH))
 }
 
 // ── Transcript Path Discovery ────────────────────────────────────────────
@@ -450,10 +513,9 @@ fn cmd_transcript_search(
                 "rg",
                 &[
                     "-n",
+                    "--column",
                     "--max-count",
                     &max_count,
-                    "--max-columns",
-                    "500",
                     pattern,
                     file_path,
                 ],
@@ -469,15 +531,7 @@ fn cmd_transcript_search(
                 let lines: Vec<&str> = stdout.lines().collect();
                 let match_count = lines.len();
                 if match_count > 0 {
-                    let first_line = lines[0];
-                    let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                        let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                        let text = &first_line[colon_pos + 1..];
-                        let text = truncate_str(text, 100);
-                        (num, text.to_string())
-                    } else {
-                        (0, first_line.to_string())
-                    };
+                    let (line_num, snippet) = parse_match_line(lines[0], true, pattern);
 
                     results.push(json!({
                             "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
@@ -621,29 +675,27 @@ fn cmd_transcript_search(
             continue;
         }
 
-        // Use rg for line-level matches with context
+        // Use rg for line-level matches with context. `--column` gives us the
+        // match offset so the snippet can be centered on the hit; the grep
+        // fallback has no column, so parse_match_line locates the pattern itself.
         let remaining = limit - results.len();
         let max_count = remaining.to_string();
+        let mut has_column = true;
         let output = match run_search_tool(
             "rg",
-            &[
-                "-n",
-                "--max-count",
-                &max_count,
-                "--max-columns",
-                "500",
-                pattern,
-                path,
-            ],
+            &["-n", "--column", "--max-count", &max_count, pattern, path],
         ) {
             Ok(output) => Ok(output),
-            Err(rg_err) if rg_err.contains("was not found on PATH") => run_search_tool(
-                "grep",
-                &["-n", "-m", &max_count, pattern, path],
-            )
-            .map_err(|grep_err| {
-                format!("transcript search requires `rg` or `grep` on PATH ({rg_err}; {grep_err})")
-            }),
+            Err(rg_err) if rg_err.contains("was not found on PATH") => {
+                has_column = false;
+                run_search_tool("grep", &["-n", "-m", &max_count, pattern, path]).map_err(
+                    |grep_err| {
+                        format!(
+                            "transcript search requires `rg` or `grep` on PATH ({rg_err}; {grep_err})"
+                        )
+                    },
+                )
+            }
             Err(err) => Err(err),
         };
 
@@ -660,16 +712,7 @@ fn cmd_transcript_search(
             let lines: Vec<&str> = stdout.lines().collect();
             let match_count = lines.len();
             if match_count > 0 {
-                // Extract first match line number and snippet
-                let first_line = lines[0];
-                let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                    let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                    let text = &first_line[colon_pos + 1..];
-                    let text = truncate_str(text, 100);
-                    (num, text.to_string())
-                } else {
-                    (0, first_line.to_string())
-                };
+                let (line_num, snippet) = parse_match_line(lines[0], has_column, pattern);
 
                 results.push(json!({
                     "hcom_name": name,
@@ -736,13 +779,10 @@ fn cmd_transcript_search(
             };
 
             println!("[{agent}:{hcom_name}] {path_display}:{line}");
+            // Snippet is already bounded and centered on the match by
+            // parse_match_line; just flatten newlines for single-line display.
             let snippet_clean = snippet.replace('\n', " ");
-            let snippet_short = if snippet_clean.len() > 100 {
-                format!("{}...", truncate_str(&snippet_clean, 100))
-            } else {
-                snippet_clean
-            };
-            println!("    {snippet_short}\n");
+            println!("    {snippet_clean}\n");
         }
     }
 
@@ -1381,6 +1421,64 @@ mod tests {
     }
 
     #[test]
+    fn test_centered_snippet_shows_match_deep_in_long_line() {
+        // A whole-JSON transcript line: the match sits far past the start, where
+        // start-anchored truncation would never reach it.
+        let prefix = "{\"parentUuid\":null,".repeat(40); // long metadata head
+        let line = format!("{prefix}\"text\":\"NEEDLE here\"}}");
+        let col = line.find("NEEDLE").unwrap() + 1; // rg is 1-based
+        let snip = centered_snippet(&line, col, SEARCH_SNIPPET_WIDTH);
+        assert!(snip.contains("NEEDLE"), "match must be visible: {snip}");
+        assert!(snip.starts_with('…'), "elided head marked: {snip}");
+        assert!(snip.len() <= SEARCH_SNIPPET_WIDTH + 8); // window + ellipses/trim slack
+    }
+
+    #[test]
+    fn test_centered_snippet_short_line_returned_whole() {
+        let line = "{\"text\":\"hi ping there\"}";
+        let col = line.find("ping").unwrap() + 1;
+        let snip = centered_snippet(line, col, SEARCH_SNIPPET_WIDTH);
+        assert_eq!(snip, line, "short line kept intact, no ellipsis");
+    }
+
+    #[test]
+    fn test_centered_snippet_multibyte_safe() {
+        // Match adjacent to multi-byte chars; slicing must not panic and must
+        // stay on char boundaries.
+        let line = format!("{}émoji→NEEDLE←café{}", "🚀".repeat(60), "ü".repeat(60));
+        let col = line.find("NEEDLE").unwrap() + 1;
+        let snip = centered_snippet(&line, col, SEARCH_SNIPPET_WIDTH);
+        assert!(snip.contains("NEEDLE"));
+        assert!(std::str::from_utf8(snip.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_match_line_rg_with_column() {
+        // rg --column format: LINE:COL:TEXT — COL points at the match.
+        let head = "x".repeat(300);
+        let text = format!("{head}FINDME{head}");
+        let col = 301; // 1-based, right after the 300-char head
+        let raw = format!("44:{col}:{text}");
+        let (line, snip) = parse_match_line(&raw, true, "FINDME");
+        assert_eq!(line, 44);
+        assert!(snip.contains("FINDME"), "centered on rg column: {snip}");
+    }
+
+    #[test]
+    fn test_parse_match_line_grep_fallback_locates_pattern() {
+        // grep format: LINE:TEXT (no column) — pattern located case-insensitively.
+        let head = "y".repeat(300);
+        let text = format!("{head}findME{head}");
+        let raw = format!("7:{text}");
+        let (line, snip) = parse_match_line(&raw, false, "FINDME");
+        assert_eq!(line, 7);
+        assert!(
+            snip.contains("findME"),
+            "grep fallback centers on match: {snip}"
+        );
+    }
+
+    #[test]
     fn test_summarize_action() {
         let short = "Hello world";
         assert_eq!(summarize_action(short), "Hello world");
@@ -1587,6 +1685,7 @@ mod tests {
             is_error: false,
             file: None,
             command: Some("pwd".to_string()),
+            output: None,
         }];
         assert_eq!(
             finalize_action_text("", &tools, &[], false),
@@ -1790,12 +1889,14 @@ mod tests {
                 is_error: true,
                 file: Some("a.rs".to_string()),
                 command: None,
+                output: None,
             },
             ToolUse {
                 name: "Edit".to_string(),
                 is_error: false,
                 file: Some("a.rs".to_string()),
                 command: None,
+                output: None,
             },
         ];
         let errors = vec![json!({"tool": "Edit", "content": "old failure"})];

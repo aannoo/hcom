@@ -1112,6 +1112,38 @@ pub fn get_merged_preset_pane_id_env(name: &str) -> Option<String> {
     get_merged_preset(name).and_then(|p| p.pane_id_env)
 }
 
+/// Environment variables that identify a terminal-local pane/window/workspace.
+///
+/// New-window runner sidecars must not replay these values from the parent:
+/// the terminal backend supplies fresh identity to the child. Include both
+/// built-in detection variables and user-configured `pane_id_env` values.
+pub fn pane_identity_env_vars() -> std::collections::HashSet<String> {
+    pane_identity_env_vars_from_path(&paths::config_toml_path())
+}
+
+fn pane_identity_env_vars_from_path(
+    toml_path: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let mut vars = crate::shared::terminal_presets::TERMINAL_ENV_MAP
+        .iter()
+        .map(|(env_var, _)| (*env_var).to_string())
+        .collect::<std::collections::HashSet<_>>();
+
+    if let Some(presets) = load_toml_presets(toml_path).and_then(|value| value.as_table().cloned())
+    {
+        vars.extend(presets.values().filter_map(|value| {
+            value
+                .as_table()
+                .and_then(|preset| preset.get("pane_id_env"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }));
+    }
+
+    vars
+}
+
 /// Get a fully merged terminal preset: TOML overrides on top of built-in defaults.
 ///
 /// Returns None if the name matches neither a TOML preset nor a built-in preset.
@@ -2367,6 +2399,27 @@ binary = "myterm"
         assert!(presets.is_some());
         let presets = presets.unwrap();
         assert!(presets.as_table().unwrap().contains_key("myterm"));
+    }
+
+    #[test]
+    fn test_pane_identity_env_vars_include_builtin_and_custom_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[terminal.presets.myterm]
+open = "myterm spawn -- bash {script}"
+close = "myterm close {pane_id}"
+pane_id_env = "MYTERM_PANE_ID"
+"#,
+        )
+        .unwrap();
+
+        let vars = pane_identity_env_vars_from_path(&path);
+        assert!(vars.contains("HERDR_PANE_ID"));
+        assert!(vars.contains("KITTY_WINDOW_ID"));
+        assert!(vars.contains("MYTERM_PANE_ID"));
     }
 
     #[test]
