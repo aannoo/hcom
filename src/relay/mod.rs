@@ -689,6 +689,10 @@ pub fn spawn_background_push() {
     spawn_background_push_with(&crate::runtime_env::get_hcom_prefix());
 }
 
+// Callers: `spawn_background_push` under `not(test)`, and the unix-only
+// regression test under `test`. Gate to match so a Windows test build (no unix
+// test, no production caller) doesn't flag it as dead code.
+#[cfg(any(not(test), unix))]
 fn spawn_background_push_with(prefix: &[String]) {
     #[cfg(not(test))]
     if let Some((cmd, prefix_args)) = prefix.split_first() {
