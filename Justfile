@@ -33,7 +33,10 @@ mock-tools:
 typecheck:
     bash ./scripts/typecheck.sh
 
-ci: mock-tools typecheck
+dist-check:
+    dist generate --check
+
+ci: dist-check mock-tools typecheck
     mkdir -p "{{ci-tmp}}"
     TMPDIR="{{ci-tmp}}" cargo fmt --all -- --check
     TMPDIR="{{ci-tmp}}" cargo clippy --all-targets --locked -- -D warnings

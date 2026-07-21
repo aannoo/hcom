@@ -2,6 +2,10 @@ name: Publish PyPI
 
 on:
   workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
 
 permissions:
   id-token: write

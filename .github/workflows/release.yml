@@ -362,6 +362,8 @@ jobs:
       - host
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     uses: ./.github/workflows/publish-pypi.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
     # publish jobs get escalated permissions
     permissions:
