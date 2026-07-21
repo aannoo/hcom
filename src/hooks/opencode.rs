@@ -747,11 +747,11 @@ fn plugin_matches_source(path: &std::path::Path) -> bool {
 /// Ensure the hcom.ts plugin is installed and up to date.
 ///
 /// Used by the launcher for auto-install on first launch.
-pub fn ensure_plugin_installed(app: &str) -> bool {
+pub fn ensure_plugin_installed(app: &str) -> std::io::Result<bool> {
     if verify_plugin_installed(app) {
-        return true;
+        return Ok(true);
     }
-    install_plugin(app).unwrap_or(false)
+    install_plugin(app)
 }
 
 #[cfg(test)]

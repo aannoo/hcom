@@ -506,6 +506,31 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
     out
 }
 
+fn format_plugin_install_error(
+    label: &str,
+    tool: &str,
+    target: &std::path::Path,
+    error: &std::io::Error,
+    diag: &str,
+) -> String {
+    use std::io::ErrorKind;
+
+    let mut message = format!(
+        "Failed to install {label} plugin at {}: {error}",
+        target.display()
+    );
+    if matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+    ) {
+        message.push_str(
+            "\nThe current process cannot write to the tool's config directory. If an AI agent ran this command inside a sandbox, retry the original hcom launch with approval or elevated permission to write this path.",
+        );
+    }
+    message.push_str(&format!("\nManual retry: hcom hooks add {tool}\n{diag}"));
+    message
+}
+
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
@@ -597,17 +622,47 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::OpenCode => {
-            if crate::hooks::opencode::ensure_plugin_installed("opencode") {
-                return Ok(());
+            match crate::hooks::opencode::ensure_plugin_installed("opencode") {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    let target = crate::hooks::opencode::get_opencode_plugin_path();
+                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
+                    bail!(
+                        "{}",
+                        format_plugin_install_error("OpenCode", "opencode", &target, &error, &diag,)
+                    );
+                }
             }
-            let diag = install_diag_context(tool, &[]);
+            let diag = install_diag_context(
+                tool,
+                &[(
+                    "plugin_path",
+                    crate::hooks::opencode::get_opencode_plugin_path(),
+                )],
+            );
             bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
         }
         LaunchTool::Kilo => {
-            if crate::hooks::opencode::ensure_plugin_installed("kilo") {
-                return Ok(());
+            match crate::hooks::opencode::ensure_plugin_installed("kilo") {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    let target = crate::hooks::opencode::get_kilo_plugin_path();
+                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
+                    bail!(
+                        "{}",
+                        format_plugin_install_error("Kilo Code", "kilo", &target, &error, &diag,)
+                    );
+                }
             }
-            let diag = install_diag_context(tool, &[]);
+            let diag = install_diag_context(
+                tool,
+                &[(
+                    "plugin_path",
+                    crate::hooks::opencode::get_kilo_plugin_path(),
+                )],
+            );
             bail!("Failed to setup Kilo Code plugin. Run: hcom hooks add kilo\n{diag}");
         }
         LaunchTool::Pi => {
@@ -784,6 +839,7 @@ fn create_runner_script_windows(
     instance_name: &str,
     env: &HashMap<String, String>,
     tool_args: &[String],
+    run_here: bool,
 ) -> Result<String> {
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
@@ -809,6 +865,11 @@ fn create_runner_script_windows(
 
     // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
     // that is dot-sourced then deleted, matching the bash runner.
+    let pane_identity_vars = if run_here {
+        std::collections::HashSet::new()
+    } else {
+        crate::config::pane_identity_env_vars()
+    };
     let ambient_env = sidecar_ambient_env(
         env,
         tool_marker_vars()
@@ -816,7 +877,8 @@ fn create_runner_script_windows(
             .chain(HCOM_IDENTITY_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-            .copied(),
+            .copied()
+            .chain(pane_identity_vars.iter().map(String::as_str)),
         true,
     );
     let sidecar_source = if ambient_env.is_empty() {
@@ -992,7 +1054,7 @@ pub fn create_runner_script(
     run_here: bool,
 ) -> Result<String> {
     if cfg!(windows) {
-        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args);
+        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args, run_here);
     }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
@@ -1020,6 +1082,11 @@ pub fn create_runner_script(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let pane_identity_vars = if run_here {
+        std::collections::HashSet::new()
+    } else {
+        crate::config::pane_identity_env_vars()
+    };
     let ambient_env = sidecar_ambient_env(
         env,
         tool_marker_vars()
@@ -1027,7 +1094,8 @@ pub fn create_runner_script(
             .chain(HCOM_IDENTITY_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-            .copied(),
+            .copied()
+            .chain(pane_identity_vars.iter().map(String::as_str)),
         false,
     );
     let env_block = terminal::build_env_string(&hcom_env, "bash_export");
@@ -2490,6 +2558,39 @@ mod tests {
     }
 
     #[test]
+    fn plugin_permission_error_tells_sandboxed_agents_how_to_retry() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sandbox denied");
+        let message = format_plugin_install_error(
+            "OpenCode",
+            "opencode",
+            std::path::Path::new("/home/test/.config/opencode/plugins/hcom.ts"),
+            &error,
+            "Diagnostic context:\n",
+        );
+
+        assert!(message.contains("sandbox denied"));
+        assert!(
+            message.contains("retry the original hcom launch with approval or elevated permission")
+        );
+        assert!(message.contains("Manual retry: hcom hooks add opencode"));
+    }
+
+    #[test]
+    fn plugin_non_permission_error_preserves_cause_without_sandbox_advice() {
+        let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad plugin data");
+        let message = format_plugin_install_error(
+            "OpenCode",
+            "opencode",
+            std::path::Path::new("/tmp/hcom.ts"),
+            &error,
+            "Diagnostic context:\n",
+        );
+
+        assert!(message.contains("bad plugin data"));
+        assert!(!message.contains("run outside the sandbox"));
+    }
+
+    #[test]
     fn launch_count_uses_per_tool_spec_limit() {
         assert!(validate_launch_count(&LaunchTool::Kimi, 10).is_ok());
         let err = validate_launch_count(&LaunchTool::Kimi, 11).unwrap_err();
@@ -3074,6 +3175,12 @@ mod tests {
             ("GEMINI_PTY_INFO".to_string(), "child_process".to_string()),
             ("GEMINI_API_KEY".to_string(), "gem-key".to_string()),
             ("GEMINI_CLI".to_string(), "1".to_string()),
+            ("HERDR_PANE_ID".to_string(), "w1:old".to_string()),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                "/tmp/herdr.sock".to_string(),
+            ),
+            ("KITTY_WINDOW_ID".to_string(), "17".to_string()),
             ("TERM".to_string(), "dumb".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
             ("NO_COLOR".to_string(), "1".to_string()),
@@ -3101,8 +3208,33 @@ mod tests {
         assert!(!sidecar.contains("COLORTERM="));
         assert!(!sidecar.contains("NO_COLOR="));
         assert!(!sidecar.contains("FORCE_COLOR="));
+        assert!(!sidecar.contains("HERDR_PANE_ID="));
+        assert!(!sidecar.contains("KITTY_WINDOW_ID="));
+        assert!(sidecar.contains("HERDR_SOCKET_PATH="));
         assert!(sidecar.contains("GEMINI_API_KEY"));
         assert!(sidecar.contains("RORI_MY_VAR"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_here_runner_preserves_current_pane_identity() {
+        let env = HashMap::from([
+            ("HERDR_PANE_ID".to_string(), "w1:current".to_string()),
+            ("RORI_MY_VAR".to_string(), "myval".to_string()),
+        ]);
+
+        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], true).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+        assert!(sidecar.contains("HERDR_PANE_ID="));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
@@ -3112,9 +3244,17 @@ mod tests {
     // site is, via a runtime cfg!(windows) check), so this runs on any host.
     #[test]
     fn test_runner_script_windows_has_bom_and_propagates_exit_code() {
-        let env = HashMap::from([("SOME_SECRET".to_string(), "sekrit".to_string())]);
+        let env = HashMap::from([
+            ("SOME_SECRET".to_string(), "sekrit".to_string()),
+            ("herdr_pane_id".to_string(), "w1:old".to_string()),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                r"C:\tmp\herdr.sock".to_string(),
+            ),
+        ]);
 
-        let script = create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[]).unwrap();
+        let script =
+            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false).unwrap();
 
         let bytes = std::fs::read(&script).unwrap();
         assert_eq!(
@@ -3139,7 +3279,14 @@ mod tests {
             b"\xEF\xBB\xBF",
             "sidecar env file needs the same BOM as the runner script"
         );
-        assert!(String::from_utf8_lossy(&sidecar_bytes).contains("SOME_SECRET"));
+        let sidecar_content = String::from_utf8_lossy(&sidecar_bytes);
+        assert!(sidecar_content.contains("SOME_SECRET"));
+        assert!(
+            !sidecar_content
+                .to_ascii_lowercase()
+                .contains("herdr_pane_id")
+        );
+        assert!(sidecar_content.contains("HERDR_SOCKET_PATH"));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(sidecar).ok();
@@ -3160,7 +3307,7 @@ mod tests {
         ];
 
         let script =
-            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args).unwrap();
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
 
         let run_line = content
@@ -3191,7 +3338,8 @@ mod tests {
     fn test_runner_script_windows_no_args_skips_sidecar_file() {
         let env = HashMap::new();
         let script =
-            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[]).unwrap();
+            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false)
+                .unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let run_line = content
             .lines()

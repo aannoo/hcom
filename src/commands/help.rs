@@ -334,7 +334,7 @@ const BUNDLE_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "    normal = truncated | full = complete | detailed = tools+edits",
+        "    normal = truncated | full = complete text | detailed = tool I/O+edits+errors",
     ),
     ("  --extends <id>", "Parent bundle for chaining"),
     ("  --bundle JSON", "Create from JSON payload"),
