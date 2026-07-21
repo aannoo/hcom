@@ -602,18 +602,21 @@ pub(super) fn build_early_launch_context() -> String {
         ctx.insert("kitty_listen_on".into(), Value::String(listen));
     }
 
-    // Preset-declared pane-id env var wins over generic terminal vars.
-    if let Ok(preset) = std::env::var("HCOM_LAUNCHED_PRESET")
-        && !preset.is_empty()
-        && let Some(var) = crate::config::get_merged_preset_pane_id_env(&preset)
+    // A selected preset defines the pane-ID namespace. Never pair its close
+    // command with an ID inherited from another backend.
+    let launched_preset = std::env::var("HCOM_LAUNCHED_PRESET")
+        .ok()
+        .filter(|preset| !preset.is_empty());
+    if let Some(preset) = launched_preset.as_deref()
+        && let Some(var) = crate::config::get_merged_preset_pane_id_env(preset)
         && let Ok(val) = std::env::var(&var)
         && !val.is_empty()
     {
         ctx.insert("pane_id".into(), Value::String(val));
     }
 
-    // Fallback: capture pane_id from generic terminal env vars (same-window launches).
-    if !ctx.contains_key("pane_id") {
+    // Legacy fallback for launches that predate effective-preset propagation.
+    if launched_preset.is_none() {
         let pane_id_vars: &[&str] = &[
             "WEZTERM_PANE",
             "TMUX_PANE",
@@ -1385,5 +1388,20 @@ mod tests {
         clear_launch_context_env();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["pane_id"], "w2:p1A");
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_known_preset_rejects_foreign_fallback() {
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("HCOM_LAUNCHED_PRESET", "herdr");
+            std::env::set_var("WEZTERM_PANE", "4");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("pane_id").is_none());
     }
 }
