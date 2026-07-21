@@ -315,6 +315,48 @@ pub fn build_launch_env(
     build_launch_env_with_resolver(hcom_config, regime, crate::shell_env::resolved_shell_env)
 }
 
+/// Apply the launcher's inherited `HCOM_NOTES` to a child instance env as a
+/// fallback only.
+///
+/// `instance_env` (via `base_env`) already carries any notes resolved from the
+/// explicit sources — config.toml, `~/.hcom/env`, and `LaunchParams.env` — and
+/// those must win. The inherited parent value only fills the gap for a nested
+/// launch where no explicit notes were configured, so it must not clobber a
+/// value already present (including an intentional empty string used to clear
+/// notes).
+fn apply_inherited_notes(instance_env: &mut HashMap<String, String>, inherited: Option<String>) {
+    if let Some(val) = inherited {
+        instance_env.entry("HCOM_NOTES".to_string()).or_insert(val);
+    }
+}
+
+fn build_codex_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+    tag: &str,
+    relay_enabled: bool,
+) -> String {
+    let notes = instance_env
+        .get("HCOM_NOTES")
+        .map(String::as_str)
+        .unwrap_or("");
+    crate::bootstrap::get_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "codex",
+        background,
+        true,
+        notes,
+        tag,
+        relay_enabled,
+        None,
+    )
+}
+
 fn build_launch_env_with_resolver<F>(
     hcom_config: &HcomConfig,
     regime: LaunchEnvRegime,
@@ -479,6 +521,31 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
     out
 }
 
+fn format_plugin_install_error(
+    label: &str,
+    tool: &str,
+    target: &std::path::Path,
+    error: &std::io::Error,
+    diag: &str,
+) -> String {
+    use std::io::ErrorKind;
+
+    let mut message = format!(
+        "Failed to install {label} plugin at {}: {error}",
+        target.display()
+    );
+    if matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+    ) {
+        message.push_str(
+            "\nThe current process cannot write to the tool's config directory. If an AI agent ran this command inside a sandbox, retry the original hcom launch with approval or elevated permission to write this path.",
+        );
+    }
+    message.push_str(&format!("\nManual retry: hcom hooks add {tool}\n{diag}"));
+    message
+}
+
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
@@ -570,17 +637,47 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::OpenCode => {
-            if crate::hooks::opencode::ensure_plugin_installed("opencode") {
-                return Ok(());
+            match crate::hooks::opencode::ensure_plugin_installed("opencode") {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    let target = crate::hooks::opencode::get_opencode_plugin_path();
+                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
+                    bail!(
+                        "{}",
+                        format_plugin_install_error("OpenCode", "opencode", &target, &error, &diag,)
+                    );
+                }
             }
-            let diag = install_diag_context(tool, &[]);
+            let diag = install_diag_context(
+                tool,
+                &[(
+                    "plugin_path",
+                    crate::hooks::opencode::get_opencode_plugin_path(),
+                )],
+            );
             bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
         }
         LaunchTool::Kilo => {
-            if crate::hooks::opencode::ensure_plugin_installed("kilo") {
-                return Ok(());
+            match crate::hooks::opencode::ensure_plugin_installed("kilo") {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    let target = crate::hooks::opencode::get_kilo_plugin_path();
+                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
+                    bail!(
+                        "{}",
+                        format_plugin_install_error("Kilo Code", "kilo", &target, &error, &diag,)
+                    );
+                }
             }
-            let diag = install_diag_context(tool, &[]);
+            let diag = install_diag_context(
+                tool,
+                &[(
+                    "plugin_path",
+                    crate::hooks::opencode::get_kilo_plugin_path(),
+                )],
+            );
             bail!("Failed to setup Kilo Code plugin. Run: hcom hooks add kilo\n{diag}");
         }
         LaunchTool::Pi => {
@@ -757,6 +854,7 @@ fn create_runner_script_windows(
     instance_name: &str,
     env: &HashMap<String, String>,
     tool_args: &[String],
+    run_here: bool,
 ) -> Result<String> {
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
@@ -782,6 +880,11 @@ fn create_runner_script_windows(
 
     // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
     // that is dot-sourced then deleted, matching the bash runner.
+    let pane_identity_vars = if run_here {
+        std::collections::HashSet::new()
+    } else {
+        crate::config::pane_identity_env_vars()
+    };
     let ambient_env = sidecar_ambient_env(
         env,
         tool_marker_vars()
@@ -789,7 +892,8 @@ fn create_runner_script_windows(
             .chain(HCOM_IDENTITY_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-            .copied(),
+            .copied()
+            .chain(pane_identity_vars.iter().map(String::as_str)),
         true,
     );
     let sidecar_source = if ambient_env.is_empty() {
@@ -965,7 +1069,7 @@ pub fn create_runner_script(
     run_here: bool,
 ) -> Result<String> {
     if cfg!(windows) {
-        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args);
+        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args, run_here);
     }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
@@ -993,6 +1097,11 @@ pub fn create_runner_script(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let pane_identity_vars = if run_here {
+        std::collections::HashSet::new()
+    } else {
+        crate::config::pane_identity_env_vars()
+    };
     let ambient_env = sidecar_ambient_env(
         env,
         tool_marker_vars()
@@ -1000,7 +1109,8 @@ pub fn create_runner_script(
             .chain(HCOM_IDENTITY_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-            .copied(),
+            .copied()
+            .chain(pane_identity_vars.iter().map(String::as_str)),
         false,
     );
     let env_block = terminal::build_env_string(&hcom_env, "bash_export");
@@ -1777,10 +1887,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         if let Ok(val) = std::env::var("HCOM_DEV_ROOT") {
             instance_env.insert("HCOM_DEV_ROOT".to_string(), val);
         }
-        // Propagate HCOM_NOTES
-        if let Ok(val) = std::env::var("HCOM_NOTES") {
-            instance_env.insert("HCOM_NOTES".to_string(), val);
-        }
+        // Propagate HCOM_NOTES from the launcher's own environment so a nested
+        // launch (an agent that inherited notes spawning a child) doesn't lose
+        // them — but only as a fallback (see `apply_inherited_notes`).
+        apply_inherited_notes(&mut instance_env, std::env::var("HCOM_NOTES").ok());
 
         let process_id = generate_process_id();
         instance_env.insert("HCOM_PROCESS_ID".to_string(), process_id.clone());
@@ -2044,17 +2154,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     }
 
                     // Generate bootstrap text for preprocessing
-                    let bootstrap = crate::bootstrap::get_bootstrap(
+                    let bootstrap = build_codex_bootstrap(
                         db,
                         &paths::hcom_dir(),
                         &instance_name,
-                        "codex",
                         params.background,
-                        true, // is_launched
-                        "",
+                        &instance_env,
                         &effective_tag,
                         hcom_config.relay_enabled,
-                        None,
                     );
 
                     let sandbox_mode = instance_env
@@ -2455,6 +2562,39 @@ mod tests {
             LaunchTool::Copilot
         );
         assert!(LaunchTool::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn plugin_permission_error_tells_sandboxed_agents_how_to_retry() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sandbox denied");
+        let message = format_plugin_install_error(
+            "OpenCode",
+            "opencode",
+            std::path::Path::new("/home/test/.config/opencode/plugins/hcom.ts"),
+            &error,
+            "Diagnostic context:\n",
+        );
+
+        assert!(message.contains("sandbox denied"));
+        assert!(
+            message.contains("retry the original hcom launch with approval or elevated permission")
+        );
+        assert!(message.contains("Manual retry: hcom hooks add opencode"));
+    }
+
+    #[test]
+    fn plugin_non_permission_error_preserves_cause_without_sandbox_advice() {
+        let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad plugin data");
+        let message = format_plugin_install_error(
+            "OpenCode",
+            "opencode",
+            std::path::Path::new("/tmp/hcom.ts"),
+            &error,
+            "Diagnostic context:\n",
+        );
+
+        assert!(message.contains("bad plugin data"));
+        assert!(!message.contains("run outside the sandbox"));
     }
 
     #[test]
@@ -2970,6 +3110,150 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_bootstrap_includes_notes_from_effective_instance_env() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let instance_env = HashMap::from([(
+            "HCOM_NOTES".to_string(),
+            "instance-specific notes".to_string(),
+        )]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        assert!(bootstrap.contains("## NOTES"));
+        assert!(bootstrap.contains("instance-specific notes"));
+    }
+
+    #[test]
+    fn test_codex_bootstrap_omits_notes_section_when_effective_env_has_none() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &HashMap::new(),
+            "",
+            false,
+        );
+
+        assert!(!bootstrap.contains("## NOTES"));
+    }
+
+    #[test]
+    fn test_codex_bootstrap_omits_notes_section_for_empty_env_value() {
+        // `HCOM_NOTES=""` is the documented way to clear notes; it is
+        // structurally different from a missing key and must still produce no
+        // `## NOTES` section.
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let instance_env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        assert!(!bootstrap.contains("## NOTES"));
+    }
+
+    #[test]
+    fn test_inherited_notes_fill_gap_when_absent() {
+        // Nested launch with no explicit notes: the parent's inherited value
+        // propagates so the child doesn't lose it.
+        let mut env = HashMap::new();
+        apply_inherited_notes(&mut env, Some("from-parent".to_string()));
+        assert_eq!(
+            env.get("HCOM_NOTES").map(String::as_str),
+            Some("from-parent")
+        );
+    }
+
+    #[test]
+    fn test_inherited_notes_do_not_override_explicit_value() {
+        // Explicit notes (config.toml / ~/.hcom/env / LaunchParams.env, already
+        // in instance_env via base_env) must win over an inherited parent value.
+        let mut env = HashMap::from([("HCOM_NOTES".to_string(), "explicit".to_string())]);
+        apply_inherited_notes(&mut env, Some("from-parent".to_string()));
+        assert_eq!(env.get("HCOM_NOTES").map(String::as_str), Some("explicit"));
+    }
+
+    #[test]
+    fn test_inherited_notes_do_not_override_intentional_clear() {
+        // An intentional empty value (`HCOM_NOTES=""`) clears notes and must not
+        // be resurrected by an inherited parent value.
+        let mut env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
+        apply_inherited_notes(&mut env, Some("from-parent".to_string()));
+        assert_eq!(env.get("HCOM_NOTES").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_inherited_notes_noop_when_parent_unset() {
+        let mut env = HashMap::new();
+        apply_inherited_notes(&mut env, None);
+        assert!(!env.contains_key("HCOM_NOTES"));
+    }
+
+    #[test]
+    fn test_codex_notes_survive_developer_instructions_toml_transport() {
+        // The helper only produces the intermediate bootstrap string. Notes
+        // actually reach Codex through `preprocess_codex_args`, which
+        // TOML-encodes the bootstrap into `-c developer_instructions=...`.
+        // Assert on the final, TOML-decoded argument so quotes, backslashes,
+        // braces, and newlines are proven to survive the real transport.
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let notes =
+            "Use \"review mode\".\nWindows path: C:\\work\\repo\n{literal braces}\nSecond line";
+        let instance_env = HashMap::from([("HCOM_NOTES".to_string(), notes.to_string())]);
+
+        let bootstrap = build_codex_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "luna",
+            false,
+            &instance_env,
+            "",
+            false,
+        );
+
+        let args =
+            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
+
+        // Locate the `-c developer_instructions=<TOML>` value and decode it.
+        // preprocess also injects sandbox `-c` args, so match by prefix rather
+        // than by the first `-c` position.
+        let encoded = args
+            .iter()
+            .find_map(|a| a.strip_prefix("developer_instructions="))
+            .expect("developer_instructions arg present");
+        let decoded: toml::Table = toml::from_str(&format!("x = {encoded}"))
+            .expect("developer_instructions is valid TOML");
+        let dev_instructions = decoded["x"].as_str().expect("string value");
+
+        assert!(dev_instructions.contains("## NOTES"));
+        assert!(dev_instructions.contains("Use \"review mode\"."));
+        assert!(dev_instructions.contains("C:\\work\\repo"));
+        assert!(dev_instructions.contains("{literal braces}"));
+        assert!(dev_instructions.contains("Second line"));
+    }
+
+    #[test]
     #[serial]
     fn test_background_runner_env_uses_upstream_resolved_base() {
         let _guard = EnvVarGuard::remove(vec!["RORI_BACKGROUND_CONTAMINATION".to_string()]);
@@ -3001,6 +3285,12 @@ mod tests {
             ("GEMINI_PTY_INFO".to_string(), "child_process".to_string()),
             ("GEMINI_API_KEY".to_string(), "gem-key".to_string()),
             ("GEMINI_CLI".to_string(), "1".to_string()),
+            ("HERDR_PANE_ID".to_string(), "w1:old".to_string()),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                "/tmp/herdr.sock".to_string(),
+            ),
+            ("KITTY_WINDOW_ID".to_string(), "17".to_string()),
             ("TERM".to_string(), "dumb".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
             ("NO_COLOR".to_string(), "1".to_string()),
@@ -3028,8 +3318,33 @@ mod tests {
         assert!(!sidecar.contains("COLORTERM="));
         assert!(!sidecar.contains("NO_COLOR="));
         assert!(!sidecar.contains("FORCE_COLOR="));
+        assert!(!sidecar.contains("HERDR_PANE_ID="));
+        assert!(!sidecar.contains("KITTY_WINDOW_ID="));
+        assert!(sidecar.contains("HERDR_SOCKET_PATH="));
         assert!(sidecar.contains("GEMINI_API_KEY"));
         assert!(sidecar.contains("RORI_MY_VAR"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_here_runner_preserves_current_pane_identity() {
+        let env = HashMap::from([
+            ("HERDR_PANE_ID".to_string(), "w1:current".to_string()),
+            ("RORI_MY_VAR".to_string(), "myval".to_string()),
+        ]);
+
+        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], true).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+        assert!(sidecar.contains("HERDR_PANE_ID="));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
@@ -3039,9 +3354,17 @@ mod tests {
     // site is, via a runtime cfg!(windows) check), so this runs on any host.
     #[test]
     fn test_runner_script_windows_has_bom_and_propagates_exit_code() {
-        let env = HashMap::from([("SOME_SECRET".to_string(), "sekrit".to_string())]);
+        let env = HashMap::from([
+            ("SOME_SECRET".to_string(), "sekrit".to_string()),
+            ("herdr_pane_id".to_string(), "w1:old".to_string()),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                r"C:\tmp\herdr.sock".to_string(),
+            ),
+        ]);
 
-        let script = create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[]).unwrap();
+        let script =
+            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false).unwrap();
 
         let bytes = std::fs::read(&script).unwrap();
         assert_eq!(
@@ -3066,7 +3389,14 @@ mod tests {
             b"\xEF\xBB\xBF",
             "sidecar env file needs the same BOM as the runner script"
         );
-        assert!(String::from_utf8_lossy(&sidecar_bytes).contains("SOME_SECRET"));
+        let sidecar_content = String::from_utf8_lossy(&sidecar_bytes);
+        assert!(sidecar_content.contains("SOME_SECRET"));
+        assert!(
+            !sidecar_content
+                .to_ascii_lowercase()
+                .contains("herdr_pane_id")
+        );
+        assert!(sidecar_content.contains("HERDR_SOCKET_PATH"));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(sidecar).ok();
@@ -3087,7 +3417,7 @@ mod tests {
         ];
 
         let script =
-            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args).unwrap();
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
 
         let run_line = content
@@ -3118,7 +3448,8 @@ mod tests {
     fn test_runner_script_windows_no_args_skips_sidecar_file() {
         let env = HashMap::new();
         let script =
-            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[]).unwrap();
+            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false)
+                .unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let run_line = content
             .lines()

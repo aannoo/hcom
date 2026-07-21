@@ -26,8 +26,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, extract_content_text, extract_edit_info, finalize_action_text,
-    is_error_result, normalize_tool_name,
+    Exchange, ToolUse, capture_tool_output, extract_content_text, extract_edit_info,
+    finalize_action_text, is_error_result, normalize_tool_name, truncate_str,
 };
 
 /// In-progress turn accumulator.
@@ -153,6 +153,7 @@ pub fn parse_kimi_wire_jsonl(
                             is_error: false,
                             file,
                             command,
+                            output: None,
                         });
                     }
                     "tool.result" => {
@@ -168,7 +169,13 @@ pub fn parse_kimi_wire_jsonl(
                         if is_err && let Some(&idx) = t.call_index.get(id) {
                             t.tools[idx].is_error = true;
                             let tool = t.tools[idx].name.clone();
-                            t.errors.push(json!({"tool": tool, "error": output}));
+                            t.errors.push(json!({
+                                "tool": tool,
+                                "content": truncate_str(output, 300),
+                            }));
+                        }
+                        if let Some(&idx) = t.call_index.get(id) {
+                            t.tools[idx].output = capture_tool_output(output);
                         }
                     }
                     _ => {}
@@ -311,6 +318,7 @@ mod tests {
         assert_eq!(ex[0].tools.len(), 1);
         assert_eq!(ex[0].tools[0].name, "Bash");
         assert_eq!(ex[0].tools[0].command.as_deref(), Some("who"));
+        assert_eq!(ex[0].tools[0].output.as_deref(), Some("anno  console"));
         assert!(!ex[0].tools[0].is_error);
         assert_eq!(ex[0].action, "done");
     }

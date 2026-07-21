@@ -5,11 +5,31 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, codex_is_error, collapse_codex_duplicate_exchanges, dedup_sorted_capped,
-    extract_codex_event_message_text, extract_text_content, finalize_action_text,
-    is_codex_system_injected_user_text, is_no_response_action, normalize_tool_name,
-    read_file_lossy, same_trimmed_text, truncate_str,
+    Exchange, ToolUse, capture_tool_output, codex_is_error, collapse_codex_duplicate_exchanges,
+    dedup_sorted_capped, extract_codex_event_message_text, extract_text_content,
+    finalize_action_text, is_codex_system_injected_user_text, is_no_response_action,
+    normalize_tool_name, read_file_lossy, same_trimmed_text, truncate_str,
 };
+
+/// Extract plain text from a `function_call_output.output` value.
+///
+/// Codex encodes this field as either a plain string (older format) or an
+/// array of content items `[{"type":"input_text","text":...}, ...]` (current
+/// format, codex-cli 0.14x). This mirrors codex's own lossy
+/// `FunctionCallOutputContentItem` → text conversion: keep `input_text` text,
+/// drop image/audio/encrypted items, join with newlines.
+fn codex_output_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
 
 /// Parse Codex JSONL transcript.
 /// Handles both response_item (older) and event_msg (newer) formats.
@@ -38,11 +58,7 @@ pub(crate) fn parse_codex_jsonl(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let output = payload
-                .get("output")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let output = codex_output_text(payload.get("output"));
             call_outputs.insert(call_id, output);
         }
         parsed_lines.push(entry);
@@ -236,6 +252,7 @@ pub(crate) fn parse_codex_jsonl(
                         is_error: is_err,
                         file,
                         command,
+                        output: capture_tool_output(output),
                     });
 
                     if is_err {
@@ -405,6 +422,21 @@ mod tests {
                 }
             }),
             json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:03Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    // Current codex encodes output as an array of content items,
+                    // not a plain string. The parser must join input_text items.
+                    "output": [
+                        {"type": "input_text", "text": "Chunk ID: abc"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,xxx"},
+                        {"type": "input_text", "text": "Process exited with code 0\nFinal output:\n/work"}
+                    ]
+                }
+            }),
+            json!({
                 "type": "event_msg",
                 "timestamp": "2026-03-27T10:01:00Z",
                 "payload": {"type": "user_message", "message": "event only user"}
@@ -431,8 +463,31 @@ mod tests {
         assert_eq!(exchanges[0].action, "response assistant");
         assert_eq!(exchanges[0].tools.len(), 1);
         assert_eq!(exchanges[0].tools[0].name, "Bash");
+        // Array output: both input_text segments joined, image item dropped.
+        assert_eq!(
+            exchanges[0].tools[0].output.as_deref(),
+            Some("Chunk ID: abc\nProcess exited with code 0\nFinal output:\n/work")
+        );
         assert_eq!(exchanges[1].user, "event only user");
         assert_eq!(exchanges[1].action, "event only assistant");
+    }
+
+    #[test]
+    fn codex_output_text_handles_string_and_array_bodies() {
+        assert_eq!(
+            codex_output_text(Some(&json!("plain string"))),
+            "plain string"
+        );
+        assert_eq!(
+            codex_output_text(Some(&json!([
+                {"type": "input_text", "text": "a"},
+                {"type": "input_text", "text": "  "},
+                {"type": "input_image", "image_url": "x"},
+                {"type": "input_text", "text": "b"}
+            ]))),
+            "a\nb"
+        );
+        assert_eq!(codex_output_text(None), "");
     }
 
     #[test]

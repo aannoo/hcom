@@ -1,12 +1,13 @@
 //! Pi Coding Agent transcript parser (.jsonl).
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, dedup_sorted_capped, extract_content_text, finalize_action_text,
-    normalize_tool_name, read_file_lossy,
+    Exchange, ToolUse, capture_tool_output, dedup_sorted_capped, extract_content_text,
+    finalize_action_text, normalize_tool_name, read_file_lossy, truncate_str,
 };
 
 fn message_text(message: &Value) -> String {
@@ -74,6 +75,12 @@ pub(crate) fn parse_pi_jsonl(
     let mut current_action = String::new();
     let mut current_tools: Vec<ToolUse> = Vec::new();
     let mut current_files: Vec<String> = Vec::new();
+    let mut current_errors: Vec<Value> = Vec::new();
+    let mut current_last_was_error = false;
+    // Pi carries tool arguments (command, file path) on the assistant's inline
+    // `toolCall` block; the later `toolResult` line has `input: null` and links
+    // back by `toolCallId`. Map id → arguments so we can recover the command.
+    let mut call_args: HashMap<String, Value> = HashMap::new();
     let mut timestamp = String::new();
     let mut position = 0usize;
 
@@ -83,12 +90,14 @@ pub(crate) fn parse_pi_jsonl(
                  action: &mut String,
                  tools: &mut Vec<ToolUse>,
                  files: &mut Vec<String>,
+                 errors: &mut Vec<Value>,
+                 last_was_error: &mut bool,
                  ts: &mut String| {
         if user.is_empty() && action.is_empty() && tools.is_empty() {
             return;
         }
         *position += 1;
-        let final_action = finalize_action_text(action, tools, &[], false);
+        let final_action = finalize_action_text(action, tools, errors, *last_was_error);
         exchanges.push(Exchange {
             position: *position,
             user: std::mem::take(user),
@@ -97,11 +106,12 @@ pub(crate) fn parse_pi_jsonl(
             timestamp: std::mem::take(ts),
             tools: std::mem::take(tools),
             edits: Vec::new(),
-            errors: Vec::new(),
-            ended_on_error: false,
+            errors: std::mem::take(errors),
+            ended_on_error: *last_was_error,
         });
         action.clear();
         files.clear();
+        *last_was_error = false;
     };
 
     for line in content.lines() {
@@ -123,6 +133,8 @@ pub(crate) fn parse_pi_jsonl(
                     &mut current_action,
                     &mut current_tools,
                     &mut current_files,
+                    &mut current_errors,
+                    &mut current_last_was_error,
                     &mut timestamp,
                 );
                 current_user = message_text(message);
@@ -134,6 +146,19 @@ pub(crate) fn parse_pi_jsonl(
                     .to_string();
             }
             "assistant" => {
+                if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                    for block in blocks {
+                        if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                            continue;
+                        }
+                        if let (Some(id), Some(args)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("arguments"),
+                        ) {
+                            call_args.insert(id.to_string(), args.clone());
+                        }
+                    }
+                }
                 let text = message_text(message);
                 if !text.is_empty() {
                     if !current_action.is_empty() {
@@ -147,21 +172,44 @@ pub(crate) fn parse_pi_jsonl(
                 if name.is_empty() {
                     continue;
                 }
-                let input = tool_input(message);
+                let mut input = tool_input(message);
+                // `toolResult.input` is null in real pi transcripts; recover the
+                // arguments recorded on the matching assistant `toolCall` block.
+                let input_missing =
+                    !input.is_object() || input.as_object().is_some_and(|o| o.is_empty());
+                if input_missing
+                    && let Some(id) = message
+                        .get("toolCallId")
+                        .or_else(|| message.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                    && let Some(args) = call_args.get(id)
+                {
+                    input = args.clone();
+                }
                 let file = tool_file(&input);
                 if let Some(file) = &file {
                     current_files.push(file.clone());
                 }
+                let is_err = message
+                    .get("isError")
+                    .or_else(|| message.get("is_error"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let output = message_text(message);
                 current_tools.push(ToolUse {
                     name: normalize_tool_name(&name).to_string(),
-                    is_error: message
-                        .get("isError")
-                        .or_else(|| message.get("is_error"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    is_error: is_err,
                     file,
                     command: tool_command(&input),
+                    output: capture_tool_output(&output),
                 });
+                if is_err {
+                    current_errors.push(json!({
+                        "tool": name,
+                        "content": truncate_str(&output, 300),
+                    }));
+                }
+                current_last_was_error = is_err;
             }
             _ => {}
         }
@@ -174,6 +222,8 @@ pub(crate) fn parse_pi_jsonl(
         &mut current_action,
         &mut current_tools,
         &mut current_files,
+        &mut current_errors,
+        &mut current_last_was_error,
         &mut timestamp,
     );
 
@@ -198,7 +248,11 @@ mod tests {
                 "\n",
                 r#"{"type":"message","timestamp":"t1","message":{"role":"user","content":"hello"}}"#,
                 "\n",
-                r#"{"type":"message","message":{"role":"toolResult","toolName":"bash","input":{"command":"pwd"}}}"#,
+                // Real pi: command lives on the assistant's inline toolCall block.
+                r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"pwd"}}]}}"#,
+                "\n",
+                // Real pi: toolResult has input:null and links by toolCallId.
+                r#"{"type":"message","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","input":null,"content":[{"type":"text","text":"/work"}],"isError":false}}"#,
                 "\n",
                 r#"{"type":"message","message":{"role":"assistant","content":"done"}}"#,
                 "\n"
@@ -210,5 +264,8 @@ mod tests {
         assert_eq!(exchanges[0].user, "hello");
         assert_eq!(exchanges[0].action, "done");
         assert_eq!(exchanges[0].tools[0].name, "Bash");
+        // Command recovered from the assistant toolCall block despite null input.
+        assert_eq!(exchanges[0].tools[0].command.as_deref(), Some("pwd"));
+        assert_eq!(exchanges[0].tools[0].output.as_deref(), Some("/work"));
     }
 }

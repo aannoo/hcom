@@ -969,7 +969,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
         println!("HOW TO USE THIS CONTEXT:\n");
         println!("Use 'hcom send' with these bundle flags to create and send directly");
         println!(
-            "Transcript detail: normal (truncated) | full (complete text) | detailed (complete text with tools)\n"
+            "Transcript detail: normal (truncated) | full (complete text) | detailed (tool I/O, edits, errors)\n"
         );
         println!("Use this bundle context as a template for your specific bundle");
         println!("- Pick relevant events/files/transcript ranges from the bundle context");

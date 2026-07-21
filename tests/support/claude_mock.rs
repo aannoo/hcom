@@ -30,6 +30,82 @@ const TOOL_FILE: &str = "toolu_lifecycle_file";
 const TOOL_SHELL: &str = "toolu_lifecycle_shell";
 const TOOL_SEND: &str = "toolu_lifecycle_send";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaudeStartupGate {
+    Theme,
+    Trust,
+    Continue,
+}
+
+impl ClaudeStartupGate {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Theme => "theme prompt",
+            Self::Trust => "workspace trust prompt",
+            Self::Continue => "continue prompt",
+        }
+    }
+}
+
+pub fn claude_startup_gate(screen: &str) -> Option<ClaudeStartupGate> {
+    let low = screen.to_lowercase();
+    if low.contains("text style") {
+        Some(ClaudeStartupGate::Theme)
+    } else if low.contains("i trust this folder")
+        || low.contains("is this a project")
+        || low.contains("accessing workspace")
+        || low.contains("do you trust")
+    {
+        // Check trust before the generic continue prompt: Claude may render
+        // both phrases on one screen, but they still describe one gate.
+        Some(ClaudeStartupGate::Trust)
+    } else if low.contains("press enter to continue") {
+        Some(ClaudeStartupGate::Continue)
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+pub struct ClaudeStartupAnswers {
+    theme: bool,
+    trust: bool,
+    continue_prompt: bool,
+}
+
+impl ClaudeStartupAnswers {
+    pub fn answer_once(&mut self, gate: ClaudeStartupGate) -> bool {
+        let answered = match gate {
+            ClaudeStartupGate::Theme => &mut self.theme,
+            ClaudeStartupGate::Trust => &mut self.trust,
+            ClaudeStartupGate::Continue => &mut self.continue_prompt,
+        };
+        if *answered {
+            false
+        } else {
+            *answered = true;
+            true
+        }
+    }
+}
+
+#[test]
+fn startup_gate_treats_overlapping_trust_and_continue_text_as_one_gate() {
+    assert_eq!(
+        claude_startup_gate("Do you trust this folder? Press Enter to continue"),
+        Some(ClaudeStartupGate::Trust)
+    );
+}
+
+#[test]
+fn startup_answers_each_gate_once() {
+    let mut answers = ClaudeStartupAnswers::default();
+    assert!(answers.answer_once(ClaudeStartupGate::Trust));
+    assert!(!answers.answer_once(ClaudeStartupGate::Trust));
+    assert!(answers.answer_once(ClaudeStartupGate::Continue));
+    assert!(!answers.answer_once(ClaudeStartupGate::Continue));
+}
+
 /// Frame `(event, json)` pairs into a Messages SSE body.
 fn sse(events: &[(&str, Value)]) -> Vec<u8> {
     let mut out = String::new();
@@ -211,18 +287,16 @@ impl ToolCase for ClaudeCase {
     }
 
     fn launch_args(&self, _h: &Hcom) -> Vec<String> {
-        // bypassPermissions keeps the main lifecycle deterministic (approval is a
-        // separate test) without disabling hooks; --bare/--safe-mode would kill
-        // the hooks under test, so they are forbidden.
+        // The lifecycle only needs Write and Bash. Auto-allow those tools while
+        // denying every other prompt; the separate approval test uses Claude's
+        // default mode. --bare/--safe-mode would disable the hooks under test.
         vec![
             "--model".to_string(),
             MODEL.to_string(),
-            // bypassPermissions keeps per-tool approvals deterministic (approval
-            // is a separate test) without disabling hooks; --bare/--safe-mode
-            // would kill the hooks under test, so they are forbidden. It does NOT
-            // accept workspace trust — that is driven via the PTY in drive_startup.
             "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
+            "dontAsk".to_string(),
+            "--allowedTools".to_string(),
+            "Write,Bash".to_string(),
             // hcom installs its hooks into the user settings.json under
             // CLAUDE_CONFIG_DIR; load that source so they activate.
             "--setting-sources".to_string(),
@@ -239,37 +313,23 @@ impl ToolCase for ClaudeCase {
         // fallback for Claude versions that ignore the seeded state.
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut last_screen = String::new();
+        let mut answers = ClaudeStartupAnswers::default();
         while Instant::now() < deadline {
             let (_, json, _) = h.run(["term", name, "--json"]);
             let (screen_code, screen, _) = h.run(["term", name]);
             last_screen = screen.clone();
-            let low = screen.to_lowercase();
-            let bypass_confirm =
-                low.contains("yes, i accept") && low.contains("bypass permissions");
-            let onboarding = bypass_confirm
-                || low.contains("text style")
-                || low.contains("i trust this folder")
-                || low.contains("is this a project")
-                || low.contains("accessing workspace")
-                || low.contains("do you trust")
-                || low.contains("press enter to continue");
+            let gate = claude_startup_gate(&screen);
             // Ready once the empty input prompt is up and no gate is visible —
             // mode-agnostic, so it also serves the default-mode approval test.
-            if screen_code == 0 && json.contains("\"prompt_empty\":true") && !onboarding {
+            if screen_code == 0 && json.contains("\"prompt_empty\":true") && gate.is_none() {
                 return;
             }
-            let (key, what) = if bypass_confirm {
-                // Bypass-mode confirmation defaults to "No, exit" — explicitly
-                // select option 2 ("Yes, I accept") or Claude quits on Enter.
-                ("2", "bypass-mode confirmation")
-            } else if onboarding {
-                // Theme/trust default to the option we want (dark, Yes).
-                ("", "onboarding prompt")
-            } else {
-                ("", "")
-            };
-            if !what.is_empty() {
-                let (code, stdout, stderr) = h.run(["term", "inject", name, key, "--enter"]);
+            if let Some(gate) = gate.filter(|gate| answers.answer_once(*gate)) {
+                let what = gate.label();
+                // term inject reports delivery to the PTY. Send each gate answer
+                // once so a stale frame cannot leak an extra Enter into the
+                // ready input prompt.
+                let (code, stdout, stderr) = h.run(["term", "inject", name, "", "--enter"]);
                 assert_eq!(
                     code, 0,
                     "drive_startup: inject for {what} failed: stdout={stdout} stderr={stderr}"

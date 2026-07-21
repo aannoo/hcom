@@ -804,6 +804,30 @@ pub fn resolve_terminal_open_argv(preset_name: &str) -> Option<Vec<String>> {
     Some(open_argv)
 }
 
+/// Inject `--to <socket>` (after the `@`) for kitten commands launched outside
+/// kitty. Splices as separate argv elements — no shell quoting.
+///
+/// Matches `argv[0]`'s file_stem (not an exact string) because
+/// `resolve_terminal_open_argv` may have already rewritten `argv[0]` to
+/// kitten's absolute macOS app-bundle path when `kitten` isn't on PATH — a
+/// literal "kitten" check would miss that and silently skip the splice,
+/// leaving kitten without a socket to reach (it then falls back to
+/// controlling-tty discovery, which fails outright in tty-less contexts).
+fn splice_kitten_to_socket(argv: &mut Vec<String>, kitty_socket: &str) {
+    let is_kitten_cmd = argv
+        .first()
+        .and_then(|a| Path::new(a).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("kitten"));
+    if !kitty_socket.is_empty()
+        && !kitty_socket.starts_with("fd:")
+        && is_kitten_cmd
+        && argv.get(1).map(String::as_str) == Some("@")
+        && !argv.iter().any(|a| a == "--to")
+    {
+        argv.splice(2..2, ["--to".to_string(), kitty_socket.to_string()]);
+    }
+}
+
 /// Get terminal presets for current platform with availability status.
 pub fn get_available_presets() -> Vec<(String, bool)> {
     let mut result = vec![("default".to_string(), true)];
@@ -2023,16 +2047,7 @@ pub fn launch_terminal(
             }
         }
         let mut argv = resolve_terminal_open_argv(&terminal_mode).unwrap_or_default();
-        // Inject `--to <socket>` (after the `@`) for kitten commands launched
-        // outside kitty. Splice as separate argv elements — no shell quoting.
-        if !kitty_socket.is_empty()
-            && !kitty_socket.starts_with("fd:")
-            && argv.first().map(String::as_str) == Some("kitten")
-            && argv.get(1).map(String::as_str) == Some("@")
-            && !argv.iter().any(|a| a == "--to")
-        {
-            argv.splice(2..2, ["--to".to_string(), kitty_socket.clone()]);
-        }
+        splice_kitten_to_socket(&mut argv, &kitty_socket);
         // Target launcher's tab for splits: insert `--match window_id:<wid>`
         // before the `--` separator.
         if (terminal_mode == "kitty-tab" || terminal_mode == "kitty-split")
@@ -3057,6 +3072,73 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert!(auto);
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_matches_absolute_app_bundle_path() {
+        // Regression: when `kitten` isn't on PATH, resolve_terminal_open_argv
+        // rewrites argv[0] to kitten's absolute macOS app-bundle path before
+        // this splice runs. A literal "kitten" string match would silently
+        // skip injecting --to, leaving the launched kitten with no socket
+        // and no KITTY_LISTEN_ON (stripped from the child env), causing it to
+        // fall back to controlling-tty discovery — which fails outright when
+        // the calling process (e.g. an AI tool's sandboxed shell) has none.
+        let mut argv = vec![
+            "/Applications/kitty.app/Contents/MacOS/kitten".to_string(),
+            "@".to_string(),
+            "launch".to_string(),
+            "--type=window".to_string(),
+        ];
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(
+            argv,
+            vec![
+                "/Applications/kitty.app/Contents/MacOS/kitten".to_string(),
+                "@".to_string(),
+                "--to".to_string(),
+                "unix:/tmp/kitty-test".to_string(),
+                "launch".to_string(),
+                "--type=window".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_bare_name() {
+        let mut argv = vec!["kitten".to_string(), "@".to_string(), "ls".to_string()];
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(
+            argv,
+            vec![
+                "kitten".to_string(),
+                "@".to_string(),
+                "--to".to_string(),
+                "unix:/tmp/kitty-test".to_string(),
+                "ls".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_noop_for_non_kitten() {
+        let mut argv = vec!["wezterm".to_string(), "cli".to_string()];
+        let before = argv.clone();
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(argv, before);
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_noop_when_already_present() {
+        let mut argv = vec![
+            "kitten".to_string(),
+            "@".to_string(),
+            "--to".to_string(),
+            "unix:/tmp/other".to_string(),
+            "ls".to_string(),
+        ];
+        let before = argv.clone();
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(argv, before);
     }
 
     #[test]
