@@ -812,6 +812,7 @@ fn create_runner_script_windows(
     instance_name: &str,
     env: &HashMap<String, String>,
     tool_args: &[String],
+    run_here: bool,
 ) -> Result<String> {
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
@@ -837,6 +838,11 @@ fn create_runner_script_windows(
 
     // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
     // that is dot-sourced then deleted, matching the bash runner.
+    let pane_identity_vars = if run_here {
+        std::collections::HashSet::new()
+    } else {
+        crate::config::pane_identity_env_vars()
+    };
     let ambient_env = sidecar_ambient_env(
         env,
         tool_marker_vars()
@@ -844,7 +850,8 @@ fn create_runner_script_windows(
             .chain(HCOM_IDENTITY_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-            .copied(),
+            .copied()
+            .chain(pane_identity_vars.iter().map(String::as_str)),
         true,
     );
     let sidecar_source = if ambient_env.is_empty() {
@@ -1020,7 +1027,7 @@ pub fn create_runner_script(
     run_here: bool,
 ) -> Result<String> {
     if cfg!(windows) {
-        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args);
+        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args, run_here);
     }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
@@ -1048,6 +1055,11 @@ pub fn create_runner_script(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let pane_identity_vars = if run_here {
+        std::collections::HashSet::new()
+    } else {
+        crate::config::pane_identity_env_vars()
+    };
     let ambient_env = sidecar_ambient_env(
         env,
         tool_marker_vars()
@@ -1055,7 +1067,8 @@ pub fn create_runner_script(
             .chain(HCOM_IDENTITY_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
-            .copied(),
+            .copied()
+            .chain(pane_identity_vars.iter().map(String::as_str)),
         false,
     );
     let env_block = terminal::build_env_string(&hcom_env, "bash_export");
@@ -3097,6 +3110,12 @@ mod tests {
             ("GEMINI_PTY_INFO".to_string(), "child_process".to_string()),
             ("GEMINI_API_KEY".to_string(), "gem-key".to_string()),
             ("GEMINI_CLI".to_string(), "1".to_string()),
+            ("HERDR_PANE_ID".to_string(), "w1:old".to_string()),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                "/tmp/herdr.sock".to_string(),
+            ),
+            ("KITTY_WINDOW_ID".to_string(), "17".to_string()),
             ("TERM".to_string(), "dumb".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
             ("NO_COLOR".to_string(), "1".to_string()),
@@ -3124,8 +3143,33 @@ mod tests {
         assert!(!sidecar.contains("COLORTERM="));
         assert!(!sidecar.contains("NO_COLOR="));
         assert!(!sidecar.contains("FORCE_COLOR="));
+        assert!(!sidecar.contains("HERDR_PANE_ID="));
+        assert!(!sidecar.contains("KITTY_WINDOW_ID="));
+        assert!(sidecar.contains("HERDR_SOCKET_PATH="));
         assert!(sidecar.contains("GEMINI_API_KEY"));
         assert!(sidecar.contains("RORI_MY_VAR"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_here_runner_preserves_current_pane_identity() {
+        let env = HashMap::from([
+            ("HERDR_PANE_ID".to_string(), "w1:current".to_string()),
+            ("RORI_MY_VAR".to_string(), "myval".to_string()),
+        ]);
+
+        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], true).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+        assert!(sidecar.contains("HERDR_PANE_ID="));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
@@ -3135,9 +3179,17 @@ mod tests {
     // site is, via a runtime cfg!(windows) check), so this runs on any host.
     #[test]
     fn test_runner_script_windows_has_bom_and_propagates_exit_code() {
-        let env = HashMap::from([("SOME_SECRET".to_string(), "sekrit".to_string())]);
+        let env = HashMap::from([
+            ("SOME_SECRET".to_string(), "sekrit".to_string()),
+            ("herdr_pane_id".to_string(), "w1:old".to_string()),
+            (
+                "HERDR_SOCKET_PATH".to_string(),
+                r"C:\tmp\herdr.sock".to_string(),
+            ),
+        ]);
 
-        let script = create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[]).unwrap();
+        let script =
+            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false).unwrap();
 
         let bytes = std::fs::read(&script).unwrap();
         assert_eq!(
@@ -3162,7 +3214,14 @@ mod tests {
             b"\xEF\xBB\xBF",
             "sidecar env file needs the same BOM as the runner script"
         );
-        assert!(String::from_utf8_lossy(&sidecar_bytes).contains("SOME_SECRET"));
+        let sidecar_content = String::from_utf8_lossy(&sidecar_bytes);
+        assert!(sidecar_content.contains("SOME_SECRET"));
+        assert!(
+            !sidecar_content
+                .to_ascii_lowercase()
+                .contains("herdr_pane_id")
+        );
+        assert!(sidecar_content.contains("HERDR_SOCKET_PATH"));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(sidecar).ok();
@@ -3183,7 +3242,7 @@ mod tests {
         ];
 
         let script =
-            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args).unwrap();
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
 
         let run_line = content
@@ -3214,7 +3273,8 @@ mod tests {
     fn test_runner_script_windows_no_args_skips_sidecar_file() {
         let env = HashMap::new();
         let script =
-            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[]).unwrap();
+            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false)
+                .unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let run_line = content
             .lines()
