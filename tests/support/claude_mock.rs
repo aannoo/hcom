@@ -18,11 +18,16 @@ use super::real_tool::{
     FORK_PROOF, INBOUND_PROOF, INITIAL_PROOF, RESUME_PROOF, ScenarioIds, ToolCase, ToolMeta,
 };
 
+// Pinned at >= 2.1.198 (not just >= 2.1.196 for `prompt_id`): 2.1.198 is also
+// where Agent/Task calls started backgrounding by default
+// (tool_response.status="async_launched"), which hcom's hook routing must
+// handle. Pinning below 2.1.198 would let real-tool CI pass without ever
+// exercising either behavior.
 const CLAUDE_META: ToolMeta = ToolMeta {
     tool: "claude",
     binary: "claude",
-    pinned_version: "2.1.185",
-    install_command: "npm install --global @anthropic-ai/claude-code@2.1.185",
+    pinned_version: "2.1.216",
+    install_command: "npm install --global @anthropic-ai/claude-code@2.1.216",
 };
 
 pub const MODEL: &str = "claude-sonnet-4-6";

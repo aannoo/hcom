@@ -55,6 +55,20 @@ impl HcomDb {
             .collect();
         Ok(rows)
     }
+
+    /// Delete all kv entries whose key starts with prefix. Returns count deleted.
+    pub fn kv_delete_prefix(&self, prefix: &str) -> Result<usize> {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{}%", escaped);
+        let n = self.conn.execute(
+            "DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'",
+            params![pattern],
+        )?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]

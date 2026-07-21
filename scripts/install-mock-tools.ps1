@@ -19,7 +19,7 @@ $cache = if ($env:HCOM_MOCK_TOOLS_NPM_CACHE) {
 if (-not $Packages -or $Packages.Count -eq 0) {
     $Packages = @(
         "@openai/codex@0.141.0",
-        "@anthropic-ai/claude-code@2.1.185"
+        "@anthropic-ai/claude-code@2.1.216"
     )
 }
 

@@ -81,13 +81,13 @@ jobs:
             test: real_tool_codex
           - os: ubuntu-latest
             tool: claude
-            package: "@anthropic-ai/claude-code@2.1.185"
-            cache: claude-2.1.185
+            package: "@anthropic-ai/claude-code@2.1.216"
+            cache: claude-2.1.216
             test: real_tool_claude
           - os: ubuntu-latest
             tool: relay
-            package: "@anthropic-ai/claude-code@2.1.185"
-            cache: relay-claude-2.1.185
+            package: "@anthropic-ai/claude-code@2.1.216"
+            cache: relay-claude-2.1.216
             test: test_relay_roundtrip
           - os: windows-latest
             tool: codex
@@ -96,13 +96,13 @@ jobs:
             test: real_tool_codex
           - os: windows-latest
             tool: claude
-            package: "@anthropic-ai/claude-code@2.1.185"
-            cache: claude-2.1.185
+            package: "@anthropic-ai/claude-code@2.1.216"
+            cache: claude-2.1.216
             test: real_tool_claude
           - os: windows-latest
             tool: relay
-            package: "@anthropic-ai/claude-code@2.1.185"
-            cache: relay-claude-2.1.185
+            package: "@anthropic-ai/claude-code@2.1.216"
+            cache: relay-claude-2.1.216
             test: test_relay_roundtrip
     steps:
       - uses: actions/checkout@v6
