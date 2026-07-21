@@ -315,6 +315,21 @@ pub fn build_launch_env(
     build_launch_env_with_resolver(hcom_config, regime, crate::shell_env::resolved_shell_env)
 }
 
+/// Apply the launcher's inherited `HCOM_NOTES` to a child instance env as a
+/// fallback only.
+///
+/// `instance_env` (via `base_env`) already carries any notes resolved from the
+/// explicit sources — config.toml, `~/.hcom/env`, and `LaunchParams.env` — and
+/// those must win. The inherited parent value only fills the gap for a nested
+/// launch where no explicit notes were configured, so it must not clobber a
+/// value already present (including an intentional empty string used to clear
+/// notes).
+fn apply_inherited_notes(instance_env: &mut HashMap<String, String>, inherited: Option<String>) {
+    if let Some(val) = inherited {
+        instance_env.entry("HCOM_NOTES".to_string()).or_insert(val);
+    }
+}
+
 fn build_codex_bootstrap(
     db: &HcomDb,
     hcom_dir: &Path,
@@ -1872,10 +1887,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         if let Ok(val) = std::env::var("HCOM_DEV_ROOT") {
             instance_env.insert("HCOM_DEV_ROOT".to_string(), val);
         }
-        // Propagate HCOM_NOTES
-        if let Ok(val) = std::env::var("HCOM_NOTES") {
-            instance_env.insert("HCOM_NOTES".to_string(), val);
-        }
+        // Propagate HCOM_NOTES from the launcher's own environment so a nested
+        // launch (an agent that inherited notes spawning a child) doesn't lose
+        // them — but only as a fallback (see `apply_inherited_notes`).
+        apply_inherited_notes(&mut instance_env, std::env::var("HCOM_NOTES").ok());
 
         let process_id = generate_process_id();
         instance_env.insert("HCOM_PROCESS_ID".to_string(), process_id.clone());
@@ -3163,6 +3178,43 @@ mod tests {
         );
 
         assert!(!bootstrap.contains("## NOTES"));
+    }
+
+    #[test]
+    fn test_inherited_notes_fill_gap_when_absent() {
+        // Nested launch with no explicit notes: the parent's inherited value
+        // propagates so the child doesn't lose it.
+        let mut env = HashMap::new();
+        apply_inherited_notes(&mut env, Some("from-parent".to_string()));
+        assert_eq!(
+            env.get("HCOM_NOTES").map(String::as_str),
+            Some("from-parent")
+        );
+    }
+
+    #[test]
+    fn test_inherited_notes_do_not_override_explicit_value() {
+        // Explicit notes (config.toml / ~/.hcom/env / LaunchParams.env, already
+        // in instance_env via base_env) must win over an inherited parent value.
+        let mut env = HashMap::from([("HCOM_NOTES".to_string(), "explicit".to_string())]);
+        apply_inherited_notes(&mut env, Some("from-parent".to_string()));
+        assert_eq!(env.get("HCOM_NOTES").map(String::as_str), Some("explicit"));
+    }
+
+    #[test]
+    fn test_inherited_notes_do_not_override_intentional_clear() {
+        // An intentional empty value (`HCOM_NOTES=""`) clears notes and must not
+        // be resurrected by an inherited parent value.
+        let mut env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
+        apply_inherited_notes(&mut env, Some("from-parent".to_string()));
+        assert_eq!(env.get("HCOM_NOTES").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_inherited_notes_noop_when_parent_unset() {
+        let mut env = HashMap::new();
+        apply_inherited_notes(&mut env, None);
+        assert!(!env.contains_key("HCOM_NOTES"));
     }
 
     #[test]
