@@ -59,7 +59,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             tool: codex
             package: "@openai/codex@0.141.0"
             cache: codex-0.141.0
@@ -99,6 +99,15 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      - name: Configure Codex Linux sandbox
+        if: runner.os == 'Linux' && matrix.tool == 'codex'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap apparmor-profiles apparmor-utils
+          sudo install -m 0644 \
+            /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
       - uses: Swatinem/rust-cache@v2.9.1
       - uses: actions/cache@v4
         with:
@@ -112,6 +121,9 @@ jobs:
       - name: Add pinned tool to PATH (Unix)
         if: runner.os != 'Windows'
         run: echo "$PWD/target/mock-tools/bin" >> "$GITHUB_PATH"
+      - name: Verify Codex Linux sandbox
+        if: runner.os == 'Linux' && matrix.tool == 'codex'
+        run: codex sandbox -- /bin/true
       - name: Install pinned tool (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
