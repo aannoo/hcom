@@ -678,15 +678,15 @@ pub fn notify_relay_daemon() -> bool {
         .unwrap_or(false)
 }
 
-/// Fire-and-forget `hcom relay push` in a detached subprocess so remote devices
-/// see local changes (session end, launch) without waiting for the worker's next
-/// periodic cycle. Best-effort: spawn failures are ignored.
+/// Fire-and-forget `hcom relay push` in a background child process so remote
+/// devices see local changes (session end, launch) without waiting for the
+/// worker's next periodic cycle. Best-effort: spawn failures are ignored.
 ///
 /// Unit tests must not spawn the real hcom binary: a child process can outlive
 /// the test's temporary environment and fall back to the developer's `~/.hcom`.
 pub fn spawn_background_push() {
-    let prefix = crate::runtime_env::get_hcom_prefix();
-    spawn_background_push_with(&prefix);
+    #[cfg(not(test))]
+    spawn_background_push_with(&crate::runtime_env::get_hcom_prefix());
 }
 
 fn spawn_background_push_with(prefix: &[String]) {

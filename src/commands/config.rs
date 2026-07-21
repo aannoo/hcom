@@ -734,7 +734,7 @@ fn config_instance(
     }
 
     // C4 fix: push config changes to relay
-    trigger_relay_push();
+    crate::relay::spawn_background_push();
 
     0
 }
@@ -2198,20 +2198,6 @@ fn update_auto_approve_permissions(value: &str) -> bool {
         eprintln!("Failed to update {tool} auto-approve permissions: {error}");
     }
     failures.is_empty()
-}
-
-/// Trigger relay push (best-effort, silent failure). C4 fix.
-fn trigger_relay_push() {
-    // Trigger relay push (best-effort)
-    let prefix = crate::runtime_env::get_hcom_prefix();
-    if let Some((cmd, prefix_args)) = prefix.split_first() {
-        let _ = std::process::Command::new(cmd)
-            .args(prefix_args)
-            .args(["relay", "push"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

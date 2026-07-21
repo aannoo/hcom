@@ -1196,15 +1196,7 @@ fn create_and_log_bundle(
     match bundles::create_bundle_event(bundle, &instance, created_by, db) {
         Ok(bundle_id) => {
             // Trigger relay push (best-effort)
-            let prefix = crate::runtime_env::get_hcom_prefix();
-            if let Some((cmd, prefix_args)) = prefix.split_first() {
-                let _ = std::process::Command::new(cmd)
-                    .args(prefix_args)
-                    .args(["relay", "push"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
+            crate::relay::spawn_background_push();
 
             if json_mode {
                 println!("{}", json!({"bundle_id": bundle_id}));
