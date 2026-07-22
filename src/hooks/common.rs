@@ -1113,6 +1113,25 @@ fn stop_instance_inner(
         }
     }
 
+    // Recursively stop native subagents whose immediate parent is this
+    // instance. Native subagent rows carry session_id=NULL and inherit the
+    // *root* session as their parent_session_id, so the session-keyed cascade
+    // above never links a nested parent to its own children — only parent_name
+    // does. Without this, stopping a nested parent leaves its children alive and
+    // reparented to a name that can later be reused. MAX_STOP_DEPTH guards
+    // against a parent_name cycle; a row already stopped above is a no-op here.
+    let native_children: Vec<String> = db
+        .conn()
+        .prepare("SELECT name FROM instances WHERE parent_name = ?")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![instance_name], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    for child in native_children {
+        stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1);
+    }
+
     // Clean notify endpoints and process bindings for this instance
     let _ = db.delete_notify_endpoints(instance_name);
     let _ = db.conn().execute(

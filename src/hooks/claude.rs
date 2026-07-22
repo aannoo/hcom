@@ -4159,6 +4159,47 @@ mod tests {
         assert!(ack.is_none());
     }
 
+    /// Property: stopping a nested native parent must recursively tear down its
+    /// own children. Native subagent rows carry session_id=NULL and inherit the
+    /// root session as parent_session_id, so the session-keyed teardown cascade
+    /// never links a nested parent to its children — only parent_name does.
+    /// Without the parent_name cascade, stopping parent A would delete A while
+    /// its child B stayed alive, reparented to a reusable name.
+    #[test]
+    #[serial]
+    fn test_stop_nested_parent_cascades_to_children() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        // A is a native subagent of root nova; B is a native subagent of A.
+        // Both share the root session as parent_session_id and have no session
+        // of their own (session_id=NULL, as insert_subagent_row leaves it).
+        insert_subagent_row(&db, "nova_a_1", "agent-a", "nova", "sess-1");
+        insert_subagent_row(&db, "nova_a_1_b_1", "agent-b", "nova_a_1", "sess-1");
+
+        crate::hooks::stop_instance(&db, "nova_a_1", "test", "task_completed");
+
+        assert!(
+            db.get_instance_by_agent_id("agent-a").unwrap().is_none(),
+            "nested parent A must be torn down"
+        );
+        assert!(
+            db.get_instance_by_agent_id("agent-b").unwrap().is_none(),
+            "child B must be cascaded, not orphaned with parent_name=A"
+        );
+        assert!(
+            db.get_instance_full("nova").unwrap().is_some(),
+            "the still-live root must not be touched"
+        );
+    }
+
     /// Property: the root's own PostToolUse must deliver even while a
     /// genuinely live background subagent is tracked active. Since Claude
     /// Code 2.1.198, Agent calls background by default, so the root can have
