@@ -166,6 +166,24 @@ pub fn derive_codex_transcript_path(session_id: &str) -> Option<String> {
     }
 }
 
+/// Normalize Windows verbatim paths before storing them in the instance row.
+///
+/// Codex can report the same transcript as `C:\...` on the initial hook and
+/// `\\?\C:\...` after a resume. Keep the database representation stable so
+/// resume and transcript lookup continue to refer to the same file.
+fn normalize_codex_transcript_path(path: &str) -> String {
+    const VERBATIM_PREFIX: &str = "\\\\?\\";
+    const VERBATIM_UNC_PREFIX: &str = "\\\\?\\UNC\\";
+
+    if let Some(unc_path) = path.strip_prefix(VERBATIM_UNC_PREFIX) {
+        format!("\\\\{unc_path}")
+    } else {
+        path.strip_prefix(VERBATIM_PREFIX)
+            .unwrap_or(path)
+            .to_string()
+    }
+}
+
 fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> Option<InstanceRow> {
     instance_binding::resolve_instance_from_binding(
         db,
@@ -192,14 +210,15 @@ fn bind_vanilla_instance_codex(
     let effective_path = transcript_path
         .filter(|s| !s.is_empty())
         .or(derived_path.as_deref())?;
+    let effective_path = normalize_codex_transcript_path(effective_path);
 
-    let instance_name = common::find_last_bind_marker(effective_path)?;
+    let instance_name = common::find_last_bind_marker(&effective_path)?;
 
     family::bind_vanilla_instance(
         db,
         &instance_name,
         Some(session_id).filter(|s| !s.is_empty()),
-        Some(effective_path),
+        Some(&effective_path),
         "codex",
         "codex-sessionstart",
     )
@@ -246,7 +265,10 @@ fn update_codex_position(
             .and_then(derive_codex_transcript_path)
     });
     if let Some(tp) = transcript_path {
-        updates.insert("transcript_path".into(), Value::String(tp));
+        updates.insert(
+            "transcript_path".into(),
+            Value::String(normalize_codex_transcript_path(&tp)),
+        );
     }
     if !updates.is_empty() {
         instances::update_instance_position(db, instance_name, &updates);
@@ -2051,6 +2073,22 @@ mod tests {
     #[test]
     fn test_derive_transcript_no_match() {
         assert!(derive_codex_transcript_path("nonexistent-thread-12345").is_none());
+    }
+
+    #[test]
+    fn test_normalize_transcript_path() {
+        assert_eq!(
+            normalize_codex_transcript_path("C:\\Users\\runner\\session.jsonl"),
+            "C:\\Users\\runner\\session.jsonl"
+        );
+        assert_eq!(
+            normalize_codex_transcript_path("\\\\?\\C:\\Users\\runner\\session.jsonl"),
+            "C:\\Users\\runner\\session.jsonl"
+        );
+        assert_eq!(
+            normalize_codex_transcript_path("\\\\?\\UNC\\server\\share\\session.jsonl"),
+            "\\\\server\\share\\session.jsonl"
+        );
     }
 
     #[test]
