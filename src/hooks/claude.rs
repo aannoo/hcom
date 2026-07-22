@@ -1991,6 +1991,13 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
         _ => return (0, String::new()),
     };
 
+    // Claim before reading the row. Otherwise duplicate hook processes can all
+    // observe the row, wait for the first claim to be released, and then each
+    // perform a second teardown against their stale copy of that row.
+    let Some(_stop_claim) = SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) else {
+        return (0, String::new());
+    };
+
     // Query subagent instance by agent_id
     let row: Option<(String, String, Option<String>, i64)> = db
         .conn()
@@ -2017,11 +2024,6 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
         // whichever instance actually tracks `agent_id` rather than assuming
         // root, or the true owner is left wedged active forever.
         instances::remove_tracked_subagent_by_agent_id(db, agent_id);
-        return (0, String::new());
-    };
-
-    // A duplicate delivery must not enter polling or teardown.
-    let Some(_stop_claim) = SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) else {
         return (0, String::new());
     };
 
