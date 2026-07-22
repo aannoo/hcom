@@ -155,6 +155,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_TITLE_MODE",
+        "Terminal title mode (combined | label | off)",
+        "string",
+    ),
+    (
         "HCOM_RELAY",
         "Relay MQTT broker URL (config file only)",
         "string",
@@ -195,6 +200,7 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
 fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
     match field_name {
         "terminal" => Some("terminal.active"),
+        "title_mode" => Some("terminal.title_mode"),
         "tag" => Some("launch.tag"),
         "hints" => Some("launch.hints"),
         "notes" => Some("launch.notes"),
@@ -366,6 +372,16 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
         }
     }
 
+    if field_name == "title_mode"
+        && !value.is_empty()
+        && !crate::shared::VALID_TITLE_MODES.contains(&value)
+    {
+        return Err(format!(
+            "title_mode must be one of: {}. Got '{value}'",
+            crate::shared::VALID_TITLE_MODES.join(", ")
+        ));
+    }
+
     if let Some(dotted_path) = toml_path_for_key(&field_name) {
         set_nested_toml(&mut doc, dotted_path, value);
     } else {
@@ -433,6 +449,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_SUBAGENT_TIMEOUT" => "30",
         "HCOM_AUTO_APPROVE" => "true",
         "HCOM_AUTO_TRUST_WORKSPACE" => "true",
+        "HCOM_TITLE_MODE" => "combined",
         _ => "",
     };
     (default.to_string(), "default")
@@ -1524,6 +1541,34 @@ Available presets:
 Notes:
   - Instances can add/remove subscriptions at runtime
   - See 'hcom events --help' for subscription management",
+        ),
+
+        "HCOM_TITLE_MODE" => Some(
+            "\
+HCOM_TITLE_MODE - What appears in the terminal/tab title for hcom-launched agents
+
+Default: combined
+
+Purpose:
+  Controls whether hcom replaces, combines, or leaves alone the wrapped tool's
+  terminal title. In combined mode, hcom keeps its live status and appends the
+  tool's own live title (for example, a Codex spinner).
+
+Values:
+  combined - Show '{icon} name - {tool title}' and update it live.
+  label    - Show hcom's status label only: '{icon} name [tool]'.
+  off      - Pass the tool's own terminal title through unchanged; hcom writes none.
+
+Usage:
+  hcom config title_mode combined   # hcom status + live tool title (default)
+  hcom config title_mode label      # hcom status label only
+  hcom config title_mode off        # use the tool's title
+  hcom config title_mode <empty>     # reset to the default
+
+Notes:
+  - This affects terminal/tab titles, not the visible PTY output.
+  - Tools that do not emit terminal titles have no live child title to append.
+  - The same setting can be provided with HCOM_TITLE_MODE in the environment.",
         ),
 
         "HCOM_NAME_EXPORT" => Some(

@@ -95,6 +95,32 @@ pub fn status_icon(status: &str) -> &'static str {
 
 // Adhoc instance icon lives on `IntegrationSpec.adhoc_icon` for Tool::Adhoc.
 
+/// Terminal-title behavior, from config `terminal.title_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleMode {
+    /// hcom leaves the title alone: the wrapped tool's own title passes through
+    /// untouched and hcom writes nothing.
+    Off,
+    /// hcom's status label only: `{icon} name [tool]` (the original behavior).
+    Label,
+    /// hcom status + the tool's live title: `{icon} name - {tool title}`.
+    Combined,
+}
+
+/// Valid `terminal.title_mode` config values (for validation + help).
+pub const VALID_TITLE_MODES: &[&str] = &["combined", "label", "off"];
+
+impl TitleMode {
+    /// Parse a config value; unknown/empty falls back to the default (`Combined`).
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "label" => Self::Label,
+            _ => Self::Combined,
+        }
+    }
+}
+
 /// Build the canonical pane-title label hcom writes into OSC 1/2 and pushes
 /// to host terminal label APIs (e.g. herdr's `pane.rename`).
 ///
@@ -106,6 +132,21 @@ pub fn format_pane_title(status: &str, display: &str, tool: &str) -> String {
         return String::new();
     }
     format!("{} {} [{}]", status_icon(status), display, tool)
+}
+
+/// Build the `TitleMode::Combined` label: `"{icon} {display}"`, with the wrapped
+/// tool's live title appended after ` - ` when present. Drops the `[tool]` tag
+/// (the passthrough title already identifies the tool's activity). Returns an
+/// empty string when `display` is empty so callers can short-circuit.
+pub fn format_pane_title_combined(status: &str, display: &str, child: Option<&str>) -> String {
+    if display.is_empty() {
+        return String::new();
+    }
+    let base = format!("{} {}", status_icon(status), display);
+    match child {
+        Some(c) if !c.is_empty() => format!("{base} - {c}"),
+        _ => base,
+    }
 }
 
 /// Status foreground ANSI color.

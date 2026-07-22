@@ -570,8 +570,29 @@ pub(super) fn finalize_launch_failure_after_exit(
 }
 
 /// Build the OSC 1/2 title-set escape for `name`/`status` under `tool_name`.
-pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> String {
-    let title = crate::shared::format_pane_title(status, name, tool_name);
+///
+/// - [`TitleMode::Label`] → `◉ luna [claude]` (hcom's status label only).
+/// - [`TitleMode::Combined`] → `◉ luna - ⠋ Working` — hcom's `{icon} name` plus
+///   the wrapped tool's live title after ` - ` (dropping the `[tool]` tag). The
+///   child text is already sanitized upstream by `ScreenTracker` (control/escape
+///   bytes stripped, whitespace collapsed, length bounded) so it cannot break
+///   out of the OSC we wrap it in.
+///
+/// [`TitleMode::Off`] never reaches here — the caller skips writing entirely and
+/// lets the tool's own title pass through — so it falls back to the label.
+pub(super) fn build_title_escape(
+    name: &str,
+    status: &str,
+    tool_name: &str,
+    mode: crate::shared::TitleMode,
+    child_title: Option<&str>,
+) -> String {
+    let title = match mode {
+        crate::shared::TitleMode::Combined => {
+            crate::shared::format_pane_title_combined(status, name, child_title)
+        }
+        _ => crate::shared::format_pane_title(status, name, tool_name),
+    };
     format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
 }
 
@@ -749,6 +770,10 @@ pub(super) struct OutputModeFilter {
     buf: Vec<u8>,
     dsr_seen: bool,
     pending_utf8: u8,
+    /// When true (title_mode `off`), the tool's own OSC 0/1/2 titles are passed
+    /// through to the terminal instead of stripped. DSR/ground-state tracking is
+    /// unaffected. Default false preserves the strip-and-override behavior.
+    passthrough_titles: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -770,6 +795,12 @@ enum FilterState {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 impl OutputModeFilter {
+    /// Pass the tool's own OSC 0/1/2 titles through instead of stripping them
+    /// (title_mode `off`). DSR/ground-state tracking is unaffected.
+    pub(super) fn set_passthrough_titles(&mut self, passthrough: bool) {
+        self.passthrough_titles = passthrough;
+    }
+
     pub(super) fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
         let output_start = out.len();
         for &b in input {
@@ -863,11 +894,16 @@ impl OutputModeFilter {
                 FilterState::OscDigit(_digit) => {
                     self.buf.push(b);
                     if b == b';' {
-                        // Confirmed OSC 0/1/2: discard the complete title,
-                        // including a terminator that may arrive in a later read.
+                        // Confirmed OSC 0/1/2: discard the complete title
+                        // (including a terminator that may arrive in a later
+                        // read) — unless title_mode `off`, where we pass the
+                        // tool's own title through untouched.
+                        if self.passthrough_titles {
+                            out.extend_from_slice(&self.buf);
+                        }
                         self.buf.clear();
                         self.state = FilterState::StringSeq {
-                            strip: true,
+                            strip: !self.passthrough_titles,
                             saw_esc: false,
                             discarded: 0,
                         };
@@ -1130,6 +1166,18 @@ mod tests {
     }
 
     #[test]
+    fn output_mode_filter_passthrough_keeps_tool_title() {
+        // title_mode `off`: the tool's own OSC 0/2 title must reach the terminal
+        // intact, including across a read split, while DSR tracking still works.
+        let mut f = OutputModeFilter::default();
+        f.set_passthrough_titles(true);
+        let mut out = Vec::new();
+        f.filter(b"before\x1b]2;Clau", &mut out);
+        f.filter(b"de Code\x07after", &mut out);
+        assert_eq!(out, b"before\x1b]2;Claude Code\x07after".to_vec());
+    }
+
+    #[test]
     fn output_mode_filter_preserves_non_title_osc_and_tracks_its_boundary() {
         let chunks: &[&[u8]] = &[b"\x1b]8;;https://exam", b"ple.test\x1b\\link"];
         assert_eq!(filter_modes(chunks), chunks.concat());
@@ -1191,9 +1239,10 @@ mod tests {
     }
 
     #[test]
-    fn build_title_escape_formats_osc_1_and_2() {
-        // listening icon is the green dot; assert exact OSC framing.
-        let esc = build_title_escape("alpha", "listening", "claude");
+    fn build_title_escape_label_mode_formats_osc_1_and_2() {
+        use crate::shared::TitleMode;
+        // Label mode keeps the [tool] tag; assert exact OSC framing.
+        let esc = build_title_escape("alpha", "listening", "claude", TitleMode::Label, None);
         let icon = status_icon("listening");
         let title = format!("{} alpha [claude]", icon);
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
@@ -1204,10 +1253,38 @@ mod tests {
 
     #[test]
     fn build_title_escape_uses_status_icon() {
+        use crate::shared::TitleMode;
         // Different statuses must change the embedded icon.
-        let listening = build_title_escape("a", "listening", "claude");
-        let blocked = build_title_escape("a", "blocked", "claude");
+        let listening = build_title_escape("a", "listening", "claude", TitleMode::Label, None);
+        let blocked = build_title_escape("a", "blocked", "claude", TitleMode::Label, None);
         assert_ne!(listening, blocked);
+    }
+
+    #[test]
+    fn build_title_escape_combined_appends_child_and_drops_tool() {
+        use crate::shared::TitleMode;
+        // Combined mode: `{icon} name - {child}`, no `[tool]` tag.
+        let icon = status_icon("active");
+        let esc = build_title_escape(
+            "luna",
+            "active",
+            "codex",
+            TitleMode::Combined,
+            Some("⠋ Working"),
+        );
+        let title = format!("{} luna - ⠋ Working", icon);
+        assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
+        assert!(!esc.contains("[codex]"), "combined mode drops the tool tag");
+    }
+
+    #[test]
+    fn build_title_escape_combined_without_child_is_icon_name() {
+        use crate::shared::TitleMode;
+        // No child title → just `{icon} name`, no dangling separator, no tag.
+        let icon = status_icon("active");
+        let esc = build_title_escape("luna", "active", "codex", TitleMode::Combined, None);
+        let title = format!("{} luna", icon);
+        assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
     }
 
     #[test]

@@ -326,6 +326,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `auto_approve` | Auto-approve safe hcom commands (send/list/events/…) |
 | `auto_subscribe` | Event subscription presets: `collision`, `created`, `stopped`, `blocked` |
 | `name_export` | Export instance name to a custom env var |
+| `title_mode` | Terminal/tab title behavior: `combined` (default), `label`, or `off` |
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
