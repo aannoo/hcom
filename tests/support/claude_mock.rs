@@ -21,8 +21,8 @@ use super::real_tool::{
 const CLAUDE_META: ToolMeta = ToolMeta {
     tool: "claude",
     binary: "claude",
-    pinned_version: "2.1.185",
-    install_command: "npm install --global @anthropic-ai/claude-code@2.1.185",
+    pinned_version: "2.1.216",
+    install_command: "npm install --global @anthropic-ai/claude-code@2.1.216",
 };
 
 pub const MODEL: &str = "claude-sonnet-4-6";

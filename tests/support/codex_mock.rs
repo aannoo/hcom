@@ -23,8 +23,8 @@ use super::real_tool::{
 const CODEX_META: ToolMeta = ToolMeta {
     tool: "codex",
     binary: "codex",
-    pinned_version: "0.141.0",
-    install_command: "npm install --global @openai/codex@0.141.0",
+    pinned_version: "0.145.0",
+    install_command: "npm install --global @openai/codex@0.145.0",
 };
 
 /// Codex adapter for the shared real-tool lifecycle. Codex has no fake-response

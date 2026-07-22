@@ -11,8 +11,8 @@ if [[ "$#" -gt 0 ]]; then
   packages=("$@")
 else
   packages=(
-    "@openai/codex@0.141.0"
-    "@anthropic-ai/claude-code@2.1.185"
+    "@openai/codex@0.145.0"
+    "@anthropic-ai/claude-code@2.1.216"
   )
 fi
 
@@ -32,7 +32,7 @@ for package in "${packages[@]}"; do
       claude_version="${package##*@}"
       ;;
     @anthropic-ai/claude-code)
-      claude_version="2.1.185"
+      claude_version="2.1.216"
       ;;
     @anthropic-ai/claude-code-*)
       has_claude_native=1

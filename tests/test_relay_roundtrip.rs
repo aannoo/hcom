@@ -1260,7 +1260,7 @@ fn test_relay_roundtrip() {
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
     let claude_version =
-        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.185".to_string());
+        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.216".to_string());
     assert_tool_pinned(
         "claude",
         &claude_version,
