@@ -64,7 +64,6 @@ fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
 fn instance_name_from_env(ctx: &HcomContext) -> Option<String> {
     ctx.raw_env
         .get("HCOM_INSTANCE_NAME")
-        .or_else(|| ctx.raw_env.get("HCOM_NAME"))
         .filter(|s| !s.is_empty())
         .cloned()
 }
@@ -294,7 +293,7 @@ pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
     };
     let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
     if has_flag(argv, "--soft") {
-        common::soft_finalize_session(db, &name, &reason, None);
+        common::soft_finalize_session(db, &name, &reason, None, true);
         (0, r#"{"ok":true,"soft":true}"#.to_string())
     } else {
         finalize_session(db, &name, &reason, None);

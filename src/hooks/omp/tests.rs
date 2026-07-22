@@ -408,7 +408,7 @@ fn start_handler_uses_central_binding_for_existing_session() {
 }
 
 #[test]
-fn soft_stop_keeps_instance_row_clears_process_binding() {
+fn soft_stop_keeps_instance_row_and_process_binding() {
     let (db, path) = setup_test_db();
     let now = chrono::Utc::now().timestamp() as f64;
     db.conn()
@@ -442,14 +442,17 @@ fn soft_stop_keeps_instance_row_clears_process_binding() {
         db.get_status("luna").unwrap().map(|(s, _)| s),
         Some(crate::shared::ST_INACTIVE.to_string())
     );
-    assert_eq!(db.get_process_binding("pid-soft").unwrap(), None);
+    assert_eq!(
+        db.get_process_binding("pid-soft").unwrap(),
+        Some("luna".to_string())
+    );
     assert_eq!(db.get_session_binding("sid-soft").unwrap(), None);
 
     cleanup(path);
 }
 
 #[test]
-fn start_recovers_binding_after_soft_stop_via_instance_name_env() {
+fn start_rebinds_via_process_binding_after_soft_stop() {
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "miso", ST_LISTENING);
@@ -472,11 +475,13 @@ fn start_recovers_binding_after_soft_stop_via_instance_name_env() {
         ],
     );
     assert_eq!(stop_code, 0);
-    assert_eq!(db.get_process_binding("pid-recover").unwrap(), None);
+    assert_eq!(
+        db.get_process_binding("pid-recover").unwrap(),
+        Some("miso".to_string())
+    );
 
     let env = std::collections::HashMap::from([
         ("HCOM_PROCESS_ID".to_string(), "pid-recover".to_string()),
-        ("HCOM_INSTANCE_NAME".to_string(), "miso".to_string()),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
@@ -509,6 +514,124 @@ fn start_recovers_binding_after_soft_stop_via_instance_name_env() {
     assert_eq!(rebound.status, ST_LISTENING);
 
     cleanup(path);
+}
+
+#[test]
+fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
+    let (db, path) = setup_test_db();
+    let temp = tempfile::TempDir::new().unwrap();
+    save_test_instance(&db, "miso", ST_LISTENING);
+    db.conn()
+        .execute(
+            "UPDATE instances SET session_id = 'sid-old', status = 'inactive' WHERE name = 'miso'",
+            [],
+        )
+        .unwrap();
+    db.rebind_session("sid-old", "miso").unwrap();
+
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "pid-recover".to_string()),
+        ("HCOM_INSTANCE_NAME".to_string(), "miso".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+
+    let (code, output) = handle_start(
+        &ctx,
+        &db,
+        &[
+            "--session-id".to_string(),
+            "sid-new".to_string(),
+            "--cwd".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ],
+    );
+
+    assert_eq!(code, 0);
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(response.get("name").and_then(|v| v.as_str()), Some("miso"));
+    assert_eq!(
+        db.get_process_binding("pid-recover").unwrap(),
+        Some("miso".to_string())
+    );
+    assert_eq!(
+        db.get_session_binding("sid-new").unwrap(),
+        Some("miso".to_string())
+    );
+
+    cleanup(path);
+}
+
+#[test]
+fn recover_rejects_non_omp_tool() {
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", crate::shared::ST_INACTIVE);
+    db.conn()
+        .execute(
+            "UPDATE instances SET tool = 'claude' WHERE name = 'luna'",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        crate::instance_binding::recover_process_binding_for_instance(
+            &db, "luna", "sid-new", "pid-1"
+        ),
+        None
+    );
+
+    cleanup(path);
+}
+
+#[test]
+fn recover_rejects_active_instance() {
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_LISTENING);
+
+    assert_eq!(
+        crate::instance_binding::recover_process_binding_for_instance(
+            &db, "luna", "sid-new", "pid-1"
+        ),
+        None
+    );
+
+    cleanup(path);
+}
+
+#[test]
+fn plugin_source_pins_soft_stop_polish_markers() {
+    assert!(PLUGIN_SOURCE.contains("Symbol.for(\"hcom.omp.identity\")"));
+    assert!(PLUGIN_SOURCE.contains("stopReconcileTimer"));
+    assert!(PLUGIN_SOURCE.contains("tearingDown"));
+    assert!(PLUGIN_SOURCE.contains("HCOM_TIMEOUT_MS"));
+    assert!(PLUGIN_SOURCE.contains("1800"));
+    let shutdown_idx = PLUGIN_SOURCE
+        .find("pi.on(\"session_shutdown\"")
+        .expect("session_shutdown handler present");
+    let handler = &PLUGIN_SOURCE[shutdown_idx..];
+    assert!(
+        handler.contains("keepOwner = !softStopOk"),
+        "failed soft-stop path must keepOwner"
+    );
+    assert!(
+        handler.contains("reg.tearingDown = false"),
+        "failed soft-stop keepOwner must clear tearingDown so owner can rebind"
+    );
+    assert!(
+        PLUGIN_SOURCE.contains("reg.tearingDown && !ownsIdentity"),
+        "tearingDown must not block the owning extension from rebinding"
+    );
+}
+
+/// Manual/CI scenario: nested OMP task extension must not steal parent identity
+/// after soft-stop + session_branch rebind. Run with:
+/// `cargo test omp_nested_task_identity_survives_soft_stop -- --ignored`
+#[test]
+#[ignore = "requires live OMP nested task; run manually"]
+fn omp_nested_task_identity_survives_soft_stop() {
+    // Launch OMP via hcom, soft-stop parent turn, spawn nested task extension,
+    // verify child does not bind and parent recovers on next turn.
 }
 
 // ── Plugin install/remove safety ──────────────────────────────────

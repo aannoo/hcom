@@ -1199,13 +1199,17 @@ fn stop_instance_inner(
 /// agy's real teardown is the PTY exit (`cleanup_antigravity_pty_exit`), which sees
 /// the inactive status and preserves the row for `hcom r`.
 ///
-/// Clears session/process bindings and logs a stopped life event with snapshot, but
-/// does not delete the instance row.
+/// Clears session bindings (and process bindings unless `keep_process_binding`),
+/// and logs a stopped life event with snapshot, but does not delete the instance row.
+///
+/// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
+/// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
+    keep_process_binding: bool,
 ) {
     log::log_info(
         "hooks",
@@ -1256,17 +1260,21 @@ pub fn soft_finalize_session(
             "DELETE FROM session_bindings WHERE session_id = ?",
             params![session_id],
         );
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE session_id = ?",
-            params![session_id],
-        );
+        if !keep_process_binding {
+            let _ = db.conn().execute(
+                "DELETE FROM process_bindings WHERE session_id = ?",
+                params![session_id],
+            );
+        }
     }
 
     let _ = db.delete_notify_endpoints(instance_name);
-    let _ = db.conn().execute(
-        "DELETE FROM process_bindings WHERE instance_name = ?",
-        params![instance_name],
-    );
+    if !keep_process_binding {
+        let _ = db.conn().execute(
+            "DELETE FROM process_bindings WHERE instance_name = ?",
+            params![instance_name],
+        );
+    }
     let _ = db.cleanup_subscriptions(instance_name);
 
     if let Err(e) = db.log_life_event(
@@ -1945,7 +1953,15 @@ mod tests {
             )
             .unwrap();
 
-        soft_finalize_session(&db, "vine", "unknown", None);
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-soft', 'sess-soft-1', 'vine', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        soft_finalize_session(&db, "vine", "unknown", None, false);
 
         assert!(db.get_instance_full("vine").unwrap().is_some());
         let status = db.get_status("vine").unwrap().map(|(s, _)| s);
@@ -1956,6 +1972,49 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("vine")
+        );
+        assert_eq!(db.get_process_binding("pid-soft").unwrap(), None);
+    }
+
+    #[test]
+    fn soft_finalize_session_can_keep_process_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id)
+                 VALUES ('luna', 'listening', ?1, 'omp', 'sess-keep')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-keep', 'luna', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-keep', 'sess-keep', 'luna', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        soft_finalize_session(&db, "luna", "turn_end", None, true);
+
+        assert_eq!(
+            db.get_process_binding("pid-keep").unwrap(),
+            Some("luna".to_string())
+        );
+        assert_eq!(db.get_session_binding("sess-keep").unwrap(), None);
+        assert_eq!(
+            db.get_status("luna").unwrap().map(|(s, _)| s),
+            Some(ST_INACTIVE.to_string())
         );
     }
 }

@@ -18,14 +18,7 @@ pub(crate) fn cleanup_antigravity_pty_exit(
     owns_instance: bool,
 ) {
     if !owns_instance {
-        log_info(
-            "native",
-            "delivery.cleanup_skipped",
-            &format!(
-                "Skipping instance cleanup for {} — name reassigned to new process",
-                current_name
-            ),
-        );
+        super::log_pty_cleanup_skipped(db, current_name);
     } else {
         let already_inactive = db
             .get_status(current_name)

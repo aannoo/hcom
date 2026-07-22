@@ -2005,7 +2005,10 @@ pub fn run_delivery_loop(
 
     let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
 
-    if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
+    if matches!(
+        Tool::from_str(&config.tool),
+        Ok(Tool::Antigravity | Tool::Omp)
+    ) {
         antigravity::cleanup_antigravity_pty_exit(db, &current_name, &process_id, owns_instance);
     } else {
         cleanup_pty_exit_default(db, &current_name, &process_id, owns_instance);
@@ -2085,6 +2088,25 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
     }
 }
 
+/// Log why PTY exit cleanup was skipped when this thread no longer owns the instance.
+pub(crate) fn log_pty_cleanup_skipped(db: &HcomDb, current_name: &str) {
+    let reason = if db
+        .get_status(current_name)
+        .ok()
+        .flatten()
+        .is_some_and(|(status, _)| status == ST_INACTIVE)
+    {
+        "instance inactive (soft-finalize); process binding cleared or reassigned"
+    } else {
+        "name reassigned to new process"
+    };
+    log_info(
+        "native",
+        "delivery.cleanup_skipped",
+        &format!("Skipping instance cleanup for {current_name} — {reason}"),
+    );
+}
+
 fn cleanup_pty_exit_default(
     db: &mut HcomDb,
     current_name: &str,
@@ -2094,14 +2116,7 @@ fn cleanup_pty_exit_default(
     if owns_instance {
         cleanup_deleted_instance(db, current_name);
     } else {
-        log_info(
-            "native",
-            "delivery.cleanup_skipped",
-            &format!(
-                "Skipping instance cleanup for {} — name reassigned to new process",
-                current_name
-            ),
-        );
+        log_pty_cleanup_skipped(db, current_name);
     }
 
     if !process_id.is_empty()
@@ -2229,6 +2244,31 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn soft_stopped_instance_survives_pty_exit_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id)
+                 VALUES ('luna', 'omp', 'inactive', 'exit:turn_end', 0, 0, 'sid-soft')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("pid-soft", "sid-soft", "luna")
+            .unwrap();
+
+        antigravity::cleanup_antigravity_pty_exit(&mut db, "luna", "pid-soft", true);
+
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+        assert_eq!(
+            db.get_status("luna").unwrap().map(|(s, _)| s),
+            Some(ST_INACTIVE.to_string())
+        );
     }
 
     // ---- phase-1 ownership tests ----
