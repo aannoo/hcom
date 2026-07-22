@@ -11,7 +11,7 @@ if [[ "$#" -gt 0 ]]; then
   packages=("$@")
 else
   packages=(
-    "@openai/codex@0.141.0"
+    "@openai/codex@0.145.0"
     "@anthropic-ai/claude-code@2.1.216"
   )
 fi

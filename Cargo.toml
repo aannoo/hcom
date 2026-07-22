@@ -41,12 +41,12 @@ uuid = { version = "1.23.0", features = ["v4"] }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 base64 = "0.22"
 sha2 = "0.11.0"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11.0"
 bytes = "1"
 rustls = "0.23.37"
 webpki-roots = "1.0.6"
 rustls-native-certs = "0.8.3"
-lru = "0.16"
+lru = "0.18.1"
 
 # Unix-only: PTY, signals, fd polling, file locks, process groups.
 [target.'cfg(unix)'.dependencies]
@@ -56,7 +56,7 @@ signal-hook = "0.4.4"
 
 # Windows-only: process/job-object control, winsock select, file locking.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",

@@ -28,9 +28,12 @@ pub use constants::{
     ST_LAUNCHING,
     ST_LISTENING,
     SYSTEM_SENDER,
+    TitleMode,
+    VALID_TITLE_MODES,
     // Functions
     extract_mentions,
     format_pane_title,
+    format_pane_title_combined,
     status_bg,
     status_fg,
     status_icon,

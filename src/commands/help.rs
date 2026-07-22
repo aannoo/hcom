@@ -487,6 +487,10 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Auto-trust launch dir (skip folder-trust prompt)",
     ),
     ("  name_export", "Export agent name to custom env var"),
+    (
+        "  title_mode",
+        "Terminal/tab title: combined, label, or off",
+    ),
     ("", "hcom config <key> --info for details"),
     ("", ""),
     ("", "Precedence: defaults < config.toml < env vars"),

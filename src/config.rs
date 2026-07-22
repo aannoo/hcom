@@ -149,6 +149,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
     ("auto_trust_workspace", "launch.auto_trust_workspace"),
+    ("title_mode", "terminal.title_mode"),
 ];
 
 /// Mapping: HcomConfig field name -> HCOM_* env var key.
@@ -186,6 +187,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
     ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
+    ("title_mode", "HCOM_TITLE_MODE"),
 ];
 
 /// Relay fields — file-only, no env var override.
@@ -297,6 +299,11 @@ pub struct HcomConfig {
     pub auto_subscribe: String,
     pub name_export: String,
     pub auto_trust_workspace: bool,
+    /// Terminal-title behavior: `"combined"` (default) shows
+    /// `{icon} name - {tool's live title}`, `"label"` shows hcom's
+    /// `{icon} name [tool]` only, `"off"` leaves the tool's own title untouched.
+    /// See [`crate::shared::TitleMode`].
+    pub title_mode: String,
 }
 
 impl Default for HcomConfig {
@@ -330,6 +337,7 @@ impl Default for HcomConfig {
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
             auto_trust_workspace: true,
+            title_mode: "combined".to_string(),
         }
     }
 }
@@ -411,6 +419,17 @@ impl HcomConfig {
             errors.insert(
                 "tag".into(),
                 "tag can only contain letters, numbers, and hyphens".into(),
+            );
+        }
+
+        if !crate::shared::VALID_TITLE_MODES.contains(&self.title_mode.as_str()) {
+            errors.insert(
+                "title_mode".into(),
+                format!(
+                    "title_mode must be one of: {}. Got '{}'",
+                    crate::shared::VALID_TITLE_MODES.join(", "),
+                    self.title_mode
+                ),
             );
         }
 
@@ -504,6 +523,7 @@ impl HcomConfig {
             "auto_trust_workspace" => {
                 Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
             }
+            "title_mode" => Some(self.title_mode.clone()),
             _ => None,
         }
     }
@@ -554,6 +574,10 @@ impl HcomConfig {
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
             "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
+            // Stored leniently; `TitleMode::from_config` maps unknown → default.
+            // The CLI set path (`config_set_at_path`) validates against
+            // `VALID_TITLE_MODES` before this is ever written to the file.
+            "title_mode" => self.title_mode = value.to_string(),
             _ => return Err(format!("unknown field: {field}")),
         }
         Ok(())
@@ -667,6 +691,7 @@ impl HcomConfig {
             "codex_system_prompt",
             "auto_subscribe",
             "name_export",
+            "title_mode",
         ];
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
@@ -979,6 +1004,7 @@ pub fn load_toml_presets(path: &std::path::Path) -> Option<toml::Value> {
 fn default_toml_structure() -> toml::Value {
     let toml_str = r#"[terminal]
 active = "default"
+title_mode = "combined"
 
 [relay]
 url = ""
@@ -2081,6 +2107,20 @@ mod tests {
     }
 
     #[test]
+    fn test_load_from_sources_title_mode_and_env_override() {
+        let mut file_config = HashMap::new();
+        file_config.insert(
+            "title_mode".to_string(),
+            TomlFieldValue::Str("label".to_string()),
+        );
+        let mut env = HashMap::new();
+        env.insert("HCOM_TITLE_MODE".to_string(), "off".to_string());
+
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        assert_eq!(config.title_mode, "off");
+    }
+
+    #[test]
     fn test_load_from_sources_env_overrides_toml() {
         let mut file_config = HashMap::new();
         file_config.insert("timeout".to_string(), TomlFieldValue::Int(3600));
@@ -2371,6 +2411,7 @@ auto_approve = false
         let structure = default_toml_structure();
         // Verify key paths exist
         assert!(get_nested(&structure, "terminal.active").is_some());
+        assert!(get_nested(&structure, "terminal.title_mode").is_some());
         assert!(get_nested(&structure, "launch.tag").is_some());
         assert!(get_nested(&structure, "launch.claude.args").is_some());
         assert!(get_nested(&structure, "relay.url").is_some());

@@ -777,6 +777,15 @@ impl Proxy {
         // Track last written title to detect changes (delivery thread updates Arcs)
         let mut last_written_name = String::new();
         let mut last_written_status = String::new();
+        // Terminal-title behavior. Read once — a session's config doesn't change
+        // under it. In `Off` we neither strip the tool's titles nor write our own;
+        // in `Combined` we append the tool's live title (read from `self.screen`,
+        // which this thread owns — no extra Arc needed).
+        let title_mode = crate::config::HcomConfig::load(None)
+            .map(|c| crate::shared::TitleMode::from_config(&c.title_mode))
+            .unwrap_or(crate::shared::TitleMode::Combined);
+        let title_enabled = title_mode != crate::shared::TitleMode::Off;
+        let mut last_written_child = String::new();
 
         // Track incomplete UTF-8 sequences to defer title writes.
         // When PTY output ends with partial multi-byte character, writing our title OSC
@@ -985,7 +994,9 @@ impl Proxy {
                                 eagain_retries = 0; // reset on successful read
                                 let data = &buf[..n];
                                 raw_chunks.push(data.to_vec());
-                                let (filtered, had_title) = if stdout_is_tty {
+                                // In Off mode, don't strip the tool's own titles —
+                                // let them reach the terminal untouched.
+                                let (filtered, had_title) = if stdout_is_tty && title_enabled {
                                     title_filter.filter(data)
                                 } else {
                                     (data.to_vec(), false)
@@ -1241,7 +1252,7 @@ impl Proxy {
             // but only when that write left no incomplete UTF-8 or escape sequence
             // (`title_write_safe`) — splitting one would corrupt the stream.
             // pending_utf8/pending_escape carry that state across read boundaries.
-            if stdout_is_tty && title_write_safe(pending_utf8, pending_escape) {
+            if stdout_is_tty && title_enabled && title_write_safe(pending_utf8, pending_escape) {
                 let (name, status) = {
                     let n = self
                         .current_name
@@ -1257,11 +1268,30 @@ impl Proxy {
                         .unwrap_or_default();
                     (n, s)
                 };
-                if !name.is_empty() && (name != last_written_name || status != last_written_status)
+                // The wrapped tool's live title (Combined only). Owned by this
+                // thread via self.screen, so no lock — read fresh each iteration
+                // and fold into the change check so a new child title re-emits.
+                let child = if title_mode == crate::shared::TitleMode::Combined {
+                    self.screen.child_title().unwrap_or("")
+                } else {
+                    ""
+                };
+                if !name.is_empty()
+                    && (name != last_written_name
+                        || status != last_written_status
+                        || child != last_written_child)
                 {
-                    let escape =
-                        shared::build_title_escape(&name, &status, self.config.target.name());
+                    let child_opt = (!child.is_empty()).then_some(child);
+                    let escape = shared::build_title_escape(
+                        &name,
+                        &status,
+                        self.config.target.name(),
+                        title_mode,
+                        child_opt,
+                    );
                     write_all(&stdout_fd, escape.as_bytes())?;
+                    last_written_child.clear();
+                    last_written_child.push_str(child);
                     last_written_name = name;
                     last_written_status = status;
                 }

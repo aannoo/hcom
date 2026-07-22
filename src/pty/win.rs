@@ -528,6 +528,15 @@ impl Proxy {
             let headless = !std::io::stdout().is_terminal();
             let mut last_name = String::new();
             let mut last_status = String::new();
+            // Terminal-title behavior. Read once; the child title comes from the
+            // reader-owned `screen`, no extra lock needed. In `Off` the filter
+            // passes the tool's own titles through and we write nothing.
+            let title_mode = crate::config::HcomConfig::load(None)
+                .map(|c| crate::shared::TitleMode::from_config(&c.title_mode))
+                .unwrap_or(crate::shared::TitleMode::Combined);
+            let title_enabled = title_mode != crate::shared::TitleMode::Off;
+            filter.set_passthrough_titles(!title_enabled);
+            let mut last_child = String::new();
 
             // `hcom term` snapshot refresh (see should_refresh_snapshot). Under
             // sustained output we render at most once per SNAPSHOT_THROTTLE;
@@ -675,16 +684,31 @@ impl Proxy {
                         // under heavy output) and name/status rarely change, so
                         // the common path holds the two read locks briefly but
                         // allocates nothing.
+                        let child = if title_mode == crate::shared::TitleMode::Combined {
+                            screen.child_title().unwrap_or("")
+                        } else {
+                            ""
+                        };
                         if !headless
+                            && title_enabled
                             && filter.title_write_safe()
                             && let (Ok(name), Ok(status)) =
                                 (current_name.read(), current_status.read())
                             && !name.is_empty()
-                            && (*name != last_name || *status != last_status)
+                            && (*name != last_name || *status != last_status || child != last_child)
                         {
-                            let esc = shared::build_title_escape(&name, &status, target.name());
+                            let child_opt = (!child.is_empty()).then_some(child);
+                            let esc = shared::build_title_escape(
+                                &name,
+                                &status,
+                                target.name(),
+                                title_mode,
+                                child_opt,
+                            );
                             let _ = stdout.write_all(esc.as_bytes());
                             let _ = stdout.flush();
+                            last_child.clear();
+                            last_child.push_str(child);
                             last_name = name.clone();
                             last_status = status.clone();
                         }

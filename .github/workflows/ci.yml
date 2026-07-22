@@ -2,35 +2,52 @@ name: CI
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      # Pinned so a new stable release can't fail CI on a fresh lint with no
-      # code change. Bump deliberately in its own PR. Local dev stays floating.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep lint behavior reproducible across fresh runners and local installs.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.88
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo check --locked --all-targets
 
   # Native Windows test gate. Release artifacts are built by cargo-dist on tags;
   # the pinned real-tool lifecycle has its own matrix below.
   windows-build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      # Pinned so a new stable release can't fail CI on a fresh lint with no
-      # code change. Bump deliberately in its own PR. Local dev stays floating.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep lint behavior reproducible across fresh runners and local installs.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --all-targets --locked
@@ -40,12 +57,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
       - run: bash ./scripts/typecheck.sh
 
@@ -57,11 +74,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Install pinned cargo-dist
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
       - run: dist generate --check
 
   real-tool-tests:
@@ -76,8 +93,8 @@ jobs:
         include:
           - os: ubuntu-24.04
             tool: codex
-            package: "@openai/codex@0.141.0"
-            cache: codex-0.141.0
+            package: "@openai/codex@0.145.0"
+            cache: codex-0.145.0
             test: real_tool_codex
           - os: ubuntu-latest
             tool: claude
@@ -91,8 +108,8 @@ jobs:
             test: test_relay_roundtrip
           - os: windows-latest
             tool: codex
-            package: "@openai/codex@0.141.0"
-            cache: codex-0.141.0
+            package: "@openai/codex@0.145.0"
+            cache: codex-0.145.0
             test: real_tool_codex
           - os: windows-latest
             tool: claude
@@ -105,15 +122,15 @@ jobs:
             cache: relay-claude-2.1.216
             test: test_relay_roundtrip
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
         with:
           toolchain: "1.97.1"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 22
+          node-version: 22.23.1
       - name: Configure Codex Linux sandbox
         if: runner.os == 'Linux' && matrix.tool == 'codex'
         run: |
@@ -123,8 +140,8 @@ jobs:
             /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
             /etc/apparmor.d/bwrap-userns-restrict
           sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
-      - uses: Swatinem/rust-cache@v2.9.1
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             target/mock-tools
