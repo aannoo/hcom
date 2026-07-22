@@ -6,7 +6,7 @@
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::shared::ST_INACTIVE;
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 
 pub fn is_remote_instance(data: &InstanceRow) -> bool {
     data.origin_device_id.is_some()
@@ -57,6 +57,34 @@ pub struct RunningTasks {
     pub subagents: Vec<serde_json::Value>,
 }
 
+impl RunningTasks {
+    pub fn tracks_subagent(&self, agent_id: &str) -> bool {
+        self.subagents.iter().any(|subagent| {
+            subagent.get("agent_id").and_then(|value| value.as_str()) == Some(agent_id)
+        })
+    }
+
+    pub fn track_subagent(&mut self, agent_id: &str, agent_type: &str) {
+        self.active = true;
+        if !self.tracks_subagent(agent_id) {
+            self.subagents.push(serde_json::json!({
+                "agent_id": agent_id,
+                "type": agent_type,
+            }));
+        }
+    }
+
+    pub fn remove_subagent(&mut self, agent_id: &str) {
+        let original_len = self.subagents.len();
+        self.subagents.retain(|subagent| {
+            subagent.get("agent_id").and_then(|value| value.as_str()) != Some(agent_id)
+        });
+        if self.subagents.len() != original_len && self.subagents.is_empty() {
+            self.active = false;
+        }
+    }
+}
+
 pub fn parse_running_tasks(json_str: Option<&str>) -> RunningTasks {
     let Some(s) = json_str else {
         return RunningTasks::default();
@@ -78,6 +106,23 @@ pub fn parse_running_tasks(json_str: Option<&str>) -> RunningTasks {
     }
 }
 
+fn write_running_tasks(
+    txn: &Transaction<'_>,
+    name: &str,
+    running_tasks: &RunningTasks,
+) -> anyhow::Result<()> {
+    let serialized = serde_json::json!({
+        "active": running_tasks.active,
+        "subagents": &running_tasks.subagents,
+    })
+    .to_string();
+    txn.execute(
+        "UPDATE instances SET running_tasks = ? WHERE name = ?",
+        rusqlite::params![serialized, name],
+    )?;
+    Ok(())
+}
+
 /// Atomically read-modify-write an instance's `running_tasks` JSON column.
 ///
 /// `running_tasks` is a whole-JSON-blob field (`{"active":bool,"subagents":[...]}`)
@@ -89,7 +134,7 @@ pub fn parse_running_tasks(json_str: Option<&str>) -> RunningTasks {
 /// read-modify-write in a `BEGIN IMMEDIATE` transaction serializes concurrent
 /// mutators through SQLite's write lock instead.
 pub fn mutate_running_tasks(db: &HcomDb, name: &str, mutate: impl FnOnce(&mut RunningTasks)) {
-    let result = db.with_transaction(|txn| {
+    let result = db.with_immediate_transaction(|txn| {
         let current: Option<String> = txn
             .query_row(
                 "SELECT running_tasks FROM instances WHERE name = ?",
@@ -100,15 +145,7 @@ pub fn mutate_running_tasks(db: &HcomDb, name: &str, mutate: impl FnOnce(&mut Ru
 
         let mut running_tasks = parse_running_tasks(current.as_deref());
         mutate(&mut running_tasks);
-        let rt_json = serde_json::json!({
-            "active": running_tasks.active,
-            "subagents": running_tasks.subagents,
-        });
-        txn.execute(
-            "UPDATE instances SET running_tasks = ? WHERE name = ?",
-            rusqlite::params![rt_json.to_string(), name],
-        )?;
-        Ok(())
+        write_running_tasks(txn, name, &running_tasks)
     });
 
     if let Err(e) = result {
@@ -128,8 +165,8 @@ pub fn mutate_running_tasks(db: &HcomDb, name: &str, mutate: impl FnOnce(&mut Ru
 /// owner could be the session-bound root *or* a nested subagent that spawned
 /// this one, so this scans rather than assuming root. No-ops if nothing
 /// tracks `agent_id`.
-pub fn remove_tracked_subagent_wherever_found(db: &HcomDb, agent_id: &str) {
-    let result = db.with_transaction(|txn| {
+pub fn remove_tracked_subagent_by_agent_id(db: &HcomDb, agent_id: &str) {
+    let result = db.with_immediate_transaction(|txn| {
         let owner: Option<String> = {
             let mut stmt = txn.prepare(
                 "SELECT name, running_tasks FROM instances
@@ -145,12 +182,7 @@ pub fn remove_tracked_subagent_wherever_found(db: &HcomDb, agent_id: &str) {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter()
-                .find(|(_, rt)| {
-                    parse_running_tasks(rt.as_deref())
-                        .subagents
-                        .iter()
-                        .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id))
-                })
+                .find(|(_, rt)| parse_running_tasks(rt.as_deref()).tracks_subagent(agent_id))
                 .map(|(name, _)| name)
         };
 
@@ -165,31 +197,16 @@ pub fn remove_tracked_subagent_wherever_found(db: &HcomDb, agent_id: &str) {
                 |row| row.get(0),
             )
             .optional()?;
-        let mut rt = parse_running_tasks(current.as_deref());
-        rt.subagents
-            .retain(|s| s.get("agent_id").and_then(|v| v.as_str()) != Some(agent_id));
-        if rt.subagents.is_empty() {
-            rt.active = false;
-        }
-        let rt_json = serde_json::json!({
-            "active": rt.active,
-            "subagents": rt.subagents,
-        });
-        txn.execute(
-            "UPDATE instances SET running_tasks = ? WHERE name = ?",
-            rusqlite::params![rt_json.to_string(), owner],
-        )?;
-        Ok(())
+        let mut running_tasks = parse_running_tasks(current.as_deref());
+        running_tasks.remove_subagent(agent_id);
+        write_running_tasks(txn, &owner, &running_tasks)
     });
 
     if let Err(e) = result {
         crate::log::log_error(
             "core",
             "db.error",
-            &format!(
-                "remove_tracked_subagent_wherever_found: {} - {}",
-                agent_id, e
-            ),
+            &format!("remove_tracked_subagent_by_agent_id: {} - {}", agent_id, e),
         );
     }
 }

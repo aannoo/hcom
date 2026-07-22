@@ -410,16 +410,8 @@ pub struct SubagentAllocation<'a> {
 /// creating duplicates, and vice versa). Otherwise computes the next free
 /// suffix and INSERTs the row.
 ///
-/// The whole idempotency-check + suffix-scan + INSERT runs inside one
-/// `BEGIN IMMEDIATE` transaction. Each SubagentStart is a separate process
-/// with its own DB connection, so parallel same-type siblings of one parent
-/// would otherwise each read the same `max_n` and pick the same `_N` suffix:
-/// the first INSERT wins, every other loses on `UNIQUE(name)`. A single
-/// `max_n + 2` retry only rescues the second racer — a third-plus sibling is
-/// dropped entirely (no row → every later actor hook silently no-ops as an
-/// unknown actor). `BEGIN IMMEDIATE` takes the write lock up front, so the
-/// scan and the INSERT are atomic with respect to other processes and each
-/// racer computes its suffix against the rows the winners already committed.
+/// The idempotency check, suffix scan, and INSERT share one `BEGIN IMMEDIATE`
+/// transaction so concurrent sibling hooks cannot choose the same suffix.
 pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Result<String> {
     let sanitized = sanitize_subagent_type(info.agent_type);
     let pattern = format!("{}_{}_", info.parent_name, sanitized);
@@ -430,7 +422,7 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
         .unwrap_or_default();
     let now = crate::shared::time::now_epoch_f64();
 
-    db.with_transaction(|txn| {
+    db.with_immediate_transaction(|txn| {
         // Idempotency check must live inside the transaction too: otherwise a
         // concurrent SubagentStart and `hcom start --name <agent_id>` for the
         // same agent_id could both miss it and insert two rows.
@@ -576,11 +568,7 @@ mod subagent_alloc_tests {
 
     #[test]
     fn allocate_concurrent_siblings_all_get_rows() {
-        // Repro for the concurrent-sibling allocation race: N separate
-        // processes (here: threads with their own connections to the same
-        // file DB, mirroring separate hook invocations) each allocate a
-        // subagent of the SAME type under the SAME parent at once. Every one
-        // must end up with its own instance row — none may be dropped.
+        // Separate connections mirror concurrent hook processes.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("race.db");
         {

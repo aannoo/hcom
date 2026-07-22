@@ -5,6 +5,14 @@ use rusqlite::params;
 
 use super::HcomDb;
 
+fn prefix_like_pattern(prefix: &str) -> String {
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{escaped}%")
+}
+
 impl HcomDb {
     /// Get value from kv table.
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -38,12 +46,7 @@ impl HcomDb {
 
     /// Get all kv entries whose key starts with prefix. Returns Vec<(key, value)>.
     pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        // Escape LIKE wildcards (%, _, \) in prefix to avoid unintended matches
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{}%", escaped);
+        let pattern = prefix_like_pattern(prefix);
         let mut stmt = self
             .conn
             .prepare_cached("SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'")?;
@@ -58,11 +61,7 @@ impl HcomDb {
 
     /// Delete all kv entries whose key starts with prefix. Returns count deleted.
     pub fn kv_delete_prefix(&self, prefix: &str) -> Result<usize> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{}%", escaped);
+        let pattern = prefix_like_pattern(prefix);
         let n = self.conn.execute(
             "DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'",
             params![pattern],
@@ -118,6 +117,25 @@ mod tests {
         let results = db.kv_prefix("events_sub").unwrap();
         // underscore in "events_sub" should match literally, not as single-char wildcard
         assert_eq!(results.len(), 2, "_ in prefix must be escaped");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_kv_delete_prefix() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.kv_set("claim:100%_done:1", Some("one")).unwrap();
+        db.kv_set("claim:100%_done:2", Some("two")).unwrap();
+        db.kv_set("claim:100x_done:1", Some("other")).unwrap();
+
+        assert_eq!(db.kv_delete_prefix("claim:100%_done:").unwrap(), 2);
+        assert!(db.kv_get("claim:100%_done:1").unwrap().is_none());
+        assert!(db.kv_get("claim:100%_done:2").unwrap().is_none());
+        assert_eq!(
+            db.kv_get("claim:100x_done:1").unwrap(),
+            Some("other".to_string())
+        );
 
         cleanup_test_db(db_path);
     }

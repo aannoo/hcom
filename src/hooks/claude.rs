@@ -39,6 +39,10 @@ const HOOK_SUBAGENT_STOP: &str = "subagent-stop";
 const HOOK_SESSIONEND: &str = "sessionend";
 const HOOK_POLL: &str = "poll";
 
+fn is_subagent_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Agent" | "Task")
+}
+
 /// Handle a Claude hook — entry point from router.
 ///
 /// Reads JSON from stdin, builds context, dispatches to appropriate handler.
@@ -235,15 +239,9 @@ fn route_claude_hook(
         return (result.0, result.1, None, timing);
     }
 
-    // Hook actor: `raw.agent_id` is Claude Code's own signal for "this hook
-    // fired inside a subagent's own execution context" (set on ordinary
-    // PreToolUse/PostToolUse and on SubagentStart/SubagentStop), absent on
-    // the root/main thread. Checked before Task/Agent transitions and before
-    // any running_tasks-based decision, because parent and every nested
-    // subagent share one session_id — session_id can't tell them apart, and
-    // running_tasks.active is parent-side bookkeeping, not identity (using it
-    // for routing is what let PR #82's reap-on-missing-row either wrongly
-    // freeze or wrongly unfreeze the parent).
+    // Claude identifies the hook's actor with agent_id. All actors share the
+    // root session_id, while running_tasks is lifecycle state rather than
+    // identity, so actor routing must happen before task-state handling.
     let raw_agent_id = payload
         .raw
         .get("agent_id")
@@ -278,26 +276,20 @@ fn route_claude_hook(
 
     // ---- Root/main-thread hook (no agent_id) from here on ----
 
-    // Task transitions
     let tool_name = payload.tool_name.as_str();
-    // Claude Code renamed the Task tool to Agent (Task kept as legacy alias),
-    // so match both to keep subagent lifecycle tracking working across versions (useless change!).
-    let is_task_tool = tool_name == "Task" || tool_name == "Agent";
-    if hook_type == HOOK_PRE && is_task_tool {
+    if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
-        let (stdout, exit_code) = match db.get_session_binding(&session_id).ok().flatten() {
+        let (exit_code, stdout) = match db.get_session_binding(&session_id).ok().flatten() {
             Some(instance_name) => start_task(db, &instance_name, &session_id, &payload.raw),
-            None => (String::new(), 0),
+            None => (0, String::new()),
         };
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
         return (exit_code, stdout, None, timing);
     }
-    if hook_type == HOOK_POST && is_task_tool {
+    if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
         let stdout = match db.get_session_binding(&session_id).ok().flatten() {
-            Some(instance_name) => {
-                end_task(db, &instance_name, &payload.raw, false).unwrap_or_default()
-            }
+            Some(instance_name) => end_task(db, &instance_name, &payload.raw).unwrap_or_default(),
             None => String::new(),
         };
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
@@ -305,13 +297,8 @@ fn route_claude_hook(
     }
 
     if hook_type == HOOK_USERPROMPTSUBMIT {
-        // Reap subagents that died without a clean SubagentStop before
-        // honoring root delivery below. This is root-side bookkeeping (a
-        // definite, user-present moment — a heuristic false positive is
-        // recoverable on the next turn), not actor routing, so it stays keyed
-        // off running_tasks.active/parse — see the module doc above for why
-        // that distinction matters. `cleanup_dead_subagents` no-ops quickly
-        // when there is nothing tracked.
+        // Reap subagents that died without a clean SubagentStop before root
+        // delivery. This is lifecycle cleanup, not actor identification.
         let transcript_path = payload.transcript_path.as_deref().unwrap_or("");
         cleanup_dead_subagents(db, &session_id, transcript_path);
         // Fall through to parent handler for PTY message delivery
@@ -417,87 +404,18 @@ fn route_subagent_actor_hook(
 ) -> (i32, String, Option<DeliveryAck>) {
     timing.context = Some("subagent");
 
-    // SubagentStart is the hook that *creates* this agent_id's row
-    // (ensure_subagent_row) — an unknown row here is the expected, normal
-    // first sighting of this subagent, not a fail-closed condition.
     if hook_type == HOOK_SUBAGENT_START {
-        let agent_type = payload
-            .raw
-            .get("agent_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !agent_id.is_empty() && !agent_type.is_empty() {
-            let parent_instance =
-                match resolve_spawn_owner(db, &payload.raw, session_id, agent_id, root_name) {
-                    SpawnOwner::LegacyRoot(name)
-                    | SpawnOwner::Resolved(name)
-                    | SpawnOwner::Resumed(name) => name,
-                    SpawnOwner::Unresolved => {
-                        // prompt_id was present (Claude Code >= 2.1.196) but
-                        // no valid owner resolved by either the fresh-spawn
-                        // or resume path, and this agent_id has never been
-                        // seen before — a missing/stale/foreign mapping means
-                        // correlation failed, not that root is a safe guess.
-                        // Fail closed entirely: no tracking, no row, no
-                        // bootstrap hint.
-                        log::log_warn(
-                            "hooks",
-                            "subagent.spawn_owner.unresolved",
-                            &format!(
-                                "agent_id={} prompt_id={:?}",
-                                agent_id,
-                                payload.raw.get("prompt_id").and_then(|v| v.as_str())
-                            ),
-                        );
-                        timing.result = Some("spawn_owner_unresolved");
-                        return (0, String::new(), None);
-                    }
-                };
-            // Remember this agent_id's owner regardless of which path
-            // resolved it, so a later Claude-initiated resume of this same
-            // agent_id (new prompt_id, no corresponding PreToolUse) can
-            // still find its true owner instead of failing closed.
-            let _ = db.kv_set(
-                &agent_owner_kv_key(session_id, agent_id),
-                Some(&parent_instance),
-            );
-            // Allocate the instance row BEFORE tracking it in the parent's
-            // running_tasks. Row-first means a tracked subagent always has a
-            // real, addressable row: the reverse order can leave a
-            // tracked-but-rowless entry (parent thinks a child is active, but
-            // every one of that child's actor hooks silently no-ops as an
-            // unknown actor and it can never receive a message). Eager
-            // allocation also makes the subagent show up in the TUI and be a
-            // valid `hcom send` target from birth, without injecting any hcom
-            // context into the subagent itself. It stays dormant
-            // (name_announced=0) until a message arrives at SubagentStop or it
-            // runs `hcom start`.
-            ensure_subagent_row(db, &parent_instance, session_id, agent_id, agent_type);
-            track_subagent(db, &parent_instance, agent_id, agent_type);
-        }
-        let output = subagent_start(&payload.raw);
-        if let Some(out) = output {
-            return (0, serde_json::to_string(&out).unwrap_or_default(), None);
-        }
-        return (0, String::new(), None);
+        return handle_subagent_start(db, payload, agent_id, session_id, root_name, timing);
     }
 
-    // SubagentStop resolves its own row by agent_id internally and already
-    // fails safe when it's missing (running_tasks cleanup scanned across all
-    // instances, no delivery — see its doc comment); no extra gate needed
-    // here.
+    // SubagentStop resolves its own row and handles a missing row safely.
     if hook_type == HOOK_SUBAGENT_STOP {
         let (exit_code, stdout) = subagent_stop(db, session_id, &payload.raw);
         return (exit_code, stdout, None);
     }
 
-    // Every other subagent-context hook needs a known, resolvable identity.
-    // Row existence is identity/participation state (allocated, best-effort,
-    // at SubagentStart) — never a liveness probe. An unknown/missing row
-    // means this agent_id has no valid slot right now: fail closed with a
-    // silent no-op, and never fall through to parent/root handling — that
-    // fallthrough is exactly the unsafe shortcut PR #82 proposed (reaping a
-    // tracked-but-rowless subagent and treating that as proof it's dead).
+    // Every other subagent hook requires a known actor row. A missing row is
+    // not proof that the hook belongs to the root, so fail closed.
     let Ok(Some(subagent_instance)) = db.get_instance_by_agent_id(agent_id) else {
         timing.result = Some("unknown_subagent_actor");
         return (0, String::new(), None);
@@ -507,17 +425,14 @@ fn route_subagent_actor_hook(
         return (0, String::new(), None);
     }
 
-    // Nested Agent/Task tool call, spawned from *inside* this subagent:
-    // mutate this subagent's own running_tasks row, not the root's (see the
-    // module-level rationale above for why session_id can't be used here).
+    // Nested Agent/Task calls mutate the acting subagent, not the shared root.
     let tool_name = payload.tool_name.as_str();
-    let is_task_tool = tool_name == "Task" || tool_name == "Agent";
-    if hook_type == HOOK_PRE && is_task_tool {
-        let (stdout, exit_code) = start_task(db, &subagent_instance, session_id, &payload.raw);
+    if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
+        let (exit_code, stdout) = start_task(db, &subagent_instance, session_id, &payload.raw);
         return (exit_code, stdout, None);
     }
-    if hook_type == HOOK_POST && is_task_tool {
-        let stdout = end_task(db, &subagent_instance, &payload.raw, false).unwrap_or_default();
+    if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
+        let stdout = end_task(db, &subagent_instance, &payload.raw).unwrap_or_default();
         return (0, stdout, None);
     }
 
@@ -543,6 +458,64 @@ fn route_subagent_actor_hook(
     }
 
     (0, String::new(), None)
+}
+
+fn handle_subagent_start(
+    db: &HcomDb,
+    payload: &HookPayload,
+    agent_id: &str,
+    session_id: &str,
+    root_name: &str,
+    timing: &mut DispatchTiming,
+) -> (i32, String, Option<DeliveryAck>) {
+    let agent_type = payload
+        .raw
+        .get("agent_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    if !agent_type.is_empty() {
+        let parent_instance =
+            match resolve_spawn_owner(db, &payload.raw, session_id, agent_id, root_name) {
+                SpawnOwner::LegacyRoot(name)
+                | SpawnOwner::Resolved(name)
+                | SpawnOwner::Resumed(name) => name,
+                SpawnOwner::Unresolved => {
+                    log::log_warn(
+                        "hooks",
+                        "subagent.spawn_owner.unresolved",
+                        &format!(
+                            "agent_id={} prompt_id={:?}",
+                            agent_id,
+                            payload
+                                .raw
+                                .get("prompt_id")
+                                .and_then(|value| value.as_str())
+                        ),
+                    );
+                    timing.result = Some("spawn_owner_unresolved");
+                    return (0, String::new(), None);
+                }
+            };
+
+        let _ = db.kv_set(
+            &agent_owner_kv_key(session_id, agent_id),
+            Some(&parent_instance),
+        );
+
+        // Allocate the row first, and only track the child once it has one, so
+        // a tracked actor is always addressable. Tracking a child whose row
+        // allocation failed would leave the parent pointing at a subagent every
+        // one of whose later hooks fails closed as an unknown actor.
+        if ensure_subagent_row(db, &parent_instance, session_id, agent_id, agent_type) {
+            track_subagent(db, &parent_instance, agent_id, agent_type);
+        }
+    }
+
+    let stdout = build_subagent_start_output(&payload.raw)
+        .and_then(|output| serde_json::to_string(&output).ok())
+        .unwrap_or_default();
+    (0, stdout, None)
 }
 
 /// Get correct session_id, handling Claude Code's fork bug.
@@ -852,9 +825,8 @@ enum SpawnOwner {
     /// already known (see `agent_owner_kv_key`) — Claude resuming a
     /// previously-spawned subagent under the same `agent_id` stamps a *new*
     /// `prompt_id` on the resumed SubagentStart with no corresponding
-    /// PreToolUse to map it (live-verified: resume never re-runs the
-    /// spawning Task/Agent PreToolUse), so the fresh-`prompt_id` lookup
-    /// always misses on resume. Falling back to this agent_id's own
+    /// PreToolUse to map it, so the fresh-`prompt_id` lookup always misses on
+    /// resume. Falling back to this agent_id's own
     /// remembered owner is safe specifically because the agent_id is
     /// already known — see `Unresolved` for why an *unknown* agent_id must
     /// not get the same treatment.
@@ -872,9 +844,8 @@ enum SpawnOwner {
 /// Resolve which instance actually spawned a SubagentStart's child.
 ///
 /// Claude stamps the same `prompt_id` on a Task/Agent tool's PreToolUse and
-/// on the SubagentStart(s) it produces — including parallel siblings spawned
-/// by the same call — live-verified against Claude Code 2.1.216 (requires at
-/// least 2.1.196; see `spawn_owner_kv_key`). `start_task` records
+/// on the SubagentStart(s) it produces, including parallel siblings spawned
+/// by the same call. `start_task` records
 /// `(root_session_id, prompt_id) -> acting instance` for exactly this
 /// lookup, so a SubagentStart spawned by a *nested* subagent resolves to
 /// that subagent, not the session-bound root — parent and every nested
@@ -941,13 +912,13 @@ fn validate_spawn_owner(db: &HcomDb, owner: &str, root_session_id: &str, root_na
 /// Agent/Task call; see the call sites in `route_claude_hook` /
 /// `route_subagent_actor_hook`).
 ///
-/// Returns (stdout, exit_code).
+/// Returns (exit_code, stdout).
 fn start_task(
     db: &HcomDb,
     instance_name: &str,
     root_session_id: &str,
     raw: &Value,
-) -> (String, i32) {
+) -> (i32, String) {
     log::log_info(
         "hooks",
         "start_task.enter",
@@ -1007,10 +978,10 @@ fn start_task(
                 "updatedInput": updated,
             }
         });
-        return (serde_json::to_string(&output).unwrap_or_default(), 0);
+        return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    (String::new(), 0)
+    (0, String::new())
 }
 
 /// PostToolUse Task: deliver freeze-period messages for `instance_name` — the
@@ -1018,11 +989,7 @@ fn start_task(
 ///
 /// Returns Option<String> — JSON stdout if messages were delivered.
 /// Dispatcher writes this to stdout before returning exit code.
-fn end_task(db: &HcomDb, instance_name: &str, raw: &Value, interrupted: bool) -> Option<String> {
-    if interrupted {
-        return None;
-    }
-
+fn end_task(db: &HcomDb, instance_name: &str, raw: &Value) -> Option<String> {
     // Since Claude Code 2.1.198, Agent/Task calls background by default: this
     // PostToolUse fires immediately with tool_response.status="async_launched"
     // when the call is merely dispatched to the background, not when the
@@ -1032,8 +999,6 @@ fn end_task(db: &HcomDb, instance_name: &str, raw: &Value, interrupted: bool) ->
     // skip delivery rather than assume anything about how/when completion is
     // reported — root-scoped messages still flow through the root's own
     // interleaved PostToolUse hooks regardless (see route_claude_hook).
-    // Not yet live-verified: what a genuine completion for a backgrounded
-    // call looks like on the wire.
     let is_async_launch = raw
         .get("tool_response")
         .and_then(|v| v.get("status"))
@@ -1653,31 +1618,14 @@ fn track_subagent(db: &HcomDb, parent_instance: &str, agent_id: &str, agent_type
     // subagents of the same parent (parallel Task calls) cannot race and
     // silently drop each other's entry.
     instances::mutate_running_tasks(db, parent_instance, |rt| {
-        rt.active = true;
-        let already_tracked = rt
-            .subagents
-            .iter()
-            .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id));
-        if !already_tracked {
-            rt.subagents.push(serde_json::json!({
-                "agent_id": agent_id,
-                "type": agent_type,
-            }));
-        }
+        rt.track_subagent(agent_id, agent_type);
     });
 }
 
 /// Remove subagent from parent's running_tasks.
 fn remove_subagent_from_parent(db: &HcomDb, parent_name: &str, agent_id: &str) {
     instances::mutate_running_tasks(db, parent_name, |rt| {
-        if rt.subagents.is_empty() {
-            return;
-        }
-        rt.subagents
-            .retain(|s| s.get("agent_id").and_then(|v| v.as_str()) != Some(agent_id));
-        if rt.subagents.is_empty() {
-            rt.active = false;
-        }
+        rt.remove_subagent(agent_id);
     });
 }
 
@@ -1872,7 +1820,7 @@ fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) 
 }
 
 /// SubagentStart: surface agent_id to subagent.
-fn subagent_start(raw: &Value) -> Option<Value> {
+fn build_subagent_start_output(raw: &Value) -> Option<Value> {
     let agent_id = raw.get("agent_id").and_then(|v| v.as_str())?;
     if agent_id.is_empty() {
         return None;
@@ -1908,16 +1856,19 @@ fn subagent_start(raw: &Value) -> Option<Value> {
 /// never get their own `session_id` (see `allocate_subagent_instance`) — it
 /// is the only value the `parent_session_id` FK column (`REFERENCES
 /// instances(session_id)`) can ever validly point at, at any nesting depth.
+/// Allocate this subagent's `instances` row. Returns `true` once a row exists
+/// and the actor is addressable (allocation is idempotent, so an already-present
+/// row also counts), `false` if the parent is unknown or allocation failed.
 fn ensure_subagent_row(
     db: &HcomDb,
     parent_instance: &str,
     root_session_id: &str,
     agent_id: &str,
     agent_type: &str,
-) {
+) -> bool {
     let parent_data = match db.get_instance_full(parent_instance) {
         Ok(Some(data)) => data,
-        _ => return,
+        _ => return false,
     };
     let parent_tag = parent_data.tag.as_deref();
 
@@ -1941,6 +1892,7 @@ fn ensure_subagent_row(
                     name, parent_instance, agent_id, agent_type
                 ),
             );
+            true
         }
         Err(e) => {
             log::log_warn(
@@ -1948,6 +1900,7 @@ fn ensure_subagent_row(
                 "subagent.row.alloc_failed",
                 &format!("agent_id={} err={}", agent_id, e),
             );
+            false
         }
     }
 }
@@ -1994,55 +1947,32 @@ fn subagent_stop_claim_prefix(root_session_id: &str) -> String {
     format!("subagent_stop_claimed:{root_session_id}:")
 }
 
-/// Atomically claim one SubagentStop invocation for processing — true if this
-/// call won the claim, false if a *concurrent* duplicate delivery of the
-/// identical invocation is already holding it. Must be checked before *any*
-/// processing (idle-gate, `poll_messages`, teardown), not only before
-/// teardown: with duplicate hook registrations, both invocations otherwise
-/// enter `poll_messages` independently — one can receive a delivered message
-/// (exit_code=2) while the other times out (exit_code=0) and tears the row
-/// down while Claude is still acting on the delivery, so the reply fails
-/// because the identity is gone.
-///
-/// The claim is a *concurrency guard*, held only for the duration of one
-/// invocation's processing and released by `StopClaimGuard` on completion —
-/// NOT a session-long tombstone. That distinction is load-bearing: the raw
-/// payload is only a content fingerprint, and two *genuinely distinct* stops
-/// can be byte-for-byte identical (stable `prompt_id`, repeated
-/// `last_assistant_message`, same transcript path — observed live: a subagent
-/// that ends two separate message turns with the same final text produces
-/// identical payloads). A permanent claim would silently suppress the second
-/// such stop (no poll, no delivery, no teardown). Because Claude blocks the
-/// subagent until its SubagentStop hook returns, two same-payload stops can
-/// only overlap in time when they are the *same* logical stop dispatched to
-/// two registered hooks — exactly the case a release-on-completion claim still
-/// dedups, while a later sequential re-fire re-claims cleanly.
-///
-/// `INSERT OR IGNORE` is a single statement, so SQLite's own write lock makes
-/// the claim atomic across concurrent processes without an explicit
-/// transaction.
-fn claim_subagent_stop(db: &HcomDb, claim_key: &str) -> bool {
-    db.conn()
-        .execute(
-            "INSERT OR IGNORE INTO kv (key, value) VALUES (?, '1')",
-            rusqlite::params![claim_key],
-        )
-        // DB error: fail open (proceed with processing) rather than risk
-        // wedging a dead subagent forever over an unrelated I/O hiccup.
-        .map(|n| n > 0)
-        .unwrap_or(true)
-}
-
-/// Releases a won SubagentStop claim when the invocation's processing ends, so
-/// a later, genuinely distinct stop with a byte-identical payload can re-claim
-/// and be processed instead of being suppressed forever. See
-/// `claim_subagent_stop` for why the claim must be transient, not permanent.
-struct StopClaimGuard<'a> {
+/// Transient claim that prevents concurrent duplicate SubagentStop hooks from
+/// polling or tearing down the same actor at the same time. The claim is
+/// released on drop so a later, distinct stop with identical content can run.
+struct SubagentStopClaim<'a> {
     db: &'a HcomDb,
     key: String,
 }
 
-impl Drop for StopClaimGuard<'_> {
+impl<'a> SubagentStopClaim<'a> {
+    fn acquire(db: &'a HcomDb, root_session_id: &str, agent_id: &str, raw: &Value) -> Option<Self> {
+        let key = subagent_stop_claim_key(root_session_id, agent_id, raw);
+        let claimed = db
+            .conn()
+            .execute(
+                "INSERT OR IGNORE INTO kv (key, value) VALUES (?, '1')",
+                rusqlite::params![key],
+            )
+            // Fail open rather than leave a stopped actor wedged by a DB error.
+            .map(|inserted| inserted > 0)
+            .unwrap_or(true);
+
+        claimed.then_some(Self { db, key })
+    }
+}
+
+impl Drop for SubagentStopClaim<'_> {
     fn drop(&mut self) {
         let _ = self
             .db
@@ -2086,20 +2016,14 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
         // that spawned this one (see `resolve_spawn_owner`) — scan for
         // whichever instance actually tracks `agent_id` rather than assuming
         // root, or the true owner is left wedged active forever.
-        instances::remove_tracked_subagent_wherever_found(db, agent_id);
+        instances::remove_tracked_subagent_by_agent_id(db, agent_id);
         return (0, String::new());
     };
 
-    // Claim this exact invocation before any further processing — see
-    // `claim_subagent_stop` for why this can't wait until the teardown
-    // decision: a duplicate delivery must not even enter `poll_messages`.
-    // `_claim_guard` releases the claim on every return path below, so a
-    // later distinct stop with a byte-identical payload is not suppressed.
-    let claim_key = subagent_stop_claim_key(root_session_id, agent_id, raw);
-    if !claim_subagent_stop(db, &claim_key) {
+    // A duplicate delivery must not enter polling or teardown.
+    let Some(_stop_claim) = SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) else {
         return (0, String::new());
-    }
-    let _claim_guard = StopClaimGuard { db, key: claim_key };
+    };
 
     // Store transcript_path if not already set
     if existing_transcript.is_empty()
@@ -3122,7 +3046,7 @@ mod tests {
     #[test]
     fn test_subagent_start_with_agent_id() {
         let raw = serde_json::json!({"agent_id": "agent-uuid-123"});
-        let result = subagent_start(&raw);
+        let result = build_subagent_start_output(&raw);
         assert!(result.is_some());
         let output = result.unwrap();
         let ctx = output["hookSpecificOutput"]["additionalContext"]
@@ -3134,13 +3058,13 @@ mod tests {
     #[test]
     fn test_subagent_start_no_agent_id() {
         let raw = serde_json::json!({});
-        assert!(subagent_start(&raw).is_none());
+        assert!(build_subagent_start_output(&raw).is_none());
     }
 
     #[test]
     fn test_subagent_start_empty_agent_id() {
         let raw = serde_json::json!({"agent_id": ""});
-        assert!(subagent_start(&raw).is_none());
+        assert!(build_subagent_start_output(&raw).is_none());
     }
 
     #[test]
@@ -4162,10 +4086,8 @@ mod tests {
     /// Property: a subagent PostToolUse whose agent_id has no resolvable
     /// `instances` row (SubagentStart's row allocation is best-effort and may
     /// not have happened, or the row is gone) must never deliver anything —
-    /// and, critically, must never fall through to root/parent delivery. That
-    /// fallthrough is exactly what PR #82 proposed (reap on row-missing, then
-    /// treat root as unfrozen) — unsafe because row-missing is
-    /// identity/participation state, not a liveness signal.
+    /// and, critically, must never fall through to root/parent delivery.
+    /// Row absence is identity state, not proof that the actor is the root.
     #[test]
     #[serial]
     fn test_subagent_posttooluse_unknown_row_never_falls_through_to_parent() {
@@ -4341,11 +4263,8 @@ mod tests {
     /// dispatched the call to the background (default since Claude Code
     /// 2.1.198) — this is not completion, so it must not deliver a
     /// "Subagents have finished" summary and must not advance the delivery
-    /// cursor. This test only asserts that conservative non-behavior; it
-    /// does not model or imply what a genuine completion for a backgrounded
-    /// call looks like on the wire (not yet live-verified — see
-    /// `test_task_posttooluse_foreground_completed_delivers` for the
-    /// separate, independently-verified foreground path).
+    /// cursor. Foreground completion is covered separately by
+    /// `test_task_posttooluse_foreground_completed_delivers`.
     #[test]
     #[serial]
     fn test_task_posttooluse_async_launch_skips_delivery() {
@@ -5030,8 +4949,7 @@ mod tests {
 
     /// Property: a resumed subagent — Claude re-firing SubagentStart for a
     /// previously-known `agent_id` under a *new* `prompt_id` with no
-    /// corresponding PreToolUse to map it (live-verified: resume doesn't
-    /// re-run the spawning Task/Agent PreToolUse) — must reattach to its
+    /// corresponding PreToolUse to map it — must reattach to its
     /// original owner via the session-scoped agent_owner memory, not fail
     /// closed. Sequential: the original subagent fully spawns and stops
     /// (row deleted) before the resume fires.
@@ -5262,30 +5180,25 @@ mod tests {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
-        let key = subagent_stop_claim_key("sess-1", "agent-x", &raw);
-        assert!(claim_subagent_stop(&db, &key), "first claim must succeed");
+        let _first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("first claim must succeed");
         assert!(
-            !claim_subagent_stop(&db, &key),
+            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw).is_none(),
             "duplicate identical invocation must not re-claim while held"
         );
 
         let raw_different_payload =
             serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1", "note": "different"});
-        assert!(
-            claim_subagent_stop(
-                &db,
-                &subagent_stop_claim_key("sess-1", "agent-x", &raw_different_payload)
-            ),
-            "same prompt_id but different payload content must be its own claim"
-        );
+        let _different_claim =
+            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw_different_payload)
+                .expect("same prompt_id but different payload content must be its own claim");
     }
 
-    /// Regression (finding #1): the claim is a transient concurrency guard, not
-    /// a session-long tombstone. Two *genuinely distinct* SubagentStop
-    /// invocations can carry byte-identical payloads (stable prompt_id +
-    /// repeated last_assistant_message — reproduced live). While one is
+    /// The claim is a transient concurrency guard, not a session-long
+    /// tombstone. Two distinct SubagentStop invocations can carry identical
+    /// payloads. While one is
     /// in-flight the identical duplicate must lose (concurrency dedup), but
-    /// once `StopClaimGuard` releases it, a later identical stop must be able
+    /// once `SubagentStopClaim` releases it, a later identical stop must be able
     /// to re-claim and be processed — not suppressed forever.
     #[test]
     #[serial]
@@ -5299,30 +5212,23 @@ mod tests {
         });
         let key = subagent_stop_claim_key("sess-1", "agent-x", &raw);
 
-        assert!(claim_subagent_stop(&db, &key), "first invocation claims");
+        let first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("first invocation claims");
         assert!(
-            !claim_subagent_stop(&db, &key),
+            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw).is_none(),
             "a concurrent duplicate still in-flight must lose the claim"
         );
-        // First invocation finishes -> guard releases.
-        {
-            let _guard = StopClaimGuard {
-                db: &db,
-                key: key.clone(),
-            };
-        }
+        drop(first_claim);
         assert!(
             db.kv_get(&key).unwrap().is_none(),
             "guard drop must release the claim key"
         );
-        assert!(
-            claim_subagent_stop(&db, &key),
-            "a later, genuinely distinct stop with a byte-identical payload must re-claim, not be suppressed"
-        );
+        let _later_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("a later, genuinely distinct stop with a byte-identical payload must re-claim");
     }
 
-    /// Integration guard for finding #1: `subagent_stop` itself must release
-    /// the claim it took, so the tombstone can't outlive the invocation. Uses
+    /// `subagent_stop` must release its claim so it cannot outlive the
+    /// invocation. Uses
     /// a zero timeout so the poll returns immediately without blocking.
     #[test]
     #[serial]
@@ -5390,10 +5296,8 @@ mod tests {
         });
         // Simulate a concurrent duplicate having already claimed this exact
         // invocation (and still in-flight, so the claim is unreleased).
-        assert!(claim_subagent_stop(
-            &db,
-            &subagent_stop_claim_key("sess-1", "agent-x", &raw)
-        ));
+        let _existing_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("the simulated concurrent invocation must hold the claim");
 
         let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0);

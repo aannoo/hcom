@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
@@ -122,29 +122,16 @@ impl HcomDb {
         &self.conn
     }
 
-    /// Run `f` inside a `BEGIN IMMEDIATE` transaction, committing on success.
+    /// Run `f` inside a `BEGIN IMMEDIATE` transaction and commit on success.
     ///
-    /// `BEGIN IMMEDIATE` takes the write lock up front (rather than on first
-    /// write), so a read-then-write sequence inside `f` is atomic with
-    /// respect to other hcom processes: each hook invocation opens its own
-    /// connection, so a plain SELECT-then-UPDATE across two statements is a
-    /// lost-update race between concurrent processes without this.
-    ///
-    /// `f` is handed the `Transaction` itself and must run its queries
-    /// through it (not through `self.conn()`), so the RAII guard is actually
-    /// what's touching the database. This also makes rollback panic-safe: a
-    /// manual `BEGIN`/`COMMIT`/`ROLLBACK` pair leaves the connection stuck
-    /// inside an open transaction if `f` panics (the `ROLLBACK` arm never
-    /// runs); `rusqlite::Transaction`'s `Drop` rolls back unconditionally
-    /// unless `commit()` was reached.
-    pub fn with_transaction<T>(
+    /// The immediate write lock makes read-modify-write sequences atomic
+    /// across the separate database connections used by hook processes.
+    /// Queries inside `f` must use the provided transaction.
+    pub fn with_immediate_transaction<T>(
         &self,
-        f: impl FnOnce(&rusqlite::Transaction) -> Result<T>,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let txn = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let result = f(&txn)?;
         txn.commit()?;
         Ok(result)
