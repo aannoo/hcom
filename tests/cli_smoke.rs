@@ -62,6 +62,26 @@ fn help_prints_and_exits_zero() {
 }
 
 #[test]
+fn send_help_documents_broadcast_flag() {
+    // Regression guard: `hcom send --help` must describe the current
+    // broadcast mechanism (explicit --broadcast required from inside an AI
+    // tool session), not the pre-fix "send -- message text" / "-- Broadcast
+    // message to everyone" wording that no longer matches send.rs behavior.
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run(["send", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("--broadcast"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("send -- message text"),
+        "stale no-flag broadcast usage still present: stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("hcom send -- Broadcast message to everyone"),
+        "stale broadcast example still present: stdout={stdout}"
+    );
+}
+
+#[test]
 fn status_json_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["status", "--json"]);
@@ -154,10 +174,12 @@ fn send_strips_redundant_trailing_name_from_auto_resolved_sender() {
 }
 
 #[test]
-fn ai_tool_broadcast_to_many_requires_go_preview() {
+fn ai_tool_broadcast_requires_explicit_broadcast_flag() {
     let h = Hcom::new();
     let sender = h.start();
-    for _ in 0..4 {
+    // Keep the recipient count below the old >3 preview threshold so this
+    // regression proves small accidental broadcasts are gated too.
+    for _ in 0..2 {
         h.start();
     }
 
@@ -179,9 +201,9 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
     );
     assert!(
         stdout.contains("BROADCAST SEND PREVIEW")
-            && stdout.contains("broadcast to 4 agents")
+            && stdout.contains("broadcast to 2 agents")
             && stdout.contains("Did you mean to send this to everyone?")
-            && stdout.contains("hcom send --go"),
+            && stdout.contains("hcom send --broadcast"),
         "stdout={stdout}"
     );
 
@@ -191,6 +213,8 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
         "preview must not send a message: events={events_out}"
     );
 
+    // --go must no longer authorize a broadcast (regression guard: accidental
+    // no-@target sends with a habitual --go used to wake every agent).
     let mut go_cmd = h.cmd();
     go_cmd.env("CODEX_SANDBOX", "1").args([
         "--go",
@@ -198,16 +222,34 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
         "--name",
         &sender,
         "--",
-        "confirmed broadcast",
+        "go does not mean everyone",
     ]);
     let go_out = go_cmd.output().expect("spawn hcom --go send");
     let go_code = go_out.status.code().unwrap_or(-1);
     let go_stdout = String::from_utf8_lossy(&go_out.stdout);
-    let go_stderr = String::from_utf8_lossy(&go_out.stderr);
-    assert_eq!(go_code, 0, "stdout={go_stdout} stderr={go_stderr}");
+    assert_ne!(go_code, 0, "--go must still preview: stdout={go_stdout}");
     assert!(
-        go_stdout.contains("Sent to:") || go_stdout.contains("Sent to 4 agents"),
+        go_stdout.contains("BROADCAST SEND PREVIEW"),
         "stdout={go_stdout}"
+    );
+
+    let mut bc_cmd = h.cmd();
+    bc_cmd.env("CODEX_SANDBOX", "1").args([
+        "send",
+        "--broadcast",
+        "--name",
+        &sender,
+        "--",
+        "confirmed broadcast",
+    ]);
+    let bc_out = bc_cmd.output().expect("spawn hcom send --broadcast");
+    let bc_code = bc_out.status.code().unwrap_or(-1);
+    let bc_stdout = String::from_utf8_lossy(&bc_out.stdout);
+    let bc_stderr = String::from_utf8_lossy(&bc_out.stderr);
+    assert_eq!(bc_code, 0, "stdout={bc_stdout} stderr={bc_stderr}");
+    assert!(
+        bc_stdout.contains("Sent to:") || bc_stdout.contains("Sent to 2 agents"),
+        "stdout={bc_stdout}"
     );
 }
 
