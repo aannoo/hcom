@@ -1101,6 +1101,20 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
+/// Soft retry floor for cursor-verify timeouts: below this many inject attempts,
+/// retry immediately without consulting pending state (fast recovery from a
+/// transient render/enter miss).
+const INJECT_SOFT_RETRY_FLOOR: u32 = 3;
+
+/// Total inject-attempt cap before giving up on a target whose cursor never
+/// advances. Beyond this the delivery loop stops re-injecting the wake prompt
+/// (pre-fix it repeated every ~`VERIFY_TIMEOUT` indefinitely — 13 injects over
+/// ~90s were observed on 2026-07-10) and parks in `State::GiveUp`. Messages are
+/// NOT dropped: they remain pending in the `events` table and re-arm on new
+/// activity. Sized to keep total wake injections well under that pathology while
+/// still tolerating a briefly busy panel (~6 × 10s verify window).
+const MAX_INJECT_ATTEMPTS: u32 = 6;
+
 /// Delivery state machine for the native PTY path (Claude/Gemini/Codex/Antigravity).
 ///
 /// OpenCode bypasses this entirely — it early-returns with its own loop
@@ -1109,6 +1123,8 @@ const MAX_ENTER_ATTEMPTS: u32 = 3;
 /// - `WaitTextRender`: confirms injected text appeared in the prompt, sends Enter on match
 /// - `WaitTextClear`: verifies prompt cleared after Enter, retries Enter on timeout
 /// - `VerifyCursor`: waits for hook-side cursor advance (falls back to has_pending==false)
+/// - `GiveUp`: parked after the inject-attempt budget is exhausted; stops
+///   re-injecting and re-arms only on new activity (messages stay pending)
 ///
 /// Failed verification returns to `Pending`; success goes to `Idle` or `Pending` (if more queued).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1118,6 +1134,41 @@ enum State {
     WaitTextRender,
     WaitTextClear,
     VerifyCursor,
+    GiveUp,
+}
+
+/// Outcome of a cursor-verify timeout, factored into a pure function for testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyTimeoutDecision {
+    /// Under the soft floor — re-inject immediately.
+    Retry,
+    /// Queue drained despite the cursor not advancing — treat as delivered.
+    SuccessNoCursor,
+    /// Still pending and under the give-up cap — reset to `Pending` and try again.
+    FailReset,
+    /// Give-up cap reached — stop injecting, park, leave messages pending.
+    GiveUp,
+}
+
+/// Decide how to react when cursor-advance verification times out.
+///
+/// `inject_attempt` is the count *after* incrementing for this timeout;
+/// `has_pending` reports whether deliverable messages still remain.
+///
+/// Ordering matters: a target that has actually drained its queue
+/// (`has_pending == false`) always resolves as delivered and is never abandoned,
+/// so a responsive-but-slow panel cannot be spuriously given up on.
+fn verify_timeout_decision(inject_attempt: u32, has_pending: bool) -> VerifyTimeoutDecision {
+    if inject_attempt < INJECT_SOFT_RETRY_FLOOR {
+        return VerifyTimeoutDecision::Retry;
+    }
+    if !has_pending {
+        return VerifyTimeoutDecision::SuccessNoCursor;
+    }
+    if inject_attempt >= MAX_INJECT_ATTEMPTS {
+        return VerifyTimeoutDecision::GiveUp;
+    }
+    VerifyTimeoutDecision::FailReset
 }
 
 /// Run the delivery loop — surfaces out-of-band hcom messages into the tool's
@@ -1328,6 +1379,9 @@ pub fn run_delivery_loop(
         let mut injected_text = String::new();
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
+        // Target cursor snapshot at the moment we gave up, used by `State::GiveUp`
+        // to detect the panel becoming responsive again.
+        let mut give_up_cursor: i64 = 0;
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
@@ -1928,61 +1982,176 @@ pub fn run_delivery_loop(
                             ),
                         );
 
-                        if inject_attempt < 3 {
-                            // Retry
-                            log_info(
-                                "native",
-                                "delivery.retry",
-                                &format!("Retrying delivery (inject_attempt={})", inject_attempt),
-                            );
-                            delivery_state = State::Pending;
-                            attempt += 1;
-                            continue;
-                        }
+                        match verify_timeout_decision(inject_attempt, db.has_pending(&current_name))
+                        {
+                            VerifyTimeoutDecision::Retry => {
+                                log_info(
+                                    "native",
+                                    "delivery.retry",
+                                    &format!(
+                                        "Retrying delivery (inject_attempt={})",
+                                        inject_attempt
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                attempt += 1;
+                                continue;
+                            }
+                            VerifyTimeoutDecision::SuccessNoCursor => {
+                                // Cursor advance is the primary proof, but "no pending
+                                // rows" is also sufficient — avoids wedging when hook
+                                // delivery succeeded but cursor bookkeeping didn't advance.
+                                if !last_block_context.is_empty() {
+                                    if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                                        log_warn(
+                                            "native",
+                                            "delivery.gate_clear_fail",
+                                            &format!("{}", e),
+                                        );
+                                    }
+                                    last_block_context.clear();
+                                }
+                                block_since = None;
 
-                        // Cursor advance is the primary proof, but "no pending rows"
-                        // is also sufficient — avoids wedging when hook delivery
-                        // succeeded but cursor bookkeeping didn't advance.
-                        if !db.has_pending(&current_name) {
-                            // Success (cursor tracking issue but delivery worked)
-                            // Clear gate block status
-                            if !last_block_context.is_empty() {
-                                if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                                log_info(
+                                    "native",
+                                    "delivery.success_no_cursor",
+                                    "Messages gone despite cursor not advancing - delivery successful",
+                                );
+                                delivery_state = State::Idle;
+                                attempt = 0;
+                                inject_attempt = 0;
+                                continue;
+                            }
+                            VerifyTimeoutDecision::FailReset => {
+                                // Bounded failure: reset and try again while still under
+                                // the give-up cap. Messages remain pending in the DB.
+                                log_warn(
+                                    "native",
+                                    "delivery.failed",
+                                    &format!(
+                                        "Delivery failed after {} attempts, resetting",
+                                        inject_attempt
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                attempt = 0;
+                            }
+                            VerifyTimeoutDecision::GiveUp => {
+                                // Give-up cap reached. Stop re-injecting the wake prompt
+                                // (the pre-fix loop repeated it every ~VERIFY_TIMEOUT
+                                // forever). Messages are NOT dropped — they stay pending
+                                // in the events table and re-arm on new activity or a
+                                // manual `hcom`. Surface a needs-attention gate status.
+                                log_warn(
+                                    "native",
+                                    "delivery.give_up",
+                                    &format!(
+                                        "Gave up after {} inject attempts (cursor stuck at {}); \
+                                         message left pending, awaiting new activity or manual hcom",
+                                        inject_attempt, current_cursor
+                                    ),
+                                );
+                                if let Err(e) = db.set_gate_status(
+                                    &current_name,
+                                    "tui:delivery-stalled",
+                                    "delivery stalled — run hcom to view pending",
+                                ) {
                                     log_warn(
                                         "native",
-                                        "delivery.gate_clear_fail",
+                                        "delivery.gate_status_fail",
                                         &format!("{}", e),
                                     );
                                 }
-                                last_block_context.clear();
+                                last_block_context = "tui:delivery-stalled".to_string();
+                                give_up_cursor = current_cursor;
+                                delivery_state = State::GiveUp;
+                                attempt = 0;
+                                continue;
                             }
-                            block_since = None;
-
-                            log_info(
-                                "native",
-                                "delivery.success_no_cursor",
-                                "Messages gone despite cursor not advancing - delivery successful",
-                            );
-                            delivery_state = State::Idle;
-                            attempt = 0;
-                            inject_attempt = 0;
-                            continue;
                         }
+                    }
 
-                        // Delivery failed - reset and wait
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                State::GiveUp => {
+                    // Parked after exhausting the inject-attempt budget. Stay quiet —
+                    // do NOT re-inject. The message remains pending in the events table
+                    // (delivery never deletes it), so it is still retrievable via `hcom`
+                    // or a later cursor advance. Re-arm only on genuine new activity.
+                    let notified = notify.wait(IDLE_WAIT);
+
+                    if !running.load(Ordering::Acquire) {
+                        log_info(
+                            "native",
+                            "delivery.shutdown",
+                            "Running flag cleared, exiting loop",
+                        );
+                        break;
+                    }
+
+                    db.reconnect_if_stale();
+
+                    if let Err(e) = db.update_heartbeat(&current_name) {
                         log_warn(
                             "native",
-                            "delivery.failed",
+                            "delivery.heartbeat_fail",
+                            &format!("Failed to update heartbeat: {}", e),
+                        );
+                    }
+                    if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
+                        log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
+                    }
+                    if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
+                        log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+                    }
+
+                    // Messages drained after all (late cursor advance or manual `hcom`) —
+                    // clear the stalled status and return to normal idle listening.
+                    if !db.has_pending(&current_name) {
+                        if !last_block_context.is_empty() {
+                            if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                                log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
+                            }
+                            last_block_context.clear();
+                        }
+                        block_since = None;
+                        log_info(
+                            "native",
+                            "delivery.give_up_cleared",
+                            "Stalled messages drained, returning to idle",
+                        );
+                        delivery_state = State::Idle;
+                        attempt = 0;
+                        inject_attempt = 0;
+                        continue;
+                    }
+
+                    // Re-arm on genuine new activity only: a fresh notify (send.rs
+                    // wake_all fires on every new message) or the target cursor finally
+                    // advancing (panel became responsive). A bare idle-poll timeout does
+                    // NOT re-arm, so a permanently stuck target is no longer spammed.
+                    let current_cursor = db.get_cursor(&current_name);
+                    if notified || current_cursor > give_up_cursor {
+                        if !last_block_context.is_empty() {
+                            if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                                log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
+                            }
+                            last_block_context.clear();
+                        }
+                        log_info(
+                            "native",
+                            "delivery.give_up_rearm",
                             &format!(
-                                "Delivery failed after {} attempts, resetting",
-                                inject_attempt
+                                "New activity (notified={}, cursor {}->{}), retrying delivery",
+                                notified, give_up_cursor, current_cursor
                             ),
                         );
                         delivery_state = State::Pending;
                         attempt = 0;
+                        inject_attempt = 0;
                     }
-
-                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -2288,6 +2457,85 @@ mod tests {
             ),
             Phase1Decision::TimedOut,
         );
+    }
+
+    // ---- cursor-verify bounded-retry / give-up tests (M2) ----
+
+    #[test]
+    fn verify_timeout_retries_below_soft_floor() {
+        for attempt in 1..INJECT_SOFT_RETRY_FLOOR {
+            assert_eq!(
+                verify_timeout_decision(attempt, true),
+                VerifyTimeoutDecision::Retry,
+                "attempt {attempt} below the soft floor must retry",
+            );
+        }
+    }
+
+    #[test]
+    fn verify_timeout_reports_success_when_drained() {
+        // At or above the soft floor, an empty queue always resolves as delivered
+        // and never gives up — a responsive target is never spuriously abandoned.
+        assert_eq!(
+            verify_timeout_decision(INJECT_SOFT_RETRY_FLOOR, false),
+            VerifyTimeoutDecision::SuccessNoCursor,
+        );
+        assert_eq!(
+            verify_timeout_decision(MAX_INJECT_ATTEMPTS + 10, false),
+            VerifyTimeoutDecision::SuccessNoCursor,
+        );
+    }
+
+    #[test]
+    fn verify_timeout_fail_resets_between_floor_and_cap() {
+        for attempt in INJECT_SOFT_RETRY_FLOOR..MAX_INJECT_ATTEMPTS {
+            assert_eq!(
+                verify_timeout_decision(attempt, true),
+                VerifyTimeoutDecision::FailReset,
+                "attempt {attempt} should fail-reset, not give up yet",
+            );
+        }
+    }
+
+    #[test]
+    fn verify_timeout_gives_up_at_cap_and_stays_bounded() {
+        // Regression for the 2026-07-10 incident: a target whose cursor never
+        // advances must NOT retry forever. Once the cap is hit, every further
+        // still-pending timeout stays GiveUp — the loop parks instead of
+        // re-injecting indefinitely.
+        assert_eq!(
+            verify_timeout_decision(MAX_INJECT_ATTEMPTS, true),
+            VerifyTimeoutDecision::GiveUp,
+        );
+        for attempt in MAX_INJECT_ATTEMPTS..=(MAX_INJECT_ATTEMPTS + 20) {
+            assert_eq!(
+                verify_timeout_decision(attempt, true),
+                VerifyTimeoutDecision::GiveUp,
+                "attempt {attempt} past the cap must remain GiveUp",
+            );
+        }
+    }
+
+    #[test]
+    fn verify_timeout_bounds_total_injections() {
+        // Drive the full pathology: cursor never advances, queue never drains.
+        // Count inject attempts until give-up. Pre-fix this was unbounded (13+
+        // observed); post-fix it must terminate exactly at the cap.
+        let mut inject_attempt = 0u32;
+        let mut injections = 0u32;
+        loop {
+            inject_attempt += 1; // mirrors the +1 at each verify timeout
+            injections += 1;
+            assert!(injections < 100, "delivery retry loop did not terminate");
+            match verify_timeout_decision(inject_attempt, true) {
+                VerifyTimeoutDecision::Retry | VerifyTimeoutDecision::FailReset => continue,
+                VerifyTimeoutDecision::GiveUp => break,
+                VerifyTimeoutDecision::SuccessNoCursor => {
+                    panic!("queue never drains in this scenario")
+                }
+            }
+        }
+        assert_eq!(injections, MAX_INJECT_ATTEMPTS);
     }
 
     #[test]
