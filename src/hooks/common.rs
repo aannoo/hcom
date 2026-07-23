@@ -70,6 +70,96 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "--new-terminal",
 ];
 
+/// True when this hook process was spawned by Grok Build.
+///
+/// Grok injects `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_HOOK_NAME` on every
+/// hook. It also loads Claude-compat hooks from `~/.claude/settings.json`, so
+/// Claude handlers often run under Grok and must not use Claude's exit-2 Stop
+/// delivery (Grok treats Stop as passive and ignores `decision: block`).
+pub fn is_grok_host() -> bool {
+    std::env::var_os("GROK_SESSION_ID").is_some()
+        || std::env::var_os("GROK_HOOK_EVENT").is_some()
+        || std::env::var_os("GROK_HOOK_NAME").is_some()
+}
+
+/// True when the submitted prompt already carries an hcom full-body inject.
+///
+/// PTY delivery for Grok types the message into the composer and hits Enter.
+/// UserPromptSubmit then fires (often twice: Claude-compat + native Grok hooks).
+/// Emitting `followup_message` again queues a **duplicate** turn. Detect the
+/// already-submitted body so hooks only ack (or no-op) instead of re-queueing.
+pub fn prompt_already_carries_hcom_body(prompt: &str, formatted: &str) -> bool {
+    let prompt = prompt.trim();
+    if prompt.is_empty() || formatted.is_empty() {
+        return false;
+    }
+    // Full-body inject is sanitized (`<>` → `[]`); compare against both forms.
+    let key: String = formatted.chars().filter(|c| *c >= ' ').take(48).collect();
+    let key = key.trim();
+    if key.len() >= 12 && prompt.contains(key) {
+        return true;
+    }
+    let sanitized: String = formatted
+        .chars()
+        .map(|c| match c {
+            '<' => '[',
+            '>' => ']',
+            c => c,
+        })
+        .take(48)
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.len() >= 12 && prompt.contains(sanitized) {
+        return true;
+    }
+    // Heuristic for our inject format: "[request #123] from → to: …"
+    prompt.contains("request #") && (prompt.contains('→') || prompt.contains("->"))
+}
+
+#[cfg(test)]
+mod grok_host_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn is_grok_host_false_without_env() {
+        // Clear any residual vars from other tests in this process.
+        unsafe {
+            std::env::remove_var("GROK_SESSION_ID");
+            std::env::remove_var("GROK_HOOK_EVENT");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        assert!(!is_grok_host());
+    }
+
+    #[test]
+    #[serial]
+    fn is_grok_host_true_with_session_id() {
+        unsafe {
+            std::env::set_var("GROK_SESSION_ID", "sess-1");
+            std::env::remove_var("GROK_HOOK_EVENT");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        assert!(is_grok_host());
+        unsafe {
+            std::env::remove_var("GROK_SESSION_ID");
+        }
+    }
+
+    #[test]
+    fn prompt_already_carries_detects_inject_format() {
+        let body = "[request #42] test → nami: hello world please reply";
+        assert!(prompt_already_carries_hcom_body(body, body));
+        assert!(prompt_already_carries_hcom_body(
+            &format!("prefix {body} suffix"),
+            body
+        ));
+        assert!(!prompt_already_carries_hcom_body("just chatting", body));
+        assert!(!prompt_already_carries_hcom_body("", body));
+    }
+}
+
 /// Pre-gate check: should hooks proceed?
 ///
 ///

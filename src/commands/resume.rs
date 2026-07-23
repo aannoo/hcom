@@ -1039,12 +1039,119 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
         crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
         crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
+        crate::tool::Tool::Grok => merge_grok_args(original, resume),
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
         crate::tool::Tool::Omp => merge_omp_args(original, resume),
         crate::tool::Tool::Adhoc => {
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
     }
+}
+
+/// Merge grok original launch args with resume args.
+///
+/// Drop prior session selectors (`--resume`/`--continue`/`--fork-session`/
+/// `--session-id`) and the stale positional task prompt; keep model and
+/// permission flags from the original launch.
+fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--model",
+        "-m",
+        "--cwd",
+        "--rules",
+        "--agent",
+        "--session-id",
+        "-s",
+        "--permission-mode",
+        "--reasoning-effort",
+        "--effort",
+        "--max-turns",
+        "--output-format",
+        "--prompt-file",
+        "--prompt-json",
+        "--disallowed-tools",
+        "--tools",
+        "--allow",
+        "--deny",
+        "--sandbox",
+    ];
+    const DROP_WITH_VALUE: &[&str] = &[
+        "--resume",
+        "-r",
+        "--session-id",
+        "-s",
+        "--single",
+        "-p",
+        "--prompt-file",
+        "--prompt-json",
+    ];
+    const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session", "--restore-code"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+
+    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip_next = false;
+    for token in resume {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let bare = lower.split('=').next().unwrap_or(&lower).to_string();
+            if VALUE_FLAGS.contains(&bare.as_str()) {
+                skip_next = !token.contains('=');
+            }
+            if !DROP_WITH_VALUE.contains(&bare.as_str()) && !DROP_BOOLEAN.contains(&bare.as_str()) {
+                resume_flags.insert(bare);
+            }
+        }
+    }
+
+    let mut filtered_original: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
+                (lower[..pos].to_string(), true)
+            } else {
+                (lower.clone(), false)
+            };
+            if DROP_WITH_VALUE.contains(&bare.as_str()) {
+                i += 1;
+                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            if DROP_BOOLEAN.contains(&bare.as_str()) {
+                i += 1;
+                continue;
+            }
+            if resume_flags.contains(&bare) {
+                i += 1;
+                if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            filtered_original.push(token.clone());
+            i += 1;
+            if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                filtered_original.push(original[i].clone());
+                i += 1;
+            }
+        } else {
+            // Drop bare positional task prompt from original launch.
+            i += 1;
+        }
+    }
+
+    let mut result = resume.to_vec();
+    result.extend(filtered_original);
+    result
 }
 
 /// Merge copilot original launch args with resume args.

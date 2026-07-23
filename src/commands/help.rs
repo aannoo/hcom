@@ -187,11 +187,11 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT] [GROK]  hcom-launched (PTY + hooks)",
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
+        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot] [grok]  vanilla (hooks only)",
     ),
     ("", "[AD-HOC]                              manual polling"),
 ];
@@ -443,7 +443,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot, .grok",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -477,7 +477,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / grok_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -864,6 +864,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "cursor-agent",
     "kimi",
     "copilot",
+    "grok",
+    "grok-build",
 ];
 
 fn resumable_tool_names() -> String {
@@ -1253,15 +1255,16 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(
-            help.contains(
-                "claude|gemini|codex|opencode|kilo|pi|omp|antigravity|cursor|kimi|copilot"
-            )
-        );
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/omp)"
+            "claude|gemini|codex|opencode|kilo|pi|omp|antigravity|cursor|kimi|copilot|grok"
+        ));
+        assert!(help.contains(
+            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/omp/grok)"
         ));
         assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
-        assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");
+        assert_eq!(
+            forkable_tool_names(),
+            "claude/codex/opencode/kilo/pi/omp/grok"
+        );
     }
 }

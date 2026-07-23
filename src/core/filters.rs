@@ -38,7 +38,7 @@ const MESSAGE_FLAGS: &[&str] = &["from", "mention", "intent", "thread", "reply_t
 const LIFE_FLAGS: &[&str] = &["action"];
 
 /// File-write tool contexts for SQL filters.
-pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create')";
+pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create', 'tool:search_replace', 'tool:MultiEdit')";
 
 /// All file operation contexts.
 pub const FILE_OP_CONTEXTS: &[&str] = &[
@@ -57,10 +57,12 @@ pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:multi_replace_file_content",
     "tool:StrReplace",
     "tool:create",
+    "tool:search_replace",
+    "tool:MultiEdit",
 ];
 
 /// Shell tool contexts.
-pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell')";
+pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command')";
 
 /// Parsed filter values — multiple values per key (OR semantics).
 pub type FilterMap = HashMap<String, Vec<String>>;

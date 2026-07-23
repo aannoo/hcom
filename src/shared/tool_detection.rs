@@ -93,6 +93,16 @@ const KIMI_NATIVE: &[EnvPredicate] = &[
         condition: EnvMatch::Set,
     },
 ];
+const GROK_NATIVE: &[EnvPredicate] = &[
+    EnvPredicate {
+        var: "GROK_SESSION_ID",
+        condition: EnvMatch::Set,
+    },
+    EnvPredicate {
+        var: "GROK_HOOK_EVENT",
+        condition: EnvMatch::Set,
+    },
+];
 const PI_NATIVE: &[EnvPredicate] = &[EnvPredicate {
     var: "HCOM_PI",
     condition: EnvMatch::Equals("1"),
@@ -120,6 +130,7 @@ hcom_tool_predicate!("kilo", HCOM_TOOL_KILO);
 hcom_tool_predicate!("cursor", HCOM_TOOL_CURSOR);
 hcom_tool_predicate!("kimi", HCOM_TOOL_KIMI);
 hcom_tool_predicate!("copilot", HCOM_TOOL_COPILOT);
+hcom_tool_predicate!("grok", HCOM_TOOL_GROK);
 hcom_tool_predicate!("pi", HCOM_TOOL_PI);
 hcom_tool_predicate!("omp", HCOM_TOOL_OMP);
 
@@ -170,6 +181,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
         tool: Tool::Kimi,
         predicates: KIMI_NATIVE,
         clear_for_child: &["KIMI_CODE_CLI", "KIMI_SESSION_ID"],
+    },
+    ToolDetectionRule {
+        tool: Tool::Grok,
+        predicates: GROK_NATIVE,
+        clear_for_child: &["GROK_SESSION_ID", "GROK_HOOK_EVENT", "GROK_HOOK_NAME"],
     },
     ToolDetectionRule {
         tool: Tool::Pi,
@@ -224,6 +240,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Copilot,
         predicates: HCOM_TOOL_COPILOT,
+        clear_for_child: &["HCOM_TOOL"],
+    },
+    ToolDetectionRule {
+        tool: Tool::Grok,
+        predicates: HCOM_TOOL_GROK,
         clear_for_child: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
