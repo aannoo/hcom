@@ -207,6 +207,37 @@ fn write_hook_output(
     Ok(())
 }
 
+/// A wake is only ever the exact `<hcom>` marker.  In particular, do not
+/// consume a user's draft when terminal injection and typing overlap.
+fn is_bare_hcom_wake(payload: &HookPayload) -> bool {
+    payload
+        .raw
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|prompt| prompt.trim() == "<hcom>")
+}
+
+/// Prevent an injected wake with no accompanying context from reaching Claude.
+/// Claude displays `reason` to the user without adding it to model context.
+fn block_bare_hcom_wake(reason: &str) -> (i32, String, Option<DeliveryAck>) {
+    let output = serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+        "suppressOriginalPrompt": true,
+    });
+    (0, output.to_string(), None)
+}
+
+fn block_unroutable_bare_hcom_wake() -> (i32, String, Option<DeliveryAck>) {
+    // A delivery race, session switch, stale/missing binding, conflicting
+    // identity evidence, or a wake landing in a subagent view can all arrive
+    // here. None of the available signals can tell those apart reliably
+    // (launch environment is replayed by Claude), so say so explicitly.
+    block_bare_hcom_wake(
+        "hcom received a wake but could not prepare delivery context for this Claude session. Another hook may already have delivered the message, or session attribution may have failed (for example, a switched or unbound session). No action is needed unless you were expecting a message; then return to the agent's main session or retry with `hcom kill <name> && hcom r <name>`. To join this session to hcom, run `hcom start`.",
+    )
+}
+
 /// Per-stage timing collected during dispatch,
 #[derive(Default)]
 struct DispatchTiming {
@@ -346,9 +377,19 @@ fn route_claude_hook(
                     });
                     return (0, output.to_string(), None, timing);
                 }
+                if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
+                    let (code, stdout, ack) = block_unroutable_bare_hcom_wake();
+                    return (code, stdout, ack, timing);
+                }
                 return (0, String::new(), None, timing);
             }
-            Err(_) => return (0, String::new(), None, timing),
+            Err(_) => {
+                if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
+                    let (code, stdout, ack) = block_unroutable_bare_hcom_wake();
+                    return (code, stdout, ack, timing);
+                }
+                return (0, String::new(), None, timing);
+            }
         };
         let (validated_root, _, root_is_primary) = common::init_hook_context(
             db,
@@ -372,6 +413,10 @@ fn route_claude_hook(
                     hook_type, session_id, root_name
                 ),
             );
+            if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
+                let (code, stdout, ack) = block_unroutable_bare_hcom_wake();
+                return (code, stdout, ack, timing);
+            }
             return (0, String::new(), None, timing);
         }
         let subagent_check_start = Instant::now();
@@ -442,6 +487,10 @@ fn route_claude_hook(
 
     let Some(ref instance_name) = instance_name else {
         timing.result = Some("no_instance");
+        if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
+            let (code, stdout, ack) = block_unroutable_bare_hcom_wake();
+            return (code, stdout, ack, timing);
+        }
         return (0, String::new(), None, timing);
     };
 
@@ -449,6 +498,10 @@ fn route_claude_hook(
         Ok(Some(data)) => data,
         _ => {
             timing.result = Some("no_instance_data");
+            if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
+                let (code, stdout, ack) = block_unroutable_bare_hcom_wake();
+                return (code, stdout, ack, timing);
+            }
             return (0, String::new(), None, timing);
         }
     };
@@ -471,6 +524,10 @@ fn route_claude_hook(
                 handle_sessionend(db, instance_name, &session_id, &payload.raw, &updates);
             timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
             return (code, stdout, None, timing);
+        }
+        if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
+            let (code, stdout, ack) = block_unroutable_bare_hcom_wake();
+            return (code, stdout, ack, timing);
         }
         return (0, String::new(), None, timing);
     }
@@ -639,6 +696,7 @@ fn route_subagent_actor_hook(
                 handle_permission_request(db, payload, &subagent_instance, &Default::default());
             (code, stdout, None)
         }
+        HOOK_USERPROMPTSUBMIT if is_bare_hcom_wake(payload) => block_unroutable_bare_hcom_wake(),
         _ => (0, String::new(), None),
     }
 }
@@ -1825,7 +1883,7 @@ fn handle_poll(
 fn handle_userpromptsubmit(
     db: &HcomDb,
     ctx: &HcomContext,
-    _payload: &HookPayload,
+    payload: &HookPayload,
     instance_name: &str,
     updates: &serde_json::Map<String, Value>,
     instance_data: &InstanceRow,
@@ -1889,6 +1947,11 @@ fn handle_userpromptsubmit(
     }
 
     lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+    if is_bare_hcom_wake(payload) {
+        return block_bare_hcom_wake(
+            "This hcom wake arrived after another hook handled the queued delivery. Nothing is pending; no action is needed.",
+        );
+    }
     (0, String::new(), None)
 }
 
@@ -5371,6 +5434,56 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn test_userpromptsubmit_only_blocks_an_exact_bare_wake_when_nothing_is_pending() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, name_announced)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        let ctx = make_ctx();
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+
+        for prompt in ["ordinary user prompt", "<hcom> user draft"] {
+            let payload = HookPayload::from_claude(serde_json::json!({ "prompt": prompt }));
+            let (_code, stdout, ack) = handle_userpromptsubmit(
+                &db,
+                &ctx,
+                &payload,
+                "nova",
+                &serde_json::Map::new(),
+                &instance,
+            );
+            assert!(stdout.is_empty(), "prompt must pass through: {prompt}");
+            assert!(ack.is_none());
+        }
+
+        let payload = HookPayload::from_claude(serde_json::json!({ "prompt": " \n<hcom>\t" }));
+        let (_code, stdout, ack) = handle_userpromptsubmit(
+            &db,
+            &ctx,
+            &payload,
+            "nova",
+            &serde_json::Map::new(),
+            &instance,
+        );
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert_eq!(output["suppressOriginalPrompt"], true);
+        assert!(
+            output["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing is pending")
+        );
+        assert!(ack.is_none());
+    }
+
     /// Property: a subagent-context hook whose row *does* resolve, but which
     /// doesn't match any actionable branch (e.g. an ordinary Edit tool call),
     /// stays a silent no-op rather than falling through to parent handling.
@@ -5499,7 +5612,7 @@ mod tests {
         let raw = serde_json::json!({
             "session_id": "sess-poisoned",
             "transcript_path": transcript,
-            "prompt": "hello"
+            "prompt": "<hcom>"
         });
         let mut payload = HookPayload::from_claude(raw);
 
@@ -5507,7 +5620,15 @@ mod tests {
             route_claude_hook(&db, &ctx, HOOK_USERPROMPTSUBMIT, &mut payload);
 
         assert_eq!(exit_code, 0);
-        assert!(stdout.is_empty());
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert_eq!(output["suppressOriginalPrompt"], true);
+        assert!(
+            output["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not prepare delivery context")
+        );
         assert!(ack.is_none());
         assert_eq!(timing.result, Some("no_instance"));
         assert_eq!(db.get_cursor("niza"), 0);
