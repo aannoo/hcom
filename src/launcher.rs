@@ -1847,15 +1847,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     });
 
     // Inject --hcom-prompt into tool args (translated per-tool).
-    // When a real hcom participant launched us, append a reply instruction so
-    // the spawned agent knows to send its result back.
+    // When a real hcom participant launched us, optionally append a reply
+    // instruction so the spawned agent knows to send its result back.
     if let Some(ref prompt) = params.initial_prompt {
-        let reply_suffix =
-            if params.append_reply_handoff && launcher_name != "api" && launcher_name != "user" {
-                format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")
-            } else {
-                String::new()
-            };
+        let reply_suffix = reply_handoff_suffix(params.append_reply_handoff, &launcher_name);
         let full_prompt = format!("{prompt}{reply_suffix}");
         append_initial_prompt_args(&normalized, &mut params.args, full_prompt)?;
     }
@@ -2458,6 +2453,17 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
 fn cleanup_instance(db: &HcomDb, name: &str, process_id: &str) {
     db.delete_instance(name).ok();
     db.delete_process_binding(process_id).ok();
+}
+
+/// Reply-handoff suffix appended after the initial prompt. The prompt is
+/// authored by the dispatcher; any reply instruction written there must stay
+/// authoritative, so callers opt in explicitly instead of always appending.
+fn reply_handoff_suffix(append: bool, launcher_name: &str) -> String {
+    if append && launcher_name != "api" && launcher_name != "user" {
+        format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")
+    } else {
+        String::new()
+    }
 }
 
 #[cfg(test)]
@@ -3721,5 +3727,19 @@ mod tests {
         assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
+    }
+
+    #[test]
+    fn test_reply_handoff_suffix_opt_in_only() {
+        // Opted out: prompt must stay exactly as authored, whoever launched us.
+        assert_eq!(reply_handoff_suffix(false, "huro"), "");
+        // Opted in from a real participant: suffix names the launcher.
+        assert_eq!(
+            reply_handoff_suffix(true, "huro"),
+            "\n\nWhen done, send your result back to @huro via hcom."
+        );
+        // Never appended for non-participant launchers, even when opted in.
+        assert_eq!(reply_handoff_suffix(true, "api"), "");
+        assert_eq!(reply_handoff_suffix(true, "user"), "");
     }
 }

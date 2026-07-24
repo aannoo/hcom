@@ -553,9 +553,8 @@ fn prepare_resume_plan_from_source(
             name: launch_name,
             skip_validation: false,
             terminal: launch_flags.terminal.clone(),
-            // Codex tracked-instance fork uses initial_prompt for an identity
-            // reset; don't dilute it with a reply-handoff suffix. Adoption-fork
-            // has no identity-reset prompt, so normal handoff rules apply.
+            // Always false on resume/fork: the prompt author owns reply
+            // semantics (see build_resume_prompts). Matches the CLI launch path.
             append_reply_handoff,
         },
         last_event_id,
@@ -846,9 +845,15 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
         (None, _) => None,
     };
 
-    // Codex tracked-instance fork uses initial_prompt for an identity reset;
-    // don't dilute it with a reply-handoff suffix. Adoption-fork has no reset.
-    let append_reply_handoff = !(fork && tool == "codex" && !is_adoption);
+    // Resume/fork never append the reply-handoff footer, for any tool. The
+    // prompt author owns reply semantics: the custom -p prompt (or the codex
+    // identity-reset prompt) is authoritative, and a hardcoded "send your
+    // result back to @<launcher>" footer contradicts prompts that say
+    // "report to X" or "no report needed". This matches the CLI launch path,
+    // which also opts out. Fork sessions don't even receive the reception-
+    // discipline primer, so there is no downstream rule to override a stray
+    // footer — all the more reason not to inject one.
+    let append_reply_handoff = false;
     (system_prompt, initial_prompt, append_reply_handoff)
 }
 
@@ -2308,6 +2313,53 @@ mod tests {
     fn test_build_resume_args_codex_resume() {
         let args = build_resume_args("codex", "sess-456", false);
         assert_eq!(args, s(&["resume", "sess-456"]));
+    }
+
+    // Reply-handoff footer must never be appended on resume/fork, for any tool
+    // or path. The prompt author owns reply semantics; a hardcoded
+    // "send your result back to @<launcher>" footer contradicts prompts that
+    // say "report to X" or "no report needed". Mirrors the CLI launch path.
+    fn append_reply_handoff_for(
+        tool: &str,
+        fork: bool,
+        is_adoption: bool,
+        child_name: Option<&str>,
+    ) -> bool {
+        let (_system, _initial, append) = build_resume_prompts(ResumePromptInput {
+            tool,
+            display_name: "luna",
+            fork,
+            is_adoption,
+            child_name,
+            effective_tag: None,
+            custom_system_prompt: None,
+            custom_initial_prompt: None,
+        });
+        append
+    }
+
+    #[test]
+    fn test_resume_never_appends_reply_handoff() {
+        // Plain tracked resume (claude / codex).
+        assert!(!append_reply_handoff_for("claude", false, false, None));
+        assert!(!append_reply_handoff_for("codex", false, false, None));
+        // Claude tracked fork (hcom f) — previously still appended the footer.
+        assert!(!append_reply_handoff_for(
+            "claude",
+            true,
+            false,
+            Some("nova")
+        ));
+        // Codex tracked fork — already suppressed before; stays suppressed.
+        assert!(!append_reply_handoff_for(
+            "codex",
+            true,
+            false,
+            Some("nova")
+        ));
+        // Adoption resume / fork (on-disk session, no prior hcom identity).
+        assert!(!append_reply_handoff_for("claude", false, true, None));
+        assert!(!append_reply_handoff_for("claude", true, true, None));
     }
 
     #[test]
