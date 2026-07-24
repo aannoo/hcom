@@ -378,6 +378,10 @@ const STOP_HELP: &[HelpEntry] = &[
 const START_HELP: &[HelpEntry] = &[
     ("start", "Connect to hcom (from inside any AI session)"),
     (
+        "start --name <agent-id>",
+        "Register a subagent using its agent ID (from SubagentStart)",
+    ),
+    (
         "start --as <name>",
         "Reclaim identity (after compaction/resume/clear)",
     ),

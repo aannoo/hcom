@@ -947,6 +947,7 @@ mod tests {
             last_stop: 0,
             status: String::from("inactive"),
             status_time: 0,
+            last_seen: 0,
             status_context: String::new(),
             status_detail: String::new(),
             directory: String::new(),
@@ -966,7 +967,6 @@ mod tests {
             terminal_preset_effective: None,
             launch_context: None,
             name_announced: 0,
-            running_tasks: None,
             idle_since: None,
         }
     }

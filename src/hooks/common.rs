@@ -1,5 +1,7 @@
 //! Shared hook functions — deliver, poll, bind, bootstrap, finalize.
 
+use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -289,6 +291,9 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
     let mut updates = serde_json::Map::new();
     updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
+    if ack.mark_announced {
+        updates.insert("name_announced".into(), serde_json::json!(true));
+    }
     instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
@@ -342,6 +347,7 @@ fn prepare_raw_messages(
             last_event_id: last_id,
             status_context: format!("deliver:{}", sender_display),
             msg_ts,
+            mark_announced: false,
         },
     })
 }
@@ -360,6 +366,21 @@ pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>
     (prepared.messages, Some(prepared.formatted))
 }
 
+/// Result of [`poll_messages`].
+pub struct PollResult {
+    /// True if a message was delivered (Stop/SubagentStop should be blocked
+    /// so Claude sees `output` on its next turn instead of ending).
+    pub delivered: bool,
+    /// `{"decision":"block","reason":...}` when `delivered`, else `None`.
+    pub output: Option<Value>,
+    pub timed_out: bool,
+    /// Deferred cursor/status commit. Caller must call `commit_delivery_ack`
+    /// only after `output` has been successfully written to stdout — never
+    /// before, since Claude only reads `output` on exit 0 and a premature
+    /// commit would advance the cursor past a message Claude never saw.
+    pub ack: Option<super::DeliveryAck>,
+}
+
 /// Stop hook polling loop — NOT used by main PTY path.
 ///
 /// Runs for: headless instances, vanilla tool instances, subagent polling.
@@ -368,17 +389,15 @@ pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
 /// Senders call `crate::notify::wake` (kind=`hook`) to wake the select().
 ///
-/// Returns (exit_code, hook_output_json, timed_out).
-/// - exit_code: 0 for timeout/no-participant, 2 for message delivery
-/// - hook_output: JSON value if messages delivered
-/// - timed_out: true if polling timed out without messages
-///
+/// Always exits 0: Claude ignores stdout JSON on exit 2 for Stop/SubagentStop
+/// (stderr-only feedback), so a delivered message must go out as exit 0 +
+/// `{"decision":"block"}` or Claude never sees it.
 pub fn poll_messages(
     db: &HcomDb,
     instance_name: &str,
     timeout_secs: u64,
     is_background: bool,
-) -> (i32, Option<Value>, bool) {
+) -> PollResult {
     match poll_messages_inner(db, instance_name, timeout_secs, is_background) {
         Ok(result) => result,
         Err(e) => {
@@ -387,7 +406,12 @@ pub fn poll_messages(
                 "hook.error",
                 &format!("hook=poll_messages err={}", e),
             );
-            (0, None, false)
+            PollResult {
+                delivered: false,
+                output: None,
+                timed_out: false,
+                ack: None,
+            }
         }
     }
 }
@@ -397,13 +421,18 @@ fn poll_messages_inner(
     instance_name: &str,
     timeout_secs: u64,
     is_background: bool,
-) -> Result<(i32, Option<Value>, bool)> {
+) -> Result<PollResult> {
     // Check instance exists
     let instance_data = db
         .get_instance_full(instance_name)
         .context("DB error checking instance")?;
     if instance_data.is_none() {
-        return Ok((0, None, false));
+        return Ok(PollResult {
+            delivered: false,
+            output: None,
+            timed_out: false,
+            ack: None,
+        });
     }
 
     // Setup TCP notification socket
@@ -452,13 +481,19 @@ fn poll_loop(
     start: Instant,
     is_background: bool,
     notify_server: Option<&TcpListener>,
-) -> Result<(i32, Option<Value>, bool)> {
+) -> Result<PollResult> {
+    let empty = || PollResult {
+        delivered: false,
+        output: None,
+        timed_out: false,
+        ack: None,
+    };
     let mut waited = false;
     while start.elapsed() < timeout {
         // Check if instance still exists (stopped = row deleted)
         let instance_data = db.get_instance_full(instance_name)?;
         if instance_data.is_none() {
-            return Ok((0, None, false));
+            return Ok(empty());
         }
 
         // Poll for messages BEFORE select to catch transition gap
@@ -468,16 +503,24 @@ fn poll_loop(
             // Only check after we've waited at least once — on the first iteration stdin
             // may legitimately be closed (e.g. subprocess invocation via `input=...`).
             if waited && !is_background && check_stdin_closed() {
-                return Ok((0, None, false));
+                return Ok(empty());
             }
 
             if let Some(prepared) = prepare_raw_messages(db, instance_name, raw_messages) {
-                commit_delivery_ack(db, &prepared.ack);
+                // Do NOT commit the ack here — the caller must only advance
+                // the cursor after `output` is actually flushed to stdout.
+                // Claude discards stdout JSON on exit 2, so this must be
+                // reported via exit 0 + decision:block for Claude to see it.
                 let output = serde_json::json!({
                     "decision": "block",
                     "reason": prepared.formatted,
                 });
-                return Ok((2, Some(output), false));
+                return Ok(PollResult {
+                    delivered: true,
+                    output: Some(output),
+                    timed_out: false,
+                    ack: Some(prepared.ack),
+                });
             }
         }
 
@@ -525,7 +568,12 @@ fn poll_loop(
     }
 
     // Timeout reached
-    Ok((0, None, true))
+    Ok(PollResult {
+        delivered: false,
+        output: None,
+        timed_out: true,
+        ack: None,
+    })
 }
 
 /// Check if stdin is closed (orphan detection heuristic).
@@ -700,16 +748,188 @@ pub fn inject_bootstrap_once(
     Some(bootstrap_text)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptOwnerResolution {
+    Owner(String),
+    Ambiguous(Vec<String>),
+    Unknown,
+}
+
+/// Resolve Claude ownership from bounded, structured transcript/session evidence.
+///
+/// Only envelope metadata is inspected. Ordinary message content, summaries,
+/// tool output, bootstrap text, and `[hcom:name]` markers are intentionally out
+/// of scope for lineage resolution.
+pub(crate) fn resolve_claude_transcript_owner(
+    db: &HcomDb,
+    transcript_path: &str,
+    incoming_session_id: Option<&str>,
+) -> Result<TranscriptOwnerResolution> {
+    const MAX_BYTES: usize = 512 * 1024;
+    const MAX_RECORDS: usize = 2048;
+
+    let mut owners = BTreeSet::new();
+    let mut structured_session_ids = BTreeSet::new();
+
+    let incoming_is_validated = match incoming_session_id.filter(|value| !value.is_empty()) {
+        Some(session_id) => db.get_validated_claude_session_owner(session_id)?.is_some(),
+        None => false,
+    };
+    if incoming_is_validated && let Some(session_id) = incoming_session_id {
+        // A hook-provided incoming ID is only self-authenticating after a
+        // trusted SessionStart or prior structured-lineage validation.
+        structured_session_ids.insert(session_id.to_string());
+    }
+
+    if !transcript_path.is_empty() {
+        owners.extend(db.get_instances_by_transcript_path(transcript_path)?);
+
+        match std::fs::File::open(transcript_path) {
+            Ok(file) => {
+                // Head-biased by design: fork ancestry is copied into the first
+                // records, and SessionStart must never stall on a huge transcript.
+                let mut input = Vec::with_capacity(MAX_BYTES + 1);
+                file.take((MAX_BYTES + 1) as u64).read_to_end(&mut input)?;
+                let input_is_truncated = input.len() > MAX_BYTES;
+                input.truncate(MAX_BYTES);
+                for line in input
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .take(MAX_RECORDS)
+                {
+                    // The bounded read may end in the middle of a UTF-8 code
+                    // point or JSON record. Ignore only that incomplete tail
+                    // rather than failing after valid earlier rows.
+                    if input_is_truncated && !line.ends_with(b"\n") {
+                        break;
+                    }
+                    let Ok(line) = std::str::from_utf8(line) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    for session_id in [
+                        value.get("sessionId").and_then(Value::as_str),
+                        value.get("session_id").and_then(Value::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    {
+                        // Claude rewrites top-level IDs to the new fork UUID.
+                        // Until that incoming binding is validated, the same ID
+                        // cannot prove its own ownership. Different top-level
+                        // IDs remain useful structured ancestry evidence.
+                        if incoming_session_id != Some(session_id) || incoming_is_validated {
+                            structured_session_ids.insert(session_id.to_string());
+                        }
+                    }
+                    if let Some(session_id) = value
+                        .get("message")
+                        .and_then(|message| message.get("session_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        // Envelope message.session_id is independent structured
+                        // provenance and may legitimately equal the current ID.
+                        structured_session_ids.insert(session_id.to_string());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    for session_id in structured_session_ids {
+        if let Some(owner) = db.get_session_binding(&session_id)? {
+            owners.insert(owner);
+        }
+    }
+
+    Ok(match owners.len() {
+        0 => TranscriptOwnerResolution::Unknown,
+        1 => TranscriptOwnerResolution::Owner(owners.into_iter().next().unwrap()),
+        _ => TranscriptOwnerResolution::Ambiguous(owners.into_iter().collect()),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeIdentityEvidence {
+    pub process_binding: Option<(Option<String>, String)>,
+    pub process_session_id: Option<String>,
+    pub process_owner: Option<String>,
+    pub session_owner: Option<String>,
+    pub validated_session_owner: Option<String>,
+    pub owners_disagree: bool,
+    pub lineage_scanned: bool,
+    pub lineage: TranscriptOwnerResolution,
+}
+
+/// Load the identity facts shared by SessionStart and ordinary Claude hooks.
+///
+/// The caller supplies only the lineage-scan policy; owner selection remains
+/// local to each resolution path.
+pub(crate) fn load_claude_identity_evidence(
+    db: &HcomDb,
+    process_id: Option<&str>,
+    session_id: &str,
+    transcript_path: &str,
+    should_scan_lineage: impl FnOnce(&ClaudeIdentityEvidence) -> bool,
+) -> Result<ClaudeIdentityEvidence> {
+    let process_binding = match process_id.filter(|value| !value.is_empty()) {
+        Some(process_id) => db.get_process_binding_full(process_id)?,
+        None => None,
+    };
+    let process_session_id = process_binding
+        .as_ref()
+        .and_then(|(session_id, _)| session_id.clone());
+    let process_owner = process_binding
+        .as_ref()
+        .map(|(_, instance_name)| instance_name.clone());
+    let session_owner = if session_id.is_empty() {
+        None
+    } else {
+        db.get_session_binding(session_id)?
+    };
+    let validated_session_owner = if session_id.is_empty() {
+        None
+    } else {
+        db.get_validated_claude_session_owner(session_id)?
+    };
+    let owners_disagree = matches!(
+        (&process_owner, &session_owner),
+        (Some(process_owner), Some(session_owner)) if process_owner != session_owner
+    );
+
+    let mut evidence = ClaudeIdentityEvidence {
+        process_binding,
+        process_session_id,
+        process_owner,
+        session_owner,
+        validated_session_owner,
+        owners_disagree,
+        lineage_scanned: false,
+        lineage: TranscriptOwnerResolution::Unknown,
+    };
+    evidence.lineage_scanned = should_scan_lineage(&evidence);
+    if evidence.lineage_scanned {
+        evidence.lineage = resolve_claude_transcript_owner(
+            db,
+            transcript_path,
+            (!session_id.is_empty()).then_some(session_id),
+        )?;
+    }
+    Ok(evidence)
+}
+
 /// Initialize instance context from hook data via binding lookup.
 ///
-/// Primary gate for hook participation. Resolution order:
-/// 1. HCOM_PROCESS_ID → process_bindings → instance_name
-/// 2. session_id → session_bindings → instance_name
-/// 3. Transcript marker fallback
-/// 4. Not found → (None, empty, false)
+/// Structured session/transcript identity wins over a conflicting process
+/// binding. Transcript scanning stays off the common hot path: it runs only
+/// when the session is unbound or its binding has not yet been validated.
 ///
 /// Returns (instance_name, metadata_updates, is_matched_resume).
-///
 pub fn init_hook_context(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -717,64 +937,132 @@ pub fn init_hook_context(
     transcript_path: &str,
 ) -> (Option<String>, serde_json::Map<String, Value>, bool) {
     let start = Instant::now();
-    let mut instance_name: Option<String> = None;
-
-    // Path 1: Process binding (hcom-launched instances)
-    let process_start = Instant::now();
-    if let Some(ref process_id) = ctx.process_id
-        && let Ok(Some(name)) = db.get_process_binding(process_id)
-    {
-        instance_name = Some(name);
-    }
-    let process_ms = process_start.elapsed().as_secs_f64() * 1000.0;
-
-    // Path 2: Session binding
-    let binding_start = Instant::now();
-    if instance_name.is_none()
-        && !session_id.is_empty()
-        && let Ok(Some(name)) = db.get_session_binding(session_id)
-    {
-        instance_name = Some(name);
-    }
-    let binding_ms = binding_start.elapsed().as_secs_f64() * 1000.0;
-
-    // Path 3: Transcript marker fallback
-    let transcript_start = Instant::now();
-    if instance_name.is_none() {
-        instance_name = try_bind_from_transcript(db, session_id, transcript_path);
-        if instance_name.is_none() {
-            let transcript_ms = transcript_start.elapsed().as_secs_f64() * 1000.0;
-            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            log::log_info(
+    let evidence = match load_claude_identity_evidence(
+        db,
+        ctx.process_id.as_deref(),
+        session_id,
+        transcript_path,
+        |evidence| {
+            let binding_needs_validation = evidence.session_owner.is_some()
+                && evidence.validated_session_owner.as_ref() != evidence.session_owner.as_ref();
+            evidence.session_owner.is_none() || binding_needs_validation
+        },
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            log::log_warn(
                 "hooks",
-                "init_hook_context.timing",
+                "init_hook_context.identity_evidence_error",
                 &format!(
-                    "process_ms={:.2} binding_ms={:.2} transcript_ms={:.2} total_ms={:.2} result=no_instance",
-                    process_ms, binding_ms, transcript_ms, total_ms
+                    "session_id={} transcript_path={} process_id={:?} err={}",
+                    session_id, transcript_path, ctx.process_id, error
                 ),
             );
             return (None, serde_json::Map::new(), false);
         }
+    };
+    let evidence_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let historical_process_binding = evidence
+        .process_session_id
+        .as_deref()
+        .filter(|bound_session_id| !bound_session_id.is_empty())
+        .is_some_and(|bound_session_id| bound_session_id != session_id);
+
+    let mut instance_name = if let Some(validated_owner) = evidence.validated_session_owner.clone()
+    {
+        Some(validated_owner)
+    } else if evidence.lineage_scanned {
+        match &evidence.lineage {
+            TranscriptOwnerResolution::Owner(owner) => Some(owner.clone()),
+            TranscriptOwnerResolution::Ambiguous(owners) => {
+                log::log_warn(
+                    "hooks",
+                    "init_hook_context.identity_ambiguous",
+                    &format!(
+                        "session_id={} transcript_path={} process_id={:?} process_owner={:?} session_owner={:?} transcript_owners={:?}",
+                        session_id,
+                        transcript_path,
+                        ctx.process_id,
+                        evidence.process_owner,
+                        evidence.session_owner,
+                        owners,
+                    ),
+                );
+                None
+            }
+            TranscriptOwnerResolution::Unknown => {
+                if evidence.session_owner.is_some() {
+                    log::log_warn(
+                        "hooks",
+                        "init_hook_context.unvalidated_session_rejected",
+                        &format!(
+                            "session_id={} transcript_path={} process_id={:?} process_owner={:?} session_owner={:?}",
+                            session_id,
+                            transcript_path,
+                            ctx.process_id,
+                            evidence.process_owner,
+                            evidence.session_owner,
+                        ),
+                    );
+                    None
+                } else if historical_process_binding {
+                    log::log_warn(
+                        "hooks",
+                        "init_hook_context.historical_process_rejected",
+                        &format!(
+                            "session_id={} transcript_path={} process_id={:?} process_session_id={:?} process_owner={:?}",
+                            session_id,
+                            transcript_path,
+                            ctx.process_id,
+                            evidence.process_session_id,
+                            evidence.process_owner,
+                        ),
+                    );
+                    None
+                } else {
+                    evidence.process_owner.clone()
+                }
+            }
+        }
+    } else {
+        evidence
+            .session_owner
+            .clone()
+            .or_else(|| evidence.process_owner.clone())
+    };
+
+    if instance_name.is_none()
+        && !matches!(&evidence.lineage, TranscriptOwnerResolution::Ambiguous(_))
+        && evidence.session_owner.is_none()
+        && evidence.process_owner.is_none()
+    {
+        instance_name = try_bind_from_transcript(db, session_id, transcript_path);
     }
-    let transcript_ms = transcript_start.elapsed().as_secs_f64() * 1000.0;
+    let Some(name) = instance_name else {
+        log::log_info(
+            "hooks",
+            "init_hook_context.timing",
+            &format!(
+                "evidence_ms={:.2} total_ms={:.2} result=no_instance owners_disagree={}",
+                evidence_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
+                evidence.owners_disagree
+            ),
+        );
+        return (None, serde_json::Map::new(), false);
+    };
 
-    let name = instance_name.unwrap();
-
-    // Build metadata updates
-    let instance_start = Instant::now();
     let mut updates = serde_json::Map::new();
     updates.insert(
         "directory".into(),
         Value::String(ctx.cwd.to_string_lossy().to_string()),
     );
-
     if !transcript_path.is_empty() {
         updates.insert(
             "transcript_path".into(),
             Value::String(transcript_path.to_string()),
         );
     }
-
     if ctx.is_background
         && let Some(ref bg_name) = ctx.background_name
     {
@@ -786,25 +1074,52 @@ pub fn init_hook_context(
         );
     }
 
-    // Check if session matches (resume detection)
-    let is_matched_resume = if !session_id.is_empty() {
-        db.get_instance_full(&name)
-            .ok()
-            .flatten()
-            .map(|data| data.session_id.as_deref() == Some(session_id))
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    let instance_ms = instance_start.elapsed().as_secs_f64() * 1000.0;
+    let instance = db.get_instance_full(&name).ok().flatten();
+    let is_matched_resume = !session_id.is_empty()
+        && instance
+            .as_ref()
+            .is_some_and(|data| data.session_id.as_deref() == Some(session_id));
 
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if is_matched_resume
+        && matches!(&evidence.lineage, TranscriptOwnerResolution::Owner(owner) if owner == &name)
+        && evidence.session_owner.as_deref() == Some(name.as_str())
+        && let Err(error) = db.mark_claude_session_validated(session_id, &name)
+    {
+        log::log_warn(
+            "hooks",
+            "init_hook_context.validation_cache_write_failed",
+            &format!("session_id={} owner={} err={}", session_id, name, error),
+        );
+    }
+
+    if evidence.lineage_scanned
+        && matches!(&evidence.lineage, TranscriptOwnerResolution::Owner(owner) if owner == &name)
+        && !is_matched_resume
+    {
+        log::log_warn(
+            "hooks",
+            "init_hook_context.unpromoted_lineage_rejected",
+            &format!(
+                "session_id={} owner={} primary_session={:?} total_ms={:.2}",
+                session_id,
+                name,
+                instance.as_ref().and_then(|row| row.session_id.as_deref()),
+                start.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
+        return (None, serde_json::Map::new(), false);
+    }
+
     log::log_info(
         "hooks",
         "init_hook_context.timing",
         &format!(
-            "instance={} process_ms={:.2} binding_ms={:.2} transcript_ms={:.2} instance_ms={:.2} total_ms={:.2}",
-            name, process_ms, binding_ms, transcript_ms, instance_ms, total_ms
+            "instance={} evidence_ms={:.2} total_ms={:.2} validated={} owners_disagree={}",
+            name,
+            evidence_ms,
+            start.elapsed().as_secs_f64() * 1000.0,
+            evidence.validated_session_owner.is_some(),
+            evidence.owners_disagree,
         ),
     );
 
@@ -860,6 +1175,13 @@ fn try_bind_from_transcript(
     let mut updates = serde_json::Map::new();
     updates.insert("session_id".into(), Value::String(session_id.to_string()));
     instances::update_instance_position(db, &instance_name, &updates);
+    if let Err(error) = db.mark_claude_session_validated(session_id, &instance_name) {
+        log::log_warn(
+            "hooks",
+            "transcript.bind.validation_cache_failed",
+            &format!("instance={} err={}", instance_name, error),
+        );
+    }
 
     log::log_info(
         "hooks",
@@ -1097,14 +1419,17 @@ fn stop_instance_inner(
         "tool": instance_data.tool,
         "directory": instance_data.directory,
         "parent_name": instance_data.parent_name,
+        "parent_session_id": instance_data.parent_session_id,
         "tag": instance_data.tag,
         "wait_timeout": instance_data.wait_timeout,
         "subagent_timeout": instance_data.subagent_timeout,
         "hints": instance_data.hints,
         "pid": instance_data.pid,
         "created_at": instance_data.created_at,
+        "last_seen": instance_data.last_seen,
         "background": instance_data.background,
         "agent_id": instance_data.agent_id,
+        "name_announced": instance_data.name_announced,
         "launch_args": instance_data.launch_args,
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
@@ -1206,6 +1531,15 @@ fn stop_instance_inner(
         }
     }
 
+    // Capabilities are scoped to the deleted actor. Root teardown also
+    // revokes every child token in the shared Claude session and drops
+    // outstanding stop-claim correlation records.
+    let _ = db.revoke_claude_actor_capabilities_for_instance(instance_name);
+    if let Some(ref session_id) = instance_data.session_id {
+        let _ = db.revoke_claude_actor_capabilities_for_session(session_id);
+        let _ = db.kv_delete_prefix(&format!("subagent_stop_inflight:{session_id}:"));
+    }
+
     // Notify remaining listeners AFTER delete (so they see the row is gone)
     crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
 
@@ -1263,14 +1597,17 @@ pub fn soft_finalize_session(
         "tool": instance_data.tool,
         "directory": instance_data.directory,
         "parent_name": instance_data.parent_name,
+        "parent_session_id": instance_data.parent_session_id,
         "tag": instance_data.tag,
         "wait_timeout": instance_data.wait_timeout,
         "subagent_timeout": instance_data.subagent_timeout,
         "hints": instance_data.hints,
         "pid": instance_data.pid,
         "created_at": instance_data.created_at,
+        "last_seen": instance_data.last_seen,
         "background": instance_data.background,
         "agent_id": instance_data.agent_id,
+        "name_announced": instance_data.name_announced,
         "launch_args": instance_data.launch_args,
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
@@ -1510,6 +1847,334 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_bound_claude_instance(
+        db: &crate::db::HcomDb,
+        name: &str,
+        session_id: &str,
+        transcript_path: &str,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, session_id, transcript_path, status, status_context, status_time, created_at, last_event_id)
+                 VALUES (?1, 'claude', ?2, ?3, 'listening', 'start', 0, 0, 0)",
+                rusqlite::params![name, session_id, transcript_path],
+            )
+            .unwrap();
+        db.set_session_binding(session_id, name).unwrap();
+        db.mark_claude_session_validated(session_id, name).unwrap();
+    }
+
+    fn context_with_process_id(
+        cwd: &std::path::Path,
+        process_id: Option<&str>,
+    ) -> crate::shared::context::HcomContext {
+        let mut env = std::collections::HashMap::new();
+        if let Some(process_id) = process_id {
+            env.insert("HCOM_PROCESS_ID".to_string(), process_id.to_string());
+        }
+        crate::shared::context::HcomContext::from_env(&env, cwd.to_path_buf())
+    }
+
+    #[test]
+    fn transcript_lineage_uses_structured_fork_ancestry() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        let transcript = dir.path().join("fork.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-new\",\"message\":{\"session_id\":\"session-original\"}}\n",
+                "{\"session_id\":\"session-new\"}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(
+                &db,
+                transcript.to_str().unwrap(),
+                Some("session-new"),
+            )
+            .unwrap(),
+            TranscriptOwnerResolution::Owner("niza".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_deduplicates_multiple_records_for_one_owner() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        let transcript = dir.path().join("same-owner.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-original\"}\n",
+                "{\"session_id\":\"session-original\"}\n",
+                "{\"message\":{\"session_id\":\"session-original\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Owner("niza".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_rejects_conflicting_owners() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        let transcript = dir.path().join("conflict.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-niza\"}\n",
+                "{\"message\":{\"session_id\":\"session-lava\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Ambiguous(vec!["lava".to_string(), "niza".to_string()])
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_ignores_ids_inside_message_content() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        let transcript = dir.path().join("quoted.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"content\":\"quoted session_id session-lava\",\"nested\":{\"session_id\":\"session-lava\"}}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_handles_missing_and_oversized_files() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        assert_eq!(
+            resolve_claude_transcript_owner(
+                &db,
+                dir.path().join("missing.jsonl").to_str().unwrap(),
+                None,
+            )
+            .unwrap(),
+            TranscriptOwnerResolution::Unknown
+        );
+
+        let transcript = dir.path().join("oversized.jsonl");
+        let mut file = std::fs::File::create(&transcript).unwrap();
+        for _ in 0..2048 {
+            writeln!(file, "{{\"type\":\"padding\"}}").unwrap();
+        }
+        writeln!(file, "{{\"sessionId\":\"session-original\"}}").unwrap();
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_ignores_truncated_utf8_tail() {
+        const MAX_BYTES: usize = 512 * 1024;
+
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        let transcript = dir.path().join("truncated-utf8.jsonl");
+        let mut contents = b"{\"sessionId\":\"session-original\"}\n".to_vec();
+        contents.resize(MAX_BYTES - 1, b' ');
+        contents.extend_from_slice("€\n".as_bytes());
+        std::fs::write(&transcript, contents).unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Owner("niza".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_rejects_duplicate_exact_path_owners() {
+        let (dir, db) = make_test_db();
+        let transcript = dir.path().join("shared.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        insert_bound_claude_instance(&db, "niza", "session-niza", transcript.to_str().unwrap());
+        insert_bound_claude_instance(&db, "lava", "session-lava", transcript.to_str().unwrap());
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Ambiguous(vec!["lava".to_string(), "niza".to_string()])
+        );
+    }
+
+    #[test]
+    fn hook_context_skips_transcript_scan_when_process_and_session_agree() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        db.set_process_binding("process-niza", "session-niza", "niza")
+            .unwrap();
+        let transcript = dir.path().join("irrelevant-conflict.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-lava\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-niza"));
+
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_uses_session_owner_with_empty_process_id() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        let ctx = context_with_process_id(dir.path(), Some(""));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_prefers_session_owner_over_conflicting_process_owner() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        db.set_process_binding("process-restored", "session-lava", "lava")
+            .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_fails_closed_on_poisoned_session_vs_transcript_ancestry() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        insert_bound_claude_instance(&db, "lava", "session-poisoned", "");
+        db.kv_set("claude_lineage_validated:session-poisoned", None)
+            .unwrap();
+        db.set_process_binding("process-restored", "session-original", "niza")
+            .unwrap();
+        let transcript = dir.path().join("poisoned.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-original\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
+
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-poisoned", transcript.to_str().unwrap());
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn hook_context_revalidates_agreeing_but_untrusted_poisoned_binding() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        insert_bound_claude_instance(&db, "lava", "session-poisoned", "");
+        db.kv_set("claude_lineage_validated:session-poisoned", None)
+            .unwrap();
+        db.set_process_binding("process-poisoned", "session-poisoned", "lava")
+            .unwrap();
+        let transcript = dir.path().join("poisoned-agree.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"session-poisoned\",\"message\":{\"session_id\":\"session-original\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-poisoned"));
+
+        let (owner, _, is_primary) =
+            init_hook_context(&db, &ctx, "session-poisoned", transcript.to_str().unwrap());
+        assert!(owner.is_none());
+        assert!(!is_primary, "ordinary hooks must not promote a generation");
+        assert_eq!(
+            db.get_instance_full("lava")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "start",
+            "rejecting a hook must not mutate the other instance's status"
+        );
+    }
+
+    #[test]
+    fn hook_context_caches_validated_lineage_after_one_scan() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        db.kv_set("claude_lineage_validated:session-niza", None)
+            .unwrap();
+        db.set_process_binding("process-niza", "session-niza", "niza")
+            .unwrap();
+        let transcript = dir.path().join("validate-once.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-niza\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-niza"));
+
+        let (owner, _, is_primary) =
+            init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("niza"));
+        assert!(is_primary);
+        assert_eq!(
+            db.get_validated_claude_session_owner("session-niza")
+                .unwrap()
+                .as_deref(),
+            Some("niza")
+        );
+
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-other\"}}\n",
+        )
+        .unwrap();
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_rejects_historical_process_fallback_for_unbound_session() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "lava", "session-old", "");
+        db.set_process_binding("process-restored", "session-old", "lava")
+            .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-new", "");
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn hook_context_keeps_fresh_process_fallback_without_lineage() {
+        let (dir, db) = make_test_db();
+        insert_test_instance(&db, "fresh");
+        db.set_process_binding("process-fresh", "", "fresh")
+            .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-fresh"));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-new", "");
+        assert_eq!(owner.as_deref(), Some("fresh"));
+    }
+
     fn insert_test_message(
         db: &crate::db::HcomDb,
         instance: &str,
@@ -1587,11 +2252,16 @@ mod tests {
             "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('parent', 'pty', 9999, 0)",
             [],
         );
-        // Add process binding
+        // Add process binding and Claude actor correlation state
         let _ = db.conn().execute(
             "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at) VALUES ('proc-1', 'sess-1', 'parent', 0)",
             [],
         );
+        let token = db
+            .issue_claude_actor_capability("sess-1", "tool-1", None, "parent")
+            .unwrap();
+        db.kv_set("subagent_stop_inflight:sess-1:a1:x", Some("owner"))
+            .unwrap();
 
         stop_instance(&db, "parent", "test", "test_cleanup");
 
@@ -1627,6 +2297,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0, "process bindings should be deleted");
+
+        assert_eq!(
+            db.resolve_claude_actor_capability(&token, "sess-1")
+                .unwrap(),
+            None,
+            "root stop should revoke session actor capabilities"
+        );
+        let claude_kv: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'subagent_stop_inflight:sess-1:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            claude_kv, 0,
+            "root stop should remove Claude actor correlation state"
+        );
 
         // Life event should be logged
         let count: i64 = db

@@ -1,10 +1,85 @@
 //! Session and process binding helpers.
 
 use anyhow::{Result, bail};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::HcomDb;
 use crate::shared::time::now_epoch_f64;
+
+const CLAUDE_LINEAGE_VALIDATION_PREFIX: &str = "claude_lineage_validated:";
+
+fn claude_lineage_validation_key(session_id: &str) -> String {
+    format!("{CLAUDE_LINEAGE_VALIDATION_PREFIX}{session_id}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeProcessBindingClassification {
+    Missing,
+    SelectedOwner,
+    ForeignLive,
+    ForeignStale,
+}
+
+fn classify_claude_process_binding(
+    txn: &Transaction<'_>,
+    process_id: &str,
+    selected_owner: &str,
+) -> Result<ClaudeProcessBindingClassification> {
+    if process_id.is_empty() {
+        return Ok(ClaudeProcessBindingClassification::Missing);
+    }
+    let binding = txn
+        .query_row(
+            "SELECT session_id, instance_name FROM process_bindings WHERE process_id = ?",
+            params![process_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((bound_session_id, bound_instance)) = binding else {
+        return Ok(ClaudeProcessBindingClassification::Missing);
+    };
+    if bound_instance == selected_owner {
+        return Ok(ClaudeProcessBindingClassification::SelectedOwner);
+    }
+
+    let stale = match bound_session_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(bound_session_id) => {
+            let bound_primary = txn
+                .query_row(
+                    "SELECT session_id FROM instances WHERE name = ?",
+                    params![&bound_instance],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            let bound_alias_owner = txn
+                .query_row(
+                    "SELECT instance_name FROM session_bindings WHERE session_id = ?",
+                    params![bound_session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            bound_primary.as_deref() != Some(bound_session_id)
+                || bound_alias_owner.as_deref() != Some(bound_instance.as_str())
+        }
+        None => true,
+    };
+    Ok(if stale {
+        ClaudeProcessBindingClassification::ForeignStale
+    } else {
+        ClaudeProcessBindingClassification::ForeignLive
+    })
+}
+
+fn claude_children_for_session(txn: &Transaction<'_>, session_id: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        txn.prepare_cached("SELECT name FROM instances WHERE parent_session_id = ? ORDER BY name")?;
+    let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +131,21 @@ impl HcomDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Return all instance names whose current transcript path exactly matches.
+    ///
+    /// Duplicate matches are returned deliberately so identity resolution can
+    /// reject them as ambiguous instead of silently selecting one row.
+    pub fn get_instances_by_transcript_path(&self, transcript_path: &str) -> Result<Vec<String>> {
+        if transcript_path.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT name FROM instances WHERE transcript_path = ?")?;
+        let rows = stmt.query_map(params![transcript_path], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Migrate notify endpoints from old instance to new instance.
@@ -195,25 +285,6 @@ impl HcomDb {
         if let Some(existing) = self.get_session_binding(session_id)?
             && existing != instance_name
         {
-            // Check if this is a subagent trying to bind without --name <agent_id>
-            if let Ok(Some(inst)) = self.get_instance(&existing)
-                && let Some(rt) = inst.get("running_tasks").and_then(|v| v.as_str())
-                && let Ok(tasks) = serde_json::from_str::<serde_json::Value>(rt)
-                && let Some(subs) = tasks.get("subagents").and_then(|v| v.as_array())
-                && !subs.is_empty()
-            {
-                let ids: Vec<&str> = subs
-                    .iter()
-                    .filter_map(|s| s.get("agent_id").and_then(|v| v.as_str()))
-                    .collect();
-                bail!(
-                    "Session bound to parent '{}'. \
-                                         Subagents must use: hcom start --name <agent_id>\n\
-                                         Active agent_ids: {}",
-                    existing,
-                    ids.join(", ")
-                );
-            }
             bail!(
                 "Session {}... already bound to {}, cannot bind to {}",
                 &session_id[..session_id.len().min(8)],
@@ -364,6 +435,182 @@ impl HcomDb {
             params![process_id, sid, instance_name, now],
         )?;
         Ok(())
+    }
+
+    /// Return the owner cached after Claude transcript lineage was validated.
+    ///
+    /// The cache is only trusted while it agrees with the live session binding;
+    /// a later rebind automatically invalidates a stale cache entry.
+    pub fn get_validated_claude_session_owner(&self, session_id: &str) -> Result<Option<String>> {
+        if session_id.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(owner) = self.kv_get(&claude_lineage_validation_key(session_id))? else {
+            return Ok(None);
+        };
+        if self.get_session_binding(session_id)?.as_deref() == Some(owner.as_str()) {
+            Ok(Some(owner))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Mark a Claude session binding as validated by a trusted SessionStart or
+    /// bounded structured transcript lineage.
+    pub fn mark_claude_session_validated(
+        &self,
+        session_id: &str,
+        instance_name: &str,
+    ) -> Result<()> {
+        if session_id.is_empty() || instance_name.is_empty() {
+            return Ok(());
+        }
+        if self.get_session_binding(session_id)?.as_deref() != Some(instance_name) {
+            bail!(
+                "cannot validate Claude session {} for non-owner {}",
+                session_id,
+                instance_name
+            );
+        }
+        self.kv_set(
+            &claude_lineage_validation_key(session_id),
+            Some(instance_name),
+        )
+    }
+
+    /// Remove cached Claude lineage validation for a session generation.
+    pub fn clear_claude_session_validation(&self, session_id: &str) -> Result<()> {
+        if session_id.is_empty() {
+            return Ok(());
+        }
+        self.kv_set(&claude_lineage_validation_key(session_id), None)
+    }
+
+    /// Attach and promote a Claude session generation without deleting older
+    /// aliases. Identity writes and validation-cache updates are atomic.
+    ///
+    /// Only the process row that delivered this SessionStart may be refreshed.
+    /// A live foreign process row is preserved; a genuinely stale conflicting
+    /// row is deleted. Returns true when that stale row was removed.
+    pub fn attach_claude_generation(
+        &self,
+        instance_name: &str,
+        session_id: &str,
+        transcript_path: &str,
+        process_id: &str,
+        _process_owner: Option<&str>,
+    ) -> Result<bool> {
+        if instance_name.is_empty() || session_id.is_empty() {
+            return Ok(false);
+        }
+
+        let now = now_epoch_f64();
+        let validation_key = claude_lineage_validation_key(session_id);
+        self.with_immediate_transaction(|txn| {
+            let old_primary_session = txn
+                .query_row(
+                    "SELECT session_id FROM instances WHERE name = ?",
+                    params![instance_name],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Claude lineage owner {} does not exist", instance_name)
+                })?
+                .filter(|old_session_id| old_session_id != session_id);
+
+            // parent_session_id has an immediate FK to instances.session_id.
+            // Detach known children before changing the root key, then restore
+            // them to the promoted generation inside the same transaction.
+            let children = match old_primary_session.as_deref() {
+                Some(old_session_id) => claude_children_for_session(txn, old_session_id)?,
+                None => Vec::new(),
+            };
+            for child in &children {
+                txn.execute(
+                    "UPDATE instances SET parent_session_id = NULL
+                     WHERE name = ? AND parent_session_id = ?",
+                    params![child, old_primary_session.as_deref()],
+                )?;
+            }
+
+            // The incoming generation may currently be (incorrectly) primary
+            // on another root. Its children reference that primary key through
+            // an immediate FK, so detach them before clearing the displaced
+            // root. They remain addressable by name/agent id but no longer
+            // claim ancestry under the repaired session generation.
+            let displaced_owner = txn
+                .query_row(
+                    "SELECT name FROM instances WHERE session_id = ? AND name != ? LIMIT 1",
+                    params![session_id, instance_name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if displaced_owner.is_some() {
+                txn.execute(
+                    "UPDATE instances SET parent_session_id = NULL
+                     WHERE parent_session_id = ?",
+                    params![session_id],
+                )?;
+            }
+
+            txn.execute(
+                "UPDATE instances SET session_id = NULL WHERE session_id = ? AND name != ?",
+                params![session_id, instance_name],
+            )?;
+            txn.execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     instance_name = excluded.instance_name,
+                     created_at = excluded.created_at",
+                params![session_id, instance_name, now],
+            )?;
+            txn.execute(
+                "UPDATE instances
+                 SET session_id = ?,
+                     transcript_path = CASE WHEN ? = '' THEN transcript_path ELSE ? END
+                 WHERE name = ?",
+                params![session_id, transcript_path, transcript_path, instance_name],
+            )?;
+            for child in &children {
+                txn.execute(
+                    "UPDATE instances SET parent_session_id = ?
+                     WHERE name = ? AND parent_session_id IS NULL",
+                    params![session_id, child],
+                )?;
+            }
+            txn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                params![validation_key, instance_name],
+            )?;
+
+            let classification = classify_claude_process_binding(txn, process_id, instance_name)?;
+            match classification {
+                ClaudeProcessBindingClassification::SelectedOwner => {
+                    txn.execute(
+                        "UPDATE process_bindings
+                         SET session_id = ?, updated_at = ?
+                         WHERE process_id = ? AND instance_name = ?",
+                        params![session_id, now, process_id, instance_name],
+                    )?;
+                }
+                ClaudeProcessBindingClassification::ForeignStale => {
+                    txn.execute(
+                        "DELETE FROM process_bindings WHERE process_id = ?",
+                        params![process_id],
+                    )?;
+                }
+                ClaudeProcessBindingClassification::Missing
+                | ClaudeProcessBindingClassification::ForeignLive => {}
+            }
+
+            Ok(matches!(
+                classification,
+                ClaudeProcessBindingClassification::ForeignStale
+            ))
+        })
     }
 
     /// Delete all process bindings for an instance.
@@ -588,6 +835,293 @@ mod tests {
         db.delete_process_binding("pid-123").unwrap();
         assert!(!db.has_process_binding_for_instance("luna"));
 
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_preserves_aliases_and_refreshes_only_current_process() {
+        let (db, db_path) = setup_full_test_db();
+        for (name, session_id) in [("niza", "sess-old"), ("lava", "sess-lava")] {
+            db.conn
+                .execute(
+                    "INSERT INTO instances (name, session_id, created_at) VALUES (?1, ?2, 1000.0)",
+                    params![name, session_id],
+                )
+                .unwrap();
+            db.set_session_binding(session_id, name).unwrap();
+        }
+        db.set_process_binding("pid-niza-current", "sess-old", "niza")
+            .unwrap();
+        db.set_process_binding("pid-niza-historical", "sess-older", "niza")
+            .unwrap();
+        db.set_process_binding("pid-lava", "sess-lava", "lava")
+            .unwrap();
+
+        assert!(
+            !db.attach_claude_generation(
+                "niza",
+                "sess-new",
+                "/tmp/new.jsonl",
+                "pid-niza-current",
+                Some("niza"),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_session_binding("sess-old").unwrap().as_deref(),
+            Some("niza")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("niza")
+        );
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-new")
+                .unwrap()
+                .as_deref(),
+            Some("niza")
+        );
+        assert_eq!(
+            db.get_process_binding_full("pid-niza-current").unwrap(),
+            Some((Some("sess-new".to_string()), "niza".to_string()))
+        );
+        assert_eq!(
+            db.get_process_binding_full("pid-niza-historical").unwrap(),
+            Some((Some("sess-older".to_string()), "niza".to_string()))
+        );
+        assert_eq!(
+            db.get_process_binding_full("pid-lava").unwrap(),
+            Some((Some("sess-lava".to_string()), "lava".to_string()))
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_reparents_existing_subagents() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('niza', 'sess-old', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-old", "niza").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (
+                    name, parent_session_id, parent_name, agent_id, created_at
+                 ) VALUES ('niza-child', 'sess-old', 'niza', 'agent-1', 1001.0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("pid-niza", "sess-old", "niza")
+            .unwrap();
+
+        db.attach_claude_generation(
+            "niza",
+            "sess-new",
+            "/tmp/new.jsonl",
+            "pid-niza",
+            Some("niza"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_instance_full("niza-child")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("sess-new")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-old").unwrap().as_deref(),
+            Some("niza")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("niza")
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_detaches_displaced_owner_subagents() {
+        let (db, db_path) = setup_full_test_db();
+        for (name, session_id) in [("niza", "sess-old"), ("lava", "sess-new")] {
+            db.conn
+                .execute(
+                    "INSERT INTO instances (name, session_id, created_at) VALUES (?1, ?2, 1000.0)",
+                    params![name, session_id],
+                )
+                .unwrap();
+            db.set_session_binding(session_id, name).unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO instances (
+                    name, parent_session_id, parent_name, agent_id, created_at
+                 ) VALUES ('lava-child', 'sess-new', 'lava', 'agent-lava', 1001.0)",
+                [],
+            )
+            .unwrap();
+
+        db.attach_claude_generation("niza", "sess-new", "/tmp/new.jsonl", "", None)
+            .unwrap();
+
+        assert_eq!(
+            db.get_instance_full("niza")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-new")
+        );
+        assert_eq!(
+            db.get_instance_full("lava").unwrap().unwrap().session_id,
+            None
+        );
+        let child = db.get_instance_full("lava-child").unwrap().unwrap();
+        assert_eq!(child.parent_session_id, None);
+        assert_eq!(child.parent_name.as_deref(), Some("lava"));
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("niza")
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_deletes_only_stale_conflicting_process() {
+        let (db, db_path) = setup_full_test_db();
+        for (name, session_id) in [("niza", "sess-old"), ("stale", "sess-stale-primary")] {
+            db.conn
+                .execute(
+                    "INSERT INTO instances (name, session_id, created_at) VALUES (?1, ?2, 1000.0)",
+                    params![name, session_id],
+                )
+                .unwrap();
+            db.set_session_binding(session_id, name).unwrap();
+        }
+        db.set_process_binding("pid-stale", "sess-stale-old", "stale")
+            .unwrap();
+
+        assert!(
+            db.attach_claude_generation("niza", "sess-new", "", "pid-stale", Some("stale"),)
+                .unwrap()
+        );
+        assert_eq!(db.get_process_binding("pid-stale").unwrap(), None);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_rolls_back_all_identity_writes_on_error() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('niza', 'sess-old', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-old", "niza").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (
+                    name, parent_session_id, parent_name, agent_id, created_at
+                 ) VALUES ('niza-child', 'sess-old', 'niza', 'agent-1', 1001.0)",
+                [],
+            )
+            .unwrap();
+        db.conn.execute("DROP TABLE process_bindings", []).unwrap();
+
+        assert!(
+            db.attach_claude_generation(
+                "niza",
+                "sess-new",
+                "/tmp/new.jsonl",
+                "pid-broken",
+                Some("foreign"),
+            )
+            .is_err()
+        );
+        assert!(db.get_session_binding("sess-new").unwrap().is_none());
+        let instance = db.get_instance_full("niza").unwrap().unwrap();
+        assert_eq!(instance.session_id.as_deref(), Some("sess-old"));
+        assert_ne!(instance.transcript_path, "/tmp/new.jsonl");
+        assert_eq!(
+            db.get_instance_full("niza-child")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("sess-old")
+        );
+        assert!(
+            db.get_validated_claude_session_owner("sess-new")
+                .unwrap()
+                .is_none()
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_deletes_process_only_conflict() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('niza', 'sess-old', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-old", "niza").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('stale-placeholder', 1001.0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("pid-process-only", "", "stale-placeholder")
+            .unwrap();
+
+        assert!(
+            db.attach_claude_generation(
+                "niza",
+                "sess-new",
+                "",
+                "pid-process-only",
+                Some("stale-placeholder"),
+            )
+            .unwrap()
+        );
+        assert_eq!(db.get_process_binding("pid-process-only").unwrap(), None);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_validated_claude_session_cache_rejects_rebound_owner() {
+        let (db, db_path) = setup_full_test_db();
+        for name in ["niza", "lava"] {
+            db.conn
+                .execute(
+                    "INSERT INTO instances (name, created_at) VALUES (?1, 1000.0)",
+                    params![name],
+                )
+                .unwrap();
+        }
+        db.set_session_binding("sess-1", "niza").unwrap();
+        db.mark_claude_session_validated("sess-1", "niza").unwrap();
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-1")
+                .unwrap()
+                .as_deref(),
+            Some("niza")
+        );
+
+        db.rebind_session("sess-1", "lava").unwrap();
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-1").unwrap(),
+            None
+        );
         cleanup_test_db(db_path);
     }
 

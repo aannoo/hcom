@@ -773,20 +773,6 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         return 1;
     }
 
-    // Subagent context: require explicit --name for identity-gated commands inside Claude
-    if crate::identity::requires_identity(cmd)
-        && ctx.explicit_name.is_none()
-        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        && let Some(ref identity) = ctx.identity
-        && crate::instances::in_subagent_context(&db, &identity.name)
-    {
-        eprintln!(
-            "Error: Subagent context active - explicit identity required\n\
-                     Use: hcom {cmd} --name parent (for parent) or --name <uuid> (for subagent)"
-        );
-        return 1;
-    }
-
     // Set hookless command status (subagent/codex/adhoc)
     crate::cli_context::set_hookless_command_status(&db, cmd, &ctx);
 

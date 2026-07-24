@@ -22,6 +22,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
+mod claude_actors;
 mod events;
 mod instances;
 mod kv;
@@ -36,16 +37,37 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
-     ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
-     UPDATE instances
-     SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
-     WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+         ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
+         UPDATE instances
+         SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
+         WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+    ),
+    (
+        18,
+        "ALTER TABLE instances ADD COLUMN last_seen INTEGER DEFAULT 0;
+         CREATE TABLE IF NOT EXISTS claude_actor_capabilities (
+             token TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             tool_use_id TEXT NOT NULL,
+             agent_id TEXT NOT NULL DEFAULT '',
+             instance_name TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             expires_at INTEGER NOT NULL,
+             last_seen INTEGER NOT NULL,
+             UNIQUE(session_id, tool_use_id, agent_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_claude_actor_expiry
+             ON claude_actor_capabilities(expires_at);
+         CREATE INDEX IF NOT EXISTS idx_claude_actor_session
+             ON claude_actor_capabilities(session_id);",
+    ),
+];
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -292,6 +314,7 @@ impl HcomDb {
                 last_event_id INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'active',
                 status_time INTEGER DEFAULT 0,
+                last_seen INTEGER DEFAULT 0,
                 status_context TEXT DEFAULT '',
                 status_detail TEXT DEFAULT '',
                 last_stop INTEGER DEFAULT 0,
@@ -317,6 +340,21 @@ impl HcomDb {
                 launch_context TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
+
+            -- Claude shell actor capabilities
+            CREATE TABLE IF NOT EXISTS claude_actor_capabilities (
+                token TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_use_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL DEFAULT '',
+                instance_name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                UNIQUE(session_id, tool_use_id, agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_claude_actor_expiry ON claude_actor_capabilities(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_claude_actor_session ON claude_actor_capabilities(session_id);
 
             -- KV table
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
@@ -408,13 +446,11 @@ impl HcomDb {
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {
                 if let Some(version) = old_version {
-                    // If version matches but columns are missing (stamped without migration),
-                    // repair by running migrations from version-1.
-                    let migrate_from = if version == SCHEMA_VERSION {
-                        version - 1
-                    } else {
-                        version
-                    };
+                    // A DB can be stamped at some version yet be missing columns
+                    // an earlier migration should have added ("stamped without
+                    // migration"). The stamp alone can't tell us how far back to
+                    // start, so key off the columns actually present.
+                    let migrate_from = self.repair_migrate_from(version);
                     match self.try_apply_migrations(migrate_from) {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
@@ -499,6 +535,7 @@ impl HcomDb {
             "kv",
             "notify_endpoints",
             "session_bindings",
+            "claude_actor_capabilities",
         ]
         .into_iter()
         .collect();
@@ -606,6 +643,7 @@ impl HcomDb {
                     "tool",
                     "terminal_preset_requested",
                     "terminal_preset_effective",
+                    "last_seen",
                 ];
                 Ok(required
                     .iter()
@@ -621,6 +659,42 @@ impl HcomDb {
         }
 
         Ok(SchemaCompat::Ok)
+    }
+
+    /// Decide the version to migrate *from* when repairing a DB that may have
+    /// been stamped without actually running its migrations.
+    ///
+    /// Migrations only ADD COLUMN, so an existing column proves its migration
+    /// ran. We walk back to the migration that adds the earliest column still
+    /// missing; a genuinely up-to-date-but-one-behind DB (all older columns
+    /// present) just re-runs the remaining steps.
+    fn repair_migrate_from(&self, version: i32) -> i32 {
+        let columns: std::collections::HashSet<String> = self
+            .conn
+            .prepare("PRAGMA table_info(instances)")
+            .and_then(|mut s| {
+                Ok(s.query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect())
+            })
+            .unwrap_or_default();
+
+        // (migration version, a column that migration introduces)
+        const COLUMN_MIGRATIONS: &[(i32, &str)] =
+            &[(17, "terminal_preset_requested"), (18, "last_seen")];
+        for (migration, column) in COLUMN_MIGRATIONS {
+            if !columns.contains(*column) {
+                return migration - 1;
+            }
+        }
+
+        // All migration-added columns present: ordinary version-behind DB, or a
+        // current stamp flagged for some other reason — re-run just the last step.
+        if version >= SCHEMA_VERSION {
+            SCHEMA_VERSION - 1
+        } else {
+            version
+        }
     }
 
     /// Try in-place migration for consecutive schema versions.
@@ -649,7 +723,23 @@ impl HcomDb {
             let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
                 return Ok(false);
             };
+            let has_status_time = if next_version == 18 {
+                let mut statement = tx.prepare("PRAGMA table_info(instances)")?;
+                let columns: Vec<String> = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|row| row.ok())
+                    .collect();
+                columns.iter().any(|column| column == "status_time")
+            } else {
+                false
+            };
             tx.execute_batch(sql)?;
+            if next_version == 18 && has_status_time {
+                tx.execute(
+                    "UPDATE instances SET last_seen = status_time WHERE last_seen = 0",
+                    [],
+                )?;
+            }
             tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
         }
         tx.commit()?;
@@ -1284,7 +1374,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_ensure_schema_migrates_v16_to_v17_in_place() {
+    fn test_ensure_schema_migrates_v16_to_v18_in_place_without_status_time() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(2500);
 
@@ -1351,6 +1441,70 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(launch_context, r#"{"terminal_preset":"ghostty-tab"}"#);
+        let last_seen: i64 = db
+            .conn
+            .query_row(
+                "SELECT last_seen FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_seen, 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_ensure_schema_migrates_v17_to_v18_using_status_time() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2750);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_migrate_status_time_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     status_time INTEGER DEFAULT 0,
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 17;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO instances (name, tool, status_time, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["luna", "claude", 123i64, 1.0f64],
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let last_seen: i64 = db
+            .conn
+            .query_row(
+                "SELECT last_seen FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_seen, 123);
 
         cleanup_test_db(db_path);
     }
@@ -1377,6 +1531,17 @@ pub(super) mod tests {
                  CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
                  CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
                  CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE claude_actor_capabilities (
+                     token TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     tool_use_id TEXT NOT NULL,
+                     agent_id TEXT NOT NULL DEFAULT '',
+                     instance_name TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     last_seen INTEGER NOT NULL,
+                     UNIQUE(session_id, tool_use_id, agent_id)
+                 );
                  PRAGMA user_version = {};",
                 SCHEMA_VERSION
             ))

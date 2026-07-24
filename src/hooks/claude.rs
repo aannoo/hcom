@@ -1,7 +1,6 @@
 //! Claude Code hook handler, settings management, and subagent lifecycle.
 //!
-//! 10 hook types: sessionstart, userpromptsubmit, pre, post, poll,
-//! notify, permission-request, subagent-start, subagent-stop, sessionend.
+//! Claude lifecycle, tool, failure, permission, and subagent hooks.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -33,15 +32,66 @@ const HOOK_SESSIONSTART: &str = "sessionstart";
 const HOOK_USERPROMPTSUBMIT: &str = "userpromptsubmit";
 const HOOK_PRE: &str = "pre";
 const HOOK_POST: &str = "post";
+const HOOK_POST_FAILURE: &str = "post-failure";
 const HOOK_NOTIFY: &str = "notify";
 const HOOK_PERMISSION_REQUEST: &str = "permission-request";
+const HOOK_PERMISSION_DENIED: &str = "permission-denied";
 const HOOK_SUBAGENT_START: &str = "subagent-start";
 const HOOK_SUBAGENT_STOP: &str = "subagent-stop";
 const HOOK_SESSIONEND: &str = "sessionend";
+const HOOK_STOP_FAILURE: &str = "stop-failure";
 const HOOK_POLL: &str = "poll";
 
 fn is_subagent_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Agent" | "Task")
+}
+
+fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "PowerShell")
+}
+
+// This is deliberately a protocol detector, not a security boundary. A
+// standalone hcom command token anywhere in a child shell command is enough to
+// instrument it. Bias toward false positives: adding actor identity to a
+// command that merely mentions hcom is harmless, while missing a wrapped hcom
+// invocation can silently attribute it to the shared root Claude session.
+static RE_HCOM_COMMAND_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)(?:^|[\s;&|('"`])(?:\$\{?HCOM\}?|(?:[^\s;&|()'"`]+/)*hcom)(?:$|[\s;&|)('"`])"#,
+    )
+    .unwrap()
+});
+
+fn visibly_invokes_hcom(command: &str) -> bool {
+    RE_HCOM_COMMAND_TOKEN.is_match(command)
+}
+
+fn child_visibly_invokes_hcom(payload: &HookPayload) -> bool {
+    payload
+        .raw
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|agent_id| !agent_id.is_empty())
+        && is_shell_tool(&payload.tool_name)
+        && payload
+            .tool_input
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(visibly_invokes_hcom)
+}
+
+fn persist_claude_session_env(ctx: &HcomContext, session_id: &str) {
+    if let Some(ref env_file) = ctx.claude_env_file
+        && !session_id.is_empty()
+        && let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(env_file)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "export HCOM_CLAUDE_UNIX_SESSION_ID={session_id}");
+    }
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Handle a Claude hook — entry point from router.
@@ -88,16 +138,30 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    // Build context from environment
+    // Build context and payload before the participation gate. SessionStart
+    // must quietly export the vanilla Claude session id even when hcom has no
+    // active rows yet, or the first `hcom start` cannot bind immediately.
     let ctx = HcomContext::from_os();
-
-    // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx, &db) {
-        return 0;
+    let mut payload = HookPayload::from_claude(raw);
+    if hook_type == HOOK_SESSIONSTART {
+        let use_fork_env_session = should_use_fork_env_session_id(&db, &ctx, &payload.raw);
+        let session_id = get_real_session_id(
+            &payload.raw,
+            ctx.claude_env_file.as_deref(),
+            use_fork_env_session,
+        );
+        persist_claude_session_env(&ctx, &session_id);
     }
 
-    // Build payload
-    let mut payload = HookPayload::from_claude(raw);
+    // Keep ordinary nonparticipants completely silent. The sole exception is
+    // a visible hcom attempt from a child: let it reach routing so it receives
+    // the actionable "start hcom in the parent first" denial even with an
+    // otherwise empty database.
+    if !common::hook_gate_check(&ctx, &db)
+        && !(hook_type == HOOK_PRE && child_visibly_invokes_hcom(&payload))
+    {
+        return 0;
+    }
 
     let (exit_code, stdout, delivery_ack, timing) = common::dispatch_with_panic_guard(
         "claude",
@@ -223,7 +287,12 @@ fn route_claude_hook(
 
     // Correct session_id (fork bug workaround)
     let session_start = Instant::now();
-    let session_id = get_real_session_id(&payload.raw, ctx.claude_env_file.as_deref(), ctx.is_fork);
+    let use_fork_env_session = should_use_fork_env_session_id(db, ctx, &payload.raw);
+    let session_id = get_real_session_id(
+        &payload.raw,
+        ctx.claude_env_file.as_deref(),
+        use_fork_env_session,
+    );
 
     // Update payload in place so downstream handlers don't need another raw clone.
     payload.session_id = Some(session_id.clone());
@@ -235,14 +304,19 @@ fn route_claude_hook(
     // SessionStart — no instance resolution needed
     if hook_type == HOOK_SESSIONSTART {
         let handler_start = Instant::now();
-        let result = handle_sessionstart(db, ctx, &session_id, &payload.raw);
+        let result = handle_sessionstart(
+            db,
+            ctx,
+            &session_id,
+            payload.transcript_path.as_deref(),
+            &payload.raw,
+        );
         timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
         return (result.0, result.1, None, timing);
     }
 
     // Claude identifies the hook's actor with agent_id. All actors share the
-    // root session_id, while running_tasks is lifecycle state rather than
-    // identity, so actor routing must happen before task-state handling.
+    // root session_id. Actor routing must therefore happen before any lifecycle handling.
     let raw_agent_id = payload
         .raw
         .get("agent_id")
@@ -258,9 +332,48 @@ fn route_claude_hook(
         // whole branch (including the `hcom start --name ...` hint at
         // SubagentStart) must be a silent no-op, same as any other
         // nonparticipant hook.
-        let Ok(Some(root_name)) = db.get_session_binding(&session_id) else {
-            return (0, String::new(), None, timing);
+        let root_name = match db.get_session_binding(&session_id) {
+            Ok(Some(root_name)) => root_name,
+            Ok(None) => {
+                if hook_type == HOOK_PRE && child_visibly_invokes_hcom(payload) {
+                    let output = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason":
+                                "This Claude subagent cannot join hcom before its parent. Run `hcom start` in the parent Claude session first, then spawn a new subagent.",
+                        }
+                    });
+                    return (0, output.to_string(), None, timing);
+                }
+                return (0, String::new(), None, timing);
+            }
+            Err(_) => return (0, String::new(), None, timing),
         };
+        let (validated_root, _, root_is_primary) = common::init_hook_context(
+            db,
+            ctx,
+            &session_id,
+            payload.transcript_path.as_deref().unwrap_or(""),
+        );
+        if validated_root.as_deref() != Some(root_name.as_str()) || !root_is_primary {
+            if matches!(
+                hook_type,
+                HOOK_POST | HOOK_POST_FAILURE | HOOK_PERMISSION_DENIED
+            ) {
+                revoke_shell_actor_for_hook(db, &session_id, payload, Some(&agent_id));
+            }
+            timing.result = Some("historical_session");
+            log::log_warn(
+                "hooks",
+                "claude.historical_subagent_hook_rejected",
+                &format!(
+                    "hook={} session_id={} root={}",
+                    hook_type, session_id, root_name
+                ),
+            );
+            return (0, String::new(), None, timing);
+        }
         let subagent_check_start = Instant::now();
         let (exit_code, stdout, delivery_ack) = route_subagent_actor_hook(
             db,
@@ -277,34 +390,17 @@ fn route_claude_hook(
 
     // ---- Root/main-thread hook (no agent_id) from here on ----
 
+    // Capability revocation is keyed by (session_id, tool_use_id) alone, so it
+    // must not depend on identity resolution: a hook we cannot attribute would
+    // otherwise leave the shell actor's `hcom send` capability granted forever.
+    if matches!(
+        hook_type,
+        HOOK_POST | HOOK_POST_FAILURE | HOOK_PERMISSION_DENIED
+    ) {
+        revoke_shell_actor_for_hook(db, &session_id, payload, None);
+    }
+
     let tool_name = payload.tool_name.as_str();
-    if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
-        let task_start = Instant::now();
-        let (exit_code, stdout) = match db.get_session_binding(&session_id).ok().flatten() {
-            Some(instance_name) => start_task(db, &instance_name, &session_id, &payload.raw),
-            None => (0, String::new()),
-        };
-        timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
-        return (exit_code, stdout, None, timing);
-    }
-    if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
-        let task_start = Instant::now();
-        let stdout = match db.get_session_binding(&session_id).ok().flatten() {
-            Some(instance_name) => end_task(db, &instance_name, &payload.raw).unwrap_or_default(),
-            None => String::new(),
-        };
-        timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
-        return (0, stdout, None, timing);
-    }
-
-    if hook_type == HOOK_USERPROMPTSUBMIT {
-        // Reap subagents that died without a clean SubagentStop before root
-        // delivery. This is lifecycle cleanup, not actor identification.
-        let transcript_path = payload.transcript_path.as_deref().unwrap_or("");
-        cleanup_dead_subagents(db, &session_id, transcript_path);
-        // Fall through to parent handler for PTY message delivery
-    }
-
     // Resolve parent instance
     let resolve_start = Instant::now();
     let (instance_name, updates, _is_matched_resume) = common::init_hook_context(
@@ -315,27 +411,33 @@ fn route_claude_hook(
     );
     timing.resolve_ms = Some(resolve_start.elapsed().as_secs_f64() * 1000.0);
 
-    // Vanilla binding for Bash post hook
+    // Vanilla marker binding is only a bootstrap path for a genuinely unbound
+    // non-hcom launch. Never let an ambiguous, poisoned, or historical hook
+    // mutate bindings before the primary-generation guard below.
     let bind_start = Instant::now();
-    let (instance_name, updates) = if hook_type == HOOK_POST && tool_name == "Bash" {
-        let bound =
-            bind_vanilla_from_marker(db, &payload.raw, &session_id, instance_name.as_deref());
-        match bound {
-            Some(name) => {
-                let mut u = updates;
-                u.entry("directory".to_string())
-                    .or_insert_with(|| Value::String(ctx.cwd.to_string_lossy().to_string()));
-                if let Some(ref tp) = payload.transcript_path {
-                    u.entry("transcript_path".to_string())
-                        .or_insert_with(|| Value::String(tp.clone()));
+    let allow_vanilla_marker_bind = instance_name.is_none()
+        && ctx.process_id.is_none()
+        && matches!(db.get_session_binding(&session_id), Ok(None));
+    let (instance_name, updates) =
+        if hook_type == HOOK_POST && is_shell_tool(tool_name) && allow_vanilla_marker_bind {
+            let bound =
+                bind_vanilla_from_marker(db, &payload.raw, &session_id, instance_name.as_deref());
+            match bound {
+                Some(name) => {
+                    let mut u = updates;
+                    u.entry("directory".to_string())
+                        .or_insert_with(|| Value::String(ctx.cwd.to_string_lossy().to_string()));
+                    if let Some(ref tp) = payload.transcript_path {
+                        u.entry("transcript_path".to_string())
+                            .or_insert_with(|| Value::String(tp.clone()));
+                    }
+                    (Some(name), u)
                 }
-                (Some(name), u)
+                None => (instance_name, updates),
             }
-            None => (instance_name, updates),
-        }
-    } else {
-        (instance_name, updates)
-    };
+        } else {
+            (instance_name, updates)
+        };
     timing.bind_ms = Some(bind_start.elapsed().as_secs_f64() * 1000.0);
 
     let Some(ref instance_name) = instance_name else {
@@ -351,19 +453,71 @@ fn route_claude_hook(
         }
     };
 
+    let is_primary_generation = instance_data.session_id.as_deref() == Some(session_id.as_str());
+    if !is_primary_generation {
+        timing.instance = Some(instance_name.clone());
+        timing.result = Some("historical_session");
+        log::log_warn(
+            "hooks",
+            "claude.historical_root_hook_rejected",
+            &format!(
+                "hook={} session_id={} instance={} primary_session={:?}",
+                hook_type, session_id, instance_name, instance_data.session_id
+            ),
+        );
+        if hook_type == HOOK_SESSIONEND {
+            let handler_start = Instant::now();
+            let (code, stdout) =
+                handle_sessionend(db, instance_name, &session_id, &payload.raw, &updates);
+            timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
+            return (code, stdout, None, timing);
+        }
+        return (0, String::new(), None, timing);
+    }
+
+    if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
+        let task_start = Instant::now();
+        common::update_tool_status(db, instance_name, "claude", tool_name, &payload.tool_input);
+        timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
+        return (0, String::new(), None, timing);
+    }
+    if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
+        let task_start = Instant::now();
+        let stdout = end_task(db, instance_name, &payload.raw).unwrap_or_default();
+        timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
+        return (0, stdout, None, timing);
+    }
+
+    if hook_type == HOOK_USERPROMPTSUBMIT {
+        // A missing completion hook is uncertain lifecycle, not identity.
+        // Only mark old child rows stale for display; never delete or reroute them.
+        mark_stale_subagents(db, &session_id);
+        // Fall through to parent handler for PTY message delivery
+    }
+
     // Dispatch to handler
     timing.instance = Some(instance_name.clone());
     let handler_start = Instant::now();
     let (exit_code, stdout, delivery_ack) = match hook_type {
         HOOK_PRE => {
-            let (code, stdout) = handle_pretooluse(db, payload, instance_name);
+            let (code, stdout) = handle_pretooluse(db, payload, instance_name, &session_id, None);
             (code, stdout, None)
         }
         HOOK_POST => handle_posttooluse(db, ctx, payload, instance_name, &instance_data, &updates),
-        HOOK_POLL => {
-            let (code, stdout) = handle_poll(db, ctx, instance_name, &instance_data);
+        HOOK_POST_FAILURE => {
+            let (code, stdout) = handle_tool_failure(db, payload, instance_name, &session_id, None);
             (code, stdout, None)
         }
+        HOOK_PERMISSION_DENIED => {
+            let (code, stdout) =
+                handle_permission_denied(db, payload, instance_name, &session_id, None);
+            (code, stdout, None)
+        }
+        HOOK_STOP_FAILURE => {
+            let (code, stdout) = handle_stop_failure(db, payload, instance_name);
+            (code, stdout, None)
+        }
+        HOOK_POLL => handle_poll(db, ctx, instance_name, &instance_data),
         HOOK_NOTIFY => {
             let (code, stdout) = handle_notify(db, payload, instance_name, &updates);
             (code, stdout, None)
@@ -388,10 +542,8 @@ fn route_claude_hook(
 }
 
 /// Route a hook whose payload carries a non-empty `agent_id` — i.e. one that
-/// fired inside a subagent's own execution context. See the call site in
-/// `route_claude_hook` for why `agent_id`, not `running_tasks.active`, is the
-/// actor signal, and for the participation gate that must run before this
-/// (root_name is already a proven hcom binding by the time we're called).
+/// fired inside a subagent's own execution context. Claude's verified
+/// `agent_id`, not parent display state, is the actor signal.
 ///
 /// Returns (exit_code, stdout, delivery_ack).
 fn route_subagent_actor_hook(
@@ -405,14 +557,20 @@ fn route_subagent_actor_hook(
 ) -> (i32, String, Option<DeliveryAck>) {
     timing.context = Some("subagent");
 
+    if matches!(
+        hook_type,
+        HOOK_POST | HOOK_POST_FAILURE | HOOK_PERMISSION_DENIED
+    ) {
+        revoke_shell_actor_for_hook(db, session_id, payload, Some(agent_id));
+    }
+
     if hook_type == HOOK_SUBAGENT_START {
         return handle_subagent_start(db, payload, agent_id, session_id, root_name, timing);
     }
 
     // SubagentStop resolves its own row and handles a missing row safely.
     if hook_type == HOOK_SUBAGENT_STOP {
-        let (exit_code, stdout) = subagent_stop(db, session_id, &payload.raw);
-        return (exit_code, stdout, None);
+        return subagent_stop(db, session_id, &payload.raw);
     }
 
     // Every other subagent hook requires a known actor row. A missing row is
@@ -421,44 +579,68 @@ fn route_subagent_actor_hook(
         timing.result = Some("unknown_subagent_actor");
         return (0, String::new(), None);
     };
+    refresh_subagent_last_seen(db, &subagent_instance);
 
-    if hook_type == HOOK_NOTIFY {
-        return (0, String::new(), None);
-    }
-
-    // Nested Agent/Task calls mutate the acting subagent, not the shared root.
     let tool_name = payload.tool_name.as_str();
+
+    // A subagent's own Agent/Task calls just update its status; the child it
+    // spawns still attaches to the root (see `handle_subagent_start`), not to
+    // this acting subagent.
     if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
-        let (exit_code, stdout) = start_task(db, &subagent_instance, session_id, &payload.raw);
-        return (exit_code, stdout, None);
+        common::update_tool_status(
+            db,
+            &subagent_instance,
+            "claude",
+            tool_name,
+            &payload.tool_input,
+        );
+        return (0, String::new(), None);
     }
     if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
         let stdout = end_task(db, &subagent_instance, &payload.raw).unwrap_or_default();
         return (0, stdout, None);
     }
 
-    if (hook_type == HOOK_PRE || hook_type == HOOK_POST) && tool_name == "Bash" {
-        if hook_type == HOOK_POST {
-            let command = payload
-                .tool_input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // A subagent may only route its own inbox: the --name it passed
-            // to `hcom start`/hook delivery must match the agent_id Claude
-            // itself stamped on this hook, or one subagent could spoof
-            // another's --name and read its inbox (see subagent_posttooluse).
-            if let Some(name_flag) = extract_name(command)
-                && name_flag == agent_id
-            {
-                let (exit_code, stdout, delivery_ack) = subagent_posttooluse(db, &payload.raw);
-                return (exit_code, stdout, delivery_ack);
+    match hook_type {
+        HOOK_PRE => {
+            let (code, stdout) =
+                handle_pretooluse(db, payload, &subagent_instance, session_id, Some(agent_id));
+            (code, stdout, None)
+        }
+        HOOK_POST => {
+            revoke_shell_actor_for_hook(db, session_id, payload, Some(agent_id));
+            if is_shell_tool(tool_name) {
+                subagent_posttooluse(db, &subagent_instance)
+            } else {
+                (0, String::new(), None)
             }
         }
-        return (0, String::new(), None);
+        HOOK_POST_FAILURE => {
+            let (code, stdout) =
+                handle_tool_failure(db, payload, &subagent_instance, session_id, Some(agent_id));
+            (code, stdout, None)
+        }
+        HOOK_PERMISSION_DENIED => {
+            let (code, stdout) = handle_permission_denied(
+                db,
+                payload,
+                &subagent_instance,
+                session_id,
+                Some(agent_id),
+            );
+            (code, stdout, None)
+        }
+        HOOK_STOP_FAILURE => {
+            let (code, stdout) = handle_stop_failure(db, payload, &subagent_instance);
+            (code, stdout, None)
+        }
+        HOOK_PERMISSION_REQUEST => {
+            let (code, stdout) =
+                handle_permission_request(db, payload, &subagent_instance, &Default::default());
+            (code, stdout, None)
+        }
+        _ => (0, String::new(), None),
     }
-
-    (0, String::new(), None)
 }
 
 fn handle_subagent_start(
@@ -475,101 +657,141 @@ fn handle_subagent_start(
         .and_then(|value| value.as_str())
         .unwrap_or("");
 
-    if !agent_type.is_empty() {
-        let parent_instance =
-            match resolve_spawn_owner(db, &payload.raw, session_id, agent_id, root_name) {
-                SpawnOwner::LegacyRoot(name)
-                | SpawnOwner::Resolved(name)
-                | SpawnOwner::Resumed(name) => name,
-                SpawnOwner::Unresolved => {
-                    log::log_warn(
-                        "hooks",
-                        "subagent.spawn_owner.unresolved",
-                        &format!(
-                            "agent_id={} prompt_id={:?}",
-                            agent_id,
-                            payload
-                                .raw
-                                .get("prompt_id")
-                                .and_then(|value| value.as_str())
-                        ),
-                    );
-                    timing.result = Some("spawn_owner_unresolved");
-                    return (0, String::new(), None);
-                }
-            };
+    // Every subagent — however deeply Claude nests it in its own hierarchy —
+    // attaches directly to the root hcom instance. Claude's hook schema gives
+    // no reliable way to correlate a nested Agent/Task call with the specific
+    // child that issued it (the same prompt_id can be reused by an
+    // interleaved sibling, see history of this function), so root attribution
+    // is the only thing knowable without guessing.
+    let effective_agent_type = if agent_type.is_empty() {
+        "task"
+    } else {
+        agent_type
+    };
+    let Some(name) = ensure_subagent_row(db, root_name, session_id, agent_id, effective_agent_type)
+    else {
+        timing.result = Some("subagent_row_allocation_failed");
+        return (0, String::new(), None);
+    };
+    refresh_subagent_last_seen(db, &name);
 
-        let _ = db.kv_set(
-            &agent_owner_kv_key(session_id, agent_id),
-            Some(&parent_instance),
-        );
-
-        // Allocate the row first, and only track the child once it has one, so
-        // a tracked actor is always addressable. Tracking a child whose row
-        // allocation failed would leave the parent pointing at a subagent every
-        // one of whose later hooks fails closed as an unknown actor.
-        if ensure_subagent_row(db, &parent_instance, session_id, agent_id, agent_type) {
-            track_subagent(db, &parent_instance, agent_id, agent_type);
-        }
-    }
-
-    let stdout = build_subagent_start_output(&payload.raw)
+    let stdout = build_subagent_start_output(&payload.raw, root_name)
         .and_then(|output| serde_json::to_string(&output).ok())
         .unwrap_or_default();
     (0, stdout, None)
 }
 
-/// Get correct session_id, handling Claude Code's fork bug.
-///
-/// For --fork-session, hook_data.session_id reports the parent's old ID.
-/// CLAUDE_ENV_FILE path has the correct one: ~/.claude/session-env/{session_id}/hook-N.sh
-fn get_real_session_id(raw: &Value, env_file: Option<&str>, is_fork: bool) -> String {
+/// Return the session id carried directly by the hook payload.
+fn hook_payload_session_id(raw: &Value) -> &str {
     let hook_session_id = raw
         .get("session_id")
         .or_else(|| raw.get("sessionId"))
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .unwrap_or("");
-
-    // Also check inside session object
-    let hook_session_id = if hook_session_id.is_empty() {
-        raw.get("session")
-            .and_then(|s| {
-                s.get("session_id")
-                    .or_else(|| s.get("sessionId"))
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("")
-    } else {
-        hook_session_id
-    };
-
-    if let Some(env_file) = env_file
-        && is_fork
-    {
-        let path = Path::new(env_file);
-        let parts: Vec<&str> = path
-            .components()
-            .filter_map(|c| c.as_os_str().to_str())
-            .collect();
-        if let Some(idx) = parts.iter().position(|&p| p == "session-env")
-            && idx + 1 < parts.len()
-        {
-            let candidate = parts[idx + 1];
-            // Sanity: UUID format (36 chars, 4 hyphens)
-            if candidate.len() == 36 && candidate.chars().filter(|&c| c == '-').count() == 4 {
-                log::log_info(
-                    "hooks",
-                    "get_real_session_id.from_env_file",
-                    &format!(
-                        "candidate={} hook_session_id={}",
-                        candidate, hook_session_id
-                    ),
-                );
-                return candidate.to_string();
-            }
-        }
+    if !hook_session_id.is_empty() {
+        return hook_session_id;
     }
+    raw.get("session")
+        .and_then(|session| {
+            session
+                .get("session_id")
+                .or_else(|| session.get("sessionId"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or("")
+}
 
+fn session_id_from_claude_env_file(env_file: Option<&str>) -> Option<String> {
+    let path = Path::new(env_file?);
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    let index = parts.iter().position(|part| *part == "session-env")?;
+    let candidate = *parts.get(index + 1)?;
+    (candidate.len() == 36
+        && candidate
+            .chars()
+            .filter(|character| *character == '-')
+            .count()
+            == 4)
+        .then(|| candidate.to_string())
+}
+
+fn is_fresh_claude_process_placeholder(
+    db: &HcomDb,
+    process_session_id: Option<&str>,
+    process_owner: Option<&str>,
+) -> bool {
+    process_session_id.is_none()
+        && process_owner.is_some_and(|owner| {
+            db.get_instance_full(owner)
+                .ok()
+                .flatten()
+                .is_some_and(|instance| {
+                    instance.session_id.is_none()
+                        && (instances::is_launching_placeholder(&instance)
+                            || (instance.status == ST_LISTENING
+                                && matches!(
+                                    instance.status_context.as_str(),
+                                    "start" | "ready_observed" | "launch_blocked_cleared"
+                                )))
+                })
+        })
+}
+
+/// `HCOM_IS_FORK` is persistent session environment, so it cannot by itself
+/// authorize replacing the hook payload's session id. The env-file workaround
+/// is allowed for the original fresh hcom-fork placeholder, or on later
+/// non-SessionStart hooks only when this exact worker is already bound to the
+/// env-file generation.
+fn should_use_fork_env_session_id(db: &HcomDb, ctx: &HcomContext, raw: &Value) -> bool {
+    if !ctx.is_fork {
+        return false;
+    }
+    let Some(env_session_id) = session_id_from_claude_env_file(ctx.claude_env_file.as_deref())
+    else {
+        return false;
+    };
+    let Some(process_id) = ctx.process_id.as_deref() else {
+        return false;
+    };
+    let Ok(Some((process_session_id, process_owner))) = db.get_process_binding_full(process_id)
+    else {
+        return false;
+    };
+    let fresh_placeholder = is_fresh_claude_process_placeholder(
+        db,
+        process_session_id.as_deref(),
+        Some(process_owner.as_str()),
+    );
+    let source = raw.get("source").and_then(Value::as_str).unwrap_or("");
+    if matches!(source, "fork" | "startup" | "resume") {
+        return fresh_placeholder;
+    }
+    process_session_id.as_deref() == Some(env_session_id.as_str())
+}
+
+/// Get the effective session id, applying Claude Code's `--fork-session`
+/// workaround only after the worker binding proves the env file belongs to
+/// this launch/generation.
+fn get_real_session_id(
+    raw: &Value,
+    env_file: Option<&str>,
+    allow_fork_env_override: bool,
+) -> String {
+    let hook_session_id = hook_payload_session_id(raw);
+    if allow_fork_env_override && let Some(candidate) = session_id_from_claude_env_file(env_file) {
+        log::log_info(
+            "hooks",
+            "get_real_session_id.from_env_file",
+            &format!(
+                "candidate={} hook_session_id={}",
+                candidate, hook_session_id
+            ),
+        );
+        return candidate;
+    }
     hook_session_id.to_string()
 }
 
@@ -578,36 +800,75 @@ fn handle_sessionstart(
     db: &HcomDb,
     ctx: &HcomContext,
     session_id: &str,
+    transcript_path: Option<&str>,
     raw: &Value,
 ) -> (i32, String) {
-    let source = raw.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let source = raw.get("source").and_then(Value::as_str).unwrap_or("");
     let process_id = ctx.process_id.as_deref();
+    let transcript_path = transcript_path.unwrap_or("");
+    let evidence = match common::load_claude_identity_evidence(
+        db,
+        process_id,
+        session_id,
+        transcript_path,
+        |evidence| {
+            let fresh_process_placeholder = is_fresh_claude_process_placeholder(
+                db,
+                evidence.process_session_id.as_deref(),
+                evidence.process_owner.as_deref(),
+            );
+            should_scan_sessionstart_lineage(
+                ctx.is_fork && fresh_process_placeholder,
+                source,
+                evidence.session_owner.is_some(),
+                evidence.validated_session_owner.is_some(),
+                evidence.owners_disagree,
+            )
+        },
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            log::log_warn(
+                "hooks",
+                "sessionstart.identity_evidence_error",
+                &format!(
+                    "source={} session_id={} transcript_path={} process_id={:?} err={} mutated=false",
+                    source, session_id, transcript_path, process_id, error
+                ),
+            );
+            return (0, String::new());
+        }
+    };
+    let fresh_process_placeholder = is_fresh_claude_process_placeholder(
+        db,
+        evidence.process_session_id.as_deref(),
+        evidence.process_owner.as_deref(),
+    );
+    let fresh_hcom_fork_launch = ctx.is_fork && fresh_process_placeholder;
+    let native_lineage_source = matches!(source, "fork" | "startup" | "resume");
 
     log::log_info(
         "hooks",
         "sessionstart.entry",
         &format!(
-            "session_id={} source={} process_id={:?} transcript_path={}",
-            session_id,
+            "source={} session_id={} transcript_path={} process_id={:?} process_binding={:?} process_owner={:?} process_session_id={:?} session_owner={:?} validated_session_owner={:?} transcript_owners={:?} hcom_is_fork={} fresh_process_placeholder={} fresh_hcom_fork_launch={}",
             source,
+            session_id,
+            transcript_path,
             process_id,
-            raw.get("session")
-                .and_then(|s| s.get("transcript_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            evidence.process_binding,
+            evidence.process_owner,
+            evidence.process_session_id,
+            evidence.session_owner,
+            evidence.validated_session_owner,
+            evidence.lineage,
+            ctx.is_fork,
+            fresh_process_placeholder,
+            fresh_hcom_fork_launch,
         ),
     );
 
-    // Persist session_id to CLAUDE_ENV_FILE for bash commands
-    if let Some(ref env_file) = ctx.claude_env_file
-        && !session_id.is_empty()
-        && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(env_file)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "export HCOM_CLAUDE_UNIX_SESSION_ID={}", session_id);
-    }
-
-    // Compaction recovery: re-inject bootstrap
+    // Compaction recovery: re-inject bootstrap.
     if source == "compact"
         && !session_id.is_empty()
         && let Some(output) = handle_compact_recovery(db, ctx, session_id, process_id)
@@ -615,7 +876,7 @@ fn handle_sessionstart(
         return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    // Vanilla instance - show hint
+    // Vanilla instance - show hint.
     if process_id.is_none() || session_id.is_empty() {
         let hcom_cmd = crate::runtime_env::build_hcom_command();
         let output = serde_json::json!({
@@ -627,28 +888,191 @@ fn handle_sessionstart(
         return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    // HCOM-launched: bind session and inject bootstrap
-    let process_id = process_id.unwrap();
-    let mut result_output: Option<Value> = None;
+    // Resolve the selected owner and log vocabulary first; the mutation and
+    // bootstrap workflow below is intentionally shared by cache and lineage.
+    let selected_owner = if let Some(owner) = evidence.validated_session_owner.as_deref() {
+        Some((
+            owner,
+            "sessionstart.validated_bind_failed",
+            "sessionstart.validated_identity_selected",
+        ))
+    } else if evidence.lineage_scanned {
+        match &evidence.lineage {
+            common::TranscriptOwnerResolution::Owner(owner) => Some((
+                owner.as_str(),
+                "sessionstart.lineage_bind_failed",
+                "sessionstart.identity_selected",
+            )),
+            common::TranscriptOwnerResolution::Ambiguous(owners) => {
+                log::log_warn(
+                    "hooks",
+                    "sessionstart.identity_ambiguous",
+                    &format!(
+                        "session_id={} source={} transcript_path={} process_id={} process_owner={:?} session_owner={:?} transcript_owners={:?} mutated=false",
+                        session_id,
+                        source,
+                        transcript_path,
+                        process_id.unwrap_or_default(),
+                        evidence.process_owner,
+                        evidence.session_owner,
+                        owners,
+                    ),
+                );
+                return (0, String::new());
+            }
+            common::TranscriptOwnerResolution::Unknown
+                if native_lineage_source && !fresh_process_placeholder =>
+            {
+                log::log_warn(
+                    "hooks",
+                    "sessionstart.lineage_unknown",
+                    &format!(
+                        "session_id={} source={} transcript_path={} process_id={} process_owner={:?} process_session={:?} fresh_process_placeholder={} mutated=false",
+                        session_id,
+                        source,
+                        transcript_path,
+                        process_id.unwrap_or_default(),
+                        evidence.process_owner,
+                        evidence.process_session_id,
+                        fresh_process_placeholder,
+                    ),
+                );
+                return (0, String::new());
+            }
+            common::TranscriptOwnerResolution::Unknown => None,
+        }
+    } else {
+        None
+    };
 
-    match bind_and_bootstrap(db, ctx, session_id, process_id) {
-        Ok(output) => result_output = output,
-        Err(e) => {
+    let process_id = process_id.unwrap();
+    if let Some((owner, bind_failed_event, selected_event)) = selected_owner {
+        if let Err(error) = bind_lineage_owner(
+            db,
+            owner,
+            session_id,
+            transcript_path,
+            process_id,
+            evidence.process_owner.as_deref(),
+        ) {
+            log::log_error(
+                "hooks",
+                bind_failed_event,
+                &format!(
+                    "session_id={} source={} owner={} err={} mutated=false",
+                    session_id, source, owner, error
+                ),
+            );
+            return (0, String::new());
+        }
+        log::log_info(
+            "hooks",
+            selected_event,
+            &format!(
+                "session_id={} source={} final_owner={} mutated=true",
+                session_id, source, owner
+            ),
+        );
+        crate::relay::worker::ensure_worker(true);
+        return bootstrap_for_existing_owner(db, ctx, owner);
+    }
+
+    let result_output = match bind_and_bootstrap(db, ctx, session_id, transcript_path, process_id) {
+        Ok(result) => result,
+        Err(error) => {
             log::log_error(
                 "hooks",
                 "bind.fail",
-                &format!("hook=sessionstart err={}", e),
+                &format!("hook=sessionstart err={}", error),
             );
+            return (0, String::new());
         }
-    }
+    };
 
-    // Auto-spawn relay-worker now that an instance is active
     crate::relay::worker::ensure_worker(true);
-
     let stdout = result_output
-        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .map(|value| serde_json::to_string(&value).unwrap_or_default())
         .unwrap_or_default();
     (0, stdout)
+}
+
+fn bind_lineage_owner(
+    db: &HcomDb,
+    owner: &str,
+    session_id: &str,
+    transcript_path: &str,
+    process_id: &str,
+    process_owner: Option<&str>,
+) -> Result<(), String> {
+    match db.attach_claude_generation(
+        owner,
+        session_id,
+        transcript_path,
+        process_id,
+        process_owner,
+    ) {
+        Ok(true) => {
+            log::log_info(
+                "hooks",
+                "sessionstart.stale_process_binding_deleted",
+                &format!("process_id={} selected_owner={}", process_id, owner),
+            );
+        }
+        Ok(false) if process_owner != Some(owner) => {
+            log::log_info(
+                "hooks",
+                "sessionstart.foreign_process_binding_preserved",
+                &format!(
+                    "process_id={} process_owner={:?} selected_owner={}",
+                    process_id, process_owner, owner
+                ),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    lifecycle::set_status(db, owner, ST_LISTENING, "start", Default::default());
+    Ok(())
+}
+
+fn bootstrap_for_existing_owner(db: &HcomDb, ctx: &HcomContext, owner: &str) -> (i32, String) {
+    let Some(instance) = db.get_instance_full(owner).ok().flatten() else {
+        return (0, String::new());
+    };
+    let bootstrap_text = bootstrap::get_bootstrap(
+        db,
+        &ctx.hcom_dir,
+        owner,
+        "claude",
+        ctx.is_background,
+        ctx.is_launched,
+        &ctx.notes,
+        instance.tag.as_deref().unwrap_or(""),
+        false,
+        ctx.background_name.as_deref(),
+    );
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": bootstrap_text,
+        }
+    });
+    (0, serde_json::to_string(&output).unwrap_or_default())
+}
+
+fn should_scan_sessionstart_lineage(
+    fresh_hcom_fork_launch: bool,
+    source: &str,
+    has_session_owner: bool,
+    has_validated_session_owner: bool,
+    owners_disagree: bool,
+) -> bool {
+    !fresh_hcom_fork_launch
+        && !has_validated_session_owner
+        && (matches!(source, "fork" | "startup" | "resume")
+            || !has_session_owner
+            || owners_disagree)
 }
 
 /// Handle compaction recovery (source=compact).
@@ -707,6 +1131,7 @@ fn bind_and_bootstrap(
     db: &HcomDb,
     ctx: &HcomContext,
     session_id: &str,
+    transcript_path: &str,
     process_id: &str,
 ) -> Result<Option<Value>, String> {
     let mut instance_name =
@@ -733,8 +1158,14 @@ fn bind_and_bootstrap(
         .map_err(|e| e.to_string())?
         .ok_or("instance not found after bind")?;
 
-    // Rebind session
-    let _ = db.rebind_instance_session(&instance_name, session_id);
+    db.attach_claude_generation(
+        &instance_name,
+        session_id,
+        transcript_path,
+        process_id,
+        Some(&instance_name),
+    )
+    .map_err(|error| error.to_string())?;
 
     // Capture launch context
     instance_binding::capture_and_store_launch_context(db, &instance_name);
@@ -781,212 +1212,8 @@ fn bind_and_bootstrap(
     Ok(Some(result))
 }
 
-/// kv-table key correlating a Task/Agent tool call's `prompt_id` — scoped to
-/// the root session it happened in — with the instance that made it. See
-/// `resolve_spawn_owner`.
-///
-/// Session-scoped (not just `prompt_id`) because a session's mappings live
-/// for the whole session (see `end_task` / `handle_sessionend` for why they
-/// can't be deleted per-Task-completion), and prompt_id values are only
-/// unique within one Claude conversation.
-fn spawn_owner_kv_key(root_session_id: &str, prompt_id: &str) -> String {
-    format!("spawn_owner:{root_session_id}:{prompt_id}")
-}
-
-/// kv-table key prefix covering every spawn-owner mapping for one root
-/// session. See `handle_sessionend`.
-fn spawn_owner_kv_prefix(root_session_id: &str) -> String {
-    format!("spawn_owner:{root_session_id}:")
-}
-
-/// kv-table key remembering which instance owns a given `agent_id`, scoped
-/// to the root session — independent of any one `prompt_id`. See
-/// `resolve_spawn_owner`'s resume fallback.
-fn agent_owner_kv_key(root_session_id: &str, agent_id: &str) -> String {
-    format!("agent_owner:{root_session_id}:{agent_id}")
-}
-
-/// kv-table key prefix covering every agent-owner mapping for one root
-/// session. See `handle_sessionend`.
-fn agent_owner_kv_prefix(root_session_id: &str) -> String {
-    format!("agent_owner:{root_session_id}:")
-}
-
-/// Outcome of resolving which instance spawned a SubagentStart's child.
-enum SpawnOwner {
-    /// `prompt_id` was absent from the payload entirely — Claude Code
-    /// < 2.1.196, where this correlation doesn't exist on the wire at all.
-    /// Root attribution is the only thing ever knowable without it; this is
-    /// not nested-spawn support, just the honest pre-2.1.196 behavior.
-    LegacyRoot(String),
-    /// `prompt_id` was present and resolved to a live owner that's verified
-    /// to belong to this root session.
-    Resolved(String),
-    /// `prompt_id` was present but didn't resolve, and this `agent_id` was
-    /// already known (see `agent_owner_kv_key`) — Claude resuming a
-    /// previously-spawned subagent under the same `agent_id` stamps a *new*
-    /// `prompt_id` on the resumed SubagentStart with no corresponding
-    /// PreToolUse to map it, so the fresh-`prompt_id` lookup always misses on
-    /// resume. Falling back to this agent_id's own
-    /// remembered owner is safe specifically because the agent_id is
-    /// already known — see `Unresolved` for why an *unknown* agent_id must
-    /// not get the same treatment.
-    Resumed(String),
-    /// `prompt_id` was present but no valid owner resolved by either path,
-    /// and this `agent_id` has never been seen before: no mapping
-    /// (correlation failed or hasn't landed yet), or the mapped instance is
-    /// gone or belongs to a different session (stale/foreign). Root is
-    /// deliberately not used as a fallback here — on a Claude Code version
-    /// that *does* send `prompt_id`, a miss on a genuinely new agent_id
-    /// means something is wrong, not that root is a safe guess.
-    Unresolved,
-}
-
-/// Resolve which instance actually spawned a SubagentStart's child.
-///
-/// Claude stamps the same `prompt_id` on a Task/Agent tool's PreToolUse and
-/// on the SubagentStart(s) it produces, including parallel siblings spawned
-/// by the same call. `start_task` records
-/// `(root_session_id, prompt_id) -> acting instance` for exactly this
-/// lookup, so a SubagentStart spawned by a *nested* subagent resolves to
-/// that subagent, not the session-bound root — parent and every nested
-/// subagent share one Claude session_id, so session_id alone can never tell
-/// them apart.
-///
-/// Falls back to `agent_owner_kv_key(root_session_id, agent_id)` — this
-/// `agent_id`'s own remembered owner from when it was first spawned — when
-/// the `prompt_id` lookup misses; see `SpawnOwner::Resumed`.
-fn resolve_spawn_owner(
-    db: &HcomDb,
-    raw: &Value,
-    root_session_id: &str,
-    agent_id: &str,
-    root_name: &str,
-) -> SpawnOwner {
-    let Some(prompt_id) = raw
-        .get("prompt_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    else {
-        return SpawnOwner::LegacyRoot(root_name.to_string());
-    };
-
-    let by_prompt = db
-        .kv_get(&spawn_owner_kv_key(root_session_id, prompt_id))
-        .ok()
-        .flatten();
-    if let Some(owner) = by_prompt
-        && validate_spawn_owner(db, &owner, root_session_id, root_name)
-    {
-        return SpawnOwner::Resolved(owner);
-    }
-
-    let by_agent = db
-        .kv_get(&agent_owner_kv_key(root_session_id, agent_id))
-        .ok()
-        .flatten();
-    if let Some(owner) = by_agent
-        && validate_spawn_owner(db, &owner, root_session_id, root_name)
-    {
-        return SpawnOwner::Resumed(owner);
-    }
-
-    SpawnOwner::Unresolved
-}
-
-/// Verify a resolved spawn-owner instance actually belongs to this root
-/// session's hierarchy, rather than trusting the kv mapping blindly — a
-/// stale entry could name an instance that's since been deleted or (in
-/// principle) reused for something else.
-fn validate_spawn_owner(db: &HcomDb, owner: &str, root_session_id: &str, root_name: &str) -> bool {
-    if owner == root_name {
-        return true;
-    }
-    match db.get_instance_full(owner) {
-        Ok(Some(data)) => data.parent_session_id.as_deref() == Some(root_session_id),
-        _ => false,
-    }
-}
-
-/// PreToolUse Task: enter subagent context for `instance_name` — the acting
-/// instance's own row (root parent, or the spawning subagent for a nested
-/// Agent/Task call; see the call sites in `route_claude_hook` /
-/// `route_subagent_actor_hook`).
-///
-/// Returns (exit_code, stdout).
-fn start_task(
-    db: &HcomDb,
-    instance_name: &str,
-    root_session_id: &str,
-    raw: &Value,
-) -> (i32, String) {
-    log::log_info(
-        "hooks",
-        "start_task.enter",
-        &format!("instance={}", instance_name),
-    );
-
-    instances::mutate_running_tasks(db, instance_name, |rt| {
-        rt.active = true;
-    });
-
-    if let Some(prompt_id) = raw
-        .get("prompt_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        let _ = db.kv_set(
-            &spawn_owner_kv_key(root_session_id, prompt_id),
-            Some(instance_name),
-        );
-    }
-
-    let tool_input = raw
-        .get("tool_input")
-        .cloned()
-        .unwrap_or(Value::Object(Default::default()));
-    let detail = family::extract_tool_detail("claude", "Task", &tool_input);
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_ACTIVE,
-        "tool:Task",
-        lifecycle::StatusUpdate {
-            detail: &detail,
-            ..Default::default()
-        },
-    );
-
-    // Append hcom instructions to Task prompt
-    let original_prompt = tool_input
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !original_prompt.is_empty() {
-        let hcom_cmd = crate::runtime_env::build_hcom_command();
-        let hcom_hint =
-            format!("\n\n---\nTo use hcom: run `{hcom_cmd} start --name <your-agent-id>` first.");
-        let mut updated = tool_input.clone();
-        if let Some(obj) = updated.as_object_mut() {
-            obj.insert(
-                "prompt".into(),
-                Value::String(format!("{}{}", original_prompt, hcom_hint)),
-            );
-        }
-        let output = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "updatedInput": updated,
-            }
-        });
-        return (0, serde_json::to_string(&output).unwrap_or_default());
-    }
-
-    (0, String::new())
-}
-
 /// PostToolUse Task: deliver freeze-period messages for `instance_name` — the
-/// acting instance's own row (see `start_task`).
+/// acting instance's own row.
 ///
 /// Returns Option<String> — JSON stdout if messages were delivered.
 /// Dispatcher writes this to stdout before returning exit code.
@@ -1189,12 +1416,27 @@ fn deliver_freeze_messages(
     )
 }
 
-/// Parent PreToolUse: status tracking with tool-specific detail.
-fn handle_pretooluse(db: &HcomDb, payload: &HookPayload, instance_name: &str) -> (i32, String) {
+/// Resolve the tool use id shared by PreToolUse and its terminal hook.
+fn tool_use_id(payload: &HookPayload) -> Option<&str> {
+    payload
+        .raw
+        .get("tool_use_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+/// PreToolUse: status tracking plus a verified actor capability for shell tools.
+fn handle_pretooluse(
+    db: &HcomDb,
+    payload: &HookPayload,
+    instance_name: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+) -> (i32, String) {
     let tool_name = payload.tool_name.as_str();
     let tool_input = &payload.tool_input;
 
-    // Skip status update for Claude's internal memory operations
+    // Skip status update for Claude's internal memory operations.
     if tool_name == "Edit" || tool_name == "Write" {
         let detail = family::extract_tool_detail("claude", tool_name, tool_input);
         if detail.contains("session-memory/") {
@@ -1203,6 +1445,188 @@ fn handle_pretooluse(db: &HcomDb, payload: &HookPayload, instance_name: &str) ->
     }
 
     common::update_tool_status(db, instance_name, "claude", tool_name, tool_input);
+
+    if !is_shell_tool(tool_name) {
+        return (0, String::new());
+    }
+
+    // Root shell commands already resolve through the Claude session/process
+    // binding. Only an in-process subagent needs a capability to distinguish
+    // it from the root that owns the shared session.
+    let Some(agent_id) = agent_id else {
+        return (0, String::new());
+    };
+
+    // Only hcom invocations need actor identity. Every other shell command is
+    // left byte-for-byte untouched; its hook event is already attributed by
+    // Claude's agent_id.
+    let (Some(tool_use_id), Some(command)) = (
+        tool_use_id(payload),
+        tool_input.get("command").and_then(|value| value.as_str()),
+    ) else {
+        return (0, String::new());
+    };
+    if !visibly_invokes_hcom(command) {
+        return (0, String::new());
+    }
+
+    // Thread a verified actor capability into this visible hcom command so the
+    // CLI resolves the exact child. If issuance fails, run uninstrumented and
+    // let the CLI's normal explicit-name rules produce the actionable error.
+
+    let token = match db.issue_claude_actor_capability(
+        session_id,
+        tool_use_id,
+        Some(agent_id),
+        instance_name,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            log::log_error(
+                "hooks",
+                "claude.actor.issue_failed",
+                &format!(
+                    "session_id={} tool_use_id={} actor={} err={}",
+                    session_id, tool_use_id, instance_name, error
+                ),
+            );
+            return (0, String::new());
+        }
+    };
+
+    let mut updated_input = tool_input.clone();
+    let Some(object) = updated_input.as_object_mut() else {
+        return (0, String::new());
+    };
+    let command = if tool_name == "PowerShell" {
+        format!(
+            "$env:{} = {}; $env:{} = {}\n{}",
+            crate::claude_actor::ENV_VAR,
+            powershell_single_quote(&token),
+            crate::claude_actor::SESSION_ENV_VAR,
+            powershell_single_quote(session_id),
+            command
+        )
+    } else {
+        let token = crate::tools::args_common::shell_quote(&token);
+        let actor_session = crate::tools::args_common::shell_quote(session_id);
+        format!(
+            "export {}={} {}={}\n{}",
+            crate::claude_actor::ENV_VAR,
+            token,
+            crate::claude_actor::SESSION_ENV_VAR,
+            actor_session,
+            command
+        )
+    };
+    object.insert("command".into(), Value::String(command));
+
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": updated_input,
+        }
+    });
+    (0, serde_json::to_string(&output).unwrap_or_default())
+}
+
+fn revoke_shell_actor_for_hook(
+    db: &HcomDb,
+    session_id: &str,
+    payload: &HookPayload,
+    agent_id: Option<&str>,
+) {
+    if !is_shell_tool(&payload.tool_name) {
+        return;
+    }
+    let Some(tool_use_id) = tool_use_id(payload) else {
+        return;
+    };
+    if let Err(error) = db.revoke_claude_actor_capability(session_id, tool_use_id, agent_id) {
+        log::log_warn(
+            "hooks",
+            "claude.actor.revoke_failed",
+            &format!(
+                "session_id={} tool_use_id={} err={}",
+                session_id, tool_use_id, error
+            ),
+        );
+    }
+}
+
+fn handle_tool_failure(
+    db: &HcomDb,
+    payload: &HookPayload,
+    instance_name: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+) -> (i32, String) {
+    revoke_shell_actor_for_hook(db, session_id, payload, agent_id);
+    let error = payload
+        .raw
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("tool failed");
+    lifecycle::set_status(
+        db,
+        instance_name,
+        ST_ACTIVE,
+        &format!("tool_failed:{}", payload.tool_name),
+        lifecycle::StatusUpdate {
+            detail: error,
+            ..Default::default()
+        },
+    );
+    (0, String::new())
+}
+
+fn handle_permission_denied(
+    db: &HcomDb,
+    payload: &HookPayload,
+    instance_name: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+) -> (i32, String) {
+    revoke_shell_actor_for_hook(db, session_id, payload, agent_id);
+    let reason = payload
+        .raw
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("permission denied");
+    lifecycle::set_status(
+        db,
+        instance_name,
+        ST_BLOCKED,
+        &format!("denied:{}", payload.tool_name),
+        lifecycle::StatusUpdate {
+            detail: reason,
+            ..Default::default()
+        },
+    );
+    (0, String::new())
+}
+
+fn handle_stop_failure(db: &HcomDb, payload: &HookPayload, instance_name: &str) -> (i32, String) {
+    let error = payload
+        .raw
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let detail = payload
+        .raw
+        .get("error_details")
+        .and_then(|value| value.as_str())
+        .unwrap_or(error);
+    lifecycle::set_status(
+        db,
+        instance_name,
+        ST_INACTIVE,
+        &format!("failure:{}", error),
+        lifecycle::StatusUpdate {
+            detail,
+            ..Default::default()
+        },
+    );
     (0, String::new())
 }
 
@@ -1230,8 +1654,8 @@ fn handle_posttooluse(
         );
     }
 
-    // Bash-specific: persist updates and check bootstrap
-    if tool_name == "Bash" {
+    // Shell-specific: persist updates and check bootstrap
+    if is_shell_tool(tool_name) {
         if !updates.is_empty() {
             instances::update_instance_position(db, instance_name, updates);
         }
@@ -1349,7 +1773,7 @@ fn handle_poll(
     ctx: &HcomContext,
     instance_name: &str,
     instance_data: &InstanceRow,
-) -> (i32, String) {
+) -> (i32, String, Option<DeliveryAck>) {
     log::log_info(
         "hooks",
         "stop.enter",
@@ -1363,7 +1787,7 @@ fn handle_poll(
     if ctx.is_pty_mode {
         lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
         common::notify_hook_instance_with_db(db, instance_name);
-        return (0, String::new());
+        return (0, String::new(), None);
     }
 
     // Non-PTY: poll for messages
@@ -1375,10 +1799,9 @@ fn handle_poll(
     updates.insert("wait_timeout".into(), serde_json::json!(timeout));
     instances::update_instance_position(db, instance_name, &updates);
 
-    let (exit_code, output, timed_out) =
-        common::poll_messages(db, instance_name, timeout as u64, ctx.is_background);
+    let result = common::poll_messages(db, instance_name, timeout as u64, ctx.is_background);
 
-    if timed_out {
+    if result.timed_out {
         lifecycle::set_status(
             db,
             instance_name,
@@ -1388,10 +1811,14 @@ fn handle_poll(
         );
     }
 
-    let stdout = output
+    let stdout = result
+        .output
         .map(|v| serde_json::to_string(&v).unwrap_or_default())
         .unwrap_or_default();
-    (exit_code, stdout)
+    // Always exit 0: Claude ignores stdout JSON on exit 2 for Stop, so a
+    // delivered message must go out as exit 0 + decision:block, with the ack
+    // committed by write_hook_output only after that stdout is flushed.
+    (0, stdout, result.ack)
 }
 
 /// Parent UserPromptSubmit: fallback bootstrap, PTY mode message delivery.
@@ -1404,27 +1831,24 @@ fn handle_userpromptsubmit(
     instance_data: &InstanceRow,
 ) -> (i32, String, Option<DeliveryAck>) {
     let name_announced = instance_data.name_announced != 0;
+    let mut contexts = Vec::new();
+    let mut system_message = None;
+    let mut delivery_ack = None;
 
     // Persist updates
     if !updates.is_empty() {
         instances::update_instance_position(db, instance_name, updates);
     }
 
-    // Bootstrap fallback (rarely fires)
+    // Bootstrap fallback (rarely fires). Do not return early: a resumed PTY can
+    // have both an unannounced bootstrap and pending messages on its first wake.
     if !name_announced
         && ctx.is_launched
         && let Some(bootstrap_text) =
             common::inject_bootstrap_once(db, ctx, instance_name, instance_data, "claude")
     {
-        let output = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": bootstrap_text,
-            }
-        });
+        contexts.push(bootstrap_text);
         paths::increment_flag_counter("instance_count");
-        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-        return (0, serde_json::to_string(&output).unwrap_or_default(), None);
     }
 
     // PTY mode: deliver messages
@@ -1436,17 +1860,31 @@ fn handle_userpromptsubmit(
         let model_context =
             common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
 
-        let output = serde_json::json!({
-            "systemMessage": user_display,
+        system_message = Some(user_display);
+        contexts.push(model_context);
+        delivery_ack = Some(prepared.ack);
+    }
+
+    if !contexts.is_empty() {
+        let mut output = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": model_context,
+                "additionalContext": contexts.join("\n\n---\n\n"),
             },
         });
+        if let Some(message) = system_message {
+            output
+                .as_object_mut()
+                .unwrap()
+                .insert("systemMessage".into(), Value::String(message));
+        }
+        if delivery_ack.is_none() {
+            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        }
         return (
             0,
             serde_json::to_string(&output).unwrap_or_default(),
-            Some(prepared.ack),
+            delivery_ack,
         );
     }
 
@@ -1558,6 +1996,27 @@ fn handle_sessionend(
         .get("reason")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+
+    let is_primary = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .and_then(|instance| instance.session_id)
+        .as_deref()
+        == Some(session_id);
+    if !is_primary {
+        log::log_warn(
+            "hooks",
+            "sessionend.historical_ignored",
+            &format!(
+                "instance={} incoming_session_id={} reason={} primary_mutation=false",
+                instance_name, session_id, reason
+            ),
+        );
+        cleanup_sessionend_scoped_state(db, session_id);
+        return (0, String::new());
+    }
+
     common::finalize_session(
         db,
         instance_name,
@@ -1569,25 +2028,39 @@ fn handle_sessionend(
         },
     );
 
-    // Root session is over: no more children can spawn under any of its
-    // prompt_id mappings (see `spawn_owner_kv_key`), no further resumes can
-    // arrive for its agent_ids (see `agent_owner_kv_key`), and no further
-    // SubagentStop invocations can fire for it (see `subagent_stop_inflight_key`).
-    // None of these can be cleaned up incrementally as they're used (parallel
-    // siblings sharing one prompt_id would race a later SubagentStart against
-    // an earlier sibling's cleanup — see `end_task`; a resumed agent_id needs
-    // its mapping to *outlive* its own stop), so the whole session's worth of
-    // each is swept here instead. Inflight stop records are transient and
-    // self-recover when their owning process dies, but sweeping them avoids
-    // retaining unreachable session data.
-    for (label, prefix) in [
-        ("spawn_owner", spawn_owner_kv_prefix(session_id)),
-        ("agent_owner", agent_owner_kv_prefix(session_id)),
-        (
-            "subagent_stop_inflight",
-            subagent_stop_inflight_prefix(session_id),
-        ),
-    ] {
+    cleanup_sessionend_scoped_state(db, session_id);
+
+    (0, String::new())
+}
+
+fn cleanup_sessionend_scoped_state(db: &HcomDb, session_id: &str) {
+    // The lineage validation cache is per session generation and nothing else
+    // ever deletes it, so an ended generation would leak a kv row forever. A
+    // generation that comes back is re-validated by its next SessionStart.
+    if let Err(error) = db.clear_claude_session_validation(session_id) {
+        log::log_warn(
+            "hooks",
+            "sessionend.validation_cache_cleanup_failed",
+            &format!("session_id={} err={}", session_id, error),
+        );
+    }
+
+    if let Err(error) = db.revoke_claude_actor_capabilities_for_session(session_id) {
+        log::log_warn(
+            "hooks",
+            "sessionend.actor_cleanup_failed",
+            &format!("session_id={} err={}", session_id, error),
+        );
+    }
+
+    // Root session is over: no further SubagentStop invocations can fire for
+    // it (see `subagent_stop_inflight_key`). Inflight stop records are
+    // transient and self-recover when their owning process dies, but
+    // sweeping them here avoids retaining unreachable session data.
+    for (label, prefix) in [(
+        "subagent_stop_inflight",
+        subagent_stop_inflight_prefix(session_id),
+    )] {
         if let Err(e) = db.kv_delete_prefix(&prefix) {
             log::log_warn(
                 "hooks",
@@ -1596,231 +2069,48 @@ fn handle_sessionend(
             );
         }
     }
-
-    (0, String::new())
 }
 
-/// Track subagent in `parent_instance`'s running_tasks. `parent_instance` is
-/// the already-resolved spawning actor (root or a nested subagent — see
-/// `resolve_spawn_owner`), not derived from session_id here.
-fn track_subagent(db: &HcomDb, parent_instance: &str, agent_id: &str, agent_type: &str) {
-    log::log_info(
-        "hooks",
-        "track_subagent.enter",
-        &format!(
-            "parent={} agent_id={} agent_type={}",
-            parent_instance, agent_id, agent_type
-        ),
+/// Refresh a child row's last-seen lease without changing its identity or
+/// lifecycle ownership. Every hook emitted inside a child calls this.
+fn refresh_subagent_last_seen(db: &HcomDb, instance_name: &str) {
+    let _ = db.conn().execute(
+        "UPDATE instances SET last_seen = ?
+         WHERE name = ? AND parent_name IS NOT NULL",
+        rusqlite::params![crate::shared::time::now_epoch_i64(), instance_name],
     );
-
-    // Dedup-check-and-insert happens inside the transaction (see
-    // `mutate_running_tasks`), so concurrent SubagentStart hooks for sibling
-    // subagents of the same parent (parallel Task calls) cannot race and
-    // silently drop each other's entry.
-    instances::mutate_running_tasks(db, parent_instance, |rt| {
-        rt.track_subagent(agent_id, agent_type);
-    });
 }
 
-/// Remove subagent from parent's running_tasks.
-fn remove_subagent_from_parent(db: &HcomDb, parent_name: &str, agent_id: &str) {
-    instances::mutate_running_tasks(db, parent_name, |rt| {
-        rt.remove_subagent(agent_id);
-    });
-}
+/// Mark quiet child rows stale for display only. Staleness never authorizes
+/// routing and never blocks start, stop, send, or listen.
+fn mark_stale_subagents(db: &HcomDb, session_id: &str) {
+    let timeout = db
+        .get_session_binding(session_id)
+        .ok()
+        .flatten()
+        .and_then(|name| db.get_instance_full(&name).ok().flatten())
+        .and_then(|row| row.subagent_timeout)
+        .unwrap_or_else(|| {
+            HcomConfig::load(None)
+                .ok()
+                .map(|config| config.subagent_timeout)
+                .unwrap_or(120)
+        });
+    let cutoff = crate::shared::time::now_epoch_i64().saturating_sub(timeout.saturating_mul(2));
 
-/// Maximum depth when searching for nested subagent transcripts.
-///
-/// Claude Code's `setAgentTranscriptSubdir` takes the subdir key unsanitized
-/// (runAgent.ts:321-352), and the documented example is `workflows/<runId>`
-/// which creates `subagents/workflows/<runId>/agent-*.jsonl`. Bound the
-/// search at 4 levels so a pathological subdir key can't turn the scan
-/// into an unbounded filesystem walk.
-const MAX_SUBAGENT_TRANSCRIPT_DEPTH: u32 = 4;
-
-/// Locate a subagent transcript when it isn't at the flat
-/// `subagents/agent-{id}.jsonl`. Walks subdirectories up to
-/// `MAX_SUBAGENT_TRANSCRIPT_DEPTH` levels looking for `agent-{id}.jsonl`.
-fn find_subagent_transcript(subagent_dir: &Path, agent_id: &str) -> Option<PathBuf> {
-    let target = format!("agent-{}.jsonl", agent_id);
-    find_subagent_transcript_impl(subagent_dir, &target, 0)
-}
-
-fn find_subagent_transcript_impl(dir: &Path, target: &str, depth: u32) -> Option<PathBuf> {
-    if depth >= MAX_SUBAGENT_TRANSCRIPT_DEPTH {
-        return None;
-    }
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let sub = entry.path();
-        let candidate = sub.join(target);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if let Some(found) = find_subagent_transcript_impl(&sub, target, depth + 1) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// Check for dead subagents by checking multiple death signals.
-fn check_dead_subagents(
-    db: &HcomDb,
-    transcript_path: &str,
-    running_tasks: &instances::RunningTasks,
-    subagent_timeout: Option<i64>,
-) -> Vec<String> {
-    let timeout = subagent_timeout.unwrap_or_else(|| {
-        HcomConfig::load(None)
-            .ok()
-            .map(|c| c.subagent_timeout)
-            .unwrap_or(120)
-    });
-    let stale_threshold = (timeout * 2) as u64;
-    // Claude Code stores subagent transcripts under
-    // `{projectDir}/{sessionId}/subagents/agent-{agentId}.jsonl`
-    // (claude-code/src/utils/sessionStorage.ts getAgentTranscriptPath).
-    // Parent's transcript_path is `{projectDir}/{sessionId}.jsonl`; strip the
-    // `.jsonl` suffix to get the directory that holds `subagents/`.
-    let subagent_dir = if transcript_path.is_empty() {
-        None
-    } else {
-        transcript_path
-            .strip_suffix(".jsonl")
-            .map(|stem| PathBuf::from(stem).join("subagents"))
-    };
-
-    let mut dead = Vec::new();
-    let now = crate::shared::time::now_epoch_i64() as u64;
-
-    for subagent in &running_tasks.subagents {
-        let agent_id = match subagent.get("agent_id").and_then(|v| v.as_str()) {
-            Some(id) => id,
-            None => continue,
-        };
-
-        // Check: instance deleted from DB
-        let exists = db
-            .conn()
-            .query_row(
-                "SELECT 1 FROM instances WHERE agent_id = ?",
-                rusqlite::params![agent_id],
-                |_| Ok(()),
-            )
-            .is_ok();
-        if !exists {
-            dead.push(agent_id.to_string());
-            continue;
-        }
-
-        let Some(ref subagent_dir) = subagent_dir else {
-            // No parent transcript path — skip rather than declare dead on
-            // missing signal.
-            continue;
-        };
-
-        // Primary path: flat `subagents/agent-{id}.jsonl`.
-        // Fallback: workflow subagents live under `subagents/<subdir>/agent-{id}.jsonl`
-        // (claude-code/src/utils/sessionStorage.ts:231-257 agentTranscriptSubdirs).
-        // If the flat path misses, look one level deeper before giving up.
-        let flat = subagent_dir.join(format!("agent-{}.jsonl", agent_id));
-        let agent_transcript = if flat.is_file() {
-            flat
-        } else {
-            find_subagent_transcript(subagent_dir, agent_id).unwrap_or(flat)
-        };
-        match std::fs::metadata(&agent_transcript) {
-            Err(_) => {
-                // Transcript not yet written (brand-new subagent) or layout
-                // differs. A missing file is not evidence of death — skip
-                // and rely on DB-row-missing / stale-mtime / marker checks
-                // on the next tick.
-                continue;
-            }
-            Ok(meta) => {
-                // Stale check
-                if let Ok(modified) = meta.modified() {
-                    let mtime = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if now.saturating_sub(mtime) > stale_threshold {
-                        dead.push(agent_id.to_string());
-                        continue;
-                    }
-                }
-
-                // Check last 4KB for interrupt marker
-                if let Ok(mut f) = std::fs::File::open(&agent_transcript) {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
-                    let read_from = size.saturating_sub(4096);
-                    let _ = f.seek(SeekFrom::Start(read_from));
-                    let mut buf = Vec::new();
-                    let _ = f.read_to_end(&mut buf);
-                    let tail = String::from_utf8_lossy(&buf);
-                    if tail.contains("[Request interrupted by user]") {
-                        dead.push(agent_id.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    dead
-}
-
-/// Clean up dead subagents from parent's running_tasks.
-fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) {
-    let instance_name = match db.get_session_binding(session_id) {
-        Ok(Some(name)) => name,
-        _ => return,
-    };
-
-    let instance_data = match db.get_instance_full(&instance_name) {
-        Ok(Some(data)) => data,
-        _ => return,
-    };
-
-    let running_tasks = instances::parse_running_tasks(instance_data.running_tasks.as_deref());
-    if running_tasks.subagents.is_empty() {
-        return;
-    }
-
-    let dead_ids = check_dead_subagents(
-        db,
-        transcript_path,
-        &running_tasks,
-        instance_data.subagent_timeout,
+    let _ = db.conn().execute(
+        "UPDATE instances
+         SET status = ?, status_context = 'subagent:stale',
+             status_detail = 'No recent child hook; lifecycle uncertain'
+         WHERE parent_session_id = ?
+           AND last_seen > 0 AND last_seen < ?
+           AND status_context != 'subagent:stale'",
+        rusqlite::params![ST_INACTIVE, session_id, cutoff],
     );
-    if dead_ids.is_empty() {
-        return;
-    }
-
-    for agent_id in &dead_ids {
-        remove_subagent_from_parent(db, &instance_name, agent_id);
-
-        // Stop the subagent instance if it exists
-        if let Ok(Some(name)) = db.get_instance_by_agent_id(agent_id) {
-            lifecycle::set_status(
-                db,
-                &name,
-                ST_INACTIVE,
-                "exit:interrupted",
-                Default::default(),
-            );
-            common::stop_instance(db, &name, "system", "interrupted");
-        }
-    }
 }
 
-/// SubagentStart: surface agent_id to subagent.
-fn build_subagent_start_output(raw: &Value) -> Option<Value> {
+/// SubagentStart: surface agent_id and root parent to subagent.
+fn build_subagent_start_output(raw: &Value, root_name: &str) -> Option<Value> {
     let agent_id = raw.get("agent_id").and_then(|v| v.as_str())?;
     if agent_id.is_empty() {
         return None;
@@ -1829,6 +2119,7 @@ fn build_subagent_start_output(raw: &Value) -> Option<Value> {
     let hcom_cmd = crate::runtime_env::build_hcom_command();
     let additional_context = format!(
         "Your agent ID: {agent_id}\n\
+         Your hcom parent: {root_name}\n\
          To use hcom, first run: {hcom_cmd} start --name {agent_id}"
     );
 
@@ -1849,26 +2140,25 @@ fn build_subagent_start_output(raw: &Value) -> Option<Value> {
 /// Idempotent: calls into `allocate_subagent_instance`, which returns the
 /// existing row's name if one already exists for this agent_id.
 ///
-/// `parent_instance` (the row's `parent_name`) is the already-resolved
-/// spawning actor, which may be a nested subagent — see
-/// `resolve_spawn_owner`. `root_session_id` is always the real Claude
-/// session_id (the root's own), never a subagent's, because subagent rows
-/// never get their own `session_id` (see `allocate_subagent_instance`) — it
-/// is the only value the `parent_session_id` FK column (`REFERENCES
-/// instances(session_id)`) can ever validly point at, at any nesting depth.
-/// Allocate this subagent's `instances` row. Returns `true` once a row exists
-/// and the actor is addressable (allocation is idempotent, so an already-present
-/// row also counts), `false` if the parent is unknown or allocation failed.
+/// `parent_instance` (the row's `parent_name`) is always the root hcom
+/// instance — every subagent, at any depth Claude nests it, attaches
+/// directly to root; see `handle_subagent_start`. `root_session_id` is
+/// always the real Claude session_id (the root's own), never a subagent's,
+/// because subagent rows never get their own `session_id` (see
+/// `allocate_subagent_instance`) — it is the only value the
+/// `parent_session_id` FK column (`REFERENCES instances(session_id)`) can
+/// ever validly point at.
+/// Allocate this subagent's `instances` row and return its stable name.
 fn ensure_subagent_row(
     db: &HcomDb,
     parent_instance: &str,
     root_session_id: &str,
     agent_id: &str,
     agent_type: &str,
-) -> bool {
+) -> Option<String> {
     let parent_data = match db.get_instance_full(parent_instance) {
         Ok(Some(data)) => data,
-        _ => return false,
+        _ => return None,
     };
     let parent_tag = parent_data.tag.as_deref();
 
@@ -1892,7 +2182,7 @@ fn ensure_subagent_row(
                     name, parent_instance, agent_id, agent_type
                 ),
             );
-            true
+            Some(name)
         }
         Err(e) => {
             log::log_warn(
@@ -1900,7 +2190,7 @@ fn ensure_subagent_row(
                 "subagent.row.alloc_failed",
                 &format!("agent_id={} err={}", agent_id, e),
             );
-            false
+            None
         }
     }
 }
@@ -1923,8 +2213,8 @@ fn hash_raw_payload(raw: &Value) -> String {
 /// alone either. Claude legitimately re-fires SubagentStop for the same
 /// agent_id (and, as far as we've established, possibly the same
 /// `prompt_id` too — SubagentStop is explicitly designed to fire again after
-/// an exit_code=2 delivery within the same agent prompt/continuation, and we
-/// have not confirmed Claude changes `prompt_id` for that re-fire) across the
+/// a `decision:"block"` delivery within the same agent prompt/continuation,
+/// and we have not confirmed Claude changes `prompt_id` for that re-fire) across the
 /// message-poll loop and on resume, so a claim keyed on either alone risks
 /// wrongly suppressing a later, genuinely different stop. The full raw
 /// payload is hashed instead: two hook registrations firing the *identical*
@@ -2090,23 +2380,25 @@ impl Drop for SubagentStopClaim<'_> {
 
 /// SubagentStop: message polling using agent_id, cleanup on exit.
 ///
-/// Returns (exit_code, stdout). exit_code=2 means message delivered
-/// (SubagentStop fires again). exit_code=0 means cleanup and stop.
-fn block_subagent_stop(error: impl std::fmt::Display) -> (i32, String) {
-    // Exit 0 with a documented Stop decision: Claude processes the JSON and
-    // keeps the subagent alive. Exit 1 would be non-blocking, while exit 2
-    // would ignore this stdout reason.
+/// Always exits 0: Claude ignores stdout JSON on exit 2 for SubagentStop
+/// (stderr-only feedback), so `decision:"block"` must go out as exit 0 for
+/// Claude to see the delivered message and keep the subagent alive.
+fn block_subagent_stop(error: impl std::fmt::Display) -> (i32, String, Option<DeliveryAck>) {
     let output = serde_json::json!({
         "decision": "block",
         "reason": format!("hcom could not finish SubagentStop: {error}. Please stop again."),
     });
-    (0, output.to_string())
+    (0, output.to_string(), None)
 }
 
-fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, String) {
+fn subagent_stop(
+    db: &HcomDb,
+    root_session_id: &str,
+    raw: &Value,
+) -> (i32, String, Option<DeliveryAck>) {
     let agent_id = match raw.get("agent_id").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => id,
-        _ => return (0, String::new()),
+        _ => return (0, String::new(), None),
     };
 
     // Claim before reading the row. Otherwise duplicate hook processes can all
@@ -2114,7 +2406,7 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
     // perform a second teardown against their stale copy of that row.
     let _stop_claim = match SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) {
         SubagentStopClaimResult::Acquired(claim) => claim,
-        SubagentStopClaimResult::Duplicate => return (0, String::new()),
+        SubagentStopClaimResult::Duplicate => return (0, String::new(), None),
         SubagentStopClaimResult::RetryableError(error) => return block_subagent_stop(error),
     };
 
@@ -2138,15 +2430,9 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
     };
 
     let Some((subagent_name, existing_transcript, parent_name, name_announced)) = row else {
-        // No instance = SubagentStart never allocated one (shouldn't happen for
-        // in-ctx subagents, but kept as a defensive fallback). The tracking
-        // entry could be on the session-bound root *or* a nested subagent
-        // that spawned this one (see `resolve_spawn_owner`) — scan for
-        // whichever instance actually tracks `agent_id` rather than assuming
-        // root, or the true owner is left wedged active forever.
-        instances::remove_tracked_subagent_by_agent_id(db, agent_id);
-        return (0, String::new());
+        return (0, String::new(), None);
     };
+    refresh_subagent_last_seen(db, &subagent_name);
 
     // Store transcript_path if not already set
     if existing_transcript.is_empty()
@@ -2175,13 +2461,9 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
         );
         match common::stop_instance(db, &subagent_name, "subagent", "idle") {
             common::StopOutcome::RetryableError(error) => return block_subagent_stop(error),
-            common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {
-                if let Some(ref pn) = parent_name {
-                    remove_subagent_from_parent(db, pn, agent_id);
-                }
-            }
+            common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {}
         }
-        return (0, String::new());
+        return (0, String::new(), None);
     }
 
     // Activation: dormant + a direct mention pending. Build the bootstrap
@@ -2219,14 +2501,15 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
                 .unwrap_or(120)
         }) as u64;
 
-    let (exit_code, output, timed_out) = common::poll_messages(db, &subagent_name, timeout, false);
+    let mut result = common::poll_messages(db, &subagent_name, timeout, false);
 
     // On first-activation delivery, prepend the subagent bootstrap to the
     // `reason` field so Claude injects both as a single user message on the
-    // subagent's next turn. We only mark `name_announced=true` here, after
-    // `poll_messages` confirmed a delivery — if it returned (0, None, _)
-    // the bootstrap is preserved for the next SubagentStop.
-    let stdout = match (&output, activation_bootstrap.as_deref()) {
+    // subagent's next turn. `name_announced` is only flipped once the caller
+    // commits `result.ack` after this stdout is actually flushed — if
+    // delivery never lands (crash, orphan, timeout) the bootstrap is
+    // preserved for the next SubagentStop instead of being burned.
+    let stdout = match (&result.output, activation_bootstrap.as_deref()) {
         (Some(Value::Object(obj)), Some(bs)) => {
             let mut munged = obj.clone();
             let existing_reason = munged
@@ -2240,19 +2523,17 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
                 format!("{bs}\n\n{existing_reason}")
             };
             munged.insert("reason".into(), Value::String(combined));
-            let mut updates = serde_json::Map::new();
-            updates.insert("name_announced".into(), serde_json::json!(true));
-            instances::update_instance_position(db, &subagent_name, &updates);
+            if let Some(ack) = result.ack.as_mut() {
+                ack.mark_announced = true;
+            }
             serde_json::to_string(&Value::Object(munged)).unwrap_or_default()
         }
         (Some(v), _) => serde_json::to_string(v).unwrap_or_default(),
         (None, _) => String::new(),
     };
 
-    // exit_code=2: message delivered, subagent continues
-    // exit_code=0: no message/timeout, cleanup
-    if exit_code == 0 {
-        let reason = if timed_out {
+    if !result.delivered {
+        let reason = if result.timed_out {
             "timeout"
         } else {
             "task_completed"
@@ -2266,58 +2547,29 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
         );
         match common::stop_instance(db, &subagent_name, "subagent", reason) {
             common::StopOutcome::RetryableError(error) => return block_subagent_stop(error),
-            common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {
-                if let Some(ref pn) = parent_name {
-                    remove_subagent_from_parent(db, pn, agent_id);
-                }
-            }
+            common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {}
         }
     }
 
-    (exit_code, stdout)
+    // Always exit 0: Claude consumes decision:block stdout only on exit 0.
+    // The dispatcher commits this deferred ack after stdout is flushed.
+    (0, stdout, result.ack)
 }
 
 /// Subagent PostToolUse: message delivery for subagents running hcom commands.
 ///
 /// Returns (exit_code, stdout).
-fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String, Option<DeliveryAck>) {
-    let tool_input = raw.get("tool_input").unwrap_or(&Value::Null);
-    let tool_name = raw.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-
-    if tool_name != "Bash" {
+fn subagent_posttooluse(db: &HcomDb, subagent_name: &str) -> (i32, String, Option<DeliveryAck>) {
+    if db.get_instance_full(subagent_name).ok().flatten().is_none() {
         return (0, String::new(), None);
     }
-
-    let command = tool_input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !command.contains("--name") {
-        return (0, String::new(), None);
-    }
-
-    let agent_id = match extract_name(command) {
-        Some(name) => name,
-        None => return (0, String::new(), None),
-    };
-
-    let subagent_name = match db.get_instance_by_agent_id(&agent_id) {
-        Ok(Some(name)) => name,
-        _ => return (0, String::new(), None),
-    };
-
-    // Check instance exists (row exists = participating)
-    let _data = match db.get_instance_full(&subagent_name) {
-        Ok(Some(data)) => data,
-        _ => return (0, String::new(), None),
-    };
 
     // Message delivery
-    let Some(prepared) = common::prepare_pending_messages(db, &subagent_name) else {
+    let Some(prepared) = common::prepare_pending_messages(db, subagent_name) else {
         return (0, String::new(), None);
     };
     let formatted =
-        common::format_messages_json_for_instance(db, &prepared.messages, &subagent_name);
+        common::format_messages_json_for_instance(db, &prepared.messages, subagent_name);
 
     let output = serde_json::json!({
         "hookSpecificOutput": {
@@ -2403,16 +2655,15 @@ fn bind_vanilla_from_marker(
     updates.insert("session_id".into(), Value::String(session_id.to_string()));
     updates.insert("tool".into(), Value::String("claude".to_string()));
     instances::update_instance_position(db, instance_name, &updates);
+    if let Err(error) = db.mark_claude_session_validated(session_id, instance_name) {
+        log::log_warn(
+            "hooks",
+            "bind.validation_cache_failed",
+            &format!("instance={} err={}", instance_name, error),
+        );
+    }
 
     Some(instance_name.to_string())
-}
-
-/// Extract --name flag value from a bash command string.
-fn extract_name(command: &str) -> Option<String> {
-    RE_NAME_FLAG
-        .captures(command)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
 }
 
 //
@@ -2425,10 +2676,18 @@ use super::common::SAFE_HCOM_COMMANDS;
 const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
     ("SessionStart", "", "sessionstart", None),
     ("UserPromptSubmit", "", "userpromptsubmit", None),
-    ("PreToolUse", "Bash|Task|Write|Edit", "pre", None),
+    (
+        "PreToolUse",
+        "Bash|PowerShell|Agent|Task|Write|Edit",
+        "pre",
+        None,
+    ),
     ("PostToolUse", "", "post", Some(86400)),
+    ("PostToolUseFailure", "", "post-failure", None),
     ("Stop", "", "poll", Some(86400)),
+    ("StopFailure", "", "stop-failure", None),
     ("PermissionRequest", "", "permission-request", None),
+    ("PermissionDenied", "", "permission-denied", None),
     ("SubagentStart", "", "subagent-start", None),
     ("SubagentStop", "", "subagent-stop", Some(86400)),
     ("Notification", "", "notify", None),
@@ -2441,8 +2700,11 @@ const CLAUDE_HOOK_COMMANDS: &[&str] = &[
     "userpromptsubmit",
     "pre",
     "post",
+    "post-failure",
     "poll",
+    "stop-failure",
     "permission-request",
+    "permission-denied",
     "subagent-start",
     "subagent-stop",
     "notify",
@@ -2455,8 +2717,11 @@ const CLAUDE_HOOK_TYPES: &[&str] = &[
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "Stop",
+    "StopFailure",
     "PermissionRequest",
+    "PermissionDenied",
     "SubagentStart",
     "SubagentStop",
     "Notification",
@@ -2464,7 +2729,6 @@ const CLAUDE_HOOK_TYPES: &[&str] = &[
 ];
 
 // Static regexes for hot-path hook command detection
-static RE_NAME_FLAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"--name\s+(\S+)").unwrap());
 static RE_HCOM_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
     let pattern = CLAUDE_HOOK_COMMANDS.join("|");
     Regex::new(&format!(r"\bhcom\s+({})\b", pattern)).unwrap()
@@ -2546,7 +2810,7 @@ fn format_claude_powershell_permission(prefix: &str, cmd: &str) -> String {
 /// Build permission patterns for installation using detected prefix.
 fn build_claude_permissions() -> Vec<String> {
     let prefix = crate::runtime_env::build_hcom_command();
-    SAFE_HCOM_COMMANDS
+    let mut patterns: Vec<String> = SAFE_HCOM_COMMANDS
         .iter()
         .map(|cmd| format_claude_permission(&prefix, cmd))
         .chain(
@@ -2554,7 +2818,28 @@ fn build_claude_permissions() -> Vec<String> {
                 .iter()
                 .map(|cmd| format_claude_powershell_permission(&prefix, cmd)),
         )
-        .collect()
+        .collect();
+    patterns.extend(claude_actor_permission_patterns());
+    patterns
+}
+
+/// Permission rules for the trusted actor prelude injected into subagent
+/// shell calls. Claude parses compound commands at shell boundaries, so these
+/// rules cover only the environment-setting statements; every original
+/// command remains subject to its own normal allow/ask/deny decision.
+fn claude_actor_permission_patterns() -> Vec<String> {
+    vec![
+        format!(
+            "Bash(export {}=* {}=*)",
+            crate::claude_actor::ENV_VAR,
+            crate::claude_actor::SESSION_ENV_VAR
+        ),
+        format!("PowerShell($env:{} = *)", crate::claude_actor::ENV_VAR),
+        format!(
+            "PowerShell($env:{} = *)",
+            crate::claude_actor::SESSION_ENV_VAR
+        ),
+    ]
 }
 
 /// Legacy commands that were once in SAFE_HCOM_COMMANDS or auto-approved.
@@ -2570,6 +2855,7 @@ fn build_all_claude_permission_patterns() -> Vec<String> {
             patterns.push(format_claude_powershell_permission(prefix, cmd));
         }
     }
+    patterns.extend(claude_actor_permission_patterns());
     patterns
 }
 
@@ -3133,6 +3419,448 @@ mod tests {
     }
 
     #[test]
+    fn hcom_fork_skips_copied_transcript_lineage() {
+        assert!(!should_scan_sessionstart_lineage(
+            true, "fork", false, false, true,
+        ));
+    }
+
+    #[test]
+    fn inherited_hcom_fork_flag_does_not_skip_native_switch_lineage() {
+        assert!(should_scan_sessionstart_lineage(
+            false, "startup", true, false, false,
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn inherited_hcom_fork_env_native_switch_uses_validated_ancestry() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        for (name, session_id) in [("kolo", "sess-fork"), ("lava", "sess-lava")] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                     VALUES (?1, ?2, 'claude', 'listening', 'start', 0, 0, 0)",
+                    rusqlite::params![name, session_id],
+                )
+                .unwrap();
+            bind_validated_session(&db, session_id, name);
+        }
+        db.set_process_binding("process-restored", "sess-lava", "lava")
+            .unwrap();
+
+        let transcript = hcom_dir.join("fork-origin-switch.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"sess-new\",\"message\":{\"session_id\":\"sess-fork\"}}\n",
+        )
+        .unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_IS_FORK".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_PROCESS_ID".to_string(),
+            "process-restored".to_string(),
+        );
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-new",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(&db, &ctx, "sess-new", transcript.to_str(), &raw);
+
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("kolo")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-fork").unwrap().as_deref(),
+            Some("kolo"),
+            "promoting the new generation must preserve the ancestor alias"
+        );
+        assert_eq!(
+            db.get_instance_full("kolo")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-new")
+        );
+        assert_eq!(
+            db.get_process_binding_full("process-restored").unwrap(),
+            Some((Some("sess-lava".to_string()), "lava".to_string()))
+        );
+        assert_eq!(
+            db.get_instance_full("lava")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "start"
+        );
+
+        let second_transcript = hcom_dir.join("fork-origin-switch-2.jsonl");
+        std::fs::write(
+            &second_transcript,
+            "{\"sessionId\":\"sess-new-2\",\"message\":{\"session_id\":\"sess-fork\"}}\n",
+        )
+        .unwrap();
+        let second_raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-new-2",
+            "transcript_path": second_transcript.to_string_lossy(),
+        });
+        let _ = handle_sessionstart(
+            &db,
+            &ctx,
+            "sess-new-2",
+            second_transcript.to_str(),
+            &second_raw,
+        );
+        assert_eq!(
+            db.get_session_binding("sess-new-2").unwrap().as_deref(),
+            Some("kolo"),
+            "a second switch may only carry the original copied ancestor"
+        );
+        assert_eq!(
+            db.get_instance_full("kolo")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-new-2")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fresh_hcom_fork_placeholder_does_not_adopt_parent_ancestry() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('niza', 'sess-parent', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-parent", "niza");
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('kolo', 'claude', 'inactive', 'new', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-fork", "", "kolo").unwrap();
+
+        let transcript = hcom_dir.join("hcom-fork-launch.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"sess-child\",\"message\":{\"session_id\":\"sess-parent\"}}\n",
+        )
+        .unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_IS_FORK".to_string(), "1".to_string());
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-fork".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-child",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(&db, &ctx, "sess-child", transcript.to_str(), &raw);
+
+        assert_eq!(
+            db.get_session_binding("sess-child").unwrap().as_deref(),
+            Some("kolo")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-parent").unwrap().as_deref(),
+            Some("niza")
+        );
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-child")
+                .unwrap()
+                .as_deref(),
+            Some("kolo")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fresh_standard_launch_bootstraps_and_validates_placeholder() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'claude', 'inactive', 'new', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-fresh", "", "nova").unwrap();
+
+        let transcript = hcom_dir.join("fresh-start.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-fresh".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-fresh",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(&db, &ctx, "sess-fresh", transcript.to_str(), &raw);
+
+        assert_eq!(
+            db.get_session_binding("sess-fresh").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-fresh")
+                .unwrap()
+                .as_deref(),
+            Some("nova")
+        );
+        assert_eq!(
+            db.get_process_binding_full("process-fresh").unwrap(),
+            Some((Some("sess-fresh".to_string()), "nova".to_string()))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unknown_native_startup_without_process_row_is_rejected() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('niza', 'sess-old', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-old", "niza");
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-gone".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-ephemeral",
+            "transcript_path": hcom_dir.join("missing.jsonl").to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(
+            &db,
+            &ctx,
+            "sess-ephemeral",
+            raw["transcript_path"].as_str(),
+            &raw,
+        );
+
+        assert_eq!(db.get_session_binding("sess-ephemeral").unwrap(), None);
+        assert_eq!(db.get_process_binding("process-gone").unwrap(), None);
+        assert_eq!(
+            db.get_instance_full("niza")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-old")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn switched_lineage_removes_process_only_stale_binding_without_blocking_unrelated_status() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('niza', 'sess-old', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-old", "niza");
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('stale', 'claude', 'inactive', 'exit:old', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-stale", "", "stale")
+            .unwrap();
+
+        let transcript = hcom_dir.join("stale-process-switch.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"sess-new\",\"message\":{\"session_id\":\"sess-old\"}}\n",
+        )
+        .unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-stale".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-new",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(&db, &ctx, "sess-new", transcript.to_str(), &raw);
+
+        assert_eq!(db.get_process_binding("process-stale").unwrap(), None);
+        assert_eq!(
+            db.get_instance_full("stale")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "exit:old"
+        );
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("niza")
+        );
+    }
+
+    #[test]
+    fn native_switch_or_unbound_session_scans_lineage() {
+        assert!(should_scan_sessionstart_lineage(
+            false, "startup", true, false, false,
+        ));
+        assert!(should_scan_sessionstart_lineage(
+            false, "clear", false, false, false,
+        ));
+    }
+
+    #[test]
+    fn settled_matching_session_skips_lineage_scan() {
+        assert!(!should_scan_sessionstart_lineage(
+            false, "clear", true, true, false,
+        ));
+    }
+
+    #[test]
+    fn inherited_fork_flag_cannot_override_native_switch_session_id() {
+        let (dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('lava', 'sess-lava', 'claude', 'listening', 'start', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-lava", "lava").unwrap();
+        db.set_process_binding("process-restored", "sess-lava", "lava")
+            .unwrap();
+        let env_file = dir
+            .path()
+            .join(".claude/session-env/12345678-1234-1234-1234-123456789012/hook-1.sh");
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_IS_FORK".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_PROCESS_ID".to_string(),
+            "process-restored".to_string(),
+        );
+        env.insert(
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "87654321-4321-4321-4321-210987654321"
+        });
+
+        assert!(!should_use_fork_env_session_id(&db, &ctx, &raw));
+        assert_eq!(
+            get_real_session_id(&raw, ctx.claude_env_file.as_deref(), false),
+            "87654321-4321-4321-4321-210987654321"
+        );
+    }
+
+    #[test]
+    fn fresh_fork_placeholder_may_use_env_file_session_id() {
+        let (dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('kolo', 'claude', 'inactive', 'new', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-fork", "", "kolo").unwrap();
+        let env_file = dir
+            .path()
+            .join(".claude/session-env/12345678-1234-1234-1234-123456789012/hook-1.sh");
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_IS_FORK".to_string(), "1".to_string());
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-fork".to_string());
+        env.insert(
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "parent-session"
+        });
+
+        assert!(should_use_fork_env_session_id(&db, &ctx, &raw));
+        assert_eq!(
+            get_real_session_id(&raw, ctx.claude_env_file.as_deref(), true),
+            "12345678-1234-1234-1234-123456789012"
+        );
+    }
+
+    #[test]
     fn test_get_real_session_id_normal() {
         let raw = serde_json::json!({"session": {"session_id": "abc-123"}});
         assert_eq!(get_real_session_id(&raw, None, false), "abc-123");
@@ -3162,40 +3890,28 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_name() {
-        assert_eq!(
-            extract_name("hcom send --name luna 'hello'"),
-            Some("luna".to_string())
-        );
-        assert_eq!(extract_name("hcom list"), None);
-        assert_eq!(
-            extract_name("hcom send --name abc123 --intent request"),
-            Some("abc123".to_string())
-        );
-    }
-
-    #[test]
     fn test_subagent_start_with_agent_id() {
         let raw = serde_json::json!({"agent_id": "agent-uuid-123"});
-        let result = build_subagent_start_output(&raw);
+        let result = build_subagent_start_output(&raw, "nova");
         assert!(result.is_some());
         let output = result.unwrap();
         let ctx = output["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
         assert!(ctx.contains("agent-uuid-123"));
+        assert!(ctx.contains("nova"));
     }
 
     #[test]
     fn test_subagent_start_no_agent_id() {
         let raw = serde_json::json!({});
-        assert!(build_subagent_start_output(&raw).is_none());
+        assert!(build_subagent_start_output(&raw, "nova").is_none());
     }
 
     #[test]
     fn test_subagent_start_empty_agent_id() {
         let raw = serde_json::json!({"agent_id": ""});
-        assert!(build_subagent_start_output(&raw).is_none());
+        assert!(build_subagent_start_output(&raw, "nova").is_none());
     }
 
     #[test]
@@ -3393,9 +4109,9 @@ mod tests {
 
     #[test]
     fn test_claude_hook_configs_count() {
-        assert_eq!(CLAUDE_HOOK_CONFIGS.len(), 10);
-        assert_eq!(CLAUDE_HOOK_TYPES.len(), 10);
-        assert_eq!(CLAUDE_HOOK_COMMANDS.len(), 10);
+        assert_eq!(CLAUDE_HOOK_CONFIGS.len(), 13);
+        assert_eq!(CLAUDE_HOOK_TYPES.len(), 13);
+        assert_eq!(CLAUDE_HOOK_COMMANDS.len(), 13);
     }
 
     #[test]
@@ -3434,18 +4150,24 @@ mod tests {
     fn test_build_claude_permissions() {
         let perms = build_claude_permissions();
         assert!(!perms.is_empty());
-        // Both Bash and PowerShell variants are installed for every safe command.
-        assert_eq!(perms.len(), SAFE_HCOM_COMMANDS.len() * 2);
+        // Both shell variants are installed for every safe command, plus the
+        // three actor-prelude statements used only by Claude subagents.
+        assert_eq!(perms.len(), SAFE_HCOM_COMMANDS.len() * 2 + 3);
         assert_eq!(
             perms.iter().filter(|p| p.starts_with("Bash(")).count(),
-            SAFE_HCOM_COMMANDS.len()
+            SAFE_HCOM_COMMANDS.len() + 1
         );
         assert_eq!(
             perms
                 .iter()
                 .filter(|p| p.starts_with("PowerShell("))
                 .count(),
-            SAFE_HCOM_COMMANDS.len()
+            SAFE_HCOM_COMMANDS.len() + 2
+        );
+        assert!(
+            perms
+                .iter()
+                .any(|p| { p == "Bash(export HCOM_CLAUDE_ACTOR=* HCOM_CLAUDE_ACTOR_SESSION=*)" })
         );
         // All should start with "Bash(" or "PowerShell("
         for p in &perms {
@@ -3460,8 +4182,8 @@ mod tests {
     #[test]
     fn test_build_all_claude_permission_patterns() {
         let patterns = build_all_claude_permission_patterns();
-        // Should have both hcom and uvx hcom variants, each with Bash and PowerShell rules
-        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2 * 2;
+        // Both hcom prefixes and shell variants, plus actor-prelude cleanup.
+        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2 * 2 + 3;
         assert_eq!(patterns.len(), expected);
         assert!(patterns.iter().any(|p| p.contains("hcom send")));
         assert!(patterns.iter().any(|p| p == "PowerShell(hcom send:*)"));
@@ -4148,15 +4870,15 @@ mod tests {
         drop(_guard);
     }
 
-    // ---- Hook-actor routing (raw.agent_id, not running_tasks.active) ----
+    // ---- Hook-actor routing (raw.agent_id is authoritative) ----
     //
     // These are dispatcher-level tests: they drive `route_claude_hook` itself
     // (the function `dispatch_claude_hook` calls after reading stdin), not the
     // individual handler functions, because the bug class here is a routing
     // bug — which branch a given hook payload falls into — not a bug inside
     // any one handler. They need `isolated_test_env()` because
-    // `route_claude_hook` exercises real log::log_info call sites (start_task,
-    // track_subagent, sessionstart, ...), which resolve the hcom log path
+    // `route_claude_hook` exercises real log::log_info call sites (spawn ownership,
+    // sessionstart and lifecycle handlers), which resolve the hcom log path
     // through the global `Config`; without isolation that would touch the
     // real `~/.hcom` of whatever machine runs the test.
 
@@ -4169,6 +4891,392 @@ mod tests {
         let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
         db.init_db().unwrap();
         (dir, guard, db)
+    }
+
+    fn bind_validated_session(db: &HcomDb, session_id: &str, instance_name: &str) {
+        db.set_session_binding(session_id, instance_name).unwrap();
+        db.mark_claude_session_validated(session_id, instance_name)
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_bash_pretooluse_does_not_inject_actor_capability() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu-1",
+            "tool_input": {"command": "hcom list"},
+        });
+        let payload = HookPayload::from_claude(raw);
+        let (_, stdout) = handle_pretooluse(&db, &payload, "nova", "sess-1", None);
+        assert!(
+            stdout.is_empty(),
+            "root command must remain byte-for-byte intact"
+        );
+        let capabilities: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM claude_actor_capabilities",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(capabilities, 0);
+    }
+
+    #[test]
+    fn test_hcom_command_detection_biases_toward_instrumentation() {
+        for command in [
+            "hcom list",
+            "PATH=/tmp/bin hcom list",
+            "echo ready && hcom send @nova -- hi",
+            "printf data | hcom events",
+            "/opt/hcom/bin/hcom list | head",
+            "uvx hcom list",
+            "$HCOM list",
+            "${HCOM} list",
+            "timeout 5 hcom list",
+            "bash -c 'hcom list'",
+            "echo hcom list",
+            "printf 'run hcom list later'",
+            "rg hcom src",
+        ] {
+            assert!(
+                visibly_invokes_hcom(command),
+                "expected hcom token to trigger instrumentation: {command}"
+            );
+        }
+
+        for command in [
+            "git status",
+            "./script-containing-hcom-in-its-name",
+            "echo hcommunication",
+            "rg hook-comms src",
+            "node tool.js",
+        ] {
+            assert!(
+                !visibly_invokes_hcom(command),
+                "non-hcom token must not trigger instrumentation: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_env_is_persisted_without_requiring_participation() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("claude-session-env.sh");
+        std::fs::write(&env_file, "").unwrap();
+        let env = std::collections::HashMap::from([
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+        ]);
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+
+        persist_claude_session_env(&ctx, "sess-vanilla");
+
+        assert_eq!(
+            std::fs::read_to_string(env_file).unwrap(),
+            "export HCOM_CLAUDE_UNIX_SESSION_ID=sess-vanilla\n"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_subagent_non_hcom_shell_command_is_not_modified() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-1",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu-ordinary",
+            "tool_input": {"command": "node -e 'console.log(42)'"},
+        });
+        let payload = HookPayload::from_claude(raw);
+        let (_, stdout) =
+            handle_pretooluse(&db, &payload, "nova_task_1", "sess-1", Some("agent-1"));
+        assert!(
+            stdout.is_empty(),
+            "non-hcom command must remain byte-for-byte untouched"
+        );
+        let capabilities: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM claude_actor_capabilities",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(capabilities, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_subagent_bash_pretooluse_injects_stable_actor_capability_and_failure_revokes_it() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-1",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu-1",
+            "tool_input": {"command": "hcom list | head"},
+        });
+        let payload = HookPayload::from_claude(raw);
+        let (_, first) = handle_pretooluse(&db, &payload, "nova_task_1", "sess-1", Some("agent-1"));
+        let (_, second) =
+            handle_pretooluse(&db, &payload, "nova_task_1", "sess-1", Some("agent-1"));
+        assert_eq!(
+            first, second,
+            "duplicate hook delivery must reuse one token"
+        );
+
+        let output: Value = serde_json::from_str(&first).unwrap();
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let prefix = format!("export {}=", crate::claude_actor::ENV_VAR);
+        assert!(command.starts_with(&prefix));
+        assert!(command.contains(&format!("{}=sess-1", crate::claude_actor::SESSION_ENV_VAR)));
+        assert!(command.ends_with("\nhcom list | head"));
+        let token = command
+            .strip_prefix(&prefix)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(
+            db.resolve_claude_actor_capability(token, "sess-1").unwrap(),
+            Some("nova_task_1".to_string())
+        );
+
+        let failure_raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-1",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu-1",
+            "tool_input": {"command": "hcom list | head"},
+            "error": "failed",
+        });
+        let failure = HookPayload::from_claude(failure_raw);
+        handle_tool_failure(&db, &failure, "nova_task_1", "sess-1", Some("agent-1"));
+        assert_eq!(
+            db.resolve_claude_actor_capability(token, "sess-1").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_powershell_pretooluse_injects_and_revokes_actor_capability() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-1",
+            "tool_name": "PowerShell",
+            "tool_use_id": "toolu-ps-1",
+            "tool_input": {"command": "hcom list"},
+        });
+        let payload = HookPayload::from_claude(raw);
+        let (_, stdout) =
+            handle_pretooluse(&db, &payload, "nova_task_1", "sess-1", Some("agent-1"));
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let prefix = format!("$env:{} = '", crate::claude_actor::ENV_VAR);
+        assert!(command.starts_with(&prefix));
+        assert!(command.contains(&format!(
+            "$env:{} = 'sess-1'",
+            crate::claude_actor::SESSION_ENV_VAR
+        )));
+        assert!(command.ends_with("\nhcom list"));
+        let token = command
+            .strip_prefix(&prefix)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        assert_eq!(
+            db.resolve_claude_actor_capability(token, "sess-1").unwrap(),
+            Some("nova_task_1".to_string())
+        );
+
+        let failure_raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-1",
+            "tool_name": "PowerShell",
+            "tool_use_id": "toolu-ps-1",
+            "tool_input": {"command": "hcom list"},
+            "error": "failed",
+        });
+        let failure = HookPayload::from_claude(failure_raw);
+        handle_tool_failure(&db, &failure, "nova_task_1", "sess-1", Some("agent-1"));
+        assert_eq!(
+            db.resolve_claude_actor_capability(token, "sess-1").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_agent_pretooluse_updates_status_without_creating_child_state() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "prompt_id": "prompt-1",
+            "tool_name": "Agent",
+            "tool_input": {"prompt": "do work"},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let _ = route_claude_hook(&db, &make_ctx(), HOOK_PRE, &mut payload);
+
+        let child_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE parent_name IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            child_count, 0,
+            "PreToolUse alone must not create child lifecycle state"
+        );
+        let root = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(root.status, ST_ACTIVE);
+        assert_eq!(root.status_context, "tool:Agent");
+    }
+
+    #[test]
+    #[serial]
+    fn test_stale_child_remains_addressable_and_subagent_start_revives_same_row() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen,
+                  subagent_timeout, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_context, status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'active', 'tool:Bash', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        mark_stale_subagents(&db, "sess-1");
+        let stale = db.get_instance_full("nova_task_1").unwrap().unwrap();
+        assert_eq!(stale.status_context, "subagent:stale");
+
+        let token = db
+            .issue_claude_actor_capability("sess-1", "tool-1", Some("agent-1"), "nova_task_1")
+            .unwrap();
+        assert_eq!(
+            db.resolve_claude_actor_capability(&token, "sess-1")
+                .unwrap(),
+            Some("nova_task_1".to_string()),
+            "display staleness must not affect verified actor identity"
+        );
+
+        let revived = ensure_subagent_row(&db, "nova", "sess-1", "agent-1", "task").unwrap();
+        assert_eq!(revived, "nova_task_1");
+        let revived_row = db.get_instance_full(&revived).unwrap().unwrap();
+        assert_eq!(revived_row.status_context, "subagent:dormant");
+        assert!(revived_row.last_seen > 1);
     }
 
     /// Same fixture as `make_delivery_test_db` (instance 'nova' + a pending
@@ -4194,10 +5302,8 @@ mod tests {
     }
 
     /// `root_session_id` matches what real `ensure_subagent_row`-created rows
-    /// carry as `parent_session_id` (always the true root session_id, at any
-    /// nesting depth — see its doc comment), so fixtures built with this
-    /// helper pass `validate_spawn_owner`'s hierarchy check the same way a
-    /// real row would.
+    /// carry as `parent_session_id` — always the true root session_id — so
+    /// fixtures built with this helper look the same as a real row would.
     fn insert_subagent_row(
         db: &HcomDb,
         name: &str,
@@ -4214,46 +5320,55 @@ mod tests {
             .unwrap();
     }
 
-    /// Property: a subagent PostToolUse whose agent_id has no resolvable
-    /// `instances` row (SubagentStart's row allocation is best-effort and may
-    /// not have happened, or the row is gone) must never deliver anything —
-    /// and, critically, must never fall through to root/parent delivery.
-    /// Row absence is identity state, not proof that the actor is the root.
     #[test]
     #[serial]
-    fn test_subagent_posttooluse_unknown_row_never_falls_through_to_parent() {
+    fn test_first_resumed_pty_wake_combines_bootstrap_and_pending_delivery() {
         crate::config::Config::init();
-        let (_dir, _guard, db) = make_isolated_delivery_test_db();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        // Parent tracks an agent_id that never got an instances row.
-        db.conn()
-            .execute(
-                "UPDATE instances SET running_tasks = ? WHERE name = 'nova'",
-                rusqlite::params![
-                    r#"{"active":true,"subagents":[{"agent_id":"ghost-agent","type":"general"}]}"#
-                ],
-            )
-            .unwrap();
-
-        let raw = serde_json::json!({
+        let (dir, _guard, db) = make_isolated_delivery_test_db();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        env.insert("HCOM_PTY_MODE".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            dir.path().join(".hcom").to_string_lossy().into_owned(),
+        );
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+        let payload = HookPayload::from_claude(serde_json::json!({
             "session_id": "sess-1",
-            "agent_id": "ghost-agent",
-            "tool_name": "Bash",
-            "tool_input": {"command": "hcom send --name ghost-agent -- hi"},
-        });
-        let mut payload = HookPayload::from_claude(raw);
-        let ctx = make_ctx();
-        let (exit_code, stdout, ack, _timing) =
-            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
+            "prompt": "<hcom>",
+        }));
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.name_announced, 0);
+
+        let (exit_code, stdout, ack) = handle_userpromptsubmit(
+            &db,
+            &ctx,
+            &payload,
+            "nova",
+            &serde_json::Map::new(),
+            &instance,
+        );
 
         assert_eq!(exit_code, 0);
         assert!(
-            stdout.is_empty(),
-            "unknown subagent actor must not deliver anything, got: {stdout}"
+            stdout.contains("hello"),
+            "pending message missing: {stdout}"
         );
-        assert!(ack.is_none());
-        // nova's own pending broadcast must remain untouched — no fallthrough.
-        assert_eq!(delivery_cursor(&db), 0);
+        assert!(
+            stdout.contains("[hcom:nova]"),
+            "bootstrap identity missing: {stdout}"
+        );
+        let ack = ack.expect("pending message must be acknowledged with the combined output");
+        assert_eq!(delivery_cursor(&db), 0, "ack must remain deferred");
+        common::commit_delivery_ack(&db, &ack);
+        assert!(delivery_cursor(&db) > 0);
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            1
+        );
     }
 
     /// Property: a subagent-context hook whose row *does* resolve, but which
@@ -4271,7 +5386,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         insert_subagent_row(&db, "nova_task_1", "sub-agent-1", "nova", "sess-1");
 
         let raw = serde_json::json!({
@@ -4308,7 +5423,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         // A is a native subagent of root nova; B is a native subagent of A.
         // Both share the root session as parent_session_id and have no session
         // of their own (session_id=NULL, as insert_subagent_row leaves it).
@@ -4331,102 +5446,79 @@ mod tests {
         );
     }
 
-    /// Property: the root's own PostToolUse must deliver even while a
-    /// genuinely live background subagent is tracked active. Since Claude
-    /// Code 2.1.198, Agent calls background by default, so the root can have
-    /// its own interleaved tool calls while a subagent still runs — gating
-    /// root delivery on `running_tasks.active` (the pre-existing design)
-    /// would freeze the parent for that whole window.
+    /// Conflicting structured identity must fail closed before
+    /// UserPromptSubmit prepares or acknowledges any pending queue.
     #[test]
     #[serial]
-    fn test_root_posttooluse_delivers_while_subagent_active() {
+    fn test_ambiguous_userpromptsubmit_does_not_consume_messages() {
         crate::config::Config::init();
-        let (_dir, _guard, db) = make_isolated_delivery_test_db();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        insert_subagent_row(&db, "nova_task_1", "live-agent-1", "nova", "sess-1");
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
         db.conn()
             .execute(
-                "UPDATE instances SET running_tasks = ? WHERE name = 'nova'",
-                rusqlite::params![
-                    r#"{"active":true,"subagents":[{"agent_id":"live-agent-1","type":"general"}]}"#
-                ],
-            )
-            .unwrap();
-
-        // Root's own PostToolUse — no agent_id: this genuinely is nova's own
-        // tool call, not a hook firing inside the live subagent.
-        let raw = serde_json::json!({
-            "session_id": "sess-1",
-            "tool_name": "Read",
-            "tool_input": {},
-        });
-        let mut payload = HookPayload::from_claude(raw);
-        let ctx = make_ctx();
-        let (_exit_code, stdout, ack, _timing) =
-            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
-
-        assert!(
-            !stdout.is_empty(),
-            "root PostToolUse must deliver even while a background subagent is active"
-        );
-        assert!(stdout.contains("hello"));
-        assert!(ack.is_some());
-    }
-
-    /// Property: a nested Agent/Task PreToolUse — one that fires *inside* a
-    /// subagent's own execution context because that subagent itself called
-    /// the Agent tool — must mark the spawning subagent's own running_tasks
-    /// active, not the root parent's. Parent and every nested subagent share
-    /// the same Claude session_id, so resolving the actor via
-    /// `get_session_binding(session_id)` (the pre-existing design) always
-    /// lands on the root regardless of which level actually spawned the call.
-    #[test]
-    #[serial]
-    fn test_nested_task_pre_updates_subagent_not_root() {
-        crate::config::Config::init();
-        let (_dir, _guard, db) = make_isolated_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
-                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES
+                 ('niza', 'sess-original', '/tmp/niza.jsonl', 'claude', 'listening', 'start', 0, 0, 0),
+                 ('lava', 'sess-poisoned', '/tmp/lava.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        insert_subagent_row(&db, "nova_task_1", "sub-agent-1", "nova", "sess-1");
+        bind_validated_session(&db, "sess-original", "niza");
+        db.set_session_binding("sess-poisoned", "lava").unwrap();
+        db.set_process_binding("process-restored", "sess-original", "niza")
+            .unwrap();
+        db.conn()
+            .execute(
+                r#"INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'sender',
+                         '{"from":"sender","text":"secret","scope":"broadcast"}')"#,
+                [],
+            )
+            .unwrap();
 
+        let transcript = hcom_dir.join("poisoned.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"sess-original\"}}\n",
+        )
+        .unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        env.insert("CLAUDECODE".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_PROCESS_ID".to_string(),
+            "process-restored".to_string(),
+        );
+        env.insert("HCOM_PTY_MODE".to_string(), "1".to_string());
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
         let raw = serde_json::json!({
-            "session_id": "sess-1",
-            "agent_id": "sub-agent-1",
-            "tool_name": "Task",
-            "tool_input": {"prompt": "spawn a nested helper"},
+            "session_id": "sess-poisoned",
+            "transcript_path": transcript,
+            "prompt": "hello"
         });
         let mut payload = HookPayload::from_claude(raw);
-        let ctx = make_ctx();
-        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload);
 
-        let sub_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova_task_1")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert!(
-            sub_rt.active,
-            "the spawning subagent's own running_tasks must be marked active"
-        );
+        let (exit_code, stdout, ack, timing) =
+            route_claude_hook(&db, &ctx, HOOK_USERPROMPTSUBMIT, &mut payload);
 
-        let root_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+        assert_eq!(timing.result, Some("no_instance"));
+        assert_eq!(db.get_cursor("niza"), 0);
+        assert_eq!(db.get_cursor("lava"), 0);
+        assert_eq!(
+            db.get_instance_full("niza").unwrap().unwrap().status,
+            ST_LISTENING
         );
-        assert!(
-            !root_rt.active,
-            "the root parent's running_tasks must not be touched by a nested Task call"
+        assert_eq!(
+            db.get_instance_full("lava").unwrap().unwrap().status,
+            ST_LISTENING
         );
     }
 
@@ -4442,7 +5534,7 @@ mod tests {
     fn test_task_posttooluse_async_launch_skips_delivery() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_delivery_test_db();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         let ctx = make_ctx();
 
         let raw_async = serde_json::json!({
@@ -4475,7 +5567,7 @@ mod tests {
     fn test_task_posttooluse_foreground_completed_delivers() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_delivery_test_db();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         let ctx = make_ctx();
 
         let raw_done = serde_json::json!({
@@ -4493,12 +5585,11 @@ mod tests {
         assert!(delivery_cursor(&db) > 0);
     }
 
-    /// Property: the `--name` a subagent passes to a Bash hcom command must
-    /// match the agent_id Claude itself stamped on this hook (raw.agent_id),
-    /// or one subagent could spoof another's `--name` and read its inbox.
+    /// Property: Bash PostToolUse delivery uses Claude's verified `agent_id`,
+    /// never a caller-controlled `--name` embedded in the command text.
     #[test]
     #[serial]
-    fn test_subagent_bash_name_mismatch_does_not_leak_other_inbox() {
+    fn test_subagent_bash_post_routes_verified_actor_not_command_name() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         db.conn()
@@ -4508,7 +5599,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         insert_subagent_row(&db, "nova_task_1", "agent-a", "nova", "sess-1");
         insert_subagent_row(&db, "nova_task_2", "agent-b", "nova", "sess-1");
         // A direct mention pending for subagent B's inbox only.
@@ -4521,8 +5612,8 @@ mod tests {
             .unwrap();
         let ctx = make_ctx();
 
-        // Hook fires inside subagent A's own context (agent_id=agent-a), but
-        // the Bash command spoofs --name agent-b.
+        // Hook fires inside subagent A's own context (agent_id=agent-a), while
+        // the command text names B. Hook delivery must still use A.
         let raw_spoof = serde_json::json!({
             "session_id": "sess-1",
             "agent_id": "agent-a",
@@ -4535,11 +5626,11 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert!(
             stdout.is_empty(),
-            "mismatched --name must not deliver another subagent's inbox, got: {stdout}"
+            "verified actor A must not receive actor B's inbox, got: {stdout}"
         );
         assert!(ack.is_none());
 
-        // The legitimate case still works: agent_id and --name match.
+        // Actor B receives B's message regardless of command parsing.
         let raw_ok = serde_json::json!({
             "session_id": "sess-1",
             "agent_id": "agent-b",
@@ -4551,131 +5642,16 @@ mod tests {
             route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_ok);
         assert!(
             stdout_ok.contains("secret for b"),
-            "matching --name must deliver its own inbox, got: {stdout_ok}"
+            "verified actor B must receive its own inbox, got: {stdout_ok}"
         );
         assert!(ack_ok.is_some());
-    }
-
-    /// Property: `running_tasks` is a whole-JSON-blob column mutated by
-    /// separate hook processes (each hook invocation opens its own DB
-    /// connection). Concurrent SubagentStart hooks for sibling subagents of
-    /// the same parent (parallel Task calls) must not race a plain
-    /// read-then-write into a lost update.
-    #[test]
-    #[serial]
-    fn test_mutate_running_tasks_concurrent_tracking_no_lost_updates() {
-        crate::config::Config::init();
-        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
-        let db_path = hcom_dir.join("test.db");
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
-                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0)",
-                [],
-            )
-            .unwrap();
-
-        let n: usize = 8;
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let path = db_path.clone();
-                std::thread::spawn(move || {
-                    let db = HcomDb::open_raw(&path).unwrap();
-                    track_subagent(&db, "nova", &format!("agent-{i}"), "general");
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let rt = instances::parse_running_tasks(
-            db.get_instance_full("nova")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert_eq!(
-            rt.subagents.len(),
-            n,
-            "concurrent SubagentStart tracking must not lose sibling entries to a read-modify-write race, got {:?}",
-            rt.subagents
-        );
-        assert!(rt.active);
-        for i in 0..n {
-            let want = format!("agent-{i}");
-            assert!(
-                rt.subagents
-                    .iter()
-                    .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some(want.as_str())),
-                "missing {want}"
-            );
-        }
-    }
-
-    /// Property: concurrent SubagentStop-driven removals for sibling
-    /// subagents must not race a plain read-then-write into a lost update
-    /// either — an entry silently surviving a lost removal is exactly what
-    /// leaves `running_tasks.active` stuck true (the original stale-freeze
-    /// symptom).
-    #[test]
-    #[serial]
-    fn test_mutate_running_tasks_concurrent_removal_no_lost_updates() {
-        crate::config::Config::init();
-        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
-        let db_path = hcom_dir.join("test.db");
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
-
-        let n: usize = 8;
-        let subagents: Vec<serde_json::Value> = (0..n)
-            .map(|i| serde_json::json!({"agent_id": format!("agent-{i}"), "type": "general"}))
-            .collect();
-        let rt_json = serde_json::json!({"active": true, "subagents": subagents});
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, running_tasks)
-                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0, ?)",
-                rusqlite::params![rt_json.to_string()],
-            )
-            .unwrap();
-
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let path = db_path.clone();
-                std::thread::spawn(move || {
-                    let db = HcomDb::open_raw(&path).unwrap();
-                    remove_subagent_from_parent(&db, "nova", &format!("agent-{i}"));
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let rt = instances::parse_running_tasks(
-            db.get_instance_full("nova")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert!(
-            rt.subagents.is_empty(),
-            "concurrent removal must not lose sibling removals to a read-modify-write race, got {:?}",
-            rt.subagents
-        );
-        assert!(!rt.active);
     }
 
     /// Property: every Claude subagent carries `agent_id` on its hooks
     /// regardless of whether its root ever ran `hcom start` — that's a
     /// property of Claude's hook schema, not of hcom participation.
     /// SubagentStart must stay a silent no-op (no `hcom start --name ...`
-    /// hint, no allocated row, no running_tasks mutation) when the shared
+    /// hint and no allocated row) when the shared
     /// session_id has no hcom root binding at all.
     #[test]
     #[serial]
@@ -4706,125 +5682,47 @@ mod tests {
         );
     }
 
-    /// Property: a SubagentStart's own `agent_id` names the *new* child, not
-    /// who spawned it, so a nested spawn (subagent A calling the Agent tool)
-    /// can only be attributed correctly via the `prompt_id` Claude repeats
-    /// across the spawning PreToolUse and the resulting SubagentStart(s) (see
-    /// `resolve_spawn_owner`). Covers the full sequence: nested Pre on A,
-    /// then SubagentStart for child B with a matching prompt_id, must
-    /// attribute B to A (not root) — and a genuinely top-level spawn (root's
-    /// own Pre, no agent_id) must still attribute to root.
     #[test]
     #[serial]
-    fn test_nested_subagent_start_resolves_via_prompt_id_not_root() {
+    fn test_nonparticipant_child_hcom_is_denied_but_other_shell_is_silent() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, running_tasks)
-                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0, ?)",
-                rusqlite::params![
-                    r#"{"active":true,"subagents":[{"agent_id":"agent-a","type":"general"}]}"#
-                ],
-            )
-            .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        insert_subagent_row(&db, "nova_task_1", "agent-a", "nova", "sess-1");
         let ctx = make_ctx();
 
-        // Nested Task PreToolUse fires *inside* subagent A (agent_id=agent-a),
-        // carrying the prompt_id Claude repeats on the SubagentStart for the
-        // child it spawns.
-        let raw_pre = serde_json::json!({
+        let hcom_raw = serde_json::json!({
             "session_id": "sess-1",
-            "agent_id": "agent-a",
-            "prompt_id": "p1",
-            "tool_name": "Task",
-            "tool_input": {"prompt": "spawn a nested helper"},
+            "agent_id": "child-1",
+            "tool_name": "Bash",
+            "tool_use_id": "tool-hcom",
+            "tool_input": {"command": "hcom start"},
         });
-        let mut payload_pre = HookPayload::from_claude(raw_pre);
-        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload_pre);
-
-        // SubagentStart for the new child B: its own agent_id names B, not A
-        // — only the shared prompt_id says who spawned it.
-        let raw_start = serde_json::json!({
-            "session_id": "sess-1",
-            "agent_id": "agent-b",
-            "agent_type": "general",
-            "prompt_id": "p1",
-        });
-        let mut payload_start = HookPayload::from_claude(raw_start);
-        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start);
-
-        let b_name = db.get_instance_by_agent_id("agent-b").unwrap().unwrap();
-        let b_row = db.get_instance_full(&b_name).unwrap().unwrap();
-        assert_eq!(
-            b_row.parent_name.as_deref(),
-            Some("nova_task_1"),
-            "the nested child must be attributed to the spawning subagent, not root"
-        );
-
-        let a_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova_task_1")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
+        let mut hcom_payload = HookPayload::from_claude(hcom_raw);
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_PRE, &mut hcom_payload);
+        assert_eq!(exit_code, 0);
+        assert!(ack.is_none());
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
         assert!(
-            a_rt.subagents
-                .iter()
-                .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some("agent-b")),
-            "the spawning subagent must track its own child"
-        );
-
-        let root_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova")
+            output["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
                 .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert!(
-            !root_rt
-                .subagents
-                .iter()
-                .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some("agent-b")),
-            "root must not be credited with a grandchild it never spawned"
-        );
-        assert_eq!(
-            root_rt.subagents.len(),
-            1,
-            "root's own directly-tracked subagent (A) must be untouched"
+                .contains("parent Claude session")
         );
 
-        // A genuinely top-level spawn (root's own Pre, no agent_id) must
-        // still resolve via the same correlation to root itself.
-        let raw_pre2 = serde_json::json!({
+        let ordinary_raw = serde_json::json!({
             "session_id": "sess-1",
-            "prompt_id": "p2",
-            "tool_name": "Task",
-            "tool_input": {"prompt": "spawn a top-level helper"},
+            "agent_id": "child-1",
+            "tool_name": "Bash",
+            "tool_use_id": "tool-ordinary",
+            "tool_input": {"command": "git status"},
         });
-        let mut payload_pre2 = HookPayload::from_claude(raw_pre2);
-        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload_pre2);
-
-        let raw_start2 = serde_json::json!({
-            "session_id": "sess-1",
-            "agent_id": "agent-c",
-            "agent_type": "general",
-            "prompt_id": "p2",
-        });
-        let mut payload_start2 = HookPayload::from_claude(raw_start2);
-        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start2);
-
-        let c_name = db.get_instance_by_agent_id("agent-c").unwrap().unwrap();
-        let c_row = db.get_instance_full(&c_name).unwrap().unwrap();
-        assert_eq!(
-            c_row.parent_name.as_deref(),
-            Some("nova"),
-            "a genuinely top-level spawn must still attribute to root"
-        );
+        let mut ordinary_payload = HookPayload::from_claude(ordinary_raw);
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_PRE, &mut ordinary_payload);
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
     }
 
     /// Property: a SubagentStart with no `prompt_id` field at all (Claude
@@ -4843,7 +5741,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
 
         let raw = serde_json::json!({
             "session_id": "sess-1",
@@ -4862,69 +5760,13 @@ mod tests {
         assert_eq!(row.parent_name.as_deref(), Some("nova"));
     }
 
-    /// Property: `prompt_id` is present (Claude Code >= 2.1.196) but no
-    /// mapping resolves — start_task's write hasn't landed yet, or never
-    /// will. Correlation failure must fail closed: no allocated row, no
-    /// running_tasks mutation anywhere (root included), no bootstrap hint.
-    /// Root is not a safe fallback here — unlike the no-`prompt_id`-at-all
-    /// case, a version that *does* send `prompt_id` and still misses means
-    /// something is actually wrong.
-    #[test]
-    #[serial]
-    fn test_subagent_start_with_prompt_id_but_no_mapping_fails_closed() {
-        crate::config::Config::init();
-        let (_dir, _guard, db) = make_isolated_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
-                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
-                [],
-            )
-            .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        let ctx = make_ctx();
-
-        // No preceding Task/Agent PreToolUse ever recorded this prompt_id.
-        let raw = serde_json::json!({
-            "session_id": "sess-1",
-            "agent_id": "orphan-1",
-            "agent_type": "general",
-            "prompt_id": "p-missing",
-        });
-        let mut payload = HookPayload::from_claude(raw);
-        let (exit_code, stdout, ack, _timing) =
-            route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload);
-
-        assert_eq!(exit_code, 0);
-        assert!(
-            stdout.is_empty(),
-            "an unresolved prompt_id must not inject an hcom hint, got: {stdout}"
-        );
-        assert!(ack.is_none());
-        assert!(
-            db.get_instance_by_agent_id("orphan-1").unwrap().is_none(),
-            "an unresolved prompt_id must not allocate an instances row"
-        );
-        let root_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert!(
-            root_rt.subagents.is_empty(),
-            "an unresolved prompt_id must not fall back to crediting root"
-        );
-    }
-
     /// Property: multiple children spawned in parallel by one actor within
     /// one turn share the same `prompt_id`. If an earlier sibling's own
     /// Task/Agent PostToolUse completes *before* a later sibling's
-    /// SubagentStart arrives, the shared mapping must survive — completion
-    /// of one sibling must not delete a mapping the others still need (the
-    /// interleaving race `end_task` used to be vulnerable to when it deleted
-    /// the mapping per-completion; see `spawn_owner_kv_key`).
+    /// SubagentStart arrives, the second sibling must still attach cleanly to
+    /// root — completion of one sibling must not disturb the other's
+    /// attribution, since both always resolve to root regardless of
+    /// prompt_id bookkeeping.
     #[test]
     #[serial]
     fn test_parallel_siblings_survive_interleaved_sibling_completion() {
@@ -4937,7 +5779,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         let ctx = make_ctx();
 
         // Root issues (what will become) two parallel Task calls in one
@@ -4998,136 +5840,15 @@ mod tests {
         );
     }
 
-    /// Property: spawn-owner mappings are cleaned up per-session at
-    /// SessionEnd (see `handle_sessionend`), not per-Task-completion — must
-    /// remove only the ending session's own keys, never another session's.
-    #[test]
-    #[serial]
-    fn test_sessionend_cleans_only_its_own_session_spawn_owner_keys() {
-        crate::config::Config::init();
-        let (_dir, _guard, db) = make_isolated_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
-                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
-                [],
-            )
-            .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        let ctx = make_ctx();
-
-        db.kv_set(&spawn_owner_kv_key("sess-1", "p1"), Some("nova"))
-            .unwrap();
-        db.kv_set(&spawn_owner_kv_key("sess-other", "p1"), Some("other-root"))
-            .unwrap();
-
-        let raw = serde_json::json!({
-            "session_id": "sess-1",
-            "reason": "clear",
-        });
-        let mut payload = HookPayload::from_claude(raw);
-        let _ = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload);
-
-        assert!(
-            db.kv_get(&spawn_owner_kv_key("sess-1", "p1"))
-                .unwrap()
-                .is_none(),
-            "SessionEnd must clean up its own session's spawn-owner mappings"
-        );
-        assert_eq!(
-            db.kv_get(&spawn_owner_kv_key("sess-other", "p1")).unwrap(),
-            Some("other-root".to_string()),
-            "SessionEnd must not touch a different session's spawn-owner mappings"
-        );
-    }
-
-    #[test]
-    fn test_spawn_owner_kv_key_is_session_scoped() {
-        assert_eq!(spawn_owner_kv_key("sess-1", "p1"), "spawn_owner:sess-1:p1");
-        assert_ne!(
-            spawn_owner_kv_key("sess-1", "p1"),
-            spawn_owner_kv_key("sess-2", "p1")
-        );
-        assert!(spawn_owner_kv_key("sess-1", "p1").starts_with(&spawn_owner_kv_prefix("sess-1")));
-    }
-
-    /// Property: when SubagentStop's own `instances` row is missing, the
-    /// stale running_tasks entry could be on the session-bound root *or* a
-    /// nested subagent that actually spawned it — removal must find and
-    /// clear it wherever it really is, not assume root.
-    #[test]
-    #[serial]
-    fn test_subagent_stop_missing_row_removes_from_actual_nested_owner() {
-        crate::config::Config::init();
-        let (_dir, _guard, db) = make_isolated_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, running_tasks)
-                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0, ?)",
-                rusqlite::params![
-                    r#"{"active":true,"subagents":[{"agent_id":"agent-a","type":"general"}]}"#
-                ],
-            )
-            .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, agent_id, parent_name, running_tasks)
-                 VALUES ('nova_task_1', 'claude', 'active', 'subagent', 0, 0, 0, 'agent-a', 'nova', ?)",
-                rusqlite::params![
-                    r#"{"active":true,"subagents":[{"agent_id":"agent-b","type":"general"}]}"#
-                ],
-            )
-            .unwrap();
-        // B (agent-b) has no instances row at all — allocation never
-        // happened, or the row is gone.
-
-        let raw = serde_json::json!({
-            "session_id": "sess-1",
-            "agent_id": "agent-b",
-        });
-        let mut payload = HookPayload::from_claude(raw);
-        let ctx = make_ctx();
-        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_STOP, &mut payload);
-
-        let a_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova_task_1")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert!(
-            a_rt.subagents.is_empty(),
-            "the actual nested owner (A) must have the dead child reaped"
-        );
-        assert!(!a_rt.active);
-
-        let root_rt = instances::parse_running_tasks(
-            db.get_instance_full("nova")
-                .unwrap()
-                .unwrap()
-                .running_tasks
-                .as_deref(),
-        );
-        assert_eq!(
-            root_rt.subagents.len(),
-            1,
-            "root must be untouched — it never tracked the nested child directly"
-        );
-    }
-
-    // ---- Resumed-agent correlation (agent_owner) ----
+    // ---- Resumed-agent correlation ----
 
     /// Property: a resumed subagent — Claude re-firing SubagentStart for a
-    /// previously-known `agent_id` under a *new* `prompt_id` with no
-    /// corresponding PreToolUse to map it — must reattach to its
-    /// original owner via the session-scoped agent_owner memory, not fail
-    /// closed. Sequential: the original subagent fully spawns and stops
-    /// (row deleted) before the resume fires.
+    /// previously-known `agent_id` under a *new* `prompt_id` — must reattach
+    /// to root, not fail closed. Sequential: the original subagent fully
+    /// spawns and stops (row deleted) before the resume fires.
     #[test]
     #[serial]
-    fn test_resumed_agent_id_reattaches_via_agent_owner_after_original_stopped() {
+    fn test_resumed_agent_id_reattaches_to_root_after_original_stopped() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         db.conn()
@@ -5137,7 +5858,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         let ctx = make_ctx();
 
         // Original spawn.
@@ -5192,18 +5913,17 @@ mod tests {
         let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_resume);
 
         let resumed_name = db.get_instance_by_agent_id("agent-x").unwrap();
-        assert!(
-            resumed_name.is_some(),
-            "resume must not fail closed just because its new prompt_id has no mapping"
+        assert!(resumed_name.is_some(), "resume must not fail closed");
+        let resumed_name = resumed_name.unwrap();
+        assert_eq!(
+            resumed_name, original_name,
+            "resume must preserve the same hcom child identity"
         );
-        let resumed_row = db
-            .get_instance_full(&resumed_name.unwrap())
-            .unwrap()
-            .unwrap();
+        let resumed_row = db.get_instance_full(&resumed_name).unwrap().unwrap();
         assert_eq!(
             resumed_row.parent_name.as_deref(),
             Some("nova"),
-            "resume must reattach to the true original owner via agent_owner memory"
+            "resume must reattach to root"
         );
     }
 
@@ -5223,11 +5943,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        // Pre-seed agent_owner as if this agent_id was spawned + stopped
-        // once already (see the sequential test above for the full path).
-        db.kv_set(&agent_owner_kv_key("sess-1", "agent-x"), Some("nova"))
-            .unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         let ctx = make_ctx();
 
         let raw_resume = serde_json::json!({
@@ -5275,9 +5991,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
-        db.kv_set(&agent_owner_kv_key("sess-1", "agent-x"), Some("nova"))
-            .unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
 
         let n = 4;
         let handles: Vec<_> = (0..n)
@@ -5466,7 +6180,7 @@ mod tests {
         db.conn().execute("DROP TABLE kv", []).unwrap();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
 
-        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        let (exit_code, stdout, _ack) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0, "JSON decisions are processed only on exit 0");
         let output: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(output["decision"], "block");
@@ -5500,7 +6214,7 @@ mod tests {
             .unwrap();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
 
-        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        let (exit_code, stdout, _ack) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0);
         let output: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(output["decision"], "block");
@@ -5513,15 +6227,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_stop_finalization_error_keeps_child_and_parent_tracking_retryable() {
+    fn test_stop_finalization_error_keeps_child_row_retryable() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances
-                 (name, session_id, tool, status, status_context, status_time, created_at, running_tasks)
-                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 1,
-                         '{\"active\":true,\"subagents\":[{\"agent_id\":\"agent-x\",\"type\":\"general\"}]}')",
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 1)",
                 [],
             )
             .unwrap();
@@ -5535,20 +6248,11 @@ mod tests {
             .unwrap();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
 
-        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        let (exit_code, stdout, _ack) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0);
         let output: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(output["decision"], "block");
         assert!(db.get_instance_by_agent_id("agent-x").unwrap().is_some());
-        let running_tasks: String = db
-            .conn()
-            .query_row(
-                "SELECT running_tasks FROM instances WHERE name = 'nova'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(running_tasks.contains("agent-x"));
     }
 
     /// `subagent_stop` must release its claim so it cannot outlive the
@@ -5623,7 +6327,7 @@ mod tests {
         let _existing_claim =
             expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
 
-        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        let (exit_code, stdout, _ack) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0);
         assert!(stdout.is_empty());
         assert!(
@@ -5707,12 +6411,186 @@ mod tests {
         );
     }
 
-    /// Property: SessionEnd sweeps agent_owner and subagent_stop_inflight
-    /// entries the same way it sweeps spawn_owner — only for its own
-    /// session.
+    /// A delayed SessionEnd from a historical Claude session must not finalize
+    /// or overwrite the newer primary generation.
     #[test]
     #[serial]
-    fn test_sessionend_cleans_agent_owner_and_stop_inflight_keys_too() {
+    fn test_historical_sessionend_preserves_current_primary_generation() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-new', '/tmp/new.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-new", "nova");
+        bind_validated_session(&db, "sess-old", "nova");
+
+        let stop_raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+        let old_stop_key = subagent_stop_inflight_key("sess-old", "agent-x", &stop_raw);
+        db.kv_set(&old_stop_key, Some("1")).unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-old",
+            "transcript_path": "/tmp/old.jsonl",
+            "reason": "clear"
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let _ = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload);
+
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.session_id.as_deref(), Some("sess-new"));
+        assert_eq!(instance.transcript_path, "/tmp/new.jsonl");
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-old").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert_eq!(db.kv_get(&old_stop_key).unwrap(), None);
+
+        let stopped_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND instance = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped_events, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn historical_subagent_completion_revokes_actor_capability() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-new', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-new", "nova");
+        bind_validated_session(&db, "sess-old", "nova");
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status, status_time, created_at)
+                 VALUES ('nova_task_1', 'sess-new', 'nova', 'agent-1', 'claude', 'active', 0, 1)",
+                [],
+            )
+            .unwrap();
+        let token = db
+            .issue_claude_actor_capability("sess-old", "toolu-old", Some("agent-1"), "nova_task_1")
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-old",
+            "agent_id": "agent-1",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu-old",
+            "tool_input": {"command": "hcom list"},
+            "tool_response": {"stdout": "done"},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let _ = route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
+
+        let remaining: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM claude_actor_capabilities WHERE token = ?",
+                rusqlite::params![token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_historical_root_hooks_are_rejected_before_dispatch() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-new', '/tmp/new.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-new", "nova");
+        bind_validated_session(&db, "sess-old", "nova");
+        db.conn()
+            .execute(
+                r#"INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'sender',
+                         '{"from":"sender","text":"secret","scope":"broadcast"}')"#,
+                [],
+            )
+            .unwrap();
+
+        let ctx = make_ctx();
+        for (hook_type, raw) in [
+            (
+                HOOK_USERPROMPTSUBMIT,
+                serde_json::json!({
+                    "session_id": "sess-old",
+                    "transcript_path": "/tmp/old.jsonl"
+                }),
+            ),
+            (
+                HOOK_PRE,
+                serde_json::json!({
+                    "session_id": "sess-old",
+                    "transcript_path": "/tmp/old.jsonl",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "echo old"}
+                }),
+            ),
+            (
+                HOOK_POST,
+                serde_json::json!({
+                    "session_id": "sess-old",
+                    "transcript_path": "/tmp/old.jsonl",
+                    "tool_name": "Write",
+                    "tool_response": {"ok": true}
+                }),
+            ),
+        ] {
+            let mut payload = HookPayload::from_claude(raw);
+            let (_, stdout, ack, timing) = route_claude_hook(&db, &ctx, hook_type, &mut payload);
+            assert!(stdout.is_empty());
+            assert!(ack.is_none());
+            assert_eq!(timing.result, Some("historical_session"));
+        }
+
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.session_id.as_deref(), Some("sess-new"));
+        assert_eq!(instance.transcript_path, "/tmp/new.jsonl");
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(instance.last_event_id, 0);
+    }
+
+    /// Property: SessionEnd sweeps subagent_stop_inflight entries — only for
+    /// its own session.
+    #[test]
+    #[serial]
+    fn test_sessionend_cleans_stop_inflight_keys() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         db.conn()
@@ -5722,13 +6600,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
         let ctx = make_ctx();
 
-        db.kv_set(&agent_owner_kv_key("sess-1", "agent-x"), Some("nova"))
-            .unwrap();
-        db.kv_set(&agent_owner_kv_key("sess-other", "agent-x"), Some("other"))
-            .unwrap();
         let stop_raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
         db.kv_set(
             &subagent_stop_inflight_key("sess-1", "agent-x", &stop_raw),
@@ -5746,20 +6620,9 @@ mod tests {
         let _ = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload);
 
         assert!(
-            db.kv_get(&agent_owner_kv_key("sess-1", "agent-x"))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
             db.kv_get(&subagent_stop_inflight_key("sess-1", "agent-x", &stop_raw))
                 .unwrap()
                 .is_none()
-        );
-        assert_eq!(
-            db.kv_get(&agent_owner_kv_key("sess-other", "agent-x"))
-                .unwrap(),
-            Some("other".to_string()),
-            "a different session's agent_owner keys must survive"
         );
         assert_eq!(
             db.kv_get(&subagent_stop_inflight_key(

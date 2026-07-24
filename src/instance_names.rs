@@ -434,7 +434,75 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
             )
             .optional()?;
         if let Some(name) = existing {
+            txn.execute(
+                "UPDATE instances
+                 SET parent_session_id = ?, parent_name = ?, tag = ?, directory = ?,
+                     status = ?, status_context = ?, status_time = ?, last_seen = ?
+                 WHERE agent_id = ?",
+                rusqlite::params![
+                    info.parent_session_id,
+                    info.parent_name,
+                    info.parent_tag,
+                    cwd,
+                    info.status,
+                    info.status_context,
+                    crate::shared::time::now_epoch_i64(),
+                    crate::shared::time::now_epoch_i64(),
+                    info.agent_id,
+                ],
+            )?;
             return Ok(name);
+        }
+
+        // Resume the same hcom identity when Claude reuses an agent_id after a
+        // definitive SubagentStop removed the live row.
+        let stopped: Option<(String, i64)> = txn
+            .query_row(
+                "SELECT instance,
+                        COALESCE(json_extract(data, '$.snapshot.name_announced'), 0)
+                 FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND json_extract(data, '$.snapshot.agent_id') = ?
+                   AND COALESCE(json_extract(data, '$.snapshot.parent_session_id'), '') = COALESCE(?, '')
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![info.agent_id, info.parent_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((candidate, name_announced)) = stopped
+            && txn
+                .query_row(
+                    "SELECT 1 FROM instances WHERE name = ?",
+                    rusqlite::params![candidate],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+        {
+            txn.execute(
+                "INSERT INTO instances
+                 (name, session_id, parent_session_id, parent_name, tag, agent_id,
+                  created_at, last_event_id, directory, last_stop, status,
+                  status_context, status_time, last_seen, name_announced)
+                 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    candidate,
+                    info.parent_session_id,
+                    info.parent_name,
+                    info.parent_tag,
+                    info.agent_id,
+                    now,
+                    initial_event_id,
+                    cwd,
+                    info.status,
+                    info.status_context,
+                    crate::shared::time::now_epoch_i64(),
+                    crate::shared::time::now_epoch_i64(),
+                    name_announced,
+                ],
+            )?;
+            return Ok(candidate);
         }
 
         let names: Vec<String> = {
@@ -457,8 +525,8 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
         txn.execute(
             "INSERT INTO instances \
              (name, session_id, parent_session_id, parent_name, tag, agent_id, \
-              created_at, last_event_id, directory, last_stop, status, status_context) \
-             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+              created_at, last_event_id, directory, last_stop, status, status_context, status_time, last_seen) \
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
             rusqlite::params![
                 candidate,
                 info.parent_session_id,
@@ -470,6 +538,8 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
                 cwd,
                 info.status,
                 info.status_context,
+                crate::shared::time::now_epoch_i64(),
+                crate::shared::time::now_epoch_i64(),
             ],
         )?;
         Ok(candidate)
@@ -544,6 +614,101 @@ mod subagent_alloc_tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn allocate_resume_reuses_stopped_identity_and_announcement_state() {
+        let (_tmp, db) = setup_db();
+        let original = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = ?",
+                rusqlite::params![original],
+            )
+            .unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "agent_id": "aid-1",
+                "parent_name": "luna",
+                "parent_session_id": null,
+                "name_announced": 1
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-01-01T00:00:00Z', 'life', ?, ?)",
+                rusqlite::params![original, snapshot.to_string()],
+            )
+            .unwrap();
+        db.delete_instance(&original).unwrap();
+
+        let resumed = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        assert_eq!(resumed, original);
+        let row = db.get_instance_full(&resumed).unwrap().unwrap();
+        assert_eq!(row.name_announced, 1);
+    }
+
+    #[test]
+    fn allocate_resume_survives_root_name_rebind() {
+        let (_tmp, db) = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('luna', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let original = allocate_subagent_instance(
+            &db,
+            &SubagentAllocation {
+                agent_id: "aid-1",
+                agent_type: "reviewer",
+                parent_name: "luna",
+                parent_session_id: Some("sess-1"),
+                parent_tag: None,
+                status: "inactive",
+                status_context: Some("subagent:dormant"),
+            },
+        )
+        .unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "agent_id": "aid-1",
+                "parent_name": "luna",
+                "parent_session_id": "sess-1",
+                "name_announced": 1
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-01-01T00:00:00Z', 'life', ?, ?)",
+                rusqlite::params![original, snapshot.to_string()],
+            )
+            .unwrap();
+        db.delete_instance(&original).unwrap();
+
+        let resumed = allocate_subagent_instance(
+            &db,
+            &SubagentAllocation {
+                agent_id: "aid-1",
+                agent_type: "reviewer",
+                parent_name: "sol",
+                parent_session_id: Some("sess-1"),
+                parent_tag: None,
+                status: "inactive",
+                status_context: Some("subagent:dormant"),
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed, original);
+        let row = db.get_instance_full(&resumed).unwrap().unwrap();
+        assert_eq!(row.parent_name.as_deref(), Some("sol"));
+        assert_eq!(row.name_announced, 1);
     }
 
     #[test]

@@ -201,6 +201,10 @@ pub struct DeliveryAck {
     pub last_event_id: i64,
     pub status_context: String,
     pub msg_ts: String,
+    /// Also flip `name_announced` on commit. Used for a subagent's first
+    /// activation delivery, so the one-shot bootstrap is only consumed once
+    /// the message that carries it is confirmed written to stdout.
+    pub mark_announced: bool,
 }
 
 /// Normalized hook payload — unified across all tools.

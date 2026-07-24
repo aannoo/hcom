@@ -5,6 +5,7 @@
 //! as a side-channel for messaging and coordination with other agents.
 
 mod bootstrap;
+mod claude_actor;
 mod cli_context;
 pub mod commands;
 mod config;
