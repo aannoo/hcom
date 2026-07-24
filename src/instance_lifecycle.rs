@@ -13,6 +13,12 @@ use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LAUNCHING, ST_LISTENI
 pub struct StatusUpdate<'a> {
     pub detail: &'a str,
     pub msg_ts: &'a str,
+    /// Tool-reported name of the tool call active when this write happened
+    /// (e.g. "Bash", "Edit"). Empty when not applicable/available.
+    pub tool_name: &'a str,
+    /// Tool-reported id of the tool call active when this write happened
+    /// (Claude's `tool_use_id`). Empty when not applicable/available.
+    pub tool_use_id: &'a str,
 }
 
 /// Max time between instance creation and session binding before launch is considered failed.
@@ -525,6 +531,7 @@ pub fn get_status_description(status: &str, context: &str) -> String {
 }
 
 /// Set instance status with timestamp and log the status-change event.
+#[track_caller]
 pub fn set_status(
     db: &HcomDb,
     instance_name: &str,
@@ -532,7 +539,13 @@ pub fn set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) {
-    let StatusUpdate { detail, msg_ts } = upd;
+    let StatusUpdate {
+        detail,
+        msg_ts,
+        tool_name,
+        tool_use_id,
+    } = upd;
+    let writer = std::panic::Location::caller();
 
     let current_data = match db.get_instance_full(instance_name) {
         Ok(data) => data,
@@ -588,6 +601,28 @@ pub fn set_status(
     }
     if !msg_ts.is_empty() {
         data["msg_ts"] = serde_json::json!(msg_ts);
+    }
+    // old_* differs from the prior status event when set_gate_status() touched
+    // the row without logging (tui:* gate context churns silently).
+    data["old_status"] = serde_json::json!(old_status);
+    data["old_context"] =
+        serde_json::json!(current_data.as_ref().map(|d| d.status_context.as_str()));
+    data["old_detail"] = serde_json::json!(current_data.as_ref().map(|d| d.status_detail.as_str()));
+    data["new_status"] = serde_json::json!(status);
+    data["new_context"] = serde_json::json!(context);
+    data["new_detail"] = serde_json::json!(detail);
+    data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
+    if let Some(session_id) = current_data.as_ref().and_then(|d| d.session_id.as_deref()) {
+        data["session"] = serde_json::json!(session_id);
+    }
+    if let Some(agent_id) = current_data.as_ref().and_then(|d| d.agent_id.as_deref()) {
+        data["agent_id"] = serde_json::json!(agent_id);
+    }
+    if !tool_name.is_empty() {
+        data["tool_name"] = serde_json::json!(tool_name);
+    }
+    if !tool_use_id.is_empty() {
+        data["tool_use_id"] = serde_json::json!(tool_use_id);
     }
     let _ = db.log_event("status", instance_name, &data);
 }

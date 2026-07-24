@@ -1642,6 +1642,8 @@ fn handle_tool_failure(
         &format!("tool_failed:{}", payload.tool_name),
         lifecycle::StatusUpdate {
             detail: error,
+            tool_name: &payload.tool_name,
+            tool_use_id: tool_use_id(payload).unwrap_or(""),
             ..Default::default()
         },
     );
@@ -1668,6 +1670,8 @@ fn handle_permission_denied(
         &format!("denied:{}", payload.tool_name),
         lifecycle::StatusUpdate {
             detail: reason,
+            tool_name: &payload.tool_name,
+            tool_use_id: tool_use_id(payload).unwrap_or(""),
             ..Default::default()
         },
     );
@@ -1718,7 +1722,11 @@ fn handle_posttooluse(
             instance_name,
             ST_ACTIVE,
             &format!("approved:{}", tool_name),
-            Default::default(),
+            lifecycle::StatusUpdate {
+                tool_name,
+                tool_use_id: tool_use_id(payload).unwrap_or(""),
+                ..Default::default()
+            },
         );
     }
 
@@ -1984,6 +1992,8 @@ fn handle_permission_request(
         "approval",
         lifecycle::StatusUpdate {
             detail: &detail,
+            tool_name: &payload.tool_name,
+            tool_use_id: tool_use_id(payload).unwrap_or(""),
             ..Default::default()
         },
     );

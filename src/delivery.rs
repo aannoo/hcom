@@ -830,6 +830,52 @@ pub(crate) fn evaluate_gate(
     }
 }
 
+/// Build a diagnostic string for a `delivery.gate_pass` log line.
+fn gate_pass_diagnostics(db: &HcomDb, name: &str, state: &DeliveryState, is_idle: bool) -> String {
+    let now = crate::shared::time::now_epoch_i64();
+    let (status, context, status_age_s) = match db.get_instance_full(name) {
+        Ok(Some(row)) => (
+            row.status,
+            row.status_context,
+            Some(now.saturating_sub(row.status_time)),
+        ),
+        _ => (String::new(), String::new(), None),
+    };
+    let writer = db.last_status_writer(name).unwrap_or_default();
+    let last_event_id = db.get_cursor(name);
+    let pending_range = db.pending_event_range(name);
+
+    let screen = state.screen.read().unwrap();
+    let prompt_empty_classification = match &screen.input_text {
+        None => "box_not_found".to_string(),
+        Some(t) if t.is_empty() => "empty".to_string(),
+        Some(t) => format!("has_text:{}", t.chars().count()),
+    };
+    let user_active = state.is_user_active_with_guard(&screen);
+    let submit_age_ms = screen.last_prompt_submit.map(|t| t.elapsed().as_millis());
+
+    format!(
+        "Gate passed, injecting to port {}. persisted={{status={}, context={}, age_s={:?}}} \
+         last_writer={} pending={:?} last_event_id={} prompt_empty={} \
+         gates={{idle={}, ready={}, nav_overlay={}, approval={}, user_active={}}} \
+         last_prompt_submit_age_ms={:?}",
+        state.inject_port,
+        status,
+        context,
+        status_age_s,
+        writer,
+        pending_range,
+        last_event_id,
+        prompt_empty_classification,
+        is_idle,
+        screen.ready,
+        screen.nav_overlay,
+        screen.approval,
+        user_active,
+        submit_age_ms,
+    )
+}
+
 fn launch_ready_observed(
     db: &HcomDb,
     name: &str,
@@ -1520,7 +1566,7 @@ pub fn run_delivery_loop(
                         log_info(
                             "native",
                             "delivery.gate_pass",
-                            &format!("Gate passed, injecting to port {}", state.inject_port),
+                            &gate_pass_diagnostics(db, &current_name, state, is_idle),
                         );
 
                         // Snapshot cursor before injection

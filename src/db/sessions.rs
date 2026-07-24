@@ -258,6 +258,39 @@ impl HcomDb {
         false
     }
 
+    /// Diagnostic-only: (min_id, max_id, count) of pending message events for
+    /// an instance, or None if nothing is pending. Not used on the delivery
+    /// hot path — for logging at `delivery.gate_pass`.
+    pub fn pending_event_range(&self, name: &str) -> Option<(i64, i64, i64)> {
+        let last_event_id = self.get_cursor(name);
+
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT id, data FROM events WHERE id > ? AND type = 'message' ORDER BY id",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map(params![last_event_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()?;
+
+        let mut min_id = i64::MAX;
+        let mut max_id = i64::MIN;
+        let mut count = 0i64;
+        for (id, data) in rows.flatten() {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
+                && Self::should_deliver_to(&json, name)
+            {
+                min_id = min_id.min(id);
+                max_id = max_id.max(id);
+                count += 1;
+            }
+        }
+        (count > 0).then_some((min_id, max_id, count))
+    }
+
     /// Get instance name bound to session_id, or None if not bound.
     pub fn get_session_binding(&self, session_id: &str) -> Result<Option<String>> {
         if session_id.is_empty() {
