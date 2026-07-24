@@ -340,19 +340,42 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     let _ = db.rebind_instance_session(&instance_name, session_id);
 
-    // agy fires PreInvocation per turn, not just at process start. Once the instance
-    // is bootstrapped on the same session, skip the setup side-effects below:
+    // agy fires PreInvocation before every model call, not just at process start.
+    // Once the instance is initialized on the same session, skip the setup
+    // side-effects below but refresh its bootstrap: agy's ephemeralMessage is
+    // not persisted in the conversation trajectory.
+    //
     // re-running set_status("listening","start") mid-turn would briefly clobber an
     // in-progress delivery status (e.g. "active:deliver:sender") set by the previous
-    // turn boundary. Bootstrap injection is already guarded by inject_bootstrap_once.
-    let already_bootstrapped = db
-        .get_instance_full(&instance_name)
-        .ok()
-        .flatten()
-        .is_some_and(|inst| {
-            inst.name_announced != 0 && inst.session_id.as_deref() == Some(session_id)
-        });
+    // turn boundary.
+    let instance = db.get_instance_full(&instance_name).ok().flatten();
+    let already_bootstrapped = instance.as_ref().is_some_and(|inst| {
+        inst.name_announced != 0 && inst.session_id.as_deref() == Some(session_id)
+    });
     if already_bootstrapped {
+        if let Some(inst) = instance.as_ref()
+            && bootstrap::is_antigravity_tool(&inst.tool)
+        {
+            let tag = inst.tag.as_deref().unwrap_or("");
+            let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
+            let recurring = bootstrap::get_bootstrap(
+                db,
+                &ctx.hcom_dir,
+                &instance_name,
+                &inst.tool,
+                ctx.is_background,
+                ctx.is_launched,
+                &ctx.notes,
+                tag,
+                crate::relay::is_relay_enabled(&hcom_config),
+                ctx.background_name.as_deref(),
+            );
+            return HookResult::Allow {
+                additional_context: Some(recurring),
+                system_message: None,
+                delivery_ack: None,
+            };
+        }
         return hook_noop();
     }
 
@@ -383,8 +406,8 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::ensure_worker(true);
 
     // Gemini: SessionStart additionalContext is hidden after /clear — bootstrap stays in BeforeAgent.
-    // Antigravity: primary bootstrap path (agy ignores GEMINI_SYSTEM_MD); inject_bootstrap_once
-    // is idempotent via the name_announced flag.
+    // Antigravity: initial bootstrap path (agy ignores GEMINI_SYSTEM_MD).
+    // Later PreInvocation hooks take the recurring path above.
     if let Ok(Some(inst)) = db.get_instance_full(&instance_name)
         && bootstrap::is_antigravity_tool(&inst.tool)
         && let Some(bootstrap) =
