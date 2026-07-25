@@ -30,25 +30,25 @@ fn update_kind(update: &Value) -> &str {
 }
 
 fn content_text(content: &Value) -> String {
+    // Do not trim individual stream chunks — Grok's ACP concatenates raw text;
+    // trimming `"Hello "` + `"world"` would become `"Helloworld"`.
     match content {
-        Value::String(s) => s.trim().to_string(),
+        Value::String(s) => s.to_string(),
         Value::Object(obj) => obj
             .get("text")
             .and_then(Value::as_str)
             .unwrap_or("")
-            .trim()
             .to_string(),
         Value::Array(blocks) => {
             let mut parts = Vec::new();
             for block in blocks {
-                if let Some(t) = block.get("text").and_then(Value::as_str) {
-                    let trimmed = t.trim();
-                    if !trimmed.is_empty() {
-                        parts.push(trimmed.to_string());
-                    }
+                if let Some(t) = block.get("text").and_then(Value::as_str)
+                    && !t.is_empty()
+                {
+                    parts.push(t.to_string());
                 }
             }
-            parts.join("\n")
+            parts.join("")
         }
         _ => String::new(),
     }
@@ -82,9 +82,20 @@ fn tool_from_call(update: &Value) -> Option<ToolUse> {
         .get("command")
         .and_then(Value::as_str)
         .map(|s| truncate_str(s, 200).to_string());
+    let is_error = update
+        .get("isError")
+        .or_else(|| update.get("is_error"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            update
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|s| matches!(s, "failed" | "error" | "cancelled" | "canceled"))
+        })
+        .unwrap_or(false);
     Some(ToolUse {
         name: normalize_tool_name(name).to_string(),
-        is_error: false,
+        is_error,
         file,
         command,
     })

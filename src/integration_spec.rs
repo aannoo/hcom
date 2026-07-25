@@ -403,7 +403,11 @@ const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
 const GROK_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom grok --model grok-build", "Use a specific model"),
     ("hcom grok --always-approve", "Auto-approve tool executions"),
-    ("hcom grok -p \"task\"", "Headless single-turn via --single"),
+    // -p/--single is one-shot scripting; not a persistent hcom-managed agent.
+    (
+        "hcom grok -p \"task\"",
+        "One-shot headless run (exits; not for multi-turn hcom)",
+    ),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -1108,7 +1112,7 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_GROK_ARGS"),
-        config_dir_env: None,
+        config_dir_env: Some("GROK_HOME"),
         initial_prompt: InitialPromptShape::Positional,
         uses_pty_default: true,
         max_launch_count: 10,

@@ -1074,6 +1074,13 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
         "--allow",
         "--deny",
         "--sandbox",
+        // Preserve worktree / debug / system-prompt values (owner review).
+        "--worktree",
+        "--worktree-ref",
+        "--ref",
+        "--leader-socket",
+        "--debug-file",
+        "--system-prompt-override",
     ];
     const DROP_WITH_VALUE: &[&str] = &[
         "--resume",
@@ -1085,6 +1092,7 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
         "--prompt-file",
         "--prompt-json",
     ];
+    // Reject one-shot flags on resume of a persistent agent.
     const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session", "--restore-code"];
 
     let is_flag = |t: &str| t.starts_with('-');

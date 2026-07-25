@@ -1,8 +1,9 @@
-//! Grok Build (xAI `grok` CLI) native hook handlers and `~/.grok/hooks` management.
+//! Grok Build (xAI `grok` CLI) native hook handlers and `$GROK_HOME`/`~/.grok` hooks.
 //!
-//! Grok loads lifecycle hooks from `~/.grok/hooks/*.json` (always trusted) using
-//! the nested Claude-compatible event format. Message delivery mirrors Cursor:
-//! `additional_context` on PostToolUse and `followup_message` on Stop.
+//! Observe-only events (SessionStart, UserPromptSubmit, PostToolUse) discard
+//! stdout on Grok — never deliver bus messages there. Stop is a real gate:
+//! deliver only via `hookSpecificOutput.additionalContext` on genuine end-of-turn.
+//!
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -66,11 +67,24 @@ pub enum SetupError {
     PostWriteVerifyFailed(PathBuf),
 }
 
+/// Resolve Grok config root: `$GROK_HOME` if set, else `<tool_config_root>/.grok`.
 fn grok_config_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     crate::runtime_env::tool_config_root().join(".grok")
 }
 
 fn default_grok_config_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::home_dir().unwrap_or_default().join(".grok")
 }
 
@@ -399,9 +413,6 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     };
     let _ = db.rebind_instance_session(&instance_name, &session_id);
     instance_binding::capture_and_store_launch_context(db, &instance_name);
-    let Some(instance) = db.get_instance_full(&instance_name).ok().flatten() else {
-        return json!({ "env": grok_session_env(ctx) });
-    };
     update_position(db, ctx, payload, &instance_name);
     lifecycle::set_status(
         db,
@@ -413,25 +424,9 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::runtime_env::set_terminal_title(&instance_name);
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
-    let mut output = serde_json::Map::from_iter([("env".into(), grok_session_env(ctx))]);
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, &instance_name, &instance, "grok")
-    {
-        // Emit both snake_case (Cursor-style) and camelCase (Claude-style) so
-        // either Grok parser path can inject bootstrap context.
-        output.insert(
-            "additional_context".into(),
-            Value::String(bootstrap.clone()),
-        );
-        output.insert(
-            "hookSpecificOutput".into(),
-            json!({
-                "hookEventName": "SessionStart",
-                "additionalContext": bootstrap,
-            }),
-        );
-    }
-    Value::Object(output)
+    // SessionStart is observe-only on Grok: stdout is not parsed into the model.
+    // Bootstrap must use launch-time channels (--rules / skill), not hook stdout.
+    json!({ "env": grok_session_env(ctx) })
 }
 
 fn handle_userpromptsubmit(
@@ -458,28 +453,9 @@ fn handle_userpromptsubmit(
         "prompt"
     };
     lifecycle::set_status(db, &instance.name, ST_ACTIVE, context, Default::default());
-
-    // Pending bus messages: only emit followup when the prompt does NOT already
-    // carry the PTY full-body inject. Otherwise Grok queues a duplicate turn
-    // (and dual Claude+native hooks would double that).
-    match common::prepare_pending_messages(db, &instance.name) {
-        Some(prepared) => {
-            if common::prompt_already_carries_hcom_body(prompt, &prepared.formatted) {
-                log::log_info(
-                    "hooks",
-                    "grok.userpromptsubmit.skip_followup",
-                    &format!("instance={} prompt already carries body", instance.name),
-                );
-                (json!({}), Some(prepared.ack))
-            } else {
-                (
-                    json!({ "followup_message": prepared.formatted }),
-                    Some(prepared.ack),
-                )
-            }
-        }
-        None => (json!({}), None),
-    }
+    // UserPromptSubmit is observe-only on Grok — stdout is discarded. Delivery
+    // is Stop(end_turn) → hookSpecificOutput.additionalContext only.
+    (json!({}), None)
 }
 
 fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
@@ -501,22 +477,70 @@ fn handle_posttooluse(
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> (Value, Option<DeliveryAck>) {
-    let Some(instance) = resolved_instance(db, ctx, payload) else {
+    let Some(_instance) = resolved_instance(db, ctx, payload) else {
         return (json!({}), None);
     };
-    match common::prepare_pending_messages(db, &instance.name) {
-        Some(prepared) => (
-            json!({
-                "additional_context": prepared.formatted,
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": prepared.formatted,
-                }
-            }),
-            Some(prepared.ack),
-        ),
-        None => (json!({}), None),
+    // PostToolUse is observe-only on Grok — stdout is discarded. Keep pending
+    // until genuine Stop(end_turn).
+    (json!({}), None)
+}
+
+/// Stop reasons that mean the session/channel is gone — never deliver or ack.
+fn is_session_end_stop(payload: &HookPayload) -> bool {
+    let reason = payload
+        .raw
+        .get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| payload.raw.get("stop_reason").and_then(Value::as_str))
+        .or_else(|| payload.raw.get("stopReason").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        reason.as_str(),
+        "channel_closed"
+            | "shutdown"
+            | "session_end"
+            | "sessionend"
+            | "end_session"
+            | "user_exit"
+            | "exit"
+            | "closed"
+            | "abort"
+    )
+}
+
+fn is_cancellable_stop_status(payload: &HookPayload) -> bool {
+    let status = payload
+        .raw
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    matches!(
+        status,
+        "cancelled" | "canceled" | "error" | "failed" | "aborted"
+    )
+}
+
+/// True when this Stop is a normal end-of-turn that may continue with context.
+fn is_genuine_end_turn_stop(payload: &HookPayload) -> bool {
+    if is_session_end_stop(payload) || is_cancellable_stop_status(payload) {
+        return false;
     }
+    let reason = payload
+        .raw
+        .get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| payload.raw.get("stop_reason").and_then(Value::as_str))
+        .or_else(|| payload.raw.get("stopReason").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Empty / end_turn / completed: allow delivery. Unknown reasons: allow only
+    // when not session-end-like (handled above).
+    reason.is_empty()
+        || reason == "end_turn"
+        || reason == "endturn"
+        || reason == "completed"
+        || reason == "stop"
 }
 
 fn handle_stop(
@@ -530,26 +554,48 @@ fn handle_stop(
     lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
 
-    // Cursor only delivers on status=="completed". Grok may omit status or use
-    // different values — deliver whenever there is a pending message unless the
-    // turn was clearly cancelled/errored.
-    let status = payload
-        .raw
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("completed");
-    if matches!(
-        status,
-        "cancelled" | "canceled" | "error" | "failed" | "aborted"
-    ) {
+    if is_session_end_stop(payload) {
+        log::log_info(
+            "hooks",
+            "grok.stop.session_end_skip",
+            &format!(
+                "instance={} — no deliver/ack on session-end Stop",
+                instance.name
+            ),
+        );
+        return (json!({}), None);
+    }
+    if is_cancellable_stop_status(payload) {
+        return (json!({}), None);
+    }
+    if !is_genuine_end_turn_stop(payload) {
         return (json!({}), None);
     }
 
+    // Stop is a real gate. Grok parses StopHookJson and feeds
+    // hookSpecificOutput.additionalContext back into the model. Do NOT use
+    // followup_message (not in the schema — silently dropped).
     match common::prepare_pending_messages(db, &instance.name) {
-        Some(prepared) => (
-            json!({ "followup_message": prepared.formatted }),
-            Some(prepared.ack),
-        ),
+        Some(prepared) => {
+            log::log_info(
+                "hooks",
+                "grok.stop.additional_context",
+                &format!(
+                    "instance={} bytes={}",
+                    instance.name,
+                    prepared.formatted.len()
+                ),
+            );
+            (
+                json!({
+                    "hookSpecificOutput": {
+                        "additionalContext": prepared.formatted,
+                        "additional_context": prepared.formatted,
+                    }
+                }),
+                Some(prepared.ack),
+            )
+        }
         None => (json!({}), None),
     }
 }
@@ -795,5 +841,31 @@ mod tests {
         let payload = HookPayload::from_grok("grok-posttooluse", raw);
         assert_eq!(payload.session_id.as_deref(), Some("sess-xyz"));
         assert_eq!(payload.tool_name, "search_replace");
+    }
+
+    #[test]
+    fn session_end_stop_reasons_are_detected() {
+        let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "channel_closed" }));
+        assert!(is_session_end_stop(&payload));
+        let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "end_turn" }));
+        assert!(!is_session_end_stop(&payload));
+        assert!(is_genuine_end_turn_stop(&payload));
+    }
+
+    #[test]
+    fn stop_output_uses_additional_context_not_followup() {
+        // Schema smoke: Stop payload shape for Grok StopHookJson.
+        let body = "hello from bus";
+        let out = json!({
+            "hookSpecificOutput": {
+                "additionalContext": body,
+                "additional_context": body,
+            }
+        });
+        assert!(out.get("followup_message").is_none());
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"].as_str(),
+            Some(body)
+        );
     }
 }

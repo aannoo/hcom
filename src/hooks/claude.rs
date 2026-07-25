@@ -1024,6 +1024,11 @@ fn inject_bootstrap_if_needed(
 
 /// Check for unread messages to deliver at PostToolUse.
 fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<(Value, DeliveryAck)> {
+    // Grok: PostToolUse is observe-only; native grok-stop owns delivery.
+    if common::is_grok_host() {
+        return None;
+    }
+
     let prepared = common::prepare_pending_messages(db, instance_name)?;
     let model_context =
         common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
@@ -1031,24 +1036,6 @@ fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<(Value, 
     // Claude needs user-facing display in addition to model context
     let user_display =
         common::format_hook_messages_for_instance(db, &prepared.messages, instance_name);
-
-    // Grok loads Claude-compat hooks but does not honor Claude's
-    // hookSpecificOutput/additionalContext on PostToolUse the same way.
-    // Emit followup_message (Grok binary accepts it) so mid-turn delivery works.
-    if common::is_grok_host() {
-        return Some((
-            serde_json::json!({
-                "followup_message": model_context,
-                "additional_context": model_context,
-                "systemMessage": user_display,
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": model_context,
-                },
-            }),
-            prepared.ack,
-        ));
-    }
 
     Some((
         serde_json::json!({
@@ -1124,15 +1111,10 @@ fn handle_poll(
         ),
     );
 
-    // Grok Build loads Claude-compat Stop hooks but treats Stop as passive:
-    // exit-2 + decision:block does NOT re-prompt. Deliver via followup_message
-    // (one-shot — never long-poll under Grok or Stop hangs for wait_timeout).
-    if common::is_grok_host() {
-        return handle_poll_for_grok(db, instance_name);
-    }
-
-    // PTY mode: exit immediately, PTY wrapper handles injection
-    if ctx.is_pty_mode {
+    // Grok loads Claude-compat Stop hooks, but native `grok-stop` is the sole
+    // delivery owner (StopHookJson.additionalContext). Claude-compat only
+    // flips listening + notifies — no followup_message (not in Grok's schema).
+    if common::is_grok_host() || ctx.is_pty_mode {
         lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
         common::notify_hook_instance_with_db(db, instance_name);
         return (0, String::new(), None);
@@ -1165,36 +1147,6 @@ fn handle_poll(
         .unwrap_or_default();
     // poll_messages already commits the delivery ack before returning.
     (exit_code, stdout, None)
-}
-
-/// One-shot Stop delivery for Grok Build (Claude-compat hook path).
-///
-/// Grok ignores Claude's exit-2 / `decision:block` Stop semantics. Use
-/// `followup_message` (same field Cursor uses; present in the Grok binary) and
-/// defer cursor advance until stdout is flushed by the dispatcher.
-fn handle_poll_for_grok(db: &HcomDb, instance_name: &str) -> (i32, String, Option<DeliveryAck>) {
-    lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
-    common::notify_hook_instance_with_db(db, instance_name);
-
-    match common::prepare_pending_messages(db, instance_name) {
-        Some(prepared) => {
-            log::log_info(
-                "hooks",
-                "stop.grok_followup",
-                &format!(
-                    "instance={} bytes={}",
-                    instance_name,
-                    prepared.formatted.len()
-                ),
-            );
-            let stdout = serde_json::json!({
-                "followup_message": prepared.formatted,
-            })
-            .to_string();
-            (0, stdout, Some(prepared.ack))
-        }
-        None => (0, String::new(), None),
-    }
 }
 
 /// Parent UserPromptSubmit: fallback bootstrap, PTY mode message delivery.
@@ -1230,55 +1182,21 @@ fn handle_userpromptsubmit(
         return (0, serde_json::to_string(&output).unwrap_or_default(), None);
     }
 
-    // PTY mode, or Grok host (Grok strips HCOM_PTY_MODE from hook env so
-    // is_pty_mode is false even for hcom-launched sessions): deliver pending.
-    if (ctx.is_pty_mode || common::is_grok_host())
+    // Grok host: UPS is observe-only (stdout discarded). Status is handled by
+    // native grok-userpromptsubmit; leave pending for grok-stop additionalContext.
+    if common::is_grok_host() {
+        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        return (0, String::new(), None);
+    }
+
+    // PTY mode: deliver pending via Claude-compatible UPS payload.
+    if ctx.is_pty_mode
         && let Some(prepared) = common::prepare_pending_messages(db, instance_name)
     {
         let user_display =
             common::format_hook_messages_for_instance(db, &prepared.messages, instance_name);
         let model_context =
             common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
-
-        if common::is_grok_host() {
-            // Grok loads Claude-compat UPS *and* native grok-userpromptsubmit.
-            // Emitting followup from both races into two queued turns. Native
-            // grok owns delivery (full-body skip-ack or bare-wake followup).
-            // Claude-compat only acks when the PTY full-body path already put
-            // the payload in the user prompt (safe no-op if native acked first).
-            let prompt = _payload
-                .raw
-                .get("prompt")
-                .and_then(|v| v.as_str())
-                .or_else(|| _payload.raw.get("userPrompt").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            if common::prompt_already_carries_hcom_body(prompt, &model_context)
-                || common::prompt_already_carries_hcom_body(prompt, &user_display)
-            {
-                log::log_info(
-                    "hooks",
-                    "userpromptsubmit.grok_skip_followup",
-                    &format!(
-                        "instance={} prompt already carries body (bytes={})",
-                        instance_name,
-                        prompt.len()
-                    ),
-                );
-                return (0, "{}".to_string(), Some(prepared.ack));
-            }
-            log::log_info(
-                "hooks",
-                "userpromptsubmit.grok_defer_to_native",
-                &format!(
-                    "instance={} bare/wake prompt — native grok UPS owns followup",
-                    instance_name
-                ),
-            );
-            // Do not prepare-ack here: leave pending for native grok UPS.
-            // We already called prepare_pending_messages above — that does NOT
-            // advance cursor; only commit_delivery_ack does. Drop ack.
-            return (0, "{}".to_string(), None);
-        }
 
         let output = serde_json::json!({
             "systemMessage": user_display,

@@ -364,87 +364,16 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
-/// How Grok PTY delivery puts work into the session.
+/// Short PTY sentinel for Grok idle wake — no angle brackets (WT paste hazard).
 ///
-/// Controlled by `HCOM_GROK_DELIVERY` (or `~/.hcom/grok_delivery_mode` one-line
-/// file for live flips without relaunch env):
-/// - `full` (default): paste full unread body into the composer, then Enter.
-/// - `wake`: paste only `hcom: wake`, then Enter; body rides UPS `followup_message`
-///   (CC/Codex-style). Faster first-submit on slow WSL; requires followup to work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GrokDeliveryMode {
-    Full,
-    Wake,
-}
-
-/// Short PTY trigger for wake mode — no angle brackets (WT image-paste hazard).
+/// Real message bodies are **not** pasted into the composer. They are delivered
+/// from native `grok-stop` via `hookSpecificOutput.additionalContext` after a
+/// genuine end-of-turn Stop (observe-only hooks discard stdout).
 pub(crate) const GROK_WAKE_TRIGGER: &str = "hcom: wake";
 
-/// Resolve Grok delivery mode. Re-read each inject so a mode file can flip live.
-pub(crate) fn grok_delivery_mode() -> GrokDeliveryMode {
-    let from_env = std::env::var("HCOM_GROK_DELIVERY").ok();
-    let from_file = std::fs::read_to_string(crate::paths::hcom_dir().join("grok_delivery_mode"))
-        .ok()
-        .map(|s| s.trim().to_string());
-    let raw = from_env
-        .or(from_file)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match raw.as_str() {
-        "wake" | "trigger" | "short" => GrokDeliveryMode::Wake,
-        _ => GrokDeliveryMode::Full,
-    }
-}
-
-/// Build the PTY inject payload for Grok Build.
-///
-/// Default (`full`): inject the **full plain-text** message body. Grok cannot
-/// use Claude's bare `<hcom>` trigger as-is (unscrapeable input box, WT `<>`
-/// paste bugs). Wake mode is experimental — see `GrokDeliveryMode::Wake`.
-pub(crate) fn build_grok_inject_text(db: &HcomDb, recipient: &str) -> String {
-    if grok_delivery_mode() == GrokDeliveryMode::Wake {
-        return GROK_WAKE_TRIGGER.to_string();
-    }
-    let messages = db.get_unread_messages(recipient);
-    if messages.is_empty() {
-        return GROK_WAKE_TRIGGER.to_string();
-    }
-    let values: Vec<serde_json::Value> = messages
-        .iter()
-        .map(crate::hooks::common::message_to_value)
-        .collect();
-    let body = crate::hooks::common::format_hook_messages_for_instance(db, &values, recipient);
-    sanitize_grok_inject_text(&body)
-}
-
-/// Strip characters that break Grok's composer / PTY inject path.
-fn sanitize_grok_inject_text(text: &str) -> String {
-    let cleaned: String = text
-        .chars()
-        .map(|c| match c {
-            // Angle brackets confuse Grok/WT (path/image paste artifacts).
-            '<' => '[',
-            '>' => ']',
-            c if c >= ' ' || c == '\t' => c,
-            // inject_text also drops non-printables; keep spaces for newlines.
-            '\n' | '\r' => ' ',
-            _ => ' ',
-        })
-        .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        "hcom: message".to_string()
-    } else {
-        // Soft cap so we do not flood the composer; full body still arrives via
-        // UserPromptSubmit hooks when present.
-        const MAX: usize = 2000;
-        if collapsed.chars().count() > MAX {
-            let truncated: String = collapsed.chars().take(MAX).collect();
-            format!("{truncated}…")
-        } else {
-            collapsed
-        }
-    }
+/// PTY inject text for Grok: always the short wake sentinel.
+pub(crate) fn build_grok_inject_text(_db: &HcomDb, _recipient: &str) -> String {
+    GROK_WAKE_TRIGGER.to_string()
 }
 
 /// Build PTY wake text for tools whose delivery path is not human-visible.
@@ -1085,57 +1014,10 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
-/// Pace large Grok pastes so a slow WSL/GB TUI can absorb them.
-///
-/// A single multi-KB write + immediate Enter is often lost under WSL: the
-/// composer is still chewing the paste when `\r` arrives, so the user sees a
-/// full body sitting unsent and hcom has already acked (no retry). Chunk + gap
-/// keeps the PTY input queue digestible.
-fn inject_text_paced(port: u16, text: &str) -> bool {
-    const CHUNK_CHARS: usize = 96;
-    const GAP: Duration = Duration::from_millis(35);
-
-    let safe_text: String = text.chars().filter(|c| *c >= ' ' || *c == '\t').collect();
-    if safe_text.is_empty() {
-        return false;
-    }
-
-    let chars: Vec<char> = safe_text.chars().collect();
-    if chars.len() <= CHUNK_CHARS {
-        return inject_text(port, &safe_text);
-    }
-
-    let mut offset = 0;
-    while offset < chars.len() {
-        let end = (offset + CHUNK_CHARS).min(chars.len());
-        let chunk: String = chars[offset..end].iter().collect();
-        if !inject_text(port, &chunk) {
-            return false;
-        }
-        offset = end;
-        if offset < chars.len() {
-            std::thread::sleep(GAP);
-        }
-    }
-    true
-}
-
 /// How long to wait after a Grok full-body inject before force-Enter.
 ///
 /// Scales with payload size: short pings stay snappy; large review dumps under
 /// slow WSL/GB get up to ~4s so the composer can finish accepting paste.
-fn grok_inject_settle(len: usize) -> Duration {
-    // Short wake trigger: tiny settle only.
-    if len <= GROK_WAKE_TRIGGER.len() + 4 {
-        return Duration::from_millis(400);
-    }
-    const BASE_MS: u64 = 450;
-    const PER_CHAR_MS: u64 = 2;
-    const MAX_MS: u64 = 4000;
-    let scaled = BASE_MS.saturating_add((len as u64).saturating_mul(PER_CHAR_MS));
-    Duration::from_millis(scaled.min(MAX_MS))
-}
-
 /// After force-Enter, how long to wait for a *real* submit signal before
 /// re-sending Enter. Must not treat `commit_delivery_ack`'s ST_ACTIVE as success
 /// (that was a false positive that skipped retries while the composer still
@@ -1154,27 +1036,6 @@ fn grok_turn_started(status: &str, context: &str) -> bool {
     matches!(context, "prompt" | "trigger")
         || context.starts_with("tool:")
         || context.starts_with("approved:")
-}
-
-/// Inject raw bytes (including control characters) to the PTY.
-fn inject_bytes(port: u16, bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return false;
-    }
-    match TcpStream::connect(format!("127.0.0.1:{}", port)) {
-        Ok(mut stream) => stream.write_all(bytes).is_ok(),
-        Err(_) => false,
-    }
-}
-
-/// Best-effort clear of the current composer line before a Grok inject.
-///
-/// Only Ctrl-U (kill line). Avoid Ctrl-A/K and CSI sequences: under Windows
-/// Terminal they have been observed to paste stale clipboard / image paths
-/// (`C:\Users\...\Pictures\*.png`) into the Grok composer.
-fn clear_composer_best_effort(port: u16) {
-    let _ = inject_bytes(port, b"\x15"); // Ctrl-U
-    std::thread::sleep(Duration::from_millis(40));
 }
 
 /// Inject Enter key to PTY via TCP
@@ -1638,13 +1499,8 @@ pub fn run_delivery_loop(
                         let parsed_tool = Tool::from_str(&config.tool).ok();
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
-                        let grok_mode = if parsed_tool == Some(Tool::Grok) {
-                            Some(grok_delivery_mode())
-                        } else {
-                            None
-                        };
                         let text = match parsed_tool {
-                            // Grok: full body or short wake — see GrokDeliveryMode.
+                            // Grok: short wake sentinel only; body via Stop additionalContext.
                             Some(Tool::Grok) => build_grok_inject_text(db, &current_name),
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
                             | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi)
@@ -1652,31 +1508,19 @@ pub fn run_delivery_loop(
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
-                        if parsed_tool == Some(Tool::Grok) {
-                            clear_composer_best_effort(state.inject_port);
-                        }
-
-                        // Grok full-body: paced inject (WSL paste reliability).
-                        // Wake mode is tiny — single burst write like CC/Codex.
-                        let inject_ok = match grok_mode {
-                            Some(GrokDeliveryMode::Full) => {
-                                inject_text_paced(state.inject_port, &text)
-                            }
-                            Some(GrokDeliveryMode::Wake) | None => {
-                                inject_text(state.inject_port, &text)
-                            }
-                        };
+                        // No Ctrl-U clear for Grok: cannot observe composer; risk
+                        // partial draft deletion. Sentinel is short and idle-gated.
+                        let inject_ok = inject_text(state.inject_port, &text);
 
                         if inject_ok {
                             log_info(
                                 "native",
                                 "delivery.injected",
                                 &format!(
-                                    "Injected '{}' (len={}, inject_attempt={}, grok_mode={:?})",
+                                    "Injected '{}' (len={}, inject_attempt={})",
                                     truncate_chars(&text, 40),
                                     text.len(),
                                     inject_attempt,
-                                    grok_mode,
                                 ),
                             );
                             injected_text = text;
@@ -1849,63 +1693,32 @@ pub fn run_delivery_loop(
                 State::WaitTextRender => {
                     let elapsed = phase_started_at.elapsed();
 
-                    // Grok's input box is unscrapeable (`input_text` stays None), so
-                    // exclusive-ownership phase-1 never succeeds and previously
-                    // re-injected `<hcom>` hundreds of times.
-                    //
-                    // Flow:
-                    //   1) paced full-body inject + length-scaled settle
-                    //   2) force Enter *without* bus-ack (ack sets ST_ACTIVE and
-                    //      used to false-confirm submit, killing Enter retries)
-                    //   3) wait for real UPS (`status_context` prompt|trigger) or
-                    //      pending cleared by the UPS skip-followup ack path
-                    //   4) re-Enter while still pending (WSL often drops first \r)
+                    // Grok: unscrapeable composer → cannot prove ownership.
+                    // Protocol (owner review): PTY only submits a short wake
+                    // sentinel; real body is delivered from grok-stop via
+                    // hookSpecificOutput.additionalContext. Never force-ack.
                     if config.tool == "grok" {
-                        // --- post-Enter confirm / retry path ---
                         if enter_attempt > 0 {
                             let still_pending = db.has_pending(&current_name);
                             let turn_started = match db.get_status(&current_name) {
                                 Ok(Some((status, ctx))) => grok_turn_started(&status, &ctx),
                                 _ => false,
                             };
-                            // UPS skip-followup acks when prompt already carries body.
-                            let submitted = turn_started || !still_pending;
-
-                            if submitted {
+                            // Success for PTY wake: turn started (UPS trigger/prompt)
+                            // or Stop already acked (pending cleared). Do NOT ack here.
+                            if turn_started || !still_pending {
                                 log_info(
                                     "native",
-                                    "delivery.grok_submit_confirmed",
+                                    "delivery.grok_wake_done",
                                     &format!(
-                                        "Grok submit confirmed (enter_attempt={enter_attempt}, turn_started={turn_started}, pending={still_pending})"
+                                        "Grok wake complete (enter_attempt={enter_attempt}, turn_started={turn_started}, pending={still_pending})"
                                     ),
                                 );
-                                // If UPS already acked, nothing to do. If turn started
-                                // but pending remains (race), ack now without followup risk
-                                // only when prompt path owns the body — UPS should win first.
-                                if still_pending
-                                    && let Some(prepared) =
-                                        crate::hooks::common::prepare_pending_messages(
-                                            db,
-                                            &current_name,
-                                        )
-                                {
-                                    crate::hooks::common::commit_delivery_ack(db, &prepared.ack);
-                                    log_info(
-                                        "native",
-                                        "delivery.grok_acked",
-                                        &format!(
-                                            "Acked after turn start (last_event_id={})",
-                                            prepared.ack.last_event_id
-                                        ),
-                                    );
-                                }
                                 inject_attempt = 0;
                                 attempt = 0;
-                                if db.has_pending(&current_name) {
-                                    delivery_state = State::Pending;
-                                } else {
-                                    delivery_state = State::Idle;
-                                }
+                                // If still pending, Stop will deliver body. Stay idle
+                                // until notify after Stop; then Pending wakes again.
+                                delivery_state = State::Idle;
                                 phase_started_at = Instant::now();
                                 continue;
                             }
@@ -1928,7 +1741,6 @@ pub fn run_delivery_loop(
                                                 "Grok Enter retry blocked (user_active={user_active}, approval={approval}); pending kept"
                                             ),
                                         );
-                                        // Keep pending so a later idle cycle can retry.
                                         delivery_state = State::Pending;
                                         inject_attempt += 1;
                                         attempt += 1;
@@ -1941,21 +1753,14 @@ pub fn run_delivery_loop(
                                     "native",
                                     "delivery.grok_retry_enter",
                                     &format!(
-                                        "Grok still pending after {:?}; re-Enter (attempt={}/{}, mode={:?})",
+                                        "Grok still pending after {:?}; re-Enter sentinel (attempt={}/{})",
                                         elapsed,
                                         enter_attempt + 1,
                                         MAX_ENTER_ATTEMPTS,
-                                        grok_delivery_mode(),
                                     ),
                                 );
-                                // Full-body: double \r helps slow WSL paste digest.
-                                // Wake mode: single \r only — double Enter can append
-                                // two wake turns into GB's submit queue.
+                                // Single Enter only — double Enter can queue two wakes.
                                 inject_enter(state.inject_port);
-                                if grok_delivery_mode() == GrokDeliveryMode::Full {
-                                    std::thread::sleep(Duration::from_millis(120));
-                                    inject_enter(state.inject_port);
-                                }
                                 enter_attempt += 1;
                                 phase_started_at = Instant::now();
                                 continue;
@@ -1963,27 +1768,21 @@ pub fn run_delivery_loop(
 
                             log_warn(
                                 "native",
-                                "delivery.grok_submit_unconfirmed",
+                                "delivery.grok_wake_unconfirmed",
                                 &format!(
-                                    "Grok still pending after {MAX_ENTER_ATTEMPTS} Enters (bytes={}); force-ack so bus does not loop-reinject",
-                                    injected_text.len()
+                                    "Grok wake unconfirmed after {MAX_ENTER_ATTEMPTS} Enters; leaving pending (no force-ack)"
                                 ),
                             );
-                            // Last resort: clear bus (composer may still need manual Enter).
-                            if let Some(prepared) =
-                                crate::hooks::common::prepare_pending_messages(db, &current_name)
-                            {
-                                crate::hooks::common::commit_delivery_ack(db, &prepared.ack);
-                            }
-                            delivery_state = State::Idle;
-                            inject_attempt = 0;
-                            attempt = 0;
+                            // Leave messages pending for a later idle cycle.
+                            delivery_state = State::Pending;
+                            inject_attempt += 1;
+                            attempt += 1;
                             phase_started_at = Instant::now();
                             continue;
                         }
 
-                        // --- first Enter: length-scaled settle ---
-                        let settle = grok_inject_settle(injected_text.chars().count());
+                        // First Enter after short settle for tiny sentinel.
+                        let settle = Duration::from_millis(400);
                         if elapsed < settle {
                             std::thread::sleep(Duration::from_millis(25));
                             continue;
@@ -2007,25 +1806,15 @@ pub fn run_delivery_loop(
                             }
                             continue;
                         }
-                        let mode = grok_delivery_mode();
                         log_info(
                             "native",
                             "delivery.grok_force_enter",
                             &format!(
-                                "Forcing Enter after unscrapeable inject (bytes={}, settle_ms={}, mode={:?}) — defer ack until UPS",
+                                "Forcing Enter after wake sentinel (bytes={}) — body via Stop additionalContext",
                                 injected_text.len(),
-                                settle.as_millis(),
-                                mode,
                             ),
                         );
-                        // Do NOT ack here (false-confirm via ST_ACTIVE). UPS acks when
-                        // full-body is already in the prompt, or emits followup_message
-                        // for bare wake so the model sees the bus payload.
                         inject_enter(state.inject_port);
-                        if mode == GrokDeliveryMode::Full {
-                            std::thread::sleep(Duration::from_millis(120));
-                            inject_enter(state.inject_port);
-                        }
                         enter_attempt = 1;
                         phase_started_at = Instant::now();
                         continue;
@@ -2537,28 +2326,6 @@ mod tests {
     // ---- phase-1 ownership tests ----
 
     #[test]
-    fn grok_inject_strips_angle_brackets() {
-        let cleaned = sanitize_grok_inject_text("<hcom>hello → world</hcom>");
-        assert!(!cleaned.contains('<'), "cleaned={cleaned}");
-        assert!(!cleaned.contains('>'), "cleaned={cleaned}");
-        assert!(cleaned.contains("hello"), "cleaned={cleaned}");
-    }
-
-    #[test]
-    fn grok_inject_empty_falls_back() {
-        assert_eq!(sanitize_grok_inject_text("   \n\t  "), "hcom: message");
-    }
-
-    #[test]
-    fn grok_inject_settle_scales_with_length() {
-        // len 0 is treated as wake-sized (short settle).
-        assert_eq!(grok_inject_settle(0), Duration::from_millis(400));
-        assert_eq!(grok_inject_settle(100), Duration::from_millis(650));
-        // Cap at 4s even for huge pastes.
-        assert_eq!(grok_inject_settle(10_000), Duration::from_millis(4000));
-    }
-
-    #[test]
     fn grok_turn_started_ignores_premature_deliver_ack() {
         // commit_delivery_ack sets active + deliver:sender — must NOT count.
         assert!(!grok_turn_started(ST_ACTIVE, "deliver:vomu"));
@@ -2574,14 +2341,6 @@ mod tests {
         assert!(!GROK_WAKE_TRIGGER.contains('<'));
         assert!(!GROK_WAKE_TRIGGER.contains('>'));
         assert_eq!(GROK_WAKE_TRIGGER, "hcom: wake");
-    }
-
-    #[test]
-    fn grok_inject_settle_is_short_for_wake_trigger() {
-        assert_eq!(
-            grok_inject_settle(GROK_WAKE_TRIGGER.len()),
-            Duration::from_millis(400)
-        );
     }
 
     #[test]
