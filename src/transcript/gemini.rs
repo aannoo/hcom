@@ -5,9 +5,36 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, extract_gemini_user_text, extract_text_content, finalize_action_text,
-    normalize_tool_name, read_file_lossy, truncate_str,
+    Exchange, ToolUse, capture_tool_output, extract_gemini_user_text, extract_text_content,
+    finalize_action_text, normalize_tool_name, read_file_lossy, truncate_str,
 };
+
+fn tool_output(tool_call: &Value) -> Option<String> {
+    let mut outputs = Vec::new();
+    if let Some(results) = tool_call.get("result").and_then(Value::as_array) {
+        for result in results {
+            let Some(response) = result
+                .get("functionResponse")
+                .and_then(|v| v.get("response"))
+            else {
+                continue;
+            };
+            if let Some(output) = response.get("output").and_then(Value::as_str) {
+                outputs.push(output.to_string());
+            } else if !response.is_null() {
+                outputs.push(response.to_string());
+            }
+        }
+    }
+    if outputs.is_empty() {
+        tool_call
+            .get("resultDisplay")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    } else {
+        Some(outputs.join("\n"))
+    }
+}
 
 /// Parse Gemini JSON transcript.
 pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> {
@@ -49,6 +76,8 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
 
     let mut current_tools: Vec<ToolUse> = Vec::new();
     let mut current_files: Vec<String> = Vec::new();
+    let mut current_errors: Vec<Value> = Vec::new();
+    let mut current_last_was_error = false;
 
     for msg in &messages {
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -64,13 +93,18 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                 exchanges.push(Exchange {
                     position,
                     user: current_user.clone(),
-                    action: finalize_action_text(&current_action, &current_tools, &[], false),
+                    action: finalize_action_text(
+                        &current_action,
+                        &current_tools,
+                        &current_errors,
+                        current_last_was_error,
+                    ),
                     files: std::mem::take(&mut current_files),
                     timestamp: current_ts.clone(),
                     tools: std::mem::take(&mut current_tools),
                     edits: Vec::new(),
-                    errors: Vec::new(),
-                    ended_on_error: false,
+                    errors: std::mem::take(&mut current_errors),
+                    ended_on_error: current_last_was_error,
                 });
             }
             // Gemini user content can be a string or array of {text: ...} blocks.
@@ -79,6 +113,8 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
             current_action = String::new();
             current_tools = Vec::new();
             current_files = Vec::new();
+            current_errors = Vec::new();
+            current_last_was_error = false;
             current_ts = ts;
         } else if msg_type == "gemini" || msg_type == "model" {
             let text = extract_text_content(msg);
@@ -104,6 +140,7 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                                 "ok" | "success" | "completed"
                             )
                         });
+                    let output = tool_output(tc);
 
                     // Extract file paths from tool args
                     if let Some(obj) = args.as_object() {
@@ -154,7 +191,16 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                         is_error: is_err,
                         file,
                         command,
+                        output: output.as_deref().and_then(capture_tool_output),
                     });
+                    if is_err {
+                        let error_output = output.unwrap_or_default();
+                        current_errors.push(json!({
+                            "tool": tool_name,
+                            "content": truncate_str(&error_output, 300),
+                        }));
+                    }
+                    current_last_was_error = is_err;
                 }
             }
         }
@@ -166,13 +212,18 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
         exchanges.push(Exchange {
             position,
             user: current_user,
-            action: finalize_action_text(&current_action, &current_tools, &[], false),
+            action: finalize_action_text(
+                &current_action,
+                &current_tools,
+                &current_errors,
+                current_last_was_error,
+            ),
             files: current_files,
             timestamp: current_ts,
             tools: current_tools,
             edits: Vec::new(),
-            errors: Vec::new(),
-            ended_on_error: false,
+            errors: current_errors,
+            ended_on_error: current_last_was_error,
         });
     }
 
@@ -182,4 +233,36 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
     }
 
     Ok(exchanges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_nested_function_response_output() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            json!({"messages": [
+                {"type": "user", "content": "run pwd"},
+                {"type": "gemini", "content": "done", "toolCalls": [{
+                    "id": "call-1",
+                    "name": "run_shell_command",
+                    "args": {"command": "pwd"},
+                    "status": "success",
+                    "result": [{"functionResponse": {
+                        "id": "call-1",
+                        "name": "run_shell_command",
+                        "response": {"output": "/work"}
+                    }}]
+                }]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        let exchanges = parse_gemini_json(file.path(), 10).unwrap();
+        assert_eq!(exchanges[0].tools[0].output.as_deref(), Some("/work"));
+    }
 }

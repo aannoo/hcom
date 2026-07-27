@@ -5,6 +5,101 @@
 
 use std::process::Command;
 
+/// Stable identity for one PID incarnation.
+///
+/// PIDs are reusable, so liveness checks for persisted ownership records must
+/// compare the process creation time as well as the numeric PID.
+pub fn identity(pid: u32) -> Option<String> {
+    process_identity_platform(pid)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn process_identity_platform(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return None;
+    }
+    // Fields after the final `) ` begin at field 3 (`state`). Linux's process
+    // start time is field 22, hence index 19 in this slice. Boot ID keeps the
+    // boot-relative tick count unique across restarts.
+    let start_ticks = stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?;
+    Some(format!("linux:{boot_id}:{start_ticks}"))
+}
+
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn process_identity_platform(pid: u32) -> Option<String> {
+    // SAFETY: `info` is a correctly sized writable proc_bsdinfo buffer and
+    // proc_pidinfo only fills it for the queried PID.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size).then(|| format!("apple:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+#[cfg(windows)]
+fn process_identity_platform(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: the handle is opened query-only, every FILETIME pointer is
+    // valid, and the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        ok.then(|| {
+            let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+            format!("windows:{ticks}")
+        })
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    ))
+))]
+fn process_identity_platform(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let started = String::from_utf8(output.stdout).ok()?;
+    let started = started.trim();
+    (!started.is_empty()).then(|| format!("unix:{started}"))
+}
+
+/// Whether `pid` still names the same process incarnation as `identity`.
+pub fn has_identity(pid: u32, expected: &str) -> bool {
+    identity(pid).as_deref() == Some(expected)
+}
+
 /// Whether a process with the given PID is currently alive.
 ///
 /// Unix: `kill(pid, 0)`, treating `EPERM` (the process exists but is owned by
@@ -552,6 +647,28 @@ mod tests {
     #[test]
     fn test_is_alive_dead_process() {
         assert!(!is_alive(99_999_999));
+    }
+
+    #[test]
+    fn test_process_identity_is_stable_for_current_process() {
+        let pid = std::process::id();
+        let first = identity(pid).expect("current process must have a start identity");
+        assert_eq!(identity(pid).as_deref(), Some(first.as_str()));
+        assert!(has_identity(pid, &first));
+        assert!(!has_identity(pid, "a different process incarnation"));
+    }
+
+    #[test]
+    fn test_process_identity_is_absent_for_dead_pid() {
+        assert!(identity(u32::MAX).is_none());
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn test_linux_process_identity_includes_boot_id() {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let identity = identity(std::process::id()).unwrap();
+        assert!(identity.contains(boot_id.trim()));
     }
 
     // Reproduces the bug fixed above: the process object stays valid (and

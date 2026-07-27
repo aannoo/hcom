@@ -1,0 +1,51 @@
+name: Lint workflows
+
+# Deliberately a separate workflow, not a job inside CI: an invalid expression
+# or malformed YAML makes GitHub fail the whole workflow before it creates any
+# job, so a linter living in ci.yml would never run for exactly the failure it
+# exists to catch (`fromJSON(inputs.repeat) * 6 + 20` — expressions have no
+# arithmetic — produced a run with zero jobs, no log, and no annotation).
+# Workflow files are also the one thing this repo's CI cannot self-test:
+# everything else is covered by cargo test / clippy / dist-check, but a broken
+# workflow means CI cannot run to report it.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Pinned tarball rather than the upstream install script, matching how
+      # every action here is SHA-pinned. shellcheck is preinstalled on the
+      # ubuntu runner, and actionlint picks it up to check `run:` bodies —
+      # without it that checking is silently skipped.
+      - name: Install pinned actionlint
+        run: |
+          curl -fsSL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+      # Pre-existing style findings in release.yml are ignored so this starts
+      # green and stays meaningful; the value here is parse/expression/context
+      # errors, which are not ignorable and are what actually take CI down.
+      # Drop an ignore once the underlying finding is fixed.
+      - name: Lint
+        run: |
+          ./actionlint \
+            -ignore 'label "macos-15-intel" is unknown' \
+            -ignore 'SC2086' \
+            -ignore 'SC2129' \
+            -ignore 'SC2001'

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
@@ -407,60 +408,127 @@ pub struct SubagentAllocation<'a> {
 /// If an instance row already exists for `agent_id`, returns its name without
 /// re-inserting (so SubagentStart can run before `hcom start --name` without
 /// creating duplicates, and vice versa). Otherwise computes the next free
-/// suffix, INSERTs the row with `SQLite UNIQUE(name)` as the collision guard,
-/// and retries once with `max_n + 2` on constraint violation.
+/// suffix and INSERTs the row.
+///
+/// The idempotency check, suffix scan, and INSERT share one `BEGIN IMMEDIATE`
+/// transaction so concurrent sibling hooks cannot choose the same suffix.
 pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Result<String> {
-    // Return early if a row already exists for this agent_id.
-    let existing: Option<String> = db
-        .conn()
-        .query_row(
-            "SELECT name FROM instances WHERE agent_id = ?",
-            rusqlite::params![info.agent_id],
-            |row| row.get(0),
-        )
-        .ok();
-    if let Some(name) = existing {
-        return Ok(name);
-    }
-
     let sanitized = sanitize_subagent_type(info.agent_type);
     let pattern = format!("{}_{}_", info.parent_name, sanitized);
     let like_pattern = format!("{pattern}%");
-    let names: Vec<String> = {
-        let mut stmt = db
-            .conn()
-            .prepare("SELECT name FROM instances WHERE name LIKE ?")?;
-        stmt.query_map(rusqlite::params![like_pattern], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect()
-    };
-
-    let mut max_n: u32 = 0;
-    for name in &names {
-        if let Some(suffix) = name.strip_prefix(&pattern)
-            && let Ok(n) = suffix.parse::<u32>()
-        {
-            max_n = max_n.max(n);
-        }
-    }
-
-    let candidate = format!("{pattern}{}", max_n + 1);
     let initial_event_id = db.get_last_event_id();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let now = crate::shared::time::now_epoch_f64();
 
-    let insert_sql = "INSERT INTO instances \
-         (name, session_id, parent_session_id, parent_name, tag, agent_id, \
-          created_at, last_event_id, directory, last_stop, status, status_context) \
-         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)";
+    db.with_immediate_transaction(|txn| {
+        // Idempotency check must live inside the transaction too: otherwise a
+        // concurrent SubagentStart and `hcom start --name <agent_id>` for the
+        // same agent_id could both miss it and insert two rows.
+        let existing: Option<String> = txn
+            .query_row(
+                "SELECT name FROM instances WHERE agent_id = ?",
+                rusqlite::params![info.agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(name) = existing {
+            txn.execute(
+                "UPDATE instances
+                 SET parent_session_id = ?, parent_name = ?, tag = ?, directory = ?,
+                     status = ?, status_context = ?, status_time = ?, last_seen = ?
+                 WHERE agent_id = ?",
+                rusqlite::params![
+                    info.parent_session_id,
+                    info.parent_name,
+                    info.parent_tag,
+                    cwd,
+                    info.status,
+                    info.status_context,
+                    crate::shared::time::now_epoch_i64(),
+                    crate::shared::time::now_epoch_i64(),
+                    info.agent_id,
+                ],
+            )?;
+            return Ok(name);
+        }
 
-    let do_insert = |name: &str| -> rusqlite::Result<usize> {
-        db.conn().execute(
-            insert_sql,
+        // Resume the same hcom identity when Claude reuses an agent_id after a
+        // definitive SubagentStop removed the live row.
+        let stopped: Option<(String, i64)> = txn
+            .query_row(
+                "SELECT instance,
+                        COALESCE(json_extract(data, '$.snapshot.name_announced'), 0)
+                 FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND json_extract(data, '$.snapshot.agent_id') = ?
+                   AND COALESCE(json_extract(data, '$.snapshot.parent_session_id'), '') = COALESCE(?, '')
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![info.agent_id, info.parent_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((candidate, name_announced)) = stopped
+            && txn
+                .query_row(
+                    "SELECT 1 FROM instances WHERE name = ?",
+                    rusqlite::params![candidate],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+        {
+            txn.execute(
+                "INSERT INTO instances
+                 (name, session_id, parent_session_id, parent_name, tag, agent_id,
+                  created_at, last_event_id, directory, last_stop, status,
+                  status_context, status_time, last_seen, name_announced)
+                 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    candidate,
+                    info.parent_session_id,
+                    info.parent_name,
+                    info.parent_tag,
+                    info.agent_id,
+                    now,
+                    initial_event_id,
+                    cwd,
+                    info.status,
+                    info.status_context,
+                    crate::shared::time::now_epoch_i64(),
+                    crate::shared::time::now_epoch_i64(),
+                    name_announced,
+                ],
+            )?;
+            return Ok(candidate);
+        }
+
+        let names: Vec<String> = {
+            let mut stmt = txn.prepare("SELECT name FROM instances WHERE name LIKE ?")?;
+            stmt.query_map(rusqlite::params![like_pattern], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        let mut max_n: u32 = 0;
+        for name in &names {
+            if let Some(suffix) = name.strip_prefix(&pattern)
+                && let Ok(n) = suffix.parse::<u32>()
+            {
+                max_n = max_n.max(n);
+            }
+        }
+
+        let candidate = format!("{pattern}{}", max_n + 1);
+        txn.execute(
+            "INSERT INTO instances \
+             (name, session_id, parent_session_id, parent_name, tag, agent_id, \
+              created_at, last_event_id, directory, last_stop, status, status_context, status_time, last_seen) \
+             VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
             rusqlite::params![
-                name,
+                candidate,
                 info.parent_session_id,
                 info.parent_name,
                 info.parent_tag,
@@ -470,23 +538,12 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
                 cwd,
                 info.status,
                 info.status_context,
+                crate::shared::time::now_epoch_i64(),
+                crate::shared::time::now_epoch_i64(),
             ],
-        )
-    };
-
-    match do_insert(&candidate) {
-        Ok(_) => Ok(candidate),
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            let retry = format!("{pattern}{}", max_n + 2);
-            do_insert(&retry).map_err(|e| {
-                anyhow::anyhow!("Failed to create unique subagent name after retry: {e}")
-            })?;
-            Ok(retry)
-        }
-        Err(e) => Err(anyhow::anyhow!("Failed to insert subagent instance: {e}")),
-    }
+        )?;
+        Ok(candidate)
+    })
 }
 
 #[cfg(test)]
@@ -560,6 +617,101 @@ mod subagent_alloc_tests {
     }
 
     #[test]
+    fn allocate_resume_reuses_stopped_identity_and_announcement_state() {
+        let (_tmp, db) = setup_db();
+        let original = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = ?",
+                rusqlite::params![original],
+            )
+            .unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "agent_id": "aid-1",
+                "parent_name": "luna",
+                "parent_session_id": null,
+                "name_announced": 1
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-01-01T00:00:00Z', 'life', ?, ?)",
+                rusqlite::params![original, snapshot.to_string()],
+            )
+            .unwrap();
+        db.delete_instance(&original).unwrap();
+
+        let resumed = allocate_subagent_instance(&db, &alloc("aid-1", "reviewer")).unwrap();
+        assert_eq!(resumed, original);
+        let row = db.get_instance_full(&resumed).unwrap().unwrap();
+        assert_eq!(row.name_announced, 1);
+    }
+
+    #[test]
+    fn allocate_resume_survives_root_name_rebind() {
+        let (_tmp, db) = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('luna', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let original = allocate_subagent_instance(
+            &db,
+            &SubagentAllocation {
+                agent_id: "aid-1",
+                agent_type: "reviewer",
+                parent_name: "luna",
+                parent_session_id: Some("sess-1"),
+                parent_tag: None,
+                status: "inactive",
+                status_context: Some("subagent:dormant"),
+            },
+        )
+        .unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "agent_id": "aid-1",
+                "parent_name": "luna",
+                "parent_session_id": "sess-1",
+                "name_announced": 1
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-01-01T00:00:00Z', 'life', ?, ?)",
+                rusqlite::params![original, snapshot.to_string()],
+            )
+            .unwrap();
+        db.delete_instance(&original).unwrap();
+
+        let resumed = allocate_subagent_instance(
+            &db,
+            &SubagentAllocation {
+                agent_id: "aid-1",
+                agent_type: "reviewer",
+                parent_name: "sol",
+                parent_session_id: Some("sess-1"),
+                parent_tag: None,
+                status: "inactive",
+                status_context: Some("subagent:dormant"),
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed, original);
+        let row = db.get_instance_full(&resumed).unwrap().unwrap();
+        assert_eq!(row.parent_name.as_deref(), Some("sol"));
+        assert_eq!(row.name_announced, 1);
+    }
+
+    #[test]
     fn allocate_retries_on_name_collision() {
         let (_tmp, db) = setup_db();
         // Pre-seed `luna_reviewer_1` directly so the natural pick collides
@@ -577,6 +729,62 @@ mod subagent_alloc_tests {
         // The seeded row has no suffix-N parsable from agent_id lookup, but
         // it does match the LIKE pattern and parses as N=1 → next is _2.
         assert_eq!(name, "luna_reviewer_2");
+    }
+
+    #[test]
+    fn allocate_concurrent_siblings_all_get_rows() {
+        // Separate connections mirror concurrent hook processes.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("race.db");
+        {
+            let db = HcomDb::open_raw(&path).unwrap();
+            db.init_db().unwrap();
+        }
+
+        const N: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    let agent_id = format!("aid-{i}");
+                    barrier.wait();
+                    allocate_subagent_instance(
+                        &db,
+                        &SubagentAllocation {
+                            agent_id: &agent_id,
+                            agent_type: "reviewer",
+                            parent_name: "luna",
+                            parent_session_id: None,
+                            parent_tag: None,
+                            status: "inactive",
+                            status_context: Some("subagent:dormant"),
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let mut ok = 0;
+        for h in handles {
+            if h.join().unwrap().is_ok() {
+                ok += 1;
+            }
+        }
+
+        let db = HcomDb::open_raw(&path).unwrap();
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE parent_name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ok, N, "every concurrent allocation must succeed");
+        assert_eq!(rows, N as i64, "every subagent must get its own row");
     }
 
     #[test]

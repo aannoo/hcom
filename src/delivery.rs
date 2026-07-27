@@ -14,6 +14,13 @@ use crate::db::HcomDb;
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
+use crate::tool::Tool;
+
+/// Wakes the PTY proxy after the delivery thread changes title state.
+///
+/// The proxy remains the sole writer to the terminal. This callback only
+/// interrupts its I/O poll so it can serialize the new OSC title promptly.
+pub type TitleWake = Arc<dyn Fn() + Send + Sync>;
 
 /// Whether the wrapped child exited because hcom killed it (vs. closed on its
 /// own). Set by the PTY proxy (Unix) and read here during delivery cleanup to
@@ -81,13 +88,13 @@ pub(crate) fn refresh_binding(
     }
 }
 
-/// Refresh shared status from DB. Updates current_status if changed.
+/// Refresh both delivery-local and PTY-shared status from the database.
 pub(crate) fn refresh_status(
     db: &HcomDb,
     current_name: &str,
     current_status: &mut String,
     shared_status: &Option<Arc<std::sync::RwLock<String>>>,
-) {
+) -> bool {
     let new_status = match db.get_status(current_name) {
         Ok(Some((status, _))) => status,
         Ok(None) => "stopped".to_string(),
@@ -101,13 +108,30 @@ pub(crate) fn refresh_status(
             "stopped".to_string()
         }
     };
-    if new_status != *current_status {
-        if let Some(shared) = shared_status
-            && let Ok(mut s) = shared.write()
-        {
-            *s = new_status.clone();
-        }
-        *current_status = new_status;
+    let local_changed = new_status != *current_status;
+    let mut shared_changed = false;
+    if let Some(shared) = shared_status
+        && let Ok(mut status) = shared.write()
+        && *status != new_status
+    {
+        *status = new_status.clone();
+        shared_changed = true;
+    }
+    *current_status = new_status;
+    local_changed || shared_changed
+}
+
+fn refresh_status_and_wake(
+    db: &HcomDb,
+    current_name: &str,
+    current_status: &mut String,
+    shared_status: &Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: &Option<TitleWake>,
+) {
+    if refresh_status(db, current_name, current_status, shared_status)
+        && let Some(wake) = title_wake
+    {
+        wake();
     }
 }
 
@@ -138,6 +162,7 @@ struct TitleRefresh<'a> {
     current_status: &'a mut String,
     shared_name: &'a Option<Arc<std::sync::RwLock<String>>>,
     shared_status: &'a Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: &'a Option<TitleWake>,
     tool: &'a str,
     host_label: &'a mut host_label::HostLabel,
 }
@@ -152,11 +177,12 @@ fn refresh_title_state(args: TitleRefresh<'_>) {
         current_status,
         shared_name,
         shared_status,
+        title_wake,
         tool,
         host_label,
     } = args;
     refresh_binding(db, process_id, current_name, shared_name);
-    refresh_status(db, current_name, current_status, shared_status);
+    refresh_status_and_wake(db, current_name, current_status, shared_status, title_wake);
     refresh_display_name(db, current_name, shared_name);
     host_label.sync(db, current_name, current_status, tool);
 }
@@ -315,10 +341,9 @@ mod host_label {
         use serial_test::serial;
 
         #[test]
+        #[serial]
         fn pane_title_label_skips_when_tool_empty() {
-            let dir = tempfile::tempdir().unwrap();
-            // SAFETY: test-local HCOM_DIR.
-            unsafe { std::env::set_var("HCOM_DIR", dir.path()) };
+            let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
             let db = crate::db::HcomDb::open().unwrap();
 
             assert_eq!(pane_title_label(&db, "luna", ST_LISTENING, ""), "");
@@ -360,6 +385,7 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
         "output_unstable" => "output still streaming",
         "prompt_has_text" => "uncommitted text in prompt",
         "approval" => "waiting for user approval",
+        "nav_overlay" => "waiting for subagent nav / session switcher to close",
         _ => "blocked",
     }
 }
@@ -660,6 +686,14 @@ pub struct ScreenState {
     /// once output has settled. Antigravity keeps its immediate scrape.
     /// See `APPROVAL_SCRAPE_CLEAR_MS`.
     pub approval_scrape_latched: bool,
+    /// A Claude TUI overlay is focused whose input box is NOT the current
+    /// session's root prompt — the subagent navigator (a human may be typing
+    /// into a subagent's box) or the `←` session switcher (input box is a
+    /// new-session creator). Both share the parent's single PTY, so injecting the
+    /// wake trigger would land in the wrong box; the gate defers while this is
+    /// set. Only ever true for Claude (see `ScreenTracker::is_claude_subagent_nav_visible`
+    /// / `is_claude_session_switcher_visible`).
+    pub nav_overlay: bool,
 }
 
 impl Default for ScreenState {
@@ -675,6 +709,7 @@ impl Default for ScreenState {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            nav_overlay: false,
         }
     }
 }
@@ -763,6 +798,17 @@ pub(crate) fn evaluate_gate(
             reason: "user_active",
         };
     }
+    // A Claude nav overlay (subagent navigator or `←` session switcher) is
+    // focused: the wake trigger writes to the shared stdin, which the tool routes
+    // to the focused view — not the root prompt. Defer, or the box-emptiness
+    // checks below would scrape the overlay's box and pass. Only ever set for
+    // Claude, so no config flag is needed.
+    if screen.nav_overlay {
+        return GateResult {
+            safe: false,
+            reason: "nav_overlay",
+        };
+    }
     // Submit-edge cooldown: after the screen shows the input clearing, the
     // tool's hook hasn't yet flipped DB status to active. Without this,
     // `require_idle + prompt_empty` both look true and we double-inject. Only
@@ -794,6 +840,52 @@ pub(crate) fn evaluate_gate(
         safe: true,
         reason: "ok",
     }
+}
+
+/// Build a diagnostic string for a `delivery.gate_pass` log line.
+fn gate_pass_diagnostics(db: &HcomDb, name: &str, state: &DeliveryState, is_idle: bool) -> String {
+    let now = crate::shared::time::now_epoch_i64();
+    let (status, context, status_age_s) = match db.get_instance_full(name) {
+        Ok(Some(row)) => (
+            row.status,
+            row.status_context,
+            Some(now.saturating_sub(row.status_time)),
+        ),
+        _ => (String::new(), String::new(), None),
+    };
+    let writer = db.last_status_writer(name).unwrap_or_default();
+    let last_event_id = db.get_cursor(name);
+    let pending_range = db.pending_event_range(name);
+
+    let screen = state.screen.read().unwrap();
+    let prompt_empty_classification = match &screen.input_text {
+        None => "box_not_found".to_string(),
+        Some(t) if t.is_empty() => "empty".to_string(),
+        Some(t) => format!("has_text:{}", t.chars().count()),
+    };
+    let user_active = state.is_user_active_with_guard(&screen);
+    let submit_age_ms = screen.last_prompt_submit.map(|t| t.elapsed().as_millis());
+
+    format!(
+        "Gate passed, injecting to port {}. persisted={{status={}, context={}, age_s={:?}}} \
+         last_writer={} pending={:?} last_event_id={} prompt_empty={} \
+         gates={{idle={}, ready={}, nav_overlay={}, approval={}, user_active={}}} \
+         last_prompt_submit_age_ms={:?}",
+        state.inject_port,
+        status,
+        context,
+        status_age_s,
+        writer,
+        pending_range,
+        last_event_id,
+        prompt_empty_classification,
+        is_idle,
+        screen.ready,
+        screen.nav_overlay,
+        screen.approval,
+        user_active,
+        submit_age_ms,
+    )
 }
 
 fn launch_ready_observed(
@@ -1086,6 +1178,32 @@ enum Phase1Decision {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyTimeoutDecision {
+    DeliveredWithoutCursor,
+    Retry,
+    FastFail,
+    Reset,
+}
+
+fn verify_timeout_decision(
+    tool: Option<Tool>,
+    has_pending: bool,
+    inject_attempt: u32,
+) -> VerifyTimeoutDecision {
+    if !has_pending {
+        return VerifyTimeoutDecision::DeliveredWithoutCursor;
+    }
+    if matches!(tool, Some(Tool::Claude)) {
+        return VerifyTimeoutDecision::FastFail;
+    }
+    if inject_attempt < 3 {
+        VerifyTimeoutDecision::Retry
+    } else {
+        VerifyTimeoutDecision::Reset
+    }
+}
+
 /// Decide phase-1 state from one screen snapshot. Ownership checks intentionally
 /// precede the deadline so a complete render observed at the boundary succeeds.
 fn phase1_decision(
@@ -1121,8 +1239,12 @@ const MAX_ENTER_ATTEMPTS: u32 = 3;
 /// - `WaitTextRender`: confirms injected text appeared in the prompt, sends Enter on match
 /// - `WaitTextClear`: verifies prompt cleared after Enter, retries Enter on timeout
 /// - `VerifyCursor`: waits for hook-side cursor advance (falls back to has_pending==false)
+/// - `WakeUnacknowledged`: Claude accepted the wake but its hook did not consume
+///   pending messages; automatic reinjection stays latched until hook-side
+///   progress, a subsequent session-switcher cycle, or a process restart
 ///
-/// Failed verification returns to `Pending`; success goes to `Idle` or `Pending` (if more queued).
+/// Non-Claude failed verification returns to `Pending`; success goes to `Idle`
+/// or `Pending` (if more queued).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
     Idle,
@@ -1130,6 +1252,7 @@ enum State {
     WaitTextRender,
     WaitTextClear,
     VerifyCursor,
+    WakeUnacknowledged,
 }
 
 /// Run the delivery loop — surfaces out-of-band hcom messages into the tool's
@@ -1153,6 +1276,7 @@ pub fn run_delivery_loop(
     config: &ToolConfig,
     shared_name: Option<Arc<std::sync::RwLock<String>>>,
     shared_status: Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: Option<TitleWake>,
 ) {
     // Resolve authoritative instance name from process binding.
     // The instance_name parameter is a fallback - the binding is the source of truth
@@ -1258,6 +1382,7 @@ pub fn run_delivery_loop(
                 current_status: &mut current_status,
                 shared_name: &shared_name,
                 shared_status: &shared_status,
+                title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
@@ -1353,6 +1478,7 @@ pub fn run_delivery_loop(
                 current_status: &mut current_status,
                 shared_name: &shared_name,
                 shared_status: &shared_status,
+                title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
@@ -1476,7 +1602,7 @@ pub fn run_delivery_loop(
                         log_info(
                             "native",
                             "delivery.gate_pass",
-                            &format!("Gate passed, injecting to port {}", state.inject_port),
+                            &gate_pass_diagnostics(db, &current_name, state, is_idle),
                         );
 
                         // Snapshot cursor before injection
@@ -2061,70 +2187,151 @@ pub fn run_delivery_loop(
 
                     if elapsed > VERIFY_TIMEOUT {
                         inject_attempt += 1;
+                        let has_pending = db.has_pending(&current_name);
+                        let parsed_tool = Tool::from_str(&config.tool).ok();
+                        let decision =
+                            verify_timeout_decision(parsed_tool, has_pending, inject_attempt);
                         log_warn(
                             "native",
                             "delivery.verify_timeout",
                             &format!(
-                                "Cursor verify timeout (before={}, current={}, inject_attempt={})",
-                                cursor_before, current_cursor, inject_attempt
+                                "Cursor verify timeout (before={}, current={}, inject_attempt={}, decision={:?})",
+                                cursor_before, current_cursor, inject_attempt, decision
                             ),
                         );
 
-                        if inject_attempt < 3 {
-                            // Retry
-                            log_info(
-                                "native",
-                                "delivery.retry",
-                                &format!("Retrying delivery (inject_attempt={})", inject_attempt),
-                            );
-                            delivery_state = State::Pending;
-                            attempt += 1;
-                            continue;
-                        }
-
-                        // Cursor advance is the primary proof, but "no pending rows"
-                        // is also sufficient — avoids wedging when hook delivery
-                        // succeeded but cursor bookkeeping didn't advance.
-                        if !db.has_pending(&current_name) {
-                            // Success (cursor tracking issue but delivery worked)
-                            // Clear gate block status
-                            if !last_block_context.is_empty() {
-                                if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                        match decision {
+                            VerifyTimeoutDecision::DeliveredWithoutCursor => {
+                                // Cursor advance is the primary proof, but "no
+                                // pending rows" is also sufficient — avoids
+                                // wedging when hook delivery succeeded but
+                                // cursor bookkeeping did not advance.
+                                if !last_block_context.is_empty() {
+                                    if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                                        log_warn(
+                                            "native",
+                                            "delivery.gate_clear_fail",
+                                            &format!("{}", e),
+                                        );
+                                    }
+                                    last_block_context.clear();
+                                }
+                                block_since = None;
+                                log_info(
+                                    "native",
+                                    "delivery.success_no_cursor",
+                                    "Messages gone despite cursor not advancing - delivery successful",
+                                );
+                                delivery_state = State::Idle;
+                                attempt = 0;
+                                inject_attempt = 0;
+                                continue;
+                            }
+                            VerifyTimeoutDecision::Retry => {
+                                log_info(
+                                    "native",
+                                    "delivery.retry",
+                                    &format!(
+                                        "Retrying delivery (inject_attempt={})",
+                                        inject_attempt
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                attempt += 1;
+                                continue;
+                            }
+                            VerifyTimeoutDecision::FastFail => {
+                                let context = "tui:wake-unacknowledged".to_string();
+                                let detail = "delivery paused; kill and resume this agent to retry";
+                                if let Err(e) = db.set_gate_status(&current_name, &context, detail)
+                                {
                                     log_warn(
                                         "native",
-                                        "delivery.gate_clear_fail",
+                                        "delivery.gate_status_fail",
                                         &format!("{}", e),
                                     );
                                 }
-                                last_block_context.clear();
+                                last_block_context = context;
+                                block_since = Some(Instant::now());
+                                log_warn(
+                                    "native",
+                                    "delivery.wake_unacknowledged",
+                                    &format!(
+                                        "Claude wake was not acknowledged for {}; leaving messages pending and stopping automatic retries",
+                                        current_name
+                                    ),
+                                );
+                                delivery_state = State::WakeUnacknowledged;
+                                attempt = 0;
+                                continue;
                             }
-                            block_since = None;
-
-                            log_info(
-                                "native",
-                                "delivery.success_no_cursor",
-                                "Messages gone despite cursor not advancing - delivery successful",
-                            );
-                            delivery_state = State::Idle;
-                            attempt = 0;
-                            inject_attempt = 0;
-                            continue;
+                            VerifyTimeoutDecision::Reset => {
+                                log_warn(
+                                    "native",
+                                    "delivery.failed",
+                                    &format!(
+                                        "Delivery failed after {} attempts, resetting",
+                                        inject_attempt
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                attempt = 0;
+                            }
                         }
-
-                        // Delivery failed - reset and wait
-                        log_warn(
-                            "native",
-                            "delivery.failed",
-                            &format!(
-                                "Delivery failed after {} attempts, resetting",
-                                inject_attempt
-                            ),
-                        );
-                        delivery_state = State::Pending;
-                        attempt = 0;
                     }
 
                     std::thread::sleep(Duration::from_millis(10));
+                }
+
+                State::WakeUnacknowledged => {
+                    // Keep the delivery loop and its endpoints alive, but do not
+                    // submit another prompt. A valid hook from the bound Claude
+                    // session consumes the pending rows and/or advances the
+                    // cursor, which safely rearms delivery for anything newer.
+                    notify.wait(IDLE_WAIT);
+                    if !running.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    db.reconnect_if_stale();
+                    if let Err(e) = db.update_heartbeat(&current_name) {
+                        log_warn(
+                            "native",
+                            "delivery.heartbeat_fail",
+                            &format!("Failed to update heartbeat: {}", e),
+                        );
+                    }
+                    if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
+                        log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
+                    }
+                    if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
+                        log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+                    }
+
+                    let current_cursor = db.get_cursor(&current_name);
+                    let has_pending = db.has_pending(&current_name);
+                    if current_cursor > cursor_before || !has_pending {
+                        if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                            log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
+                        }
+                        last_block_context.clear();
+                        block_since = None;
+                        attempt = 0;
+                        inject_attempt = 0;
+                        delivery_state = if has_pending {
+                            State::Pending
+                        } else {
+                            State::Idle
+                        };
+                        log_info(
+                            "native",
+                            "delivery.wake_rearmed",
+                            &format!(
+                                "Claude delivery rearmed for {} (cursor {} -> {}, pending={})",
+                                current_name, cursor_before, current_cursor, has_pending
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -2147,7 +2354,10 @@ pub fn run_delivery_loop(
 
     let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
 
-    if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
+    if matches!(
+        Tool::from_str(&config.tool),
+        Ok(Tool::Antigravity | Tool::Omp)
+    ) {
         antigravity::cleanup_antigravity_pty_exit(db, &current_name, &process_id, owns_instance);
     } else {
         cleanup_pty_exit_default(db, &current_name, &process_id, owns_instance);
@@ -2227,6 +2437,25 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
     }
 }
 
+/// Log why PTY exit cleanup was skipped when this thread no longer owns the instance.
+pub(crate) fn log_pty_cleanup_skipped(db: &HcomDb, current_name: &str) {
+    let reason = if db
+        .get_status(current_name)
+        .ok()
+        .flatten()
+        .is_some_and(|(status, _)| status == ST_INACTIVE)
+    {
+        "instance inactive (soft-finalize); process binding cleared or reassigned"
+    } else {
+        "name reassigned to new process"
+    };
+    log_info(
+        "native",
+        "delivery.cleanup_skipped",
+        &format!("Skipping instance cleanup for {current_name} — {reason}"),
+    );
+}
+
 fn cleanup_pty_exit_default(
     db: &mut HcomDb,
     current_name: &str,
@@ -2236,14 +2465,7 @@ fn cleanup_pty_exit_default(
     if owns_instance {
         cleanup_deleted_instance(db, current_name);
     } else {
-        log_info(
-            "native",
-            "delivery.cleanup_skipped",
-            &format!(
-                "Skipping instance cleanup for {} — name reassigned to new process",
-                current_name
-            ),
-        );
+        log_pty_cleanup_skipped(db, current_name);
     }
 
     if !process_id.is_empty()
@@ -2280,7 +2502,58 @@ mod tests {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            nav_overlay: false,
         }
+    }
+
+    #[test]
+    fn status_refresh_repairs_codex_approval_cache_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('halo', 'codex', 'active', 'tool:Bash', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let shared_status = Arc::new(std::sync::RwLock::new(ST_BLOCKED.to_string()));
+        let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count_for_callback = wake_count.clone();
+        let title_wake: TitleWake = Arc::new(move || {
+            wake_count_for_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        // Codex approval detection updates the PTY-owned shared status directly.
+        // The delivery loop's private cache can therefore still say active when
+        // the approval clears and the database returns to active.
+        let mut current_status = ST_ACTIVE.to_string();
+
+        refresh_status_and_wake(
+            &db,
+            "halo",
+            &mut current_status,
+            &Some(shared_status.clone()),
+            &Some(title_wake.clone()),
+        );
+
+        assert_eq!(current_status, ST_ACTIVE);
+        assert_eq!(*shared_status.read().unwrap(), ST_ACTIVE);
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+
+        // A context/detail-only status event does not change the title icon and
+        // must not create redundant proxy wakeups.
+        refresh_status_and_wake(
+            &db,
+            "halo",
+            &mut current_status,
+            &Some(shared_status),
+            &Some(title_wake),
+        );
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2321,6 +2594,31 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn soft_stopped_instance_survives_pty_exit_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id)
+                 VALUES ('luna', 'omp', 'inactive', 'exit:turn_end', 0, 0, 'sid-soft')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("pid-soft", "sid-soft", "luna")
+            .unwrap();
+
+        antigravity::cleanup_antigravity_pty_exit(&mut db, "luna", "pid-soft", true);
+
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+        assert_eq!(
+            db.get_status("luna").unwrap().map(|(s, _)| s),
+            Some(ST_INACTIVE.to_string())
+        );
     }
 
     // ---- phase-1 ownership tests ----
@@ -2385,6 +2683,34 @@ mod tests {
                 Duration::from_millis(501),
             ),
             Phase1Decision::MixedPrompt,
+        );
+    }
+
+    #[test]
+    fn claude_fast_fails_after_first_unacknowledged_wake() {
+        assert_eq!(
+            verify_timeout_decision(Some(Tool::Claude), true, 1),
+            VerifyTimeoutDecision::FastFail
+        );
+    }
+
+    #[test]
+    fn claude_accepts_consumed_queue_without_cursor_advance() {
+        assert_eq!(
+            verify_timeout_decision(Some(Tool::Claude), false, 1),
+            VerifyTimeoutDecision::DeliveredWithoutCursor
+        );
+    }
+
+    #[test]
+    fn non_claude_keeps_existing_verify_retry_contract() {
+        assert_eq!(
+            verify_timeout_decision(Some(Tool::Codex), true, 1),
+            VerifyTimeoutDecision::Retry
+        );
+        assert_eq!(
+            verify_timeout_decision(Some(Tool::Codex), true, 3),
+            VerifyTimeoutDecision::Reset
         );
     }
 
@@ -2476,6 +2802,20 @@ mod tests {
         let result = evaluate_gate(&config, &state, true);
         assert!(!result.safe);
         assert_eq!(result.reason, "user_active");
+    }
+
+    #[test]
+    fn gate_blocks_while_nav_overlay_open() {
+        // A Claude nav overlay (subagent view or session switcher) is focused:
+        // the box-emptiness checks would otherwise scrape the overlay's (empty)
+        // input box and pass, landing the wake trigger in the wrong box.
+        let config = ToolConfig::claude();
+        let mut screen = safe_screen(); // ready + prompt_empty: would pass otherwise
+        screen.nav_overlay = true;
+        let state = make_state(screen, 500);
+        let result = evaluate_gate(&config, &state, true);
+        assert!(!result.safe);
+        assert_eq!(result.reason, "nav_overlay");
     }
 
     #[test]
@@ -2711,6 +3051,10 @@ mod tests {
         assert_eq!(
             gate_block_detail("submit_settle"),
             "waiting for prompt submit to settle"
+        );
+        assert_eq!(
+            gate_block_detail("nav_overlay"),
+            "waiting for subagent nav / session switcher to close"
         );
         assert_eq!(gate_block_detail("unknown"), "blocked");
     }

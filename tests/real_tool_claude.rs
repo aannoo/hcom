@@ -136,18 +136,31 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
     );
     let name = launched_names[0].clone();
 
+    // Gate on the PTY proxy actually being up, not on `process_bound`: the
+    // launcher writes that binding before it spawns anything, so waiting on it
+    // always passes instantly and a stalled launch chain would instead surface
+    // 90s later inside `drive_startup`, looking like Claude had hung. The
+    // registered inject endpoint (`hcom term` exiting 0) is the first state that
+    // only exists once `hcom pty` is running, and polling `term` — rather than
+    // `list` — avoids finalizing the still-unbound placeholder as
+    // `launch_failed`. See `real_tool::wait_pty_proxy_up` for both hazards.
+    let launched = h
+        .instance_json(&name)
+        .expect("list launched Claude")
+        .expect("launched Claude present");
+    assert!(
+        launched
+            .get("process_bound")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "launcher did not register a process binding for {name}: {launched}"
+    );
     h.eventually(
-        "Claude process-bound launch",
-        Duration::from_secs(40),
+        "Claude PTY proxy up (inject endpoint registered)",
+        Duration::from_secs(90),
         || {
-            let Some(instance) = h.instance_json(&name)? else {
-                return Ok(None);
-            };
-            Ok(instance
-                .get("process_bound")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                .then_some(()))
+            let (code, _stdout, _stderr) = h.run(["term", &name]);
+            Ok((code == 0).then_some(()))
         },
     );
     // Clear the onboarding/trust gate (no bypass-mode warning in default mode).

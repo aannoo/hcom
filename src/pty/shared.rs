@@ -82,6 +82,12 @@ pub(super) fn update_delivery_state(
         }
         state.prompt_empty = new_prompt_empty;
         state.input_text = input_text;
+        // Claude only: defer injection while a nav overlay is focused (subagent
+        // navigator or `←` session switcher) — the wake trigger would land in the
+        // overlay's shared-PTY input box, not the session's root prompt.
+        state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
+            && (screen.is_claude_subagent_nav_visible()
+                || screen.is_claude_session_switcher_visible());
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {
@@ -313,6 +319,7 @@ pub(super) fn start_delivery_thread(
     notify_port: Arc<AtomicU16>,
     current_name: Arc<RwLock<String>>,
     current_status: Arc<RwLock<String>>,
+    title_wake: Option<crate::delivery::TitleWake>,
 ) -> Result<DeliveryStart> {
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
@@ -423,6 +430,7 @@ pub(super) fn start_delivery_thread(
             &config,
             Some(current_name),
             Some(current_status),
+            title_wake,
         );
 
         log_info(
@@ -570,8 +578,29 @@ pub(super) fn finalize_launch_failure_after_exit(
 }
 
 /// Build the OSC 1/2 title-set escape for `name`/`status` under `tool_name`.
-pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> String {
-    let title = crate::shared::format_pane_title(status, name, tool_name);
+///
+/// - [`TitleMode::Label`] → `◉ luna [claude]` (hcom's status label only).
+/// - [`TitleMode::Combined`] → `◉ luna - ⠋ Working` — hcom's `{icon} name` plus
+///   the wrapped tool's live title after ` - ` (dropping the `[tool]` tag). The
+///   child text is already sanitized upstream by `ScreenTracker` (control/escape
+///   bytes stripped, whitespace collapsed, length bounded) so it cannot break
+///   out of the OSC we wrap it in.
+///
+/// [`TitleMode::Off`] never reaches here — the caller skips writing entirely and
+/// lets the tool's own title pass through — so it falls back to the label.
+pub(super) fn build_title_escape(
+    name: &str,
+    status: &str,
+    tool_name: &str,
+    mode: crate::shared::TitleMode,
+    child_title: Option<&str>,
+) -> String {
+    let title = match mode {
+        crate::shared::TitleMode::Combined => {
+            crate::shared::format_pane_title_combined(status, name, child_title)
+        }
+        _ => crate::shared::format_pane_title(status, name, tool_name),
+    };
     format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
 }
 
@@ -602,19 +631,34 @@ pub(super) fn build_early_launch_context() -> String {
         ctx.insert("kitty_listen_on".into(), Value::String(listen));
     }
 
-    // Capture pane_id from terminal env vars for same-window launches.
-    let pane_id_vars: &[&str] = &[
-        "WEZTERM_PANE",
-        "TMUX_PANE",
-        "KITTY_WINDOW_ID",
-        "ZELLIJ_PANE_ID",
-    ];
-    for &var in pane_id_vars {
-        if let Ok(val) = std::env::var(var)
-            && !val.is_empty()
-        {
-            ctx.insert("pane_id".into(), Value::String(val));
-            break;
+    // A selected preset defines the pane-ID namespace. Never pair its close
+    // command with an ID inherited from another backend.
+    let launched_preset = std::env::var("HCOM_LAUNCHED_PRESET")
+        .ok()
+        .filter(|preset| !preset.is_empty());
+    if let Some(preset) = launched_preset.as_deref()
+        && let Some(var) = crate::config::get_merged_preset_pane_id_env(preset)
+        && let Ok(val) = std::env::var(&var)
+        && !val.is_empty()
+    {
+        ctx.insert("pane_id".into(), Value::String(val));
+    }
+
+    // Legacy fallback for launches that predate effective-preset propagation.
+    if launched_preset.is_none() {
+        let pane_id_vars: &[&str] = &[
+            "WEZTERM_PANE",
+            "TMUX_PANE",
+            "KITTY_WINDOW_ID",
+            "ZELLIJ_PANE_ID",
+        ];
+        for &var in pane_id_vars {
+            if let Ok(val) = std::env::var(var)
+                && !val.is_empty()
+            {
+                ctx.insert("pane_id".into(), Value::String(val));
+                break;
+            }
         }
     }
 
@@ -734,6 +778,10 @@ pub(super) struct OutputModeFilter {
     buf: Vec<u8>,
     dsr_seen: bool,
     pending_utf8: u8,
+    /// When true (title_mode `off`), the tool's own OSC 0/1/2 titles are passed
+    /// through to the terminal instead of stripped. DSR/ground-state tracking is
+    /// unaffected. Default false preserves the strip-and-override behavior.
+    passthrough_titles: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -755,6 +803,12 @@ enum FilterState {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 impl OutputModeFilter {
+    /// Pass the tool's own OSC 0/1/2 titles through instead of stripping them
+    /// (title_mode `off`). DSR/ground-state tracking is unaffected.
+    pub(super) fn set_passthrough_titles(&mut self, passthrough: bool) {
+        self.passthrough_titles = passthrough;
+    }
+
     pub(super) fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
         let output_start = out.len();
         for &b in input {
@@ -848,11 +902,16 @@ impl OutputModeFilter {
                 FilterState::OscDigit(_digit) => {
                     self.buf.push(b);
                     if b == b';' {
-                        // Confirmed OSC 0/1/2: discard the complete title,
-                        // including a terminator that may arrive in a later read.
+                        // Confirmed OSC 0/1/2: discard the complete title
+                        // (including a terminator that may arrive in a later
+                        // read) — unless title_mode `off`, where we pass the
+                        // tool's own title through untouched.
+                        if self.passthrough_titles {
+                            out.extend_from_slice(&self.buf);
+                        }
                         self.buf.clear();
                         self.state = FilterState::StringSeq {
-                            strip: true,
+                            strip: !self.passthrough_titles,
                             saw_esc: false,
                             discarded: 0,
                         };
@@ -1115,6 +1174,18 @@ mod tests {
     }
 
     #[test]
+    fn output_mode_filter_passthrough_keeps_tool_title() {
+        // title_mode `off`: the tool's own OSC 0/2 title must reach the terminal
+        // intact, including across a read split, while DSR tracking still works.
+        let mut f = OutputModeFilter::default();
+        f.set_passthrough_titles(true);
+        let mut out = Vec::new();
+        f.filter(b"before\x1b]2;Clau", &mut out);
+        f.filter(b"de Code\x07after", &mut out);
+        assert_eq!(out, b"before\x1b]2;Claude Code\x07after".to_vec());
+    }
+
+    #[test]
     fn output_mode_filter_preserves_non_title_osc_and_tracks_its_boundary() {
         let chunks: &[&[u8]] = &[b"\x1b]8;;https://exam", b"ple.test\x1b\\link"];
         assert_eq!(filter_modes(chunks), chunks.concat());
@@ -1176,9 +1247,10 @@ mod tests {
     }
 
     #[test]
-    fn build_title_escape_formats_osc_1_and_2() {
-        // listening icon is the green dot; assert exact OSC framing.
-        let esc = build_title_escape("alpha", "listening", "claude");
+    fn build_title_escape_label_mode_formats_osc_1_and_2() {
+        use crate::shared::TitleMode;
+        // Label mode keeps the [tool] tag; assert exact OSC framing.
+        let esc = build_title_escape("alpha", "listening", "claude", TitleMode::Label, None);
         let icon = status_icon("listening");
         let title = format!("{} alpha [claude]", icon);
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
@@ -1189,10 +1261,38 @@ mod tests {
 
     #[test]
     fn build_title_escape_uses_status_icon() {
+        use crate::shared::TitleMode;
         // Different statuses must change the embedded icon.
-        let listening = build_title_escape("a", "listening", "claude");
-        let blocked = build_title_escape("a", "blocked", "claude");
+        let listening = build_title_escape("a", "listening", "claude", TitleMode::Label, None);
+        let blocked = build_title_escape("a", "blocked", "claude", TitleMode::Label, None);
         assert_ne!(listening, blocked);
+    }
+
+    #[test]
+    fn build_title_escape_combined_appends_child_and_drops_tool() {
+        use crate::shared::TitleMode;
+        // Combined mode: `{icon} name - {child}`, no `[tool]` tag.
+        let icon = status_icon("active");
+        let esc = build_title_escape(
+            "luna",
+            "active",
+            "codex",
+            TitleMode::Combined,
+            Some("⠋ Working"),
+        );
+        let title = format!("{} luna - ⠋ Working", icon);
+        assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
+        assert!(!esc.contains("[codex]"), "combined mode drops the tool tag");
+    }
+
+    #[test]
+    fn build_title_escape_combined_without_child_is_icon_name() {
+        use crate::shared::TitleMode;
+        // No child title → just `{icon} name`, no dangling separator, no tag.
+        let icon = status_icon("active");
+        let esc = build_title_escape("luna", "active", "codex", TitleMode::Combined, None);
+        let title = format!("{} luna", icon);
+        assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
     }
 
     #[test]
@@ -1298,6 +1398,8 @@ mod tests {
             std::env::remove_var("TMUX_PANE");
             std::env::remove_var("KITTY_WINDOW_ID");
             std::env::remove_var("ZELLIJ_PANE_ID");
+            std::env::remove_var("HCOM_LAUNCHED_PRESET");
+            std::env::remove_var("HERDR_PANE_ID");
         }
     }
 
@@ -1355,5 +1457,36 @@ mod tests {
         clear_launch_context_env();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["pane_id"], "kitty-window-1");
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_preset_pane_id_env_wins_over_generic_vars() {
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("HCOM_LAUNCHED_PRESET", "herdr");
+            std::env::set_var("HERDR_PANE_ID", "w2:p1A");
+            std::env::set_var("WEZTERM_PANE", "0");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["pane_id"], "w2:p1A");
+    }
+
+    #[test]
+    #[serial]
+    fn build_early_launch_context_known_preset_rejects_foreign_fallback() {
+        clear_launch_context_env();
+        // SAFETY: test is #[serial].
+        unsafe {
+            std::env::set_var("HCOM_LAUNCHED_PRESET", "herdr");
+            std::env::set_var("WEZTERM_PANE", "4");
+        }
+        let json = build_early_launch_context();
+        clear_launch_context_env();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("pane_id").is_none());
     }
 }

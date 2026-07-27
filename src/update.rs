@@ -186,6 +186,22 @@ pub(crate) fn is_powershell_installer_command(cmd: &str) -> bool {
     cmd == WINDOWS_INSTALL_CMD
 }
 
+/// Prefer `pwsh` over `powershell`: Windows PowerShell 5.1's module load can
+/// fail on a polluted `PSModulePath` (nested shells, OneDrive redirects);
+/// `pwsh` isn't affected. Falls back to `powershell` if pwsh isn't installed.
+pub(crate) fn windows_installer_program() -> &'static str {
+    let pwsh_available = std::process::Command::new("pwsh")
+        .args(["-NoProfile", "-Command", "exit 0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if pwsh_available { "pwsh" } else { "powershell" }
+}
+
 /// Split a plain `program arg1 arg2 ...` command string into program + args.
 /// Only meant for the shell-free update commands `get_update_cmd()` returns
 /// (no quoting to worry about); not a general shell parser.
@@ -222,7 +238,10 @@ fn get_update_cmd_for_exe(exe: &Path) -> &'static str {
         return "uv tool upgrade hcom";
     }
 
-    // pip install inside a venv or directly in site-packages/dist-packages
+    // pip install inside a venv. Maturin's `bindings = "bin"` wheels put the
+    // executable in the environment's scripts directory, not site-packages,
+    // so arbitrary environment names are also covered by the metadata check
+    // below.
     if path_lower.contains("/site-packages/")
         || path_lower.contains("/dist-packages/")
         || path_lower.contains("/venv/")
@@ -231,9 +250,10 @@ fn get_update_cmd_for_exe(exe: &Path) -> &'static str {
         return "pip install -U hcom";
     }
 
-    // pip install --user with maturin `bindings = "bin"` puts the binary in
-    // ~/.local/bin, so the executable path alone doesn't reveal pip ownership.
-    if is_user_site_pip_install(&resolved) {
+    // A prefix-wide pip install puts the binary in <prefix>/bin and metadata
+    // below <prefix>/lib. This is the normal layout on Termux, where prefix is
+    // /data/data/com.termux/files/usr, and is also common for system Python.
+    if is_prefix_pip_install(&resolved) {
         return "pip install -U hcom";
     }
 
@@ -248,53 +268,71 @@ fn platform_installer_cmd() -> &'static str {
     }
 }
 
-// NOTE: only checks the Unix `~/.local/bin` + `~/.local/lib/pythonX.Y/site-packages`
-// layout. A Windows `pip install --user hcom` uses a different layout (e.g.
-// under `%APPDATA%\Python`), which this doesn't detect — such an install
-// would fall through to the curl-installer default on Windows. Not adding a
-// Windows branch here without being able to verify the actual path layout on
-// a real Windows/Python install; this is a known, low-risk gap (worst case:
-// `hcom update` on Windows suggests the wrong command for this one install
-// method, users can still update manually).
-fn is_user_site_pip_install(exe: &Path) -> bool {
-    let home = match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home),
-        None => return false,
-    };
-
-    let local_bin = home.join(".local/bin");
-    if !exe.starts_with(&local_bin) {
-        return false;
-    }
-
-    let local_lib = home.join(".local/lib");
-    let Ok(entries) = fs::read_dir(local_lib) else {
+fn record_owns_exe(site_dir: &Path, dist_info: &Path, exe: &Path) -> bool {
+    let Ok(record) = fs::read_to_string(dist_info.join("RECORD")) else {
         return false;
     };
 
-    for entry in entries.flatten() {
-        let py_dir = entry.path();
-        if !py_dir.is_dir() {
-            continue;
-        }
+    record.lines().any(|line| {
+        let Some(record_path) = line.split(',').next() else {
+            return false;
+        };
+        let candidate = site_dir.join(record_path);
+        matches!(
+            (std::fs::canonicalize(candidate), std::fs::canonicalize(exe)),
+            (Ok(candidate), Ok(exe)) if candidate == exe
+        )
+    })
+}
 
-        for pkg_dir_name in ["site-packages", "dist-packages"] {
-            let pkg_dir = py_dir.join(pkg_dir_name);
-            let Ok(pkg_entries) = fs::read_dir(pkg_dir) else {
-                continue;
-            };
+fn site_dir_has_hcom_exe(site_dir: &Path, exe: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(site_dir) else {
+        return false;
+    };
 
-            if pkg_entries.flatten().any(|pkg| {
-                pkg.file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("hcom-") && name.ends_with(".dist-info"))
-            }) {
-                return true;
-            }
-        }
+    entries.flatten().any(|pkg| {
+        let is_hcom_dist_info = pkg
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("hcom-") && name.ends_with(".dist-info"));
+        is_hcom_dist_info && pkg.path().is_dir() && record_owns_exe(site_dir, &pkg.path(), exe)
+    })
+}
+
+fn python_lib_has_hcom_exe(lib_dir: &Path, exe: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(lib_dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let python_dir = entry.path();
+        python_dir.is_dir()
+            && ["site-packages", "dist-packages"]
+                .iter()
+                .any(|name| site_dir_has_hcom_exe(&python_dir.join(name), exe))
+    })
+}
+
+fn is_prefix_pip_install(exe: &Path) -> bool {
+    let Some(scripts_dir) = exe.parent() else {
+        return false;
+    };
+    let Some(prefix) = scripts_dir.parent() else {
+        return false;
+    };
+
+    let scripts_dir_name = scripts_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if scripts_dir_name != "bin" && !scripts_dir_name.eq_ignore_ascii_case("scripts") {
+        return false;
     }
 
-    false
+    [prefix.join("lib"), prefix.join("lib64")]
+        .iter()
+        .any(|lib_dir| python_lib_has_hcom_exe(lib_dir, exe))
+        || site_dir_has_hcom_exe(&prefix.join("Lib/site-packages"), exe)
 }
 
 /// Check for updates (once daily cached). Returns (latest_version, update_cmd) or None.
@@ -349,7 +387,6 @@ pub fn get_update_notice() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn test_parse_version() {
@@ -422,46 +459,42 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn test_user_site_pip_detection() {
+    fn test_prefix_pip_detection_matches_termux_layout() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let exe = home.join(".local/bin/hcom");
-        let dist_info = home.join(".local/lib/python3.13/site-packages/hcom-0.7.8.dist-info");
+        let prefix = tmp.path().join("data/data/com.termux/files/usr");
+        let exe = prefix.join("bin/hcom");
+        let dist_info = prefix.join("lib/python3.14/site-packages/hcom-0.7.23.dist-info");
 
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&dist_info).unwrap();
         std::fs::write(&exe, b"binary").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "../../../bin/hcom,sha256=test,6\n",
+        )
+        .unwrap();
 
-        let old_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        assert!(is_user_site_pip_install(&exe));
-        match old_home {
-            Some(val) => unsafe { std::env::set_var("HOME", val) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        assert_eq!(get_update_cmd_for_exe(&exe), "pip install -U hcom");
     }
 
     #[test]
-    #[serial]
-    fn test_user_site_pip_detection_ignores_plain_local_bin() {
+    fn test_prefix_pip_detection_ignores_stale_dist_info() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let exe = home.join(".local/bin/hcom");
+        let prefix = tmp.path().join("usr");
+        let exe = prefix.join("bin/hcom");
+        let other_exe = prefix.join("bin/other-hcom");
+        let dist_info = prefix.join("lib/python3.14/site-packages/hcom-0.7.23.dist-info");
 
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&dist_info).unwrap();
         std::fs::write(&exe, b"binary").unwrap();
+        std::fs::write(&other_exe, b"other binary").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "../../../bin/other-hcom,sha256=test,12\n",
+        )
+        .unwrap();
 
-        let old_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        assert!(!is_user_site_pip_install(&exe));
-        match old_home {
-            Some(val) => unsafe { std::env::set_var("HOME", val) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        assert_eq!(get_update_cmd_for_exe(&exe), platform_installer_cmd());
     }
 }

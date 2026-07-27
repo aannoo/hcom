@@ -422,6 +422,14 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
     )
 }
 
+/// `hcom update` must run from the binary the user invoked. Re-executing a
+/// configured dev-root binary would compare the checkout version and inspect
+/// the checkout executable path instead of updating the installed binary.
+fn is_update_invocation(argv: &[String]) -> bool {
+    let (positional, _, _) = extract_global_flags_full(argv);
+    positional.first().is_some_and(|arg| arg == "update")
+}
+
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
     if let Ok(r) = env::var("HCOM_DEV_ROOT")
         && !r.is_empty()
@@ -493,8 +501,9 @@ pub fn dispatch() -> anyhow::Result<()> {
     let argv = &args[1..]; // strip binary name
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
-    // trap the user — the invoked binary owns its own dev_root setting.
-    if !is_config_dev_root_invocation(argv) {
+    // trap the user. Also keep `update` on the invoked (installed) binary;
+    // otherwise the checkout's version and path would drive update decisions.
+    if !is_config_dev_root_invocation(argv) && !is_update_invocation(argv) {
         maybe_reexec_dev_root();
     }
 
@@ -665,6 +674,7 @@ fn launch_new_terminal() -> i32 {
         false, // not run_here (open new window)
         None,  // default terminal
         inside_ai,
+        None, // not launching a specific tool (hcom TUI itself)
     ) {
         Ok((crate::terminal::LaunchResult::Success, _)) => 0,
         Ok((crate::terminal::LaunchResult::Failed(msg), _)) => {
@@ -762,20 +772,6 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     if let Err(e) = crate::cli_context::check_identity_gate(cmd, &ctx, has_from_flag, is_inside_ai)
     {
         eprintln!("Error: {e}");
-        return 1;
-    }
-
-    // Subagent context: require explicit --name for identity-gated commands inside Claude
-    if crate::identity::requires_identity(cmd)
-        && ctx.explicit_name.is_none()
-        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        && let Some(ref identity) = ctx.identity
-        && crate::instances::in_subagent_context(&db, &identity.name)
-    {
-        eprintln!(
-            "Error: Subagent context active - explicit identity required\n\
-                     Use: hcom {cmd} --name parent (for parent) or --name <uuid> (for subagent)"
-        );
         return 1;
     }
 
@@ -996,6 +992,21 @@ mod tests {
         ])));
         assert!(!is_config_dev_root_invocation(&sv(&["list"])));
         assert!(!is_config_dev_root_invocation(&[]));
+    }
+
+    #[test]
+    fn is_update_invocation_matches_expected_shapes() {
+        assert!(is_update_invocation(&sv(&["update"])));
+        assert!(is_update_invocation(&sv(&["update", "--check"])));
+        assert!(is_update_invocation(&sv(&["--go", "update"])));
+        assert!(is_update_invocation(&sv(&[
+            "--name", "lovi", "update", "--check"
+        ])));
+        assert!(!is_update_invocation(&sv(&["config", "update"])));
+        assert!(!is_update_invocation(&sv(&[
+            "send", "@lovi", "--", "update"
+        ])));
+        assert!(!is_update_invocation(&[]));
     }
 
     // ── resolve_action tests ────────────────────────────────────────────

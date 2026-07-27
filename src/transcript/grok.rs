@@ -98,6 +98,9 @@ fn tool_from_call(update: &Value) -> Option<ToolUse> {
         is_error,
         file,
         command,
+        // Grok updates.jsonl rarely carries tool stdout on the same event; leave empty
+        // unless a future schema starts embedding it (other parsers use capture_tool_output).
+        output: None,
     })
 }
 

@@ -6,6 +6,7 @@
 //! - `maybe_deliver_pending_messages` — append unread for codex/adhoc
 //! - `format_messages_human` — human-readable message formatting
 
+use crate::claude_actor;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle as lifecycle;
@@ -38,7 +39,14 @@ pub fn build_ctx_for_command(
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
 ) -> Result<CommandContext, HcomError> {
-    let identity = if let Some(name) = explicit_name {
+    let verified_actor = claude_actor::resolve_env_actor(db)?;
+    if let (Some(actor), Some(name)) = (verified_actor.as_ref(), explicit_name) {
+        claude_actor::ensure_explicit_matches(db, actor, name)?;
+    }
+
+    let identity = if let Some(actor) = verified_actor {
+        Some(actor)
+    } else if let Some(name) = explicit_name {
         if cmd != Some("start") {
             // Explicit --name: propagate typed error so router can pattern-match.
             Some(identity::resolve_identity(
@@ -116,7 +124,7 @@ pub fn check_identity_gate(
 ///
 /// Claude/Gemini main instances have PreToolUse hooks that set active:tool:*.
 /// These instance types need explicit status updates here:
-/// - Subagent: has Claude hooks but not for hcom Bash commands
+/// - Subagent: status is also updated directly for manual/non-hook invocations
 /// - Codex: has notify hook (turn-end) but no pre-tool hook
 /// - Adhoc: no hooks at all
 ///

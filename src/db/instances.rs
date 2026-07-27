@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
-use super::HcomDb;
+use super::{HcomDb, chrono_now_iso, subscriptions};
 use crate::shared::constants::ST_LISTENING;
 use crate::shared::time::now_epoch_i64;
 
@@ -28,6 +28,7 @@ pub struct InstanceRow {
     pub last_stop: i64,
     pub status: String,
     pub status_time: i64,
+    pub last_seen: i64,
     pub status_context: String,
     pub status_detail: String,
     pub directory: String,
@@ -47,7 +48,6 @@ pub struct InstanceRow {
     pub terminal_preset_effective: Option<String>,
     pub launch_context: Option<String>,
     pub name_announced: i64,
-    pub running_tasks: Option<String>,
     pub idle_since: Option<String>,
 }
 
@@ -76,6 +76,7 @@ impl InstanceRow {
                 .get::<_, Option<String>>("status")?
                 .unwrap_or_else(|| "inactive".into()),
             status_time: row.get::<_, Option<i64>>("status_time")?.unwrap_or(0),
+            last_seen: row.get::<_, Option<i64>>("last_seen")?.unwrap_or(0),
             status_context: row
                 .get::<_, Option<String>>("status_context")?
                 .unwrap_or_default(),
@@ -119,9 +120,6 @@ impl InstanceRow {
                 .get::<_, Option<String>>("launch_context")?
                 .filter(|s| !s.is_empty()),
             name_announced: row.get::<_, Option<i64>>("name_announced")?.unwrap_or(0),
-            running_tasks: row
-                .get::<_, Option<String>>("running_tasks")?
-                .filter(|s| !s.is_empty()),
             idle_since: row
                 .get::<_, Option<String>>("idle_since")?
                 .filter(|s| !s.is_empty()),
@@ -133,9 +131,9 @@ impl InstanceRow {
 /// Column list for instance SELECT queries. Must match instance_row_to_json index order.
 pub(super) const INSTANCE_COLUMNS: &str =
     "name, session_id, parent_session_id, parent_name, tag, last_event_id,
-     status, status_time, status_context, status_detail, last_stop, directory,
+     status, status_time, last_seen, status_context, status_detail, last_stop, directory,
      created_at, transcript_path, tcp_mode, wait_timeout, background,
-     background_log_file, name_announced, agent_id, running_tasks,
+     background_log_file, name_announced, agent_id,
      origin_device_id, hints, subagent_timeout, tool, launch_args,
      terminal_preset_requested, terminal_preset_effective,
      idle_since, pid, launch_context";
@@ -397,6 +395,75 @@ impl HcomDb {
         Ok(rows > 0)
     }
 
+    /// Atomically publish a stopped event and remove its live instance state.
+    ///
+    /// The instance delete is the ownership CAS. Cleanup and event insertion
+    /// share its transaction, so an error restores the row for a later retry.
+    pub fn finalize_instance_stop(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
+        let timestamp = chrono_now_iso();
+        let data = serde_json::to_string(event_data)?;
+        let mut event_id = None;
+
+        let won = self.with_immediate_transaction(|tx| {
+            let deleted = tx.execute(
+                "DELETE FROM instances
+                 WHERE name = ? AND created_at = ?
+                   AND session_id IS ? AND agent_id IS ?",
+                params![name, created_at, session_id, agent_id],
+            )?;
+            if deleted == 0 {
+                return Ok(false);
+            }
+
+            if let Some(session_id) = session_id {
+                tx.execute(
+                    "DELETE FROM session_bindings WHERE session_id = ?",
+                    params![session_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM process_bindings WHERE session_id = ?",
+                    params![session_id],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM notify_endpoints WHERE instance = ?",
+                params![name],
+            )?;
+            tx.execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?",
+                params![name],
+            )?;
+            tx.execute(
+                "DELETE FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.caller') = ?
+                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+                params![name],
+            )?;
+            tx.execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (?, 'life', ?, ?)",
+                params![timestamp, name, data],
+            )?;
+            event_id = Some(tx.last_insert_rowid());
+            Ok(true)
+        })?;
+
+        // Subscription notifications are best-effort external effects. Run
+        // them only after the stopped event and deletion are durable.
+        if let Some(event_id) = event_id {
+            subscriptions::process_logged_event(self, event_id, "life", name, event_data);
+        }
+        Ok(won)
+    }
+
     /// Check whether `name`'s *current* identity is a subagent slot.
     ///
     /// Classification rules, in order:
@@ -463,19 +530,19 @@ impl HcomDb {
             "last_event_id": row.get::<_, i64>(5).unwrap_or(0),
             "status": row.get::<_, String>(6).unwrap_or_default(),
             "status_time": row.get::<_, i64>(7).unwrap_or(0),
-            "status_context": row.get::<_, String>(8).unwrap_or_default(),
-            "status_detail": row.get::<_, String>(9).unwrap_or_default(),
-            "last_stop": row.get::<_, i64>(10).unwrap_or(0),
-            "directory": row.get::<_, Option<String>>(11).unwrap_or(None),
-            "created_at": row.get::<_, f64>(12).unwrap_or(0.0),
-            "transcript_path": row.get::<_, String>(13).unwrap_or_default(),
-            "tcp_mode": row.get::<_, i64>(14).unwrap_or(0),
-            "wait_timeout": row.get::<_, i64>(15).unwrap_or(86400),
-            "background": row.get::<_, i64>(16).unwrap_or(0),
-            "background_log_file": row.get::<_, String>(17).unwrap_or_default(),
-            "name_announced": row.get::<_, i64>(18).unwrap_or(0),
-            "agent_id": row.get::<_, Option<String>>(19).unwrap_or(None),
-            "running_tasks": row.get::<_, String>(20).unwrap_or_default(),
+            "last_seen": row.get::<_, i64>(8).unwrap_or(0),
+            "status_context": row.get::<_, String>(9).unwrap_or_default(),
+            "status_detail": row.get::<_, String>(10).unwrap_or_default(),
+            "last_stop": row.get::<_, i64>(11).unwrap_or(0),
+            "directory": row.get::<_, Option<String>>(12).unwrap_or(None),
+            "created_at": row.get::<_, f64>(13).unwrap_or(0.0),
+            "transcript_path": row.get::<_, String>(14).unwrap_or_default(),
+            "tcp_mode": row.get::<_, i64>(15).unwrap_or(0),
+            "wait_timeout": row.get::<_, i64>(16).unwrap_or(86400),
+            "background": row.get::<_, i64>(17).unwrap_or(0),
+            "background_log_file": row.get::<_, String>(18).unwrap_or_default(),
+            "name_announced": row.get::<_, i64>(19).unwrap_or(0),
+            "agent_id": row.get::<_, Option<String>>(20).unwrap_or(None),
             "origin_device_id": row.get::<_, String>(21).unwrap_or_default(),
             "hints": row.get::<_, String>(22).unwrap_or_default(),
             "subagent_timeout": row.get::<_, Option<i64>>(23).unwrap_or(None),
@@ -765,6 +832,7 @@ impl HcomDb {
             "last_stop",
             "status",
             "status_time",
+            "last_seen",
             "status_context",
             "status_detail",
             "directory",
@@ -782,7 +850,6 @@ impl HcomDb {
             "launch_args",
             "launch_context",
             "name_announced",
-            "running_tasks",
             "idle_since",
             "terminal_preset_requested",
             "terminal_preset_effective",

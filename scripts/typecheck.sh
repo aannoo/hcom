@@ -27,6 +27,8 @@ cd "$project_root"
 if [[ "${CI:-}" == "true" ]]; then
   npm ci --ignore-scripts
 else
-  npm install --ignore-scripts --prefer-offline
+  # CI enforces the pinned Node 22 runtime. Local typechecking can also run on a
+  # newer Node even when the user's global npm config enables engine-strict.
+  npm install --ignore-scripts --prefer-offline --engine-strict=false
 fi
 npm run typecheck

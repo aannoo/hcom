@@ -492,6 +492,24 @@ impl HcomDb {
         Ok(event_id)
     }
 
+    /// Diagnostic-only: `writer` field of the most recent "status" event
+    /// logged for an instance (set_status's `#[track_caller]` file:line).
+    pub fn last_status_writer(&self, instance: &str) -> Option<String> {
+        let data: String = self
+            .conn
+            .query_row(
+                "SELECT data FROM events WHERE instance = ? AND type = 'status' ORDER BY id DESC LIMIT 1",
+                params![instance],
+                |row| row.get(0),
+            )
+            .ok()?;
+        serde_json::from_str::<serde_json::Value>(&data)
+            .ok()?
+            .get("writer")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
     /// Get events since a given ID with optional filters.
     pub fn get_events_since(
         &self,

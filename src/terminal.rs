@@ -804,6 +804,30 @@ pub fn resolve_terminal_open_argv(preset_name: &str) -> Option<Vec<String>> {
     Some(open_argv)
 }
 
+/// Inject `--to <socket>` (after the `@`) for kitten commands launched outside
+/// kitty. Splices as separate argv elements — no shell quoting.
+///
+/// Matches `argv[0]`'s file_stem (not an exact string) because
+/// `resolve_terminal_open_argv` may have already rewritten `argv[0]` to
+/// kitten's absolute macOS app-bundle path when `kitten` isn't on PATH — a
+/// literal "kitten" check would miss that and silently skip the splice,
+/// leaving kitten without a socket to reach (it then falls back to
+/// controlling-tty discovery, which fails outright in tty-less contexts).
+fn splice_kitten_to_socket(argv: &mut Vec<String>, kitty_socket: &str) {
+    let is_kitten_cmd = argv
+        .first()
+        .and_then(|a| Path::new(a).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("kitten"));
+    if !kitty_socket.is_empty()
+        && !kitty_socket.starts_with("fd:")
+        && is_kitten_cmd
+        && argv.get(1).map(String::as_str) == Some("@")
+        && !argv.iter().any(|a| a == "--to")
+    {
+        argv.splice(2..2, ["--to".to_string(), kitty_socket.to_string()]);
+    }
+}
+
 /// Get terminal presets for current platform with availability status.
 pub fn get_available_presets() -> Vec<(String, bool)> {
     let mut result = vec![("default".to_string(), true)];
@@ -904,27 +928,15 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Resolve a human-readable tool name for the launch script title/banner,
-/// detecting from the command when not explicitly provided.
-fn launch_display_name<'a>(command_str: &str, tool_name: Option<&'a str>) -> &'a str {
-    tool_name.unwrap_or_else(|| {
-        let cmd_lower = command_str.to_lowercase();
-        if cmd_lower.contains("opencode") {
-            "OpenCode"
-        } else if cmd_lower.contains("kilo") {
-            "Kilo Code"
-        } else if cmd_lower.contains("cursor-agent") {
-            "Cursor Agent"
-        } else if cmd_lower.contains("gemini") {
-            "Gemini"
-        } else if cmd_lower.contains("codex") {
-            "Codex"
-        } else if cmd_lower.contains("claude") {
-            "Claude Code"
-        } else {
-            "hcom"
-        }
-    })
+/// Resolve a human-readable tool name for the launch script title/banner
+/// from the internal tool id (e.g. "cursor", "kilo"). Falls back to "hcom"
+/// when there's no tool id (plain `hcom` TUI launches) or it doesn't
+/// resolve to a known tool.
+fn launch_display_name(tool_id: Option<&str>) -> &'static str {
+    tool_id
+        .and_then(|id| id.parse::<crate::tool::Tool>().ok())
+        .map(|t| t.spec().label)
+        .unwrap_or("hcom")
 }
 
 /// Create a bash script for terminal launch.
@@ -936,10 +948,10 @@ pub fn create_bash_script(
     cwd: Option<&str>,
     command_str: &str,
     background: bool,
-    tool_name: Option<&str>,
+    tool_id: Option<&str>,
     opens_new_window: bool,
 ) -> Result<()> {
-    let tool_name = launch_display_name(command_str, tool_name);
+    let tool_name = launch_display_name(tool_id);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
 
@@ -1040,6 +1052,18 @@ pub fn create_bash_script(
     Ok(())
 }
 
+/// Flags for every PowerShell process hcom starts to run a generated script.
+///
+/// `-NoProfile` is the Windows counterpart of running the Unix launcher with
+/// plain `bash script.sh` — a non-interactive, non-login shell that reads no
+/// `.bashrc`/`.profile`. Without it, a user's PowerShell profile runs inside
+/// each agent launch: its banner output lands in the PTY stream the screen
+/// scraper reads, its PATH/location edits override what the generated script
+/// just set, and anything in it that waits on input blocks forever, because
+/// background launches attach stdin to NUL. It also skips profile and module
+/// analysis work on every launch.
+pub const POWERSHELL_SCRIPT_FLAGS: &[&str] = &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"];
+
 /// Quote a string as a PowerShell single-quoted literal (embedded `'` doubled).
 pub fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -1076,10 +1100,10 @@ pub fn create_powershell_script(
     cwd: Option<&str>,
     command_str: &str,
     background: bool,
-    tool_name: Option<&str>,
+    tool_id: Option<&str>,
     opens_new_window: bool,
 ) -> Result<()> {
-    let tool_name = launch_display_name(command_str, tool_name);
+    let tool_name = launch_display_name(tool_id);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
     // Windows PowerShell 5.1 decodes BOM-less scripts using the active ANSI
@@ -1842,6 +1866,7 @@ fn parse_herdr_pane_id(captured: &str) -> Option<String> {
 /// - `background=true`: Launch as background process, returns Background(log_file, pid)
 /// - `run_here=true`: Run in current terminal (blocking via execve)
 /// - Otherwise: New terminal window/tab/split
+#[allow(clippy::too_many_arguments)]
 pub fn launch_terminal(
     command: &str,
     env: &HashMap<String, String>,
@@ -1850,6 +1875,7 @@ pub fn launch_terminal(
     run_here: bool,
     terminal: Option<&str>,
     inside_ai_tool: bool,
+    tool_id: Option<&str>,
 ) -> Result<(LaunchResult, String)> {
     let config_and_instance_env = env.clone();
 
@@ -1904,7 +1930,7 @@ pub fn launch_terminal(
             cwd,
             command,
             background,
-            None,
+            tool_id,
             opens_new_window,
         )?;
     } else {
@@ -1914,7 +1940,7 @@ pub fn launch_terminal(
             cwd,
             command,
             background,
-            None,
+            tool_id,
             opens_new_window,
         )?;
     }
@@ -1930,7 +1956,7 @@ pub fn launch_terminal(
 
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("powershell");
-            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c.args(POWERSHELL_SCRIPT_FLAGS);
             c
         } else {
             Command::new(resolve_bash_command())
@@ -1975,7 +2001,7 @@ pub fn launch_terminal(
         // Replace this process entirely with the script's shell.
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("powershell");
-            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c.args(POWERSHELL_SCRIPT_FLAGS);
             c
         } else {
             Command::new(resolve_bash_command())
@@ -2023,16 +2049,7 @@ pub fn launch_terminal(
             }
         }
         let mut argv = resolve_terminal_open_argv(&terminal_mode).unwrap_or_default();
-        // Inject `--to <socket>` (after the `@`) for kitten commands launched
-        // outside kitty. Splice as separate argv elements — no shell quoting.
-        if !kitty_socket.is_empty()
-            && !kitty_socket.starts_with("fd:")
-            && argv.first().map(String::as_str) == Some("kitten")
-            && argv.get(1).map(String::as_str) == Some("@")
-            && !argv.iter().any(|a| a == "--to")
-        {
-            argv.splice(2..2, ["--to".to_string(), kitty_socket.clone()]);
-        }
+        splice_kitten_to_socket(&mut argv, &kitty_socket);
         // Target launcher's tab for splits: insert `--match window_id:<wid>`
         // before the `--` separator.
         if (terminal_mode == "kitty-tab" || terminal_mode == "kitty-split")
@@ -2850,7 +2867,7 @@ mod tests {
             Some("/work/dir"),
             "claude --foo",
             false, // background
-            None,
+            Some("claude"),
             true, // opens_new_window
         )
         .unwrap();
@@ -2860,8 +2877,8 @@ mod tests {
                 .starts_with(&[0xEF, 0xBB, 0xBF])
         );
         let content = std::fs::read_to_string(&script).unwrap();
-        assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude Code...\""));
-        assert!(content.contains("Write-Host \"Starting Claude Code...\""));
+        assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude...\""));
+        assert!(content.contains("Write-Host \"Starting Claude...\""));
         assert!(content.contains("Remove-Item Env:"));
         assert!(content.contains("$env:HCOM_TOOL = 'claude'"));
         assert!(content.contains("Set-Location '/work/dir'"));
@@ -3057,6 +3074,73 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert!(auto);
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_matches_absolute_app_bundle_path() {
+        // Regression: when `kitten` isn't on PATH, resolve_terminal_open_argv
+        // rewrites argv[0] to kitten's absolute macOS app-bundle path before
+        // this splice runs. A literal "kitten" string match would silently
+        // skip injecting --to, leaving the launched kitten with no socket
+        // and no KITTY_LISTEN_ON (stripped from the child env), causing it to
+        // fall back to controlling-tty discovery — which fails outright when
+        // the calling process (e.g. an AI tool's sandboxed shell) has none.
+        let mut argv = vec![
+            "/Applications/kitty.app/Contents/MacOS/kitten".to_string(),
+            "@".to_string(),
+            "launch".to_string(),
+            "--type=window".to_string(),
+        ];
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(
+            argv,
+            vec![
+                "/Applications/kitty.app/Contents/MacOS/kitten".to_string(),
+                "@".to_string(),
+                "--to".to_string(),
+                "unix:/tmp/kitty-test".to_string(),
+                "launch".to_string(),
+                "--type=window".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_bare_name() {
+        let mut argv = vec!["kitten".to_string(), "@".to_string(), "ls".to_string()];
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(
+            argv,
+            vec![
+                "kitten".to_string(),
+                "@".to_string(),
+                "--to".to_string(),
+                "unix:/tmp/kitty-test".to_string(),
+                "ls".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_noop_for_non_kitten() {
+        let mut argv = vec!["wezterm".to_string(), "cli".to_string()];
+        let before = argv.clone();
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(argv, before);
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_noop_when_already_present() {
+        let mut argv = vec![
+            "kitten".to_string(),
+            "@".to_string(),
+            "--to".to_string(),
+            "unix:/tmp/other".to_string(),
+            "ls".to_string(),
+        ];
+        let before = argv.clone();
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(argv, before);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::db::HcomDb;
 use crate::hooks::common::stop_instance;
 use crate::identity;
 use crate::identity::{get_full_name, resolve_display_name};
-use crate::instances::{is_remote_instance, is_subagent_instance, parse_running_tasks};
+use crate::instances::{is_remote_instance, is_subagent_instance};
 use crate::log::log_info;
 use crate::shared::{CommandContext, SENDER, SenderKind, is_inside_ai_tool};
 
@@ -265,7 +265,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             identity::resolve_identity(db, None, None, None, None, None, None).ok()
         };
 
-        let name = match identity {
+        match identity {
             Some(id) => id.name,
             None => {
                 eprintln!(
@@ -273,18 +273,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 );
                 return 1;
             }
-        };
-
-        // Guard: block subagents from stopping their parent (in_subagent_context check)
-        if let Ok(Some(inst_data)) = db.get_instance_full(&name) {
-            let rt = parse_running_tasks(inst_data.running_tasks.as_deref());
-            if rt.active {
-                eprintln!("Error: Cannot run hcom stop from within a Task subagent");
-                return 1;
-            }
         }
-
-        name
     };
 
     // Handle SENDER (not real instance)

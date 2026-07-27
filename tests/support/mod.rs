@@ -21,12 +21,22 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Hard ceiling on a single hcom CLI invocation. Real commands finish in well
+/// under a second; this only trips when one is genuinely wedged, converting an
+/// unbounded hang into a fast, labelled failure instead of a CI job timeout.
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ceiling on the diagnostics process snapshot. Shorter than [`RUN_TIMEOUT`]:
+/// it is one OS query, and it runs from the panic hook where an unbounded wait
+/// would turn a failing test into a hung job.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Hcom {
     pub root: TempDir,
@@ -46,6 +56,264 @@ pub struct Hcom {
     launch_env: RefCell<BTreeMap<String, String>>,
     cleanup_pids: RefCell<HashSet<i64>>,
     cleanup_children: RefCell<Vec<Child>>,
+}
+
+/// Everything [`diagnostics_for`] needs to shell out to the fixture's exact
+/// hcom binary with its isolated env — split out of `Hcom` (which also holds
+/// non-`Send`-friendly-to-share bits like open `Child` handles) so the panic
+/// hook installed by [`install_diagnostics_panic_hook`] can hold one without
+/// borrowing a live `&Hcom`. `launch_env` (provider vars for the *launched*
+/// tool, not hcom's own read commands) is deliberately omitted — diagnostics
+/// only ever runs read-only hcom subcommands (list/status/events/term/
+/// transcript), which don't consult it.
+#[derive(Clone)]
+struct DiagContext {
+    bin: PathBuf,
+    root_path: PathBuf,
+    home: PathBuf,
+    hcom_dir: PathBuf,
+    codex_home: PathBuf,
+    path_env: OsString,
+}
+
+thread_local! {
+    // Thread-local, not a process-wide `Mutex`: `cli_smoke.rs` runs ~20
+    // non-`#[ignore]` tests that each call `Hcom::new()`, and the Justfile's
+    // `step test` (unlike the three real-tool/relay steps) runs plain `cargo
+    // test --locked` with the default multi-threaded runner — a shared slot
+    // there would dump whichever fixture happened to be active on some other
+    // thread, or nothing at all. The panic hook always runs on the panicking
+    // thread before unwinding starts, so thread-local storage is guaranteed
+    // correct regardless of how many fixtures are live across other threads,
+    // and needs no `Drop`-time ownership check to avoid clobbering.
+    static ACTIVE_DIAG: RefCell<Option<DiagContext>> = const { RefCell::new(None) };
+}
+
+static PANIC_HOOK_INIT: Once = Once::new();
+
+/// Installs (once per process) a panic hook that prints the active fixture's
+/// diagnostics — the same `hcom list/status/events`, hcom.log tail, and
+/// per-instance term/transcript dump `Hcom::diagnostics()` produces — to
+/// stderr before the default hook runs. Most `assert_eq!` call sites in the
+/// shared real-tool runner already thread `h.diagnostics()` through by hand,
+/// but that's easy to forget at any new call site, and a bare `assert!` /
+/// `panic!` / `.expect()` anywhere (this repo has dozens) previously surfaced
+/// with zero context — exactly the gap that made a real Windows relay-worker
+/// flake undiagnosable (it panicked with just "relay worker not running",
+/// no way to tell a real crash from a timing race). Fires for every
+/// `Hcom`-based real-tool test process-wide, not just one call site.
+///
+/// Skips the dump entirely if the panic payload already contains the
+/// diagnostics header — several call sites (`real_tool.rs`, `claude_mock.rs`,
+/// `real_tool_claude.rs`, `real_tool_codex.rs`, `Hcom::diagnostics` callers)
+/// already thread `h.diagnostics()` through their own panic message, and
+/// regenerating the same dump a second time would double the output and the
+/// subprocess cost exactly when the box is already under load.
+///
+/// The hook body must never itself panic: std aborts the process
+/// (`rtabort!`, uncatchable by `catch_unwind`) on a panic raised from inside
+/// a panic hook, which would skip `Drop` entirely and leak every fixture
+/// process this test spawned. [`diagnostics_for`] and everything it calls
+/// (`run_ctx`, `list_json_ctx`) fold spawn/wait errors into the dump text
+/// instead of panicking for exactly this reason.
+fn install_diagnostics_panic_hook() {
+    PANIC_HOOK_INIT.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            let already_dumped = info
+                .payload()
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| info.payload().downcast_ref::<&str>().copied())
+                .is_some_and(|msg| msg.contains("hcom integration-test diagnostics"));
+            if already_dumped {
+                return;
+            }
+            let ctx = ACTIVE_DIAG.with(|slot| slot.borrow().clone());
+            if let Some(ctx) = ctx {
+                eprintln!("\n===== hcom integration-test diagnostics (panic hook) =====");
+                eprintln!("{}", diagnostics_for(&ctx));
+                eprintln!("===== end diagnostics =====\n");
+            }
+        }));
+    });
+}
+
+/// Build the isolated, credential-stripped env every hcom invocation under a
+/// fixture runs with. Shared by `Hcom::apply_isolated_env` (real launch_env)
+/// and the panic-hook/diagnostics path (empty launch_env — read-only hcom
+/// subcommands don't consult it).
+fn apply_isolated_env_ctx(
+    ctx: &DiagContext,
+    launch_env: &BTreeMap<String, String>,
+    command: &mut Command,
+) {
+    command.env_clear();
+    command.env("PATH", &ctx.path_env);
+    if let Ok(lang) = std::env::var("LANG") {
+        command.env("LANG", lang);
+    } else {
+        command.env("LANG", "C.UTF-8");
+    }
+    command.env("LC_ALL", "C.UTF-8");
+    command.env("TERM", "xterm-256color");
+    command.env("NO_COLOR", "1");
+    command.env("CI", "1");
+
+    command.env("HOME", &ctx.home);
+    command.env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"));
+    #[cfg(windows)]
+    {
+        // Windows PowerShell and cmd are OS components, not user state.
+        // Clearing SystemRoot/WINDIR can make powershell.exe fail before it
+        // reads the generated runner; PATHEXT/COMSPEC are required for npm
+        // .cmd shims. Keep user-writable profile/temp locations isolated.
+        for key in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command.env("USERPROFILE", &ctx.home);
+        command.env("APPDATA", ctx.home.join("AppData/Roaming"));
+        command.env("LOCALAPPDATA", ctx.home.join("AppData/Local"));
+        command.env("TEMP", ctx.root_path.join("tmp"));
+        command.env("TMP", ctx.root_path.join("tmp"));
+    }
+    command.env("HCOM_DIR", &ctx.hcom_dir);
+    command.env("TMPDIR", ctx.root_path.join("tmp"));
+    command.env("XDG_CONFIG_HOME", ctx.root_path.join("xdg/config"));
+    command.env("XDG_CACHE_HOME", ctx.root_path.join("xdg/cache"));
+    command.env("XDG_DATA_HOME", ctx.root_path.join("xdg/data"));
+    command.env("XDG_STATE_HOME", ctx.root_path.join("xdg/state"));
+
+    // Codex reads CODEX_HOME for config/state/sessions and hcom installs its
+    // native hooks there. The mock-provider `env_key` (DUMMY_KEY) only needs
+    // to be non-empty: it is sent as `Authorization: Bearer` to the
+    // localhost mock, never to OpenAI. env_clear guarantees no real key leaks.
+    command.env("CODEX_HOME", &ctx.codex_home);
+    command.env("DUMMY_KEY", "hcom-real-test-dummy-key");
+
+    // Fixture-owned provider/config vars (e.g. Claude's ANTHROPIC_BASE_URL).
+    // Set on the parent too so the hcom CLI itself resolves them while it
+    // installs hooks; the launched child gets them from `$HCOM_DIR/env`.
+    for (key, value) in launch_env.iter() {
+        command.env(key, value);
+    }
+}
+
+/// Run an hcom invocation directly from a [`DiagContext`], for the
+/// panic-hook/diagnostics path where there's no live `&Hcom` to call
+/// `Hcom::run` on.
+fn run_ctx<I, S>(ctx: &DiagContext, args: I) -> (i32, String, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let mut command = Command::new(&ctx.bin);
+    apply_isolated_env_ctx(ctx, &BTreeMap::new(), &mut command);
+    command.args(&args);
+    run_command_bounded_safe(command, &args)
+}
+
+fn list_json_ctx(ctx: &DiagContext) -> Result<Vec<Value>, String> {
+    let (code, stdout, stderr) = run_ctx(ctx, ["list", "--json"]);
+    if code != 0 {
+        return Err(format!("hcom list --json failed ({code}): {stderr}"));
+    }
+    serde_json::from_str::<Vec<Value>>(&stdout)
+        .map_err(|e| format!("invalid list JSON: {e}\n{stdout}"))
+}
+
+/// Same dump `Hcom::diagnostics()` produces, built from a [`DiagContext`] so
+/// the panic hook can call it without a live `&Hcom`.
+fn diagnostics_for(ctx: &DiagContext) -> String {
+    let mut out = String::new();
+    out.push_str("\n===== hcom integration-test diagnostics =====\n");
+    for (label, args) in [
+        ("list --json", vec!["list", "--json"]),
+        ("status --json", vec!["status", "--json"]),
+        ("events --last 100", vec!["events", "--last", "100"]),
+    ] {
+        let (code, stdout, stderr) = run_ctx(ctx, args);
+        out.push_str(&format!(
+            "\n--- {label} (exit {code}) ---\n{stdout}{stderr}"
+        ));
+    }
+
+    // `list -v` adds what the JSON omits: the headless log path and the
+    // human-readable status detail. Do NOT read its `bindings:` line as
+    // evidence the PTY came up — "pty" there means `process_bound`, which the
+    // *launcher* writes before it spawns anything, so it is true for every
+    // launch. The `term <name>` exit code below and the process snapshot are
+    // the signals that actually distinguish a live PTY proxy from none.
+    let (code, stdout, stderr) = run_ctx(ctx, ["list", "-v"]);
+    out.push_str(&format!(
+        "\n--- list -v (exit {code}) ---\n{stdout}{stderr}"
+    ));
+
+    let hcom_log = ctx.hcom_dir.join(".tmp/logs/hcom.log");
+    out.push_str(&format!(
+        "\n--- {} (tail) ---\n{}",
+        hcom_log.display(),
+        read_tail(&hcom_log, 120)
+    ));
+
+    // The generated launch scripts are the exact commands the launch chain was
+    // going to run. A launch that stalls before the tool prints anything leaves
+    // no other record of what it tried; background mode never deletes them, so
+    // they are still on disk at failure time.
+    out.push_str(&format!(
+        "\n--- launch scripts ---\n{}",
+        launch_scripts_dump(&ctx.hcom_dir.join(".tmp/launch"))
+    ));
+
+    // Which processes in the launch chain are actually alive. Without this the
+    // dump cannot distinguish "the tool hung" from "the wrapper shell never got
+    // as far as starting the tool" — the tracked pid is the background wrapper,
+    // not the tool.
+    out.push_str(&format!(
+        "\n--- launch-chain processes ---\n{}",
+        process_snapshot()
+    ));
+
+    // PTY screen per instance shows the exact upstream error text for
+    // failed model turns. Single `list --json` call reused for both the
+    // term/transcript dump and the background-log tail below — spawning
+    // hcom is the costliest part of this function.
+    if let Ok(instances) = list_json_ctx(ctx) {
+        for instance in &instances {
+            if let Some(name) = instance.get("name").and_then(Value::as_str) {
+                let (code, stdout, stderr) = run_ctx(ctx, ["term", name]);
+                out.push_str(&format!(
+                    "\n--- term {name} (exit {code}) ---\n{stdout}{stderr}"
+                ));
+                let (code, stdout, stderr) =
+                    run_ctx(ctx, ["transcript", name, "--full", "--detailed"]);
+                out.push_str(&format!(
+                    "\n--- transcript {name} --full --detailed (exit {code}) ---\n{stdout}{stderr}"
+                ));
+            }
+            if let Some(path) = instance
+                .get("background_log_file")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                let path = PathBuf::from(path);
+                out.push_str(&format!(
+                    "\n--- {} (tail) ---\n{}",
+                    path.display(),
+                    read_tail(&path, 120)
+                ));
+            }
+        }
+    }
+
+    out
 }
 
 impl Hcom {
@@ -86,7 +354,7 @@ impl Hcom {
         }
         let path_env = std::env::join_paths(path_entries).expect("construct isolated PATH");
 
-        Self {
+        let fixture = Self {
             root,
             home,
             hcom_dir,
@@ -98,6 +366,21 @@ impl Hcom {
             launch_env: RefCell::new(BTreeMap::new()),
             cleanup_pids: RefCell::new(HashSet::new()),
             cleanup_children: RefCell::new(Vec::new()),
+        };
+        install_diagnostics_panic_hook();
+        let ctx = fixture.diag_context();
+        ACTIVE_DIAG.with(|slot| *slot.borrow_mut() = Some(ctx));
+        fixture
+    }
+
+    fn diag_context(&self) -> DiagContext {
+        DiagContext {
+            bin: self.bin.clone(),
+            root_path: self.root.path().to_path_buf(),
+            home: self.home.clone(),
+            hcom_dir: self.hcom_dir.clone(),
+            codex_home: self.codex_home.clone(),
+            path_env: self.path_env.clone(),
         }
     }
 
@@ -127,57 +410,7 @@ impl Hcom {
     }
 
     fn apply_isolated_env(&self, command: &mut Command) {
-        command.env_clear();
-        command.env("PATH", &self.path_env);
-        if let Ok(lang) = std::env::var("LANG") {
-            command.env("LANG", lang);
-        } else {
-            command.env("LANG", "C.UTF-8");
-        }
-        command.env("LC_ALL", "C.UTF-8");
-        command.env("TERM", "xterm-256color");
-        command.env("NO_COLOR", "1");
-        command.env("CI", "1");
-
-        command.env("HOME", &self.home);
-        command.env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"));
-        #[cfg(windows)]
-        {
-            // Windows PowerShell and cmd are OS components, not user state.
-            // Clearing SystemRoot/WINDIR can make powershell.exe fail before it
-            // reads the generated runner; PATHEXT/COMSPEC are required for npm
-            // .cmd shims. Keep user-writable profile/temp locations isolated.
-            for key in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
-                if let Some(value) = std::env::var_os(key) {
-                    command.env(key, value);
-                }
-            }
-            command.env("USERPROFILE", &self.home);
-            command.env("APPDATA", self.home.join("AppData/Roaming"));
-            command.env("LOCALAPPDATA", self.home.join("AppData/Local"));
-            command.env("TEMP", self.root.path().join("tmp"));
-            command.env("TMP", self.root.path().join("tmp"));
-        }
-        command.env("HCOM_DIR", &self.hcom_dir);
-        command.env("TMPDIR", self.root.path().join("tmp"));
-        command.env("XDG_CONFIG_HOME", self.root.path().join("xdg/config"));
-        command.env("XDG_CACHE_HOME", self.root.path().join("xdg/cache"));
-        command.env("XDG_DATA_HOME", self.root.path().join("xdg/data"));
-        command.env("XDG_STATE_HOME", self.root.path().join("xdg/state"));
-
-        // Codex reads CODEX_HOME for config/state/sessions and hcom installs its
-        // native hooks there. The mock-provider `env_key` (DUMMY_KEY) only needs
-        // to be non-empty: it is sent as `Authorization: Bearer` to the
-        // localhost mock, never to OpenAI. env_clear guarantees no real key leaks.
-        command.env("CODEX_HOME", &self.codex_home);
-        command.env("DUMMY_KEY", "hcom-real-test-dummy-key");
-
-        // Fixture-owned provider/config vars (e.g. Claude's ANTHROPIC_BASE_URL).
-        // Set on the parent too so the hcom CLI itself resolves them while it
-        // installs hooks; the launched child gets them from `$HCOM_DIR/env`.
-        for (key, value) in self.launch_env.borrow().iter() {
-            command.env(key, value);
-        }
+        apply_isolated_env_ctx(&self.diag_context(), &self.launch_env.borrow(), command);
     }
 
     /// Set a provider/config var the launched tool must see, surviving hcom's
@@ -227,19 +460,40 @@ impl Hcom {
         command
     }
 
+    /// Resolve an external tool the same way hcom's own `which_bin` does, so a
+    /// version check and the launch it gates can never disagree about which file
+    /// they mean.
+    ///
+    /// Windows resolves extension-major *within* each PATH directory, so a stray
+    /// `claude.exe` sitting next to npm's `claude.cmd` shim wins — which is
+    /// exactly how a mock-tools prefix left over from an earlier pin silently
+    /// takes over. Returning the path lets callers name the offending file.
+    pub fn resolve_external<S: AsRef<OsStr>>(&self, program: S) -> Option<PathBuf> {
+        let program = program.as_ref();
+        #[cfg(windows)]
+        {
+            std::env::split_paths(&self.path_env)
+                .flat_map(|dir| {
+                    [".COM", ".EXE", ".BAT", ".CMD", ""]
+                        .map(move |ext| dir.join(format!("{}{ext}", program.to_string_lossy())))
+                })
+                .find(|candidate| candidate.is_file())
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::split_paths(&self.path_env)
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+        }
+    }
+
     /// Build a non-hcom command (for example `codex --version`) with the same
     /// credential-stripped, isolated environment.
     pub fn external_cmd<S: AsRef<OsStr>>(&self, program: S) -> Command {
         #[cfg(windows)]
         let mut command = {
             let program = program.as_ref();
-            let resolved = std::env::split_paths(&self.path_env)
-                .flat_map(|dir| {
-                    [".COM", ".EXE", ".BAT", ".CMD", ""]
-                        .map(move |ext| dir.join(format!("{}{ext}", program.to_string_lossy())))
-                })
-                .find(|candidate| candidate.is_file());
-            match resolved {
+            match self.resolve_external(program) {
                 Some(path)
                     if matches!(
                         path.extension().and_then(OsStr::to_str),
@@ -273,15 +527,9 @@ impl Hcom {
         if std::env::var_os("HCOM_TEST_TRACE_COMMANDS").is_some() {
             eprintln!("hcom test command: {:?}", args);
         }
-        let out = self
-            .cmd()
-            .args(&args)
-            .output()
-            .unwrap_or_else(|error| panic!("spawn hcom binary for {:?}: {error}", args));
-        let code = out.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        (code, stdout, stderr)
+        let mut command = self.cmd();
+        command.args(&args);
+        run_command_bounded(command, &args)
     }
 
     /// Run a command as a manually-started identity.
@@ -290,16 +538,13 @@ impl Hcom {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let out = self
-            .cmd()
-            .env("HCOM_PROCESS_ID", process_id)
-            .args(args)
-            .output()
-            .expect("spawn hcom binary with HCOM_PROCESS_ID");
-        let code = out.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        (code, stdout, stderr)
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        let mut command = self.cmd();
+        command.env("HCOM_PROCESS_ID", process_id).args(&args);
+        run_command_bounded(command, &args)
     }
 
     /// Start a manual identity and return its canonical name.
@@ -440,12 +685,7 @@ impl Hcom {
     }
 
     pub fn list_json(&self) -> Result<Vec<Value>, String> {
-        let (code, stdout, stderr) = self.run(["list", "--json"]);
-        if code != 0 {
-            return Err(format!("hcom list --json failed ({code}): {stderr}"));
-        }
-        serde_json::from_str::<Vec<Value>>(&stdout)
-            .map_err(|e| format!("invalid list JSON: {e}\n{stdout}"))
+        list_json_ctx(&self.diag_context())
     }
 
     pub fn instance_json(&self, name: &str) -> Result<Option<Value>, String> {
@@ -556,62 +796,7 @@ impl Hcom {
     }
 
     pub fn diagnostics(&self) -> String {
-        let mut out = String::new();
-        out.push_str("\n===== hcom integration-test diagnostics =====\n");
-        for (label, args) in [
-            ("list --json", vec!["list", "--json"]),
-            ("status --json", vec!["status", "--json"]),
-            ("events --last 100", vec!["events", "--last", "100"]),
-        ] {
-            let (code, stdout, stderr) = self.run(args);
-            out.push_str(&format!(
-                "\n--- {label} (exit {code}) ---\n{stdout}{stderr}"
-            ));
-        }
-
-        let hcom_log = self.hcom_dir.join(".tmp/logs/hcom.log");
-        out.push_str(&format!(
-            "\n--- {} (tail) ---\n{}",
-            hcom_log.display(),
-            read_tail(&hcom_log, 120)
-        ));
-
-        // PTY screen per instance shows the exact upstream error text for
-        // failed model turns.
-        if let Ok(instances) = self.list_json() {
-            for instance in &instances {
-                if let Some(name) = instance.get("name").and_then(Value::as_str) {
-                    let (code, stdout, stderr) = self.run(["term", name]);
-                    out.push_str(&format!(
-                        "\n--- term {name} (exit {code}) ---\n{stdout}{stderr}"
-                    ));
-                    let (code, stdout, stderr) =
-                        self.run(["transcript", name, "--full", "--detailed"]);
-                    out.push_str(&format!(
-                        "\n--- transcript {name} --full --detailed (exit {code}) ---\n{stdout}{stderr}"
-                    ));
-                }
-            }
-        }
-
-        if let Ok(instances) = self.list_json() {
-            for instance in instances {
-                if let Some(path) = instance
-                    .get("background_log_file")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                {
-                    let path = PathBuf::from(path);
-                    out.push_str(&format!(
-                        "\n--- {} (tail) ---\n{}",
-                        path.display(),
-                        read_tail(&path, 120)
-                    ));
-                }
-            }
-        }
-
-        out
+        diagnostics_for(&self.diag_context())
     }
 
     pub fn process_group_alive(&self, pid: i64) -> bool {
@@ -627,6 +812,10 @@ impl Hcom {
 
 impl Drop for Hcom {
     fn drop(&mut self) {
+        // Thread-local: always this thread's own fixture, so no ownership
+        // check is needed before clearing (unlike a process-wide slot, a
+        // fixture on another thread can't have overwritten this one).
+        ACTIVE_DIAG.with(|slot| *slot.borrow_mut() = None);
         if std::thread::panicking() {
             self.root.disable_cleanup(true);
             eprintln!(
@@ -771,6 +960,160 @@ pub fn unique_suffix() -> String {
         .to_string()
 }
 
+/// Spawn `command` and collect its output under a hard deadline.
+///
+/// `Command::output` waits for stdout+stderr to reach EOF, which needs every
+/// process holding an inherited copy of those pipe handles to exit —
+/// including a detached launch grandchild that keeps the write end open long
+/// after the direct child returns. That turns one wedged invocation into an
+/// unbounded hang (the `eventually` poll only checks its own deadline
+/// *between* calls), and CI can only end it with a job timeout.
+///
+/// Instead we drain both pipes on background threads into shared buffers and
+/// wait for the *direct* child alone. On exit (or [`RUN_TIMEOUT`]) we
+/// snapshot whatever the readers captured rather than joining them, so a
+/// grandchild holding the pipe never blocks the call. A timeout kills the
+/// child, reports a non-zero code, and prints a labelled marker so the wedged
+/// subcommand is named in the log.
+///
+/// Panics on spawn/wait failure — fine for the ordinary `Hcom::run` path
+/// where that's a fixture-breaking bug worth failing loudly on. The
+/// diagnostics/panic-hook path must never panic (see
+/// [`install_diagnostics_panic_hook`]) and uses [`run_command_bounded_safe`]
+/// instead.
+fn run_command_bounded(mut command: Command, args: &[OsString]) -> (i32, String, String) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn hcom binary for {args:?}: {error}"));
+    let stdout_buf = drain_stream(child.stdout.take());
+    let stderr_buf = drain_stream(child.stderr.take());
+
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let (code, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status.code().unwrap_or(-1), false),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break (-1, true);
+            }
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => panic!("wait on hcom binary for {args:?}: {error}"),
+        }
+    };
+    // Grace for the readers to drain bytes already buffered in the pipe. We
+    // snapshot instead of joining: a detached grandchild can hold the write
+    // end open, so a reader may never observe EOF.
+    std::thread::sleep(Duration::from_millis(200));
+    let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+    if timed_out {
+        let marker = format!(
+            "<hcom test: `hcom {}` exceeded {}s and was killed>",
+            args.iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            RUN_TIMEOUT.as_secs()
+        );
+        eprintln!("{marker}");
+        stderr.push_str(&marker);
+        stderr.push('\n');
+    }
+    (code, stdout, stderr)
+}
+
+/// Same contract as [`run_command_bounded`], for the diagnostics/panic-hook
+/// path (`run_ctx`, `list_json_ctx`, `diagnostics_for`) where a panic would
+/// abort the whole process instead of just failing one test — std aborts
+/// (`rtabort!`, uncatchable) on a panic raised from inside a panic hook.
+/// Spawn and wait failures are folded into the returned stderr as `<...>`
+/// markers instead.
+fn run_command_bounded_safe(mut command: Command, args: &[OsString]) -> (i32, String, String) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return (
+                -1,
+                String::new(),
+                format!("<failed to spawn hcom binary for {args:?}: {error}>\n"),
+            );
+        }
+    };
+    let stdout_buf = drain_stream(child.stdout.take());
+    let stderr_buf = drain_stream(child.stderr.take());
+
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let (code, timed_out, wait_error) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status.code().unwrap_or(-1), false, None),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break (-1, true, None);
+            }
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => break (-1, false, Some(error.to_string())),
+        }
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let stdout = String::from_utf8_lossy(
+        &stdout_buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    let mut stderr = String::from_utf8_lossy(
+        &stderr_buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    if timed_out {
+        stderr.push_str(&format!(
+            "<hcom test: `hcom {}` exceeded {}s and was killed>\n",
+            args.iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            RUN_TIMEOUT.as_secs()
+        ));
+    }
+    if let Some(error) = wait_error {
+        stderr.push_str(&format!("<wait on hcom binary failed: {error}>\n"));
+    }
+    (code, stdout, stderr)
+}
+
+/// Drain a child pipe on a background thread into a shared buffer, appending as
+/// bytes arrive. The caller snapshots the buffer under its own deadline instead
+/// of joining, so a pipe the child never closes (a detached grandchild holds the
+/// write end) can't wedge the read. A leaked reader dies with the test process.
+fn drain_stream<R: Read + Send + 'static>(stream: Option<R>) -> Arc<Mutex<Vec<u8>>> {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    if let Some(mut stream) = stream {
+        let sink = Arc::clone(&buffer);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+    }
+    buffer
+}
+
 fn poll_until<F>(timeout: Duration, mut predicate: F) -> bool
 where
     F: FnMut() -> bool,
@@ -796,4 +1139,185 @@ fn read_tail(path: &Path, max_lines: usize) -> String {
     let mut tail = lines[start..].join("\n");
     tail.push('\n');
     tail
+}
+
+/// Every generated launch/runner script still on disk, with its body.
+///
+/// A background launch that never produces tool output leaves these as the only
+/// record of what the wrapper shell was asked to run (background mode, unlike
+/// foreground, never deletes them).
+///
+/// Bodies are printed only for files positively identified as an hcom-generated
+/// wrapper/runner or an args sidecar. The launch dir ALSO holds the ambient-env
+/// sidecar, which carries the parent's non-HCOM environment — real credentials
+/// on a dev box — and the runner deletes it right after sourcing it. A launch
+/// that stalls before the runner runs is exactly when it is still there, i.e.
+/// exactly the case this dump exists for, so name-based exclusion is not enough
+/// (on Windows it is another `.ps1` with the same naming pattern). Identify by
+/// content instead and fail closed: hcom's scripts open with a comment or the
+/// window-title line, the env sidecar opens with an assignment.
+fn launch_scripts_dump(launch_dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(launch_dir) else {
+        return format!("<no launch dir at {}>\n", launch_dir.display());
+    };
+    let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    names.sort();
+    if names.is_empty() {
+        return "<launch dir is empty>\n".to_string();
+    }
+    let mut out = String::new();
+    for path in names {
+        out.push_str(&format!("\n-- {} --\n", path.display()));
+        let is_args = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".args.json"));
+        let body = fs::read_to_string(&path).unwrap_or_default();
+        let first = body
+            .trim_start_matches('\u{feff}')
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default();
+        let generated = first.starts_with('#') || first.starts_with("$Host.UI.RawUI.WindowTitle");
+        if is_args || generated {
+            out.push_str(&read_tail(&path, 60));
+        } else {
+            out.push_str("<not dumped: unrecognized file, may be the ambient-env sidecar>\n");
+        }
+    }
+    out
+}
+
+#[test]
+fn launch_scripts_dump_prints_generated_scripts_but_not_the_env_sidecar() {
+    let dir = tempfile::tempdir().expect("temp launch dir");
+    fs::write(
+        dir.path().join("claude_luna_1_2.ps1"),
+        "\u{feff}# Claude hcom native runner (luna)\n& 'hcom.exe' pty claude\n",
+    )
+    .expect("write runner");
+    fs::write(
+        dir.path().join("hcom_1_3.ps1"),
+        "\u{feff}$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude...\"\nWrite-Host x\n",
+    )
+    .expect("write wrapper");
+    // Same extension and naming shape as the runner — only the body tells them
+    // apart, and this one holds the parent's ambient environment.
+    fs::write(
+        dir.path().join("claude_luna_1_4.ps1"),
+        "\u{feff}$env:AWS_SECRET_ACCESS_KEY = 'super-secret'\n",
+    )
+    .expect("write env sidecar");
+
+    let dump = launch_scripts_dump(dir.path());
+    assert!(dump.contains("pty claude"), "runner body missing:\n{dump}");
+    assert!(
+        dump.contains("Write-Host x"),
+        "wrapper body missing:\n{dump}"
+    );
+    assert!(
+        !dump.contains("super-secret"),
+        "ambient-env sidecar must never be dumped:\n{dump}"
+    );
+    assert!(
+        dump.contains("may be the ambient-env sidecar"),
+        "skipped file should say why:\n{dump}"
+    );
+}
+
+/// Processes in the launch chain that are still alive, with command lines.
+///
+/// The pid hcom tracks for a background launch is the *wrapper shell*, not the
+/// tool, so "process alive" in a launch-failure detail says nothing about
+/// whether the tool ever started. This snapshot is what separates the two:
+/// wrapper-only means the chain stalled before the tool; a live tool process
+/// means the tool itself is stuck.
+fn process_snapshot() -> String {
+    #[cfg(windows)]
+    let mut command = {
+        // CIM rather than `tasklist`: the command line is what distinguishes the
+        // outer wrapper, the runner shell, and `hcom pty` — all three are
+        // `powershell.exe`/`hcom.exe` by image name alone.
+        //
+        // Filter on the image name inside the query, not on the rendered line:
+        // matching `node` against whole command lines pulls in every Electron
+        // helper on a dev box (`--utility-sub-type=node.mojom.NodeService`) and
+        // buries the four processes this dump exists to show.
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process \
+             | Where-Object { $_.Name -match '^(hcom|claude|codex|node|powershell|pwsh|cmd|conhost|OpenConsole)\\.exe$' } \
+             | Select-Object ProcessId,ParentProcessId,Name,CommandLine \
+             | Format-Table -AutoSize | Out-String -Width 400",
+        ]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("ps");
+        command.args(["-eo", "pid,ppid,etime,args"]);
+        command
+    };
+
+    // Bounded like every other diagnostics subprocess: this runs from the panic
+    // hook, where a `wait_with_output()` that never returns would hang the test
+    // binary instead of failing it, and WMI in particular can stall on a loaded
+    // machine — exactly when this dump matters most.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return format!("<process snapshot unavailable: {error}>\n"),
+    };
+    let stdout_buf = drain_stream(child.stdout.take());
+    let _stderr_buf = drain_stream(child.stderr.take());
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return format!(
+                    "<process snapshot exceeded {}s and was killed>\n",
+                    SNAPSHOT_TIMEOUT.as_secs()
+                );
+            }
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => return format!("<process snapshot wait failed: {error}>\n"),
+        }
+    }
+    let captured = stdout_buf
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let text = String::from_utf8_lossy(&captured);
+    let mut out = String::new();
+    for line in text.lines() {
+        // Windows already filtered in the query; `ps` output is narrow enough
+        // that a substring match over the whole line is fine here.
+        #[cfg(not(windows))]
+        {
+            const INTERESTING: &[&str] =
+                &["hcom", "claude", "codex", "node", "bash", "sh -", "script"];
+            let low = line.to_lowercase();
+            if !INTERESTING.iter().any(|needle| low.contains(needle)) {
+                continue;
+            }
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("<no launch-chain processes alive>\n");
+    }
+    out
 }

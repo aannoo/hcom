@@ -12,8 +12,8 @@
 # 0.103.x (the patched copy, also in Cargo.lock). The vulnerable 0.102 code is
 # linked but never executed. The relay is also an opt-in remote feature.
 #
-# Revisit when rumqttc ships a webpki-0.103 release, or if relay TLS adds custom
-# certificate verification (CRLs / name constraints).
+# Revisit by 2026-10-21, when rumqttc ships a webpki-0.103 release, or if relay
+# TLS adds custom certificate verification (CRLs / name constraints).
 
 [advisories]
 ignore = [

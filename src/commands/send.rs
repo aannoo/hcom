@@ -1191,7 +1191,15 @@ fn cli_context_build_prefix(
 mod tests {
     use super::*;
     use clap::Parser;
+    use serial_test::serial;
     use std::path::PathBuf;
+
+    type TestEnv = (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        crate::hooks::test_helpers::EnvGuard,
+    );
 
     #[test]
     fn parse_basic_send() {
@@ -1423,10 +1431,13 @@ mod tests {
         assert!(msg.is_none());
     }
 
-    fn setup_test_db() -> (HcomDb, PathBuf) {
+    fn setup_test_db() -> (HcomDb, PathBuf, TestEnv) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+        // send_message() reaches the process-global relay notification path,
+        // so its ambient HCOM_DIR must live as long as the test DB.
+        let env = crate::hooks::test_helpers::isolated_test_env();
         let temp_dir = std::env::temp_dir();
         let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let db_path = temp_dir.join(format!(
@@ -1436,7 +1447,7 @@ mod tests {
         ));
 
         let db = HcomDb::open_at(&db_path).unwrap();
-        (db, db_path)
+        (db, db_path, env)
     }
 
     fn cleanup_test_db(path: PathBuf) {
@@ -1448,8 +1459,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_threads_seed_and_reuse_memberships() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
@@ -1491,8 +1503,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_thread_without_members_errors() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
@@ -1518,8 +1531,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_external_sender_does_not_auto_subscribe_to_thread() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
@@ -1553,8 +1567,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_thread_request_does_not_create_request_watch_rows() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
@@ -1619,8 +1634,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_mention_excludes_inactive_instances() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, status, status_context, created_at)
@@ -1655,8 +1671,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_mention_excludes_exit_no_tool_call_inactive() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, status, status_context, created_at)
