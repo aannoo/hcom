@@ -105,17 +105,6 @@ fn hook_noop() -> HookResult {
     }
 }
 
-fn hcom_available_hint() -> HookResult {
-    HookResult::Allow {
-        additional_context: Some(format!(
-            "[hcom available - run '{} start' to participate]",
-            crate::runtime_env::build_hcom_command()
-        )),
-        system_message: None,
-        delivery_ack: None,
-    }
-}
-
 fn codex_event_name(hook_name: &str) -> &'static str {
     CODEX_HOOK_COMMANDS
         .iter()
@@ -320,7 +309,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     let instance_name = match instance_name {
         Some(name) => name,
-        None => return hcom_available_hint(),
+        None => return hook_noop(),
     };
 
     let _ = db.rebind_instance_session(&instance_name, session_id);

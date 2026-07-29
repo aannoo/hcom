@@ -39,14 +39,20 @@ dist-check:
 # Each check's full output goes to a per-step log under {{ci-tmp}}/ci-logs/; stdout
 # only shows one ok/FAILED line per step so a pass is scannable and a failure
 # points straight at the relevant log instead of requiring re-runs or grepping.
-ci:
+# Optional args name the only steps to run, e.g. `just ci real_tool_claude`.
+[unix]
+ci *steps:
     #!/usr/bin/env bash
     set -uo pipefail
+    only_steps="{{steps}}"
     mkdir -p "{{ci-tmp}}"
     log_dir="{{ci-tmp}}/ci-logs"
     mkdir -p "$log_dir"
     step() {
         local name="$1"; shift
+        if [[ -n "$only_steps" && " $only_steps " != *" $name "* ]]; then
+            return
+        fi
         local log="$log_dir/$name.log"
         printf '[ci] %-20s ' "$name"
         if "$@" > "$log" 2>&1; then
@@ -60,7 +66,6 @@ ci:
         fi
     }
     step dist-check  dist generate --check
-    step mock-tools  env HCOM_MOCK_TOOLS_PREFIX="{{mock-prefix}}" HCOM_MOCK_TOOLS_NPM_CACHE="{{mock-cache}}" bash ./scripts/install-mock-tools.sh
     step typecheck   bash ./scripts/typecheck.sh
     step fmt         env TMPDIR="{{ci-tmp}}" cargo fmt --all -- --check
     step clippy      env TMPDIR="{{ci-tmp}}" cargo clippy --all-targets --locked -- -D warnings
@@ -71,6 +76,7 @@ ci:
     # `posix_spawn` fail with EAGAIN. Raise the soft limit to the hard ceiling for
     # these steps so the tests aren't flaky against a busy machine.
     ulimit -Su "$(ulimit -Hu)"
+    step mock-tools             env HCOM_MOCK_TOOLS_PREFIX="{{mock-prefix}}" HCOM_MOCK_TOOLS_NPM_CACHE="{{mock-cache}}" bash ./scripts/install-mock-tools.sh
     step real_tool_codex        env TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1
     step real_tool_claude       env TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
     step test_relay_roundtrip  env TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
@@ -92,9 +98,9 @@ real-tool-tests-windows: mock-tools-windows
 # target/ci-logs/, stdout shows one ok/FAILED line per step. Without this a
 # failing pre-commit run buries the one relevant assertion under a full
 # --nocapture real-tool transcript. Optional args name the only steps to run,
-# e.g. `just ci-windows real_tool_claude`.
+# e.g. `just ci real_tool_claude`.
 [windows]
-ci-windows *steps:
+ci *steps:
     & "{{justfile_directory()}}/scripts/ci-windows.ps1" {{ if steps == "" { "" } else { "-Only " + steps } }}
 
 [windows]

@@ -73,6 +73,41 @@ if [[ -n "$claude_version" && "$has_claude_native" -eq 0 ]]; then
   packages+=("@anthropic-ai/claude-code-$claude_platform@$claude_version")
 fi
 
+# npm's cache retains downloaded tarballs, but `npm install --global` still
+# revalidates registry metadata and reifies the installed packages on every
+# invocation. The real-tool gate needs exact pins, so a successful version
+# check is enough to reuse an already-installed, platform-specific tool.
+installed_pin_matches() {
+  local tool="$1" wanted="$2" launcher="$PREFIX/bin/$1" reported
+  [[ -x "$launcher" ]] || return 1
+  reported="$("$launcher" --version 2>&1 || true)"
+  reported="${reported#"${reported%%[! ]*}"}"   # trim leading whitespace
+  reported="${reported%"${reported##*[! ]}"}"   # trim trailing whitespace
+  [[ "$reported" == "$wanted" ]]
+}
+
+# Build tool→version map from packages and check all of them.
+declare -A pin_map=()
+[[ -z "$codex_version" ]]  || pin_map[codex]="$codex_version"
+[[ -z "$claude_version" ]] || pin_map[claude]="$claude_version"
+
+if [[ ${#pin_map[@]} -gt 0 ]]; then
+  all_cached=true
+  for tool in "${!pin_map[@]}"; do
+    if ! installed_pin_matches "$tool" "${pin_map[$tool]}"; then
+      all_cached=false
+      break
+    fi
+  done
+  if $all_cached; then
+    for tool in "${!pin_map[@]}"; do
+      printf '%s %s verified at %s\n' "$tool" "${pin_map[$tool]}" "$PREFIX/bin/$tool" >&2
+    done
+    printf '%s\n' "$PREFIX/bin"
+    exit 0
+  fi
+fi
+
 npm_platform="$(node -p 'process.platform')"
 npm_platform_args=()
 if [[ "$npm_platform" == "android" ]]; then

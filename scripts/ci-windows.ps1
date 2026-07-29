@@ -75,10 +75,10 @@ function Step([string] $name, [scriptblock] $body) {
 
 Unlock-DevBinary
 
-Step mock-tools { & (Join-Path $PSScriptRoot "install-mock-tools.ps1") }
 Step fmt        { cargo fmt --all -- --check }
 Step clippy     { cargo clippy --all-targets --locked -- -D warnings }
 Step test       { cargo test --all-targets --locked }
+Step mock-tools { & (Join-Path $PSScriptRoot "install-mock-tools.ps1") }
 Step real_tool_codex      { cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1 }
 Step real_tool_claude     { cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1 }
 Step test_relay_roundtrip { cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1 }

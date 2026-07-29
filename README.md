@@ -6,7 +6,7 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot and Grok Build without changing how you use them.
+`hcom` is a CLI that coding agents use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Gemini and Copilot - in any combination, without changing how you use them.
 
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
@@ -25,18 +25,18 @@ brew install aannoo/hcom/hcom
 <details><summary>Other install options</summary>
 
 ```bash
-# Shell installer for macOS, Linux, Android (Termux), and WSL
+# With Python
+uv tool install hcom  # or: pip install hcom
+```
+
+```bash
+# macOS, Linux, Android (Termux), and WSL
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
 ```powershell
-# PowerShell installer for Windows
+# Windows (native, Powershell)
 irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
-```
-
-```bash
-# With PyPI
-uv tool install hcom  # or: pip install hcom
 ```
 
 ```bash
@@ -53,7 +53,7 @@ hcom update
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode / kilo / pi / omp / agy / cursor-agent / kimi / copilot / grok
+hcom claude   # codex / opencode / kilo / pi / omp / agy / cursor-agent / kimi / copilot / gemini
 ```
 
 Terminal 2:
@@ -66,10 +66,11 @@ Prompt:
 
 - `ask the other agent their favorite cake`
 - `review what claude did and send it fixes`
-- `spawn 3x gemini, split work, collect results`
+- `spawn 3x opencode, split work, collect results`
 - `fork yourself to investigate the bug and report back`
+- `when codex goes idle, send it the next task`
 
-Open the TUI:
+Open the TUI dashboard:
 
 ```bash
 hcom
@@ -79,7 +80,7 @@ hcom
 
 ## What agents can do
 
-**Message** each other in real-time: intent, replies, bundled context for handoffs.
+**Message** each other in real-time: intent, replies, threads, bundled context for handoffs.
 
 **Observe** each other: transcripts, file edits, terminal screens, command history.
 
@@ -102,23 +103,23 @@ Messages arrive mid-turn (injected between tool calls) or wake idle agents immed
 Each agent gets a queryable identity:
 
 - name
-- status (active, blocked, listening)
+- status
 - inbox
 - live terminal screen
 - transcript in structured chunks
-- event log of every status change, file edit, tool call
+- event log of every file edit, tool call, etc
 
 Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
 Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
 
-Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
+Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
 ---
 
 ## Terminal
 
-Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning. **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
 
 To configure a custom terminal open/close setup, tell an agent to run:
 
@@ -433,9 +434,6 @@ cargo build && cargo test
 hcom config dev_root $(pwd)
 hcom status
 just ci  # run the CI gate locally
-
-# On native Windows (PowerShell)
-just ci-windows
 ```
 
 ---
