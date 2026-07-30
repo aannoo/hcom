@@ -526,6 +526,11 @@ mod host_label {
 
     /// Outcome of one socket round-trip, classified so the caller can react
     /// correctly instead of failing closed on every hiccup (issue #102, F1).
+    ///
+    /// `Transient`/`Rejected` are only produced by the `#[cfg(unix)]`
+    /// round-trip; on non-unix the stub yields `Unreachable`, so allow the
+    /// otherwise-unconstructed variants there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     enum SocketError {
         /// herdr is unreachable (connect failed, or the connection dropped
         /// mid-request). Treated as fatal — the backend is disabled.
