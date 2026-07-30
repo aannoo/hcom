@@ -203,13 +203,38 @@ mod host_label {
     #[cfg(unix)]
     const SOCKET_TIMEOUT: Duration = Duration::from_millis(200);
 
+    /// A run of this many consecutive transient socket failures (with no
+    /// intervening success) disables the backend, as a safety valve against a
+    /// wedged-but-connectable socket. Set high enough that ordinary
+    /// busy-at-startup EAGAIN churn — several ops per tick during pane creation
+    /// — doesn't trip it; any single success resets the count. herdr actually
+    /// *exiting* is caught immediately by the connect-failure (Unreachable)
+    /// path, so this only guards the rare "socket alive but server stuck" case.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
     /// Per-loop state: which backend (if any) we resolved at startup, and the
-    /// last label we successfully pushed (for dedupe). On the first I/O error
-    /// we drop the backend so subsequent iterations are no-ops — avoids log
-    /// spam and per-tick socket churn when herdr exits mid-session.
+    /// last label we successfully pushed (for dedupe). A connect failure (herdr
+    /// exited) drops the backend immediately; transient I/O only skips the
+    /// current op and retries next tick, so a momentary EAGAIN no longer
+    /// permanently kills label/state/rename updates (issue #102, F1).
     pub(super) struct HostLabel {
         backend: Option<Backend>,
         last_pushed: Option<String>,
+        /// Last agent state we reported via `pane.report_agent` (dedupe).
+        last_reported_state: Option<&'static str>,
+        /// Monotonic per-source sequence number for `pane.report_agent`; herdr
+        /// rejects stale (non-increasing) reports.
+        seq: u64,
+        /// Whether we've set herdr's canonical agent `name` via `agent.rename`
+        /// (once, after the pane is classified). Restores `herdr agent
+        /// send/prompt <name>` targeting that the old `agent start {name}`
+        /// flow provided — the new `tab create` launch doesn't set it. Flips
+        /// only when the rename returns a real success envelope, so it retries
+        /// across the classification race instead of latching on a bare ack.
+        name_set: bool,
+        /// Consecutive transient socket failures since the last success; any
+        /// success resets it. See [`MAX_CONSECUTIVE_FAILURES`].
+        consecutive_failures: u32,
     }
 
     enum Backend {
@@ -222,9 +247,9 @@ mod host_label {
     impl HostLabel {
         pub(super) fn resolve() -> Self {
             // `last_pushed` starts unset so the first delivery-loop iteration
-            // *always* pushes a styled label. The built-in herdr preset
-            // invokes `agent start {instance_name}` which leaves the pane
-            // labeled with the bare instance name; the styled
+            // *always* pushes a styled label. The built-in herdr preset opens
+            // the pane via `tab create --label {instance_name}`, so herdr's
+            // initial label is the bare instance name; the styled
             // `◉ luna [claude]` label only appears once we push it. Seeding
             // from HCOM_PANE_TITLE (which a custom template might or might
             // not have applied) would silently skip that first push and leave
@@ -232,6 +257,10 @@ mod host_label {
             Self {
                 backend: Backend::resolve(),
                 last_pushed: None,
+                last_reported_state: None,
+                seq: 0,
+                name_set: false,
+                consecutive_failures: 0,
             }
         }
 
@@ -239,26 +268,150 @@ mod host_label {
             if self.backend.is_none() {
                 return;
             }
+
+            // 1. Styled visual label via `pane.rename`, deduped on the last
+            //    pushed string. On failure we leave `last_pushed` unset so the
+            //    label retries next tick, but we do NOT abort — the state report
+            //    and rename below are independent ops and shouldn't be starved
+            //    by a transient label hiccup (issue #102, F1). If the failure
+            //    disabled the backend, those later `send`s are no-ops anyway.
             let label = pane_title_label(db, name, status, tool);
-            if label.is_empty() || self.last_pushed.as_deref() == Some(label.as_str()) {
-                return;
+            if !label.is_empty()
+                && self.last_pushed.as_deref() != Some(label.as_str())
+                && self.send(|backend| backend.push(&label))
+            {
+                self.last_pushed = Some(label);
             }
-            // Take the backend so we can drop it on failure without holding a
-            // borrow across the I/O call.
-            let backend = self.backend.take().expect("backend present");
-            match backend.push(&label) {
-                Ok(()) => {
-                    self.backend = Some(backend);
-                    self.last_pushed = Some(label);
+
+            // 2. Agent state via `pane.report_agent` so herdr classifies the
+            //    pane as an agent (its foreground process is `hcom pty`, not the
+            //    tool). Best-effort and deduped on the mapped state. Skipped
+            //    when the tool name is unknown — herdr needs a real agent label.
+            if !tool.is_empty() {
+                let state = map_report_state(status);
+                if self.last_reported_state != Some(state) {
+                    let seq = self.next_seq();
+                    if self.send(|backend| backend.report_agent(tool, state, seq)) {
+                        self.last_reported_state = Some(state);
+                    }
                 }
-                Err(err) => {
+            }
+
+            // 3. Set herdr's canonical agent `name` once so `herdr agent
+            //    send/prompt/focus <name>` resolves — parity with the retired
+            //    `agent start {name}` flow. herdr's `agent.rename` requires the
+            //    pane to already be a classified agent terminal; that classifier
+            //    is EITHER our `report_agent` above OR herdr's own installed
+            //    integration for the tool (which shadows ours — issue #102, F2).
+            //    We can't tell which from hcom's side, and an ignored
+            //    `report_agent` still returns a success envelope, so we don't
+            //    try to. Instead we attempt the rename each tick once we've
+            //    entered the agent regime and let it self-heal: `name_set` flips
+            //    only when `agent.rename` returns a real success — before
+            //    classification it returns an `error` envelope (Rejected), which
+            //    leaves `name_set` false so the next tick retries. The styled
+            //    label stays on `pane.rename`; this only sets the plain name
+            //    field, so the two don't clobber each other.
+            if !self.name_set
+                && self.last_reported_state.is_some()
+                && !name.is_empty()
+                && self.send(|backend| backend.rename_agent(name))
+            {
+                self.name_set = true;
+            }
+        }
+
+        /// Run one socket op against the backend, taking it so we can drop it on
+        /// failure without holding a borrow across the I/O call. Returns whether
+        /// the op *applied* (herdr answered with success). The backend is only
+        /// disabled (dropped) when herdr is unreachable, or after a run of
+        /// transient failures — a single EAGAIN/timeout just skips this op and
+        /// retries next tick, and a semantic `Rejected` keeps the healthy
+        /// backend so the caller can retry (issue #102, F1/F2).
+        fn send<F>(&mut self, op: F) -> bool
+        where
+            F: FnOnce(&Backend) -> Result<(), SocketError>,
+        {
+            let Some(backend) = self.backend.take() else {
+                return false;
+            };
+            match op(&backend) {
+                Ok(()) => {
+                    self.consecutive_failures = 0;
+                    self.backend = Some(backend);
+                    true
+                }
+                Err(SocketError::Rejected(msg)) => {
+                    // herdr is alive and answered "no" (e.g. rename before the
+                    // pane is a classified agent). Keep the backend and let the
+                    // caller retry; this isn't a connectivity problem.
+                    self.consecutive_failures = 0;
                     crate::log::log_info(
                         "host_label",
-                        "push_failed_disabling",
-                        &format!("{}: {err}", backend.kind()),
+                        "op_rejected",
+                        &format!("{}: {msg}", backend.kind()),
                     );
+                    self.backend = Some(backend);
+                    false
+                }
+                Err(SocketError::Transient(msg)) => {
+                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                    if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        crate::log::log_info(
+                            "host_label",
+                            "disabling_after_transient",
+                            &format!(
+                                "{}: {msg} ({} consecutive)",
+                                backend.kind(),
+                                self.consecutive_failures
+                            ),
+                        );
+                        // Drop the backend (leave self.backend = None).
+                    } else {
+                        self.backend = Some(backend);
+                    }
+                    false
+                }
+                Err(SocketError::Unreachable(msg)) => {
+                    crate::log::log_info(
+                        "host_label",
+                        "disabling_unreachable",
+                        &format!("{}: {msg}", backend.kind()),
+                    );
+                    // Drop the backend (leave self.backend = None).
+                    false
                 }
             }
+        }
+
+        /// Next `pane.report_agent` sequence. herdr keeps the last seq per
+        /// source *per terminal* and rejects any `seq <= last_seq`, and that map
+        /// outlives a delivery-loop restart in the same pane — so a plain
+        /// counter reset to 1 would be silently dropped after a restart. Anchor
+        /// to a wall-clock nanosecond timestamp (like herdr's own hook does)
+        /// while forcing strict monotonicity, so reports survive restarts and
+        /// never collide even on a coarse clock.
+        fn next_seq(&mut self) -> u64 {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            self.seq = self.seq.saturating_add(1).max(now_ns);
+            self.seq
+        }
+    }
+
+    /// Map an hcom status constant to a herdr `pane_agent_state` value.
+    ///
+    /// listening → idle, active → working, blocked → blocked; everything else
+    /// (inactive/launching/error) → unknown.
+    fn map_report_state(status: &str) -> &'static str {
+        use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
+        match status {
+            ST_LISTENING => "idle",
+            ST_ACTIVE => "working",
+            ST_BLOCKED => "blocked",
+            _ => "unknown",
         }
     }
 
@@ -289,7 +442,7 @@ mod host_label {
         /// than `agent.rename` (which would also overwrite the herdr-canonical
         /// agent name with the status-icon-prefixed string and break
         /// `herdr agent send <name>` targeting).
-        fn push(&self, label: &str) -> Result<(), String> {
+        fn push(&self, label: &str) -> Result<(), SocketError> {
             match self {
                 Backend::Herdr {
                     socket_path,
@@ -304,6 +457,65 @@ mod host_label {
                 }
             }
         }
+
+        /// Report the agent and its state via `pane.report_agent`. When no other
+        /// source owns the pane, this establishes hcom as the `hook_authority`,
+        /// making `is_agent_terminal()` true independent of the foreground
+        /// process — so herdr tracks the pane as an agent even though `hcom pty`
+        /// is what's actually running.
+        ///
+        /// Caveat (issue #102, F2): if herdr has its *own* integration installed
+        /// for this tool (pi, omp, claude, codex, opencode, …), that
+        /// `herdr:<tool>` source owns lifecycle authority and our `source:
+        /// "hcom"` report is accepted-and-ignored — herdr still returns a
+        /// success envelope, so we can't detect the shadowing from here. That's
+        /// fine: herdr's own integration is then tracking state, and the report
+        /// still pays off for tools herdr doesn't integrate. herdr accepts any
+        /// `agent` string (nothing is rejected on that field), so this is purely
+        /// best-effort. `state` is a herdr snake_case `pane_agent_state`.
+        fn report_agent(&self, agent: &str, state: &str, seq: u64) -> Result<(), SocketError> {
+            match self {
+                Backend::Herdr {
+                    socket_path,
+                    pane_id,
+                } => {
+                    let request = serde_json::json!({
+                        "id": "hcom:pane:report_agent",
+                        "method": "pane.report_agent",
+                        "params": {
+                            "pane_id": pane_id,
+                            "source": "hcom",
+                            "agent": agent,
+                            "state": state,
+                            "seq": seq,
+                        },
+                    });
+                    send_unix_request(socket_path, &request)
+                }
+            }
+        }
+
+        /// Set herdr's canonical agent `name` (the targetable field) via
+        /// `agent.rename`, so `herdr agent send/prompt/focus <name>` resolves.
+        /// Only valid once the pane is a classified agent terminal — our
+        /// `report_agent` establishes that. Kept separate from the styled
+        /// `pane.rename` label so the status-icon string never clobbers the
+        /// plain name (herdr composes its own title from name + agent title).
+        fn rename_agent(&self, name: &str) -> Result<(), SocketError> {
+            match self {
+                Backend::Herdr {
+                    socket_path,
+                    pane_id,
+                } => {
+                    let request = serde_json::json!({
+                        "id": "hcom:agent:rename",
+                        "method": "agent.rename",
+                        "params": { "target": pane_id, "name": name },
+                    });
+                    send_unix_request(socket_path, &request)
+                }
+            }
+        }
     }
 
     /// Build the same label hcom writes into OSC 1/2 (`◉ tag-luna [claude]`).
@@ -312,33 +524,108 @@ mod host_label {
         format_pane_title(status, &display, tool)
     }
 
+    /// Outcome of one socket round-trip, classified so the caller can react
+    /// correctly instead of failing closed on every hiccup (issue #102, F1).
+    enum SocketError {
+        /// herdr is unreachable (connect failed, or the connection dropped
+        /// mid-request). Treated as fatal — the backend is disabled.
+        Unreachable(String),
+        /// Transient I/O against a live-looking socket (EAGAIN / timeout /
+        /// interrupt). herdr is likely just busy; skip this op and retry next
+        /// tick. Only a run of these disables the backend.
+        Transient(String),
+        /// herdr received the request and answered with a JSON `error` (e.g.
+        /// `agent.rename` before the pane is a classified agent terminal). The
+        /// socket is healthy; only this specific op didn't apply, so we neither
+        /// disable the backend nor record the op as done — we retry next tick.
+        Rejected(String),
+    }
+
     #[cfg(unix)]
-    fn send_unix_request(socket_path: &str, request: &serde_json::Value) -> Result<(), String> {
-        use std::io::{BufRead, BufReader, Write};
+    fn send_unix_request(
+        socket_path: &str,
+        request: &serde_json::Value,
+    ) -> Result<(), SocketError> {
+        use std::io::{BufRead, BufReader, ErrorKind, Write};
         use std::os::unix::net::UnixStream;
 
-        let mut stream =
-            UnixStream::connect(socket_path).map_err(|e| format!("connect: {socket_path}: {e}"))?;
+        // A read/write error against an already-connected socket: EAGAIN /
+        // timeout / interrupt are transient (retry), anything else means herdr
+        // dropped the connection (fatal).
+        fn classify_io(stage: &str, e: &std::io::Error) -> SocketError {
+            match e.kind() {
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted => {
+                    SocketError::Transient(format!("{stage}: {e}"))
+                }
+                _ => SocketError::Unreachable(format!("{stage}: {e}")),
+            }
+        }
+
+        let mut stream = UnixStream::connect(socket_path)
+            .map_err(|e| SocketError::Unreachable(format!("connect: {socket_path}: {e}")))?;
         let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
         let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-        writeln!(stream, "{request}").map_err(|e| format!("write: {e}"))?;
+        writeln!(stream, "{request}").map_err(|e| classify_io("write", &e))?;
         let mut response = String::new();
         BufReader::new(&stream)
             .read_line(&mut response)
-            .map_err(|e| format!("read: {e}"))?;
-        Ok(())
+            .map_err(|e| classify_io("read", &e))?;
+
+        classify_response(&response)
+    }
+
+    /// Inspect herdr's one-line JSON response. A top-level `error` field means a
+    /// semantic rejection; a `result` (or any other parseable body) is success.
+    /// An empty line means herdr closed the connection without answering —
+    /// treated as unreachable.
+    #[cfg(unix)]
+    fn classify_response(response: &str) -> Result<(), SocketError> {
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            return Err(SocketError::Unreachable("empty response".into()));
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(val) => match val.get("error") {
+                Some(err) => {
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("rejected");
+                    Err(SocketError::Rejected(msg.to_string()))
+                }
+                None => Ok(()),
+            },
+            // A non-empty but unparseable line: herdr answered with something, so
+            // it's alive — be lenient and count it as success rather than
+            // wedging retries on a body we mostly don't read anyway.
+            Err(_) => Ok(()),
+        }
     }
 
     #[cfg(not(unix))]
-    fn send_unix_request(_socket_path: &str, _request: &serde_json::Value) -> Result<(), String> {
-        Err("unix sockets unavailable on this platform".into())
+    fn send_unix_request(
+        _socket_path: &str,
+        _request: &serde_json::Value,
+    ) -> Result<(), SocketError> {
+        Err(SocketError::Unreachable(
+            "unix sockets unavailable on this platform".into(),
+        ))
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::shared::ST_LISTENING;
+        use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LAUNCHING, ST_LISTENING};
         use serial_test::serial;
+
+        #[test]
+        fn map_report_state_covers_hcom_statuses() {
+            assert_eq!(map_report_state(ST_LISTENING), "idle");
+            assert_eq!(map_report_state(ST_ACTIVE), "working");
+            assert_eq!(map_report_state(ST_BLOCKED), "blocked");
+            assert_eq!(map_report_state(ST_INACTIVE), "unknown");
+            assert_eq!(map_report_state(ST_LAUNCHING), "unknown");
+        }
 
         #[test]
         #[serial]
@@ -352,11 +639,11 @@ mod host_label {
         #[test]
         #[serial]
         fn resolve_does_not_seed_last_pushed_from_pane_title_env() {
-            // The built-in herdr preset launches with `agent start
-            // {instance_name}`, so herdr's initial pane label is the bare
-            // name (e.g. `luna`). Seeding `last_pushed` from HCOM_PANE_TITLE
-            // would silently swallow the first push and leave the pane
-            // stuck on `luna` until the next status transition.
+            // The built-in herdr preset opens the pane via `tab create --label
+            // {instance_name}`, so herdr's initial tab label is the bare name
+            // (e.g. `luna`). Seeding `last_pushed` from HCOM_PANE_TITLE would
+            // silently swallow the first push and leave the pane stuck on
+            // `luna` until the next status transition.
             // SAFETY: test is #[serial].
             unsafe {
                 std::env::set_var("HCOM_PANE_TITLE", "\u{25c9} luna [claude]");
@@ -371,6 +658,37 @@ mod host_label {
                 "last_pushed must start unset so the first delivery-loop \
                  iteration always pushes a styled label"
             );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn classify_response_distinguishes_error_success_and_closed() {
+            // A JSON `error` envelope is a semantic rejection (herdr alive but
+            // said no) — keep the backend, retry the op (issue #102, F1/F2).
+            let err = r#"{"id":"hcom:agent:rename","error":{"code":"not_agent","message":"pane w1:p1 is not an agent"}}"#;
+            match classify_response(err) {
+                Err(SocketError::Rejected(msg)) => assert!(msg.contains("not an agent")),
+                _ => panic!("expected Rejected for an error envelope"),
+            }
+
+            // A `result` envelope is success — the op applied.
+            let ok = r#"{"id":"hcom:agent:rename","result":{"type":"agent_renamed"}}"#;
+            assert!(classify_response(ok).is_ok());
+
+            // An ignored `report_agent` still comes back as a success envelope,
+            // so it must classify as Ok (we can't detect the shadowing — F2).
+            let ignored = r#"{"id":"hcom:pane:report_agent","result":{"type":"agent_reported"}}"#;
+            assert!(classify_response(ignored).is_ok());
+
+            // A non-empty but unparseable line: herdr answered, so treat as Ok
+            // rather than wedging retries on a body we don't read.
+            assert!(classify_response("not json at all\n").is_ok());
+
+            // An empty line means herdr closed the connection without a reply.
+            assert!(matches!(
+                classify_response("   \n"),
+                Err(SocketError::Unreachable(_))
+            ));
         }
     }
 }
