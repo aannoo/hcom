@@ -1,8 +1,10 @@
-//! Start command: `hcom start [--as <name>] [--orphan <name|pid>]`
+//! Start command: `hcom start [--name <agent-id>] [--as <name>] [--orphan <name|pid>]`
 //!
 //! Runs inside an already-running tool session rather than launching a new one.
 //! Used for adhoc/manual setup, identity rebinding, and orphan recovery:
 //! - Bare start: detect vanilla tool or create adhoc instance
+//! - `--name <agent-id>`: register a subagent (a router-level global flag, not
+//!   parsed by `StartArgs` — resolved in `run()` via `flags.name`)
 //! - `--orphan`: recover orphaned PTY process
 //! - `--as`: rebind session identity
 
@@ -12,8 +14,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::bootstrap;
+use crate::claude_actor;
 use crate::config::HcomConfig;
-use crate::db::HcomDb;
+use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
@@ -75,226 +78,130 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
     let ctx = HcomContext::from_os();
-    let instance_name = flags
+    let verified_actor = claude_actor::resolve_env_actor(&db).map_err(anyhow::Error::new)?;
+    if let (Some(actor), Some(name)) = (verified_actor.as_ref(), flags.name.as_deref()) {
+        claude_actor::ensure_explicit_matches(&db, actor, name).map_err(anyhow::Error::new)?;
+    }
+
+    let requested_name = flags
         .name
         .as_deref()
         .map(|name| identity::resolve_display_name(&db, name).unwrap_or_else(|| name.to_string()));
 
-    // BLOCK DURING ACTIVE TASKS: prevents subagents from corrupting parent/sibling instances.
-    // When a subagent runs --as or bare start, process_id resolves to the parent which has
-    // running_tasks.active=True. Only --name <agent_id> (explicit initiator) bypasses this gate.
-    if (rebind_target.is_some() || orphan_target.is_some() || instance_name.is_none())
-        && let Ok(ident) =
-            identity::resolve_identity(&db, None, None, None, ctx.process_id.as_deref(), None, None)
-        && let Some(inst_data) = &ident.instance_data
+    // A verified child actor can only promote/use its existing row. It cannot
+    // rebind or recover another identity, and it does not need --name.
+    if let Some(actor) = verified_actor.as_ref()
+        && let Some(actor_row) = db.get_instance_full(&actor.name)?
+        && instances::is_subagent_instance(&actor_row)
     {
-        let rt_str = inst_data
-            .get("running_tasks")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let rt = instances::parse_running_tasks(Some(rt_str));
-        if rt.active {
-            if rebind_target.is_some() {
-                println!("[HCOM] Cannot use --as while Tasks are running.");
-            } else if orphan_target.is_some() {
-                println!("[HCOM] Cannot use --orphan while Tasks are running.");
-            } else {
-                println!(
-                    "[HCOM] Cannot run 'hcom start' from within a Task subagent.\n\
-                             Subagents must use: hcom start --name <your-agent-id>"
-                );
-            }
+        if rebind_target.is_some() {
+            println!("[HCOM] Subagents cannot use --as. End your turn.");
             return Ok(1);
         }
+        if orphan_target.is_some() {
+            println!("[HCOM] Subagents cannot use --orphan. End your turn.");
+            return Ok(1);
+        }
+        return start_subagent(&db, &actor_row);
     }
 
-    // SUBAGENT DETECTION: check BOTH --name and --as for agent_id matches in running_tasks.
-    // Must happen BEFORE --as handling to block subagents from picking new identities.
-    // Check both independently: --as matching a subagent agent_id must be blocked,
-    // --name matching triggers subagent registration.
-    let subagent_via_name = instance_name
-        .as_deref()
-        .and_then(|id| detect_subagent(&db, id));
-    let subagent_via_as = rebind_target
-        .as_deref()
-        .and_then(|id| detect_subagent(&db, id));
+    // Without a capability, retain the ordinary manual fallback. A direct
+    // indexed child lookup supports the documented --name <agent-id> form
+    // without scanning duplicated parent JSON.
+    let subagent_via_name = if verified_actor.is_none() {
+        requested_name
+            .as_deref()
+            .and_then(|id| detect_subagent(&db, id))
+    } else {
+        None
+    };
+    let subagent_via_as = if verified_actor.is_none() {
+        rebind_target
+            .as_deref()
+            .and_then(|id| detect_subagent(&db, id))
+    } else {
+        None
+    };
 
     if subagent_via_as.is_some() || (subagent_via_name.is_some() && rebind_target.is_some()) {
         println!("[HCOM] Subagents cannot change identity. End your turn.");
         return Ok(1);
     }
-    let subagent_info = subagent_via_name;
 
     if let Some(orphan) = orphan_target {
         return start_from_orphan(&db, &hcom_dir, &orphan, &ctx);
     }
 
     if let Some(rebind) = rebind_target {
-        return start_rebind(&db, &rebind, &ctx, instance_name.as_deref());
+        let current_name = verified_actor
+            .as_ref()
+            .map(|actor| actor.name.as_str())
+            .or(requested_name.as_deref());
+        return start_rebind(&db, &rebind, &ctx, current_name);
     }
 
-    // Subagent registration path (--name <agent_id> that matched a parent's running_tasks)
-    if let Some(info) = subagent_info {
-        return start_subagent(&db, &info);
+    if let Some(subagent) = subagent_via_name {
+        return start_subagent(&db, &subagent);
     }
 
-    // Bare start: auto-detect tool or create adhoc instance
-    start_bare(&db, &hcom_dir, &ctx, instance_name.as_deref())
+    // A verified root actor stays the root even while children exist.
+    let effective_name = verified_actor
+        .as_ref()
+        .map(|actor| actor.name.as_str())
+        .or(requested_name.as_deref());
+    start_bare(&db, &hcom_dir, &ctx, effective_name)
 }
 
-/// Info about a detected subagent from a parent's running_tasks.
-struct SubagentInfo {
-    agent_id: String,
-    agent_type: String,
-    parent_name: String,
-    parent_session_id: Option<String>,
-    parent_tag: Option<String>,
+/// Resolve a live child row directly by agent_id (or by its exact row name).
+fn detect_subagent(db: &HcomDb, check_id: &str) -> Option<InstanceRow> {
+    let name = db
+        .get_instance_by_agent_id(check_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| check_id.to_string());
+    let row = db.get_instance_full(&name).ok().flatten()?;
+    row.parent_name.as_ref().filter(|name| !name.is_empty())?;
+    Some(row)
 }
 
-/// Check if `check_id` matches an agent_id in any parent's running_tasks.subagents.
-fn detect_subagent(db: &HcomDb, check_id: &str) -> Option<SubagentInfo> {
-    // Query instances that have subagents tracked
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT name, session_id, tag, running_tasks FROM instances \
-             WHERE running_tasks LIKE '%subagents%'",
-        )
-        .ok()?;
-
-    let rows: Vec<(String, Option<String>, Option<String>, String)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for (name, session_id, tag, rt_json) in &rows {
-        let rt = instances::parse_running_tasks(Some(rt_json));
-        for task in &rt.subagents {
-            if task.get("agent_id").and_then(|v| v.as_str()) == Some(check_id) {
-                let agent_type = task
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("task")
-                    .to_string();
-                return Some(SubagentInfo {
-                    agent_id: check_id.to_string(),
-                    agent_type,
-                    parent_name: name.clone(),
-                    parent_session_id: session_id.clone(),
-                    parent_tag: tag.clone(),
-                });
-            }
-        }
-    }
-    None
-}
-
-/// Path S: Subagent registration — create structured parent_type_N name.
-fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
-    // Gate: subagents get ONE start. Any stop = permanently dead.
-    let stopped_by: Option<String> = db
-        .conn()
-        .prepare(
-            "SELECT json_extract(data, '$.by') FROM events \
-             WHERE type = 'life' \
-             AND json_extract(data, '$.action') = 'stopped' \
-             AND json_extract(data, '$.snapshot.agent_id') = ? \
-             ORDER BY timestamp DESC LIMIT 1",
-        )?
-        .query_row(rusqlite::params![info.agent_id], |row| row.get(0))
-        .ok();
-
-    if let Some(by) = stopped_by {
-        let by = if by.is_empty() {
-            "system".to_string()
-        } else {
-            by
-        };
-        println!(
-            "[HCOM] Your session was stopped by {by}. Do not continue working. End your turn immediately."
+/// Promote an existing dormant child row into active hcom participation.
+fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
+    let parent_name = info.parent_name.as_deref().unwrap_or("");
+    if parent_name.is_empty() || info.agent_id.as_deref().unwrap_or("").is_empty() {
+        bail!(
+            "Subagent row '{}' is missing parent/agent identity",
+            info.name
         );
-        return Ok(1);
     }
 
-    // Resolve existing row (placeholder from SubagentStart, or a prior start).
-    // `name_announced` distinguishes "dormant placeholder being promoted now"
-    // from "same subagent called hcom start twice."
-    let existing: Option<(String, i64)> = db
-        .conn()
-        .query_row(
-            "SELECT name, name_announced FROM instances WHERE agent_id = ?",
-            rusqlite::params![info.agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                ))
-            },
-        )
-        .ok();
-
-    let (subagent_name, was_announced) = match existing {
-        Some((name, announced)) => (name, announced != 0),
-        None => {
-            let alloc = instance_names::SubagentAllocation {
-                agent_id: &info.agent_id,
-                agent_type: &info.agent_type,
-                parent_name: &info.parent_name,
-                parent_session_id: info.parent_session_id.as_deref(),
-                parent_tag: info.parent_tag.as_deref(),
-                status: ST_ACTIVE,
-                status_context: Some("tool:start"),
-            };
-            let name = instance_names::allocate_subagent_instance(db, &alloc)?;
-            (name, false)
-        }
-    };
-
-    // Flip to active + emit life event so TUI/watchers see the state change.
-    lifecycle::set_status(
-        db,
-        &subagent_name,
-        ST_ACTIVE,
-        "tool:start",
-        Default::default(),
-    );
-
-    // Capture launch context (process binding etc.)
-    instance_binding::capture_and_store_launch_context(db, &subagent_name);
+    let was_announced = info.name_announced != 0;
+    lifecycle::set_status(db, &info.name, ST_ACTIVE, "tool:start", Default::default());
+    instance_binding::capture_and_store_launch_context(db, &info.name);
 
     log_info(
         "lifecycle",
         "start.subagent",
         &format!(
-            "name={} parent={} agent_id={} agent_type={} announced={}",
-            subagent_name, info.parent_name, info.agent_id, info.agent_type, was_announced
+            "name={} parent={} agent_id={} announced={}",
+            info.name,
+            parent_name,
+            info.agent_id.as_deref().unwrap_or(""),
+            was_announced
         ),
     );
 
-    // Second `hcom start --name <id>` from the same subagent: no bootstrap
-    // reprint. Just report and return.
     if was_announced {
-        println!("hcom already started for {subagent_name}");
+        println!("hcom already started for {}", info.name);
         return Ok(0);
     }
 
-    // First announcement: print bootstrap and mark the row announced so
-    // SubagentStop knows not to re-inject it on activation.
-    let bootstrap = bootstrap::get_subagent_bootstrap(&subagent_name, &info.parent_name);
+    let bootstrap = bootstrap::get_subagent_bootstrap(&info.name, parent_name);
     if !bootstrap.is_empty() {
         println!("{bootstrap}");
     }
     let mut updates = serde_json::Map::new();
     updates.insert("name_announced".into(), serde_json::json!(true));
-    instances::update_instance_position(db, &subagent_name, &updates);
+    instances::update_instance_position(db, &info.name, &updates);
 
     Ok(0)
 }
@@ -397,7 +304,52 @@ fn start_from_orphan(
     Ok(0)
 }
 
-/// Rebind session identity (`--as <name>`), preserving last_event_id.
+#[derive(Debug, Clone)]
+struct ChildLink {
+    name: String,
+    parent_name: Option<String>,
+}
+
+fn snapshot_child_links(db: &HcomDb, session_id: Option<&str>) -> Result<Vec<ChildLink>> {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT name, parent_name FROM instances WHERE parent_session_id = ?")?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        Ok(ChildLink {
+            name: row.get(0)?,
+            parent_name: row.get(1)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn restore_child_links_after_root_rebind(
+    db: &HcomDb,
+    links: &[ChildLink],
+    session_id: &str,
+    old_root: &str,
+    new_root: &str,
+) -> Result<()> {
+    db.with_immediate_transaction(|txn| {
+        for link in links {
+            let parent_name = match link.parent_name.as_deref() {
+                Some(parent) if parent == old_root => Some(new_root),
+                other => other,
+            };
+            txn.execute(
+                "UPDATE instances SET parent_session_id = ?, parent_name = ? WHERE name = ?",
+                rusqlite::params![session_id, parent_name, &link.name],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// Rebind session identity (`--as <name>`), preserving last_event_id and any
+/// live Claude child hierarchy owned by the current root actor.
 fn start_rebind(
     db: &HcomDb,
     rebind_target: &str,
@@ -424,7 +376,7 @@ fn start_rebind(
         return Ok(1);
     }
 
-    let current_name = explicit_name.unwrap_or("");
+    let explicit_current_name = explicit_name.unwrap_or("");
 
     // Resolve session_id from process binding or existing instance
     let mut session_id: Option<String> = None;
@@ -434,11 +386,19 @@ fn start_rebind(
         session_id = sid.filter(|s| !s.is_empty());
     }
     if session_id.is_none()
-        && !current_name.is_empty()
-        && let Ok(Some(current_data)) = db.get_instance_full(current_name)
+        && !explicit_current_name.is_empty()
+        && let Ok(Some(current_data)) = db.get_instance_full(explicit_current_name)
     {
         session_id = current_data.session_id.filter(|s| !s.is_empty());
     }
+    let current_name = if !explicit_current_name.is_empty() {
+        explicit_current_name.to_string()
+    } else if let Some(ref sid) = session_id {
+        db.get_session_binding(sid)?.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let child_links = snapshot_child_links(db, session_id.as_deref())?;
 
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
     if let Some(ref meta) = target_meta {
@@ -473,7 +433,7 @@ fn start_rebind(
     // Delete old identity if different from target
     if !current_name.is_empty()
         && current_name != target_name
-        && let Err(e) = db.delete_instance(current_name)
+        && let Err(e) = db.delete_instance(&current_name)
     {
         eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
     }
@@ -497,6 +457,18 @@ fn start_rebind(
         None,  // hints
         Some(&cwd_override),
     );
+
+    if let Some(ref sid) = session_id {
+        let old_root = if current_name.is_empty() {
+            target_name.as_str()
+        } else {
+            current_name.as_str()
+        };
+        restore_child_links_after_root_rebind(db, &child_links, sid, old_root, &target_name)?;
+        if old_root != target_name {
+            db.rebind_claude_root_actor_state(sid, old_root, &target_name)?;
+        }
+    }
 
     // Restore cursor position + mark as announced
     {
@@ -525,7 +497,7 @@ fn start_rebind(
         // Migrate notify endpoints before notify so wake reaches correct port
         if !current_name.is_empty()
             && current_name != target_name
-            && let Err(e) = db.migrate_notify_endpoints(current_name, &target_name)
+            && let Err(e) = db.migrate_notify_endpoints(&current_name, &target_name)
         {
             eprintln!("[hcom] warn: migrate_notify_endpoints failed: {e}");
         }
@@ -709,6 +681,26 @@ fn start_bare(
     }
 
     let tool = ctx.tool.as_str();
+    // Claude's SessionStart hook exports its real session id through
+    // CLAUDE_ENV_FILE. The Python implementation consumed this value here;
+    // restore that immediate vanilla-session binding instead of depending
+    // solely on the PostToolUse stdout marker fallback.
+    let claude_session_id = (ctx.tool == crate::tool::Tool::Claude)
+        .then(|| std::env::var("HCOM_CLAUDE_UNIX_SESSION_ID").ok())
+        .flatten()
+        .filter(|value| !value.is_empty());
+
+    if explicit_name.is_none()
+        && let Some(ref session_id) = claude_session_id
+        && let Some(bound_name) = db.get_session_binding(session_id)?
+    {
+        // SessionStart exported this id into Claude's per-session environment,
+        // so a matching CLI-created binding is trusted identity evidence. Heal
+        // bindings created by older versions before returning the existing row.
+        db.mark_claude_session_validated(session_id, &bound_name)?;
+        println!("hcom already started for {bound_name}");
+        return Ok(0);
+    }
 
     // Resolve or generate name
     let name = if let Some(n) = explicit_name {
@@ -738,7 +730,7 @@ fn start_bare(
     instance_binding::initialize_instance_in_position_file(
         db,
         &name,
-        None, // session_id
+        claude_session_id.as_deref(),
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
@@ -751,6 +743,11 @@ fn start_bare(
         None,  // hints
         None,  // cwd_override
     );
+
+    if let Some(ref session_id) = claude_session_id {
+        db.set_session_binding(session_id, &name)?;
+        db.mark_claude_session_validated(session_id, &name)?;
+    }
 
     // Bind process if we have a process_id
     if let Some(ref process_id) = ctx.process_id
@@ -902,6 +899,176 @@ mod tests {
         assert!(
             err.to_string().contains("Remote start is not supported"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_vanilla_claude_start_immediately_binds_exported_session() {
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("HCOM_CLAUDE_UNIX_SESSION_ID", value),
+                        None => std::env::remove_var("HCOM_CLAUDE_UNIX_SESSION_ID"),
+                    }
+                }
+            }
+        }
+
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+
+        let _restore = RestoreEnv(std::env::var_os("HCOM_CLAUDE_UNIX_SESSION_ID"));
+        unsafe {
+            std::env::set_var("HCOM_CLAUDE_UNIX_SESSION_ID", "sess-vanilla");
+        }
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let name = db
+            .get_session_binding("sess-vanilla")
+            .unwrap()
+            .expect("bare vanilla start must bind immediately");
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("sess-vanilla"));
+        assert_eq!(row.tool, "claude");
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-vanilla")
+                .unwrap()
+                .as_deref(),
+            Some(name.as_str()),
+            "CLI-created Claude bindings must be immediately trusted by hooks"
+        );
+
+        let transcript = hcom_dir.join("vanilla.jsonl");
+        std::fs::write(&transcript, "{\"sessionId\":\"sess-vanilla\"}\n").unwrap();
+        let mut hook_ctx = ctx.clone();
+        hook_ctx.process_id = None;
+        let (resolved, _, _) = crate::hooks::common::init_hook_context(
+            &db,
+            &hook_ctx,
+            "sess-vanilla",
+            transcript.to_str().unwrap(),
+        );
+        assert_eq!(resolved.as_deref(), Some(name.as_str()));
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("sess-vanilla").unwrap().as_deref(),
+            Some(name.as_str()),
+            "repeated bare start must retain the existing vanilla identity"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_rebind_preserves_child_hierarchy_and_actor_state() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_2', 'sess-1', 'nova_task_1', 'agent-2', 'claude',
+                         'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let token = db
+            .issue_claude_actor_capability("sess-1", "tool-root", None, "nova")
+            .unwrap();
+
+        let links = snapshot_child_links(&db, Some("sess-1")).unwrap();
+        assert_eq!(links.len(), 2);
+        db.delete_instance("nova").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('sol', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        restore_child_links_after_root_rebind(&db, &links, "sess-1", "nova", "sol").unwrap();
+        db.rebind_claude_root_actor_state("sess-1", "nova", "sol")
+            .unwrap();
+
+        let direct = db.get_instance_full("nova_task_1").unwrap().unwrap();
+        assert_eq!(direct.parent_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(direct.parent_name.as_deref(), Some("sol"));
+        let nested = db.get_instance_full("nova_task_2").unwrap().unwrap();
+        assert_eq!(nested.parent_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(nested.parent_name.as_deref(), Some("nova_task_1"));
+        assert_eq!(
+            db.resolve_claude_actor_capability(&token, "sess-1")
+                .unwrap(),
+            Some("sol".to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_same_name_root_rebind_restores_child_session_links() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, directory, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', '/tmp/project', 'active', 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'active', 0, 0, 2)",
+                [],
+            )
+            .unwrap();
+        let token = db
+            .issue_claude_actor_capability("sess-1", "tool-child", Some("agent-1"), "nova_task_1")
+            .unwrap();
+
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+        assert_eq!(start_rebind(&db, "nova", &ctx, Some("nova")).unwrap(), 0);
+
+        let child = db.get_instance_full("nova_task_1").unwrap().unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(child.parent_name.as_deref(), Some("nova"));
+        assert_eq!(
+            db.resolve_claude_actor_capability(&token, "sess-1")
+                .unwrap(),
+            Some("nova_task_1".to_string())
         );
     }
 

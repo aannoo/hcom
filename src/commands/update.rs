@@ -1,10 +1,11 @@
 //! `hcom update` command — check and apply updates.
 //!
 //! Uses the shared `fetch_update_info()` function from update.rs to get current,
-//! latest, and availability in one call. Handles interactive prompts and applies updates.
+//! latest, and availability in one call. Applies immediately when an update is
+//! available; `--check` reports availability without applying.
 
 use crate::db::HcomDb;
-use crate::shared::{CommandContext, is_inside_ai_tool};
+use crate::shared::CommandContext;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "update", about = "Check for and apply updates")]
@@ -17,13 +18,13 @@ pub struct UpdateArgs {
 fn print_dev_root_notice(db: &HcomDb) {
     if let Some((path, source)) = crate::router::resolve_effective_dev_root(db.path()) {
         println!("Using local build: {} [{}]", path.display(), source);
-        println!("`hcom update` updates the installed hcom, not this local checkout.");
-        println!("Unset with `hcom config dev_root --unset` to update the installed binary.");
+        println!("`hcom update` bypasses dev_root and updates the binary you invoked.");
+        println!("The local checkout is not changed.");
         println!();
     }
 }
 
-pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>) -> i32 {
+pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>) -> i32 {
     println!("Checking for updates...");
     print_dev_root_notice(_db);
 
@@ -49,34 +50,13 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
         return 0;
     }
 
-    let go = ctx.map(|c| c.go).unwrap_or(false);
-    let inside_ai = is_inside_ai_tool();
-
-    // Inside AI tool without --go: suggest hcom update --go
-    if inside_ai && !go {
-        println!("Run `hcom update --go` to apply automatically.");
-        return 0;
-    }
-
-    // Interactive prompt when running in a terminal
-    if !go && !inside_ai {
-        print!("Apply update? [y/N] ");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err()
-            || !matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
-        {
-            println!("Cancelled.");
-            return 0;
-        }
-    }
-
-    println!("Running: {}", info.cmd);
-
     let status = if cfg!(windows) {
         if crate::update::is_powershell_installer_command(info.cmd) {
-            std::process::Command::new("powershell")
+            let program = crate::update::windows_installer_program();
+            println!(
+                "Running: {program} -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex\""
+            );
+            std::process::Command::new(program)
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
@@ -90,12 +70,14 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
                 "POSIX shell update command selected on Windows",
             ))
         } else {
+            println!("Running: {}", info.cmd);
             match crate::update::split_program_args(info.cmd) {
                 Some((program, args)) => std::process::Command::new(program).args(args).status(),
                 None => Err(std::io::Error::other("empty update command")),
             }
         }
     } else {
+        println!("Running: {}", info.cmd);
         std::process::Command::new("sh")
             .args(["-c", info.cmd])
             .status()

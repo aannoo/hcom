@@ -831,7 +831,7 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         let data: serde_json::Value = serde_json::from_str(&entry.data).unwrap_or_default();
         let snapshot = &data["snapshot"];
         println!("Stopped: {}", entry.instance);
-        println!("  Time:       {}", &entry.timestamp);
+        println!("  Time:       {}", entry.timestamp);
         if let Some(by) = data["by"].as_str() {
             println!("  By:         {by}");
         }

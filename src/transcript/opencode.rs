@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::shared::{Exchange, ToolUse, finalize_action_text, normalize_tool_name, truncate_str};
+use super::shared::{
+    Exchange, ToolUse, capture_tool_output, finalize_action_text, normalize_tool_name, truncate_str,
+};
 use crate::log::log_warn;
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,44 @@ pub(crate) fn get_opencode_db_path() -> Option<PathBuf> {
 
 pub(crate) fn get_kilo_db_path() -> Option<PathBuf> {
     get_family_db_path("kilo")
+}
+
+fn extract_opencode_edits(state: &Value, input: &Value) -> Vec<Value> {
+    let Some(metadata) = state.get("metadata") else {
+        return Vec::new();
+    };
+    let mut edits = Vec::new();
+    if let Some(files) = metadata.get("files").and_then(Value::as_array) {
+        for file in files {
+            // Real opencode/kilo `apply_patch` stores the per-file diff under
+            // `patch`; `diff` is kept as a fallback for other schema versions.
+            let Some(diff) = file
+                .get("patch")
+                .or_else(|| file.get("diff"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let path = file
+                .get("filePath")
+                .or_else(|| file.get("relativePath"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            edits.push(json!({"file": path, "diff": truncate_str(diff, 1000)}));
+        }
+    }
+    if edits.is_empty()
+        && let Some(diff) = metadata.get("diff").and_then(Value::as_str)
+    {
+        let path = input
+            .get("file_path")
+            .or_else(|| input.get("filePath"))
+            .or_else(|| input.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        edits.push(json!({"file": path, "diff": truncate_str(diff, 1000)}));
+    }
+    edits
 }
 
 fn search_family_sessions(
@@ -272,6 +312,8 @@ pub(crate) fn parse_opencode_sqlite(
         let mut action_parts: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
         let mut tools: Vec<ToolUse> = Vec::new();
+        let mut edits: Vec<Value> = Vec::new();
+        let mut errors: Vec<Value> = Vec::new();
 
         for msg in &messages[(user_idx + 1)..next_user_idx] {
             if msg.role != "assistant" {
@@ -300,6 +342,11 @@ pub(crate) fn parse_opencode_sqlite(
                         let state = p.get("state").cloned().unwrap_or(json!({}));
                         let input = state.get("input").cloned().unwrap_or(json!({}));
                         let is_err = state.get("status").and_then(|v| v.as_str()) == Some("error");
+                        let raw_output = if is_err {
+                            state.get("error").and_then(Value::as_str)
+                        } else {
+                            state.get("output").and_then(Value::as_str)
+                        };
 
                         // Extract file paths
                         if let Some(obj) = input.as_object() {
@@ -340,11 +387,22 @@ pub(crate) fn parse_opencode_sqlite(
                                     .to_string()
                             });
 
+                        if matches!(normalized, "Edit" | "Write") {
+                            edits.extend(extract_opencode_edits(&state, &input));
+                        }
+                        if is_err {
+                            errors.push(json!({
+                                "tool": normalized,
+                                "content": raw_output.map(|s| truncate_str(s, 300)).unwrap_or(""),
+                            }));
+                        }
+
                         tools.push(ToolUse {
                             name: normalized.to_string(),
                             is_error: is_err,
                             file,
                             command,
+                            output: raw_output.and_then(capture_tool_output),
                         });
                     }
                     _ => {}
@@ -355,12 +413,6 @@ pub(crate) fn parse_opencode_sqlite(
         position += 1;
         files.truncate(5);
 
-        // Collect errors from tools with is_error
-        let errors: Vec<Value> = tools
-            .iter()
-            .filter(|t| t.is_error)
-            .map(|t| json!({"tool": t.name, "content": ""}))
-            .collect();
         let ended_on_error = tools.last().map(|t| t.is_error).unwrap_or(false);
         let action =
             finalize_action_text(&action_parts.join("\n"), &tools, &errors, ended_on_error);
@@ -372,7 +424,7 @@ pub(crate) fn parse_opencode_sqlite(
             files,
             timestamp,
             tools,
-            edits: Vec::new(),
+            edits,
             errors,
             ended_on_error,
         });
@@ -385,4 +437,100 @@ pub(crate) fn parse_opencode_sqlite(
     }
 
     Ok(exchanges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_outputs_errors_and_edit_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT, message_id TEXT, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["u1", "ses_1", json!({"role": "user"}).to_string(), 1_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "p1",
+                "u1",
+                json!({"type": "text", "text": "edit it"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "a1",
+                "ses_1",
+                json!({"role": "assistant"}).to_string(),
+                2_000
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "p2",
+                "a1",
+                json!({
+                    "type": "tool",
+                    "tool": "apply_patch",
+                    "state": {
+                        "status": "completed",
+                        // Real apply_patch input carries only patchText (no
+                        // path), so the file must be resolved from
+                        // metadata.files[].filePath and the diff from `patch`.
+                        "input": {"patchText": "*** Update File: /work/a.rs"},
+                        "output": "updated",
+                        "metadata": {"files": [{
+                            "filePath": "/work/a.rs",
+                            "patch": "-old\n+new"
+                        }]}
+                    }
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "p3",
+                "a1",
+                json!({
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {
+                        "status": "error",
+                        "input": {"command": "false"},
+                        "error": "exit status 1"
+                    }
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let exchanges = parse_opencode_sqlite(&db_path, "ses_1", 10).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].tools[0].output.as_deref(), Some("updated"));
+        assert_eq!(
+            exchanges[0].tools[1].output.as_deref(),
+            Some("exit status 1")
+        );
+        assert_eq!(exchanges[0].errors[0]["content"], "exit status 1");
+        assert_eq!(exchanges[0].edits[0]["file"], "/work/a.rs");
+        assert_eq!(exchanges[0].edits[0]["diff"], "-old\n+new");
+    }
 }

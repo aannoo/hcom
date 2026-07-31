@@ -1,10 +1,10 @@
 [build-system]
-requires = ["maturin>=1.12.6,<2.0"]
+requires = ["maturin>=1.14.1,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "hcom"
-version = "0.7.23"
+version = "0.7.24"
 description = "Let AI agents message, watch, and spawn each other across terminals. Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot."
 readme = "README.md"
 license = "MIT"

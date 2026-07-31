@@ -18,10 +18,11 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
+mod claude_actors;
 mod events;
 mod instances;
 mod kv;
@@ -36,16 +37,37 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
-     ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
-     UPDATE instances
-     SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
-     WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+         ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
+         UPDATE instances
+         SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
+         WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+    ),
+    (
+        18,
+        "ALTER TABLE instances ADD COLUMN last_seen INTEGER DEFAULT 0;
+         CREATE TABLE IF NOT EXISTS claude_actor_capabilities (
+             token TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             tool_use_id TEXT NOT NULL,
+             agent_id TEXT NOT NULL DEFAULT '',
+             instance_name TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             expires_at INTEGER NOT NULL,
+             last_seen INTEGER NOT NULL,
+             UNIQUE(session_id, tool_use_id, agent_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_claude_actor_expiry
+             ON claude_actor_capabilities(expires_at);
+         CREATE INDEX IF NOT EXISTS idx_claude_actor_session
+             ON claude_actor_capabilities(session_id);",
+    ),
+];
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -68,10 +90,73 @@ fn get_inode(path: &std::path::Path) -> u64 {
     crate::sys::fs::file_id(path)
 }
 
+/// Reject filesystem-backed unit-test databases that are not disposable state.
+/// This is a last-resort tripwire for code paths that bypass Config entirely.
+///
+/// A path is disposable if a fixture registered its root, or if it sits under
+/// the system temp tree — the backstop for ad-hoc `tempfile` DBs opened by
+/// explicit path. Unlike the Config redirect, this stays lenient about temp
+/// geography because tests only ever hand `open_raw` their own throwaway paths;
+/// the inherited-real-DB threat flows through Config, which is registry-gated.
+#[cfg(test)]
+fn assert_isolated_db_path(db_path: &std::path::Path) {
+    if db_path == std::path::Path::new(":memory:") {
+        return;
+    }
+
+    if crate::paths::test_roots::is_registered(db_path) {
+        return;
+    }
+
+    assert!(
+        crate::paths::is_test_temp_path(db_path),
+        "test refused to open a DB at {} (not a registered or temp-tree path).\n\
+         This path is not disposable test state, so open_raw fails closed.\n\
+         Tests must install an isolated environment first:\n    \
+         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();",
+        db_path.display(),
+    );
+}
+
 impl HcomDb {
+    /// Open a hardened connection: secure the directory and database files to
+    /// owner-only modes (see `paths::ensure_private_db`), then open with the
+    /// standard hcom PRAGMAs. The single write path for opening the DB.
+    fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
+        crate::paths::ensure_private_db(db_path)
+            .with_context(|| format!("Failed to secure database: {}", db_path.display()))?;
+
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+        // busy_timeout first: converting a fresh db to WAL takes a brief
+        // exclusive lock, so with a 0 timeout a concurrent first-open (or heavy
+        // load) fails instantly with SQLITE_BUSY. Setting the timeout up front
+        // makes the WAL conversion retry instead.
+        conn.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
+        )?;
+
+        Ok(conn)
+    }
+
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Run `f` inside a `BEGIN IMMEDIATE` transaction and commit on success.
+    ///
+    /// The immediate write lock makes read-modify-write sequences atomic
+    /// across the separate database connections used by hook processes.
+    /// Queries inside `f` must use the provided transaction.
+    pub fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let result = f(&txn)?;
+        txn.commit()?;
+        Ok(result)
     }
 
     /// Access the filesystem path backing this DB handle.
@@ -81,8 +166,10 @@ impl HcomDb {
 
     /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
     pub fn open() -> Result<Self> {
-        let db_path = crate::paths::db_path();
-        Self::open_at(&db_path)
+        let hcom_dir = crate::paths::hcom_dir();
+        crate::paths::ensure_private_directory(&hcom_dir)
+            .with_context(|| format!("Failed to secure hcom directory: {}", hcom_dir.display()))?;
+        Self::open_at(&hcom_dir.join("hcom.db"))
     }
 
     /// Open the hcom database at a specific path with schema migration/compat.
@@ -94,17 +181,9 @@ impl HcomDb {
 
     /// Open DB connection without schema checks (for testing only).
     pub fn open_raw(db_path: &std::path::Path) -> Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create db directory: {}", parent.display()))?;
-        }
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
-
-        // Enable WAL mode for concurrent access + foreign keys for CASCADE
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
+        #[cfg(test)]
+        assert_isolated_db_path(db_path);
+        let conn = Self::open_connection(db_path)?;
 
         let inode = get_inode(db_path);
 
@@ -126,10 +205,21 @@ impl HcomDb {
         }
         // DB file replaced — reconnect
         use crate::log::{log_error, log_info};
+        // Best-effort re-harden: the replacement was written by another hcom
+        // process (reset/archive) that already secured it, so failing here must
+        // not wedge a live delivery/listener loop — log and continue.
+        if let Err(e) = crate::paths::ensure_private_db(&self.db_path) {
+            use crate::log::log_warn;
+            log_warn(
+                "native",
+                "db.secure_fail",
+                &format!("Failed to re-secure DB after replacement: {}", e),
+            );
+        }
         match Connection::open(&self.db_path) {
             Ok(new_conn) => {
                 if let Err(e) = new_conn.execute_batch(
-                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+                    "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
                 ) {
                     use crate::log::log_warn;
                     log_warn(
@@ -224,6 +314,7 @@ impl HcomDb {
                 last_event_id INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'active',
                 status_time INTEGER DEFAULT 0,
+                last_seen INTEGER DEFAULT 0,
                 status_context TEXT DEFAULT '',
                 status_detail TEXT DEFAULT '',
                 last_stop INTEGER DEFAULT 0,
@@ -249,6 +340,21 @@ impl HcomDb {
                 launch_context TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
+
+            -- Claude shell actor capabilities
+            CREATE TABLE IF NOT EXISTS claude_actor_capabilities (
+                token TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_use_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL DEFAULT '',
+                instance_name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                UNIQUE(session_id, tool_use_id, agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_claude_actor_expiry ON claude_actor_capabilities(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_claude_actor_session ON claude_actor_capabilities(session_id);
 
             -- KV table
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
@@ -340,13 +446,11 @@ impl HcomDb {
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {
                 if let Some(version) = old_version {
-                    // If version matches but columns are missing (stamped without migration),
-                    // repair by running migrations from version-1.
-                    let migrate_from = if version == SCHEMA_VERSION {
-                        version - 1
-                    } else {
-                        version
-                    };
+                    // A DB can be stamped at some version yet be missing columns
+                    // an earlier migration should have added ("stamped without
+                    // migration"). The stamp alone can't tell us how far back to
+                    // start, so key off the columns actually present.
+                    let migrate_from = self.repair_migrate_from(version);
                     match self.try_apply_migrations(migrate_from) {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
@@ -385,15 +489,12 @@ impl HcomDb {
                 }
 
                 // Reconnect to fresh DB file
-                let new_conn = Connection::open(&self.db_path).with_context(|| {
+                let new_conn = Self::open_connection(&self.db_path).with_context(|| {
                     format!(
                         "Failed to reopen DB after archive: {}",
                         self.db_path.display()
                     )
                 })?;
-                new_conn.execute_batch(
-                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-                )?;
                 self.conn = new_conn;
                 self.db_inode = get_inode(&self.db_path);
 
@@ -434,6 +535,7 @@ impl HcomDb {
             "kv",
             "notify_endpoints",
             "session_bindings",
+            "claude_actor_capabilities",
         ]
         .into_iter()
         .collect();
@@ -541,6 +643,7 @@ impl HcomDb {
                     "tool",
                     "terminal_preset_requested",
                     "terminal_preset_effective",
+                    "last_seen",
                 ];
                 Ok(required
                     .iter()
@@ -556,6 +659,42 @@ impl HcomDb {
         }
 
         Ok(SchemaCompat::Ok)
+    }
+
+    /// Decide the version to migrate *from* when repairing a DB that may have
+    /// been stamped without actually running its migrations.
+    ///
+    /// Migrations only ADD COLUMN, so an existing column proves its migration
+    /// ran. We walk back to the migration that adds the earliest column still
+    /// missing; a genuinely up-to-date-but-one-behind DB (all older columns
+    /// present) just re-runs the remaining steps.
+    fn repair_migrate_from(&self, version: i32) -> i32 {
+        let columns: std::collections::HashSet<String> = self
+            .conn
+            .prepare("PRAGMA table_info(instances)")
+            .and_then(|mut s| {
+                Ok(s.query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect())
+            })
+            .unwrap_or_default();
+
+        // (migration version, a column that migration introduces)
+        const COLUMN_MIGRATIONS: &[(i32, &str)] =
+            &[(17, "terminal_preset_requested"), (18, "last_seen")];
+        for (migration, column) in COLUMN_MIGRATIONS {
+            if !columns.contains(*column) {
+                return migration - 1;
+            }
+        }
+
+        // All migration-added columns present: ordinary version-behind DB, or a
+        // current stamp flagged for some other reason — re-run just the last step.
+        if version >= SCHEMA_VERSION {
+            SCHEMA_VERSION - 1
+        } else {
+            version
+        }
     }
 
     /// Try in-place migration for consecutive schema versions.
@@ -584,7 +723,23 @@ impl HcomDb {
             let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
                 return Ok(false);
             };
+            let has_status_time = if next_version == 18 {
+                let mut statement = tx.prepare("PRAGMA table_info(instances)")?;
+                let columns: Vec<String> = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|row| row.ok())
+                    .collect();
+                columns.iter().any(|column| column == "status_time")
+            } else {
+                false
+            };
             tx.execute_batch(sql)?;
+            if next_version == 18 && has_status_time {
+                tx.execute(
+                    "UPDATE instances SET last_seen = status_time WHERE last_seen = 0",
+                    [],
+                )?;
+            }
             tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
         }
         tx.commit()?;
@@ -832,6 +987,158 @@ pub(super) mod tests {
         let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
     }
 
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_raw_creates_private_database_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("hcom.db");
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.conn()
+            .execute("CREATE TABLE permission_probe (id INTEGER)", [])
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO permission_probe VALUES (1)", [])
+            .unwrap();
+
+        assert_eq!(mode(&db_path), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-wal")), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-shm")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_raw_restricts_existing_database_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("hcom.db");
+        let first = HcomDb::open_raw(&db_path).unwrap();
+        first
+            .conn()
+            .execute("CREATE TABLE permission_probe (id INTEGER)", [])
+            .unwrap();
+        first
+            .conn()
+            .execute("INSERT INTO permission_probe VALUES (1)", [])
+            .unwrap();
+
+        for path in [
+            db_path.clone(),
+            crate::paths::sidecar_path(&db_path, "-wal"),
+            crate::paths::sidecar_path(&db_path, "-shm"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let _second = HcomDb::open_raw(&db_path).unwrap();
+
+        assert_eq!(mode(&db_path), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-wal")), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-shm")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_raw_restricts_sidecars_for_non_db_filename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("state.sqlite");
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.conn()
+            .execute("CREATE TABLE permission_probe (id INTEGER)", [])
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO permission_probe VALUES (1)", [])
+            .unwrap();
+
+        let wal_path = tmp.path().join("state.sqlite-wal");
+        let shm_path = tmp.path().join("state.sqlite-shm");
+        std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _second = HcomDb::open_raw(&db_path).unwrap();
+
+        assert_eq!(mode(&wal_path), 0o600);
+        assert_eq!(mode(&shm_path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_restricts_the_configured_hcom_directory_and_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::set_permissions(&hcom_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = HcomDb::open().unwrap();
+
+        assert_eq!(mode(&hcom_dir), 0o700);
+        assert_eq!(mode(db.path()), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_if_stale_resecures_replaced_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("hcom.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+
+        // Simulate another process replacing the DB with a broad-mode file
+        // (new inode), as reset/schema-archive does.
+        std::fs::remove_file(&db_path).unwrap();
+        let _ = std::fs::remove_file(crate::paths::sidecar_path(&db_path, "-wal"));
+        let _ = std::fs::remove_file(crate::paths::sidecar_path(&db_path, "-shm"));
+        drop(HcomDb::open_raw(&db_path).unwrap());
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(db.reconnect_if_stale());
+        assert_eq!(mode(&db_path), 0o600);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a registered or temp-tree path")]
+    fn test_open_raw_rejects_non_temp_path() {
+        let db_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".hcom-unsafe-test")
+            .join("hcom.db");
+        let _ = HcomDb::open_raw(&db_path);
+    }
+
+    #[test]
+    fn test_open_raw_allows_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("allowed.db");
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+
+        assert_eq!(db.path(), db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "not a registered or temp-tree path")]
+    fn test_open_raw_rejects_temp_symlink_to_non_temp_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("outside");
+        symlink(env!("CARGO_MANIFEST_DIR"), &link).unwrap();
+        let db_path = link.join(".hcom").join("hcom.db");
+
+        let _ = HcomDb::open_raw(&db_path);
+    }
+
     #[test]
     fn test_all_methods_return_ok_none_when_not_found() {
         let (db, db_path) = setup_full_test_db();
@@ -1067,7 +1374,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_ensure_schema_migrates_v16_to_v17_in_place() {
+    fn test_ensure_schema_migrates_v16_to_v18_in_place_without_status_time() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(2500);
 
@@ -1134,6 +1441,70 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(launch_context, r#"{"terminal_preset":"ghostty-tab"}"#);
+        let last_seen: i64 = db
+            .conn
+            .query_row(
+                "SELECT last_seen FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_seen, 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_ensure_schema_migrates_v17_to_v18_using_status_time() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2750);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_migrate_status_time_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     status_time INTEGER DEFAULT 0,
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 17;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO instances (name, tool, status_time, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["luna", "claude", 123i64, 1.0f64],
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let last_seen: i64 = db
+            .conn
+            .query_row(
+                "SELECT last_seen FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_seen, 123);
 
         cleanup_test_db(db_path);
     }
@@ -1160,6 +1531,17 @@ pub(super) mod tests {
                  CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
                  CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
                  CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE claude_actor_capabilities (
+                     token TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     tool_use_id TEXT NOT NULL,
+                     agent_id TEXT NOT NULL DEFAULT '',
+                     instance_name TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     last_seen INTEGER NOT NULL,
+                     UNIQUE(session_id, tool_use_id, agent_id)
+                 );
                  PRAGMA user_version = {};",
                 SCHEMA_VERSION
             ))

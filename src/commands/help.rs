@@ -334,7 +334,7 @@ const BUNDLE_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "    normal = truncated | full = complete | detailed = tools+edits",
+        "    normal = truncated | full = complete text | detailed = tool I/O+edits+errors",
     ),
     ("  --extends <id>", "Parent bundle for chaining"),
     ("  --bundle JSON", "Create from JSON payload"),
@@ -377,6 +377,10 @@ const STOP_HELP: &[HelpEntry] = &[
 
 const START_HELP: &[HelpEntry] = &[
     ("start", "Connect to hcom (from inside any AI session)"),
+    (
+        "start --name <agent-id>",
+        "Register a subagent using its agent ID (from SubagentStart)",
+    ),
     (
         "start --as <name>",
         "Reclaim identity (after compaction/resume/clear)",
@@ -487,6 +491,10 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Auto-trust launch dir (skip folder-trust prompt)",
     ),
     ("  name_export", "Export agent name to custom env var"),
+    (
+        "  title_mode",
+        "Terminal/tab title: combined, label, or off",
+    ),
     ("", "hcom config <key> --info for details"),
     ("", ""),
     ("", "Precedence: defaults < config.toml < env vars"),

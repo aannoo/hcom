@@ -1,5 +1,7 @@
 //! Shared hook functions — deliver, poll, bind, bootstrap, finalize.
 
+use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -289,6 +291,9 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
     let mut updates = serde_json::Map::new();
     updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
+    if ack.mark_announced {
+        updates.insert("name_announced".into(), serde_json::json!(true));
+    }
     instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
@@ -342,6 +347,7 @@ fn prepare_raw_messages(
             last_event_id: last_id,
             status_context: format!("deliver:{}", sender_display),
             msg_ts,
+            mark_announced: false,
         },
     })
 }
@@ -360,6 +366,21 @@ pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>
     (prepared.messages, Some(prepared.formatted))
 }
 
+/// Result of [`poll_messages`].
+pub struct PollResult {
+    /// True if a message was delivered (Stop/SubagentStop should be blocked
+    /// so Claude sees `output` on its next turn instead of ending).
+    pub delivered: bool,
+    /// `{"decision":"block","reason":...}` when `delivered`, else `None`.
+    pub output: Option<Value>,
+    pub timed_out: bool,
+    /// Deferred cursor/status commit. Caller must call `commit_delivery_ack`
+    /// only after `output` has been successfully written to stdout — never
+    /// before, since Claude only reads `output` on exit 0 and a premature
+    /// commit would advance the cursor past a message Claude never saw.
+    pub ack: Option<super::DeliveryAck>,
+}
+
 /// Stop hook polling loop — NOT used by main PTY path.
 ///
 /// Runs for: headless instances, vanilla tool instances, subagent polling.
@@ -368,17 +389,15 @@ pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
 /// Senders call `crate::notify::wake` (kind=`hook`) to wake the select().
 ///
-/// Returns (exit_code, hook_output_json, timed_out).
-/// - exit_code: 0 for timeout/no-participant, 2 for message delivery
-/// - hook_output: JSON value if messages delivered
-/// - timed_out: true if polling timed out without messages
-///
+/// Always exits 0: Claude ignores stdout JSON on exit 2 for Stop/SubagentStop
+/// (stderr-only feedback), so a delivered message must go out as exit 0 +
+/// `{"decision":"block"}` or Claude never sees it.
 pub fn poll_messages(
     db: &HcomDb,
     instance_name: &str,
     timeout_secs: u64,
     is_background: bool,
-) -> (i32, Option<Value>, bool) {
+) -> PollResult {
     match poll_messages_inner(db, instance_name, timeout_secs, is_background) {
         Ok(result) => result,
         Err(e) => {
@@ -387,7 +406,12 @@ pub fn poll_messages(
                 "hook.error",
                 &format!("hook=poll_messages err={}", e),
             );
-            (0, None, false)
+            PollResult {
+                delivered: false,
+                output: None,
+                timed_out: false,
+                ack: None,
+            }
         }
     }
 }
@@ -397,13 +421,18 @@ fn poll_messages_inner(
     instance_name: &str,
     timeout_secs: u64,
     is_background: bool,
-) -> Result<(i32, Option<Value>, bool)> {
+) -> Result<PollResult> {
     // Check instance exists
     let instance_data = db
         .get_instance_full(instance_name)
         .context("DB error checking instance")?;
     if instance_data.is_none() {
-        return Ok((0, None, false));
+        return Ok(PollResult {
+            delivered: false,
+            output: None,
+            timed_out: false,
+            ack: None,
+        });
     }
 
     // Setup TCP notification socket
@@ -452,13 +481,19 @@ fn poll_loop(
     start: Instant,
     is_background: bool,
     notify_server: Option<&TcpListener>,
-) -> Result<(i32, Option<Value>, bool)> {
+) -> Result<PollResult> {
+    let empty = || PollResult {
+        delivered: false,
+        output: None,
+        timed_out: false,
+        ack: None,
+    };
     let mut waited = false;
     while start.elapsed() < timeout {
         // Check if instance still exists (stopped = row deleted)
         let instance_data = db.get_instance_full(instance_name)?;
         if instance_data.is_none() {
-            return Ok((0, None, false));
+            return Ok(empty());
         }
 
         // Poll for messages BEFORE select to catch transition gap
@@ -468,16 +503,24 @@ fn poll_loop(
             // Only check after we've waited at least once — on the first iteration stdin
             // may legitimately be closed (e.g. subprocess invocation via `input=...`).
             if waited && !is_background && check_stdin_closed() {
-                return Ok((0, None, false));
+                return Ok(empty());
             }
 
             if let Some(prepared) = prepare_raw_messages(db, instance_name, raw_messages) {
-                commit_delivery_ack(db, &prepared.ack);
+                // Do NOT commit the ack here — the caller must only advance
+                // the cursor after `output` is actually flushed to stdout.
+                // Claude discards stdout JSON on exit 2, so this must be
+                // reported via exit 0 + decision:block for Claude to see it.
                 let output = serde_json::json!({
                     "decision": "block",
                     "reason": prepared.formatted,
                 });
-                return Ok((2, Some(output), false));
+                return Ok(PollResult {
+                    delivered: true,
+                    output: Some(output),
+                    timed_out: false,
+                    ack: Some(prepared.ack),
+                });
             }
         }
 
@@ -525,7 +568,12 @@ fn poll_loop(
     }
 
     // Timeout reached
-    Ok((0, None, true))
+    Ok(PollResult {
+        delivered: false,
+        output: None,
+        timed_out: true,
+        ack: None,
+    })
 }
 
 /// Check if stdin is closed (orphan detection heuristic).
@@ -700,16 +748,188 @@ pub fn inject_bootstrap_once(
     Some(bootstrap_text)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptOwnerResolution {
+    Owner(String),
+    Ambiguous(Vec<String>),
+    Unknown,
+}
+
+/// Resolve Claude ownership from bounded, structured transcript/session evidence.
+///
+/// Only envelope metadata is inspected. Ordinary message content, summaries,
+/// tool output, bootstrap text, and `[hcom:name]` markers are intentionally out
+/// of scope for lineage resolution.
+pub(crate) fn resolve_claude_transcript_owner(
+    db: &HcomDb,
+    transcript_path: &str,
+    incoming_session_id: Option<&str>,
+) -> Result<TranscriptOwnerResolution> {
+    const MAX_BYTES: usize = 512 * 1024;
+    const MAX_RECORDS: usize = 2048;
+
+    let mut owners = BTreeSet::new();
+    let mut structured_session_ids = BTreeSet::new();
+
+    let incoming_is_validated = match incoming_session_id.filter(|value| !value.is_empty()) {
+        Some(session_id) => db.get_validated_claude_session_owner(session_id)?.is_some(),
+        None => false,
+    };
+    if incoming_is_validated && let Some(session_id) = incoming_session_id {
+        // A hook-provided incoming ID is only self-authenticating after a
+        // trusted SessionStart or prior structured-lineage validation.
+        structured_session_ids.insert(session_id.to_string());
+    }
+
+    if !transcript_path.is_empty() {
+        owners.extend(db.get_instances_by_transcript_path(transcript_path)?);
+
+        match std::fs::File::open(transcript_path) {
+            Ok(file) => {
+                // Head-biased by design: fork ancestry is copied into the first
+                // records, and SessionStart must never stall on a huge transcript.
+                let mut input = Vec::with_capacity(MAX_BYTES + 1);
+                file.take((MAX_BYTES + 1) as u64).read_to_end(&mut input)?;
+                let input_is_truncated = input.len() > MAX_BYTES;
+                input.truncate(MAX_BYTES);
+                for line in input
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .take(MAX_RECORDS)
+                {
+                    // The bounded read may end in the middle of a UTF-8 code
+                    // point or JSON record. Ignore only that incomplete tail
+                    // rather than failing after valid earlier rows.
+                    if input_is_truncated && !line.ends_with(b"\n") {
+                        break;
+                    }
+                    let Ok(line) = std::str::from_utf8(line) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    for session_id in [
+                        value.get("sessionId").and_then(Value::as_str),
+                        value.get("session_id").and_then(Value::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    {
+                        // Claude rewrites top-level IDs to the new fork UUID.
+                        // Until that incoming binding is validated, the same ID
+                        // cannot prove its own ownership. Different top-level
+                        // IDs remain useful structured ancestry evidence.
+                        if incoming_session_id != Some(session_id) || incoming_is_validated {
+                            structured_session_ids.insert(session_id.to_string());
+                        }
+                    }
+                    if let Some(session_id) = value
+                        .get("message")
+                        .and_then(|message| message.get("session_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        // Envelope message.session_id is independent structured
+                        // provenance and may legitimately equal the current ID.
+                        structured_session_ids.insert(session_id.to_string());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    for session_id in structured_session_ids {
+        if let Some(owner) = db.get_session_binding(&session_id)? {
+            owners.insert(owner);
+        }
+    }
+
+    Ok(match owners.len() {
+        0 => TranscriptOwnerResolution::Unknown,
+        1 => TranscriptOwnerResolution::Owner(owners.into_iter().next().unwrap()),
+        _ => TranscriptOwnerResolution::Ambiguous(owners.into_iter().collect()),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeIdentityEvidence {
+    pub process_binding: Option<(Option<String>, String)>,
+    pub process_session_id: Option<String>,
+    pub process_owner: Option<String>,
+    pub session_owner: Option<String>,
+    pub validated_session_owner: Option<String>,
+    pub owners_disagree: bool,
+    pub lineage_scanned: bool,
+    pub lineage: TranscriptOwnerResolution,
+}
+
+/// Load the identity facts shared by SessionStart and ordinary Claude hooks.
+///
+/// The caller supplies only the lineage-scan policy; owner selection remains
+/// local to each resolution path.
+pub(crate) fn load_claude_identity_evidence(
+    db: &HcomDb,
+    process_id: Option<&str>,
+    session_id: &str,
+    transcript_path: &str,
+    should_scan_lineage: impl FnOnce(&ClaudeIdentityEvidence) -> bool,
+) -> Result<ClaudeIdentityEvidence> {
+    let process_binding = match process_id.filter(|value| !value.is_empty()) {
+        Some(process_id) => db.get_process_binding_full(process_id)?,
+        None => None,
+    };
+    let process_session_id = process_binding
+        .as_ref()
+        .and_then(|(session_id, _)| session_id.clone());
+    let process_owner = process_binding
+        .as_ref()
+        .map(|(_, instance_name)| instance_name.clone());
+    let session_owner = if session_id.is_empty() {
+        None
+    } else {
+        db.get_session_binding(session_id)?
+    };
+    let validated_session_owner = if session_id.is_empty() {
+        None
+    } else {
+        db.get_validated_claude_session_owner(session_id)?
+    };
+    let owners_disagree = matches!(
+        (&process_owner, &session_owner),
+        (Some(process_owner), Some(session_owner)) if process_owner != session_owner
+    );
+
+    let mut evidence = ClaudeIdentityEvidence {
+        process_binding,
+        process_session_id,
+        process_owner,
+        session_owner,
+        validated_session_owner,
+        owners_disagree,
+        lineage_scanned: false,
+        lineage: TranscriptOwnerResolution::Unknown,
+    };
+    evidence.lineage_scanned = should_scan_lineage(&evidence);
+    if evidence.lineage_scanned {
+        evidence.lineage = resolve_claude_transcript_owner(
+            db,
+            transcript_path,
+            (!session_id.is_empty()).then_some(session_id),
+        )?;
+    }
+    Ok(evidence)
+}
+
 /// Initialize instance context from hook data via binding lookup.
 ///
-/// Primary gate for hook participation. Resolution order:
-/// 1. HCOM_PROCESS_ID → process_bindings → instance_name
-/// 2. session_id → session_bindings → instance_name
-/// 3. Transcript marker fallback
-/// 4. Not found → (None, empty, false)
+/// Structured session/transcript identity wins over a conflicting process
+/// binding. Transcript scanning stays off the common hot path: it runs only
+/// when the session is unbound or its binding has not yet been validated.
 ///
 /// Returns (instance_name, metadata_updates, is_matched_resume).
-///
 pub fn init_hook_context(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -717,64 +937,132 @@ pub fn init_hook_context(
     transcript_path: &str,
 ) -> (Option<String>, serde_json::Map<String, Value>, bool) {
     let start = Instant::now();
-    let mut instance_name: Option<String> = None;
-
-    // Path 1: Process binding (hcom-launched instances)
-    let process_start = Instant::now();
-    if let Some(ref process_id) = ctx.process_id
-        && let Ok(Some(name)) = db.get_process_binding(process_id)
-    {
-        instance_name = Some(name);
-    }
-    let process_ms = process_start.elapsed().as_secs_f64() * 1000.0;
-
-    // Path 2: Session binding
-    let binding_start = Instant::now();
-    if instance_name.is_none()
-        && !session_id.is_empty()
-        && let Ok(Some(name)) = db.get_session_binding(session_id)
-    {
-        instance_name = Some(name);
-    }
-    let binding_ms = binding_start.elapsed().as_secs_f64() * 1000.0;
-
-    // Path 3: Transcript marker fallback
-    let transcript_start = Instant::now();
-    if instance_name.is_none() {
-        instance_name = try_bind_from_transcript(db, session_id, transcript_path);
-        if instance_name.is_none() {
-            let transcript_ms = transcript_start.elapsed().as_secs_f64() * 1000.0;
-            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            log::log_info(
+    let evidence = match load_claude_identity_evidence(
+        db,
+        ctx.process_id.as_deref(),
+        session_id,
+        transcript_path,
+        |evidence| {
+            let binding_needs_validation = evidence.session_owner.is_some()
+                && evidence.validated_session_owner.as_ref() != evidence.session_owner.as_ref();
+            evidence.session_owner.is_none() || binding_needs_validation
+        },
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            log::log_warn(
                 "hooks",
-                "init_hook_context.timing",
+                "init_hook_context.identity_evidence_error",
                 &format!(
-                    "process_ms={:.2} binding_ms={:.2} transcript_ms={:.2} total_ms={:.2} result=no_instance",
-                    process_ms, binding_ms, transcript_ms, total_ms
+                    "session_id={} transcript_path={} process_id={:?} err={}",
+                    session_id, transcript_path, ctx.process_id, error
                 ),
             );
             return (None, serde_json::Map::new(), false);
         }
+    };
+    let evidence_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let historical_process_binding = evidence
+        .process_session_id
+        .as_deref()
+        .filter(|bound_session_id| !bound_session_id.is_empty())
+        .is_some_and(|bound_session_id| bound_session_id != session_id);
+
+    let mut instance_name = if let Some(validated_owner) = evidence.validated_session_owner.clone()
+    {
+        Some(validated_owner)
+    } else if evidence.lineage_scanned {
+        match &evidence.lineage {
+            TranscriptOwnerResolution::Owner(owner) => Some(owner.clone()),
+            TranscriptOwnerResolution::Ambiguous(owners) => {
+                log::log_warn(
+                    "hooks",
+                    "init_hook_context.identity_ambiguous",
+                    &format!(
+                        "session_id={} transcript_path={} process_id={:?} process_owner={:?} session_owner={:?} transcript_owners={:?}",
+                        session_id,
+                        transcript_path,
+                        ctx.process_id,
+                        evidence.process_owner,
+                        evidence.session_owner,
+                        owners,
+                    ),
+                );
+                None
+            }
+            TranscriptOwnerResolution::Unknown => {
+                if evidence.session_owner.is_some() {
+                    log::log_warn(
+                        "hooks",
+                        "init_hook_context.unvalidated_session_rejected",
+                        &format!(
+                            "session_id={} transcript_path={} process_id={:?} process_owner={:?} session_owner={:?}",
+                            session_id,
+                            transcript_path,
+                            ctx.process_id,
+                            evidence.process_owner,
+                            evidence.session_owner,
+                        ),
+                    );
+                    None
+                } else if historical_process_binding {
+                    log::log_warn(
+                        "hooks",
+                        "init_hook_context.historical_process_rejected",
+                        &format!(
+                            "session_id={} transcript_path={} process_id={:?} process_session_id={:?} process_owner={:?}",
+                            session_id,
+                            transcript_path,
+                            ctx.process_id,
+                            evidence.process_session_id,
+                            evidence.process_owner,
+                        ),
+                    );
+                    None
+                } else {
+                    evidence.process_owner.clone()
+                }
+            }
+        }
+    } else {
+        evidence
+            .session_owner
+            .clone()
+            .or_else(|| evidence.process_owner.clone())
+    };
+
+    if instance_name.is_none()
+        && !matches!(&evidence.lineage, TranscriptOwnerResolution::Ambiguous(_))
+        && evidence.session_owner.is_none()
+        && evidence.process_owner.is_none()
+    {
+        instance_name = try_bind_from_transcript(db, session_id, transcript_path);
     }
-    let transcript_ms = transcript_start.elapsed().as_secs_f64() * 1000.0;
+    let Some(name) = instance_name else {
+        log::log_info(
+            "hooks",
+            "init_hook_context.timing",
+            &format!(
+                "evidence_ms={:.2} total_ms={:.2} result=no_instance owners_disagree={}",
+                evidence_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
+                evidence.owners_disagree
+            ),
+        );
+        return (None, serde_json::Map::new(), false);
+    };
 
-    let name = instance_name.unwrap();
-
-    // Build metadata updates
-    let instance_start = Instant::now();
     let mut updates = serde_json::Map::new();
     updates.insert(
         "directory".into(),
         Value::String(ctx.cwd.to_string_lossy().to_string()),
     );
-
     if !transcript_path.is_empty() {
         updates.insert(
             "transcript_path".into(),
             Value::String(transcript_path.to_string()),
         );
     }
-
     if ctx.is_background
         && let Some(ref bg_name) = ctx.background_name
     {
@@ -786,25 +1074,52 @@ pub fn init_hook_context(
         );
     }
 
-    // Check if session matches (resume detection)
-    let is_matched_resume = if !session_id.is_empty() {
-        db.get_instance_full(&name)
-            .ok()
-            .flatten()
-            .map(|data| data.session_id.as_deref() == Some(session_id))
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    let instance_ms = instance_start.elapsed().as_secs_f64() * 1000.0;
+    let instance = db.get_instance_full(&name).ok().flatten();
+    let is_matched_resume = !session_id.is_empty()
+        && instance
+            .as_ref()
+            .is_some_and(|data| data.session_id.as_deref() == Some(session_id));
 
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if is_matched_resume
+        && matches!(&evidence.lineage, TranscriptOwnerResolution::Owner(owner) if owner == &name)
+        && evidence.session_owner.as_deref() == Some(name.as_str())
+        && let Err(error) = db.mark_claude_session_validated(session_id, &name)
+    {
+        log::log_warn(
+            "hooks",
+            "init_hook_context.validation_cache_write_failed",
+            &format!("session_id={} owner={} err={}", session_id, name, error),
+        );
+    }
+
+    if evidence.lineage_scanned
+        && matches!(&evidence.lineage, TranscriptOwnerResolution::Owner(owner) if owner == &name)
+        && !is_matched_resume
+    {
+        log::log_warn(
+            "hooks",
+            "init_hook_context.unpromoted_lineage_rejected",
+            &format!(
+                "session_id={} owner={} primary_session={:?} total_ms={:.2}",
+                session_id,
+                name,
+                instance.as_ref().and_then(|row| row.session_id.as_deref()),
+                start.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
+        return (None, serde_json::Map::new(), false);
+    }
+
     log::log_info(
         "hooks",
         "init_hook_context.timing",
         &format!(
-            "instance={} process_ms={:.2} binding_ms={:.2} transcript_ms={:.2} instance_ms={:.2} total_ms={:.2}",
-            name, process_ms, binding_ms, transcript_ms, instance_ms, total_ms
+            "instance={} evidence_ms={:.2} total_ms={:.2} validated={} owners_disagree={}",
+            name,
+            evidence_ms,
+            start.elapsed().as_secs_f64() * 1000.0,
+            evidence.validated_session_owner.is_some(),
+            evidence.owners_disagree,
         ),
     );
 
@@ -860,6 +1175,13 @@ fn try_bind_from_transcript(
     let mut updates = serde_json::Map::new();
     updates.insert("session_id".into(), Value::String(session_id.to_string()));
     instances::update_instance_position(db, &instance_name, &updates);
+    if let Err(error) = db.mark_claude_session_validated(session_id, &instance_name) {
+        log::log_warn(
+            "hooks",
+            "transcript.bind.validation_cache_failed",
+            &format!("instance={} err={}", instance_name, error),
+        );
+    }
 
     log::log_info(
         "hooks",
@@ -913,8 +1235,20 @@ pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
 ///
 /// Handles: snapshot capture, session/process/notify/subscription cleanup,
 /// life event logging, and instance deletion.
-pub fn stop_instance(db: &HcomDb, instance_name: &str, initiated_by: &str, reason: &str) {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0);
+pub fn stop_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+) -> StopOutcome {
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    Stopped,
+    AlreadyStopped,
+    RetryableError(String),
 }
 
 pub(crate) fn stop_placeholder_instance(
@@ -922,13 +1256,24 @@ pub(crate) fn stop_placeholder_instance(
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
-) {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0);
+) -> StopOutcome {
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
 /// corruption creates a parent_session_id cycle.
 const MAX_STOP_DEPTH: u32 = 10;
+
+fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<String>> {
+    let sql = match column {
+        "parent_session_id" => "SELECT name FROM instances WHERE parent_session_id = ?",
+        "parent_name" => "SELECT name FROM instances WHERE parent_name = ?",
+        _ => anyhow::bail!("unsupported child relationship: {column}"),
+    };
+    let mut stmt = db.conn().prepare(sql)?;
+    let rows = stmt.query_map(params![value], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
 
 fn stop_instance_inner(
     db: &HcomDb,
@@ -937,7 +1282,7 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
-) {
+) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
             "core",
@@ -947,12 +1292,19 @@ fn stop_instance_inner(
                 MAX_STOP_DEPTH, instance_name
             ),
         );
-        return;
+        return StopOutcome::RetryableError(format!(
+            "recursion limit reached while stopping {instance_name}"
+        ));
     }
 
     let instance_data = match db.get_instance_full(instance_name) {
         Ok(Some(data)) => data,
-        _ => return,
+        Ok(None) => return StopOutcome::AlreadyStopped,
+        Err(e) => {
+            return StopOutcome::RetryableError(format!(
+                "could not read instance {instance_name}: {e}"
+            ));
+        }
     };
 
     // Kill headless processes (background=true)
@@ -1067,63 +1419,88 @@ fn stop_instance_inner(
         "tool": instance_data.tool,
         "directory": instance_data.directory,
         "parent_name": instance_data.parent_name,
+        "parent_session_id": instance_data.parent_session_id,
         "tag": instance_data.tag,
         "wait_timeout": instance_data.wait_timeout,
         "subagent_timeout": instance_data.subagent_timeout,
         "hints": instance_data.hints,
         "pid": instance_data.pid,
         "created_at": instance_data.created_at,
+        "last_seen": instance_data.last_seen,
         "background": instance_data.background,
         "agent_id": instance_data.agent_id,
+        "name_announced": instance_data.name_announced,
         "launch_args": instance_data.launch_args,
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
     });
 
-    // Clean session bindings + process bindings + stop subagents for this session
-    if let Some(ref session_id) = instance_data.session_id {
-        let _ = db.conn().execute(
-            "DELETE FROM session_bindings WHERE session_id = ?",
-            params![session_id],
-        );
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE session_id = ?",
-            params![session_id],
-        );
+    // Snapshot both child sets before deleting the parent. Only the teardown
+    // winner processes them, but it still needs relationships that may be
+    // cascaded or otherwise obscured by the parent deletion.
+    let session_subagents = match instance_data.session_id.as_deref() {
+        Some(session_id) => match child_instance_names(db, "parent_session_id", session_id) {
+            Ok(children) => children,
+            Err(e) => {
+                return StopOutcome::RetryableError(format!(
+                    "could not enumerate session children of {instance_name}: {e}"
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
+    let native_children = match child_instance_names(db, "parent_name", instance_name) {
+        Ok(children) => children,
+        Err(e) => {
+            return StopOutcome::RetryableError(format!(
+                "could not enumerate native children of {instance_name}: {e}"
+            ));
+        }
+    };
 
-        // Recursively stop subagents whose parent_session_id matches this session
-        let subagents: Vec<String> = db
-            .conn()
-            .prepare("SELECT name FROM instances WHERE parent_session_id = ?")
-            .and_then(|mut stmt| {
-                stmt.query_map(params![session_id], |row| row.get::<_, String>(0))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default();
-        for sub_name in subagents {
-            stop_instance_inner(
-                db,
-                &sub_name,
-                initiated_by,
-                "parent_stopped",
-                false,
-                depth + 1,
+    // Finish children first while the parent row keeps the teardown retryable.
+    // Concurrent callers may repeat this work; every child has its own atomic
+    // event/delete gate.
+    for sub_name in session_subagents {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+            db,
+            &sub_name,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+        ) {
+            log::log_warn(
+                "hooks",
+                "finalize.child_stop_incomplete",
+                &format!("parent={instance_name} child={sub_name} err={error}"),
             );
+            return StopOutcome::RetryableError(format!(
+                "could not stop child {sub_name}: {error}"
+            ));
         }
     }
 
-    // Clean notify endpoints and process bindings for this instance
-    let _ = db.delete_notify_endpoints(instance_name);
-    let _ = db.conn().execute(
-        "DELETE FROM process_bindings WHERE instance_name = ?",
-        params![instance_name],
-    );
+    // Native subagent rows carry session_id=NULL and inherit the root session
+    // as parent_session_id, so only parent_name links nested children. A row
+    // already stopped via the session set is a no-op here.
+    for child in native_children {
+        if let StopOutcome::RetryableError(error) =
+            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
+        {
+            log::log_warn(
+                "hooks",
+                "finalize.child_stop_incomplete",
+                &format!("parent={instance_name} child={child} err={error}"),
+            );
+            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
+        }
+    }
 
-    // Clean event subscriptions
-    let _ = db.cleanup_subscriptions(instance_name);
-
-    // Log life event with snapshot BEFORE delete
+    // Publish the winner's pre-delete snapshot in the same transaction that
+    // deletes the row and its control-plane state. Event failure rolls the
+    // deletion back, so another invocation can retry the whole teardown.
     let mut event_data = serde_json::json!({
         "action": "stopped",
         "by": initiated_by,
@@ -1133,36 +1510,42 @@ fn stop_instance_inner(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    if let Err(e) = db.log_event("life", instance_name, &event_data) {
-        log::log_warn(
-            "hooks",
-            "finalize.life_event_failed",
-            &format!("log_life_event failed for {instance_name}: {e}"),
-        );
+    match db.finalize_instance_stop(
+        instance_name,
+        instance_data.created_at,
+        instance_data.session_id.as_deref(),
+        instance_data.agent_id.as_deref(),
+        &event_data,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return StopOutcome::AlreadyStopped,
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "finalize.transaction_failed",
+                &format!("instance={instance_name} err={e}"),
+            );
+            return StopOutcome::RetryableError(format!(
+                "could not finalize stop for {instance_name}: {e}"
+            ));
+        }
     }
 
-    // Delete instance row (CASCADE cleans remaining FK references)
-    if let Err(e) = db.delete_instance(instance_name) {
-        log::log_warn(
-            "hooks",
-            "finalize.delete_failed",
-            &format!("delete_instance failed for {instance_name}: {e}"),
-        );
+    // Capabilities are scoped to the deleted actor. Root teardown also
+    // revokes every child token in the shared Claude session and drops
+    // outstanding stop-claim correlation records.
+    let _ = db.revoke_claude_actor_capabilities_for_instance(instance_name);
+    if let Some(ref session_id) = instance_data.session_id {
+        let _ = db.revoke_claude_actor_capabilities_for_session(session_id);
+        let _ = db.kv_delete_prefix(&format!("subagent_stop_inflight:{session_id}:"));
     }
 
     // Notify remaining listeners AFTER delete (so they see the row is gone)
     crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
 
     // Trigger relay push (best-effort)
-    let prefix = crate::runtime_env::get_hcom_prefix();
-    if let Some((cmd, prefix_args)) = prefix.split_first() {
-        let _ = std::process::Command::new(cmd)
-            .args(prefix_args)
-            .args(["relay", "push"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    crate::relay::spawn_background_push();
+    StopOutcome::Stopped
 }
 
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
@@ -1176,13 +1559,17 @@ fn stop_instance_inner(
 /// agy's real teardown is the PTY exit (`cleanup_antigravity_pty_exit`), which sees
 /// the inactive status and preserves the row for `hcom r`.
 ///
-/// Clears session/process bindings and logs a stopped life event with snapshot, but
-/// does not delete the instance row.
+/// Clears session bindings (and process bindings unless `keep_process_binding`),
+/// and logs a stopped life event with snapshot, but does not delete the instance row.
+///
+/// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
+/// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
+    keep_process_binding: bool,
 ) {
     log::log_info(
         "hooks",
@@ -1214,14 +1601,17 @@ pub fn soft_finalize_session(
         "tool": instance_data.tool,
         "directory": instance_data.directory,
         "parent_name": instance_data.parent_name,
+        "parent_session_id": instance_data.parent_session_id,
         "tag": instance_data.tag,
         "wait_timeout": instance_data.wait_timeout,
         "subagent_timeout": instance_data.subagent_timeout,
         "hints": instance_data.hints,
         "pid": instance_data.pid,
         "created_at": instance_data.created_at,
+        "last_seen": instance_data.last_seen,
         "background": instance_data.background,
         "agent_id": instance_data.agent_id,
+        "name_announced": instance_data.name_announced,
         "launch_args": instance_data.launch_args,
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
@@ -1233,17 +1623,21 @@ pub fn soft_finalize_session(
             "DELETE FROM session_bindings WHERE session_id = ?",
             params![session_id],
         );
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE session_id = ?",
-            params![session_id],
-        );
+        if !keep_process_binding {
+            let _ = db.conn().execute(
+                "DELETE FROM process_bindings WHERE session_id = ?",
+                params![session_id],
+            );
+        }
     }
 
     let _ = db.delete_notify_endpoints(instance_name);
-    let _ = db.conn().execute(
-        "DELETE FROM process_bindings WHERE instance_name = ?",
-        params![instance_name],
-    );
+    if !keep_process_binding {
+        let _ = db.conn().execute(
+            "DELETE FROM process_bindings WHERE instance_name = ?",
+            params![instance_name],
+        );
+    }
     let _ = db.cleanup_subscriptions(instance_name);
 
     if let Err(e) = db.log_life_event(
@@ -1324,6 +1718,8 @@ pub fn update_tool_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use serial_test::serial;
     use std::io::Write;
 
     #[test]
@@ -1433,9 +1829,11 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_hook_instance_no_db() {
-        // Best-effort function should not panic even with no DB
-        // (HcomDb::open() will fail in test env without ~/.hcom)
+    #[serial]
+    fn test_notify_hook_instance_missing_instance() {
+        // Best-effort wake must not panic when the DB opens but the named
+        // instance has no row (the common case for a stale notify target).
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         notify_hook_instance("nonexistent");
     }
 
@@ -1455,6 +1853,334 @@ mod tests {
                 [name],
             )
             .unwrap();
+    }
+
+    fn insert_bound_claude_instance(
+        db: &crate::db::HcomDb,
+        name: &str,
+        session_id: &str,
+        transcript_path: &str,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, session_id, transcript_path, status, status_context, status_time, created_at, last_event_id)
+                 VALUES (?1, 'claude', ?2, ?3, 'listening', 'start', 0, 0, 0)",
+                rusqlite::params![name, session_id, transcript_path],
+            )
+            .unwrap();
+        db.set_session_binding(session_id, name).unwrap();
+        db.mark_claude_session_validated(session_id, name).unwrap();
+    }
+
+    fn context_with_process_id(
+        cwd: &std::path::Path,
+        process_id: Option<&str>,
+    ) -> crate::shared::context::HcomContext {
+        let mut env = std::collections::HashMap::new();
+        if let Some(process_id) = process_id {
+            env.insert("HCOM_PROCESS_ID".to_string(), process_id.to_string());
+        }
+        crate::shared::context::HcomContext::from_env(&env, cwd.to_path_buf())
+    }
+
+    #[test]
+    fn transcript_lineage_uses_structured_fork_ancestry() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        let transcript = dir.path().join("fork.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-new\",\"message\":{\"session_id\":\"session-original\"}}\n",
+                "{\"session_id\":\"session-new\"}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(
+                &db,
+                transcript.to_str().unwrap(),
+                Some("session-new"),
+            )
+            .unwrap(),
+            TranscriptOwnerResolution::Owner("niza".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_deduplicates_multiple_records_for_one_owner() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        let transcript = dir.path().join("same-owner.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-original\"}\n",
+                "{\"session_id\":\"session-original\"}\n",
+                "{\"message\":{\"session_id\":\"session-original\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Owner("niza".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_rejects_conflicting_owners() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        let transcript = dir.path().join("conflict.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-niza\"}\n",
+                "{\"message\":{\"session_id\":\"session-lava\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Ambiguous(vec!["lava".to_string(), "niza".to_string()])
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_ignores_ids_inside_message_content() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        let transcript = dir.path().join("quoted.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"content\":\"quoted session_id session-lava\",\"nested\":{\"session_id\":\"session-lava\"}}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_handles_missing_and_oversized_files() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        assert_eq!(
+            resolve_claude_transcript_owner(
+                &db,
+                dir.path().join("missing.jsonl").to_str().unwrap(),
+                None,
+            )
+            .unwrap(),
+            TranscriptOwnerResolution::Unknown
+        );
+
+        let transcript = dir.path().join("oversized.jsonl");
+        let mut file = std::fs::File::create(&transcript).unwrap();
+        for _ in 0..2048 {
+            writeln!(file, "{{\"type\":\"padding\"}}").unwrap();
+        }
+        writeln!(file, "{{\"sessionId\":\"session-original\"}}").unwrap();
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_ignores_truncated_utf8_tail() {
+        const MAX_BYTES: usize = 512 * 1024;
+
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        let transcript = dir.path().join("truncated-utf8.jsonl");
+        let mut contents = b"{\"sessionId\":\"session-original\"}\n".to_vec();
+        contents.resize(MAX_BYTES - 1, b' ');
+        contents.extend_from_slice("€\n".as_bytes());
+        std::fs::write(&transcript, contents).unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Owner("niza".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_lineage_rejects_duplicate_exact_path_owners() {
+        let (dir, db) = make_test_db();
+        let transcript = dir.path().join("shared.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        insert_bound_claude_instance(&db, "niza", "session-niza", transcript.to_str().unwrap());
+        insert_bound_claude_instance(&db, "lava", "session-lava", transcript.to_str().unwrap());
+
+        assert_eq!(
+            resolve_claude_transcript_owner(&db, transcript.to_str().unwrap(), None).unwrap(),
+            TranscriptOwnerResolution::Ambiguous(vec!["lava".to_string(), "niza".to_string()])
+        );
+    }
+
+    #[test]
+    fn hook_context_skips_transcript_scan_when_process_and_session_agree() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        db.set_process_binding("process-niza", "session-niza", "niza")
+            .unwrap();
+        let transcript = dir.path().join("irrelevant-conflict.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-lava\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-niza"));
+
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_uses_session_owner_with_empty_process_id() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        let ctx = context_with_process_id(dir.path(), Some(""));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_prefers_session_owner_over_conflicting_process_owner() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        insert_bound_claude_instance(&db, "lava", "session-lava", "");
+        db.set_process_binding("process-restored", "session-lava", "lava")
+            .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_fails_closed_on_poisoned_session_vs_transcript_ancestry() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        insert_bound_claude_instance(&db, "lava", "session-poisoned", "");
+        db.kv_set("claude_lineage_validated:session-poisoned", None)
+            .unwrap();
+        db.set_process_binding("process-restored", "session-original", "niza")
+            .unwrap();
+        let transcript = dir.path().join("poisoned.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-original\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
+
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-poisoned", transcript.to_str().unwrap());
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn hook_context_revalidates_agreeing_but_untrusted_poisoned_binding() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-original", "");
+        insert_bound_claude_instance(&db, "lava", "session-poisoned", "");
+        db.kv_set("claude_lineage_validated:session-poisoned", None)
+            .unwrap();
+        db.set_process_binding("process-poisoned", "session-poisoned", "lava")
+            .unwrap();
+        let transcript = dir.path().join("poisoned-agree.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"session-poisoned\",\"message\":{\"session_id\":\"session-original\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-poisoned"));
+
+        let (owner, _, is_primary) =
+            init_hook_context(&db, &ctx, "session-poisoned", transcript.to_str().unwrap());
+        assert!(owner.is_none());
+        assert!(!is_primary, "ordinary hooks must not promote a generation");
+        assert_eq!(
+            db.get_instance_full("lava")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "start",
+            "rejecting a hook must not mutate the other instance's status"
+        );
+    }
+
+    #[test]
+    fn hook_context_caches_validated_lineage_after_one_scan() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "niza", "session-niza", "");
+        db.kv_set("claude_lineage_validated:session-niza", None)
+            .unwrap();
+        db.set_process_binding("process-niza", "session-niza", "niza")
+            .unwrap();
+        let transcript = dir.path().join("validate-once.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-niza\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-niza"));
+
+        let (owner, _, is_primary) =
+            init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("niza"));
+        assert!(is_primary);
+        assert_eq!(
+            db.get_validated_claude_session_owner("session-niza")
+                .unwrap()
+                .as_deref(),
+            Some("niza")
+        );
+
+        std::fs::write(
+            &transcript,
+            "{\"message\":{\"session_id\":\"session-other\"}}\n",
+        )
+        .unwrap();
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_rejects_historical_process_fallback_for_unbound_session() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "lava", "session-old", "");
+        db.set_process_binding("process-restored", "session-old", "lava")
+            .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-new", "");
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn hook_context_keeps_fresh_process_fallback_without_lineage() {
+        let (dir, db) = make_test_db();
+        insert_test_instance(&db, "fresh");
+        db.set_process_binding("process-fresh", "", "fresh")
+            .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-fresh"));
+
+        let (owner, _, _) = init_hook_context(&db, &ctx, "session-new", "");
+        assert_eq!(owner.as_deref(), Some("fresh"));
     }
 
     fn insert_test_message(
@@ -1534,11 +2260,16 @@ mod tests {
             "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('parent', 'pty', 9999, 0)",
             [],
         );
-        // Add process binding
+        // Add process binding and Claude actor correlation state
         let _ = db.conn().execute(
             "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at) VALUES ('proc-1', 'sess-1', 'parent', 0)",
             [],
         );
+        let token = db
+            .issue_claude_actor_capability("sess-1", "tool-1", None, "parent")
+            .unwrap();
+        db.kv_set("subagent_stop_inflight:sess-1:a1:x", Some("owner"))
+            .unwrap();
 
         stop_instance(&db, "parent", "test", "test_cleanup");
 
@@ -1574,6 +2305,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0, "process bindings should be deleted");
+
+        assert_eq!(
+            db.resolve_claude_actor_capability(&token, "sess-1")
+                .unwrap(),
+            None,
+            "root stop should revoke session actor capabilities"
+        );
+        let claude_kv: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'subagent_stop_inflight:sess-1:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            claude_kv, 0,
+            "root stop should remove Claude actor correlation state"
+        );
 
         // Life event should be logged
         let count: i64 = db
@@ -1712,13 +2462,13 @@ mod tests {
             }
         }
 
-        // Stop root — should stop up to depth 10 but leave the deepest 2
+        // Stop root. Hitting the depth guard leaves the full chain retryable;
+        // partial deletion would orphan the surviving descendants.
         stop_instance(&db, "inst0", "test", "test_depth_limit");
 
-        // inst10 and inst11 should survive (depth 10 and 11, beyond limit)
         let remaining: Vec<String> = db
             .conn()
-            .prepare("SELECT name FROM instances ORDER BY name")
+            .prepare("SELECT name FROM instances ORDER BY CAST(SUBSTR(name, 5) AS INTEGER)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
@@ -1726,9 +2476,18 @@ mod tests {
             .collect();
         assert_eq!(
             remaining,
-            vec!["inst10", "inst11"],
-            "instances beyond depth limit should survive"
+            (0..12).map(|i| format!("inst{i}")).collect::<Vec<_>>(),
+            "an incomplete child cascade must leave every ancestor retryable"
         );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "an incomplete cascade must publish no stops");
     }
 
     #[test]
@@ -1766,6 +2525,163 @@ mod tests {
 
         // Should be a no-op, not panic
         stop_instance(&db, "nonexistent", "test", "test");
+    }
+
+    #[test]
+    fn test_stale_stop_cannot_delete_reused_name() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, agent_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('inst', 'old-session', 'old-agent', 'claude', 'active', 'running', 0, 1)",
+                [],
+            )
+            .unwrap();
+        let old = db.get_instance_full("inst").unwrap().unwrap();
+        db.delete_instance("inst").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, agent_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('inst', 'new-session', 'new-agent', 'claude', 'active', 'running', 0, 2)",
+                [],
+            )
+            .unwrap();
+        let event = serde_json::json!({"action": "stopped", "snapshot": {"name": "inst"}});
+
+        let won = db
+            .finalize_instance_stop(
+                "inst",
+                old.created_at,
+                old.session_id.as_deref(),
+                old.agent_id.as_deref(),
+                &event,
+            )
+            .unwrap();
+        assert!(!won, "the stale row incarnation must lose its delete CAS");
+        let current = db.get_instance_full("inst").unwrap().unwrap();
+        assert_eq!(current.session_id.as_deref(), Some("new-session"));
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "a stale stopper must publish no event");
+    }
+
+    #[test]
+    fn test_child_enumeration_error_keeps_parent_retryable() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('parent', 'sess-1', 'claude', 'active', 'running', 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_name, tool, status, status_context, status_time, created_at)
+                 VALUES (x'80', 'parent', 'claude', 'active', 'running', 0, 2)",
+                [],
+            )
+            .unwrap();
+
+        let outcome = stop_instance(&db, "parent", "test", "child-read-error");
+        assert!(matches!(outcome, StopOutcome::RetryableError(_)));
+        assert!(db.get_instance("parent").unwrap().is_some());
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0);
+    }
+
+    #[test]
+    fn test_stop_instance_does_not_publish_until_delete_wins() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('inst', 'sess-1', 'claude', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "inst").unwrap();
+        // RAISE(IGNORE) makes DELETE report zero affected rows, modeling a
+        // contender that lost the teardown ownership CAS.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER suppress_inst_delete BEFORE DELETE ON instances
+                 WHEN OLD.name = 'inst' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+
+        stop_instance(&db, "inst", "test", "first");
+        assert!(db.get_instance("inst").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("sess-1").unwrap().as_deref(),
+            Some("inst"),
+            "a failed ownership delete must leave bindings retryable"
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "a losing teardown must not publish stopped");
+
+        db.conn()
+            .execute_batch("DROP TRIGGER suppress_inst_delete;")
+            .unwrap();
+
+        // Event insertion and deletion form one transaction. If publication
+        // fails, SQLite must restore both the row and its binding.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_stopped_event BEFORE INSERT ON events
+                 WHEN NEW.type = 'life' AND NEW.instance = 'inst'
+                 BEGIN SELECT RAISE(ABORT, 'injected event failure'); END;",
+            )
+            .unwrap();
+        stop_instance(&db, "inst", "test", "event-failure");
+        assert!(db.get_instance("inst").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("sess-1").unwrap().as_deref(),
+            Some("inst"),
+            "event failure must roll back deletion and cleanup"
+        );
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_stopped_event;")
+            .unwrap();
+
+        stop_instance(&db, "inst", "test", "retry");
+        assert!(db.get_instance("inst").unwrap().is_none());
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 1, "the retry winner publishes exactly once");
     }
 
     #[test]
@@ -1864,7 +2780,15 @@ mod tests {
             )
             .unwrap();
 
-        soft_finalize_session(&db, "vine", "unknown", None);
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-soft', 'sess-soft-1', 'vine', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        soft_finalize_session(&db, "vine", "unknown", None, false);
 
         assert!(db.get_instance_full("vine").unwrap().is_some());
         let status = db.get_status("vine").unwrap().map(|(s, _)| s);
@@ -1875,6 +2799,49 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("vine")
+        );
+        assert_eq!(db.get_process_binding("pid-soft").unwrap(), None);
+    }
+
+    #[test]
+    fn soft_finalize_session_can_keep_process_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id)
+                 VALUES ('luna', 'listening', ?1, 'omp', 'sess-keep')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-keep', 'luna', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-keep', 'sess-keep', 'luna', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        soft_finalize_session(&db, "luna", "turn_end", None, true);
+
+        assert_eq!(
+            db.get_process_binding("pid-keep").unwrap(),
+            Some("luna".to_string())
+        );
+        assert_eq!(db.get_session_binding("sess-keep").unwrap(), None);
+        assert_eq!(
+            db.get_status("luna").unwrap().map(|(s, _)| s),
+            Some(ST_INACTIVE.to_string())
         );
     }
 }

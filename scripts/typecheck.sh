@@ -4,6 +4,19 @@ set -euo pipefail
 repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -o 2>/dev/null || true)" == "Android" ]]; then
+  # TypeScript 7 ships the compiler as a per-platform native (Go) binary and
+  # publishes no `@typescript/typescript-android-*` package, so `tsc` cannot
+  # resolve an executable here at all. Substituting the linux-arm64 build does
+  # not help either: Android's seccomp filter kills it with SIGSYS on startup.
+  # The typecheck gate therefore only runs on the ubuntu CI job (see the
+  # `typecheck` job in .github/workflows/ci.yml); skipping loudly here keeps a
+  # local `just ci` honest about what it did and did not verify.
+  if [[ "${HCOM_TYPECHECK_FORCE:-}" != "1" ]]; then
+    echo "typecheck: SKIPPED on Android (TypeScript 7 has no android native build)"
+    echo "typecheck: plugin types are gated by the ubuntu CI job; set HCOM_TYPECHECK_FORCE=1 to attempt it anyway"
+    exit 0
+  fi
+
   # Stage the plugin sources under a dedicated child dir so the rm -rf below
   # can never target a caller-supplied path directly (e.g. HCOM_TYPECHECK_ROOT
   # pointed at the repo would otherwise wipe the whole src/ tree).
@@ -27,6 +40,8 @@ cd "$project_root"
 if [[ "${CI:-}" == "true" ]]; then
   npm ci --ignore-scripts
 else
-  npm install --ignore-scripts --prefer-offline
+  # CI enforces the pinned Node 22 runtime. Local typechecking can also run on a
+  # newer Node even when the user's global npm config enables engine-strict.
+  npm install --ignore-scripts --prefer-offline --engine-strict=false
 fi
 npm run typecheck

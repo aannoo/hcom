@@ -1,21 +1,21 @@
 - name: Set up JDK 17 (required by Android SDK tools)
   if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
-  uses: actions/setup-java@v5.2.0
+  uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
   with:
     java-version: '17'
     distribution: temurin
 - name: Set up Android SDK
   if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
-  uses: android-actions/setup-android@v4.0.1
+  uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
 - name: Install Android NDK
   if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
-  run: yes | sdkmanager "ndk;25.2.9519653" > /dev/null
+  run: yes | sdkmanager "ndk;27.3.13750724" > /dev/null
 - name: Configure Android target
   if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
   shell: bash
   run: |
     rustup target add aarch64-linux-android
-    NDK_BIN="$ANDROID_HOME/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    NDK_BIN="$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
     echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
     echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
     echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"

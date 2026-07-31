@@ -34,11 +34,27 @@ function log(
 	} catch {}
 }
 
+const HCOM_TIMEOUT_MS = 1800;
+
 function hcom(args: string[]): Promise<HcomResult> {
 	return new Promise((resolve) => {
 		const child = spawn("hcom", args, { stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
+		let settled = false;
+		const finish = (code: number) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve({ code, stdout, stderr });
+		};
+		const timer = setTimeout(() => {
+			try {
+				child.kill("SIGTERM");
+			} catch {}
+			finish(124);
+		}, HCOM_TIMEOUT_MS);
+		timer.unref?.();
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
 		child.stdout.on("data", (chunk) => {
@@ -47,8 +63,11 @@ function hcom(args: string[]): Promise<HcomResult> {
 		child.stderr.on("data", (chunk) => {
 			stderr += chunk;
 		});
-		child.on("error", (error) => resolve({ code: 127, stdout, stderr: String(error) }));
-		child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
+		child.on("error", (error) => {
+			stderr = stderr || String(error);
+			finish(127);
+		});
+		child.on("close", (code) => finish(code === null ? 1 : code));
 	});
 }
 
@@ -72,9 +91,43 @@ function isBodylessWake(text: string): boolean {
 	return trimmed === "<hcom>" || trimmed === "<hcom></hcom>";
 }
 
+// Same-process latch: OMP task subagents load a fresh extension instance in the
+// parent Node process (SessionShutdownEvent has no sessionId). The first binder
+// owns hcom identity; nested instances skip bind/stop so dispose cannot soft-stop
+// the parent (lefo / task repro). ExtensionContext does not expose taskDepth.
+const IDENTITY_REGISTRY_KEY = Symbol.for("hcom.omp.identity");
+const IDENTITY_OWNER_ENV = "HCOM_OMP_IDENTITY_OWNER";
+
+type OmpIdentityRegistry = {
+	owner: string | null;
+	tearingDown: boolean;
+};
+
+function getIdentityRegistry(): OmpIdentityRegistry {
+	const g = globalThis as Record<symbol, OmpIdentityRegistry | undefined>;
+	if (!g[IDENTITY_REGISTRY_KEY]) {
+		g[IDENTITY_REGISTRY_KEY] = { owner: null, tearingDown: false };
+	}
+	return g[IDENTITY_REGISTRY_KEY]!;
+}
+
+function syncIdentityOwnerEnv(owner: string | null): void {
+	if (owner) process.env[IDENTITY_OWNER_ENV] = owner;
+	else delete process.env[IDENTITY_OWNER_ENV];
+}
+
+function clearIdentityOwnership(): void {
+	const reg = getIdentityRegistry();
+	reg.owner = null;
+	reg.tearingDown = false;
+	syncIdentityOwnerEnv(null);
+}
+
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
+	let ownsIdentity = false;
+	let nestedOptOut = false;
 	let bootstrapText: string | null = null;
 	let bindingPromise: Promise<void> | null = null;
 	let notifyServer: Server | null = null;
@@ -138,12 +191,42 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		notifyPort = null;
 	}
 
+	function nestedSkipReason(): string | null {
+		const reg = getIdentityRegistry();
+		if (nestedOptOut) return "sticky_nested_opt_out";
+		// Owner may rebind after a failed soft-stop while keepOwner retained the latch;
+		// tearingDown only blocks nested/non-owner extensions.
+		if (reg.tearingDown && !ownsIdentity) return "tearing_down";
+		if (reg.owner && !ownsIdentity) return "nested_registry";
+		if (!reg.owner && process.env[IDENTITY_OWNER_ENV] && !ownsIdentity) return "nested_env";
+		return null;
+	}
+
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
 		if (process.env.HCOM_LAUNCHED !== "1") return;
+		const skipReason = nestedSkipReason();
+		if (skipReason) {
+			nestedOptOut = true;
+			const reg = getIdentityRegistry();
+			log("INFO", "plugin.bind_skipped_nested", null, {
+				reason: skipReason,
+				owner: reg.owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
+			});
+			return;
+		}
 		bindingPromise = (async () => {
 			try {
+				const reg = getIdentityRegistry();
+				if ((reg.tearingDown && !ownsIdentity) || (reg.owner && !ownsIdentity)) {
+					nestedOptOut = true;
+					log("INFO", "plugin.bind_skipped_nested", null, {
+						reason: reg.tearingDown && !ownsIdentity ? "tearing_down" : "nested_registry",
+						owner: reg.owner,
+					});
+					return;
+				}
 				const sid = ctx.sessionManager.getSessionId();
 				const transcriptPath = ctx.sessionManager.getSessionFile();
 				const port = await startNotifyServer();
@@ -164,7 +247,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				}
 				instanceName = json.name;
 				sessionId = json.session_id || sid;
+				ownsIdentity = true;
+				reg.owner = instanceName;
+				syncIdentityOwnerEnv(instanceName ?? "1");
 				bootstrapText = typeof json.bootstrap === "string" ? json.bootstrap : null;
+				startReconcileTimer();
 				log("INFO", "plugin.bound", instanceName, {
 					session_id: sessionId,
 					notify_port: port,
@@ -352,10 +439,19 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	function startReconcileTimer(): void {
-		if (!reconcileTimer) reconcileTimer = setInterval(() => void reconcile(), 5_000);
+		stopReconcileTimer();
+		reconcileTimer = setInterval(() => void reconcile(), 5_000);
 	}
 
-	function resetBinding(): void {
+	function stopReconcileTimer(): void {
+		if (reconcileTimer) {
+			clearInterval(reconcileTimer);
+			reconcileTimer = null;
+		}
+	}
+
+	function resetBinding(opts?: { keepOwner?: boolean }): void {
+		stopReconcileTimer();
 		stopNotifyServer();
 		bindingGeneration++;
 		instanceName = null;
@@ -372,25 +468,74 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		lastPendingPollAt = 0;
 		agentActive = false;
 		clearIdleTimer();
+		// keepOwner: session_branch rebinds in the same extension instance — retain
+		// process-local ownership so nested task extensions still skip bind.
+		if (!opts?.keepOwner && ownsIdentity) {
+			clearIdentityOwnership();
+			ownsIdentity = false;
+		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		resetBinding();
 		await bindIdentity(ctx);
-		startReconcileTimer();
 	});
 
-	pi.on("session_shutdown", async (_event) => {
-		if (instanceName) {
-			await hcom(["omp-stop", "--name", instanceName, "--reason", "shutdown"]);
+	// SessionShutdownEvent is only `{ type: "session_shutdown" }` — no sessionId.
+	// Soft-stop only when THIS extension instance owns the identity (nested task
+	// instances never bind, so they never stop the parent).
+	pi.on("session_shutdown", async () => {
+		let keepOwner = false;
+		if (instanceName && ownsIdentity) {
+			const reg = getIdentityRegistry();
+			reg.tearingDown = true;
+			const reason = "shutdown";
+			const stopName = instanceName;
+			let softStopOk = false;
+			try {
+				const result = await hcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
+				if (result.code === 0) {
+					softStopOk = true;
+				} else {
+					log("WARN", "plugin.session_shutdown_soft_stop_failed", stopName, {
+						exit_code: result.code,
+						reason,
+						stderr: result.stderr.slice(0, 300),
+					});
+				}
+			} catch (error) {
+				log("ERROR", "plugin.session_shutdown_soft_stop_error", stopName, {
+					error: String(error),
+					reason,
+				});
+			}
+			keepOwner = !softStopOk;
+			// Shutdown attempt finished. If we retain ownership after a failed stop,
+			// drop tearingDown so the owner can re-omp-start; nested skip still uses reg.owner.
+			if (keepOwner) {
+				reg.tearingDown = false;
+			}
+		} else {
+			const skipReason = nestedSkipReason();
+			if (skipReason) {
+				nestedOptOut = true;
+				const reg = getIdentityRegistry();
+				log("INFO", "plugin.session_shutdown_skipped", null, {
+					reason: "nested_session",
+					skip_reason: skipReason,
+					owner: reg.owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
+				});
+			}
 		}
-		resetBinding();
+		resetBinding({ keepOwner });
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		currentCtx = ctx;
-		resetBinding();
+		// Keep process-local ownership across switch rebind so a live nested task
+		// extension cannot claim identity in the window between clear and omp-start.
+		resetBinding({ keepOwner: true });
 		await bindIdentity(ctx);
 	});
 
@@ -398,11 +543,12 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	// which mints a NEW session id + file and emits only session_branch — not
 	// session_switch. Without rebinding here the cached sessionId stays stale,
 	// isBoundSession() fails against the new id, and every later deliverPending
-	// silently returns false (delivery dead after branch). Rebind like a switch.
+	// silently returns false (delivery dead after branch). Rebind like a switch,
+	// but keep process-local ownership so nested task extensions still skip bind.
 	// session_tree does NOT mint a new session id/file, so it needs no rebind.
 	pi.on("session_branch", async (_event, ctx) => {
 		currentCtx = ctx;
-		resetBinding();
+		resetBinding({ keepOwner: true });
 		await bindIdentity(ctx);
 	});
 

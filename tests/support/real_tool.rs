@@ -129,10 +129,20 @@ fn has_exact_version(version_output: &str, expected: &str) -> bool {
 /// Panic with install instructions unless exactly the pinned oracle is present.
 pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
     let meta = case.meta();
+    // Name the exact file the version came from. A mock-tools prefix reused
+    // across pins keeps stale launchers that outrank npm's shims in PATHEXT
+    // order (`claude.exe` before `claude.cmd`), so "found 2.1.185" on its own
+    // sends you looking at the npm install that did in fact write the right
+    // version — the path is what points at the leftover.
+    let resolved = h
+        .resolve_external(meta.binary)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| format!("<{} not found on PATH>", meta.binary));
     let version = match h.external_version(meta.binary) {
         Ok(version) => version,
         Err(reason) => panic!(
-            "real {tool} integration test requires {binary} {version}: {reason}. Install with: {install}",
+            "real {tool} integration test requires {binary} {version}: {reason}. \
+             Resolved to: {resolved}. Install with: {install}",
             tool = meta.tool,
             binary = meta.binary,
             version = meta.pinned_version,
@@ -141,8 +151,10 @@ pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
     };
     if !has_exact_version(&version, meta.pinned_version) {
         panic!(
-            "real {tool} integration test requires {binary} {expected}, found `{version}`. \
-             Install the pinned version with: {install}",
+            "real {tool} integration test requires {binary} {expected}, found `{version}` \
+             at {resolved}. If that path is not the pinned install, delete it — a stale \
+             launcher in the mock-tools prefix shadows npm's shim. Install the pinned \
+             version with: {install}",
             tool = meta.tool,
             binary = meta.binary,
             expected = meta.pinned_version,
@@ -231,25 +243,49 @@ fn instance_status_context(h: &Hcom, name: &str) -> Option<String> {
     })
 }
 
-/// Wait until a tool instance is process-bound; return its canonical name.
+/// Wait until the tool's PTY proxy has come up; return the instance snapshot.
 ///
-/// 90s (not 40s): on Windows CI, npm-shimmed tools (codex in particular, whose
-/// launcher bypasses the shim to invoke node directly, see
-/// `terminal::resolve_windows_tool_launcher`) cold-start slower than on Unix
-/// runners and have been observed landing just past a 40s deadline.
-fn wait_process_bound<C: ToolCase>(h: &Hcom, case: &C, name: &str, what: &str) -> Value {
-    h.eventually(what, Duration::from_secs(90), || {
-        let Some(instance) = h.instance_json(name)? else {
-            return Ok(None);
-        };
-        let bound = instance
+/// `process_bound` is NOT that signal and must not be used as one: the launcher
+/// writes the process binding itself, before it spawns the wrapper shell, so it
+/// is already true when the launch command returns and a wait on it always
+/// passes instantly. Gating on it made every launch-chain stall surface later,
+/// inside whatever step ran next (`drive_startup` for Claude), and read as a
+/// hang in the *tool* — the launch chain was never actually observed.
+///
+/// The registered inject endpoint is the first thing that only exists once
+/// `hcom pty` is really running: the delivery thread registers it at init,
+/// independent of whether the tool has painted anything yet. `hcom term` exits
+/// nonzero until then.
+///
+/// The wait polls `hcom term` and NOT `hcom list`: computing an instance's
+/// status finalizes a still-unbound launch placeholder as `launch_failed` once
+/// it is older than `instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT` (30s), so
+/// a list-based poll would itself kill any launch slower than that instead of
+/// observing it. `hcom term` only looks up the inject endpoint and never
+/// computes status. `process_bound` is checked once, up front, where it is
+/// meaningful — the launcher has already returned by then.
+///
+/// 90s (not 40s): on Windows CI the wrapper shell is two nested PowerShell
+/// starts before `hcom pty` even begins, and npm-shimmed tools cold-start
+/// slower than on Unix runners.
+fn wait_pty_proxy_up<C: ToolCase>(h: &Hcom, case: &C, name: &str, what: &str) -> Value {
+    let _ = case;
+    let launched = h
+        .instance_json(name)
+        .expect("list launched instance")
+        .expect("launched instance present");
+    assert!(
+        launched
             .get("process_bound")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if bound { Ok(Some(instance)) } else { Ok(None) }
+            .unwrap_or(false),
+        "launcher did not register a process binding for {name}: {launched}"
+    );
+    h.eventually(what, Duration::from_secs(90), || {
+        let (code, _stdout, _stderr) = h.run(["term", name]);
+        Ok((code == 0).then_some(()))
     });
     // Re-read so callers always see the latest snapshot.
-    let _ = case;
     h.instance_json(name)
         .expect("list bound instance")
         .expect("bound instance present")
@@ -371,7 +407,12 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     );
     let name = launched_names[0].clone();
 
-    wait_process_bound(&h, &case, &name, "process-bound launch");
+    wait_pty_proxy_up(
+        &h,
+        &case,
+        &name,
+        "PTY proxy up (inject endpoint registered)",
+    );
     // Verify the placeholder's PID is tracked before hook/session binding
     // replaces it below (this early-window registration is a separate code
     // path from the later hook-bound PID, see `initial_pid` in Phase 2).
@@ -956,12 +997,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         "real {tool} resume failed:\n-- stdout --\n{resume_stdout}\n-- stderr --\n{resume_stderr}\n{}",
         h.diagnostics()
     );
-    wait_process_bound(
-        &h,
-        &case,
-        &name,
-        "resumed process-bound under same identity",
-    );
+    wait_pty_proxy_up(&h, &case, &name, "resumed PTY proxy up under same identity");
     // Resume also relaunches the tool; clear any startup gate it re-surfaces.
     case.drive_startup(&h, &name);
     let resumed_pid = h.eventually("new resumed process id", Duration::from_secs(10), || {

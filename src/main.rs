@@ -5,6 +5,7 @@
 //! as a side-channel for messaging and coordination with other agents.
 
 mod bootstrap;
+mod claude_actor;
 mod cli_context;
 pub mod commands;
 mod config;
@@ -166,7 +167,8 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         .collect();
 
     // Create and run PTY
-    let mut proxy = pty::Proxy::spawn(
+    let instance_name_for_failure = instance_name.clone();
+    let mut proxy = match pty::Proxy::spawn(
         &command,
         &full_args,
         pty::ProxyConfig {
@@ -175,8 +177,41 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             target,
             env_vars: pty_child_env(),
         },
-    )
-    .context("Failed to spawn PTY")?;
+    ) {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            let err = e.context("Failed to spawn PTY");
+            // The launched terminal window may close on process exit before
+            // anyone can read stderr (depends on the terminal's own
+            // exit/profile behavior, which hcom doesn't control), so stderr
+            // alone can't be relied on. Log so the failure survives, and —
+            // same path used for a child that exits before binding — push it
+            // through the launch-failure event so the launcher (human or the
+            // agent that ran `hcom N <tool>`) is notified immediately instead
+            // of waiting on the generic stale-placeholder timeout.
+            log::log_error("pty", "spawn_failed", &format!("{err:#}"));
+            if let Some(name) = instance_name_for_failure.as_deref()
+                && let Ok(db) = db::HcomDb::open()
+                && let Ok(Some(instance)) = db.get_instance_full(name)
+            {
+                let fallback = format!("{err:#}");
+                if let Some(detail) = instance_lifecycle::finalize_launch_failure_detail(
+                    &db,
+                    &instance,
+                    Some(&fallback),
+                ) {
+                    let _ = db.emit_launch_failed_event(
+                        name,
+                        shared::ST_INACTIVE,
+                        "launch_failed",
+                        "spawn_failed",
+                        &detail,
+                    );
+                }
+            }
+            return Err(err);
+        }
+    };
 
     let exit_code = proxy.run().context("PTY run failed")?;
 

@@ -12,69 +12,15 @@ pub fn is_remote_instance(data: &InstanceRow) -> bool {
 }
 
 pub fn is_subagent_instance(data: &InstanceRow) -> bool {
-    data.parent_session_id.is_some()
-}
-
-/// Check if a session/instance is in subagent context (Task active).
-///
-/// Accepts either a session_id or instance name. Returns true if the instance
-/// has active running tasks (i.e. a Task subagent is executing).
-pub fn in_subagent_context(db: &HcomDb, session_id: &str) -> bool {
-    let instance_name = match db.get_session_binding(session_id) {
-        Ok(Some(name)) => name,
-        _ => session_id.to_string(),
-    };
-
-    let row: Option<Option<String>> = db
-        .conn()
-        .query_row(
-            "SELECT running_tasks FROM instances WHERE name = ? LIMIT 1",
-            rusqlite::params![instance_name],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok();
-
-    match row {
-        Some(Some(rt_json)) if !rt_json.is_empty() => {
-            let rt = parse_running_tasks(Some(&rt_json));
-            rt.active
-        }
-        _ => false,
-    }
+    data.parent_name
+        .as_deref()
+        .is_some_and(|parent| !parent.is_empty())
 }
 
 pub fn is_launching_placeholder(data: &InstanceRow) -> bool {
     data.session_id.is_none()
         && data.status_context == "new"
         && (data.status == ST_INACTIVE || data.status == "pending")
-}
-
-/// Parsed running_tasks JSON field.
-#[derive(Debug, Clone, Default)]
-pub struct RunningTasks {
-    pub active: bool,
-    pub subagents: Vec<serde_json::Value>,
-}
-
-pub fn parse_running_tasks(json_str: Option<&str>) -> RunningTasks {
-    let Some(s) = json_str else {
-        return RunningTasks::default();
-    };
-    if s.is_empty() {
-        return RunningTasks::default();
-    }
-
-    match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(serde_json::Value::Object(obj)) => RunningTasks {
-            active: obj.get("active").and_then(|v| v.as_bool()).unwrap_or(false),
-            subagents: obj
-                .get("subagents")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default(),
-        },
-        _ => RunningTasks::default(),
-    }
 }
 
 /// Update instance position atomically.
@@ -135,6 +81,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    fn default_instance() -> InstanceRow {
+        InstanceRow {
+            name: String::new(),
+            session_id: None,
+            parent_session_id: None,
+            parent_name: None,
+            agent_id: None,
+            tag: None,
+            last_event_id: 0,
+            last_stop: 0,
+            status: ST_INACTIVE.into(),
+            status_time: 0,
+            last_seen: 0,
+            status_context: String::new(),
+            status_detail: String::new(),
+            directory: String::new(),
+            created_at: 0.0,
+            transcript_path: String::new(),
+            tool: "claude".into(),
+            background: 0,
+            background_log_file: String::new(),
+            tcp_mode: 0,
+            wait_timeout: None,
+            subagent_timeout: None,
+            hints: None,
+            origin_device_id: None,
+            pid: None,
+            launch_args: None,
+            terminal_preset_requested: None,
+            terminal_preset_effective: None,
+            launch_context: None,
+            name_announced: 0,
+            idle_since: None,
+        }
     }
 
     #[test]
@@ -251,6 +233,23 @@ mod tests {
     }
 
     #[test]
+    fn test_subagent_classification_uses_child_row_parent() {
+        let child = InstanceRow {
+            parent_name: Some("luna".into()),
+            parent_session_id: None,
+            ..default_instance()
+        };
+        assert!(is_subagent_instance(&child));
+
+        let root = InstanceRow {
+            parent_name: None,
+            parent_session_id: Some("stale-session".into()),
+            ..default_instance()
+        };
+        assert!(!is_subagent_instance(&root));
+    }
+
+    #[test]
     fn test_is_remote_instance() {
         let local = default_instance();
         assert!(!is_remote_instance(&local));
@@ -339,53 +338,6 @@ mod tests {
         );
 
         cleanup(path);
-    }
-
-    #[test]
-    fn test_parse_running_tasks() {
-        assert!(!parse_running_tasks(None).active);
-        assert!(!parse_running_tasks(Some("")).active);
-        assert!(!parse_running_tasks(Some("invalid")).active);
-
-        let rt = parse_running_tasks(Some(r#"{"active":true,"subagents":[{"agent_id":"a1"}]}"#));
-        assert!(rt.active);
-        assert_eq!(rt.subagents.len(), 1);
-    }
-
-    fn default_instance() -> InstanceRow {
-        InstanceRow {
-            name: String::new(),
-            session_id: None,
-            parent_session_id: None,
-            parent_name: None,
-            agent_id: None,
-            tag: None,
-            last_event_id: 0,
-            last_stop: 0,
-            status: ST_INACTIVE.into(),
-            status_time: 0,
-            status_context: String::new(),
-            status_detail: String::new(),
-            directory: String::new(),
-            created_at: 0.0,
-            transcript_path: String::new(),
-            tool: "claude".into(),
-            background: 0,
-            background_log_file: String::new(),
-            tcp_mode: 0,
-            wait_timeout: None,
-            subagent_timeout: None,
-            hints: None,
-            origin_device_id: None,
-            pid: None,
-            launch_args: None,
-            terminal_preset_requested: None,
-            terminal_preset_effective: None,
-            launch_context: None,
-            name_announced: 0,
-            running_tasks: None,
-            idle_since: None,
-        }
     }
 
     #[test]

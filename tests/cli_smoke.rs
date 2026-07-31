@@ -518,6 +518,12 @@ fn antigravity_e2e_hook_dispatch() {
     let start_out = start_cmd.output().expect("failed to run hcom start");
     let me = support::parse_hcom_marker(&String::from_utf8_lossy(&start_out.stdout))
         .expect("no [hcom:NAME] marker");
+    let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open hcom db");
+    conn.execute(
+        "UPDATE instances SET tool = 'antigravity' WHERE name = ?1",
+        [&me],
+    )
+    .expect("mark fixture as Antigravity");
 
     // 1. Pipe PreInvocation (session start) to gemini-sessionstart.
     // This will bind the session_id "sess-agy-1" to the active instance.
@@ -557,12 +563,59 @@ fn antigravity_e2e_hook_dispatch() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let first_stdout = String::from_utf8_lossy(&out.stdout);
+    let first: serde_json::Value =
+        serde_json::from_str(first_stdout.trim()).expect("first sessionstart json");
+    let first_context = first["injectSteps"][0]["ephemeralMessage"]
+        .as_str()
+        .expect("initial Antigravity bootstrap");
+    assert!(first_context.contains("[HCOM SESSION]"));
+    assert!(first_context.contains(&format!("[hcom:{me}]")));
 
     // Verify session_id binding matches in the DB via hcom list --json
     let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("failed to parse list json");
     assert_eq!(v["session_id"].as_str(), Some("sess-agy-1"));
+
+    // Antigravity fires this hook before every model invocation. Its ephemeral
+    // bootstrap must be present after the one-shot name announcement too.
+    let mut cmd = h.cmd();
+    cmd.args(["gemini-sessionstart"]);
+    cmd.env("ANTIGRAVITY_AGENT", "1");
+    cmd.env("HCOM_PROCESS_ID", "pid-agy-123");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn repeated sessionstart");
+    {
+        let mut stdin = child.stdin.take().expect("failed to open stdin");
+        stdin
+            .write_all(
+                serde_json::to_string(&session_start_payload)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+    }
+    let out = child
+        .wait_with_output()
+        .expect("failed to wait repeated sessionstart");
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repeated_stdout = String::from_utf8_lossy(&out.stdout);
+    let repeated: serde_json::Value =
+        serde_json::from_str(repeated_stdout.trim()).expect("repeated sessionstart json");
+    let repeated_context = repeated["injectSteps"][0]["ephemeralMessage"]
+        .as_str()
+        .expect("recurring Antigravity bootstrap");
+    assert!(repeated_context.contains("[HCOM SESSION]"));
+    assert!(repeated_context.contains(&format!("[hcom:{me}]")));
 
     // 2. Now pipe PreToolUse to gemini-beforetool.
     // Since the session is bound, it should resolve the instance and execute successfully.

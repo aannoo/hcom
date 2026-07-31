@@ -32,7 +32,7 @@ use nix::pty::openpty;
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
-use nix::unistd::{Pid, read, write};
+use nix::unistd::{Pid, pipe, read, write};
 #[cfg(unix)]
 use std::io;
 #[cfg(unix)]
@@ -628,6 +628,10 @@ pub struct Proxy {
     current_name: Arc<RwLock<String>>,
     /// Current status (shared with delivery thread, updated on status change)
     current_status: Arc<RwLock<String>>,
+    /// Read side used to interrupt the proxy poll when title state changes.
+    title_notify_read: OwnedFd,
+    /// Write side shared with the delivery thread's title wake callback.
+    title_notify_write: Arc<OwnedFd>,
 }
 
 #[cfg(unix)]
@@ -741,6 +745,9 @@ impl Proxy {
         };
         let current_name = Arc::new(RwLock::new(initial_display_name));
         let current_status = Arc::new(RwLock::new("listening".to_string()));
+        let (title_notify_read, title_notify_write) = pipe().context("title notify pipe failed")?;
+        set_nonblocking(&title_notify_read)?;
+        set_nonblocking(&title_notify_write)?;
 
         Ok(Self {
             config,
@@ -758,6 +765,8 @@ impl Proxy {
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
             current_status,
+            title_notify_read,
+            title_notify_write: Arc::new(title_notify_write),
         })
     }
 
@@ -777,6 +786,15 @@ impl Proxy {
         // Track last written title to detect changes (delivery thread updates Arcs)
         let mut last_written_name = String::new();
         let mut last_written_status = String::new();
+        // Terminal-title behavior. Read once — a session's config doesn't change
+        // under it. In `Off` we neither strip the tool's titles nor write our own;
+        // in `Combined` we append the tool's live title (read from `self.screen`,
+        // which this thread owns — no extra Arc needed).
+        let title_mode = crate::config::HcomConfig::load(None)
+            .map(|c| crate::shared::TitleMode::from_config(&c.title_mode))
+            .unwrap_or(crate::shared::TitleMode::Combined);
+        let title_enabled = title_mode != crate::shared::TitleMode::Off;
+        let mut last_written_child = String::new();
 
         // Track incomplete UTF-8 sequences to defer title writes.
         // When PTY output ends with partial multi-byte character, writing our title OSC
@@ -849,6 +867,12 @@ impl Proxy {
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
             }
 
+            let title_notify_idx = poll_fds.len();
+            poll_fds.push(PollFd::new(
+                self.title_notify_read.as_fd(),
+                PollFlags::POLLIN,
+            ));
+
             // Include the inject listener unless we're in backoff (macOS spurious POLLIN).
             // Reset backoff here so it applies for exactly one iteration.
             let include_listener = !listener_backoff;
@@ -913,6 +937,7 @@ impl Proxy {
                             self.notify_port.clone(),
                             self.current_name.clone(),
                             self.current_status.clone(),
+                            Some(title_wake_callback(self.title_notify_write.clone())),
                         )? {
                             shared::DeliveryStart::Started(h) => {
                                 self.delivery_handle = Some(h);
@@ -985,7 +1010,9 @@ impl Proxy {
                                 eagain_retries = 0; // reset on successful read
                                 let data = &buf[..n];
                                 raw_chunks.push(data.to_vec());
-                                let (filtered, had_title) = if stdout_is_tty {
+                                // In Off mode, don't strip the tool's own titles —
+                                // let them reach the terminal untouched.
+                                let (filtered, had_title) = if stdout_is_tty && title_enabled {
                                     title_filter.filter(data)
                                 } else {
                                     (data.to_vec(), false)
@@ -1079,6 +1106,7 @@ impl Proxy {
                                     self.notify_port.clone(),
                                     self.current_name.clone(),
                                     self.current_status.clone(),
+                                    Some(title_wake_callback(self.title_notify_write.clone())),
                                 )? {
                                     shared::DeliveryStart::Started(h) => {
                                         self.delivery_handle = Some(h);
@@ -1235,13 +1263,29 @@ impl Proxy {
                 }
             }
 
+            // Drain title notifications. The shared status is read below; the
+            // pipe only interrupts poll and coalesces repeated transitions.
+            if poll_fds[title_notify_idx]
+                .revents()
+                .is_some_and(|events| events.contains(PollFlags::POLLIN))
+            {
+                let mut title_notifications = [0u8; 64];
+                loop {
+                    match read(&self.title_notify_read, &mut title_notifications) {
+                        Ok(0) | Err(Errno::EAGAIN) => break,
+                        Ok(_) | Err(Errno::EINTR) => continue,
+                        Err(error) => bail!("read title notification failed: {error}"),
+                    }
+                }
+            }
+
             // Check for title changes (delivery thread updates shared Arcs).
             // Writing here serializes the title OSC with PTY output on the same
             // thread. We append it right after this iteration's coalesced write,
             // but only when that write left no incomplete UTF-8 or escape sequence
             // (`title_write_safe`) — splitting one would corrupt the stream.
             // pending_utf8/pending_escape carry that state across read boundaries.
-            if stdout_is_tty && title_write_safe(pending_utf8, pending_escape) {
+            if stdout_is_tty && title_enabled && title_write_safe(pending_utf8, pending_escape) {
                 let (name, status) = {
                     let n = self
                         .current_name
@@ -1257,11 +1301,30 @@ impl Proxy {
                         .unwrap_or_default();
                     (n, s)
                 };
-                if !name.is_empty() && (name != last_written_name || status != last_written_status)
+                // The wrapped tool's live title (Combined only). Owned by this
+                // thread via self.screen, so no lock — read fresh each iteration
+                // and fold into the change check so a new child title re-emits.
+                let child = if title_mode == crate::shared::TitleMode::Combined {
+                    self.screen.child_title().unwrap_or("")
+                } else {
+                    ""
+                };
+                if !name.is_empty()
+                    && (name != last_written_name
+                        || status != last_written_status
+                        || child != last_written_child)
                 {
-                    let escape =
-                        shared::build_title_escape(&name, &status, self.config.target.name());
+                    let child_opt = (!child.is_empty()).then_some(child);
+                    let escape = shared::build_title_escape(
+                        &name,
+                        &status,
+                        self.config.target.name(),
+                        title_mode,
+                        child_opt,
+                    );
                     write_all(&stdout_fd, escape.as_bytes())?;
+                    last_written_child.clear();
+                    last_written_child.push_str(child);
                     last_written_name = name;
                     last_written_status = status;
                 }
@@ -1499,6 +1562,15 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
         .context("fcntl F_SETFL failed")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn title_wake_callback(write_fd: Arc<OwnedFd>) -> crate::delivery::TitleWake {
+    Arc::new(move || {
+        // A full pipe means a wake is already pending. The proxy always reads
+        // the authoritative shared title state after it wakes.
+        let _ = write(write_fd.as_ref(), &[1]);
+    })
 }
 
 #[cfg(unix)]

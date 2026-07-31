@@ -14,7 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-const CACHE_VERSION: u32 = 2;
+// 3: seeds PREFIX into the resolver shell (see `clean_shell_seed_env`). Caches
+// written by v2 can hold a TMPDIR resolved from an empty PREFIX, so they have
+// to be discarded rather than aged out over CACHE_TTL.
+const CACHE_VERSION: u32 = 3;
 const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 const MARKER_VAR: &str = "HCOM_SHELL_ENV_MARKER";
 const RC_FILES: &[&str] = &[
@@ -190,7 +193,13 @@ fn cache_is_fresh(entry: &ShellEnvCache, rc_mtime: u64, now: u64) -> bool {
 
 fn clean_shell_seed_env(shell: &Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    for key in ["HOME", "USER", "LOGNAME", "TMPDIR"] {
+    // PREFIX: Termux-specific (unset elsewhere, so harmless on other platforms).
+    // Termux rc files commonly derive TMPDIR from it (e.g. `export
+    // TMPDIR="$PREFIX/tmp"`); without it seeded here, re-sourcing that rc file
+    // in this stripped-down shell silently clobbers an already-correct TMPDIR
+    // back to a bare "/tmp" — writable inside a proot container's private
+    // /tmp, but not on real Android, where /tmp is owned by uid 2000 (shell).
+    for key in ["HOME", "USER", "LOGNAME", "TMPDIR", "PREFIX"] {
         if let Some(value) = std::env::var_os(key).filter(|v| !v.is_empty()) {
             env.insert(key.to_string(), value.to_string_lossy().to_string());
         }
@@ -300,6 +309,37 @@ mod tests {
         assert!(parse_shell_env_output(b"a=1\0b=2", "MARKER", MARKER_VAR).is_none());
     }
 
+    // Termux rc files write `export TMPDIR="$PREFIX/tmp"`. If PREFIX is absent
+    // from the resolver shell's seed env that expands to a bare "/tmp", which
+    // on real Android is uid 2000's and unwritable by the app -- launched
+    // agents then die with EACCES on their scratch dir. Seed PREFIX so the rc
+    // file re-derives the TMPDIR the user actually has.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn resolver_shell_seeds_prefix_so_rc_derived_tmpdir_survives() {
+        let shell = test_shell_path();
+        let original = std::env::var_os("PREFIX");
+        unsafe { std::env::set_var("PREFIX", "/seeded/prefix") };
+
+        let seeded = clean_shell_seed_env(&shell);
+
+        unsafe { std::env::remove_var("PREFIX") };
+        let unset = clean_shell_seed_env(&shell);
+
+        // Restore before asserting: this is real process-global state that
+        // sibling tests spawn login shells against.
+        if let Some(value) = original {
+            unsafe { std::env::set_var("PREFIX", value) };
+        }
+
+        assert_eq!(
+            seeded.get("PREFIX").map(String::as_str),
+            Some("/seeded/prefix")
+        );
+        assert!(!unset.contains_key("PREFIX"));
+    }
+
     #[test]
     fn cache_key_mtime_change_busts_cache() {
         let entry = ShellEnvCache {
@@ -386,14 +426,20 @@ mod tests {
     fn resolver_discards_stderr_without_breaking_env_resolution() {
         let shell = test_shell_path();
         let marker = "hcom-shell-env-stderr-test";
+        // ~256KB of stderr, several times the 64KB pipe buffer the resolver
+        // would deadlock on if stderr were piped instead of discarded. The
+        // chunk is doubled into a variable and emitted with the `echo`
+        // builtin so the volume costs no forks: an external command per line
+        // is ~23ms on syscall-heavy sandboxes (PRoot, Android), which turns a
+        // per-line loop into minutes of wall time.
         let cmd = format!(
-            "i=0; while [ \"$i\" -lt 8192 ]; do \
-             printf 'verbose resolver diagnostic\n' >&2; i=$((i + 1)); done; \
+            "chunk=x; i=0; while [ \"$i\" -lt 12 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
+             i=0; while [ \"$i\" -lt 64 ]; do echo \"$chunk\" >&2; i=$((i + 1)); done; \
              printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
         );
 
         let output =
-            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(5)).unwrap();
+            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(30)).unwrap();
         let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
 
         assert!(env.contains_key("PATH"));

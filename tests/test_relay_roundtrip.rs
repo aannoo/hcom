@@ -30,13 +30,16 @@ mod support;
 
 use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use support::claude_mock::{MODEL, claude_text, claude_tool_use, latest_user_turn};
+use support::claude_mock::{
+    ClaudeStartupAnswers, MODEL, claude_startup_gate, claude_text, claude_tool_use,
+    latest_user_turn,
+};
 use support::mock_http::{MockHttp, RecordedRequest, Reply};
 
 // ── Logging ────────────────────────────────────────────────────────────
@@ -135,7 +138,9 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         // (tmux/kitty/etc.) is required in CI.
         .env(
             "HCOM_CLAUDE_ARGS",
-            format!("--model {MODEL} --permission-mode bypassPermissions --setting-sources user"),
+            format!(
+                "--model {MODEL} --permission-mode dontAsk --allowedTools Write,Bash --setting-sources user"
+            ),
         );
 
     let mut path_entries = Vec::new();
@@ -476,10 +481,8 @@ fn poll_rpc_result_on_device(hcom_dir: &str, action: &str) -> serde_json::Value 
 /// True if `text` has Claude's input prompt marker at the start of a rendered
 /// screen line, present whenever the TUI is rendered, independent of the
 /// dontAsk / accept-edits mode that hides the "? for shortcuts" status bar.
-/// `--permission-mode bypassPermissions` (used by this test) renders a plain
-/// `>` instead of the styled `❯`. Requiring the marker to lead the line (not
-/// just appear anywhere) keeps this from matching an unrelated `>` in tips,
-/// diffs, or other screen content.
+/// Requiring the marker to lead the line (not just appear anywhere) keeps this
+/// from matching an unrelated `>` in tips, diffs, or other screen content.
 fn screen_has_claude_prompt(text: &str) -> bool {
     text.lines().any(|line| {
         let trimmed = strip_term_line_number_prefix(line).trim_start();
@@ -636,28 +639,23 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
 fn drive_claude_startup(hcom_dir: &str, name: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     let mut last_screen = String::new();
+    let mut answers = ClaudeStartupAnswers::default();
     while Instant::now() < deadline {
         let json_out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
         let screen_out = hcom_with_dir(&format!("term {name}"), hcom_dir);
         last_screen = String::from_utf8_lossy(&screen_out.stdout).to_string();
-        let low = last_screen.to_lowercase();
-        let bypass_confirm = low.contains("yes, i accept") && low.contains("bypass permissions");
-        let onboarding = bypass_confirm
-            || low.contains("text style")
-            || low.contains("i trust this folder")
-            || low.contains("is this a project")
-            || low.contains("accessing workspace")
-            || low.contains("do you trust")
-            || low.contains("press enter to continue");
+        let gate = claude_startup_gate(&last_screen);
         if screen_out.status.success()
             && String::from_utf8_lossy(&json_out.stdout).contains("\"prompt_empty\":true")
-            && !onboarding
+            && gate.is_none()
         {
             return;
         }
-        if bypass_confirm || onboarding {
-            let key = if bypass_confirm { "2 " } else { "" };
-            let inject = hcom_with_dir(&format!("term inject {name} {key}--enter"), hcom_dir);
+        if gate.is_some_and(|gate| answers.answer_once(gate)) {
+            // A successful inject delivered Enter to the PTY. Do not repeat it
+            // while a stale frame still shows the gate: the next Enter could
+            // land in Claude's ready prompt.
+            let inject = hcom_with_dir(&format!("term inject {name} --enter"), hcom_dir);
             assert!(
                 inject.status.success(),
                 "drive startup inject failed\nstdout: {}\nstderr: {}",
@@ -858,6 +856,100 @@ fn phase10_diagnostics(
     )
 }
 
+/// Tail of a device's hcom.log — this is where the relay-worker's own
+/// crash would surface, since `main()` installs a panic hook that logs
+/// panics via `log::log_error` instead of letting them hit stderr (the
+/// worker's stdout/stderr are redirected to null so it survives the
+/// parent terminal closing; see `do_spawn` in src/relay/worker.rs).
+fn tail_hcom_log(hcom_dir: &str, lines: usize) -> String {
+    let log_path = Path::new(hcom_dir)
+        .join(".tmp")
+        .join("logs")
+        .join("hcom.log");
+    match fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(lines);
+            all[start..].join("\n")
+        }
+        Err(e) => format!("<unavailable: {} ({e})>", log_path.display()),
+    }
+}
+
+/// Bounded, non-panicking `hcom relay status` for the panic-hook path.
+/// Deliberately doesn't reuse `hcom_with_dir`/`run_command_with_timeout`:
+/// those panic on spawn failure, wait failure, or a 90s timeout, and a panic
+/// raised from inside a panic hook aborts the whole process (`rtabort!`,
+/// uncatchable by `catch_unwind`) instead of just failing this test — see
+/// `install_diagnostic_panic_hook`. Every failure mode here folds into the
+/// returned string instead, and the bound is a short 10s since this only
+/// ever needs a cheap local status read, not a network round trip.
+fn safe_relay_status(hcom_dir: &str) -> String {
+    let mut command = Command::new(hcom_bin());
+    command
+        .args(["relay", "status"])
+        .env("HCOM_DIR", hcom_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return format!("<spawn failed: {e}>"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "<timed out after 10s>".to_string();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(e) => return format!("<wait failed: {e}>"),
+        }
+    }
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    format!("{stdout}{stderr}")
+}
+
+/// Installs a process-wide panic hook that dumps both devices' relay
+/// status and hcom.log tail before the default hook runs. Any phase's
+/// `check()`/`poll_until()`/`assert!` can panic — a bare "timed out" or
+/// "command failed" panic gives no way to tell whether a device's own
+/// relay-worker died out from under it (the Phase 13 Windows flake this
+/// was added for: the worker was alive through Phase 12, then
+/// `is_relay_worker_running()` reported false a few seconds later with
+/// no visible cause). Chains to the previous hook so normal panic output
+/// is unchanged; this only adds extra stderr before that.
+///
+/// The hook body must never itself panic (see `safe_relay_status`'s doc for
+/// why), which is also why it uses `tail_hcom_log`'s plain `Result`-based
+/// file read rather than anything that could panic on a missing/unreadable
+/// log.
+fn install_diagnostic_panic_hook(path_a: String, path_b: String) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        eprintln!("\n----- relay diagnostics on panic -----");
+        for (label, dir) in [("A", &path_a), ("B", &path_b)] {
+            eprintln!("Device {label} relay status:\n{}", safe_relay_status(dir));
+            eprintln!(
+                "Device {label} hcom.log (last 60 lines):\n{}",
+                tail_hcom_log(dir, 60)
+            );
+        }
+        eprintln!("----- end relay diagnostics -----\n");
+    }));
+}
+
 /// Kill orphan debug relay-worker processes from previous failed test runs.
 /// Without this, a stale daemon can hold MQTT connections and interfere with
 /// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
@@ -950,6 +1042,8 @@ fn test_relay_roundtrip() {
 
     let path_a = dir_a_path.to_string_lossy().to_string();
     let path_b = dir_b_path.to_string_lossy().to_string();
+
+    install_diagnostic_panic_hook(path_a.clone(), path_b.clone());
 
     let claude_mock =
         MockHttp::start(relay_claude_mock_response).expect("start localhost Claude mock provider");
@@ -1262,7 +1356,7 @@ fn test_relay_roundtrip() {
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
     let claude_version =
-        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.185".to_string());
+        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.216".to_string());
     assert_tool_pinned(
         "claude",
         &claude_version,
