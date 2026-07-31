@@ -779,6 +779,10 @@ fn start_bare(
 
     println!("[hcom:{}]", name);
     println!("{}", bootstrap_text);
+    // Repeated deliberately: the header above sits on top of a long bootstrap, so
+    // `hcom start | tail -n` shows none of it. A caller that cannot see its own
+    // name re-runs start, which is exactly how duplicate identities appear.
+    println!("[hcom:{}] ready", name);
 
     // Log
     db.log_event(
