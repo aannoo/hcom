@@ -1572,6 +1572,7 @@ mod tests {
             ),
             ("/home/user/.pi/agent/sessions/x/20260603_abc.jsonl", "pi"),
             ("/home/user/.omp/agent/sessions/x/20260603_abc.jsonl", "omp"),
+            ("/home/user/.hermes/state.db", "hermes"),
         ];
         let expected: std::collections::HashSet<&str> =
             crate::integration_spec::released_tool_names()

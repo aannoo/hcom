@@ -9,6 +9,11 @@ use std::os::fd::AsRawFd;
 /// Magic prefix for query commands (not injection)
 const QUERY_PREFIX: u8 = 0x00;
 
+/// Magic prefix for raw injection: the payload passes through verbatim, keeping
+/// any trailing newline. Used by the Hermes ACP delivery loop, whose
+/// newline-delimited JSON-RPC framing requires an intact trailing `\n`.
+pub(crate) const RAW_PREFIX: u8 = 0x01;
+
 /// Result of reading from an inject client
 pub enum InjectResult {
     /// Text to inject into PTY
@@ -111,9 +116,17 @@ impl InjectServer {
     /// - ScreenQuery(index): caller should dump screen and call respond_query()
     /// - Pending: no data ready yet
     pub fn read_client(&mut self, index: usize) -> Result<InjectResult> {
+        // Ensure any pending connections are accepted so that the requested index is valid.
+        while self.clients.len() <= index {
+            if !self.accept()? {
+                break;
+            }
+        }
         if index >= self.clients.len() {
             return Ok(InjectResult::Pending);
         }
+
+
 
         let (stream, buffer) = &mut self.clients[index];
         let mut buf = [0u8; 8192];
@@ -151,26 +164,62 @@ impl InjectServer {
             }
         }
 
+        // If the client closed its write side without a zero‑length read (e.g.,
+        // on platforms where shutdown triggers WouldBlock first), treat any buffered
+        // data as complete.
+        if !buffer.is_empty() {
+            let data = std::mem::take(buffer);
+            // Process possible query command.
+            if data.first() == Some(&QUERY_PREFIX) {
+                let cmd = std::str::from_utf8(&data[1..]).unwrap_or("").trim();
+                let (stream, _) = self.clients.remove(index);
+                let command = match cmd {
+                    "SCREEN" => QueryCommand::Screen,
+                    _ => QueryCommand::Unknown,
+                };
+                return Ok(InjectResult::Query(QueryClient { stream, command }));
+            }
+            self.clients.remove(index);
+            return Ok(InjectResult::Inject(self.process_inject_data(&data)));
+        }
         Ok(InjectResult::Pending)
     }
 
     /// Process injection data: decode and strip trailing LF
     /// Fix #7: Use UTF-8 with Latin-1 fallback instead of lossy (which mangles bytes)
     fn process_inject_data(&self, data: &[u8]) -> String {
-        let mut text = match String::from_utf8(data.to_vec()) {
-            Ok(s) => s,
-            Err(_) => {
-                // Fallback to Latin-1 (preserves all byte values as chars)
-                data.iter().map(|&b| b as char).collect()
-            }
+        // Determine if this is a raw injection (prefix 0x01).
+        let (raw, payload) = match data.first() {
+            Some(&RAW_PREFIX) => (true, &data[1..]),
+            _ => (false, data),
         };
 
-        // Strip single trailing LF (from echo/nc), preserve CR for submit
-        if text.ends_with('\n') {
-            text.pop();
+        // Decode payload, falling back to Latin‑1 if UTF‑8 is invalid.
+        let decoded = match String::from_utf8(payload.to_vec()) {
+            Ok(s) => s,
+            Err(_) => payload.iter().map(|&b| b as char).collect(),
+        };
+
+        if raw {
+            // If the payload is valid UTF‑8 and contains no control characters (except
+            // the framing newline), we can return it unchanged – the newline is kept.
+            let utf8_ok = String::from_utf8(payload.to_vec()).is_ok();
+            let has_control = decoded
+                .chars()
+                .any(|c| (c as u32) <= 0x1F && c != '\n');
+            if utf8_ok && !has_control {
+                return decoded;
+            }
+// Raw injection: pass through verbatim (including newline and control bytes).
+            return decoded;
         }
 
-        text
+        // Non‑raw injection: strip a single trailing LF (typical of echo/nc), preserve CR.
+        let mut s = decoded;
+        if s.ends_with('\n') {
+            s.pop();
+        }
+        s
     }
 }
 
@@ -239,5 +288,47 @@ mod tests {
         };
         assert_eq!(read_next(&mut server), "text");
         assert_eq!(read_next(&mut server), "\r");
+    }
+
+    #[test]
+    fn raw_prefix_preserves_trailing_newline() {
+        let mut server = InjectServer::new().unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        let json_line = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
+        let mut payload = Vec::new();
+        payload.push(super::RAW_PREFIX);
+        payload.extend_from_slice(json_line);
+        payload.push(b'\n');
+        client.write_all(&payload).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let InjectResult::Inject(text) = server.read_client(0).unwrap() {
+                let expected = String::from_utf8(json_line.to_vec()).unwrap();
+                assert_eq!(text, expected + "\n");
+                break;
+            }
+            assert!(Instant::now() < deadline, "raw client did not complete");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn raw_prefix_keeps_c0_bytes() {
+        let mut server = InjectServer::new().unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        client.write_all(&[super::RAW_PREFIX, b'a', b'\x1b', b'b', b'\n']).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let InjectResult::Inject(text) = server.read_client(0).unwrap() {
+                assert_eq!(text, "a\u{1b}b\n");
+                break;
+            }
+            assert!(Instant::now() < deadline, "raw client did not complete");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }

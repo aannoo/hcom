@@ -481,7 +481,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / hermes_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -886,6 +886,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "cursor-agent",
     "kimi",
     "copilot",
+    "hermes",
 ];
 
 fn resumable_tool_names() -> String {
@@ -1189,6 +1190,7 @@ mod tests {
             "agy",
             "antigravity",
             "kimi",
+            "hermes",
         ];
         for cmd in commands {
             let help = get_command_help(cmd);

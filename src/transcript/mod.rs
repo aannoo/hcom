@@ -10,6 +10,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod gemini;
+pub mod hermes;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
@@ -40,6 +41,7 @@ pub enum TranscriptBackend {
     KimiWireJsonl,
     CopilotJsonl,
     PiJsonl,
+    HermesSqlite,
 }
 
 /// Where `transcript search --all` discovers sessions for a tool.
@@ -59,6 +61,7 @@ enum TranscriptDiscovery {
     CopilotSessionState,
     PiSessions,
     OmpSessions,
+    HermesStateDb,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +126,11 @@ static TRANSCRIPT_PROFILES: &[TranscriptProfile] = &[
         tool: Tool::Copilot,
         backend: TranscriptBackend::CopilotJsonl,
         discovery: TranscriptDiscovery::CopilotSessionState,
+    },
+    TranscriptProfile {
+        tool: Tool::Hermes,
+        backend: TranscriptBackend::HermesSqlite,
+        discovery: TranscriptDiscovery::HermesStateDb,
     },
 ];
 
@@ -217,6 +225,13 @@ pub fn read(
             copilot::parse_copilot_jsonl(path, opts.last, opts.detailed)
         }
         TranscriptBackend::PiJsonl => pi::parse_pi_jsonl(path, opts.last, opts.detailed),
+        TranscriptBackend::HermesSqlite => {
+            let sid = opts.session_id.as_deref().unwrap_or("");
+            if sid.is_empty() {
+                return Err("Hermes transcript requires a session_id".to_string());
+            }
+            hermes::parse_hermes_sqlite(path, sid, opts.last)
+        }
         TranscriptBackend::OpenCodeSqlite => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -291,6 +306,8 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
         Some(Tool::OpenCode)
     } else if file_name == "kilo.db" || lower.contains("/kilo/") {
         Some(Tool::Kilo)
+    } else if file_name == "state.db" && (lower.contains("/.hermes/") || lower.contains("/hermes/")) {
+        Some(Tool::Hermes)
     } else if lower.contains("/.gemini/tmp/")
         && lower.contains("/chats/")
         && file_name.starts_with("session-")
@@ -535,7 +552,9 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         }
         TranscriptDiscovery::PiSessions => pi_session_roots(),
         TranscriptDiscovery::OmpSessions => omp_session_roots(),
-        TranscriptDiscovery::OpenCodeDatabase | TranscriptDiscovery::KiloDatabase => Vec::new(),
+        TranscriptDiscovery::OpenCodeDatabase
+        | TranscriptDiscovery::KiloDatabase
+        | TranscriptDiscovery::HermesStateDb => Vec::new(),
     }
 }
 
@@ -544,6 +563,7 @@ pub(crate) fn database_search_path(tool: Tool) -> Option<PathBuf> {
     match profile_for_tool(tool)?.discovery {
         TranscriptDiscovery::OpenCodeDatabase => opencode::get_opencode_db_path(),
         TranscriptDiscovery::KiloDatabase => opencode::get_kilo_db_path(),
+        TranscriptDiscovery::HermesStateDb => hermes::get_hermes_db_path(),
         _ => None,
     }
 }
@@ -562,6 +582,9 @@ pub(crate) fn search_database_sessions(
         }
         Some(TranscriptDiscovery::KiloDatabase) => {
             opencode::search_kilo_sessions(db_path, pattern, limit)
+        }
+        Some(TranscriptDiscovery::HermesStateDb) => {
+            hermes::search_hermes_sessions(db_path, pattern, limit)
         }
         _ => Err(format!("Tool '{}' is not database-backed", tool)),
     }
@@ -722,7 +745,7 @@ mod tests {
     fn every_transcript_tool_has_a_disk_or_database_discovery_source() {
         for tool in transcript_tools() {
             let roots = disk_search_roots(tool);
-            if matches!(tool, Tool::OpenCode | Tool::Kilo) {
+            if matches!(tool, Tool::OpenCode | Tool::Kilo | Tool::Hermes) {
                 assert!(
                     roots.is_empty(),
                     "database tool {tool} should not expose disk roots"

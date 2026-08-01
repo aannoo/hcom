@@ -20,6 +20,7 @@ pub enum Tool {
     Cursor,
     Kimi,
     Copilot,
+    Hermes,
     Pi,
     Omp,
     Adhoc,
@@ -103,6 +104,7 @@ impl Tool {
             Tool::Copilot => {
                 crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
             }
+            Tool::Hermes => crate::hooks::hermes::verify_hermes_hooks_installed(include_permissions),
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
             Tool::Adhoc => false,
@@ -139,6 +141,8 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Copilot => crate::hooks::copilot::try_setup_copilot_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
+            Tool::Hermes => crate::hooks::hermes::try_setup_hermes_hooks(include_permissions)
+                .map_err(|e| e.to_string()),
             Tool::Pi => match crate::hooks::pi::install_pi_plugin() {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(String::new()),
@@ -171,6 +175,7 @@ impl Tool {
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
+            Tool::Hermes => Ok(crate::hooks::hermes::remove_hermes_hooks()),
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
@@ -194,6 +199,7 @@ impl Tool {
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
             Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
+            Tool::Hermes => crate::hooks::hermes::get_hermes_hooks_path(),
             Tool::Pi => crate::hooks::pi::get_pi_plugin_path(),
             Tool::Omp => crate::hooks::omp::get_omp_plugin_path(),
             Tool::Adhoc => return String::new(),
@@ -309,6 +315,24 @@ mod tests {
     #[test]
     fn antigravity_shares_gemini_hooks() {
         assert_eq!(Tool::Antigravity.hooks(), Tool::Gemini.hooks());
+    }
+
+    #[test]
+    fn hermes_from_str_and_has_no_hooks() {
+        assert_eq!("hermes".parse::<Tool>(), Ok(Tool::Hermes));
+        assert!(Tool::Hermes.hooks().is_empty());
+        assert!(!Tool::Hermes.owns_hook("poll"));
+        assert_eq!(Tool::from_hook_name("poll"), Some(Tool::Claude));
+        assert_eq!(Tool::Hermes.as_str(), "hermes");
+        assert!(Tool::Hermes.ready_pattern().is_empty());
+    }
+
+    #[test]
+    fn hermes_hook_ops_are_noops() {
+        assert!(Tool::Hermes.verify_hooks_installed(false));
+        assert!(Tool::Hermes.try_setup_hooks(false).is_ok());
+        assert_eq!(Tool::Hermes.remove_hooks(), Ok(true));
+        assert!(!Tool::Hermes.hooks_settings_path().is_empty());
     }
 
     #[test]

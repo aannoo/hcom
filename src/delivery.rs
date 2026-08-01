@@ -2,6 +2,8 @@
 
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
+#[path = "delivery/hermes.rs"]
+mod hermes;
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -682,7 +684,16 @@ pub struct ScreenState {
     /// set. Only ever true for Claude (see `ScreenTracker::is_claude_subagent_nav_visible`
     /// / `is_claude_session_switcher_visible`).
     pub nav_overlay: bool,
+    /// Raw bytes read from the PTY master, capped at [`RAW_OUTPUT_CAP`].
+    /// Appended by the PTY proxy, drained by the Hermes ACP delivery loop
+    /// (which parses newline-delimited JSON-RPC). Unused for other tools.
+    pub raw_output: Vec<u8>,
 }
+
+/// Cap for [`ScreenState::raw_output`]. The delivery loop drains frequently,
+/// so this only guards against a burst between drains (a single large
+/// `session/prompt` response can be hundreds of KB).
+pub(crate) const RAW_OUTPUT_CAP: usize = 16 * 1024 * 1024;
 
 impl Default for ScreenState {
     fn default() -> Self {
@@ -698,6 +709,7 @@ impl Default for ScreenState {
             last_prompt_submit: None,
             approval_scrape_latched: false,
             nav_overlay: false,
+            raw_output: Vec::new(),
         }
     }
 }
@@ -1102,6 +1114,23 @@ pub(crate) fn inject_enter(port: u16) -> bool {
     }
 }
 
+/// Inject a raw JSON-RPC line to the PTY master.
+///
+/// The raw-inject prefix ([`crate::pty::RAW_PREFIX`]) makes the inject server
+/// pass the payload through verbatim — including the trailing newline that
+/// newline-delimited JSON-RPC framing needs — and skips the interactive C0
+/// filter. Used by the Hermes ACP delivery loop.
+pub(crate) fn inject_raw_line(port: u16, line: &str) -> bool {
+    let mut payload = Vec::with_capacity(line.len() + 2);
+    payload.push(crate::pty::RAW_PREFIX);
+    payload.extend_from_slice(line.as_bytes());
+    payload.push(b'\n');
+    match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+        Ok(mut stream) => stream.write_all(&payload).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Fixed retry delay between gate-blocked delivery attempts.
 /// TCP notify handles the fast path (instant wake on status change);
 /// this is the fallback polling interval for missed notifications.
@@ -1321,7 +1350,25 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(
+    if matches!(Tool::from_str(&config.tool), Ok(Tool::Hermes)) {
+        // Hermes ACP: JSON-RPC delivery loop over the raw PTY. Runs its own
+        // state machine (initialize -> session -> prompt) instead of the gate
+        // machine below; the shared launch-outcome plumbing is passed in so
+        // launch readiness tracks the ACP handshake.
+        hermes::run_hermes_acp_loop(
+            running,
+            db,
+            notify,
+            state,
+            &mut current_name,
+            &process_id,
+            &shared_name,
+            &shared_status,
+            &title_wake,
+            config,
+            &mut launch_outcome,
+        );
+    } else if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
     ) {
@@ -2334,6 +2381,7 @@ mod tests {
             last_prompt_submit: None,
             approval_scrape_latched: false,
             nav_overlay: false,
+            raw_output: Vec::new(),
         }
     }
 

@@ -168,6 +168,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     // Create and run PTY
     let instance_name_for_failure = instance_name.clone();
+    let is_hermes_acp = tool_str == "hermes" && tool_args.first().copied() == Some("acp");
     let mut proxy = match pty::Proxy::spawn(
         &command,
         &full_args,
@@ -175,7 +176,32 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             ready_pattern,
             instance_name,
             target,
-            env_vars: pty_child_env(),
+            // hermes acp is a JSON-RPC stdio server: the PTY slave must be raw
+            // (no echo / CRLF mangling) and hermes' stderr logs must be diverted
+            // to a file so the master stream stays pure JSON-RPC for delivery.
+            raw_pty: is_hermes_acp,
+            stderr_path: if is_hermes_acp {
+                Some(
+                    crate::paths::hcom_path(&[
+                        ".tmp",
+                        "logs",
+                        &format!("{}-hermes-acp.log", instance_name_for_failure.as_deref().unwrap_or("hermes")),
+                    ]),
+                )
+            } else {
+                None
+            },
+            env_vars: {
+                let mut vars = pty_child_env();
+                if is_hermes_acp {
+                    // Hermes skips its globally-configured MCP servers when the
+                    // host says so; hcom owns the session's cwd and the user's
+                    // prompt turns, so a slow/stuck global MCP server must not
+                    // delay the initialize handshake.
+                    vars.push(("HERMES_ACP_SKIP_CONFIGURED_MCP".to_string(), "1".to_string()));
+                }
+                vars
+            },
         },
     ) {
         Ok(proxy) => proxy,

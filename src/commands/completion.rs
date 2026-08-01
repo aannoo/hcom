@@ -161,6 +161,7 @@ fn generate_zsh_completion() -> String {
                 "cursor" | "cursor-agent" => "Launch Cursor agent",
                 "kimi" => "Launch Kimi agent",
                 "copilot" => "Launch Copilot agent",
+                "hermes" => "Launch Hermes ACP agent",
                 _ => "Launch agent",
             };
             format!("{}:{:?}", t, desc)
