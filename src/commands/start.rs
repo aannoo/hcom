@@ -703,6 +703,31 @@ fn start_bare(
     }
 
     // Resolve or generate name
+    //
+    // Identity for a vanilla session rides on HCOM_CLAUDE_UNIX_SESSION_ID, which
+    // the SessionStart hook appends to CLAUDE_ENV_FILE. When that file is absent
+    // the id never reaches the CLI, the reuse check above cannot fire, and a
+    // second `hcom start` from the SAME session silently mints a SECOND identity:
+    // the first is left bound to nothing and later reports as launch_failed.
+    // Observed 2026-07-31. hcom cannot prove identity here, so instead of
+    // guessing it says so and names the rebind command.
+    let unverifiable_identity = explicit_name.is_none()
+        && ctx.tool == crate::tool::Tool::Claude
+        && claude_session_id.is_none();
+    if unverifiable_identity {
+        eprintln!(
+            "[hcom] warn: cannot identify this session (HCOM_CLAUDE_UNIX_SESSION_ID unset, \
+             CLAUDE_ENV_FILE {}). A repeat `hcom start` here creates a SECOND identity \
+             rather than returning the first. If this session already has a name, run \
+             `hcom start --as <name>` instead.",
+            if ctx.claude_env_file.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+    }
+
     let name = if let Some(n) = explicit_name {
         n.to_string()
     } else {
