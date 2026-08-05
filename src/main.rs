@@ -181,13 +181,14 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             // to a file so the master stream stays pure JSON-RPC for delivery.
             raw_pty: is_hermes_acp,
             stderr_path: if is_hermes_acp {
-                Some(
-                    crate::paths::hcom_path(&[
-                        ".tmp",
-                        "logs",
-                        &format!("{}-hermes-acp.log", instance_name_for_failure.as_deref().unwrap_or("hermes")),
-                    ]),
-                )
+                Some(crate::paths::hcom_path(&[
+                    ".tmp",
+                    "logs",
+                    &format!(
+                        "{}-hermes-acp.log",
+                        instance_name_for_failure.as_deref().unwrap_or("hermes")
+                    ),
+                ]))
             } else {
                 None
             },
@@ -198,7 +199,10 @@ pub fn run_pty(args: &[String]) -> Result<()> {
                     // host says so; hcom owns the session's cwd and the user's
                     // prompt turns, so a slow/stuck global MCP server must not
                     // delay the initialize handshake.
-                    vars.push(("HERMES_ACP_SKIP_CONFIGURED_MCP".to_string(), "1".to_string()));
+                    vars.push((
+                        "HERMES_ACP_SKIP_CONFIGURED_MCP".to_string(),
+                        "1".to_string(),
+                    ));
                 }
                 vars
             },

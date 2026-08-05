@@ -663,14 +663,11 @@ impl Proxy {
         // Termios is a property of the tty device and is set here (master side)
         // before the child opens the slave.
         if config.raw_pty {
-            let mut termios = nix::sys::termios::tcgetattr(&pty.slave).context("tcgetattr failed")?;
+            let mut termios =
+                nix::sys::termios::tcgetattr(&pty.slave).context("tcgetattr failed")?;
             nix::sys::termios::cfmakeraw(&mut termios);
-            nix::sys::termios::tcsetattr(
-                &pty.slave,
-                nix::sys::termios::SetArg::TCSANOW,
-                &termios,
-            )
-            .context("tcsetattr (raw mode) failed")?;
+            nix::sys::termios::tcsetattr(&pty.slave, nix::sys::termios::SetArg::TCSANOW, &termios)
+                .context("tcsetattr (raw mode) failed")?;
         }
 
         // Open stderr log file in the parent and hand the fd to the child via
@@ -685,9 +682,7 @@ impl Proxy {
                         .create(true)
                         .append(true)
                         .open(path)
-                        .with_context(|| {
-                            format!("open stderr log {:?} failed", path)
-                        })?,
+                        .with_context(|| format!("open stderr log {:?} failed", path))?,
                 )
             }
             None => None,

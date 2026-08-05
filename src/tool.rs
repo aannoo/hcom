@@ -104,7 +104,9 @@ impl Tool {
             Tool::Copilot => {
                 crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
             }
-            Tool::Hermes => crate::hooks::hermes::verify_hermes_hooks_installed(include_permissions),
+            Tool::Hermes => {
+                crate::hooks::hermes::verify_hermes_hooks_installed(include_permissions)
+            }
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
             Tool::Adhoc => false,

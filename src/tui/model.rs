@@ -1283,7 +1283,8 @@ mod tests {
     fn tool_prev_cycles_backward() {
         assert_eq!(Tool::Claude.prev(), Tool::Hermes);
         assert_eq!(Tool::Hermes.prev(), Tool::Copilot);
-        assert_eq!(Tool::Copilot.prev(), Tool::Kimi);        assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
+        assert_eq!(Tool::Copilot.prev(), Tool::Kimi);
+        assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
         assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);
         assert_eq!(Tool::Antigravity.prev(), Tool::Omp);
         assert_eq!(Tool::Omp.prev(), Tool::Pi);

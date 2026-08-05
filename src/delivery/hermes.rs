@@ -37,9 +37,9 @@ use crate::notify::NotifyServer;
 use crate::shared::ST_LISTENING;
 
 use super::{
-    DeliveryState, LaunchOutcome, TitleRefresh, ToolConfig, TitleWake,
-    drive_launch_outcome, emit_launch_failed_if_needed, host_label,
-    inject_raw_line, refresh_title_state, IDLE_WAIT,
+    DeliveryState, IDLE_WAIT, LaunchOutcome, TitleRefresh, TitleWake, ToolConfig,
+    drive_launch_outcome, emit_launch_failed_if_needed, host_label, inject_raw_line,
+    refresh_title_state,
 };
 
 /// ACP protocol version sent in `initialize`.
@@ -304,7 +304,10 @@ pub(super) fn run_hermes_acp_loop(
                         phase = AcpPhase::Session;
                         continue;
                     }
-                    match result.and_then(|r| r.get("sessionId")).and_then(|v| v.as_str()) {
+                    match result
+                        .and_then(|r| r.get("sessionId"))
+                        .and_then(|v| v.as_str())
+                    {
                         Some(sid) => {
                             log_info(
                                 "native",
@@ -415,16 +418,9 @@ pub(super) fn run_hermes_acp_loop(
                     log_info(
                         "native",
                         "hermes.acp.session_new",
-                        &format!(
-                            "{}: creating new ACP session (cwd={})",
-                            current_name, cwd
-                        ),
+                        &format!("{}: creating new ACP session (cwd={})", current_name, cwd),
                     );
-                    (
-                        "session/new",
-                        acp_new_session_params(&cwd),
-                        "session/new",
-                    )
+                    ("session/new", acp_new_session_params(&cwd), "session/new")
                 };
                 if send_acp_request(state, next_id, method, params, current_name, what) {
                     phase = AcpPhase::AwaitingSession {
@@ -543,10 +539,18 @@ pub(super) fn run_hermes_acp_loop(
                 log_warn("native", "hermes.acp.heartbeat_fail", &format!("{}", e));
             }
             if let Err(e) = db.register_notify_port(current_name, notify.port()) {
-                log_warn("native", "hermes.acp.register_notify_fail", &format!("{}", e));
+                log_warn(
+                    "native",
+                    "hermes.acp.register_notify_fail",
+                    &format!("{}", e),
+                );
             }
             if let Err(e) = db.register_inject_port(current_name, state.inject_port) {
-                log_warn("native", "hermes.acp.register_inject_fail", &format!("{}", e));
+                log_warn(
+                    "native",
+                    "hermes.acp.register_inject_fail",
+                    &format!("{}", e),
+                );
             }
             last_heartbeat = Instant::now();
         }
@@ -660,11 +664,7 @@ mod tests {
 
     #[test]
     fn request_is_single_line_newline_delimited() {
-        let msg = acp_request(
-            7,
-            "session/prompt",
-            acp_prompt_params("s1", "hello\nworld"),
-        );
+        let msg = acp_request(7, "session/prompt", acp_prompt_params("s1", "hello\nworld"));
         let line = serde_json::to_string(&msg).unwrap();
         assert!(line.contains("hello\\nworld"));
         assert_eq!(line.chars().filter(|&c| c == '\n').count(), 0);

@@ -19,8 +19,24 @@ pub struct CompletionArgs {
 
 /// Commands available at the top level (keep in sync with router.rs).
 const CLI_COMMANDS: &[&str] = &[
-    "send", "list", "events", "stop", "start", "listen", "status", "config", "hooks",
-    "archive", "reset", "transcript", "bundle", "kill", "term", "relay", "run", "update",
+    "send",
+    "list",
+    "events",
+    "stop",
+    "start",
+    "listen",
+    "status",
+    "config",
+    "hooks",
+    "archive",
+    "reset",
+    "transcript",
+    "bundle",
+    "kill",
+    "term",
+    "relay",
+    "run",
+    "update",
 ];
 
 /// All tool names (released) + their public aliases.
@@ -484,7 +500,9 @@ pub fn cmd_completion(_db: &HcomDb, args: &CompletionArgs, _ctx: Option<&Command
                     }
                 } else {
                     eprintln!("Error: Could not determine Zsh completion directory.");
-                    eprintln!("Install manually: hcom completion zsh > /usr/local/share/zsh/site-functions/_hcom");
+                    eprintln!(
+                        "Install manually: hcom completion zsh > /usr/local/share/zsh/site-functions/_hcom"
+                    );
                     1
                 }
             } else {

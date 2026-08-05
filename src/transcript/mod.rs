@@ -306,7 +306,8 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
         Some(Tool::OpenCode)
     } else if file_name == "kilo.db" || lower.contains("/kilo/") {
         Some(Tool::Kilo)
-    } else if file_name == "state.db" && (lower.contains("/.hermes/") || lower.contains("/hermes/")) {
+    } else if file_name == "state.db" && (lower.contains("/.hermes/") || lower.contains("/hermes/"))
+    {
         Some(Tool::Hermes)
     } else if lower.contains("/.gemini/tmp/")
         && lower.contains("/chats/")

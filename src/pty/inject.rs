@@ -126,8 +126,6 @@ impl InjectServer {
             return Ok(InjectResult::Pending);
         }
 
-
-
         let (stream, buffer) = &mut self.clients[index];
         let mut buf = [0u8; 8192];
 
@@ -204,13 +202,11 @@ impl InjectServer {
             // If the payload is valid UTF‑8 and contains no control characters (except
             // the framing newline), we can return it unchanged – the newline is kept.
             let utf8_ok = String::from_utf8(payload.to_vec()).is_ok();
-            let has_control = decoded
-                .chars()
-                .any(|c| (c as u32) <= 0x1F && c != '\n');
+            let has_control = decoded.chars().any(|c| (c as u32) <= 0x1F && c != '\n');
             if utf8_ok && !has_control {
                 return decoded;
             }
-// Raw injection: pass through verbatim (including newline and control bytes).
+            // Raw injection: pass through verbatim (including newline and control bytes).
             return decoded;
         }
 
@@ -318,7 +314,9 @@ mod tests {
     fn raw_prefix_keeps_c0_bytes() {
         let mut server = InjectServer::new().unwrap();
         let mut client = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
-        client.write_all(&[super::RAW_PREFIX, b'a', b'\x1b', b'b', b'\n']).unwrap();
+        client
+            .write_all(&[super::RAW_PREFIX, b'a', b'\x1b', b'b', b'\n'])
+            .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);

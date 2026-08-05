@@ -28,7 +28,9 @@ pub(crate) fn get_hermes_db_path() -> Option<PathBuf> {
     {
         PathBuf::from(dir)
     } else {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".hermes")
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".hermes")
     };
     let db = home.join("state.db");
     db.exists().then_some(db)
@@ -261,9 +263,8 @@ pub(crate) fn parse_hermes_sqlite(
                                     is_error,
                                     file,
                                     command,
-                                    output: output.and_then(|raw| {
-                                        capture_tool_output(&output_to_text(&raw))
-                                    }),
+                                    output: output
+                                        .and_then(|raw| capture_tool_output(&output_to_text(&raw))),
                                 });
                             }
                         }
@@ -307,7 +308,8 @@ pub(crate) fn parse_hermes_sqlite(
         files.truncate(5);
 
         let ended_on_error = tools.last().map(|t| t.is_error).unwrap_or(false);
-        let action = finalize_action_text(&action_parts.join("\n"), &tools, &errors, ended_on_error);
+        let action =
+            finalize_action_text(&action_parts.join("\n"), &tools, &errors, ended_on_error);
 
         exchanges.push(Exchange {
             position,
@@ -493,15 +495,35 @@ mod tests {
             [],
         )
         .unwrap();
-        insert(&conn, "ses_1", "user", Some("fix the bug"), None, None, None, 1.0);
-        insert(&conn, "ses_1", "assistant", Some("Let me check."), None, None, None, 2.0);
+        insert(
+            &conn,
+            "ses_1",
+            "user",
+            Some("fix the bug"),
+            None,
+            None,
+            None,
+            1.0,
+        );
+        insert(
+            &conn,
+            "ses_1",
+            "assistant",
+            Some("Let me check."),
+            None,
+            None,
+            None,
+            2.0,
+        );
         insert(
             &conn,
             "ses_1",
             "assistant",
             None,
             None,
-            Some(r#"[{"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"cargo test\"}"}}]"#),
+            Some(
+                r#"[{"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"cargo test\"}"}}]"#,
+            ),
             None,
             3.0,
         );
@@ -515,7 +537,16 @@ mod tests {
             Some("Bash"),
             4.0,
         );
-        insert(&conn, "ses_1", "assistant", Some("Done!"), None, None, None, 5.0);
+        insert(
+            &conn,
+            "ses_1",
+            "assistant",
+            Some("Done!"),
+            None,
+            None,
+            None,
+            5.0,
+        );
 
         let exchanges = parse_hermes_sqlite(&db_path, "ses_1", 10).unwrap();
         assert_eq!(exchanges.len(), 1);
@@ -523,11 +554,11 @@ mod tests {
         assert_eq!(exchanges[0].action, "Let me check.\nDone!");
         assert_eq!(exchanges[0].tools.len(), 1);
         assert_eq!(exchanges[0].tools[0].name, "Bash");
+        assert_eq!(exchanges[0].tools[0].command.as_deref(), Some("cargo test"));
         assert_eq!(
-            exchanges[0].tools[0].command.as_deref(),
-            Some("cargo test")
+            exchanges[0].tools[0].output.as_deref(),
+            Some("All tests passed")
         );
-        assert_eq!(exchanges[0].tools[0].output.as_deref(), Some("All tests passed"));
         assert!(!exchanges[0].ended_on_error);
     }
 
@@ -560,7 +591,16 @@ mod tests {
             None,
             3.0,
         );
-        insert(&conn, "ses_2", "assistant", Some("ok"), None, None, None, 4.0);
+        insert(
+            &conn,
+            "ses_2",
+            "assistant",
+            Some("ok"),
+            None,
+            None,
+            None,
+            4.0,
+        );
 
         let exchanges = parse_hermes_sqlite(&db_path, "ses_2", 10).unwrap();
         assert_eq!(exchanges.len(), 2);
@@ -580,8 +620,26 @@ mod tests {
             [],
         )
         .unwrap();
-        insert(&conn, "ses_a", "user", Some("reply with PONG"), None, None, None, 1.0);
-        insert(&conn, "ses_b", "user", Some("hello world"), None, None, None, 2.0);
+        insert(
+            &conn,
+            "ses_a",
+            "user",
+            Some("reply with PONG"),
+            None,
+            None,
+            None,
+            1.0,
+        );
+        insert(
+            &conn,
+            "ses_b",
+            "user",
+            Some("hello world"),
+            None,
+            None,
+            None,
+            2.0,
+        );
 
         let matches = search_hermes_sessions(&db_path, "PONG", 10).unwrap();
         assert_eq!(matches.len(), 1);

@@ -616,18 +616,21 @@ const UPDATE_HELP: &[HelpEntry] = &[
 const COMPLETION_HELP: &[HelpEntry] = &[
     ("completion zsh", "Generate Zsh completion script to stdout"),
     ("", ""),
-    (
-        "",
-        "Source the script to activate completions immediately:",
-    ),
+    ("", "Source the script to activate completions immediately:"),
     ("", "  eval \"$(hcom completion zsh)\""),
     ("", ""),
     ("", "Install permanently:"),
     ("", "  hcom completion zsh --install"),
-    ("", "  # or:  hcom completion zsh > /usr/local/share/zsh/site-functions/_hcom"),
+    (
+        "",
+        "  # or:  hcom completion zsh > /usr/local/share/zsh/site-functions/_hcom",
+    ),
     ("", "  compinit"),
     ("", ""),
-    ("", "Once installed, tab-complete hcom commands, tools, and flags."),
+    (
+        "",
+        "Once installed, tab-complete hcom commands, tools, and flags.",
+    ),
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[
