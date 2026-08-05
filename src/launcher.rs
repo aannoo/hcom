@@ -45,6 +45,7 @@ pub enum LaunchTool {
     Kimi,
     Copilot,
     Omp,
+    Hermes,
 }
 
 impl LaunchTool {
@@ -63,6 +64,7 @@ impl LaunchTool {
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
             "copilot" => Ok(LaunchTool::Copilot),
+            "hermes" => Ok(LaunchTool::Hermes),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -81,6 +83,7 @@ impl LaunchTool {
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
             LaunchTool::Copilot => "copilot",
+            LaunchTool::Hermes => "hermes",
         }
     }
 
@@ -101,6 +104,7 @@ impl LaunchTool {
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
+            LaunchTool::Hermes => crate::tool::Tool::Hermes,
         }
     }
 
@@ -170,7 +174,8 @@ impl LaunchBackend {
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
             | LaunchTool::Kimi
-            | LaunchTool::Copilot => LaunchBackend::HeadlessPty,
+            | LaunchTool::Copilot
+            | LaunchTool::Hermes => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -448,7 +453,12 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::Cursor => ".cursor",
         crate::tool::Tool::Kimi => ".kimi",
         crate::tool::Tool::Copilot => ".copilot",
-        crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
+        // Hermes must use the real HERMES_HOME (auth.json, state.db,
+        // config.yaml) — a fresh per-project tree would have no credentials
+        // and `hermes acp` would fail setup. No isolation, like OpenCode.
+        crate::tool::Tool::Hermes | crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => {
+            return None;
+        }
     };
     Some(root.join(dirname))
 }
@@ -770,6 +780,10 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             }
             Ok(())
         }
+        // Hermes has no hook surface — nothing to ensure (the ACP delivery
+        // loop replaces hook delivery). verify trivially passes, so this arm
+        // is only reachable via the match's exhaustiveness, never in practice.
+        LaunchTool::Hermes => Ok(()),
     }
 }
 
@@ -2358,6 +2372,33 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Hermes => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(&stored_launch_args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "hermes",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -2456,6 +2497,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             ANTIGRAVITY_REJECTED_ARGS,
         ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
+        LaunchTool::Hermes => crate::tools::launch_arg_validation::validate_hermes_args(args),
     }
 }
 

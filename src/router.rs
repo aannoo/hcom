@@ -39,6 +39,7 @@ const COMMANDS: &[&str] = &[
     "relay",
     "run",
     "update",
+    "completion",
 ];
 
 fn is_command(name: &str) -> bool {
@@ -104,6 +105,7 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             crate::hooks::copilot::dispatch_copilot_hook_native(hook),
             String::new(),
         ),
+        Tool::Hermes => unreachable!("hermes has no hook bridge"),
         Tool::Adhoc => unreachable!("adhoc has no hooks"),
     }
 }
@@ -608,6 +610,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "relay"
                     | "run"
                     | "update"
+                    | "completion"
             ) =>
         {
             let exit_code = dispatch_native_command(cmd, args);
@@ -882,6 +885,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             cmd,
             &cmd_argv,
             |args| crate::commands::update::cmd_update(&db, &args, Some(&ctx))
+        ),
+        "completion" => clap_dispatch!(
+            crate::commands::completion::CompletionArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::completion::cmd_completion(&db, &args, Some(&ctx))
         ),
         _ => {
             // Should never happen — only matched commands reach here

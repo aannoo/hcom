@@ -148,6 +148,103 @@ pub(crate) const ANTIGRAVITY_REJECTED_ARGS: &[RejectedArg] = &[
     },
 ];
 
+/// Hermes root subcommands / top-level flags that would leave ACP mode.
+///
+/// `hcom hermes` is the ACP launch surface: the command line must start with
+/// the `acp` subcommand. Anything else either starts the interactive TUI
+/// (unmanaged, no delivery), exits immediately, or is a non-ACP surface.
+pub(crate) const HERMES_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "chat",
+        reason: "starts the interactive TUI instead of the ACP stdio server",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "gateway",
+        reason: "starts the gateway service instead of the ACP stdio server",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "serve",
+        reason: "starts a server surface instead of the ACP stdio server",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "desktop",
+        reason: "starts the desktop surface instead of the ACP stdio server",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "gui",
+        reason: "starts a GUI surface instead of the ACP stdio server",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "send",
+        reason: "sends a message and exits instead of running the ACP stdio server",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "setup",
+        reason: "runs interactive setup and exits",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "sessions",
+        reason: "manages session history and exits",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "mcp",
+        reason: "manages MCP servers and exits",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "-r",
+        reason: "resumes a session in the interactive TUI, not the ACP stdio server",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--resume",
+        reason: "resumes a session in the interactive TUI, not the ACP stdio server",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--continue",
+        reason: "resumes a session in the interactive TUI, not the ACP stdio server",
+        kind: RejectedArgKind::Flag,
+    },
+];
+
+/// Hermes is the ACP launch surface: the first token must be the `acp`
+/// subcommand (or a benign help flag). `hermes acp` itself accepts only
+/// `--accept-hooks`, `--version`, `--check`, `--setup`, `--setup-browser`,
+/// `--yes` — everything else is a hermes root subcommand / top-level flag
+/// that leaves ACP mode and is rejected here with a clear redirect.
+pub(crate) fn validate_hermes_args(args: &[String]) -> Vec<String> {
+    let Some(first) = args.first() else {
+        return vec![
+            "hcom hermes requires the `acp` subcommand: run `hcom hermes acp` to start Hermes in ACP (JSON-RPC stdio) mode."
+                .to_string(),
+        ];
+    };
+    if matches!(first.as_str(), "acp" | "--help" | "-h") {
+        return Vec::new();
+    }
+    if let Some(rule) = HERMES_REJECTED_ARGS
+        .iter()
+        .find(|rule| long_flag_matches(first, rule.token))
+    {
+        return vec![format!(
+            "Hermes argument `{}` is not supported by `hcom hermes`: {}. Launch the hcom-managed ACP server with `hcom hermes acp` instead.",
+            rule.token, rule.reason
+        )];
+    }
+    vec![format!(
+        "Hermes argument `{first}` is not supported by `hcom hermes`: hcom drives Hermes over ACP. Run `hcom hermes acp` instead."
+    )]
+}
+
 /// Match a CLI token against a flag, accepting the `--flag=value` equals form
 /// for long flags. Short flags (`-p`) and subcommand words match exactly only.
 /// Shared so per-tool validators (cursor/copilot) reject `--print=…` the same

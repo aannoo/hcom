@@ -438,6 +438,15 @@ fn prepare_resume_plan_from_source(
         cli_tool_args
     };
 
+    // Hermes ACP resume is carried out-of-band: `hermes acp` takes no resume
+    // CLI flag, so the session id reaches the ACP delivery loop (which issues
+    // `session/load`) via a host-side env var. It is set on the PTY host
+    // process before launch and stripped from the hermes child's env by the
+    // launcher's instance-state cleanup.
+    if tool == "hermes" && !fork {
+        unsafe { std::env::set_var("HCOM_HERMES_ACP_RESUME", &session_id) };
+    }
+
     let mut merged_args = merged_cli_args.clone();
 
     if launch_flags.headless && tool != "claude" && tool != "kimi" {
@@ -999,6 +1008,11 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
     let mut args = match resume_spec.resume {
         ResumeArgs::Flag(flag) => vec![flag.to_string(), session_id.to_string()],
         ResumeArgs::Subcommand(sub) => vec![sub.to_string(), session_id.to_string()],
+        // Hermes ACP: resume is session/load over JSON-RPC (the delivery loop
+        // issues it); `hermes acp` takes no resume CLI flag, so emit none.
+        // The session id is threaded to the delivery loop via the
+        // HCOM_HERMES_ACP_RESUME env var set at resume time.
+        ResumeArgs::JsonRpc => Vec::new(),
     };
 
     if fork {
@@ -1039,6 +1053,14 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
         crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
         crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
+        crate::tool::Tool::Hermes => {
+            // Grammar-free like Claude/Gemini/Codex: hermes adds no resume
+            // args at the command line (ResumeArgs::JsonRpc), so resume
+            // injects nothing into the stored `hermes acp …` vector.
+            let mut merged = original.to_vec();
+            merged.extend_from_slice(resume);
+            merged
+        }
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
         crate::tool::Tool::Omp => merge_omp_args(original, resume),
         crate::tool::Tool::Adhoc => {

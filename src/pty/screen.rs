@@ -606,6 +606,7 @@ impl ScreenTracker {
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
+            Ok(Tool::Hermes) => None, // ACP delivery loop, no PTY input detection
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
