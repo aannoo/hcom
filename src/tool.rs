@@ -20,6 +20,7 @@ pub enum Tool {
     Cursor,
     Kimi,
     Copilot,
+    Grok,
     Pi,
     Omp,
     Adhoc,
@@ -103,6 +104,7 @@ impl Tool {
             Tool::Copilot => {
                 crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
             }
+            Tool::Grok => crate::hooks::grok::verify_grok_hooks_installed(include_permissions),
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
             Tool::Adhoc => false,
@@ -139,6 +141,8 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Copilot => crate::hooks::copilot::try_setup_copilot_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
+            Tool::Grok => crate::hooks::grok::try_setup_grok_hooks(include_permissions)
+                .map_err(|e| e.to_string()),
             Tool::Pi => match crate::hooks::pi::install_pi_plugin() {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(String::new()),
@@ -171,6 +175,7 @@ impl Tool {
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
+            Tool::Grok => Ok(crate::hooks::grok::remove_grok_hooks()),
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
@@ -194,6 +199,7 @@ impl Tool {
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
             Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
+            Tool::Grok => crate::hooks::grok::get_grok_hooks_path(),
             Tool::Pi => crate::hooks::pi::get_pi_plugin_path(),
             Tool::Omp => crate::hooks::omp::get_omp_plugin_path(),
             Tool::Adhoc => return String::new(),

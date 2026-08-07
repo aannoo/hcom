@@ -234,6 +234,7 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Cursor CLI | automatic | `hcom cursor-agent` |
 | Kimi | automatic | `hcom kimi` |
 | Copilot CLI | automatic | `hcom copilot` |
+| Grok Build | automatic | `hcom grok` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -267,7 +268,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot   # launch N agents
+hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot|grok   # launch N agents
 hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane
@@ -331,7 +332,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `grok_args` | Default args passed to the tool |
 
 ### Scope
 

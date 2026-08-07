@@ -1780,6 +1780,11 @@ fn inject_bootstrap_if_needed(
 
 /// Check for unread messages to deliver at PostToolUse.
 fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<(Value, DeliveryAck)> {
+    // Grok: PostToolUse is observe-only; native grok-stop owns delivery.
+    if common::is_grok_host() {
+        return None;
+    }
+
     let prepared = common::prepare_pending_messages(db, instance_name)?;
     let model_context =
         common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
@@ -1854,13 +1859,18 @@ fn handle_poll(
         "hooks",
         "stop.enter",
         &format!(
-            "instance={} is_headless={} pty_mode={}",
-            instance_name, ctx.is_background, ctx.is_pty_mode
+            "instance={} is_headless={} pty_mode={} grok_host={}",
+            instance_name,
+            ctx.is_background,
+            ctx.is_pty_mode,
+            common::is_grok_host()
         ),
     );
 
-    // PTY mode: exit immediately, PTY wrapper handles injection
-    if ctx.is_pty_mode {
+    // Grok loads Claude-compat Stop hooks, but native `grok-stop` is the sole
+    // delivery owner (StopHookJson.additionalContext). Claude-compat only
+    // flips listening + notifies — no followup_message (not in Grok's schema).
+    if common::is_grok_host() || ctx.is_pty_mode {
         lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
         common::notify_hook_instance_with_db(db, instance_name);
         return (0, String::new(), None);
@@ -1894,6 +1904,7 @@ fn handle_poll(
     // Always exit 0: Claude ignores stdout JSON on exit 2 for Stop, so a
     // delivered message must go out as exit 0 + decision:block, with the ack
     // committed by write_hook_output only after that stdout is flushed.
+    // (Grok hosts already returned above — native grok-stop owns delivery.)
     (0, stdout, result.ack)
 }
 
@@ -1927,7 +1938,14 @@ fn handle_userpromptsubmit(
         paths::increment_flag_counter("instance_count");
     }
 
-    // PTY mode: deliver messages
+    // Grok host: UPS is observe-only (stdout discarded). Status is handled by
+    // native grok-userpromptsubmit; leave pending for grok-stop additionalContext.
+    if common::is_grok_host() {
+        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        return (0, String::new(), None);
+    }
+
+    // PTY mode: deliver pending via Claude-compatible UPS payload.
     if ctx.is_pty_mode
         && let Some(prepared) = common::prepare_pending_messages(db, instance_name)
     {

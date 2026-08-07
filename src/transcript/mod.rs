@@ -10,6 +10,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod gemini;
+pub mod grok;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
@@ -40,6 +41,7 @@ pub enum TranscriptBackend {
     KimiWireJsonl,
     CopilotJsonl,
     PiJsonl,
+    GrokUpdatesJsonl,
 }
 
 /// Where `transcript search --all` discovers sessions for a tool.
@@ -59,6 +61,7 @@ enum TranscriptDiscovery {
     CopilotSessionState,
     PiSessions,
     OmpSessions,
+    GrokSessions,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +126,11 @@ static TRANSCRIPT_PROFILES: &[TranscriptProfile] = &[
         tool: Tool::Copilot,
         backend: TranscriptBackend::CopilotJsonl,
         discovery: TranscriptDiscovery::CopilotSessionState,
+    },
+    TranscriptProfile {
+        tool: Tool::Grok,
+        backend: TranscriptBackend::GrokUpdatesJsonl,
+        discovery: TranscriptDiscovery::GrokSessions,
     },
 ];
 
@@ -217,6 +225,9 @@ pub fn read(
             copilot::parse_copilot_jsonl(path, opts.last, opts.detailed)
         }
         TranscriptBackend::PiJsonl => pi::parse_pi_jsonl(path, opts.last, opts.detailed),
+        TranscriptBackend::GrokUpdatesJsonl => {
+            grok::parse_grok_updates_jsonl(path, opts.last, opts.detailed)
+        }
         TranscriptBackend::OpenCodeSqlite => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -255,6 +266,10 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
     // being silently assigned a parser.
     if lower.contains("antigravity") || lower.contains("/agy/") || lower.contains("/agy-") {
         Some(Tool::Antigravity)
+    } else if lower.contains("/.grok/sessions/")
+        || (file_name == "updates.jsonl" && lower.contains("/.grok/"))
+    {
+        Some(Tool::Grok)
     } else if lower.contains("/agent-transcripts/") {
         Some(Tool::Cursor)
     } else if lower.contains("/.copilot/session-state/")
@@ -535,6 +550,9 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         }
         TranscriptDiscovery::PiSessions => pi_session_roots(),
         TranscriptDiscovery::OmpSessions => omp_session_roots(),
+        TranscriptDiscovery::GrokSessions => {
+            vec![home.join(".grok").join("sessions")]
+        }
         TranscriptDiscovery::OpenCodeDatabase | TranscriptDiscovery::KiloDatabase => Vec::new(),
     }
 }

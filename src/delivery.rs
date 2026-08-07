@@ -713,6 +713,18 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
+/// Short PTY sentinel for Grok idle wake — no angle brackets (WT paste hazard).
+///
+/// Real message bodies are **not** pasted into the composer. They are delivered
+/// from native `grok-stop` via `hookSpecificOutput.additionalContext` after a
+/// genuine end-of-turn Stop (observe-only hooks discard stdout).
+pub(crate) const GROK_WAKE_TRIGGER: &str = "hcom: wake";
+
+/// PTY inject text for Grok: always the short wake sentinel.
+pub(crate) fn build_grok_inject_text(_db: &HcomDb, _recipient: &str) -> String {
+    GROK_WAKE_TRIGGER.to_string()
+}
+
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
 /// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
@@ -1417,6 +1429,30 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
+/// How long to wait after a Grok full-body inject before force-Enter.
+///
+/// Scales with payload size: short pings stay snappy; large review dumps under
+/// slow WSL/GB get up to ~4s so the composer can finish accepting paste.
+/// After force-Enter, how long to wait for a *real* submit signal before
+/// re-sending Enter. Must not treat `commit_delivery_ack`'s ST_ACTIVE as success
+/// (that was a false positive that skipped retries while the composer still
+/// held unsent text).
+const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(1200);
+
+/// True when Grok has actually started a user turn (UPS / stop cycle), not when
+/// we merely acked the bus. `deliver:*` is our own premature-ack context and
+/// must NOT count as submit.
+fn grok_turn_started(status: &str, context: &str) -> bool {
+    if status != ST_ACTIVE && status != "active" {
+        // Allow any non-listening non-active that clearly means mid-turn tools.
+        // Primary success path is ST_ACTIVE + prompt/trigger from UPS.
+        return false;
+    }
+    matches!(context, "prompt" | "trigger")
+        || context.starts_with("tool:")
+        || context.starts_with("approved:")
+}
+
 /// Inject Enter key to PTY via TCP
 pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
@@ -1913,13 +1949,19 @@ pub fn run_delivery_loop(
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
+                            // Grok: short wake sentinel only; body via Stop additionalContext.
+                            Some(Tool::Grok) => build_grok_inject_text(db, &current_name),
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
                             | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi)
                             | Some(Tool::Omp) => "<hcom>".to_string(),
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
-                        if inject_text(state.inject_port, &text) {
+                        // No Ctrl-U clear for Grok: cannot observe composer; risk
+                        // partial draft deletion. Sentinel is short and idle-gated.
+                        let inject_ok = inject_text(state.inject_port, &text);
+
+                        if inject_ok {
                             log_info(
                                 "native",
                                 "delivery.injected",
@@ -1927,7 +1969,7 @@ pub fn run_delivery_loop(
                                     "Injected '{}' (len={}, inject_attempt={})",
                                     truncate_chars(&text, 40),
                                     text.len(),
-                                    inject_attempt
+                                    inject_attempt,
                                 ),
                             );
                             injected_text = text;
@@ -2099,6 +2141,133 @@ pub fn run_delivery_loop(
 
                 State::WaitTextRender => {
                     let elapsed = phase_started_at.elapsed();
+
+                    // Grok: unscrapeable composer → cannot prove ownership.
+                    // Protocol (owner review): PTY only submits a short wake
+                    // sentinel; real body is delivered from grok-stop via
+                    // hookSpecificOutput.additionalContext. Never force-ack.
+                    if config.tool == "grok" {
+                        if enter_attempt > 0 {
+                            let still_pending = db.has_pending(&current_name);
+                            let turn_started = match db.get_status(&current_name) {
+                                Ok(Some((status, ctx))) => grok_turn_started(&status, &ctx),
+                                _ => false,
+                            };
+                            // Success for PTY wake: turn started (UPS trigger/prompt)
+                            // or Stop already acked (pending cleared). Do NOT ack here.
+                            if turn_started || !still_pending {
+                                log_info(
+                                    "native",
+                                    "delivery.grok_wake_done",
+                                    &format!(
+                                        "Grok wake complete (enter_attempt={enter_attempt}, turn_started={turn_started}, pending={still_pending})"
+                                    ),
+                                );
+                                inject_attempt = 0;
+                                attempt = 0;
+                                // If still pending, Stop will deliver body. Stay idle
+                                // until notify after Stop; then Pending wakes again.
+                                delivery_state = State::Idle;
+                                phase_started_at = Instant::now();
+                                continue;
+                            }
+
+                            if elapsed < GROK_SUBMIT_CONFIRM {
+                                std::thread::sleep(Duration::from_millis(50));
+                                continue;
+                            }
+
+                            if enter_attempt < MAX_ENTER_ATTEMPTS {
+                                let user_active = state.is_user_active();
+                                let approval =
+                                    state.screen.read().map(|s| s.approval).unwrap_or(false);
+                                if user_active || approval {
+                                    if elapsed > PHASE1_TIMEOUT {
+                                        log_warn(
+                                            "native",
+                                            "delivery.grok_enter_retry_blocked",
+                                            &format!(
+                                                "Grok Enter retry blocked (user_active={user_active}, approval={approval}); pending kept"
+                                            ),
+                                        );
+                                        delivery_state = State::Pending;
+                                        inject_attempt += 1;
+                                        attempt += 1;
+                                    } else {
+                                        std::thread::sleep(Duration::from_millis(50));
+                                    }
+                                    continue;
+                                }
+                                log_info(
+                                    "native",
+                                    "delivery.grok_retry_enter",
+                                    &format!(
+                                        "Grok still pending after {:?}; re-Enter sentinel (attempt={}/{})",
+                                        elapsed,
+                                        enter_attempt + 1,
+                                        MAX_ENTER_ATTEMPTS,
+                                    ),
+                                );
+                                // Single Enter only — double Enter can queue two wakes.
+                                inject_enter(state.inject_port);
+                                enter_attempt += 1;
+                                phase_started_at = Instant::now();
+                                continue;
+                            }
+
+                            log_warn(
+                                "native",
+                                "delivery.grok_wake_unconfirmed",
+                                &format!(
+                                    "Grok wake unconfirmed after {MAX_ENTER_ATTEMPTS} Enters; leaving pending (no force-ack)"
+                                ),
+                            );
+                            // Leave messages pending for a later idle cycle.
+                            delivery_state = State::Pending;
+                            inject_attempt += 1;
+                            attempt += 1;
+                            phase_started_at = Instant::now();
+                            continue;
+                        }
+
+                        // First Enter after short settle for tiny sentinel.
+                        let settle = Duration::from_millis(400);
+                        if elapsed < settle {
+                            std::thread::sleep(Duration::from_millis(25));
+                            continue;
+                        }
+                        let user_active = state.is_user_active();
+                        let approval = state.screen.read().map(|s| s.approval).unwrap_or(false);
+                        if user_active || approval {
+                            if elapsed > PHASE1_TIMEOUT {
+                                log_warn(
+                                    "native",
+                                    "delivery.grok_enter_blocked",
+                                    &format!(
+                                        "Grok force-Enter blocked (user_active={user_active}, approval={approval})"
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                inject_attempt += 1;
+                                attempt += 1;
+                            } else {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            continue;
+                        }
+                        log_info(
+                            "native",
+                            "delivery.grok_force_enter",
+                            &format!(
+                                "Forcing Enter after wake sentinel (bytes={}) — body via Stop additionalContext",
+                                injected_text.len(),
+                            ),
+                        );
+                        inject_enter(state.inject_port);
+                        enter_attempt = 1;
+                        phase_started_at = Instant::now();
+                        continue;
+                    }
 
                     // Inspect the latest screen before applying the deadline. This
                     // avoids rejecting a render that completed at the timeout edge.
@@ -2776,6 +2945,24 @@ mod tests {
     }
 
     // ---- phase-1 ownership tests ----
+
+    #[test]
+    fn grok_turn_started_ignores_premature_deliver_ack() {
+        // commit_delivery_ack sets active + deliver:sender — must NOT count.
+        assert!(!grok_turn_started(ST_ACTIVE, "deliver:vomu"));
+        assert!(!grok_turn_started(ST_LISTENING, ""));
+        // Real UPS contexts.
+        assert!(grok_turn_started(ST_ACTIVE, "prompt"));
+        assert!(grok_turn_started(ST_ACTIVE, "trigger"));
+        assert!(grok_turn_started(ST_ACTIVE, "tool:Bash"));
+    }
+
+    #[test]
+    fn grok_wake_trigger_has_no_angle_brackets() {
+        assert!(!GROK_WAKE_TRIGGER.contains('<'));
+        assert!(!GROK_WAKE_TRIGGER.contains('>'));
+        assert_eq!(GROK_WAKE_TRIGGER, "hcom: wake");
+    }
 
     #[test]
     fn phase1_timeout_is_ten_seconds() {

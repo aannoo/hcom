@@ -65,6 +65,7 @@ fn is_tool_installed(tool: crate::tool::Tool) -> bool {
         crate::tool::Tool::Omp => crate::terminal::which_bin("omp").is_some(),
         crate::tool::Tool::Cursor => crate::terminal::which_bin("cursor-agent").is_some(),
         crate::tool::Tool::Copilot => crate::terminal::which_bin("copilot").is_some(),
+        crate::tool::Tool::Grok => crate::terminal::which_bin("grok").is_some(),
         crate::tool::Tool::Adhoc => false,
         _ => is_in_path(tool.spec().cli_binary),
     }
