@@ -10,7 +10,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::bootstrap;
@@ -391,6 +391,13 @@ fn start_rebind(
     {
         session_id = current_data.session_id.filter(|s| !s.is_empty());
     }
+    if session_id.is_none() && ctx.tool == crate::tool::Tool::Claude {
+        // A vanilla Claude session has neither a process binding nor, before its
+        // first start, a row to read the id back from. Its own session id is
+        // what makes the rebind stick: without it the reclaimed name stays
+        // unbound and the identity it replaces is never cleaned up.
+        session_id = resolve_claude_session_id(&ctx.raw_env);
+    }
     let current_name = if !explicit_current_name.is_empty() {
         explicit_current_name.to_string()
     } else if let Some(ref sid) = session_id {
@@ -483,10 +490,19 @@ fn start_rebind(
     }
 
     // Create bindings
-    if let Some(ref sid) = session_id
-        && let Err(e) = db.set_session_binding(sid, &target_name)
-    {
-        eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
+    if let Some(ref sid) = session_id {
+        if let Err(e) = db.set_session_binding(sid, &target_name) {
+            eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
+        } else if ctx.tool == crate::tool::Tool::Claude
+            && let Err(e) = db.mark_claude_session_validated(sid, &target_name)
+        {
+            // The cache still names the identity being replaced, and it is keyed
+            // by session generation, so it does not expire on its own. Left
+            // stale, every hook for this session resolves to no_instance: no
+            // status, no delivery, and the reclaimed row is flagged
+            // launch_failed ~30s later while the session is alive and bound.
+            eprintln!("[hcom] warn: mark_claude_session_validated failed for {target_name}: {e}");
+        }
     }
     if let Some(ref process_id) = ctx.process_id {
         let sid = session_id.as_deref().unwrap_or("");
@@ -527,6 +543,8 @@ fn start_rebind(
 
     println!("[hcom:{}]", target_name);
     println!("{}", bootstrap_text);
+    // Same reason as bare start: keep the new name visible in a tailed snapshot.
+    println!("[hcom:{}]", target_name);
 
     log_info(
         "start",
@@ -624,6 +642,51 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
     bail!("No rebind metadata found for '{}'", name)
 }
 
+/// Resolve the Claude session id visible to a CLI invocation.
+///
+/// Two sources, in order:
+/// - `HCOM_CLAUDE_UNIX_SESSION_ID`: hcom's own SessionStart hook appends this
+///   export to `CLAUDE_ENV_FILE`, which Claude runs before each Bash command.
+/// - `CLAUDE_CODE_SESSION_ID`: Claude sets this directly in every Bash and
+///   PowerShell subprocess, and it matches the `session_id` hooks receive.
+///
+/// The env-file round trip is the fragile one: it needs `CLAUDE_ENV_FILE` to
+/// exist and our SessionStart to have run in this session generation. Without
+/// the second source, a session that misses it cannot be recognized on a repeat
+/// `hcom start`, which then mints a SECOND identity — the first stays bound to
+/// nothing and later reports as launch_failed. Both values are set by Claude
+/// for the session running this command, so either one binds identity.
+fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
+    ["HCOM_CLAUDE_UNIX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"]
+        .into_iter()
+        .find_map(|key| env.get(key).filter(|value| !value.is_empty()).cloned())
+}
+
+/// Live local Claude instances in this directory that no session id points at.
+///
+/// These are the plausible earlier identities of a session that exposes no id
+/// of its own — the only useful thing to say when hcom cannot recognize it.
+fn unbound_claude_candidates(db: &HcomDb, ctx: &HcomContext, exclude: &str) -> Vec<String> {
+    let cwd = ctx.cwd.to_string_lossy();
+    let mut rows: Vec<InstanceRow> = db
+        .iter_instances_full()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| {
+            row.tool == "claude"
+                && row.status != "stopped"
+                && row.name != exclude
+                && row.directory == cwd
+                && row.session_id.is_none()
+                && row.parent_name.is_none()
+                && !crate::instances::is_remote_instance(row)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
+    rows.truncate(4);
+    rows.into_iter().map(|row| row.name).collect()
+}
+
 /// Path C: Bare start — detect tool or create adhoc instance.
 fn start_bare(
     db: &HcomDb,
@@ -681,53 +744,23 @@ fn start_bare(
     }
 
     let tool = ctx.tool.as_str();
-    // Claude's SessionStart hook exports its real session id through
-    // CLAUDE_ENV_FILE. The Python implementation consumed this value here;
-    // restore that immediate vanilla-session binding instead of depending
-    // solely on the PostToolUse stdout marker fallback.
     let claude_session_id = (ctx.tool == crate::tool::Tool::Claude)
-        .then(|| std::env::var("HCOM_CLAUDE_UNIX_SESSION_ID").ok())
-        .flatten()
-        .filter(|value| !value.is_empty());
+        .then(|| resolve_claude_session_id(&ctx.raw_env))
+        .flatten();
 
     if explicit_name.is_none()
         && let Some(ref session_id) = claude_session_id
         && let Some(bound_name) = db.get_session_binding(session_id)?
     {
-        // SessionStart exported this id into Claude's per-session environment,
-        // so a matching CLI-created binding is trusted identity evidence. Heal
-        // bindings created by older versions before returning the existing row.
+        // Only hcom writes session bindings, so a row keyed by this session's
+        // own id is trusted identity evidence. Heal bindings created by older
+        // versions before returning the existing row.
         db.mark_claude_session_validated(session_id, &bound_name)?;
         println!("hcom already started for {bound_name}");
         return Ok(0);
     }
 
     // Resolve or generate name
-    //
-    // Identity for a vanilla session rides on HCOM_CLAUDE_UNIX_SESSION_ID, which
-    // the SessionStart hook appends to CLAUDE_ENV_FILE. When that file is absent
-    // the id never reaches the CLI, the reuse check above cannot fire, and a
-    // second `hcom start` from the SAME session silently mints a SECOND identity:
-    // the first is left bound to nothing and later reports as launch_failed.
-    // Observed 2026-07-31. hcom cannot prove identity here, so instead of
-    // guessing it says so and names the rebind command.
-    let unverifiable_identity = explicit_name.is_none()
-        && ctx.tool == crate::tool::Tool::Claude
-        && claude_session_id.is_none();
-    if unverifiable_identity {
-        eprintln!(
-            "[hcom] warn: cannot identify this session (HCOM_CLAUDE_UNIX_SESSION_ID unset, \
-             CLAUDE_ENV_FILE {}). A repeat `hcom start` here creates a SECOND identity \
-             rather than returning the first. If this session already has a name, run \
-             `hcom start --as <name>` instead.",
-            if ctx.claude_env_file.is_some() {
-                "present"
-            } else {
-                "absent"
-            }
-        );
-    }
-
     let name = if let Some(n) = explicit_name {
         n.to_string()
     } else {
@@ -781,6 +814,27 @@ fn start_bare(
         eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
+    // Claude builds old enough to expose neither session id leave nothing to
+    // recognize this session by, so a later `hcom start` here mints another
+    // identity. Say what was just created and name the way back instead of
+    // letting the duplicate appear silently.
+    if explicit_name.is_none()
+        && ctx.tool == crate::tool::Tool::Claude
+        && claude_session_id.is_none()
+    {
+        let candidates = unbound_claude_candidates(db, ctx, &name);
+        eprintln!(
+            "[hcom] warn: this Claude session exposes no session id, so it was registered \
+             as a new identity '{name}'. If it already had one{}, reclaim it with \
+             `hcom start --as <name>` and drop this one with `hcom kill {name}`.",
+            if candidates.is_empty() {
+                String::new()
+            } else {
+                format!(" (unbound here: {})", candidates.join(", "))
+            }
+        );
+    }
+
     // Print bootstrap
     let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
         eprintln!("[hcom] warn: config load failed, using defaults: {e}");
@@ -806,8 +860,8 @@ fn start_bare(
     println!("{}", bootstrap_text);
     // Repeated deliberately: the header above sits on top of a long bootstrap, so
     // `hcom start | tail -n` shows none of it. A caller that cannot see its own
-    // name re-runs start, which is exactly how duplicate identities appear.
-    println!("[hcom:{}] ready", name);
+    // name re-runs start, which is one way duplicate identities appear.
+    println!("[hcom:{}]", name);
 
     // Log
     db.log_event(
@@ -838,6 +892,19 @@ mod tests {
         let mut env: HashMap<String, String> = std::env::vars().collect();
         for (k, v) in tool_env {
             env.insert((*k).to_string(), (*v).to_string());
+        }
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    /// Claude context carrying exactly one session-id source, so an ambient
+    /// value from the shell running the tests cannot decide the outcome.
+    fn make_claude_ctx(session: Option<(&str, &str)>, cwd: &str) -> HcomContext {
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("HCOM_CLAUDE_UNIX_SESSION_ID");
+        env.remove("CLAUDE_CODE_SESSION_ID");
+        env.insert("CLAUDECODE".to_string(), "1".to_string());
+        if let Some((key, value)) = session {
+            env.insert(key.to_string(), value.to_string());
         }
         HcomContext::from_env(&env, PathBuf::from(cwd))
     }
@@ -989,6 +1056,168 @@ mod tests {
             db.get_session_binding("sess-vanilla").unwrap().as_deref(),
             Some(name.as_str()),
             "repeated bare start must retain the existing vanilla identity"
+        );
+    }
+
+    #[test]
+    fn test_resolve_claude_session_id_sources() {
+        let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            resolve_claude_session_id(&env(&[
+                ("HCOM_CLAUDE_UNIX_SESSION_ID", "hook-sess"),
+                ("CLAUDE_CODE_SESSION_ID", "claude-sess"),
+            ])),
+            Some("hook-sess".to_string()),
+            "our own export stays the first source"
+        );
+        assert_eq!(
+            resolve_claude_session_id(&env(&[("CLAUDE_CODE_SESSION_ID", "claude-sess")])),
+            Some("claude-sess".to_string()),
+            "Claude's own Bash env carries identity when the env file cannot"
+        );
+        assert_eq!(
+            resolve_claude_session_id(&env(&[
+                ("HCOM_CLAUDE_UNIX_SESSION_ID", ""),
+                ("CLAUDE_CODE_SESSION_ID", "claude-sess"),
+            ])),
+            Some("claude-sess".to_string()),
+            "an empty export is not identity"
+        );
+        assert_eq!(resolve_claude_session_id(&env(&[])), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_vanilla_claude_start_reuses_claude_code_session_id() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+
+        // No CLAUDE_ENV_FILE round trip, so HCOM_CLAUDE_UNIX_SESSION_ID never
+        // arrives — the case that used to mint a second identity per start.
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claude-env")),
+            "/tmp/project",
+        );
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let name = db
+            .get_session_binding("sess-claude-env")
+            .unwrap()
+            .expect("CLAUDE_CODE_SESSION_ID must bind identity");
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-claude-env")
+                .unwrap()
+                .as_deref(),
+            Some(name.as_str()),
+            "hooks must trust the binding the CLI just created"
+        );
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("sess-claude-env")
+                .unwrap()
+                .as_deref(),
+            Some(name.as_str()),
+            "repeat start must return the first identity, not mint a second"
+        );
+        let claude_rows: Vec<String> = db
+            .iter_instances_full()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.tool == "claude")
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(claude_rows, vec![name], "exactly one identity per session");
+    }
+
+    #[test]
+    #[serial]
+    fn test_vanilla_claude_rebind_binds_session_and_drops_old_identity() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-rebind")),
+            "/tmp/project",
+        );
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let first = db.get_session_binding("sess-rebind").unwrap().unwrap();
+
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("sess-rebind").unwrap().as_deref(),
+            Some("nova"),
+            "a reclaimed name must own the session that reclaimed it"
+        );
+        assert!(
+            db.get_instance_full(&first).unwrap().is_none(),
+            "the identity being replaced must not be left behind"
+        );
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-rebind")
+                .unwrap()
+                .as_deref(),
+            Some("nova"),
+            "hooks must resolve the reclaimed name, not reject the session"
+        );
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("sess-rebind").unwrap().as_deref(),
+            Some("nova"),
+            "a start after the rebind returns the reclaimed identity"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_unidentifiable_claude_start_lists_unbound_candidates() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = make_claude_ctx(None, cwd.to_str().unwrap());
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let first = db
+            .iter_instances_full()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool == "claude")
+            .expect("first start creates an identity")
+            .name;
+        assert!(
+            db.get_instance_full(&first)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .is_none(),
+            "a session with no id leaves the row unbound"
+        );
+
+        // Without any session id hcom still cannot recognize the session, so the
+        // second start mints another identity — the warning names this one back.
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let second = db
+            .iter_instances_full()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool == "claude" && row.name != first)
+            .expect("second start mints a second identity")
+            .name;
+        assert_eq!(
+            unbound_claude_candidates(&db, &ctx, &second),
+            vec![first],
+            "the earlier unbound identity is the reclaim candidate"
         );
     }
 
