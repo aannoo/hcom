@@ -613,6 +613,23 @@ const UPDATE_HELP: &[HelpEntry] = &[
     ("", "  curl installer  → re-run hcom-installer.sh"),
 ];
 
+const COMPLETION_HELP: &[HelpEntry] = &[
+    ("completion zsh", "Generate Zsh completion script to stdout"),
+    ("", ""),
+    (
+        "",
+        "Source the script to activate completions immediately:",
+    ),
+    ("", "  eval \"$(hcom completion zsh)\""),
+    ("", ""),
+    ("", "Install permanently:"),
+    ("", "  hcom completion zsh --install"),
+    ("", "  # or:  hcom completion zsh > /usr/local/share/zsh/site-functions/_hcom"),
+    ("", "  compinit"),
+    ("", ""),
+    ("", "Once installed, tab-complete hcom commands, tools, and flags."),
+];
+
 const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks", "Show hook status"),
     ("hooks status", "Same as above"),
@@ -852,6 +869,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "relay",
     "run",
     "update",
+    "completion",
     "claude",
     "gemini",
     "codex",
@@ -928,7 +946,8 @@ Commands:\n\
   hooks        Add or remove hooks\n\
   status       Installation and diagnostics\n\
   term         View/inject into agent PTY screens\n\
-  update       Check and apply updates",
+   update       Check and apply updates\n\
+   completion   Generate shell completion scripts",
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -1044,6 +1063,7 @@ pub fn get_command_help(name: &str) -> String {
         "run" => Some(RUN_HELP),
         "status" => Some(STATUS_HELP),
         "update" => Some(UPDATE_HELP),
+        "completion" => Some(COMPLETION_HELP),
         "hooks" => None,
         "term" => Some(TERM_HELP),
         _ => None,
@@ -1159,10 +1179,13 @@ mod tests {
             "term",
             "relay",
             "run",
+            "update",
+            "completion",
             "claude",
             "gemini",
             "codex",
             "opencode",
+            "kilo",
             "agy",
             "antigravity",
             "kimi",

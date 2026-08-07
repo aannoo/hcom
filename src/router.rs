@@ -39,6 +39,7 @@ const COMMANDS: &[&str] = &[
     "relay",
     "run",
     "update",
+    "completion",
 ];
 
 fn is_command(name: &str) -> bool {
@@ -608,6 +609,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "relay"
                     | "run"
                     | "update"
+                    | "completion"
             ) =>
         {
             let exit_code = dispatch_native_command(cmd, args);
@@ -882,6 +884,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             cmd,
             &cmd_argv,
             |args| crate::commands::update::cmd_update(&db, &args, Some(&ctx))
+        ),
+        "completion" => clap_dispatch!(
+            crate::commands::completion::CompletionArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::completion::cmd_completion(&db, &args, Some(&ctx))
         ),
         _ => {
             // Should never happen — only matched commands reach here
