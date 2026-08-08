@@ -198,7 +198,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             name: None, // --name is caller identity, not instance name
             skip_validation: false,
             terminal,
-            append_reply_handoff: true,
+            // CLI launches never append the reply footer: the dispatcher's
+            // prompt owns the reply semantics (a hardcoded footer contradicts
+            // prompts that say "report to X" or "no report needed").
+            append_reply_handoff: false,
         },
     )?;
 
