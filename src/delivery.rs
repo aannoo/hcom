@@ -1518,6 +1518,28 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
+/// Refresh every liveness signal a long-lived delivery loop owes the rest of the
+/// system, from any path that would otherwise only touch the heartbeat.
+///
+/// Two signals, same meaning ("this loop is alive and current"), different
+/// audiences: the instance heartbeat, and the wake beacon/window that
+/// short-lived processes read. A one-shot like `hcom list` reaps stale
+/// instances but cannot detect a sleep on its own — it has no earlier monotonic
+/// sample to compare against — so a poll path that heartbeats without
+/// publishing leaves a window where `hcom list` runs after wake, sees an
+/// hours-old status clock, and unlinks a live agent. Keeping both writes in one
+/// place is what stops the paths from drifting apart again.
+fn refresh_liveness(db: &HcomDb, current_name: &str) {
+    crate::instance_lifecycle::is_in_wake_grace_publishing(db);
+    if let Err(e) = db.update_heartbeat(current_name) {
+        log_warn(
+            "native",
+            "delivery.heartbeat_fail",
+            &format!("Failed to update heartbeat: {}", e),
+        );
+    }
+}
+
 /// Delivery state machine for the native PTY path (Claude/Gemini/Codex/Antigravity).
 ///
 /// OpenCode bypasses this entirely — it early-returns with its own loop
@@ -1729,9 +1751,7 @@ pub fn run_delivery_loop(
             db.reconnect_if_stale();
 
             // Heartbeat + port re-registration
-            if let Err(e) = db.update_heartbeat(&current_name) {
-                log_warn("native", "delivery.heartbeat_fail", &format!("{}", e));
-            }
+            refresh_liveness(db, &current_name);
             if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
                 log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
             }
@@ -1822,14 +1842,8 @@ pub fn run_delivery_loop(
                     // Detect DB file replacement (hcom reset / schema bump) and reconnect
                     db.reconnect_if_stale();
 
-                    // Update heartbeat to prove we're alive (also re-asserts tcp_mode=true)
-                    if let Err(e) = db.update_heartbeat(&current_name) {
-                        log_warn(
-                            "native",
-                            "delivery.heartbeat_fail",
-                            &format!("Failed to update heartbeat: {}", e),
-                        );
-                    }
+                    // Heartbeat (also re-asserts tcp_mode=true) + wake state.
+                    refresh_liveness(db, &current_name);
                     // Re-register endpoints (self-heals after DB reset/instance recreation)
                     if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
                         log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
@@ -1940,11 +1954,11 @@ pub fn run_delivery_loop(
                             attempt += 1;
                         }
                     } else {
-                        // Gate blocked - refresh heartbeat so we don't go stale while waiting
-                        // (DB status is still "listening" until message is delivered and hooks fire)
-                        if let Err(e) = db.update_heartbeat(&current_name) {
-                            log_warn("native", "delivery.heartbeat_fail", &format!("{}", e));
-                        }
+                        // Gate blocked - refresh liveness so we don't go stale while
+                        // waiting (DB status is still "listening" until the message is
+                        // delivered and hooks fire). This path can hold for a long time
+                        // behind an approval prompt, so it publishes wake state too.
+                        refresh_liveness(db, &current_name);
 
                         // Log gate failure
                         if attempt == 0 || attempt.is_multiple_of(5) {
@@ -2448,13 +2462,7 @@ pub fn run_delivery_loop(
                     }
 
                     db.reconnect_if_stale();
-                    if let Err(e) = db.update_heartbeat(&current_name) {
-                        log_warn(
-                            "native",
-                            "delivery.heartbeat_fail",
-                            &format!("Failed to update heartbeat: {}", e),
-                        );
-                    }
+                    refresh_liveness(db, &current_name);
                     if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
                         log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
                     }
