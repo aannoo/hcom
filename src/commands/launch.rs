@@ -426,6 +426,8 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             );
         }
     }
+
+    println!("\n[Preview Mode] Add --go to proceed with launch.");
 }
 
 /// Hcom-level flags extracted from launch argv.
