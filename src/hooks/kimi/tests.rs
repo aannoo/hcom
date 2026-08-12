@@ -4,8 +4,10 @@ use super::{
     kimi_permission_patterns, merge_hcom_hooks, merge_hcom_permissions, remove_hcom_permissions,
 };
 use crate::db::HcomDb;
+use crate::hooks::HookResult;
+use crate::hooks::common::commit_delivery_ack;
 use crate::hooks::test_helpers::isolated_test_env;
-use crate::shared::ST_LISTENING;
+use crate::shared::{ST_ACTIVE, ST_LISTENING};
 use serial_test::serial;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
@@ -278,6 +280,196 @@ fn kimi_payload(session_id: &str, hook_name: &str) -> crate::hooks::HookPayload 
         notification_type: None,
         raw: serde_json::Value::Null,
     }
+}
+
+fn seed_bound_kimi_instance(db: &HcomDb, name: &str, session_id: &str, process_id: &str) {
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, status_context, created_at, tool, session_id, last_event_id)
+                 VALUES (?1, 'active', 'docs/x.md', ?2, 'kimi', ?3, 0)",
+            rusqlite::params![name, now, session_id],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![process_id, session_id, name, now],
+        )
+        .unwrap();
+    db.rebind_session(session_id, name).unwrap();
+}
+
+fn insert_unread_message(db: &HcomDb, from: &str, text: &str) -> i64 {
+    let data = serde_json::json!({
+        "from": from,
+        "text": text,
+        "scope": "broadcast",
+    })
+    .to_string();
+    db.conn()
+        .execute(
+            "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:01Z', ?1, ?2)",
+            rusqlite::params![from, data],
+        )
+        .unwrap();
+    db.conn().last_insert_rowid()
+}
+
+fn instance_last_event_id(db: &HcomDb, name: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn assert_allow_no_delivery(result: HookResult) {
+    match result {
+        HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } => {
+            assert!(additional_context.is_none());
+            assert!(delivery_ack.is_none());
+        }
+        _ => panic!("expected Allow with no delivery"),
+    }
+}
+
+#[test]
+fn posttooluse_with_pending_does_not_ack_or_advance_cursor() {
+    let (_dir, db) = make_test_db();
+    seed_bound_kimi_instance(&db, "kima", "sess-post", "pid-post");
+    let message_id = insert_unread_message(&db, "homo", "secret body");
+
+    let handler = get_handler("kimi-posttooluse").expect("kimi-posttooluse handler");
+    let result = handler(
+        &db,
+        &ctx_with_process("pid-post"),
+        &kimi_payload("sess-post", "kimi-posttooluse"),
+    );
+    assert_allow_no_delivery(result);
+
+    assert_eq!(instance_last_event_id(&db, "kima"), 0);
+    let unread = db.get_unread_messages("kima");
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].event_id, Some(message_id));
+}
+
+#[test]
+fn notification_with_pending_does_not_ack_or_advance_cursor() {
+    let (_dir, db) = make_test_db();
+    seed_bound_kimi_instance(&db, "kima", "sess-notify", "pid-notify");
+    let message_id = insert_unread_message(&db, "homo", "secret body");
+
+    let handler = get_handler("kimi-notification").expect("kimi-notification handler");
+    let result = handler(
+        &db,
+        &ctx_with_process("pid-notify"),
+        &kimi_payload("sess-notify", "kimi-notification"),
+    );
+    assert_allow_no_delivery(result);
+
+    assert_eq!(instance_last_event_id(&db, "kima"), 0);
+    let unread = db.get_unread_messages("kima");
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].event_id, Some(message_id));
+}
+
+#[test]
+fn posttooluse_repeated_while_pending_leaves_cursor_unchanged() {
+    let (_dir, db) = make_test_db();
+    seed_bound_kimi_instance(&db, "kima", "sess-repeat", "pid-repeat");
+    insert_unread_message(&db, "homo", "secret body");
+
+    let handler = get_handler("kimi-posttooluse").expect("kimi-posttooluse handler");
+    let ctx = ctx_with_process("pid-repeat");
+    let payload = kimi_payload("sess-repeat", "kimi-posttooluse");
+    for _ in 0..3 {
+        assert_allow_no_delivery(handler(&db, &ctx, &payload));
+    }
+
+    assert_eq!(instance_last_event_id(&db, "kima"), 0);
+    assert_eq!(db.get_unread_messages("kima").len(), 1);
+}
+
+#[test]
+fn userpromptsubmit_with_pending_delivers_and_acks() {
+    let (_dir, db) = make_test_db();
+    seed_bound_kimi_instance(&db, "kima", "sess-prompt", "pid-prompt");
+    let message_id = insert_unread_message(&db, "homo", "deliver me");
+
+    let handler = get_handler("kimi-userpromptsubmit").expect("kimi-userpromptsubmit handler");
+    let result = handler(
+        &db,
+        &ctx_with_process("pid-prompt"),
+        &kimi_payload("sess-prompt", "kimi-userpromptsubmit"),
+    );
+
+    let ack = match result {
+        HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } => {
+            let ctx = additional_context.expect("expected formatted delivery context");
+            assert!(ctx.contains("deliver me"));
+            delivery_ack.expect("expected deferred delivery ack")
+        }
+        _ => panic!("expected Allow with delivery"),
+    };
+
+    assert_eq!(instance_last_event_id(&db, "kima"), 0);
+
+    // Simulates dispatch writing stdout then committing the deferred ack.
+    commit_delivery_ack(&db, &ack);
+
+    assert_eq!(instance_last_event_id(&db, "kima"), message_id);
+    let inst = db.get_instance_full("kima").unwrap().unwrap();
+    assert_eq!(inst.status, ST_ACTIVE);
+    assert!(inst.status_context.starts_with("deliver:"));
+}
+
+#[test]
+fn stop_with_pending_defers_ack_stays_active() {
+    let (_dir, db) = make_test_db();
+    seed_bound_kimi_instance(&db, "gire", "sess-stop-pending", "pid-stop-pending");
+    let message_id = insert_unread_message(&db, "homo", "stop deliver");
+
+    let result = handle_stop(
+        &db,
+        &ctx_with_process("pid-stop-pending"),
+        &kimi_payload("sess-stop-pending", "kimi-stop"),
+    );
+
+    let ack = match result {
+        HookResult::Block {
+            reason,
+            delivery_ack,
+        } => {
+            assert!(reason.contains("stop deliver"));
+            delivery_ack.expect("expected deferred delivery ack on pending stop")
+        }
+        _ => panic!("expected Block with deferred delivery"),
+    };
+
+    assert_eq!(instance_last_event_id(&db, "gire"), 0);
+    let inst = db.get_instance_full("gire").unwrap().unwrap();
+    assert_eq!(inst.status, ST_ACTIVE);
+    assert_ne!(inst.status, ST_LISTENING);
+
+    // Simulates dispatch writing block reason stdout then committing the ack.
+    commit_delivery_ack(&db, &ack);
+
+    assert_eq!(instance_last_event_id(&db, "gire"), message_id);
+    let inst = db.get_instance_full("gire").unwrap().unwrap();
+    assert_eq!(inst.status, ST_ACTIVE);
+    assert_ne!(inst.status, ST_LISTENING);
 }
 
 #[test]

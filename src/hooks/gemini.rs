@@ -753,7 +753,7 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
                 None
             }
         }
-        HookResult::Block { reason } => {
+        HookResult::Block { reason, .. } => {
             if is_agy {
                 Some(serde_json::json!({
                     "decision": "deny",
@@ -2982,6 +2982,7 @@ mod tests {
     fn test_antigravity_serialization_block() {
         let result = HookResult::Block {
             reason: "permission denied".to_string(),
+            delivery_ack: None,
         };
         let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
         assert_eq!(out["decision"], "deny");

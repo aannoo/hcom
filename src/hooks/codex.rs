@@ -510,7 +510,7 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
             }
             0
         }
-        HookResult::Block { reason } => {
+        HookResult::Block { reason, .. } => {
             // Codex hooks on exit 2 read the reason from stderr, not stdout.
             let _ = std::io::stderr().lock().write_all(reason.as_bytes());
             2

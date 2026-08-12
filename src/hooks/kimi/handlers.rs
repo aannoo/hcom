@@ -228,21 +228,10 @@ fn handle_pretooluse(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     hook_noop()
 }
 
-fn handle_posttooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance(db, ctx, payload) {
-        Some(inst) => inst,
-        None => return hook_noop(),
-    };
-    let instance_name = &instance.name;
-
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        return HookResult::Allow {
-            additional_context: Some(prepared.formatted),
-            system_message: None,
-            delivery_ack: Some(prepared.ack),
-        };
-    }
-
+fn handle_posttooluse(_db: &HcomDb, _ctx: &HcomContext, _payload: &HookPayload) -> HookResult {
+    // Kimi treats PostToolUse as observation-only; hook output is ignored and
+    // must not advance the delivery cursor — silently acking here caused vanish.
+    // Delivery happens at UserPromptSubmit and Stop only.
     hook_noop()
 }
 
@@ -319,11 +308,13 @@ pub(crate) fn handle_stop(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload)
     let instance_name = &instance.name;
 
     if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        // The Stop hook delivers via Block{reason}, which cannot carry the ack
-        // back to the dispatch — commit inline so the cursor advances.
-        common::commit_delivery_ack(db, &prepared.ack);
+        // Defer ack to dispatch after Block stdout succeeds. Leave status
+        // active — listening only on empty Stop (or PTY recovery). Stop Block
+        // model visibility is the same delivery class as before; UPS remains
+        // the wire-proven inject path.
         return HookResult::Block {
             reason: prepared.formatted,
+            delivery_ack: Some(prepared.ack),
         };
     }
 
@@ -400,21 +391,10 @@ fn handle_subagentstop(_db: &HcomDb, _ctx: &HcomContext, _payload: &HookPayload)
     hook_noop()
 }
 
-fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance(db, ctx, payload) {
-        Some(inst) => inst,
-        None => return hook_noop(),
-    };
-    let instance_name = &instance.name;
-
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        return HookResult::Allow {
-            additional_context: Some(prepared.formatted),
-            system_message: None,
-            delivery_ack: Some(prepared.ack),
-        };
-    }
-
+fn handle_notification(_db: &HcomDb, _ctx: &HcomContext, _payload: &HookPayload) -> HookResult {
+    // Kimi treats Notification as observation-only; hook output is ignored and
+    // must not advance the delivery cursor — silently acking here caused vanish.
+    // Delivery happens at UserPromptSubmit and Stop only.
     hook_noop()
 }
 
@@ -534,6 +514,9 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
         HookResult::UpdateInput { .. } => 0,
     };
 
+    // Advance the delivery cursor only after stdout is written (Allow message
+    // or Block permissionDecisionReason). Without this the PTY loop never
+    // observes the advance and keeps re-injecting `<hcom>`.
     match result {
         HookResult::Allow {
             additional_context: Some(ctx),
@@ -546,14 +529,14 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
                 }
             });
             println!("{}", output);
-            // Advance the delivery cursor only after the message is handed to
-            // kimi (stdout). Without this the PTY delivery loop never observes
-            // the cursor advancing and keeps re-injecting `<hcom>`.
             if let Some(ack) = delivery_ack {
                 common::commit_delivery_ack(&db, &ack);
             }
         }
-        HookResult::Block { reason } => {
+        HookResult::Block {
+            reason,
+            delivery_ack,
+        } => {
             let output = json!({
                 "hookSpecificOutput": {
                     "permissionDecision": "deny",
@@ -562,6 +545,9 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
             });
             eprintln!("{}", reason);
             println!("{}", output);
+            if let Some(ack) = delivery_ack {
+                common::commit_delivery_ack(&db, &ack);
+            }
         }
         _ => {}
     }
