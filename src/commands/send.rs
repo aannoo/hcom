@@ -105,6 +105,10 @@ pub struct SendArgs {
     #[arg(long)]
     pub quiet: bool,
 
+    /// Print result as a single-line JSON object instead of human-readable output
+    #[arg(long)]
+    pub json: bool,
+
     // ── Inline bundle ──
     /// Bundle title (creates inline bundle)
     #[arg(long)]
@@ -374,14 +378,14 @@ fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
 
 ///
 /// Validates message, computes scope, logs event, notifies all instances.
-/// Returns delivered_to list (base names).
+/// Returns the logged event ID and delivered_to list (base names).
 pub fn send_message(
     db: &HcomDb,
     identity: &SenderIdentity,
     message: &str,
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
-) -> Result<Vec<String>, String> {
+) -> Result<(i64, Vec<String>), String> {
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
@@ -444,7 +448,7 @@ pub fn send_message(
     };
 
     // Log event to DB
-    let _event_id = db
+    let event_id = db
         .log_event("message", &routing_instance, &data)
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
 
@@ -463,7 +467,7 @@ pub fn send_message(
             && delivery.effective_scope == MessageScope::Mentions
             && !delivery.is_thread_resolved
         {
-            create_request_watches(db, &identity.name, _event_id, &delivery.delivered_to);
+            create_request_watches(db, &identity.name, event_id, &delivery.delivered_to);
         }
     }
 
@@ -473,7 +477,7 @@ pub fn send_message(
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
 
-    Ok(delivery.delivered_to)
+    Ok((event_id, delivery.delivered_to))
 }
 
 /// Resolve reply_to to local event ID. Returns None if not found.
@@ -1012,7 +1016,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some();
 
-    let delivered_to = match send_message(
+    let (event_id, delivered_to) = match send_message(
         db,
         &sender_identity,
         &message,
@@ -1027,6 +1031,16 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     };
 
     // ── Feedback ──
+    if args.json {
+        let out = serde_json::json!({
+            "event_id": event_id,
+            "delivered_to": delivered_to,
+        });
+        println!("{}", serde_json::to_string(&out).unwrap());
+        crate::relay::worker::ensure_worker(true);
+        return 0;
+    }
+
     if args.quiet {
         crate::relay::worker::ensure_worker(true);
         return 0;
@@ -1480,7 +1494,7 @@ mod tests {
             ..Default::default()
         };
 
-        let delivered = send_message(
+        let (_, delivered) = send_message(
             &db,
             &sender,
             "hello",
@@ -1496,7 +1510,7 @@ mod tests {
             vec!["nova".to_string(), "miso".to_string(), "luna".to_string()]
         );
 
-        let delivered = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
+        let (_, delivered) = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
         assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
 
         cleanup_test_db(path);
@@ -1552,7 +1566,7 @@ mod tests {
             ..Default::default()
         };
 
-        let delivered = send_message(
+        let (_, delivered) = send_message(
             &db,
             &sender,
             "hello",
@@ -1601,7 +1615,7 @@ mod tests {
             thread: Some("ops".into()),
             ..Default::default()
         };
-        let delivered =
+        let (_, delivered) =
             send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
         assert_eq!(delivered, vec!["nova".to_string()]);
 
