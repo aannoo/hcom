@@ -1413,8 +1413,8 @@ mod tests {
         // const — so a rename of DOING_EVENT_TYPE that is not mirrored at the
         // filter gate fails to compile/parse here rather than silently dropping
         // `--type doing` results.
-        let args = EventsArgs::try_parse_from(["events", "--type", crate::db::DOING_EVENT_TYPE])
-            .unwrap();
+        let args =
+            EventsArgs::try_parse_from(["events", "--type", crate::db::DOING_EVENT_TYPE]).unwrap();
         assert_eq!(
             args.filters.event_type,
             vec![crate::db::DOING_EVENT_TYPE.to_string()]

@@ -1245,8 +1245,7 @@ fn doing_rejects_terminal_escape_and_newline_injection() {
     // Terminal-escape injection: an ESC (0x1B) sequence would clear/recolor a
     // peer's screen and fake a roster row when rendered raw via println!. It
     // must be rejected at the write boundary and never stored.
-    let (code, _stdout, stderr) =
-        h.run(["doing", "--name", &me, "\x1b[2J\x1b[31mSYSTEM ALERT"]);
+    let (code, _stdout, stderr) = h.run(["doing", "--name", &me, "\x1b[2J\x1b[31mSYSTEM ALERT"]);
     assert_ne!(code, 0, "escape sequence must be rejected; stderr={stderr}");
 
     // Newline injection: `doing` renders on one roster line, so a value that
