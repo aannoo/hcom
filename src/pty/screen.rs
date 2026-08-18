@@ -37,6 +37,28 @@ const OSC_TITLE_0: &[u8] = b"\x1b]0;";
 const OSC_TITLE_2: &[u8] = b"\x1b]2;";
 const CODEX_ACTION_REQUIRED: &str = "Action Required";
 
+/// Codex 空闲状态下可能随机显示的输入框占位文本。
+///
+/// Windows PTY/IDEA Terminal 场景下，文本的 dim 样式可能丢失，
+/// 因此不能只依靠 cell.dim() 判断它是否是占位文本。
+const CODEX_PLACEHOLDERS: &[&str] = &[
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Implement {feature}",
+    "Find and fix a bug in @filename",
+    "Write tests for @filename",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Use /skills to list available skills",
+    "Check recently modified functions for compatibility",
+    "How many files have been modified?",
+    "Will this algorithm scale well?",
+];
+
+fn is_codex_placeholder(text: &str) -> bool {
+    CODEX_PLACEHOLDERS.contains(&text)
+}
+
 /// Return the last complete OSC 0/2 terminal title in a raw output buffer.
 ///
 /// OSC strings may end with BEL or ST and may be split across PTY reads. Calling
@@ -882,6 +904,12 @@ impl ScreenTracker {
                     return Some(String::new());
                 }
 
+                // Windows PTY 或某些终端可能丢失占位文字的 dim 样式。
+                // 对 Codex 已知的官方占位文本直接判定为空输入框。
+                if is_codex_placeholder(text) {
+                    return Some(String::new());
+                }
+
                 // Dim text = placeholder, not real input
                 match self.is_dim_after_prompt(row_idx as u16, "›") {
                     Some(true) => return Some(String::new()),
@@ -1555,6 +1583,18 @@ mod tests {
     }
 
     // ---- Codex input extraction ----
+
+    #[test]
+    fn codex_known_placeholder_without_dim_returns_empty() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+
+        // 模拟 Windows PTY 丢失 dim 样式：
+        // 占位文字以普通文本形式输出。
+        t.process("› Improve documentation in @filename\r\n? for shortcuts\r\n".as_bytes());
+
+        assert_eq!(t.get_codex_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("codex"));
+    }
 
     #[test]
     fn codex_extracts_text_after_prompt() {
