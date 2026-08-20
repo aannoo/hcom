@@ -139,6 +139,8 @@ pub(crate) const TERMINAL_CONTEXT_VARS: &[&str] = &[
     "GHOSTTY_RESOURCES_DIR",
     "ITERM_SESSION_ID",
     "ALACRITTY_WINDOW_ID",
+    "PTYXIS_PROFILE",
+    "PTYXIS_VERSION",
     "GNOME_TERMINAL_SCREEN",
     "KONSOLE_DBUS_WINDOW",
     "TERMINATOR_UUID",
@@ -1511,6 +1513,8 @@ pub fn get_default_fallback_terminal_name() -> &'static str {
                 }
             } else if which_bin("gnome-terminal").is_some() {
                 "gnome-terminal"
+            } else if which_bin("ptyxis").is_some() {
+                "ptyxis"
             } else if which_bin("konsole").is_some() {
                 "konsole"
             } else if which_bin("xterm").is_some() {
@@ -1530,6 +1534,10 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
         (
             "gnome-terminal",
             &["gnome-terminal", "--", "bash", "{script}"] as &[&str],
+        ),
+        (
+            "ptyxis",
+            &["ptyxis", "--new-window", "--", "bash", "{script}"],
         ),
         ("konsole", &["konsole", "-e", "bash", "{script}"]),
         ("xterm", &["xterm", "-e", "bash", "{script}"]),
@@ -1624,6 +1632,7 @@ fn is_external_terminal_launcher(argv: &[String]) -> bool {
             | "ttab"
             | "wttab"
             | "gnome-terminal"
+            | "ptyxis"
             | "konsole"
             | "xterm"
             | "tilix"
@@ -3182,6 +3191,31 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_detect_terminal_from_ptyxis_version() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        unsafe {
+            std::env::set_var("PTYXIS_VERSION", "50.1");
+        }
+
+        assert_eq!(detect_terminal_from_env().as_deref(), Some("ptyxis"));
+    }
+
+    #[test]
+    fn test_launcher_env_strips_ptyxis_identity() {
+        let env = get_launcher_env_from(vec![
+            ("PTYXIS_PROFILE".into(), "profile-id".into()),
+            ("PTYXIS_VERSION".into(), "50.1".into()),
+            ("PATH".into(), "/bin".into()),
+        ]);
+
+        assert!(!env.contains_key("PTYXIS_PROFILE"));
+        assert!(!env.contains_key("PTYXIS_VERSION"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
     fn test_splice_kitten_to_socket_matches_absolute_app_bundle_path() {
         // Regression: when `kitten` isn't on PATH, resolve_terminal_open_argv
         // rewrites argv[0] to kitten's absolute macOS app-bundle path before
@@ -3984,6 +4018,8 @@ mod tests {
         assert!(terminal_preset_supported_on("wttab", "Windows"));
         assert!(!terminal_preset_supported_on("wttab", "Darwin"));
         assert!(terminal_preset_supported_on("wezterm", "Windows"));
+        assert!(terminal_preset_supported_on("ptyxis", "Linux"));
+        assert!(!terminal_preset_supported_on("ptyxis", "Darwin"));
         assert!(!terminal_preset_supported_on("nope", "Darwin"));
     }
 }
