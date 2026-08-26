@@ -844,6 +844,28 @@ fn sidecar_ambient_env<'a>(
         .collect()
 }
 
+/// Add the executable directories needed by generated runners in precedence order.
+///
+/// Node must precede Python because a generic system directory containing `python3`
+/// may also contain an older `node`/`npx` than the runtime selected by the caller.
+/// Both Unix and Windows runners use this helper so their PATH rules cannot diverge.
+fn append_runner_binary_dirs(
+    path_dirs: &mut Vec<String>,
+    tool_bin: &str,
+    mut which_bin: impl FnMut(&str) -> Option<String>,
+) {
+    for bin_name in [tool_bin, "hcom", "node", "python3"] {
+        if let Some(bin_path) = which_bin(bin_name)
+            && let Some(dir) = Path::new(&bin_path).parent()
+        {
+            let dir = dir.to_string_lossy().into_owned();
+            if !path_dirs.contains(&dir) {
+                path_dirs.push(dir);
+            }
+        }
+    }
+}
+
 /// Windows runner: a PowerShell script that launches the tool through the hcom
 /// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
 /// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
@@ -958,16 +980,7 @@ fn create_runner_script_windows(
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
-    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name)
-            && let Some(dir) = Path::new(&bin_path).parent()
-        {
-            let d = dir.to_string_lossy().to_string();
-            if !path_dirs.contains(&d) {
-                path_dirs.push(d);
-            }
-        }
-    }
+    append_runner_binary_dirs(&mut path_dirs, tool_bin, terminal::which_bin);
     let path_line = if path_dirs.is_empty() {
         String::new()
     } else {
@@ -1154,16 +1167,7 @@ pub fn create_runner_script(
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
-    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name)
-            && let Some(dir) = Path::new(&bin_path).parent()
-        {
-            let d = dir.to_string_lossy().to_string();
-            if !path_dirs.contains(&d) {
-                path_dirs.push(d);
-            }
-        }
-    }
+    append_runner_binary_dirs(&mut path_dirs, tool_bin, terminal::which_bin);
 
     let path_export = if !path_dirs.is_empty() {
         format!("export PATH=\"{}:$PATH\"", path_dirs.join(":"))
@@ -3294,6 +3298,33 @@ mod tests {
         assert_eq!(
             runner_env.get("RORI_BACKGROUND_AUTH").map(String::as_str),
             Some("auth-token")
+        );
+    }
+
+    #[test]
+    fn test_runner_binary_dirs_prioritize_selected_node_and_deduplicate() {
+        let resolved = HashMap::from([
+            ("codex", "pnpm/bin/codex"),
+            ("hcom", "target/debug/hcom"),
+            ("node", "nvm/bin/node"),
+            ("python3", "system/bin/python3"),
+        ]);
+        // Model an earlier dev-root/current-exe insertion. Resolving hcom to the
+        // same directory must not add it twice.
+        let mut path_dirs = vec!["target/debug".to_string()];
+
+        append_runner_binary_dirs(&mut path_dirs, "codex", |name| {
+            resolved.get(name).map(ToString::to_string)
+        });
+
+        assert_eq!(
+            path_dirs,
+            ["target/debug", "pnpm/bin", "nvm/bin", "system/bin"].map(ToString::to_string)
+        );
+        assert!(
+            path_dirs.iter().position(|dir| dir == "nvm/bin")
+                < path_dirs.iter().position(|dir| dir == "system/bin"),
+            "the selected Node directory must precede the generic system directory"
         );
     }
 
