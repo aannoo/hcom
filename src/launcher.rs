@@ -453,6 +453,31 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
     Some(root.join(dirname))
 }
 
+/// Make the tool config directory explicit in the child environment.
+///
+/// Some launch backends clear the inherited environment while others do not.
+/// Copying an ambient override into the effective launch map keeps preflight,
+/// hook setup, and the child process on the same directory in both cases.
+fn ensure_tool_config_env(tool: &LaunchTool, env: &mut HashMap<String, String>) {
+    let Some(env_var) = tool.spec().launch.config_dir_env else {
+        return;
+    };
+    if env.contains_key(env_var) {
+        return;
+    }
+    if let Some(value) = std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        env.insert(env_var.to_string(), value);
+    } else if let Some(config_dir) = isolated_tool_config_dir(tool) {
+        env.insert(
+            env_var.to_string(),
+            config_dir.to_string_lossy().to_string(),
+        );
+    }
+}
+
 /// Get system prompt file path for Gemini/Codex.
 fn get_system_prompt_path(tool: &str) -> std::path::PathBuf {
     let prompts_dir = paths::hcom_path(&["system-prompts"]);
@@ -1730,19 +1755,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         base_env.extend(caller_env.clone());
     }
     base_env.remove("HCOM_TERMINAL");
-    if let Some(env_var) = normalized.spec().launch.config_dir_env
-        && !base_env.contains_key(env_var)
-        && std::env::var(env_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_none()
-        && let Some(config_dir) = isolated_tool_config_dir(&normalized)
-    {
-        base_env.insert(
-            env_var.to_string(),
-            config_dir.to_string_lossy().to_string(),
-        );
-    }
+    ensure_tool_config_env(&normalized, &mut base_env);
 
     // Codex preflight and hook setup must use the same effective CODEX_HOME as
     // the child, including overrides from ~/.hcom/env and caller-provided env.
@@ -3067,6 +3080,21 @@ mod tests {
         assert_eq!(
             env.get("RORI_RESOLVED_AUTH").map(String::as_str),
             Some("auth-token")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_tool_config_env_copies_ambient_override_into_clean_child_env() {
+        let _guard = EnvVarGuard::remove(vec!["CODEX_HOME".to_string()]);
+        unsafe { std::env::set_var("CODEX_HOME", "/isolated/codex-home") };
+        let mut env = HashMap::from([("HOME".to_string(), "/clean-shell-home".to_string())]);
+
+        ensure_tool_config_env(&LaunchTool::Codex, &mut env);
+
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/isolated/codex-home")
         );
     }
 
