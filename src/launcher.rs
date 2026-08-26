@@ -550,7 +550,11 @@ fn format_plugin_install_error(
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
+fn ensure_hooks_installed(
+    tool: &LaunchTool,
+    include_permissions: bool,
+    codex_home: Option<&std::path::Path>,
+) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => {
             if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
@@ -605,12 +609,15 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::Codex => {
-            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
-                && crate::hooks::codex::codex_current_feature_enabled()
+            let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
+            if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
+                && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
             {
                 return Ok(());
             }
-            if let Err(e) = crate::hooks::codex::try_setup_codex_hooks(include_permissions) {
+            if let Err(e) =
+                crate::hooks::codex::try_setup_codex_hooks_at(include_permissions, codex_home)
+            {
                 if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
                     crate::log::log_warn(
                         "codex",
@@ -623,8 +630,8 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
                     let diag = install_diag_context(
                         tool,
                         &[
-                            ("config_path", crate::hooks::codex::get_codex_config_path()),
-                            ("hooks_path", crate::hooks::codex::get_codex_hooks_path()),
+                            ("config_path", codex_home.join("config.toml")),
+                            ("hooks_path", codex_home.join("hooks.json")),
                         ],
                     );
                     bail!(
@@ -1700,14 +1707,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         c
     });
 
-    // For Codex: probe CODEX_HOME writability synchronously. Sandboxed parent
-    // codex would otherwise spawn a child that hangs on the readonly-state-DB
-    // repair prompt. Failing here lets the parent's sandbox-escalation flow
-    // surface the denial to the user.
-    if matches!(normalized, LaunchTool::Codex) {
-        crate::tools::codex_preprocessing::ensure_codex_home_writable()?;
-    }
-
     let inside_ai_tool = crate::shared::context::HcomContext::from_os().is_inside_ai_tool();
     let terminal_mode = params
         .terminal
@@ -1720,9 +1719,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         terminal_mode,
         inside_ai_tool,
     );
-
-    // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
 
     // Build base environment for the current launch regime, then overlay
     // config.toml + ~/.hcom/env which win.
@@ -1747,6 +1743,24 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             config_dir.to_string_lossy().to_string(),
         );
     }
+
+    // Codex preflight and hook setup must use the same effective CODEX_HOME as
+    // the child, including overrides from ~/.hcom/env and caller-provided env.
+    let codex_home = if matches!(normalized, LaunchTool::Codex) {
+        crate::tools::codex_preprocessing::resolve_codex_home_from_env(&base_env)
+    } else {
+        None
+    };
+    if let Some((ref path, explicit_env)) = codex_home {
+        crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
+    }
+
+    // Ensure hooks are installed (strict: refuse to launch without hooks)
+    ensure_hooks_installed(
+        &normalized,
+        hcom_config.auto_approve,
+        codex_home.as_ref().map(|(path, _)| path.as_path()),
+    )?;
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1832,7 +1846,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // paired with a project layer that hcom itself just marked trusted — that
     // layer could contribute a hook source the scan never saw.
     let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
-        codex_preprocessing::resolve_codex_hook_trust(&params.args, &canonical_dir)
+        codex_preprocessing::resolve_codex_hook_trust_at(
+            &params.args,
+            &canonical_dir,
+            codex_home
+                .as_ref()
+                .map(|(path, _)| path.as_path())
+                .expect("Codex launch must resolve CODEX_HOME"),
+        )
     } else {
         codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
     };
