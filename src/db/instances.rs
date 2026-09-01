@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
-use crate::shared::constants::ST_LISTENING;
+use crate::shared::constants::{ST_LISTENING, is_delivery_paused_status_context};
 use crate::shared::time::now_epoch_i64;
 
 /// Instance status info
@@ -204,6 +204,44 @@ impl HcomDb {
             params![context, detail, name],
         )?;
         Ok(())
+    }
+
+    /// Publish a PTY gate context only while the instance is still listening.
+    /// The status check and write are one statement so a concurrent hook/tool
+    /// transition cannot be overwritten between a read and update.
+    pub(crate) fn set_gate_status_if_listening(
+        &self,
+        name: &str,
+        context: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE instances SET status_context = ?,
+                status_detail = CASE WHEN status_detail = 'cmd:listen' THEN status_detail ELSE ? END
+             WHERE name = ? AND status = ?",
+            params![context, detail, name, ST_LISTENING],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Clear a PTY gate context only if the instance row still contains the
+    /// exact context published by the caller.
+    pub(crate) fn clear_gate_status_if_context(
+        &self,
+        name: &str,
+        expected_context: &str,
+    ) -> Result<bool> {
+        if !is_delivery_paused_status_context(expected_context) {
+            return Ok(false);
+        }
+
+        let changed = self.conn.execute(
+            "UPDATE instances SET status_context = '',
+                status_detail = CASE WHEN status_detail = 'cmd:listen' THEN status_detail ELSE '' END
+             WHERE name = ? AND status_context = ?",
+            params![name, expected_context],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Update instance PID after spawn

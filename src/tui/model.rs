@@ -273,7 +273,7 @@ impl Agent {
 
     /// True when PTY delivery is gate-blocked (daemon wrote a `tui:*` context).
     pub fn is_pty_blocked(&self) -> bool {
-        self.status_context.starts_with("tui:")
+        crate::shared::is_delivery_paused_status_context(&self.status_context)
     }
 }
 
@@ -1247,6 +1247,13 @@ mod tests {
     fn pty_blocked_with_tui_prefix() {
         let mut a = test_agent("nova");
         a.status_context = "tui:not-ready".into();
+        assert!(a.is_pty_blocked());
+    }
+
+    #[test]
+    fn pty_blocked_with_hook_approval_context() {
+        let mut a = test_agent("nova");
+        a.status_context = "approval".into();
         assert!(a.is_pty_blocked());
     }
 

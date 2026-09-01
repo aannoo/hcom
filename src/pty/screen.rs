@@ -14,6 +14,16 @@ use std::time::Instant;
 
 use crate::config::Config;
 
+/// Is `text` Antigravity's accept-edits banner rather than a user draft?
+///
+/// Callers must also require the ready footer; this predicate alone is not
+/// sufficient. The two-way prefix test accepts the banner whole or truncated by
+/// a narrow terminal, and rejects anything continuing past its end.
+fn is_antigravity_accept_edits_banner(text: &str) -> bool {
+    text.starts_with(ANTIGRAVITY_ACCEPT_EDITS_MARKER)
+        && ANTIGRAVITY_ACCEPT_EDITS_BANNER.starts_with(text)
+}
+
 /// Escape a string as a JSON string literal (with quotes).
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -36,6 +46,16 @@ fn json_escape(s: &str) -> String {
 const OSC_TITLE_0: &[u8] = b"\x1b]0;";
 const OSC_TITLE_2: &[u8] = b"\x1b]2;";
 const CODEX_ACTION_REQUIRED: &str = "Action Required";
+
+/// Antigravity's accept-edits banner, rendered on the prompt row in normal
+/// intensity — visually identical to a user draft (`Antigravity 1.1.17`).
+const ANTIGRAVITY_ACCEPT_EDITS_BANNER: &str =
+    "Accept-edits mode: file edits auto-approved (shift+tab to cycle)";
+
+/// The stable leading portion of the banner. A narrow terminal truncates the
+/// tail, so recognition keys on this marker plus a prefix relation rather than
+/// on the full string.
+const ANTIGRAVITY_ACCEPT_EDITS_MARKER: &str = "Accept-edits mode:";
 
 /// Return the last complete OSC 0/2 terminal title in a raw output buffer.
 ///
@@ -918,6 +938,10 @@ impl ScreenTracker {
             Some((row_idx, trim_with_nbsp(after)))
         }) {
             if text.is_empty() {
+                return Some(String::new());
+            }
+
+            if self.is_ready() && is_antigravity_accept_edits_banner(text) {
                 return Some(String::new());
             }
 
@@ -1862,6 +1886,82 @@ mod tests {
         t.process("some agent output\r\n".as_bytes());
         t.process("> \r\n? for shortcuts\r\n".as_bytes());
         assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    // ---- Antigravity accept-edits banner ----
+
+    #[test]
+    fn antigravity_accept_edits_banner_with_ready_is_empty() {
+        let mut t = make_tracker(24, 192, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_wrapped_is_empty() {
+        let mut t = make_tracker(24, 40, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_banner_in_scrollback_then_real_draft_blocks() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        t.process("some agent output\r\n".as_bytes());
+        t.process("> deploy to prod\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("deploy to prod".to_string())
+        );
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    // Ready footer absent: the banner must still block, or hcom would deliver
+    // into a session that cannot act.
+    #[test]
+    fn antigravity_banner_without_ready_footer_is_not_empty() {
+        let mut t = make_tracker(24, 192, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             AI: Out of credits\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("Accept-edits mode: file edits auto-approved (shift+tab to cycle)".to_string())
+        );
+    }
+
+    #[test]
+    fn antigravity_banner_text_with_trailing_draft_is_not_empty() {
+        let mut t = make_tracker(24, 192, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle) and also ship it\r\n             ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_ne!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_cut_inside_marker_still_blocks() {
+        let mut t = make_tracker(24, 12, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("Accept-edi".to_string())
+        );
     }
 
     // ---- Claude input extraction ----

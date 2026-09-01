@@ -34,6 +34,7 @@ pub use constants::{
     extract_mentions,
     format_pane_title,
     format_pane_title_combined,
+    is_delivery_paused_status_context,
     status_bg,
     status_fg,
     status_icon,

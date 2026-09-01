@@ -223,6 +223,10 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
         send_code, 0,
         "held-message send failed: stdout={send_stdout} stderr={send_stderr}"
     );
+    assert!(
+        send_stdout.contains("Queued; delivery") && !send_stdout.contains("Sent to:"),
+        "approval-blocked or unresolved recipient must be reported as queued: {send_stdout}"
+    );
 
     h.eventually(
         "blocked(approval) to latch from Claude's PermissionRequest hook",

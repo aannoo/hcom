@@ -69,6 +69,16 @@ pub const ST_INACTIVE: &str = "inactive";
 pub const ST_LAUNCHING: &str = "launching";
 pub const ST_ERROR: &str = "error";
 
+/// Status-context prefix used while PTY delivery is held at a TUI safety gate.
+const TUI_DELIVERY_PAUSED_STATUS_PREFIX: &str = "tui:";
+
+/// Whether queued messages cannot currently be submitted through the target's PTY.
+pub fn is_delivery_paused_status_context(status_context: &str) -> bool {
+    status_context.starts_with(TUI_DELIVERY_PAUSED_STATUS_PREFIX)
+        || status_context == "pty:approval"
+        || status_context == "approval"
+}
+
 /// Valid status values (ordered for display priority).
 pub const STATUS_ORDER: &[&str] = &[
     ST_ACTIVE,

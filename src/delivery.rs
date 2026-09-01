@@ -713,6 +713,198 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
+const TRANSIENT_GATE_STATUS_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Delay before the daemon publishes a PTY gate reason to shared instance state.
+///
+/// Operator-held gates are durable dispositions that status/TUI consumers and
+/// synchronous send feedback must see immediately. Runtime transition gates
+/// are expected to clear on their own, so retain the historical debounce to
+/// avoid exposing normal prompt and output churn as a delivery pause.
+fn gate_status_publication_delay(reason: &str) -> Duration {
+    if matches!(
+        reason,
+        "not_ready"
+            | "prompt_has_text"
+            | "user_active"
+            | "approval"
+            | "nav_overlay"
+            | "wake_unacknowledged"
+    ) {
+        Duration::ZERO
+    } else {
+        TRANSIENT_GATE_STATUS_DEBOUNCE
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GateStatusUpdate {
+    None,
+    Publish {
+        context: String,
+        reason: &'static str,
+    },
+    Clear,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OwnedGateStatus {
+    instance_name: String,
+    context: String,
+}
+
+#[derive(Default)]
+struct GateStatusTracker {
+    blocked_instance: Option<String>,
+    blocked_reason: Option<&'static str>,
+    blocked_since: Option<Instant>,
+    owned_status: Option<OwnedGateStatus>,
+    clear_pending: bool,
+}
+
+impl GateStatusTracker {
+    fn observe_blocked_for(
+        &mut self,
+        instance_name: &str,
+        reason: &'static str,
+        now: Instant,
+    ) -> GateStatusUpdate {
+        let gate_changed = self.blocked_instance.as_deref() != Some(instance_name)
+            || self.blocked_reason != Some(reason);
+        if gate_changed {
+            self.blocked_instance = Some(instance_name.to_owned());
+            self.blocked_reason = Some(reason);
+            self.blocked_since = Some(now);
+        }
+
+        let blocked_for = now.saturating_duration_since(self.blocked_since.unwrap_or(now));
+        if blocked_for >= gate_status_publication_delay(reason) {
+            let context = format!("tui:{}", reason.replace('_', "-"));
+            if self
+                .owned_status
+                .as_ref()
+                .is_some_and(|owned| owned.instance_name != instance_name)
+            {
+                self.clear_pending = true;
+                return GateStatusUpdate::Clear;
+            }
+            if !self.owned_status.as_ref().is_some_and(|owned| {
+                owned.instance_name == instance_name && owned.context == context
+            }) {
+                return GateStatusUpdate::Publish { context, reason };
+            }
+        } else if self.owned_status.is_some() {
+            self.clear_pending = true;
+            return GateStatusUpdate::Clear;
+        }
+
+        GateStatusUpdate::None
+    }
+
+    fn reset(&mut self) -> GateStatusUpdate {
+        self.blocked_instance = None;
+        self.blocked_reason = None;
+        self.blocked_since = None;
+        if self.owned_status.is_some() {
+            self.clear_pending = true;
+            GateStatusUpdate::Clear
+        } else {
+            GateStatusUpdate::None
+        }
+    }
+
+    fn record_published_for(&mut self, instance_name: &str, context: String) {
+        self.owned_status = Some(OwnedGateStatus {
+            instance_name: instance_name.to_owned(),
+            context,
+        });
+        self.clear_pending = false;
+    }
+
+    fn record_cleared(&mut self) {
+        self.owned_status = None;
+        self.clear_pending = false;
+    }
+
+    fn owned_status(&self) -> Option<(&str, &str)> {
+        self.owned_status
+            .as_ref()
+            .map(|owned| (owned.instance_name.as_str(), owned.context.as_str()))
+    }
+
+    fn clear_owned_status(&mut self, db: &HcomDb) {
+        let Some((instance_name, context)) = self
+            .owned_status()
+            .map(|(name, context)| (name.to_owned(), context.to_owned()))
+        else {
+            self.clear_pending = false;
+            return;
+        };
+
+        match db.clear_gate_status_if_context(&instance_name, &context) {
+            Ok(_) => self.record_cleared(),
+            Err(e) => log_warn("native", "delivery.gate_clear_fail", &format!("{}", e)),
+        }
+    }
+
+    fn reconcile_instance(&mut self, db: &HcomDb, current_name: &str) {
+        if self
+            .blocked_instance
+            .as_deref()
+            .is_some_and(|name| name != current_name)
+        {
+            self.blocked_instance = None;
+            self.blocked_reason = None;
+            self.blocked_since = None;
+        }
+        if self
+            .owned_status
+            .as_ref()
+            .is_some_and(|owned| owned.instance_name != current_name)
+        {
+            self.clear_pending = true;
+        }
+        if self.clear_pending {
+            self.clear_owned_status(db);
+        }
+    }
+
+    fn apply_update(&mut self, db: &HcomDb, name: &str, update: GateStatusUpdate) {
+        self.reconcile_instance(db, name);
+        if self.clear_pending {
+            return;
+        }
+
+        match update {
+            GateStatusUpdate::None => {}
+            GateStatusUpdate::Clear => {
+                self.clear_pending = true;
+                self.clear_owned_status(db);
+            }
+            GateStatusUpdate::Publish { context, reason } => {
+                if self
+                    .owned_status
+                    .as_ref()
+                    .is_some_and(|owned| owned.instance_name != name)
+                {
+                    self.clear_pending = true;
+                    self.clear_owned_status(db);
+                    if self.clear_pending {
+                        return;
+                    }
+                }
+
+                let detail = gate_block_detail(reason);
+                match db.set_gate_status_if_listening(name, &context, detail) {
+                    Ok(true) => self.record_published_for(name, context),
+                    Ok(false) => {}
+                    Err(e) => log_warn("native", "delivery.gate_status_fail", &format!("{}", e)),
+                }
+            }
+        }
+    }
+}
+
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
 /// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
@@ -1750,9 +1942,7 @@ pub fn run_delivery_loop(
         let mut injected_text = String::new();
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
-        // Gate block tracking for TUI status updates
-        let mut block_since: Option<Instant> = None;
-        let mut last_block_context: String = String::new();
+        let mut gate_status_tracker = GateStatusTracker::default();
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1769,6 +1959,7 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
+            gate_status_tracker.reconcile_instance(db, &current_name);
             drive_launch_outcome(
                 db,
                 state,
@@ -1873,6 +2064,8 @@ pub fn run_delivery_loop(
                         );
                         delivery_state = State::Idle;
                         attempt = 0;
+                        let update = gate_status_tracker.reset();
+                        gate_status_tracker.apply_update(db, &current_name, update);
                         continue;
                     }
 
@@ -1886,6 +2079,8 @@ pub fn run_delivery_loop(
                     let gate = evaluate_gate(config, state, is_idle);
 
                     if gate.safe {
+                        let update = gate_status_tracker.reset();
+                        gate_status_tracker.apply_update(db, &current_name, update);
                         log_info(
                             "native",
                             "delivery.gate_pass",
@@ -1940,6 +2135,13 @@ pub fn run_delivery_loop(
                             attempt += 1;
                         }
                     } else {
+                        let update = gate_status_tracker.observe_blocked_for(
+                            &current_name,
+                            gate.reason,
+                            Instant::now(),
+                        );
+                        gate_status_tracker.apply_update(db, &current_name, update);
+
                         // Gate blocked - refresh heartbeat so we don't go stale while waiting
                         // (DB status is still "listening" until message is delivered and hooks fire)
                         if let Err(e) = db.update_heartbeat(&current_name) {
@@ -1961,11 +2163,6 @@ pub fn run_delivery_loop(
                                     state.is_user_active()
                                 ),
                             );
-                        }
-
-                        // Track when blocking started
-                        if block_since.is_none() {
-                            block_since = Some(Instant::now());
                         }
 
                         let approval_showing = {
@@ -2017,70 +2214,6 @@ pub fn run_delivery_loop(
                                         "delivery.recovery_check",
                                         &format!("DB error checking status: {}", e),
                                     );
-                                }
-                            }
-                            // Fall through to TUI status update
-                            if let Some(since) = block_since
-                                && since.elapsed().as_secs_f64() >= 2.0
-                            {
-                                match db.get_status(&current_name) {
-                                    Ok(Some((status, _))) if status == ST_LISTENING => {
-                                        let context = "tui:not-idle".to_string();
-                                        if context != last_block_context {
-                                            if let Err(e) = db.set_gate_status(
-                                                &current_name,
-                                                &context,
-                                                "waiting for idle status",
-                                            ) {
-                                                log_warn(
-                                                    "native",
-                                                    "delivery.gate_status_fail",
-                                                    &format!("{}", e),
-                                                );
-                                            }
-                                            last_block_context = context;
-                                        }
-                                    }
-                                    Ok(Some(_)) | Ok(None) => {
-                                        // Status not "listening" or not found - skip
-                                    }
-                                    Err(e) => {
-                                        log_error(
-                                            "native",
-                                            "delivery.tui_status_update",
-                                            &format!("DB error checking status: {}", e),
-                                        );
-                                    }
-                                }
-                            }
-                        } else if let Some(since) = block_since {
-                            // After 2 seconds of blocking, update TUI status context
-                            if since.elapsed().as_secs_f64() >= 2.0 {
-                                // Only update if status is "listening" (don't overwrite active/blocked)
-                                match db.get_status(&current_name) {
-                                    Ok(Some((status, _))) if status == ST_LISTENING => {
-                                        // Format context: tui:not-ready, tui:user-active, etc.
-                                        let reason_formatted = gate.reason.replace("_", "-");
-                                        let context = format!("tui:{}", reason_formatted);
-
-                                        // Only update if context changed
-                                        if context != last_block_context {
-                                            let detail = gate_block_detail(gate.reason);
-                                            let _ =
-                                                db.set_gate_status(&current_name, &context, detail);
-                                            last_block_context = context;
-                                        }
-                                    }
-                                    Ok(Some(_)) | Ok(None) => {
-                                        // Status not "listening" or not found - skip
-                                    }
-                                    Err(e) => {
-                                        log_error(
-                                            "native",
-                                            "delivery.gate_status_update",
-                                            &format!("DB error checking status: {}", e),
-                                        );
-                                    }
                                 }
                             }
                         }
@@ -2303,14 +2436,8 @@ pub fn run_delivery_loop(
                     let current_cursor = db.get_cursor(&current_name);
                     if current_cursor > cursor_before {
                         // Success! Clear gate block status
-                        if !last_block_context.is_empty() {
-                            if let Err(e) = db.set_gate_status(&current_name, "", "") {
-                                log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
-                            }
-                            last_block_context.clear();
-                        }
-                        block_since = None;
-
+                        let update = gate_status_tracker.reset();
+                        gate_status_tracker.apply_update(db, &current_name, update);
                         log_info(
                             "native",
                             "delivery.success",
@@ -2360,17 +2487,8 @@ pub fn run_delivery_loop(
                                 // pending rows" is also sufficient — avoids
                                 // wedging when hook delivery succeeded but
                                 // cursor bookkeeping did not advance.
-                                if !last_block_context.is_empty() {
-                                    if let Err(e) = db.set_gate_status(&current_name, "", "") {
-                                        log_warn(
-                                            "native",
-                                            "delivery.gate_clear_fail",
-                                            &format!("{}", e),
-                                        );
-                                    }
-                                    last_block_context.clear();
-                                }
-                                block_since = None;
+                                let update = gate_status_tracker.reset();
+                                gate_status_tracker.apply_update(db, &current_name, update);
                                 log_info(
                                     "native",
                                     "delivery.success_no_cursor",
@@ -2397,16 +2515,20 @@ pub fn run_delivery_loop(
                             VerifyTimeoutDecision::FastFail => {
                                 let context = "tui:wake-unacknowledged".to_string();
                                 let detail = "delivery paused; kill and resume this agent to retry";
-                                if let Err(e) = db.set_gate_status(&current_name, &context, detail)
-                                {
-                                    log_warn(
+                                match db.set_gate_status_if_listening(
+                                    &current_name,
+                                    &context,
+                                    detail,
+                                ) {
+                                    Ok(true) => gate_status_tracker
+                                        .record_published_for(&current_name, context),
+                                    Ok(false) => {}
+                                    Err(e) => log_warn(
                                         "native",
                                         "delivery.gate_status_fail",
                                         &format!("{}", e),
-                                    );
+                                    ),
                                 }
-                                last_block_context = context;
-                                block_since = Some(Instant::now());
                                 log_warn(
                                     "native",
                                     "delivery.wake_unacknowledged",
@@ -2465,11 +2587,8 @@ pub fn run_delivery_loop(
                     let current_cursor = db.get_cursor(&current_name);
                     let has_pending = db.has_pending(&current_name);
                     if current_cursor > cursor_before || !has_pending {
-                        if let Err(e) = db.set_gate_status(&current_name, "", "") {
-                            log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
-                        }
-                        last_block_context.clear();
-                        block_since = None;
+                        let update = gate_status_tracker.reset();
+                        gate_status_tracker.apply_update(db, &current_name, update);
                         attempt = 0;
                         inject_attempt = 0;
                         delivery_state = if has_pending {
@@ -2658,6 +2777,105 @@ mod tests {
             approval_scrape_latched: false,
             nav_overlay: false,
         }
+    }
+
+    fn observe_gate_status_within_feedback_deadline(
+        config: ToolConfig,
+        screen: ScreenState,
+    ) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, created_at, tcp_mode)
+                 VALUES ('rozo', 'antigravity', 'listening', '', 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "message",
+            "ext_bigboss",
+            &serde_json::json!({
+                "from": "bigboss",
+                "sender_kind": "external",
+                "scope": "mentions",
+                "text": "probe",
+                "mentions": ["rozo"],
+                "delivered_to": ["rozo"],
+            }),
+        )
+        .unwrap();
+
+        let notify = NotifyServer::new().unwrap();
+        let notify_port = notify.port();
+        let running = Arc::new(AtomicBool::new(true));
+        let running_for_loop = running.clone();
+        let state = make_state(screen, 500);
+
+        let delivery = std::thread::spawn(move || {
+            run_delivery_loop(
+                running_for_loop,
+                &mut db,
+                &notify,
+                &state,
+                "rozo",
+                &config,
+                None,
+                None,
+                None,
+            );
+        });
+
+        let observer = HcomDb::open_raw(&db_path).unwrap();
+        let deadline = Instant::now() + crate::commands::send::RECIPIENT_FEEDBACK_SYNC_TIMEOUT;
+        let mut observed_status = String::new();
+        let mut observed_context = String::new();
+        while Instant::now() < deadline {
+            if let Some(row) = observer.get_instance_full("rozo").unwrap() {
+                observed_status = row.status;
+                observed_context = row.status_context;
+            }
+            if observed_context.starts_with("tui:") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        running.store(false, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", notify_port));
+        delivery.join().unwrap();
+
+        (observed_status, observed_context)
+    }
+
+    #[test]
+    fn operator_blocking_gate_status_is_published_before_feedback_deadline() {
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        screen.input_text = Some("UNSUBMITTED-20260831-R1".to_string());
+
+        let observed =
+            observe_gate_status_within_feedback_deadline(ToolConfig::antigravity(), screen);
+
+        assert_eq!(observed, ("listening".into(), "tui:not-ready".into()));
+    }
+
+    #[test]
+    fn transient_gate_status_is_debounced_past_feedback_deadline() {
+        let mut screen = safe_screen();
+        screen.last_prompt_submit = Some(Instant::now());
+
+        let observed = observe_gate_status_within_feedback_deadline(ToolConfig::codex(), screen);
+
+        assert_eq!(observed.0, "listening");
+        assert!(
+            !crate::shared::is_delivery_paused_status_context(&observed.1),
+            "transient gate must not publish a shared TUI pause before debounce: {observed:?}"
+        );
     }
 
     #[test]
@@ -3193,6 +3411,334 @@ mod tests {
             "waiting for subagent nav / session switcher to close"
         );
         assert_eq!(gate_block_detail("unknown"), "blocked");
+    }
+
+    #[test]
+    fn operator_blocking_gate_statuses_publish_without_debounce() {
+        for reason in [
+            "not_ready",
+            "prompt_has_text",
+            "user_active",
+            "approval",
+            "nav_overlay",
+            "wake_unacknowledged",
+        ] {
+            assert_eq!(gate_status_publication_delay(reason), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn transient_gate_statuses_retain_historical_debounce() {
+        for reason in ["submit_settle", "output_unstable", "not_idle", "unknown"] {
+            assert_eq!(
+                gate_status_publication_delay(reason),
+                TRANSIENT_GATE_STATUS_DEBOUNCE
+            );
+        }
+    }
+
+    #[test]
+    fn transient_gate_status_publishes_only_after_two_seconds() {
+        let started_at = Instant::now();
+        let mut tracker = GateStatusTracker::default();
+
+        assert_eq!(
+            tracker.observe_blocked_for("rozo", "submit_settle", started_at),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "submit_settle",
+                started_at + TRANSIENT_GATE_STATUS_DEBOUNCE - Duration::from_millis(1),
+            ),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "submit_settle",
+                started_at + TRANSIENT_GATE_STATUS_DEBOUNCE,
+            ),
+            GateStatusUpdate::Publish {
+                context: "tui:submit-settle".into(),
+                reason: "submit_settle",
+            }
+        );
+    }
+
+    #[test]
+    fn durable_to_transient_clears_owned_context_and_restarts_debounce() {
+        let started_at = Instant::now();
+        let transition_at = started_at + Duration::from_millis(20);
+        let mut tracker = GateStatusTracker::default();
+
+        assert_eq!(
+            tracker.observe_blocked_for("rozo", "not_ready", started_at),
+            GateStatusUpdate::Publish {
+                context: "tui:not-ready".into(),
+                reason: "not_ready",
+            }
+        );
+        tracker.record_published_for("rozo", "tui:not-ready".into());
+        assert_eq!(
+            tracker.observe_blocked_for("rozo", "submit_settle", transition_at),
+            GateStatusUpdate::Clear
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "submit_settle",
+                transition_at + Duration::from_millis(1),
+            ),
+            GateStatusUpdate::Clear,
+            "failed conditional clears must be retried while the transient gate is debounced"
+        );
+        tracker.record_cleared();
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "submit_settle",
+                transition_at + TRANSIENT_GATE_STATUS_DEBOUNCE - Duration::from_millis(1),
+            ),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "submit_settle",
+                transition_at + TRANSIENT_GATE_STATUS_DEBOUNCE,
+            ),
+            GateStatusUpdate::Publish {
+                context: "tui:submit-settle".into(),
+                reason: "submit_settle",
+            }
+        );
+    }
+
+    #[test]
+    fn transient_reason_change_restarts_debounce() {
+        let started_at = Instant::now();
+        let changed_at = started_at + Duration::from_secs(1);
+        let mut tracker = GateStatusTracker::default();
+
+        assert_eq!(
+            tracker.observe_blocked_for("rozo", "submit_settle", started_at),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for("rozo", "output_unstable", changed_at),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "output_unstable",
+                changed_at + TRANSIENT_GATE_STATUS_DEBOUNCE - Duration::from_millis(1),
+            ),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "rozo",
+                "output_unstable",
+                changed_at + TRANSIENT_GATE_STATUS_DEBOUNCE,
+            ),
+            GateStatusUpdate::Publish {
+                context: "tui:output-unstable".into(),
+                reason: "output_unstable",
+            }
+        );
+    }
+
+    #[test]
+    fn safe_no_pending_and_message_transitions_reset_owned_context() {
+        for transition in ["safe", "no-pending", "message-delivered"] {
+            let mut tracker = GateStatusTracker::default();
+            tracker.record_published_for("rozo", "tui:not-ready".into());
+
+            assert_eq!(
+                tracker.reset(),
+                GateStatusUpdate::Clear,
+                "{transition} transition must clear loop-owned gate status"
+            );
+            tracker.record_cleared();
+            assert_eq!(tracker.reset(), GateStatusUpdate::None);
+        }
+    }
+
+    #[test]
+    fn clearing_loop_owned_status_preserves_other_writer() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, status_detail, created_at)
+                 VALUES ('rozo', 'listening', 'tool:Bash', 'running', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let mut tracker = GateStatusTracker::default();
+        tracker.record_published_for("rozo", "tui:not-ready".into());
+
+        tracker.clear_owned_status(&db);
+
+        let row = db.get_instance_full("rozo").unwrap().unwrap();
+        assert_eq!(row.status_context, "tool:Bash");
+        assert_eq!(row.status_detail, "running");
+        assert_eq!(tracker.owned_status(), None);
+    }
+
+    #[test]
+    fn clearing_loop_owned_status_clears_matching_shared_context() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, status_detail, created_at)
+                 VALUES ('rozo', 'listening', 'tui:not-ready', 'prompt not visible', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let mut tracker = GateStatusTracker::default();
+        tracker.record_published_for("rozo", "tui:not-ready".into());
+
+        tracker.clear_owned_status(&db);
+
+        let row = db.get_instance_full("rozo").unwrap().unwrap();
+        assert_eq!(row.status_context, "");
+        assert_eq!(row.status_detail, "");
+        assert_eq!(tracker.owned_status(), None);
+    }
+
+    #[test]
+    fn clearing_loop_owned_status_preserves_cmd_listen_detail() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, status_detail, created_at)
+                 VALUES ('rozo', 'listening', 'tui:not-ready', 'cmd:listen', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let mut tracker = GateStatusTracker::default();
+        tracker.record_published_for("rozo", "tui:not-ready".into());
+
+        tracker.clear_owned_status(&db);
+
+        let row = db.get_instance_full("rozo").unwrap().unwrap();
+        assert_eq!(row.status_context, "");
+        assert_eq!(row.status_detail, "cmd:listen");
+        assert_eq!(tracker.owned_status(), None);
+    }
+
+    #[test]
+    fn publication_cas_preserves_concurrent_non_listening_writer() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, status_detail, created_at)
+                 VALUES ('rozo', 'listening', '', '', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Deterministically model the interleaving that used to occur between
+        // delivery's status read and status write: the tool writer wins first.
+        db.set_status("rozo", "active", "tool:Bash").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status_detail = 'running' WHERE name = 'rozo'",
+                [],
+            )
+            .unwrap();
+
+        let published = db
+            .set_gate_status_if_listening("rozo", "tui:not-ready", "prompt not visible")
+            .unwrap();
+
+        assert!(!published);
+        let row = db.get_instance_full("rozo").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(row.status_context, "tool:Bash");
+        assert_eq!(row.status_detail, "running");
+    }
+
+    #[test]
+    fn binding_transition_clears_owned_old_instance_and_resets_debounce() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, status_detail, created_at)
+                 VALUES
+                 ('old', 'listening', 'tui:not-ready', 'prompt not visible', 1000.0),
+                 ('new', 'listening', '', '', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let started_at = Instant::now();
+        let mut tracker = GateStatusTracker::default();
+        tracker.record_published_for("old", "tui:not-ready".into());
+
+        tracker.reconcile_instance(&db, "new");
+
+        assert_eq!(
+            db.get_instance_full("old").unwrap().unwrap().status_context,
+            ""
+        );
+        assert_eq!(tracker.owned_status(), None);
+        assert_eq!(
+            tracker.observe_blocked_for("new", "submit_settle", started_at),
+            GateStatusUpdate::None
+        );
+        assert_eq!(
+            tracker.observe_blocked_for(
+                "new",
+                "submit_settle",
+                started_at + TRANSIENT_GATE_STATUS_DEBOUNCE - Duration::from_millis(1),
+            ),
+            GateStatusUpdate::None
+        );
+    }
+
+    #[test]
+    fn failed_idle_clear_is_retried_without_clobbering_replacement_writer() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, status_detail, created_at)
+                 VALUES ('rozo', 'listening', 'tui:not-ready', 'prompt not visible', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let mut tracker = GateStatusTracker::default();
+        tracker.record_published_for("rozo", "tui:not-ready".into());
+        let update = tracker.reset();
+        assert_eq!(update, GateStatusUpdate::Clear);
+
+        db.conn()
+            .execute("ALTER TABLE instances RENAME TO instances_unavailable", [])
+            .unwrap();
+        tracker.apply_update(&db, "rozo", update);
+        assert_eq!(
+            tracker.owned_status(),
+            Some(("rozo", "tui:not-ready")),
+            "failed clear must retain ownership for retry"
+        );
+        db.conn()
+            .execute("ALTER TABLE instances_unavailable RENAME TO instances", [])
+            .unwrap();
+        db.set_status("rozo", "active", "tool:Bash").unwrap();
+
+        tracker.reconcile_instance(&db, "rozo");
+
+        let row = db.get_instance_full("rozo").unwrap().unwrap();
+        assert_eq!(row.status_context, "tool:Bash");
+        assert_eq!(tracker.owned_status(), None);
     }
 
     // ---- ToolConfig ----
