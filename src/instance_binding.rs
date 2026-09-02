@@ -85,6 +85,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "kitty_listen_on",
         "process_id",
         "terminal_preset_effective",
+        "codex_directory_pin_v1",
     ];
     let mut ctx = new_ctx;
 
@@ -1166,8 +1167,8 @@ mod tests {
     #[serial]
     fn test_capture_and_store_launch_context_preserves_terminal_metadata() {
         // Preserve only the fields we can't recapture from hook env:
-        // pane_id, terminal_id, kitty_listen_on, process_id, and the resolved
-        // terminal preset name.
+        // pane_id, terminal_id, kitty_listen_on, process_id, the resolved
+        // terminal preset name, and an explicit Codex logical-directory pin.
         let (db, path) = setup_test_db();
         db.conn()
             .execute(
@@ -1176,7 +1177,7 @@ mod tests {
                     "luna",
                     "claude",
                     1.0f64,
-                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1"}"#
+                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1","codex_directory_pin_v1":{"directory":"/tmp/cultivation","session_id":"thread-1","source":"explicit-start-relocate-v1"}}"#
                 ],
             )
             .unwrap();
@@ -1197,6 +1198,12 @@ mod tests {
         assert_eq!(
             ctx.get("process_id").and_then(|v| v.as_str()),
             Some("proc-1")
+        );
+        assert_eq!(
+            ctx.get("codex_directory_pin_v1")
+                .and_then(|v| v.get("directory"))
+                .and_then(|v| v.as_str()),
+            Some("/tmp/cultivation")
         );
 
         cleanup(path);

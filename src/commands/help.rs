@@ -386,6 +386,10 @@ const START_HELP: &[HelpEntry] = &[
         "Reclaim identity (after compaction/resume/clear)",
     ),
     (
+        "start --as <name> --relocate",
+        "Move a stopped top-level Codex identity to this task's directory",
+    ),
+    (
         "start --orphan <name|pid>",
         "Recover orphaned PTY process from pidtrack",
     ),

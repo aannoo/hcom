@@ -52,31 +52,182 @@ pub struct ListArgs {
     pub last: Option<usize>,
 }
 
-/// Get unread message count for a single instance.
-fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
-    db.conn()
-        .query_row(
-            "SELECT COUNT(*) FROM events WHERE id > ? AND type = 'message'
-             AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?)",
-            rusqlite::params![last_event_id, name],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
+/// Diagnostic-only threshold for a pending PTY delivery whose durable gate
+/// state says it is blocked. This does not change delivery retries or timeouts.
+const DELIVERY_STALLED_AFTER_SECS: i64 = 60;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UnreadInfo {
+    count: i64,
+    oldest_age_seconds: Option<i64>,
 }
 
-/// Get unread counts for all instances in batch.
-fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<String, i64> {
-    let mut counts = HashMap::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryVisibility {
+    mode: &'static str,
+    state: &'static str,
+    stalled: bool,
+    detail: String,
+}
+
+/// Get durable unread evidence for a single instance.
+///
+/// The cursor/event gap proves that a message is still pending. Event time is
+/// used only to age that fact; an unparseable timestamp remains visible as
+/// unread but never manufactures a stalled signal.
+fn get_unread_info(db: &HcomDb, name: &str, last_event_id: i64, now: i64) -> UnreadInfo {
+    let (count, oldest_timestamp): (i64, Option<String>) = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*), MIN(timestamp) FROM events
+             WHERE id > ? AND type = 'message'
+             AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?)",
+            rusqlite::params![last_event_id, name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, None));
+
+    let oldest_age_seconds = oldest_timestamp
+        .as_deref()
+        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| now.saturating_sub(timestamp.timestamp()).max(0));
+
+    UnreadInfo {
+        count,
+        oldest_age_seconds,
+    }
+}
+
+/// Get unread evidence for all local instances in batch.
+fn get_unread_info_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<String, UnreadInfo> {
+    let mut unread = HashMap::new();
+    let now = crate::shared::time::now_epoch_i64();
     for inst in instances {
         if is_remote_instance(inst) {
             continue;
         }
-        let count = get_unread_count(db, &inst.name, inst.last_event_id);
-        if count > 0 {
-            counts.insert(inst.name.clone(), count);
+        let info = get_unread_info(db, &inst.name, inst.last_event_id, now);
+        if info.count > 0 {
+            unread.insert(inst.name.clone(), info);
         }
     }
-    counts
+    unread
+}
+
+fn gate_block_detail(status_context: &str, status_detail: &str) -> Option<String> {
+    let reason = status_context.strip_prefix("tui:")?;
+    if !status_detail.is_empty() && status_detail != "cmd:listen" {
+        Some(status_detail.to_string())
+    } else {
+        Some(reason.replace('-', " "))
+    }
+}
+
+/// Classify only what the durable database state proves.
+///
+/// Hook-only sessions have no HCOM-owned input stream, so queued messages are
+/// boundary-driven rather than instant. A PTY delivery is called stalled only
+/// when both halves are present: an old unread event and a persisted `tui:*`
+/// gate reason. This intentionally avoids inferring failure from silence alone.
+fn delivery_visibility(
+    status_context: &str,
+    status_detail: &str,
+    is_remote: bool,
+    hooks_bound: bool,
+    process_bound: bool,
+    unread: &UnreadInfo,
+) -> DeliveryVisibility {
+    let mode = if is_remote {
+        "remote"
+    } else if process_bound {
+        "pty"
+    } else if hooks_bound {
+        "hook_boundary"
+    } else {
+        "manual"
+    };
+
+    let gate_detail = gate_block_detail(status_context, status_detail);
+    let old_enough = unread
+        .oldest_age_seconds
+        .is_some_and(|age| age >= DELIVERY_STALLED_AFTER_SECS);
+    let stalled_detail = if unread.count > 0 && old_enough {
+        if process_bound {
+            gate_detail.clone()
+        } else if !is_remote && !hooks_bound {
+            Some("no automatic delivery binding".to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(detail) = stalled_detail {
+        return DeliveryVisibility {
+            mode,
+            state: "stalled",
+            stalled: true,
+            detail,
+        };
+    }
+
+    if unread.count == 0 {
+        let detail = if mode == "hook_boundary" {
+            "delivery occurs at a supported hook boundary, not instantly".to_string()
+        } else {
+            String::new()
+        };
+        return DeliveryVisibility {
+            mode,
+            state: "clear",
+            stalled: false,
+            detail,
+        };
+    }
+
+    let (state, detail) = match mode {
+        "hook_boundary" => (
+            "waiting_for_hook_boundary",
+            "queued until a supported hook boundary; no PTY injection".to_string(),
+        ),
+        "pty" if gate_detail.is_some() => (
+            "blocked",
+            gate_detail.unwrap_or_else(|| "PTY delivery gate is blocked".to_string()),
+        ),
+        "pty" => ("queued", "queued for PTY delivery".to_string()),
+        "manual" => (
+            "waiting_for_poll",
+            "unread with no automatic delivery binding".to_string(),
+        ),
+        _ => ("queued_remote", "queued for remote delivery".to_string()),
+    };
+
+    DeliveryVisibility {
+        mode,
+        state,
+        stalled: false,
+        detail,
+    }
+}
+
+fn human_delivery_suffix(delivery: &DeliveryVisibility, unread: &UnreadInfo) -> String {
+    let age = unread.oldest_age_seconds.map(format_age);
+    if delivery.stalled {
+        let age = age.unwrap_or_else(|| "unknown age".to_string());
+        format!(" | DELIVERY STALLED {age}: {}", delivery.detail)
+    } else if delivery.mode == "hook_boundary" {
+        if unread.count > 0 {
+            let age = age.map(|age| format!(", oldest {age}")).unwrap_or_default();
+            format!(" | delivery: supported hook boundary{age}")
+        } else {
+            " | delivery: hook boundary (not instant)".to_string()
+        }
+    } else if unread.count > 0 && delivery.mode == "manual" {
+        " | delivery: manual poll required".to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Main entry point for `hcom list` command.
@@ -148,6 +299,22 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         match db.get_instance_full(&lookup_name) {
             Ok(Some(data)) => {
+                let hooks_bound = db.has_session_binding(&data.name);
+                let process_bound = db.has_process_binding_for_instance(&data.name);
+                let unread = get_unread_info(
+                    db,
+                    &data.name,
+                    data.last_event_id,
+                    crate::shared::time::now_epoch_i64(),
+                );
+                let delivery = delivery_visibility(
+                    &data.status_context,
+                    &data.status_detail,
+                    is_remote_instance(&data),
+                    hooks_bound,
+                    process_bound,
+                    &unread,
+                );
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
                     "session_id": data.session_id,
@@ -157,6 +324,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     "parent_name": data.parent_name,
                     "agent_id": data.agent_id,
                     "tool": data.tool,
+                    "unread_count": unread.count,
+                    "oldest_unread_age_seconds": unread.oldest_age_seconds,
+                    "hooks_bound": hooks_bound,
+                    "process_bound": process_bound,
+                    "delivery_mode": delivery.mode,
+                    "delivery_state": delivery.state,
+                    "delivery_stalled": delivery.stalled,
+                    "delivery_stalled_after_seconds": DELIVERY_STALLED_AFTER_SECS,
+                    "delivery_detail": delivery.detail,
                 });
 
                 if is_self
@@ -211,7 +387,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    let unread_counts = get_unread_counts_batch(db, &sorted_instances);
+    let unread_info = get_unread_info_batch(db, &sorted_instances);
 
     if names_output {
         for data in &sorted_instances {
@@ -231,6 +407,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             // Get binding status
             let hooks_bound = db.has_session_binding(&data.name);
             let process_bound = db.has_process_binding_for_instance(&data.name);
+            let unread = unread_info.get(&data.name).cloned().unwrap_or_default();
+            let delivery = delivery_visibility(
+                &data.status_context,
+                &data.status_detail,
+                is_remote_instance(data),
+                hooks_bound,
+                process_bound,
+                &unread,
+            );
 
             // Parse launch_context JSON
             let launch_context: serde_json::Value = data
@@ -247,7 +432,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "status_detail": data.status_detail,
                 "status_age_seconds": age_seconds,
                 "description": description,
-                "unread_count": unread_counts.get(&data.name).copied().unwrap_or(0),
+                "unread_count": unread.count,
+                "oldest_unread_age_seconds": unread.oldest_age_seconds,
                 "headless": data.background != 0,
                 "session_id": data.session_id.as_deref().unwrap_or(""),
                 "directory": data.directory,
@@ -261,6 +447,11 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "base_name": data.name,
                 "hooks_bound": hooks_bound,
                 "process_bound": process_bound,
+                "delivery_mode": delivery.mode,
+                "delivery_state": delivery.state,
+                "delivery_stalled": delivery.stalled,
+                "delivery_stalled_after_seconds": DELIVERY_STALLED_AFTER_SECS,
+                "delivery_detail": delivery.detail,
                 "launch_context": launch_context,
             });
             result_list.push(payload);
@@ -358,7 +549,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         if is_remote_instance(data) {
             n += 9; // " [remote]"
         }
-        let uc = unread_counts.get(&data.name).copied().unwrap_or(0);
+        let uc = unread_info
+            .get(&data.name)
+            .map(|info| info.count)
+            .unwrap_or(0);
         if uc > 0 {
             n += format!(" +{uc}").len();
         }
@@ -371,6 +565,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         let cs = get_instance_status(data, db);
         let (status, age_str, description) = (cs.status, cs.age_string, cs.description);
         let icon = status_icon(&status);
+        let hooks_bound = db.has_session_binding(&data.name);
+        let process_bound = db.has_process_binding_for_instance(&data.name);
 
         let age_display = if age_str == "now" {
             age_str.clone()
@@ -385,8 +581,6 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         // Tool prefix — binding state encoding:
         // UPPER = pty+hooks, lower = hooks only, UPPER* = pty only, lower* = no binding
         let tool_prefix = if show_tool {
-            let hooks_bound = db.has_session_binding(&data.name);
-            let process_bound = db.has_process_binding_for_instance(&data.name);
             let tool_display = if data.tool == "adhoc" {
                 "ad-hoc".to_string()
             } else if process_bound && hooks_bound {
@@ -417,12 +611,22 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         };
 
         // Unread
-        let unread = unread_counts.get(&data.name).copied().unwrap_or(0);
-        let unread_str = if unread > 0 {
-            format!(" +{unread}")
+        let unread = unread_info.get(&data.name).cloned().unwrap_or_default();
+        let unread_str = if unread.count > 0 {
+            format!(" +{}", unread.count)
         } else {
             String::new()
         };
+
+        let delivery = delivery_visibility(
+            &data.status_context,
+            &data.status_detail,
+            is_remote_instance(data),
+            hooks_bound,
+            process_bound,
+            &unread,
+        );
+        let delivery_suffix = human_delivery_suffix(&delivery, &unread);
 
         // Listening-since suffix: show idle duration for listening agents idle >= 60s
         let listening_since = if status == ST_LISTENING && cs.age_seconds >= 60 {
@@ -453,8 +657,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         };
 
         let name_part = format!("{name}{headless_badge}{remote_badge}{unread_str}");
-        let status_text =
-            format!("{age_display}{desc_sep}{description}{listening_since}{timeout_marker}");
+        let status_text = format!(
+            "{age_display}{desc_sep}{description}{listening_since}{timeout_marker}{delivery_suffix}"
+        );
 
         println!(
             "{tool_prefix}{icon} {name_part:<width$}{status_text}",
@@ -507,8 +712,6 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
 
             // Binding status
-            let hooks_bound = db.has_session_binding(&data.name);
-            let process_bound = db.has_process_binding_for_instance(&data.name);
             let bind_str = match (hooks_bound, process_bound) {
                 (true, true) => "hooks, pty",
                 (true, false) => "hooks",
@@ -516,6 +719,13 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 (false, false) => "none",
             };
             println!("    bindings:     {bind_str}");
+            println!("    delivery:     {} ({})", delivery.state, delivery.mode);
+            if let Some(age) = unread.oldest_age_seconds {
+                println!("    oldest unread: {}", format_age(age));
+            }
+            if !delivery.detail.is_empty() {
+                println!("    delivery note: {}", delivery.detail);
+            }
 
             let transcript = if data.transcript_path.is_empty() {
                 "(none)".to_string()
@@ -658,16 +868,31 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
         }
     }
 
-    // Unread Count
-    let unread = get_unread_count(db, &data.name, data.last_event_id);
-    if unread > 0 {
-        let s = if unread == 1 { "" } else { "s" };
-        println!("  Unread:      {unread} message{s}");
-    }
-
-    // Bindings
+    // Delivery evidence and bindings
     let hooks_bound = db.has_session_binding(&data.name);
     let process_bound = db.has_process_binding_for_instance(&data.name);
+    let unread = get_unread_info(
+        db,
+        &data.name,
+        data.last_event_id,
+        crate::shared::time::now_epoch_i64(),
+    );
+    let delivery = delivery_visibility(
+        &data.status_context,
+        &data.status_detail,
+        is_remote_instance(data),
+        hooks_bound,
+        process_bound,
+        &unread,
+    );
+    if unread.count > 0 {
+        let s = if unread.count == 1 { "" } else { "s" };
+        println!("  Unread:      {} message{s}", unread.count);
+        if let Some(age) = unread.oldest_age_seconds {
+            println!("  Oldest:      {}", format_age(age));
+        }
+    }
+
     let bind_str = match (hooks_bound, process_bound) {
         (true, true) => "hooks, pty",
         (true, false) => "hooks",
@@ -675,6 +900,10 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
         (false, false) => "none",
     };
     println!("  Bindings:    {bind_str}");
+    println!("  Delivery:    {} ({})", delivery.state, delivery.mode);
+    if !delivery.detail.is_empty() {
+        println!("  Delivery Note: {}", delivery.detail);
+    }
 
     if let Some(pid) = data.pid {
         println!("  PID:         {pid}");
@@ -963,4 +1192,119 @@ fn get_recently_stopped(
         .filter_map(|r| r.ok())
         .filter(|name| !exclude_active.contains(name))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn hook_only_delivery_is_boundary_driven_not_stalled() {
+        let unread = UnreadInfo {
+            count: 2,
+            oldest_age_seconds: Some(600),
+        };
+
+        let delivery = delivery_visibility("", "", false, true, false, &unread);
+
+        assert_eq!(delivery.mode, "hook_boundary");
+        assert_eq!(delivery.state, "waiting_for_hook_boundary");
+        assert!(!delivery.stalled);
+        assert!(delivery.detail.contains("supported hook boundary"));
+        assert!(human_delivery_suffix(&delivery, &unread).contains("hook boundary"));
+    }
+
+    #[test]
+    fn pty_gate_becomes_stalled_only_at_bounded_age() {
+        let young = UnreadInfo {
+            count: 1,
+            oldest_age_seconds: Some(DELIVERY_STALLED_AFTER_SECS - 1),
+        };
+        let old = UnreadInfo {
+            count: 1,
+            oldest_age_seconds: Some(DELIVERY_STALLED_AFTER_SECS),
+        };
+
+        let young_delivery = delivery_visibility(
+            "tui:prompt-has-text",
+            "uncommitted text in prompt",
+            false,
+            true,
+            true,
+            &young,
+        );
+        let old_delivery = delivery_visibility(
+            "tui:prompt-has-text",
+            "uncommitted text in prompt",
+            false,
+            true,
+            true,
+            &old,
+        );
+
+        assert_eq!(young_delivery.state, "blocked");
+        assert!(!young_delivery.stalled);
+        assert_eq!(old_delivery.state, "stalled");
+        assert!(old_delivery.stalled);
+        assert_eq!(old_delivery.detail, "uncommitted text in prompt");
+    }
+
+    #[test]
+    fn old_unread_without_any_binding_has_explicit_stalled_signal() {
+        let unread = UnreadInfo {
+            count: 1,
+            oldest_age_seconds: Some(DELIVERY_STALLED_AFTER_SECS),
+        };
+
+        let delivery = delivery_visibility("", "", false, false, false, &unread);
+
+        assert_eq!(delivery.mode, "manual");
+        assert_eq!(delivery.state, "stalled");
+        assert!(delivery.stalled);
+        assert_eq!(delivery.detail, "no automatic delivery binding");
+    }
+
+    #[test]
+    #[serial]
+    fn unread_info_uses_durable_recipient_and_event_age() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, last_event_id) VALUES ('desktop', 'codex', 1.0, 0)",
+                [],
+            )
+            .unwrap();
+        db.log_event_with_ts(
+            "message",
+            "sender",
+            &serde_json::json!({
+                "from": "sender",
+                "text": "queued",
+                "delivered_to": ["desktop"]
+            }),
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        db.log_event_with_ts(
+            "message",
+            "sender",
+            &serde_json::json!({
+                "from": "sender",
+                "text": "not for desktop",
+                "delivered_to": ["someone-else"]
+            }),
+            Some("2026-01-01T00:00:30Z"),
+        )
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:02:00Z")
+            .unwrap()
+            .timestamp();
+
+        let unread = get_unread_info(&db, "desktop", 0, now);
+
+        assert_eq!(unread.count, 1);
+        assert_eq!(unread.oldest_age_seconds, Some(120));
+    }
 }

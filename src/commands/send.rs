@@ -248,10 +248,27 @@ fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
     let rows = db
         .conn()
         .prepare(
-            "SELECT name, tag FROM instances
-             WHERE status != 'stopped'
-               AND status_context != 'launch_failed'
-               AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
+            "SELECT i.name, i.tag FROM instances i
+             WHERE i.status != 'stopped'
+               AND i.status_context != 'launch_failed'
+               AND (
+                   NOT (i.status = 'inactive' AND i.status_context LIKE 'exit:%')
+                   OR (
+                       i.status = 'inactive'
+                       AND i.status_context = 'exit:timeout'
+                       AND i.tool = 'claude'
+                       AND COALESCE(i.origin_device_id, '') = ''
+                       AND EXISTS (
+                           SELECT 1 FROM session_bindings sb
+                           WHERE sb.instance_name = i.name
+                             AND sb.session_id = i.session_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM process_bindings pb
+                           WHERE pb.instance_name = i.name
+                       )
+                   )
+               )",
         )
         .map_err(|e| format!("DB error: {e}"))?
         .query_map([], |row| {
@@ -1698,6 +1715,75 @@ mod tests {
             !available_line.contains("dove"),
             "soft-stopped agent must not appear in Available: {err}"
         );
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_queues_for_hook_only_claude_timeout() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, created_at, last_event_id)
+                 VALUES ('luna', 'sess-luna', 'claude', 'listening', '', 1000.0, 0),
+                        ('risa', 'sess-risa', 'claude', 'inactive', 'exit:timeout', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-risa", "risa").unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: Some("sess-luna".into()),
+        };
+
+        let delivered =
+            send_message(&db, &sender, "queued", None, Some(&["risa".to_string()])).unwrap();
+        assert_eq!(delivered, vec!["risa".to_string()]);
+
+        let unread = db.get_unread_messages("risa");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].text, "queued");
+        assert_eq!(db.get_cursor("risa"), 0, "send must not consume the queue");
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_excludes_non_desktop_claude_timeout() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, created_at)
+                 VALUES ('luna', 'sess-luna', 'claude', 'listening', '', 1000.0),
+                        ('risa', 'sess-risa', 'claude', 'inactive', 'exit:timeout', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: Some("sess-luna".into()),
+        };
+
+        let err =
+            send_message(&db, &sender, "ping", None, Some(&["risa".to_string()])).unwrap_err();
+        assert!(err.contains("@risa"), "err={err}");
+
+        db.set_session_binding("sess-risa", "risa").unwrap();
+        db.set_process_binding("proc-risa", "sess-risa", "risa")
+            .unwrap();
+        let err =
+            send_message(&db, &sender, "ping", None, Some(&["risa".to_string()])).unwrap_err();
+        assert!(err.contains("@risa"), "err={err}");
 
         cleanup_test_db(path);
     }

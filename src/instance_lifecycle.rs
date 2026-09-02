@@ -62,6 +62,31 @@ pub struct ComputedStatus {
 
 pub use crate::shared::time::format_age;
 
+/// Whether this row represents a live Claude session that can only receive
+/// messages at hook boundaries (for example, Claude Desktop).
+///
+/// The session binding is the durable ownership signal. Hard stops delete it,
+/// and soft stops clear it, so a non-null `instances.session_id` alone is not
+/// sufficient. A process binding means the PTY delivery path owns the session.
+pub(crate) fn is_hook_only_claude_session(data: &InstanceRow, db: &HcomDb) -> bool {
+    if data.tool != "claude"
+        || data
+            .origin_device_id
+            .as_deref()
+            .is_some_and(|device_id| !device_id.is_empty())
+        || db.has_process_binding_for_instance(&data.name)
+    {
+        return false;
+    }
+
+    data.session_id.as_deref().is_some_and(|session_id| {
+        matches!(
+            db.get_session_binding(session_id),
+            Ok(Some(owner)) if owner == data.name
+        )
+    })
+}
+
 // Tracks wall-clock vs monotonic-clock drift to detect system sleep.
 // On macOS, Instant (mach_absolute_time) does not advance during sleep,
 // but SystemTime (gettimeofday) does. Large drift means the system just woke.
@@ -686,6 +711,19 @@ pub fn cleanup_stale_instances(
                 continue;
             }
 
+            // A Claude Stop-hook poll timeout is ordinary idle state, not a
+            // session stop. Older binaries persisted that state as
+            // inactive/exit:timeout; retain such rows while their exact hook
+            // binding remains live so queued messages survive until the next
+            // supported hook boundary. Explicit stop/SessionEnd removes the
+            // binding and therefore does not take this path.
+            if data.status == ST_INACTIVE
+                && data.status_context == "exit:timeout"
+                && is_hook_only_claude_session(data, db)
+            {
+                continue;
+            }
+
             let context = &computed.context;
             let age = computed.age_seconds;
 
@@ -1269,6 +1307,47 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_placeholders(&db);
         assert_eq!(deleted, 0);
         assert!(db.get_instance_full("real").unwrap().is_some());
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn cleanup_preserves_bound_hook_only_claude_timeout() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let old = now_epoch_i64() - 120;
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('risa', 'sess-risa', 'claude', 'inactive', 'exit:timeout', ?, 1)",
+                rusqlite::params![old],
+            )
+            .unwrap();
+        db.set_session_binding("sess-risa", "risa").unwrap();
+
+        assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 0);
+        assert!(db.get_instance_full("risa").unwrap().is_some());
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn cleanup_removes_unbound_claude_timeout() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let old = now_epoch_i64() - 120;
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('risa', 'sess-risa', 'claude', 'inactive', 'exit:timeout', ?, 1)",
+                rusqlite::params![old],
+            )
+            .unwrap();
+
+        assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 1);
+        assert!(db.get_instance_full("risa").unwrap().is_none());
 
         cleanup(path);
     }

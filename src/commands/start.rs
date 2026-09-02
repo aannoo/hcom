@@ -1,4 +1,4 @@
-//! Start command: `hcom start [--name <agent-id>] [--as <name>] [--orphan <name|pid>]`
+//! Start command: `hcom start [--name <agent-id>] [--as <name> [--relocate]] [--orphan <name|pid>]`
 //!
 //! Runs inside an already-running tool session rather than launching a new one.
 //! Used for adhoc/manual setup, identity rebinding, and orphan recovery:
@@ -9,8 +9,10 @@
 //! - `--as`: rebind session identity
 
 use anyhow::{Result, bail};
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 
 use crate::bootstrap;
@@ -37,6 +39,9 @@ pub struct StartArgs {
     /// Rebind to a different instance name
     #[arg(long = "as")]
     pub as_name: Option<String>,
+    /// Explicitly move a stopped top-level Codex identity to this task's directory
+    #[arg(long)]
+    pub relocate: bool,
     /// Recover orphaned PTY process by name or PID
     #[arg(long)]
     pub orphan: Option<String>,
@@ -73,6 +78,14 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 
     let orphan_target = start_args.orphan;
     let rebind_target = start_args.as_name;
+    let relocate = start_args.relocate;
+
+    if relocate && rebind_target.is_none() {
+        bail!("--relocate requires --as <name>");
+    }
+    if relocate && orphan_target.is_some() {
+        bail!("--relocate cannot be combined with --orphan");
+    }
 
     let db = HcomDb::open()?;
     let hcom_dir = paths::hcom_dir();
@@ -137,7 +150,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             .as_ref()
             .map(|actor| actor.name.as_str())
             .or(requested_name.as_deref());
-        return start_rebind(&db, &rebind, &ctx, current_name);
+        return start_rebind_with_options(&db, &rebind, &ctx, current_name, relocate);
     }
 
     if let Some(subagent) = subagent_via_name {
@@ -350,11 +363,22 @@ fn restore_child_links_after_root_rebind(
 
 /// Rebind session identity (`--as <name>`), preserving last_event_id and any
 /// live Claude child hierarchy owned by the current root actor.
+#[cfg(test)]
 fn start_rebind(
     db: &HcomDb,
     rebind_target: &str,
     ctx: &HcomContext,
     explicit_name: Option<&str>,
+) -> Result<i32> {
+    start_rebind_with_options(db, rebind_target, ctx, explicit_name, false)
+}
+
+fn start_rebind_with_options(
+    db: &HcomDb,
+    rebind_target: &str,
+    ctx: &HcomContext,
+    explicit_name: Option<&str>,
+    relocate: bool,
 ) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
@@ -398,6 +422,23 @@ fn start_rebind(
         // unbound and the identity it replaces is never cleaned up.
         session_id = resolve_claude_session_id(&ctx.raw_env);
     }
+    if ctx.tool == crate::tool::Tool::Codex {
+        // Codex Desktop is not launched through hcom, so it has no
+        // HCOM_PROCESS_ID/process binding. Its thread id is the stable
+        // session identity exposed to commands run inside the task.
+        if let Some(codex_session_id) = resolve_codex_session_id(ctx) {
+            if let Some(existing_session_id) = session_id.as_deref()
+                && existing_session_id != codex_session_id
+            {
+                bail!(
+                    "Refusing Codex rebind: current task session '{}' conflicts with existing session '{}'",
+                    codex_session_id,
+                    existing_session_id
+                );
+            }
+            session_id = Some(codex_session_id);
+        }
+    }
     let current_name = if !explicit_current_name.is_empty() {
         explicit_current_name.to_string()
     } else if let Some(ref sid) = session_id {
@@ -407,9 +448,35 @@ fn start_rebind(
     };
     let child_links = snapshot_child_links(db, session_id.as_deref())?;
 
-    let target_meta = load_rebind_target_metadata(db, &target_name).ok();
+    let relocation = if relocate {
+        Some(validate_codex_relocation(
+            db,
+            &target_name,
+            ctx,
+            session_id.as_deref(),
+            &current_name,
+        )?)
+    } else {
+        None
+    };
+    let target_meta = if relocation.is_some() {
+        None
+    } else {
+        load_rebind_target_metadata(db, &target_name).ok()
+    };
     if let Some(ref meta) = target_meta {
-        ensure_rebind_compatible(&target_name, meta, ctx)?;
+        ensure_rebind_compatible(&target_name, meta, ctx, relocation.is_some())?;
+    }
+
+    // A relocation is deliberately not a generic rebind. A generic rebind
+    // deletes the target before recreating it, which lets a registration that
+    // wins between validation and mutation be deleted and stolen. Compare the
+    // exact stopped proof, create the row, and bind the session under one
+    // BEGIN IMMEDIATE transaction. Any competing winner makes the whole
+    // transaction fail without changing that winner.
+    if let Some(ref proof) = relocation {
+        commit_codex_relocation(db, &target_name, ctx, proof)?;
+        return finish_rebind_output(db, &hcom_dir, &target_name, ctx, &current_name, true);
     }
 
     // Preserve last_event_id from target (cursor preservation)
@@ -448,14 +515,17 @@ fn start_rebind(
     // Create fresh instance with the target name
     let tool = ctx.tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    instance_binding::initialize_instance_in_position_file(
+    let transcript_path = relocation
+        .as_ref()
+        .map(|proof| proof.transcript_path.as_str());
+    let initialized = instance_binding::initialize_instance_in_position_file(
         db,
         &target_name,
         session_id.as_deref(),
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
-        None, // transcript_path
+        transcript_path,
         Some(tool),
         false, // background
         None,  // tag
@@ -464,6 +534,11 @@ fn start_rebind(
         None,  // hints
         Some(&cwd_override),
     );
+
+    debug_assert!(relocation.is_none());
+    if !initialized {
+        bail!("Could not create identity '{target_name}'");
+    }
 
     if let Some(ref sid) = session_id {
         let old_root = if current_name.is_empty() {
@@ -521,7 +596,18 @@ fn start_rebind(
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
-    // Print bootstrap
+    finish_rebind_output(db, &hcom_dir, &target_name, ctx, &current_name, false)
+}
+
+fn finish_rebind_output(
+    db: &HcomDb,
+    hcom_dir: &std::path::Path,
+    target_name: &str,
+    ctx: &HcomContext,
+    current_name: &str,
+    relocated: bool,
+) -> Result<i32> {
+    let tool = ctx.tool.as_str();
     let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {
         let mut c = HcomConfig::default();
         c.normalize();
@@ -530,8 +616,8 @@ fn start_rebind(
 
     let bootstrap_text = bootstrap::get_bootstrap(
         db,
-        &hcom_dir,
-        &target_name,
+        hcom_dir,
+        target_name,
         tool,
         false,
         false,
@@ -549,10 +635,413 @@ fn start_rebind(
     log_info(
         "start",
         "rebind.complete",
-        &format!("from={} to={}", current_name, target_name),
+        &format!(
+            "from={} to={} relocated={}",
+            current_name, target_name, relocated
+        ),
     );
 
     Ok(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexRelocationProof {
+    session_id: String,
+    transcript_path: String,
+    stopped_event_id: i64,
+    stopped_event_data: String,
+    last_event_id: i64,
+}
+
+const MAX_CODEX_SESSION_META_BYTES: u64 = 2 * 1024 * 1024;
+
+fn validate_codex_relocation(
+    db: &HcomDb,
+    target_name: &str,
+    ctx: &HcomContext,
+    resolved_session_id: Option<&str>,
+    current_name: &str,
+) -> Result<CodexRelocationProof> {
+    if ctx.tool != crate::tool::Tool::Codex {
+        bail!("--relocate is supported only from the owning Codex Desktop task");
+    }
+    if db.get_instance_full(target_name)?.is_some() {
+        bail!("Refusing to relocate '{target_name}': the identity is still live");
+    }
+    if !current_name.is_empty() && current_name != target_name {
+        bail!(
+            "Refusing to relocate '{target_name}': this task is already bound as '{current_name}'"
+        );
+    }
+    if !ctx.cwd.is_absolute() || !ctx.cwd.is_dir() {
+        bail!(
+            "Refusing to relocate '{target_name}': current directory '{}' is not an existing absolute directory",
+            ctx.cwd.display()
+        );
+    }
+
+    let thread_id = resolve_codex_session_id(ctx)
+        .ok_or_else(|| anyhow::anyhow!("Codex relocation requires CODEX_THREAD_ID"))?;
+    let session_env = ctx
+        .raw_env
+        .get("CODEX_SESSION_ID")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Codex relocation requires CODEX_SESSION_ID"))?;
+    if thread_id != session_env {
+        bail!(
+            "Refusing Codex relocation: CODEX_THREAD_ID '{}' conflicts with CODEX_SESSION_ID '{}'",
+            thread_id,
+            session_env
+        );
+    }
+    if resolved_session_id != Some(thread_id.as_str()) {
+        bail!("Refusing Codex relocation: current session identity is not canonical");
+    }
+    if let Some(owner) = db.get_session_binding(&thread_id)? {
+        bail!(
+            "Refusing to relocate '{target_name}': session '{thread_id}' is already bound to '{owner}'"
+        );
+    }
+
+    let (stopped_event_id, stopped_event_data): (i64, String) = db
+        .conn()
+        .query_row(
+            "SELECT id, data FROM events
+             WHERE type = 'life'
+               AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![target_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| anyhow::anyhow!("No stopped identity found for '{target_name}'"))?;
+    let data: serde_json::Value = serde_json::from_str(&stopped_event_data)?;
+    let snapshot = data
+        .get("snapshot")
+        .ok_or_else(|| anyhow::anyhow!("Stopped identity '{target_name}' has no snapshot"))?;
+
+    if snapshot.get("tool").and_then(serde_json::Value::as_str) != Some("codex") {
+        bail!("Refusing to relocate '{target_name}': stopped identity is not Codex");
+    }
+    if !json_identity_field_is_empty(snapshot.get("origin_device_id")) {
+        bail!("Refusing to relocate '{target_name}': stopped identity is remote");
+    }
+    if !json_identity_field_is_empty(snapshot.get("parent_name"))
+        || !json_identity_field_is_empty(snapshot.get("parent_session_id"))
+        || !json_identity_field_is_empty(snapshot.get("agent_id"))
+    {
+        bail!("Refusing to relocate '{target_name}': stopped identity is a child task");
+    }
+    if snapshot.get("background").is_some_and(|value| {
+        !value.is_null() && value.as_i64().is_none_or(|background| background != 0)
+    }) {
+        bail!("Refusing to relocate '{target_name}': stopped identity is not top-level");
+    }
+    if snapshot
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(thread_id.as_str())
+    {
+        bail!("Refusing to relocate '{target_name}': stopped session does not match this task");
+    }
+
+    let stopped_directory = snapshot
+        .get("directory")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let current_directory = ctx.cwd.to_string_lossy();
+    if stopped_directory.is_empty() || same_path(stopped_directory, &current_directory) {
+        bail!(
+            "Refusing to relocate '{target_name}': stopped and current directories are not distinct"
+        );
+    }
+
+    let snapshot_transcript = snapshot
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Stopped identity '{target_name}' has no transcript"))?;
+    let derived_transcript = crate::hooks::codex::derive_codex_transcript_path(&thread_id)
+        .ok_or_else(|| anyhow::anyhow!("Could not locate the active Codex transcript"))?;
+    if !same_path(snapshot_transcript, &derived_transcript) {
+        bail!("Refusing to relocate '{target_name}': stopped and active transcript paths differ");
+    }
+    validate_codex_session_meta(&derived_transcript, &thread_id, stopped_directory)?;
+
+    let last_event_id = snapshot
+        .get("last_event_id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Stopped identity '{target_name}' has no valid event cursor")
+        })?;
+
+    Ok(CodexRelocationProof {
+        session_id: thread_id,
+        transcript_path: derived_transcript,
+        stopped_event_id,
+        stopped_event_data,
+        last_event_id,
+    })
+}
+
+fn json_identity_field_is_empty(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(value)) => value.is_empty(),
+        Some(_) => false,
+    }
+}
+
+fn commit_codex_relocation(
+    db: &HcomDb,
+    target_name: &str,
+    ctx: &HcomContext,
+    proof: &CodexRelocationProof,
+) -> Result<()> {
+    let directory = ctx.cwd.to_string_lossy().to_string();
+    let launch_context =
+        crate::hooks::codex::directory_override_launch_context(&directory, &proof.session_id);
+    let created_at = crate::shared::time::now_epoch_f64();
+    let status_time = crate::shared::time::now_epoch_i64();
+    let wait_timeout = HcomConfig::effective_timeout();
+
+    db.with_immediate_transaction(|txn| {
+        let latest_stop = txn
+            .query_row(
+                "SELECT id, data FROM events
+                 WHERE type = 'life'
+                   AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![target_name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if latest_stop.as_ref()
+            != Some(&(
+                proof.stopped_event_id,
+                proof.stopped_event_data.clone(),
+            ))
+        {
+            bail!(
+                "Refusing to relocate '{target_name}': stopped identity changed during verification"
+            );
+        }
+
+        let target_exists: bool = txn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM instances WHERE name = ?1)",
+            rusqlite::params![target_name],
+            |row| row.get(0),
+        )?;
+        if target_exists {
+            bail!(
+                "Refusing to relocate '{target_name}': another task registered it during verification"
+            );
+        }
+
+        let session_owner = txn
+            .query_row(
+                "SELECT instance_name FROM session_bindings WHERE session_id = ?1",
+                rusqlite::params![&proof.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(owner) = session_owner {
+            bail!(
+                "Refusing to relocate '{target_name}': session is already bound to '{owner}'"
+            );
+        }
+
+        let target_binding = txn
+            .query_row(
+                "SELECT session_id FROM session_bindings WHERE instance_name = ?1 LIMIT 1",
+                rusqlite::params![target_name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if target_binding.is_some() {
+            bail!(
+                "Refusing to relocate '{target_name}': target binding changed during verification"
+            );
+        }
+
+        let instance_session_owner = txn
+            .query_row(
+                "SELECT name FROM instances WHERE session_id = ?1 LIMIT 1",
+                rusqlite::params![&proof.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(owner) = instance_session_owner {
+            bail!(
+                "Refusing to relocate '{target_name}': session is already owned by '{owner}'"
+            );
+        }
+
+        let process_collision: bool = txn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM process_bindings
+                 WHERE instance_name = ?1 OR session_id = ?2
+             )",
+            rusqlite::params![target_name, &proof.session_id],
+            |row| row.get(0),
+        )?;
+        if process_collision {
+            bail!(
+                "Refusing to relocate '{target_name}': a process binding changed during verification"
+            );
+        }
+
+        let initial_event_id = proof.last_event_id;
+
+        txn.execute(
+            "INSERT INTO instances (
+                 name, session_id, last_event_id, last_stop, status, status_time,
+                 status_context, directory, created_at, transcript_path, tool,
+                 background, wait_timeout, name_announced, launch_context
+             ) VALUES (
+                 ?1, ?2, ?3, 0, 'inactive', ?4,
+                 'new', ?5, ?6, ?7, 'codex',
+                 0, ?8, 1, ?9
+             )",
+            rusqlite::params![
+                target_name,
+                &proof.session_id,
+                initial_event_id,
+                status_time,
+                &directory,
+                created_at,
+                &proof.transcript_path,
+                wait_timeout,
+                &launch_context,
+            ],
+        )?;
+        txn.execute(
+            "INSERT INTO session_bindings (session_id, instance_name, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![&proof.session_id, target_name, created_at],
+        )?;
+
+        let written: (Option<String>, String, String, String, i64, String) = txn.query_row(
+            "SELECT session_id, tool, directory, transcript_path, last_event_id, launch_context
+             FROM instances WHERE name = ?1",
+            rusqlite::params![target_name],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let binding: String = txn.query_row(
+            "SELECT instance_name FROM session_bindings WHERE session_id = ?1",
+            rusqlite::params![&proof.session_id],
+            |row| row.get(0),
+        )?;
+        if written.0.as_deref() != Some(proof.session_id.as_str())
+            || written.1 != "codex"
+            || written.2 != directory
+            || written.3 != proof.transcript_path
+            || written.4 != initial_event_id
+            || written.5 != launch_context
+            || binding != target_name
+        {
+            bail!("Relocated Codex identity failed transactional verification");
+        }
+        Ok(())
+    })?;
+
+    let row = db
+        .get_instance_full(target_name)?
+        .ok_or_else(|| anyhow::anyhow!("Relocated Codex identity disappeared after commit"))?;
+    let binding = db.get_session_binding(&proof.session_id)?;
+    if row.tool != "codex"
+        || row.session_id.as_deref() != Some(proof.session_id.as_str())
+        || !same_path(&row.directory, &directory)
+        || !same_path(&row.transcript_path, &proof.transcript_path)
+        || binding.as_deref() != Some(target_name)
+        || crate::hooks::codex::pinned_directory_from_launch_context(
+            row.launch_context.as_deref(),
+            &proof.session_id,
+        )
+        .is_none_or(|pinned| !same_path(&pinned, &directory))
+    {
+        bail!("Relocated Codex identity failed final bound-state verification");
+    }
+
+    let _ = db.log_event(
+        "life",
+        target_name,
+        &serde_json::json!({
+            "action": "created",
+            "by": "explicit-start-relocate-v1",
+            "is_hcom_launched": false,
+            "is_subagent": false,
+            "parent_name": "",
+        }),
+    );
+    Ok(())
+}
+
+fn validate_codex_session_meta(
+    transcript_path: &str,
+    session_id: &str,
+    stopped_directory: &str,
+) -> Result<()> {
+    let file = std::fs::File::open(transcript_path)?;
+    let mut reader = BufReader::new(file).take(MAX_CODEX_SESSION_META_BYTES + 1);
+    let mut first_line = String::new();
+    let bytes = reader.read_line(&mut first_line)?;
+    if bytes == 0 || bytes as u64 > MAX_CODEX_SESSION_META_BYTES {
+        bail!("Codex transcript session metadata is missing or too large");
+    }
+    let meta: serde_json::Value = serde_json::from_str(first_line.trim_end())?;
+    let payload = meta
+        .get("payload")
+        .ok_or_else(|| anyhow::anyhow!("Codex transcript has no session metadata payload"))?;
+    if meta.get("type").and_then(serde_json::Value::as_str) != Some("session_meta")
+        || payload.get("id").and_then(serde_json::Value::as_str) != Some(session_id)
+        || payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(session_id)
+        || payload
+            .get("originator")
+            .and_then(serde_json::Value::as_str)
+            != Some("Codex Desktop")
+        || payload.get("source").and_then(serde_json::Value::as_str) != Some("vscode")
+        || payload
+            .get("thread_source")
+            .and_then(serde_json::Value::as_str)
+            != Some("user")
+        || payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|cwd| !same_path(cwd, stopped_directory))
+    {
+        bail!("Codex transcript does not describe this top-level Desktop task");
+    }
+    for field in [
+        "parent_thread_id",
+        "parent_session_id",
+        "source_thread_id",
+        "forked_from",
+    ] {
+        if payload
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_str().is_none_or(|s| !s.is_empty()))
+        {
+            bail!("Codex transcript describes a child or forked task");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +1055,7 @@ fn ensure_rebind_compatible(
     target_name: &str,
     meta: &RebindTargetMetadata,
     ctx: &HcomContext,
+    allow_directory_relocation: bool,
 ) -> Result<()> {
     let current_tool = ctx.tool.as_str();
     if !meta.tool.is_empty() && meta.tool != current_tool {
@@ -577,7 +1067,10 @@ fn ensure_rebind_compatible(
     }
 
     let current_dir = ctx.cwd.to_string_lossy();
-    if !meta.directory.is_empty() && !same_path(&meta.directory, &current_dir) {
+    if !allow_directory_relocation
+        && !meta.directory.is_empty()
+        && !same_path(&meta.directory, &current_dir)
+    {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used directory '{}' but current session is '{}'",
             meta.directory,
@@ -662,6 +1155,15 @@ fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
         .find_map(|key| env.get(key).filter(|value| !value.is_empty()).cloned())
 }
 
+/// Resolve the stable Codex task identity exposed to commands inside Desktop.
+fn resolve_codex_session_id(ctx: &HcomContext) -> Option<String> {
+    ctx.codex_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 /// Live local Claude instances in this directory that no session id points at.
 ///
 /// These are the plausible earlier identities of a session that exposes no id
@@ -744,18 +1246,22 @@ fn start_bare(
     }
 
     let tool = ctx.tool.as_str();
-    let claude_session_id = (ctx.tool == crate::tool::Tool::Claude)
-        .then(|| resolve_claude_session_id(&ctx.raw_env))
-        .flatten();
+    let session_id = match ctx.tool {
+        crate::tool::Tool::Claude => resolve_claude_session_id(&ctx.raw_env),
+        crate::tool::Tool::Codex => resolve_codex_session_id(ctx),
+        _ => None,
+    };
 
     if explicit_name.is_none()
-        && let Some(ref session_id) = claude_session_id
+        && let Some(ref session_id) = session_id
         && let Some(bound_name) = db.get_session_binding(session_id)?
     {
         // Only hcom writes session bindings, so a row keyed by this session's
-        // own id is trusted identity evidence. Heal bindings created by older
-        // versions before returning the existing row.
-        db.mark_claude_session_validated(session_id, &bound_name)?;
+        // own id is trusted identity evidence. Heal Claude bindings created by
+        // older versions before returning the existing row.
+        if ctx.tool == crate::tool::Tool::Claude {
+            db.mark_claude_session_validated(session_id, &bound_name)?;
+        }
         println!("hcom already started for {bound_name}");
         return Ok(0);
     }
@@ -788,7 +1294,7 @@ fn start_bare(
     instance_binding::initialize_instance_in_position_file(
         db,
         &name,
-        claude_session_id.as_deref(),
+        session_id.as_deref(),
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
@@ -802,9 +1308,11 @@ fn start_bare(
         None,  // cwd_override
     );
 
-    if let Some(ref session_id) = claude_session_id {
+    if let Some(ref session_id) = session_id {
         db.set_session_binding(session_id, &name)?;
-        db.mark_claude_session_validated(session_id, &name)?;
+        if ctx.tool == crate::tool::Tool::Claude {
+            db.mark_claude_session_validated(session_id, &name)?;
+        }
     }
 
     // Bind process if we have a process_id
@@ -818,10 +1326,7 @@ fn start_bare(
     // recognize this session by, so a later `hcom start` here mints another
     // identity. Say what was just created and name the way back instead of
     // letting the duplicate appear silently.
-    if explicit_name.is_none()
-        && ctx.tool == crate::tool::Tool::Claude
-        && claude_session_id.is_none()
-    {
+    if explicit_name.is_none() && ctx.tool == crate::tool::Tool::Claude && session_id.is_none() {
         let candidates = unbound_claude_candidates(db, ctx, &name);
         eprintln!(
             "[hcom] warn: this Claude session exposes no session id, so it was registered \
@@ -909,6 +1414,50 @@ mod tests {
         HcomContext::from_env(&env, PathBuf::from(cwd))
     }
 
+    fn make_codex_ctx(thread_id: Option<&str>, cwd: &str) -> HcomContext {
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("HCOM_PROCESS_ID");
+        env.remove("HCOM_LAUNCHED");
+        env.remove("HCOM_PTY_MODE");
+        env.remove("CODEX_SANDBOX");
+        match thread_id {
+            Some(value) => {
+                env.insert("CODEX_THREAD_ID".to_string(), value.to_string());
+                env.insert("CODEX_SESSION_ID".to_string(), value.to_string());
+            }
+            None => {
+                env.remove("CODEX_THREAD_ID");
+                env.remove("CODEX_SESSION_ID");
+            }
+        }
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    fn write_codex_session_meta(home: &std::path::Path, session_id: &str, cwd: &str) -> String {
+        let codex_home = home.join(".codex");
+        let sessions = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("02");
+        std::fs::create_dir_all(&sessions).unwrap();
+        unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
+        let transcript = sessions.join(format!("rollout-test-{session_id}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "session_id": session_id,
+                "cwd": cwd,
+                "originator": "Codex Desktop",
+                "source": "vscode",
+                "thread_source": "user"
+            }
+        });
+        std::fs::write(&transcript, format!("{meta}\n")).unwrap();
+        transcript.to_string_lossy().to_string()
+    }
+
     fn log_stopped_snapshot(
         db: &HcomDb,
         name: &str,
@@ -937,6 +1486,7 @@ mod tests {
         let args = StartArgs::try_parse_from(["start"]).unwrap();
         assert!(args.orphan.is_none());
         assert!(args.as_name.is_none());
+        assert!(!args.relocate);
     }
 
     #[test]
@@ -951,6 +1501,15 @@ mod tests {
         let args = StartArgs::try_parse_from(["start", "--as", "luna"]).unwrap();
         assert!(args.orphan.is_none());
         assert_eq!(args.as_name, Some("luna".to_string()));
+        assert!(!args.relocate);
+    }
+
+    #[test]
+    fn test_start_args_explicit_relocation() {
+        let args =
+            StartArgs::try_parse_from(["start", "--as", "cultivation", "--relocate"]).unwrap();
+        assert_eq!(args.as_name.as_deref(), Some("cultivation"));
+        assert!(args.relocate);
     }
 
     #[test]
@@ -969,6 +1528,29 @@ mod tests {
     fn test_start_args_unknown_flag_errors() {
         let err = StartArgs::try_parse_from(["start", "--bogus"]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_relocation_requires_as_and_rejects_orphan() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let flags = crate::router::GlobalFlags::default();
+        let missing_as = run(&["start".into(), "--relocate".into()], &flags).unwrap_err();
+        assert!(missing_as.to_string().contains("requires --as"));
+
+        let conflict = run(
+            &[
+                "start".into(),
+                "--as".into(),
+                "cultivation".into(),
+                "--relocate".into(),
+                "--orphan".into(),
+                "old".into(),
+            ],
+            &flags,
+        )
+        .unwrap_err();
+        assert!(conflict.to_string().contains("cannot be combined"));
     }
 
     #[test]
@@ -1093,6 +1675,60 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_codex_session_id_trims_and_rejects_empty_values() {
+        assert_eq!(
+            resolve_codex_session_id(&make_codex_ctx(Some("  thread-1  "), "/tmp/project")),
+            Some("thread-1".to_string())
+        );
+        assert_eq!(
+            resolve_codex_session_id(&make_codex_ctx(Some("   "), "/tmp/project")),
+            None
+        );
+        assert_eq!(
+            resolve_codex_session_id(&make_codex_ctx(None, "/tmp/project")),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_bare_codex_start_binds_and_reuses_thread_id() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::codex::setup_codex_hooks(false));
+        let ctx = make_codex_ctx(Some("thread-bare-codex"), "/tmp/project");
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let name = db
+            .get_session_binding("thread-bare-codex")
+            .unwrap()
+            .expect("the first bare start must bind the Desktop task");
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(row.tool, "codex");
+        assert_eq!(row.session_id.as_deref(), Some("thread-bare-codex"));
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("thread-bare-codex")
+                .unwrap()
+                .as_deref(),
+            Some(name.as_str())
+        );
+        let codex_rows: Vec<String> = db
+            .iter_instances_full()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.tool == "codex")
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(
+            codex_rows,
+            vec![name],
+            "repeat start must not mint a duplicate"
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_vanilla_claude_start_reuses_claude_code_session_id() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
@@ -1175,6 +1811,492 @@ mod tests {
             Some("nova"),
             "a start after the rebind returns the reclaimed identity"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_rebind_uses_thread_id_without_process_binding() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, directory, status, created_at) VALUES (?1, 'codex', ?2, 'active', ?3)",
+                params!["desktop-old", "/tmp/project", crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+        let ctx = make_codex_ctx(Some("thread-desktop"), "/tmp/project");
+
+        assert_eq!(start_rebind(&db, "desktop-old", &ctx, None).unwrap(), 0);
+        let row = db.get_instance_full("desktop-old").unwrap().unwrap();
+        assert_eq!(row.tool, "codex");
+        assert_eq!(row.session_id.as_deref(), Some("thread-desktop"));
+        assert_eq!(
+            db.get_session_binding("thread-desktop").unwrap().as_deref(),
+            Some("desktop-old")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_rebind_ignores_empty_thread_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, directory, status, created_at) VALUES (?1, 'codex', ?2, 'active', ?3)",
+                params!["desktop-empty", "/tmp/project", crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+        let ctx = make_codex_ctx(Some("   "), "/tmp/project");
+
+        assert_eq!(start_rebind(&db, "desktop-empty", &ctx, None).unwrap(), 0);
+        let row = db.get_instance_full("desktop-empty").unwrap().unwrap();
+        assert!(row.session_id.is_none());
+        assert!(db.get_session_binding("").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_rebind_rejects_conflicting_process_session_before_mutation() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, directory, status, created_at)
+                 VALUES ('current-codex', 'thread-stale', 'codex', '/tmp/project', 'active', 1)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-current", "thread-stale", "current-codex")
+            .unwrap();
+        log_stopped_snapshot(
+            &db,
+            "cultivation",
+            "codex",
+            "/tmp/project",
+            "thread-current",
+            41,
+        );
+        let mut ctx = make_codex_ctx(Some("thread-current"), "/tmp/project");
+        ctx.process_id = Some("process-current".to_string());
+
+        let err = start_rebind(&db, "cultivation", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("conflicts with existing session"));
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        assert!(db.get_instance_full("current-codex").unwrap().is_some());
+        assert_eq!(
+            db.get_process_binding_full("process-current")
+                .unwrap()
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("thread-stale")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_rebind_rejects_conflicting_explicit_row_session_before_mutation() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, directory, status, created_at)
+                 VALUES ('current-codex', 'thread-stale', 'codex', '/tmp/project', 'active', 1)",
+                [],
+            )
+            .unwrap();
+        log_stopped_snapshot(
+            &db,
+            "cultivation",
+            "codex",
+            "/tmp/project",
+            "thread-current",
+            42,
+        );
+        let ctx = make_codex_ctx(Some("thread-current"), "/tmp/project");
+
+        let err = start_rebind(&db, "cultivation", &ctx, Some("current-codex")).unwrap_err();
+        assert!(err.to_string().contains("conflicts with existing session"));
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        let current = db.get_instance_full("current-codex").unwrap().unwrap();
+        assert_eq!(current.session_id.as_deref(), Some("thread-stale"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_cli_rebind_still_rejects_cross_directory_for_same_env_session() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        log_stopped_snapshot(
+            &db,
+            "cultivation",
+            "codex",
+            "/tmp/old-project",
+            "thread-cultivation",
+            43,
+        );
+        let ctx = make_codex_ctx(Some("thread-cultivation"), "/tmp/cultivation");
+
+        let err = start_rebind(&db, "cultivation", &ctx, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to reclaim 'cultivation'")
+        );
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        assert!(
+            db.get_session_binding("thread-cultivation")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_explicit_relocation_uses_verified_transcript_and_persists_pin() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-cultivation-relocate";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "parent_name": null,
+                    "parent_session_id": null,
+                    "agent_id": null,
+                    "origin_device_id": null,
+                    "last_event_id": 73
+                }
+            }),
+        )
+        .unwrap();
+        let ctx = make_codex_ctx(Some(session_id), &new_directory);
+
+        assert_eq!(
+            start_rebind_with_options(&db, "cultivation", &ctx, None, true).unwrap(),
+            0
+        );
+        let row = db.get_instance_full("cultivation").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some(session_id));
+        assert_eq!(row.last_event_id, 73);
+        assert!(same_path(&row.directory, &new_directory));
+        assert!(same_path(&row.transcript_path, &transcript));
+        assert_eq!(
+            crate::hooks::codex::pinned_directory_from_launch_context(
+                row.launch_context.as_deref(),
+                session_id,
+            )
+            .as_deref(),
+            Some(new_directory.as_str())
+        );
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some("cultivation")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_relocation_binding_failure_rolls_back_instance() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-binding-rollback";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "last_event_id": 31
+                }
+            }),
+        )
+        .unwrap();
+        let ctx = make_codex_ctx(Some(session_id), &new_directory);
+        let proof =
+            validate_codex_relocation(&db, "cultivation", &ctx, Some(session_id), "").unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER deny_relocation_binding
+                 BEFORE INSERT ON session_bindings
+                 BEGIN SELECT RAISE(ABORT, 'forced binding failure'); END;",
+            )
+            .unwrap();
+
+        let error = commit_codex_relocation(&db, "cultivation", &ctx, &proof).unwrap_err();
+        assert!(error.to_string().contains("forced binding failure"));
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_relocation_preserves_target_winner_after_proof() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-target-race";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        let winner_directory = tmp.path().join("winner");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        std::fs::create_dir_all(&winner_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let winner_directory = winner_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "last_event_id": 32
+                }
+            }),
+        )
+        .unwrap();
+        let ctx = make_codex_ctx(Some(session_id), &new_directory);
+        let proof =
+            validate_codex_relocation(&db, "cultivation", &ctx, Some(session_id), "").unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, directory, status, created_at)
+                 VALUES ('cultivation', 'thread-winner', 'codex', ?1, 'active', 1)",
+                params![winner_directory],
+            )
+            .unwrap();
+        db.set_session_binding("thread-winner", "cultivation")
+            .unwrap();
+
+        let error = commit_codex_relocation(&db, "cultivation", &ctx, &proof).unwrap_err();
+        assert!(error.to_string().contains("another task registered"));
+        let winner = db.get_instance_full("cultivation").unwrap().unwrap();
+        assert_eq!(winner.session_id.as_deref(), Some("thread-winner"));
+        assert_eq!(winner.directory, winner_directory);
+        assert_eq!(
+            db.get_session_binding("thread-winner").unwrap().as_deref(),
+            Some("cultivation")
+        );
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_relocation_preserves_session_winner_after_proof() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-session-race";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "last_event_id": 33
+                }
+            }),
+        )
+        .unwrap();
+        let ctx = make_codex_ctx(Some(session_id), &new_directory);
+        let proof =
+            validate_codex_relocation(&db, "cultivation", &ctx, Some(session_id), "").unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, directory, status, created_at)
+                 VALUES ('session-winner', ?1, 'codex', ?2, 'active', 1)",
+                params![session_id, new_directory],
+            )
+            .unwrap();
+        db.set_session_binding(session_id, "session-winner")
+            .unwrap();
+
+        let error = commit_codex_relocation(&db, "cultivation", &ctx, &proof).unwrap_err();
+        assert!(error.to_string().contains("session is already bound"));
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some("session-winner")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_relocation_rejects_malformed_snapshot_identity_fields() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cases = [
+            ("origin_device_id", json!(7)),
+            ("parent_name", json!({"unexpected": true})),
+            ("agent_id", json!(["unexpected"])),
+            ("background", json!(true)),
+            ("background", json!(1)),
+        ];
+
+        for (index, (field, bad_value)) in cases.into_iter().enumerate() {
+            let bad_value_display = bad_value.to_string();
+            let name = format!("cultivation-{index}");
+            let session_id = format!("thread-malformed-{index}");
+            let old_directory = tmp.path().join(format!("old-{index}"));
+            let new_directory = tmp.path().join(format!("new-{index}"));
+            std::fs::create_dir_all(&old_directory).unwrap();
+            std::fs::create_dir_all(&new_directory).unwrap();
+            let old_directory = old_directory.to_string_lossy().to_string();
+            let new_directory = new_directory.to_string_lossy().to_string();
+            let transcript = write_codex_session_meta(&home, &session_id, &old_directory);
+            let mut snapshot = json!({
+                "tool": "codex",
+                "directory": old_directory,
+                "session_id": session_id,
+                "transcript_path": transcript,
+                "last_event_id": 34
+            });
+            snapshot
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), bad_value);
+            db.log_event(
+                "life",
+                &name,
+                &json!({"action": "stopped", "snapshot": snapshot}),
+            )
+            .unwrap();
+            let ctx = make_codex_ctx(Some(&session_id), &new_directory);
+
+            let error = validate_codex_relocation(&db, &name, &ctx, Some(session_id.as_str()), "")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("stopped identity"),
+                "{field}={bad_value_display} unexpectedly produced: {error}"
+            );
+            assert!(db.get_instance_full(&name).unwrap().is_none());
+            assert!(db.get_session_binding(&session_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_relocation_rejects_mismatched_session_env_without_mutation() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-owned";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "origin_device_id": null,
+                    "last_event_id": 73
+                }
+            }),
+        )
+        .unwrap();
+        let mut ctx = make_codex_ctx(Some(session_id), &new_directory);
+        ctx.raw_env
+            .insert("CODEX_SESSION_ID".into(), "thread-foreign".into());
+
+        let error = start_rebind_with_options(&db, "cultivation", &ctx, None, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with CODEX_SESSION_ID")
+        );
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_relocation_rejects_remote_snapshot_without_mutation() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-remote";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "origin_device_id": "remote-device",
+                    "last_event_id": 73
+                }
+            }),
+        )
+        .unwrap();
+        let ctx = make_codex_ctx(Some(session_id), &new_directory);
+
+        let error = start_rebind_with_options(&db, "cultivation", &ctx, None, true).unwrap_err();
+        assert!(error.to_string().contains("stopped identity is remote"));
+        assert!(db.get_instance_full("cultivation").unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
     }
 
     #[test]

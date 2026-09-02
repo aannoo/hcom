@@ -1418,6 +1418,10 @@ fn stop_instance_inner(
         "session_id": instance_data.session_id,
         "tool": instance_data.tool,
         "directory": instance_data.directory,
+        "codex_directory_pin_v1": crate::hooks::codex::directory_override_snapshot_value(
+            instance_data.launch_context.as_deref(),
+            instance_data.session_id.as_deref(),
+        ),
         "parent_name": instance_data.parent_name,
         "parent_session_id": instance_data.parent_session_id,
         "tag": instance_data.tag,
@@ -1600,6 +1604,10 @@ pub fn soft_finalize_session(
         "session_id": instance_data.session_id,
         "tool": instance_data.tool,
         "directory": instance_data.directory,
+        "codex_directory_pin_v1": crate::hooks::codex::directory_override_snapshot_value(
+            instance_data.launch_context.as_deref(),
+            instance_data.session_id.as_deref(),
+        ),
         "parent_name": instance_data.parent_name,
         "parent_session_id": instance_data.parent_session_id,
         "tag": instance_data.tag,
@@ -2335,6 +2343,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "life event should be logged");
+    }
+
+    #[test]
+    fn test_stop_instance_snapshots_only_valid_codex_directory_pin() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let pinned_directory = std::env::current_dir()
+            .unwrap()
+            .join("cultivation")
+            .to_string_lossy()
+            .to_string();
+        let launch_context = serde_json::json!({
+            "terminal_id": "must-not-leak",
+            "env": {"SSH_CONNECTION": "must-not-leak"},
+            "codex_directory_pin_v1": {
+                "directory": pinned_directory.clone(),
+                "session_id": "thread-cultivation",
+                "source": "explicit-start-relocate-v1"
+            }
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, session_id, directory, launch_context, status,
+                  status_context, status_time, created_at)
+                 VALUES ('cultivation', 'codex', 'thread-cultivation',
+                         ?1, ?2, 'active', 'new', 0, 0)",
+                rusqlite::params![pinned_directory, launch_context],
+            )
+            .unwrap();
+
+        stop_instance(&db, "cultivation", "test", "pin_snapshot");
+
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type='life' AND instance='cultivation'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let data: Value = serde_json::from_str(&data).unwrap();
+        let snapshot = &data["snapshot"];
+        assert_eq!(
+            snapshot["codex_directory_pin_v1"]["directory"],
+            pinned_directory
+        );
+        assert!(snapshot.get("launch_context").is_none());
+        assert!(snapshot.get("terminal_id").is_none());
+        assert!(snapshot.get("env").is_none());
     }
 
     #[test]
