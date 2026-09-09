@@ -470,6 +470,15 @@ mod tests {
     }
 
     #[test]
+    fn plugin_delivers_pending_mail_as_steer() {
+        // Omitted deliverAs starts a Yield/user turn when idle. Mail must always steer.
+        assert!(PLUGIN_SOURCE.contains("sendUserMessage(formatted, { deliverAs: \"steer\" })"));
+        assert!(!PLUGIN_SOURCE.contains("deliverAs: \"followUp\""));
+        assert!(!PLUGIN_SOURCE.contains("pi.sendUserMessage(formatted);"));
+        assert!(PLUGIN_SOURCE.contains("ackPending(\"sendUserMessage:steer\")"));
+    }
+
+    #[test]
     fn status_handler_wakes_plugin_only_when_entering_listening() {
         let (db, path) = setup_test_db();
         save_test_instance(&db, "luna", ST_LISTENING);

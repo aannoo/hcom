@@ -152,6 +152,15 @@ fn plugin_delivery_reports_active_edge() {
     assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));
 }
 
+#[test]
+fn plugin_delivers_pending_mail_as_steer() {
+    // Omitted deliverAs starts a Yield/user turn when idle. Mail must always steer.
+    assert!(PLUGIN_SOURCE.contains("sendUserMessage(formatted, { deliverAs: \"steer\" })"));
+    assert!(!PLUGIN_SOURCE.contains("deliverAs: \"followUp\""));
+    assert!(!PLUGIN_SOURCE.contains("await pi.sendUserMessage(formatted);"));
+    assert!(PLUGIN_SOURCE.contains("ackPending(\"steer\")"));
+}
+
 // The embedded plugin is include_str!'d and never tsc'd, so these guard the
 // delivery-correctness invariants that upstream API/lifecycle drift silently
 // broke before (see PR review). They pin behavior, not just strings.

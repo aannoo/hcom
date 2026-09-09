@@ -222,18 +222,16 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			const formatted = formatMessagesForInjection(pending.messages, instanceName);
 			pendingAckId = pending.maxId;
 			try {
-				if (ctx.isIdle()) {
-					pi.sendUserMessage(formatted);
-				} else {
-					pi.sendUserMessage(formatted, { deliverAs: "followUp" });
-				}
+				const isIdle = ctx.isIdle();
+				// Explicit steer: omitted deliverAs starts a Yield/user turn when idle.
+				pi.sendUserMessage(formatted, { deliverAs: "steer" });
 				const sender = String(pending.messages[0]?.from ?? "");
 				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
-				await ackPending(ctx.isIdle() ? "sendUserMessage:idle" : "sendUserMessage:followUp");
+				await ackPending("sendUserMessage:steer");
 				log("INFO", "plugin.delivery_pending", instanceName, {
 					count: pending.messages.length,
 					pending_ack: pending.maxId,
-					idle: ctx.isIdle(),
+					idle: isIdle,
 				});
 				return true;
 			} catch (error) {
