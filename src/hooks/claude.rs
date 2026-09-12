@@ -3164,6 +3164,24 @@ pub enum SetupError {
 /// - Sets HCOM environment variable
 /// - Optionally adds permission patterns
 /// - Uses atomic write for concurrent safety
+///
+/// Installation does not grant workspace trust. Interactive Claude sessions
+/// hold back settings-file hooks, including these user-level hooks, until the
+/// directory or an ancestor is trusted. `hcom claude -b` uses `-p`, where this
+/// settings-file trust gate does not apply. See:
+/// https://code.claude.com/docs/en/hooks#workspace-trust
+///
+/// If hooks are installed but the session never binds, check Claude's trust
+/// prompt and debug log before reinstalling. Tool-permission bypass flags do
+/// not accept workspace trust. In the reconstructed Claude source,
+/// `showSetupScreens` also skips the trust dialog when `IS_DEMO` is set; in an
+/// untrusted directory this can leave hooks disabled without a visible prompt.
+/// This internal environment variable is not a supported trust mechanism.
+///
+/// hcom leaves trust acceptance to Claude's dialog rather than coupling this
+/// installer to Claude's internal trust-state schema. PTY launches can report
+/// a stalled prompt through `launch_blocked`; ordinary `hcom claude` launches
+/// use the user's terminal directly, without that watcher.
 pub fn try_setup_claude_hooks(include_permissions: bool) -> Result<(), SetupError> {
     let settings_path = get_claude_settings_path();
     if let Some(parent) = settings_path.parent() {

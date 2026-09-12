@@ -6,7 +6,9 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that coding agents use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Gemini and Copilot - in any combination, without changing how you use them.
+`hcom` is a CLI that coding agents use to message, watch, and spawn each other across terminals.
+
+Works with Claude Code, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi and Copilot - in any combination, without changing how you use them.
 
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
@@ -35,7 +37,7 @@ curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installe
 ```
 
 ```powershell
-# Windows (native, Powershell)
+# Windows (native, PowerShell)
 irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
 ```
 
@@ -80,7 +82,7 @@ hcom
 
 ## What agents can do
 
-**Message** each other in real-time: intent, replies, threads, bundled context for handoffs.
+**Message** each other in real time: requests, updates, replies, threads, and bundled context for handoffs.
 
 **Observe** each other: transcripts, file edits, terminal screens, command history.
 
@@ -100,14 +102,12 @@ agent → hooks → db → hooks → other agent
 
 Messages arrive mid-turn (injected between tool calls) or wake idle agents immediately.
 
-Each agent gets a queryable identity:
+Each agent has a name. You and other agents can inspect its:
 
-- name
-- status
-- inbox
+- status and inbox
 - live terminal screen
-- transcript in structured chunks
-- event log of every file edit, tool call, etc
+- transcript
+- event log, including file edits and tool calls
 
 Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
@@ -200,6 +200,9 @@ To keep using relay after a leak, create a new relay with `hcom relay new` and m
 
 ```bash
 hcom status                  # diagnostics
+```
+
+```bash
 hcom reset all               # clear and archive: database + hooks + config
 ```
 
@@ -268,9 +271,9 @@ What you might type from a shell. Agents run their own commands that they learn 
 
 ```bash
 hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot   # launch N agents
-hcom r <name|session_id>                # resume agent
-hcom f <name|session_id>                # fork session
-hcom kill <name|tag:T|all>              # kill + close terminal pane
+hcom r <name|session_id>     # resume agent
+hcom f <name|session_id>     # fork session
+hcom kill <name|tag:T|all>   # kill + close terminal pane
 ```
 
 hcom launch flags:
@@ -290,12 +293,12 @@ Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 ### Other commands
 
 ```bash
-hcom                                # TUI dashboard
-hcom send -b @luna -- hey           # one-off message to an agent
-hcom list                           # show all active agents
-hcom term [name]                    # view/inject into an agent's PTY screen
-hcom events --wait <filters>         # Block until match for scripting
-hcom update                         # update hcom version
+hcom                           # TUI dashboard
+hcom send -b @luna -- hey      # one-off message to an agent
+hcom list                      # show all active agents
+hcom term [name]               # view/inject into an agent's PTY screen
+hcom events --wait <filters>   # Block until match for scripting
+hcom update                    # update hcom version
 ```
 
 `hcom run docs --cli` for all commands.
@@ -336,9 +339,9 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 ### Scope
 
 ```bash
-hcom config tag mycrew                          # global
-hcom config -i luna hints "respond in JSON"     # per-agent
-HCOM_TAG=dev hcom 3 claude                      # per-launch env
+hcom config tag mycrew                        # global
+hcom config -i luna hints "respond in JSON"   # per-agent
+HCOM_TAG=dev hcom 3 claude                    # per-launch env
 ```
 
 ### Per-project isolation
@@ -367,7 +370,7 @@ hcom run debate "topic"    # run one
 hcom run docs              # tell agent to run this to create any new workflow
 ```
 
-### Included Scripts
+### Included scripts
 
 Tell agent to run them:
 
@@ -384,7 +387,7 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 <details>
 <summary>Build</summary>
 
-### Building from Source
+### Building from source
 
 ```bash
 # Prerequisites: Rust 1.88+
@@ -432,8 +435,7 @@ Issues and PRs welcome. The codebase is Rust.
 cargo build && cargo test
 hcom config dev_root $(pwd)
 hcom status
-just     # list the available recipes
-just ci  # run the CI gate locally (`just ci <step>` runs one step)
+just ci  # run the CI gate locally
 ```
 
 ---
