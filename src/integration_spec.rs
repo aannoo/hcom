@@ -1084,8 +1084,8 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     tui_prefix: "grk ",
     adhoc_icon: None,
     released: true,
-    // Grok TUI chrome is themeable; empty ready_pattern relies on prompt-empty
-    // + hook idle status (same approach as Cursor MVP).
+    // No verified composer parser yet. Interactive idle wake stays gated;
+    // an explicit unattended headless worker may use hook idle status.
     ready_pattern: b"",
     pty: PtySpec {
         delivery_start_timeout_secs: 10,
@@ -1101,12 +1101,12 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
         require_idle: true,
         // Grok TUI has no stable ready footer we can scrape yet.
         require_ready_prompt: false,
-        // get_input_box_text("grok") is None today; requiring prompt-empty would
-        // permanently report prompt_has_text and block PTY inject forever.
+        // Grok's delivery gate checks draft/headless ownership explicitly.
+        // Keep this false: it also gates launch readiness, and no parser exists.
         require_prompt_empty: false,
         block_on_user_activity: true,
-        // Composer scrape is None; do not pretend we can see Grok approval UI.
-        block_on_approval: false,
+        // Honor any positive approval signal, even without a complete UI parser.
+        block_on_approval: true,
         // Launch readiness falls back to settle-timeout without a ready pattern.
         launch_requires_ready: false,
         launch_ready_on_plugin_bind: false,

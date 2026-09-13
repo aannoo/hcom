@@ -1768,6 +1768,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             bail!("{}", validation_errors.join("\n"));
         }
     }
+    if normalized == LaunchTool::Grok {
+        let args: Vec<_> = params.args.iter().map(String::as_str).collect();
+        crate::delivery::grok::Launch::check_policy_support(
+            crate::terminal::executable_command(tool_binary),
+            &args,
+        )?;
+    }
 
     // Load config before hook setup so auto_approve is authoritative for
     // wrapped launches as well as manual `hcom hooks add`.
@@ -2578,7 +2585,14 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             ANTIGRAVITY_REJECTED_ARGS,
         ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
-        LaunchTool::Grok => validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS),
+        LaunchTool::Grok => {
+            let mut errors = validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS);
+            let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
+            if let Err(error) = crate::delivery::grok::Launch::validate_args(&borrowed) {
+                errors.push(error.to_string());
+            }
+            errors
+        }
     }
 }
 
@@ -2814,6 +2828,17 @@ mod tests {
         assert!(
             validate_tool_args(&LaunchTool::Grok, &["--always-approve".to_string()]).is_empty()
         );
+        assert_eq!(
+            validate_tool_args(&LaunchTool::Grok, &["--no-leader".into()]).len(),
+            1
+        );
+        for flag in ["--deny=bash", "--disable-web-search"] {
+            assert!(validate_tool_args(&LaunchTool::Grok, &[flag.to_string()]).is_empty());
+        }
+        assert!(
+            validate_tool_args(&LaunchTool::Grok, &["--allow".into(), "Bash".into()]).is_empty()
+        );
+        assert!(validate_tool_args(&LaunchTool::Grok, &["--no-subagents".to_string()]).is_empty());
     }
 
     #[test]

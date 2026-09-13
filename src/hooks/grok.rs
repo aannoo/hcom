@@ -496,12 +496,30 @@ fn handle_stop(
     db: &HcomDb,
     ctx: &HcomContext,
     payload: &HookPayload,
+    acp_enabled: bool,
 ) -> (Value, Option<DeliveryAck>) {
     let Some(instance) = resolved_instance(db, ctx, payload) else {
         return (json!({}), None);
     };
     lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
+
+    // Managed ACP sessions have one mailbox consumer. Hooks still publish
+    // lifecycle state, but must not race the queued prompt's deferred receipt.
+    log::log_info(
+        "hooks",
+        "grok.stop.owner",
+        &format!(
+            "acp={} tcp={} process={} executable={}",
+            acp_enabled,
+            instance.tcp_mode,
+            ctx.process_id.as_deref().unwrap_or(""),
+            std::env::current_exe().unwrap_or_default().display()
+        ),
+    );
+    if acp_enabled && instance.tcp_mode != 0 {
+        return (json!({}), None);
+    }
 
     if !is_genuine_end_turn_stop(payload) {
         return (json!({}), None);
@@ -585,9 +603,19 @@ pub fn dispatch_grok_hook(hook_name: &str) -> i32 {
             "grok-userpromptsubmit" => handle_userpromptsubmit(&db, &ctx, &payload),
             "grok-pretooluse" => (handle_pretooluse(&db, &ctx, &payload), None),
             "grok-posttooluse" => handle_posttooluse(&db, &ctx, &payload),
-            "grok-stop" => handle_stop(&db, &ctx, &payload),
+            "grok-stop" => handle_stop(
+                &db,
+                &ctx,
+                &payload,
+                std::env::var("HCOM_GROK_ACP").as_deref() == Ok("1"),
+            ),
             "grok-subagentstart" => (handle_subagentstart(&db, &ctx, &payload), None),
-            "grok-subagentstop" => handle_stop(&db, &ctx, &payload),
+            "grok-subagentstop" => handle_stop(
+                &db,
+                &ctx,
+                &payload,
+                std::env::var("HCOM_GROK_ACP").as_deref() == Ok("1"),
+            ),
             "grok-sessionend" => (handle_sessionend(&db, &ctx, &payload), None),
             _ => (json!({}), None),
         },
@@ -801,6 +829,47 @@ mod tests {
 
     #[test]
     #[serial]
+    fn acp_stop_keeps_mail_when_only_session_binding_survives() {
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn().execute(
+            "INSERT INTO instances (name, session_id, tool, status, created_at, last_event_id, tcp_mode) VALUES ('nova', 'sess-1', 'grok', 'listening', 0, 0, 1)",
+            [],
+        ).unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.conn().execute(
+            "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:01Z', 'luna', ?1)",
+            rusqlite::params![json!({"from": "luna", "text": "ACP owns this mail", "scope": "broadcast"}).to_string()],
+        ).unwrap();
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".into(), "missing-process-binding".into()),
+            ("HCOM_LAUNCHED".into(), "1".into()),
+            ("HCOM_DIR".into(), hcom_dir.to_string_lossy().into_owned()),
+        ]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("."));
+        let payload = HookPayload::from_grok(
+            "grok-stop",
+            json!({"session_id": "sess-1", "reason": "end_turn"}),
+        );
+        let (out, ack) = handle_stop(&db, &ctx, &payload, true);
+        assert_eq!(out, json!({}));
+        assert!(ack.is_none());
+        assert_eq!(db.get_cursor("nova"), 0);
+        assert!(db.has_pending("nova"));
+
+        db.update_tcp_mode("nova", false).unwrap();
+        let (out, ack) = handle_stop(&db, &ctx, &payload, true);
+        assert!(
+            out["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("ACP owns this mail")
+        );
+        assert!(ack.is_some(), "hook-only sessions retain legacy delivery");
+    }
+
+    #[test]
+    #[serial]
     fn stop_output_uses_additional_context_not_followup() {
         let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().expect("db");
@@ -835,7 +904,7 @@ mod tests {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         );
         let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "end_turn" }));
-        let (out, ack) = handle_stop(&db, &ctx, &payload);
+        let (out, ack) = handle_stop(&db, &ctx, &payload, false);
 
         assert!(
             out.get("followup_message").is_none(),

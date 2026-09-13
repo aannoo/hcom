@@ -2,8 +2,9 @@
 
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
+pub(crate) mod grok;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -384,6 +385,9 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
         "not_ready" => "prompt not visible",
         "output_unstable" => "output still streaming",
         "prompt_has_text" => "uncommitted text in prompt",
+        "prompt_unverified" => {
+            "Grok composer cannot be verified; idle wake requires an unattended --headless worker"
+        }
         "approval" => "waiting for user approval",
         "nav_overlay" => "waiting for subagent nav / session switcher to close",
         _ => "blocked",
@@ -593,6 +597,9 @@ pub struct GateResult {
 /// Shared state for delivery thread
 pub struct DeliveryState {
     pub screen: Arc<std::sync::RwLock<ScreenState>>,
+    /// Explicit headless Grok worker with no interactive terminal on stdin.
+    pub grok_unattended: bool,
+    pub grok_acp: Option<grok::Launch>,
     /// True while the launch outcome is still Pending. Cleared once any
     /// terminal outcome (ready/failed/blocked) fires, so the PTY proxy can
     /// stop computing launch-only signals (e.g. `visible_tail`).
@@ -667,6 +674,8 @@ pub struct ScreenState {
     pub input_text: Option<String>,
     pub visible_tail: Option<String>,
     pub last_user_input: Instant,
+    /// Sticky for this PTY lifetime: a cooldown cannot prove a draft was cleared.
+    pub user_input_seen: bool,
     /// Timestamp of last output (for stability-based recovery)
     pub last_output: Instant,
     /// Terminal width in columns
@@ -705,6 +714,7 @@ impl Default for ScreenState {
             input_text: None,
             visible_tail: None,
             last_user_input: Instant::now(),
+            user_input_seen: false,
             last_output: Instant::now(),
             cols: 80,
             last_prompt_submit: None,
@@ -827,6 +837,16 @@ pub(crate) fn evaluate_gate(
         return GateResult {
             safe: false,
             reason: "not_ready",
+        };
+    }
+    if config.tool == "grok" && !grok_prompt_owned(&screen, state.grok_unattended, "") {
+        return GateResult {
+            safe: false,
+            reason: if screen.input_text.is_some() {
+                "prompt_has_text"
+            } else {
+                "prompt_unverified"
+            },
         };
     }
     if config.require_prompt_empty && !screen.prompt_empty {
@@ -1134,6 +1154,28 @@ fn grok_turn_started(status: &str, context: &str) -> bool {
         || context.starts_with("approved:")
 }
 
+/// Acknowledged internal wake commands let the PTY distinguish automation from
+/// operator input and re-check ownership at the actual write boundary.
+pub(crate) fn inject_grok_command(port: u16, enter: bool) -> bool {
+    let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) else {
+        return false;
+    };
+    let timeout = Some(Duration::from_secs(2));
+    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
+        return false;
+    }
+    let command: &[u8] = if enter {
+        b"\0GROK_ENTER"
+    } else {
+        b"\0GROK_WAKE"
+    };
+    if stream.write_all(command).is_err() || stream.shutdown(std::net::Shutdown::Write).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    stream.take(64).read_to_string(&mut response).is_ok() && response == "ok\n"
+}
+
 /// Inject Enter key to PTY via TCP
 pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
@@ -1171,6 +1213,23 @@ fn prompt_ownership(input_text: Option<&str>, injected_text: &str) -> PromptOwne
             PromptOwnership::Mixed
         }
         _ => PromptOwnership::Other,
+    }
+}
+
+pub(crate) fn grok_prompt_owned(screen: &ScreenState, unattended: bool, expected: &str) -> bool {
+    match screen.input_text.as_deref() {
+        Some(input) => input == expected,
+        None => unattended && !screen.user_input_seen,
+    }
+}
+
+impl DeliveryState {
+    /// Both the first Enter and every retry must retain submit authority.
+    fn grok_can_submit(&self, injected_text: &str) -> bool {
+        let screen = self.screen.read().unwrap();
+        !self.is_user_active_with_guard(&screen)
+            && !screen.approval
+            && grok_prompt_owned(&screen, self.grok_unattended, injected_text)
     }
 }
 
@@ -1361,7 +1420,23 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(
+    if let Some(launch) = state.grok_acp.as_ref().filter(|_| config.tool == "grok") {
+        grok::run(
+            launch,
+            &running,
+            db,
+            notify,
+            state,
+            &process_id,
+            &mut current_name,
+            config,
+            &shared_name,
+            &shared_status,
+            &title_wake,
+            &mut host_label,
+            &mut launch_outcome,
+        );
+    } else if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
     ) {
@@ -1683,7 +1758,11 @@ pub fn run_delivery_loop(
 
                         // No Ctrl-U clear for Grok: cannot observe composer; risk
                         // partial draft deletion. Sentinel is short and idle-gated.
-                        let inject_ok = inject_text(state.inject_port, &text);
+                        let inject_ok = if config.tool == "grok" {
+                            inject_grok_command(state.inject_port, false)
+                        } else {
+                            inject_text(state.inject_port, &text)
+                        };
 
                         if inject_ok {
                             log_info(
@@ -1866,7 +1945,8 @@ pub fn run_delivery_loop(
                 State::WaitTextRender => {
                     let elapsed = phase_started_at.elapsed();
 
-                    // Grok: unscrapeable composer → cannot prove ownership.
+                    // Grok: an unobserved composer is only owned by a headless
+                    // worker that has never received human input.
                     // Protocol (owner review): PTY only submits a short wake
                     // sentinel; real body is delivered from grok-stop via
                     // hookSpecificOutput.additionalContext. Never force-ack.
@@ -1913,13 +1993,13 @@ pub fn run_delivery_loop(
                                 let user_active = state.is_user_active();
                                 let approval =
                                     state.screen.read().map(|s| s.approval).unwrap_or(false);
-                                if user_active || approval {
+                                if !state.grok_can_submit(&injected_text) {
                                     if elapsed > PHASE1_TIMEOUT {
                                         log_warn(
                                             "native",
                                             "delivery.grok_enter_retry_blocked",
                                             &format!(
-                                                "Grok Enter retry blocked (user_active={user_active}, approval={approval}); pending kept"
+                                                "Grok Enter retry lacks submit authority (user_active={user_active}, approval={approval}); pending kept"
                                             ),
                                         );
                                         delivery_state = State::Pending;
@@ -1941,7 +2021,7 @@ pub fn run_delivery_loop(
                                     ),
                                 );
                                 // Single Enter only — double Enter can queue two wakes.
-                                inject_enter(state.inject_port);
+                                inject_grok_command(state.inject_port, true);
                                 enter_attempt += 1;
                                 phase_started_at = Instant::now();
                                 continue;
@@ -1970,13 +2050,13 @@ pub fn run_delivery_loop(
                         }
                         let user_active = state.is_user_active();
                         let approval = state.screen.read().map(|s| s.approval).unwrap_or(false);
-                        if user_active || approval {
+                        if !state.grok_can_submit(&injected_text) {
                             if elapsed > PHASE1_TIMEOUT {
                                 log_warn(
                                     "native",
                                     "delivery.grok_enter_blocked",
                                     &format!(
-                                        "Grok force-Enter blocked (user_active={user_active}, approval={approval})"
+                                        "Grok Enter lacks submit authority (user_active={user_active}, approval={approval}); pending kept"
                                     ),
                                 );
                                 delivery_state = State::Pending;
@@ -1995,7 +2075,7 @@ pub fn run_delivery_loop(
                                 injected_text.len(),
                             ),
                         );
-                        inject_enter(state.inject_port);
+                        inject_grok_command(state.inject_port, true);
                         enter_attempt = 1;
                         phase_started_at = Instant::now();
                         continue;
@@ -2537,7 +2617,9 @@ mod tests {
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
         DeliveryState {
+            grok_acp: None,
             screen: Arc::new(std::sync::RwLock::new(screen)),
+            grok_unattended: false,
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             inject_port: 0,
             user_activity_cooldown_ms: cooldown_ms,
@@ -2553,6 +2635,7 @@ mod tests {
             input_text: None,
             visible_tail: None,
             last_user_input: Instant::now() - Duration::from_secs(10),
+            user_input_seen: false,
             last_output: Instant::now() - Duration::from_secs(10),
             cols: 80,
             last_prompt_submit: None,
@@ -2702,6 +2785,96 @@ mod tests {
         assert!(!grok_should_skip_rewake(None, 42, true));
         assert!(!GROK_WAKE_TRIGGER.contains('>'));
         assert_eq!(GROK_WAKE_TRIGGER, "hcom: wake");
+    }
+
+    #[test]
+    fn grok_interactive_unknown_composer_blocks_wake_after_cooldown() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        let state = make_state(safe_screen(), 500);
+        let gate = evaluate_gate(&config, &state, true);
+        assert!(!gate.safe);
+        assert_eq!(gate.reason, "prompt_unverified");
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
+
+    #[test]
+    fn grok_headless_unknown_composer_retains_automatic_wake() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        let mut screen = safe_screen();
+        screen.prompt_empty = false;
+        let mut state = make_state(screen, 500);
+        state.grok_unattended = true;
+        assert!(evaluate_gate(&config, &state, true).safe);
+        assert!(state.grok_can_submit(GROK_WAKE_TRIGGER));
+        assert!(!evaluate_gate(&config, &state, false).safe);
+
+        state.screen.write().unwrap().approval = true;
+        assert!(!evaluate_gate(&config, &state, true).safe);
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
+
+    #[test]
+    fn grok_launch_readiness_does_not_require_an_idle_injection_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let config = ToolConfig::for_tool(Tool::Grok);
+        for unattended in [false, true] {
+            let mut screen = safe_screen();
+            screen.prompt_empty = false;
+            let mut state = make_state(screen, 500);
+            state.grok_unattended = unattended;
+            assert!(launch_ready_observed(&db, "nova", &config, &state));
+            assert_eq!(evaluate_gate(&config, &state, true).safe, unattended);
+        }
+    }
+
+    #[test]
+    fn grok_human_input_permanently_revokes_unknown_composer_ownership() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        let mut state = make_state(safe_screen(), 500);
+        state.grok_unattended = true;
+        assert!(state.grok_can_submit(GROK_WAKE_TRIGGER));
+        {
+            let mut screen = state.screen.write().unwrap();
+            screen.user_input_seen = true;
+            screen.last_user_input = Instant::now() - Duration::from_secs(60);
+        }
+        assert!(!evaluate_gate(&config, &state, true).safe);
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
+
+    #[test]
+    fn grok_headless_never_overrides_an_observed_draft() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        for unattended in [false, true] {
+            for draft in [
+                "private draft",
+                "private draft\nhcom: wake",
+                "hcom: wake private draft",
+            ] {
+                let mut screen = safe_screen();
+                screen.prompt_empty = false;
+                screen.input_text = Some(draft.into());
+                let mut state = make_state(screen, 500);
+                state.grok_unattended = unattended;
+                assert!(!evaluate_gate(&config, &state, true).safe);
+                assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+            }
+        }
+    }
+
+    #[test]
+    fn grok_verified_sentinel_loses_submit_authority_when_draft_changes() {
+        let mut screen = safe_screen();
+        screen.prompt_empty = false;
+        screen.input_text = Some(GROK_WAKE_TRIGGER.into());
+        let state = make_state(screen, 500);
+        assert!(state.grok_can_submit(GROK_WAKE_TRIGGER));
+        state.screen.write().unwrap().input_text = Some("hcom: wake edited by user".into());
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+        state.screen.write().unwrap().input_text = None;
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
     }
 
     #[test]
