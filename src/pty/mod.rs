@@ -8,6 +8,7 @@
 //! - Delivery: Notify-driven message delivery (integrated)
 
 mod inject;
+pub(crate) use inject::RAW_PREFIX;
 pub mod screen;
 #[cfg(any(unix, windows))]
 mod shared;
@@ -587,6 +588,16 @@ pub struct ProxyConfig {
     pub target: PtyTarget,
     /// Extra environment variables to set in the child process
     pub env_vars: Vec<(String, String)>,
+    /// Run the PTY slave in raw mode: no input echo, no canonical line
+    /// buffering, no ONLCR `\n`→`\r\n` output translation. Required for
+    /// JSON-RPC stdio servers (hermes acp) where the master stream must
+    /// round-trip byte-clean. Unix-only; a no-op on Windows.
+    pub raw_pty: bool,
+    /// When set, the child's stderr is redirected to this file instead of the
+    /// PTY slave. Keeps human-readable logs out of a protocol-clean master
+    /// stream (hermes logs to stderr, so under a PTY they would otherwise
+    /// interleave with JSON-RPC frames on stdout).
+    pub stderr_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ProxyConfig {
@@ -596,6 +607,8 @@ impl Default for ProxyConfig {
             instance_name: None,
             target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
+            raw_pty: false,
+            stderr_path: None,
         }
     }
 }
@@ -645,6 +658,37 @@ impl Proxy {
         let terminal_guard = TerminalGuard::new()?;
         terminal::setup_signal_handlers()?;
 
+        // For protocol-clean tools (hermes acp), run the slave in raw mode so
+        // injected bytes are not echoed back and child output is not CRLF-mangled.
+        // Termios is a property of the tty device and is set here (master side)
+        // before the child opens the slave.
+        if config.raw_pty {
+            let mut termios =
+                nix::sys::termios::tcgetattr(&pty.slave).context("tcgetattr failed")?;
+            nix::sys::termios::cfmakeraw(&mut termios);
+            nix::sys::termios::tcsetattr(&pty.slave, nix::sys::termios::SetArg::TCSANOW, &termios)
+                .context("tcsetattr (raw mode) failed")?;
+        }
+
+        // Open stderr log file in the parent and hand the fd to the child via
+        // dup2 in pre_exec (raw fd i32 is Copy, safe across fork).
+        let stderr_file = match &config.stderr_path {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                Some(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .with_context(|| format!("open stderr log {:?} failed", path))?,
+                )
+            }
+            None => None,
+        };
+        let stderr_raw = stderr_file.as_ref().map(|f| f.as_raw_fd());
+
         // Spawn child process
         let slave_fd = pty.slave.as_raw_fd();
         let master_fd = pty.master.as_raw_fd();
@@ -683,7 +727,16 @@ impl Proxy {
                     if libc::dup2(slave_fd, 1) == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::dup2(slave_fd, 2) == -1 {
+                    if let Some(stderr_fd) = stderr_raw {
+                        // Keep logs off the protocol stream (hermes acp).
+                        if libc::dup2(stderr_fd, 2) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        // Close the inherited log fd if it's not a stdio slot.
+                        if stderr_fd > 2 {
+                            libc::close(stderr_fd);
+                        }
+                    } else if libc::dup2(slave_fd, 2) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     // Close slave fd if it's not stdio
@@ -1072,6 +1125,9 @@ impl Proxy {
                         self.screen.process(raw);
                     }
                     if !raw_chunks.is_empty() {
+                        // Preserve the raw byte stream for protocol tools
+                        // (hermes acp JSON-RPC delivery).
+                        shared::append_raw_output(&self.delivery_state, &raw_chunks);
                         shared::update_delivery_state(
                             &self.delivery_state,
                             &self.screen,

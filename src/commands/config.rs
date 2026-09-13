@@ -220,6 +220,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
         "copilot_args" => Some("launch.copilot.args"),
+        "hermes_args" => Some("launch.hermes.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -1646,6 +1647,20 @@ HCOM_KIMI_ARGS - Default args passed to kimi on launch
 
 Example: hcom config kimi_args \"--model kimi-k2.6\"
 Clear:   hcom config kimi_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_HERMES_ARGS" => Some(
+            "\
+HCOM_HERMES_ARGS - Default args passed to hermes on launch
+
+Hermes runs hcom's ACP (JSON-RPC stdio) server, so the argument list must
+start with `acp`; hcom validates this on launch. Extra flags (e.g. model
+overrides) are appended after `acp`.
+
+Example: hcom config hermes_args \"acp\"
+Clear:   hcom config hermes_args \"\"
 
 Prepended to launch-time cli args.",
         ),

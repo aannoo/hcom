@@ -139,6 +139,12 @@ pub enum ResumeArgs {
     Flag(&'static str),
     /// `resume <id>` (Codex subcommand).
     Subcommand(&'static str),
+    /// Resume is handled by the delivery loop over the tool's protocol, not by
+    /// CLI args. Hermes ACP: the delivery loop issues `session/load <id>`
+    /// instead of `session/new`; the id is threaded through the
+    /// `HCOM_HERMES_ACP_RESUME` env var on the PTY host process. `hermes acp`
+    /// accepts no resume flags of its own (see `hermes acp --help`).
+    JsonRpc,
 }
 
 /// Per-tool fork argument shape.
@@ -402,6 +408,14 @@ const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
     (
         "hcom copilot --allow-tool 'shell(hcom:*)'",
         "Flags forwarded to copilot",
+    ),
+];
+
+const HERMES_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom hermes acp", "Run Hermes over ACP (JSON-RPC stdio)"),
+    (
+        "hcom send @<name> -- \"task\"",
+        "Deliver a task to a Hermes session",
     ),
 ];
 
@@ -1059,6 +1073,85 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static HERMES: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Hermes,
+    name: "hermes",
+    label: "Hermes",
+    aliases: &[],
+    cli_binary: "hermes",
+    tui_prefix: "her ",
+    adhoc_icon: None,
+    released: true,
+    // `hermes acp` is a JSON-RPC stdio server: there is no scraped on-screen
+    // ready marker. Empty pattern => is_ready() is always true, so launch
+    // readiness is NOT gated on scraped chrome — it is proven by the ACP
+    // `initialize` response in the delivery loop (emit_launch_ready_once).
+    ready_pattern: b"",
+    pty: PtySpec {
+        // hermes acp prints nothing to stdout until it receives `initialize`;
+        // delivery starts on this timeout so the loop can begin the handshake.
+        delivery_start_timeout_secs: 10,
+    },
+    // HERMES_HOME (the acp session store) is instance state only in the sense
+    // that a same-tool child must not inherit it; it is set per-launch by the
+    // PTY host and stripped by the launcher's child-env cleanup. The ACP
+    // resume id is threaded via HCOM_HERMES_ACP_RESUME (see ResumeArgs::JsonRpc).
+    instance_state_env: &["HCOM_HERMES_ACP_RESUME"],
+    hooks: HooksSpec {
+        // Hermes has no hcom hook bridge; the ACP delivery loop replaces hook
+        // delivery (pending messages are pulled directly by the loop).
+        names: &[],
+        shared_hooks_with: None,
+        invocation: HookInvocation::None,
+    },
+    // ACP delivery owns all runtime gating: idle = a prior session/prompt
+    // response has been fully drained; approvals are answered over JSON-RPC,
+    // not screen-scraped. Every gate stays off so the delivery loop is the
+    // single authority.
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: false,
+        block_on_approval: false,
+        launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_HERMES_ARGS"),
+        // Read by the launch diagnostic dump. Launcher config-isolation is a
+        // no-op (isolated_tool_config_dir returns None for Hermes): `hermes acp`
+        // needs the real HERMES_HOME (auth.json, state.db, config.yaml) and the
+        // delivery loop resolves readiness from `initialize`, so there is no
+        // per-project config tree to point at.
+        config_dir_env: Some("HERMES_HOME"),
+        initial_prompt: InitialPromptShape::Unsupported {
+            reason: "hermes delivers prompts over the ACP session/prompt method after the session is created. Launch `hcom hermes acp`, then send the task with `hcom send @<name> -- \"…\"`.",
+        },
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        // Resume is session/load over JSON-RPC (the delivery loop issues it);
+        // `hermes acp` takes no resume CLI flag.
+        resume: ResumeArgs::JsonRpc,
+        // No CLI fork primitive under acp; `session/fork` support is deferred.
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: HERMES_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    // Hermes built-in coding tools: shell is `terminal`, file ops are
+    // `write_file`/`patch`, delegation is `delegate_task`.
+    status_detail: StatusDetailSpec {
+        bash: &["terminal"],
+        file: &["write_file", "patch"],
+        delegate: &["delegate_task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -1123,6 +1216,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &CURSOR,
     &KIMI,
     &COPILOT,
+    &HERMES,
     &ADHOC,
 ];
 
@@ -1141,6 +1235,7 @@ impl Tool {
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
+            Tool::Hermes => &HERMES,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -1188,6 +1283,7 @@ mod tests {
             Tool::Cursor,
             Tool::Kimi,
             Tool::Copilot,
+            Tool::Hermes,
             Tool::Pi,
             Tool::Omp,
             Tool::Adhoc,
@@ -1256,7 +1352,8 @@ mod tests {
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 11);
+        assert!(names.contains(&"hermes"));
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

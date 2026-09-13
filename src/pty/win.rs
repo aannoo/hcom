@@ -643,6 +643,10 @@ impl Proxy {
 
                         screen.process(data);
 
+                        // Preserve the raw byte stream for protocol tools
+                        // (hermes acp JSON-RPC delivery).
+                        shared::append_raw_output(&screen_state, &[data.to_vec()]);
+
                         // Refresh the `hcom term` snapshot, throttled to ≤10Hz so
                         // heavy output doesn't spend the reader in screen dumps
                         // (~150µs each). A chunk skipped here is marked dirty and

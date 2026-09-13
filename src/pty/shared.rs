@@ -34,6 +34,29 @@ use super::screen::ScreenTracker;
 /// enables this for Claude.
 pub(super) const USER_ACTIVITY_COOLDOWN_MS: u64 = 500;
 
+/// Append raw PTY output to the shared screen state (capped ring buffer).
+///
+/// Only the Hermes ACP delivery loop consumes this; every other tool ignores it.
+/// Called by the PTY proxy (Unix read loop and Windows reader thread) for each
+/// batch of chunks read from the master, so the JSON-RPC stream is preserved
+/// byte-for-byte even when it has no screen-grid meaning.
+pub(super) fn append_raw_output(screen_state: &Arc<RwLock<ScreenState>>, chunks: &[Vec<u8>]) {
+    if chunks.is_empty() {
+        return;
+    }
+    let cap = crate::delivery::RAW_OUTPUT_CAP;
+    if let Ok(mut state) = screen_state.write() {
+        for chunk in chunks {
+            state.raw_output.extend_from_slice(chunk);
+        }
+        let len = state.raw_output.len();
+        if len > cap {
+            let excess = len - cap;
+            state.raw_output.drain(..excess);
+        }
+    }
+}
+
 /// Update shared delivery state from screen tracker.
 ///
 /// `publish` is the caller's approval-status publisher (it owns the
