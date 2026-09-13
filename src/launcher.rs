@@ -910,6 +910,59 @@ fn sidecar_ambient_env<'a>(
         .collect()
 }
 
+struct RunnerBinaries {
+    path_dirs: Vec<String>,
+    tool_path: Option<String>,
+}
+
+/// Resolve the executables needed by generated runners and order their directories.
+///
+/// The selected Node runtime must precede every other prepended directory: tool,
+/// hcom, and Python directories can all contain an older `node`/`npx`. The tool is
+/// resolved before PATH changes and passed explicitly to `hcom pty`, so moving its
+/// directory after Node does not change which tool executable is launched.
+fn resolve_runner_binaries(
+    initial_dirs: Vec<String>,
+    tool_bin: &str,
+    mut which_bin: impl FnMut(&str) -> Option<String>,
+) -> RunnerBinaries {
+    let tool_path = which_bin(tool_bin);
+    let hcom_path = which_bin("hcom");
+    let node_path = which_bin("node");
+    let python_path = which_bin("python3");
+    let mut path_dirs = Vec::new();
+
+    fn append_binary_dir(path_dirs: &mut Vec<String>, path: &str) {
+        if let Some(dir) = Path::new(path).parent() {
+            let dir = dir.to_string_lossy().into_owned();
+            if !path_dirs.contains(&dir) {
+                path_dirs.push(dir);
+            }
+        }
+    }
+
+    for path in node_path.iter() {
+        append_binary_dir(&mut path_dirs, path);
+    }
+    for dir in initial_dirs {
+        if !path_dirs.contains(&dir) {
+            path_dirs.push(dir);
+        }
+    }
+    for path in tool_path
+        .iter()
+        .chain(hcom_path.iter())
+        .chain(python_path.iter())
+    {
+        append_binary_dir(&mut path_dirs, path);
+    }
+
+    RunnerBinaries {
+        path_dirs,
+        tool_path,
+    }
+}
+
 /// Windows runner: a PowerShell script that launches the tool through the hcom
 /// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
 /// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
@@ -1024,16 +1077,8 @@ fn create_runner_script_windows(
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
-    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name)
-            && let Some(dir) = Path::new(&bin_path).parent()
-        {
-            let d = dir.to_string_lossy().to_string();
-            if !path_dirs.contains(&d) {
-                path_dirs.push(d);
-            }
-        }
-    }
+    let binaries = resolve_runner_binaries(path_dirs, tool_bin, terminal::which_bin);
+    let path_dirs = binaries.path_dirs;
     let path_line = if path_dirs.is_empty() {
         String::new()
     } else {
@@ -1058,8 +1103,18 @@ fn create_runner_script_windows(
     let hcom_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "hcom".to_string());
+    let tool_path_arg = binaries
+        .tool_path
+        .as_deref()
+        .map(|path| format!(" --hcom-tool-path {}", terminal::ps_quote(path)))
+        .unwrap_or_default();
     let run_line = if tool_args.is_empty() {
-        format!("& {} pty {}", terminal::ps_quote(&hcom_bin), tool)
+        format!(
+            "& {} pty {}{}",
+            terminal::ps_quote(&hcom_bin),
+            tool,
+            tool_path_arg
+        )
     } else {
         let args_file = launch_dir.join(format!(
             "{}_{}_{}_{}.args.json",
@@ -1071,9 +1126,10 @@ fn create_runner_script_windows(
         let mut file = crate::sys::fs::create_private_new(&args_file)?;
         file.write_all(serde_json::to_string(tool_args)?.as_bytes())?;
         format!(
-            "& {} pty {} --hcom-args-file {}",
+            "& {} pty {}{} --hcom-args-file {}",
             terminal::ps_quote(&hcom_bin),
             tool,
+            tool_path_arg,
             terminal::ps_quote(&args_file.to_string_lossy())
         )
     };
@@ -1222,16 +1278,8 @@ pub fn create_runner_script(
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
-    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name)
-            && let Some(dir) = Path::new(&bin_path).parent()
-        {
-            let d = dir.to_string_lossy().to_string();
-            if !path_dirs.contains(&d) {
-                path_dirs.push(d);
-            }
-        }
-    }
+    let binaries = resolve_runner_binaries(path_dirs, tool_bin, terminal::which_bin);
+    let path_dirs = binaries.path_dirs;
 
     let path_export = if !path_dirs.is_empty() {
         format!("export PATH=\"{}:$PATH\"", path_dirs.join(":"))
@@ -1240,6 +1288,16 @@ pub fn create_runner_script(
     };
 
     let use_exec = if run_here { "" } else { "exec " };
+    let tool_path_arg = binaries
+        .tool_path
+        .as_deref()
+        .map(|path| {
+            format!(
+                " --hcom-tool-path {}",
+                crate::tools::args_common::shell_quote(path)
+            )
+        })
+        .unwrap_or_default();
 
     let content = format!(
         "#!/bin/bash\n\
@@ -1254,7 +1312,7 @@ pub fn create_runner_script(
          {}\n\
          {}\n\
          \n\
-         {}{} pty {} {}\n",
+         {}{} pty {}{} {}\n",
         tool.chars()
             .next()
             .unwrap_or('?')
@@ -1273,6 +1331,7 @@ pub fn create_runner_script(
         use_exec,
         crate::tools::args_common::shell_quote(&native_bin_str),
         tool,
+        tool_path_arg,
         tool_args_str,
     );
 
@@ -3406,6 +3465,55 @@ mod tests {
             runner_env.get("RORI_BACKGROUND_AUTH").map(String::as_str),
             Some("auth-token")
         );
+    }
+
+    #[test]
+    fn test_runner_binary_dirs_prioritize_selected_node_and_deduplicate() {
+        let resolved = HashMap::from([
+            ("codex", "pnpm/bin/codex"),
+            ("hcom", "target/debug/hcom"),
+            ("node", "nvm/bin/node"),
+            ("python3", "system/bin/python3"),
+        ]);
+        // Model an earlier dev-root/current-exe insertion. Resolving hcom to the
+        // same directory must not add it twice.
+        let binaries = resolve_runner_binaries(vec!["target/debug".to_string()], "codex", |name| {
+            resolved.get(name).map(ToString::to_string)
+        });
+
+        assert_eq!(
+            binaries.path_dirs,
+            ["nvm/bin", "target/debug", "pnpm/bin", "system/bin"].map(ToString::to_string)
+        );
+        assert_eq!(binaries.tool_path.as_deref(), Some("pnpm/bin/codex"));
+        assert!(
+            binaries.path_dirs.iter().position(|dir| dir == "nvm/bin")
+                < binaries
+                    .path_dirs
+                    .iter()
+                    .position(|dir| dir == "system/bin"),
+            "the selected Node directory must precede every generic system directory"
+        );
+    }
+
+    #[test]
+    fn test_runner_binary_dirs_keep_system_tool_explicit_behind_selected_node() {
+        let resolved = HashMap::from([
+            ("codex", "system/bin/codex"),
+            ("hcom", "system/bin/hcom"),
+            ("node", "nvm/bin/node"),
+            ("python3", "system/bin/python3"),
+        ]);
+
+        let binaries = resolve_runner_binaries(vec![], "codex", |name| {
+            resolved.get(name).map(ToString::to_string)
+        });
+
+        assert_eq!(
+            binaries.path_dirs,
+            ["nvm/bin", "system/bin"].map(ToString::to_string)
+        );
+        assert_eq!(binaries.tool_path.as_deref(), Some("system/bin/codex"));
     }
 
     // Unix-only: asserts the bash runner's `. 'sidecar'` sourcing + unset block;

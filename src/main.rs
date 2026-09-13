@@ -108,23 +108,36 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     let tool_str = &args[0];
 
-    // Windows runner scripts pass tool args via a JSON sidecar file instead of
-    // inline argv (see create_runner_script_windows): the PowerShell →
-    // native-exe boundary corrupts arguments with embedded double quotes.
-    let sidecar_args: Vec<String>;
-    let tool_args: Vec<&str> = if args.get(1).map(String::as_str) == Some("--hcom-args-file") {
-        let Some(path) = args.get(2) else {
-            bail!("--hcom-args-file requires a path");
+    // Generated runners pin the tool resolved from the caller's PATH before
+    // installing their runtime-first PATH. Windows runner scripts additionally
+    // pass tool args via a JSON sidecar because the PowerShell → native-exe
+    // boundary corrupts arguments with embedded double quotes.
+    let mut arg_index = 1;
+    let tool_path = if args.get(arg_index).map(String::as_str) == Some("--hcom-tool-path") {
+        let Some(path) = args.get(arg_index + 1) else {
+            bail!("--hcom-tool-path requires a path");
         };
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read args file {path}"))?;
-        let _ = std::fs::remove_file(path);
-        sidecar_args = serde_json::from_str(&content)
-            .with_context(|| format!("Invalid JSON in args file {path}"))?;
-        sidecar_args.iter().map(|s| s.as_str()).collect()
+        arg_index += 2;
+        Some(path.as_str())
     } else {
-        args[1..].iter().map(|s| s.as_str()).collect()
+        None
     };
+
+    let sidecar_args: Vec<String>;
+    let tool_args: Vec<&str> =
+        if args.get(arg_index).map(String::as_str) == Some("--hcom-args-file") {
+            let Some(path) = args.get(arg_index + 1) else {
+                bail!("--hcom-args-file requires a path");
+            };
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read args file {path}"))?;
+            let _ = std::fs::remove_file(path);
+            sidecar_args = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in args file {path}"))?;
+            sidecar_args.iter().map(|s| s.as_str()).collect()
+        } else {
+            args[arg_index..].iter().map(|s| s.as_str()).collect()
+        };
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
@@ -140,7 +153,10 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         .parse::<tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool_str);
-    let resolved = terminal::which_bin(tool_exe).unwrap_or_else(|| tool_exe.to_string());
+    let resolved = tool_path
+        .map(ToString::to_string)
+        .or_else(|| terminal::which_bin(tool_exe))
+        .unwrap_or_else(|| tool_exe.to_string());
 
     // On Termux, some wrapped tools need a launcher override instead of direct exec.
     let (command, extra_args): (String, Vec<String>);
