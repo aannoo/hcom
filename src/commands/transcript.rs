@@ -236,19 +236,6 @@ fn attribute_disk_match(
     owner
 }
 
-/// Get transcript path for an instance from DB.
-fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
-    db.conn()
-        .query_row(
-            "SELECT transcript_path FROM instances WHERE name = ?",
-            rusqlite::params![name],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
-}
-
 /// Build an appropriate error message when transcript resolution fails.
 /// Uses resolve_display_name_or_stopped (which handles exact base and tag-name
 /// resolution) to check if the instance exists without a transcript.
@@ -1360,20 +1347,33 @@ fn resolve_instance_transcript(
     db: &HcomDb,
     name: &str,
 ) -> Option<(String, String, String, Option<String>)> {
-    let name = crate::identity::resolve_display_name_or_stopped(db, name)
-        .unwrap_or_else(|| name.to_string());
+    // An exact live or stopped identity is authoritative even when it has no
+    // transcript. Only infer a prefix when no exact identity exists; otherwise
+    // a transcript-bearing longer name can disclose the wrong conversation.
+    if let Some(exact_name) = crate::identity::resolve_display_name_or_stopped(db, name) {
+        match db.get_instance_full(&exact_name) {
+            Ok(Some(instance)) if !instance.transcript_path.is_empty() => {
+                return Some((
+                    exact_name,
+                    instance.transcript_path,
+                    instance.tool,
+                    instance.session_id,
+                ));
+            }
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
 
-    // Direct match
-    if let Some(path) = get_transcript_path(db, &name) {
-        let (tool, sid) = db
-            .conn()
-            .query_row(
-                "SELECT tool, session_id FROM instances WHERE name = ?",
-                rusqlite::params![&name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .unwrap_or_else(|_| (detect_agent_type(&path).to_string(), None));
-        return Some((name, path, tool, sid));
+        if let Ok((path, sid)) = db.conn().query_row(
+            "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&exact_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        ) {
+            let agent = detect_agent_type(&path).to_string();
+            return Some((exact_name, path, agent, sid));
+        }
+
+        return None;
     }
 
     // Prefix match (literal matching; only an unambiguous single match returns immediately)
@@ -1402,16 +1402,6 @@ fn resolve_instance_transcript(
         {
             return Some(matches.into_iter().next().unwrap());
         }
-    }
-
-    // Check stopped events (session_id from snapshot)
-    if let Ok((path, sid)) = db.conn().query_row(
-        "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
-        rusqlite::params![&name],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-    ) {
-        let agent = detect_agent_type(&path).to_string();
-        return Some((name, path, agent, sid));
     }
 
     None
@@ -2135,6 +2125,95 @@ mod tests {
         assert_eq!(name, "exact");
         assert_eq!(path, p_exact.to_str().unwrap());
         assert_eq!(tool, "codex");
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_live_without_transcript_blocks_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) VALUES ('pico', 1.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let p_longer = dir.path().join("pico_worker.jsonl");
+        fs::write(&p_longer, "").unwrap();
+        insert_test_instance(&db, "pico_worker", p_longer.to_str().unwrap(), "codex");
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "pico"),
+            None,
+            "an exact live identity without a transcript must not borrow a prefix match"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_stopped_preempts_unique_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_longer = dir.path().join("pico_worker.jsonl");
+        let p_stopped = dir.path().join("pico_stopped.jsonl");
+        fs::write(&p_longer, "").unwrap();
+        fs::write(&p_stopped, "").unwrap();
+        insert_test_instance(&db, "pico_worker", p_longer.to_str().unwrap(), "codex");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'pico', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": p_stopped.to_str().unwrap(),
+                            "session_id": "sess-pico-stopped"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let resolved = resolve_instance_transcript(&db, "pico").unwrap();
+        assert_eq!(resolved.0, "pico");
+        assert_eq!(resolved.1, p_stopped.to_str().unwrap());
+        assert_eq!(resolved.3.as_deref(), Some("sess-pico-stopped"));
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_live_without_transcript_blocks_stale_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) VALUES ('pico', 1.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let p_stopped = dir.path().join("pico_stopped.jsonl");
+        fs::write(&p_stopped, "").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'pico', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {"transcript_path": p_stopped.to_str().unwrap()}
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "pico"),
+            None,
+            "a current exact identity must not inherit an older incarnation's transcript"
+        );
     }
 
     #[test]
