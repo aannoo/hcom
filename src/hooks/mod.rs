@@ -519,6 +519,8 @@ pub enum HookResult {
     Block {
         /// Reason text (formatted messages for delivery).
         reason: String,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Update the tool input before execution (exit 0, updatedInput field).
@@ -755,11 +757,16 @@ mod tests {
     fn test_hook_result_block() {
         let result = HookResult::Block {
             reason: "<hcom>message here</hcom>".into(),
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 2);
         match &result {
-            HookResult::Block { reason } => {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
                 assert_eq!(reason, "<hcom>message here</hcom>");
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Block"),
         }
