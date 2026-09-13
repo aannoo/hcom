@@ -20,6 +20,7 @@ const FLAG_MAP: &[(&str, &str)] = &[
     ("--file", "file"),
     ("--cmd", "cmd"),
     ("--from", "from"),
+    ("--participant", "participant"),
     ("--mention", "mention"),
     ("--action", "action"),
     ("--after", "after"),
@@ -33,7 +34,14 @@ const FLAG_MAP: &[(&str, &str)] = &[
 /// Flags that require type='status'.
 const STATUS_FLAGS: &[&str] = &["status", "context", "file", "cmd"];
 /// Flags that require type='message'.
-const MESSAGE_FLAGS: &[&str] = &["from", "mention", "intent", "thread", "reply_to"];
+const MESSAGE_FLAGS: &[&str] = &[
+    "from",
+    "participant",
+    "mention",
+    "intent",
+    "thread",
+    "reply_to",
+];
 /// Flags that require type='life'.
 const LIFE_FLAGS: &[&str] = &["action"];
 
@@ -155,7 +163,7 @@ pub fn parse_event_flags(argv: &[String]) -> Result<(FilterMap, Vec<String>), St
 ///
 ///
 pub fn resolve_filter_names(filters: &mut FilterMap, db: &crate::db::HcomDb) {
-    for key in ["instance", "mention"] {
+    for key in ["instance", "participant", "mention"] {
         let Some(names) = filters.get_mut(key) else {
             continue;
         };
@@ -279,6 +287,22 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
         clauses.push("type = 'message'".into());
     } else if LIFE_FLAGS.iter().any(|f| filters.contains_key(*f)) {
         clauses.push("type = 'life'".into());
+    }
+
+    // A participant is either the message's routing instance (the sender) or
+    // one of its delivery recipients. Unlike --agent, this reconstructs both
+    // sides of an hcom transport exchange.
+    if let Some(values) = filters.get("participant") {
+        let participant_clauses: Vec<String> = values
+            .iter()
+            .map(|value| {
+                let value = escape_sql(value);
+                format!(
+                    "(instance = '{value}' OR EXISTS (SELECT 1 FROM json_each(msg_delivered_to) WHERE value = '{value}'))"
+                )
+            })
+            .collect();
+        clauses.push(or_wrap(participant_clauses));
     }
 
     // Status filter
@@ -466,6 +490,9 @@ pub struct EventFilterArgs {
     pub cmd: Vec<String>,
     #[arg(long)]
     pub from: Vec<String>,
+    /// Include messages sent by or delivered to this participant.
+    #[arg(long)]
+    pub participant: Vec<String>,
     #[arg(long)]
     pub mention: Vec<String>,
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
@@ -522,6 +549,7 @@ impl EventFilterArgs {
         insert_if_nonempty!("file", self.file.clone());
         insert_if_nonempty!("cmd", self.cmd.clone());
         insert_if_nonempty!("from", self.from.clone());
+        insert_if_nonempty!("participant", self.participant.clone());
         insert_if_nonempty!("mention", self.mention.clone());
         insert_if_nonempty!("action", self.action.clone());
         insert_if_nonempty!("after", self.after.clone());
@@ -546,6 +574,7 @@ impl EventFilterArgs {
             || !self.file.is_empty()
             || !self.cmd.is_empty()
             || !self.from.is_empty()
+            || !self.participant.is_empty()
             || !self.mention.is_empty()
             || !self.action.is_empty()
             || !self.after.is_empty()
@@ -659,6 +688,16 @@ mod tests {
         filters.insert("instance".into(), vec!["peso".into(), "luna".into()]);
         let sql = build_sql_from_flags(&filters).unwrap();
         assert!(sql.contains("instance IN ('peso', 'luna')"));
+    }
+
+    #[test]
+    fn test_build_participant_matches_sender_and_recipient() {
+        let mut filters = FilterMap::new();
+        filters.insert("participant".into(), vec!["pita".into()]);
+        let sql = build_sql_from_flags(&filters).unwrap();
+        assert!(sql.contains("type = 'message'"));
+        assert!(sql.contains("instance = 'pita'"));
+        assert!(sql.contains("json_each(msg_delivered_to) WHERE value = 'pita'"));
     }
 
     #[test]

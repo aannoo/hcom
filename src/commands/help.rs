@@ -31,6 +31,10 @@ const FILTER_HELP: &[HelpEntry] = &[
     ),
     ("  --collision", "Two agents edit same file within 30s"),
     ("  --from NAME", "Sender"),
+    (
+        "  --participant NAME",
+        "Message sender or delivery recipient",
+    ),
     ("  --mention NAME", "@mention target"),
     ("  --intent VAL", "request | inform | ack"),
     ("  --thread NAME", "Thread name"),

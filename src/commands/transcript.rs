@@ -252,14 +252,29 @@ fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
 /// Build an appropriate error message when transcript resolution fails.
 /// Uses resolve_display_name_or_stopped (which handles exact base and tag-name
 /// resolution) to check if the instance exists without a transcript.
-fn no_transcript_error(db: &HcomDb, name: &str) -> String {
+fn no_transcript_error(
+    db: &HcomDb,
+    name: &str,
+    display_name: &str,
+    device: Option<&str>,
+) -> String {
     if let Some(resolved) = crate::identity::resolve_display_name_or_stopped(db, name) {
+        let display_name = if display_name.is_empty() {
+            &resolved
+        } else {
+            display_name
+        };
+        let command = match device {
+            Some(device) => format!(
+                "hcom events --remote-fetch --device {device} --participant {resolved} --type message"
+            ),
+            None => format!("hcom events --participant {resolved} --type message"),
+        };
         format!(
-            "Agent '{}' has no transcript yet — no messages have been exchanged",
-            resolved
+            "No model transcript is registered for {display_name}.\nView transport messages with: {command}"
         )
     } else {
-        format!("Agent '{name}' not found")
+        format!("Agent '{display_name}' not found")
     }
 }
 
@@ -1006,6 +1021,8 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
                 crate::relay::control::rpc_action::TRANSCRIPT,
                 &json!({
                     "target": base_name,
+                    "display_target": resolved,
+                    "origin_device": device,
                     "last": last_n,
                     "range": args.range_flag.as_ref().or(args.range_positional.as_ref()),
                     "json": json_mode,
@@ -1050,7 +1067,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         match resolved {
             Some(r) => r,
             None => {
-                eprintln!("Error: {}", no_transcript_error(db, name));
+                eprintln!("Error: {}", no_transcript_error(db, name, name, None));
                 return 1;
             }
         }
@@ -1210,6 +1227,8 @@ pub fn render_instance_transcript(
             last_n,
             ..Default::default()
         },
+        name,
+        None,
     )
 }
 
@@ -1233,7 +1252,21 @@ pub fn render_instance_transcript_with_options_no_retry(
             detailed,
             retry_codex: false,
         },
+        name,
+        None,
     )
+}
+
+/// Render a remote transcript while retaining the caller's device-qualified
+/// name in diagnostics.
+pub fn render_remote_instance_transcript_with_options_no_retry(
+    db: &HcomDb,
+    name: &str,
+    display_name: &str,
+    device: &str,
+    opts: &TranscriptRenderOpts<'_>,
+) -> Result<String, String> {
+    render_instance_transcript_impl(db, name, opts, display_name, Some(device))
 }
 
 pub fn render_instance_transcript_with_options(
@@ -1256,6 +1289,8 @@ pub fn render_instance_transcript_with_options(
             detailed,
             retry_codex: true,
         },
+        name,
+        None,
     )
 }
 
@@ -1263,9 +1298,12 @@ fn render_instance_transcript_impl(
     db: &HcomDb,
     name: &str,
     opts: &TranscriptRenderOpts<'_>,
+    display_name: &str,
+    device: Option<&str>,
 ) -> Result<String, String> {
     let (instance_name, transcript_path, agent_type, session_id) =
-        resolve_instance_transcript(db, name).ok_or_else(|| no_transcript_error(db, name))?;
+        resolve_instance_transcript(db, name)
+            .ok_or_else(|| no_transcript_error(db, name, display_name, device))?;
     let (range_start, range_end) = if let Some(r) = opts.range {
         parse_range(r)
     } else {
@@ -1433,6 +1471,45 @@ mod tests {
         db.init_db().unwrap();
         std::mem::forget(dir);
         db
+    }
+
+    #[test]
+    fn known_agent_without_transcript_points_to_transport_history() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+             VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita", "pita", None);
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita.\n\
+View transport messages with: hcom events --participant pita --type message"
+        );
+        assert!(!error.contains("no messages have been exchanged"));
+    }
+
+    #[test]
+    fn remote_agent_without_transcript_queries_its_origin_device() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita", "pita:ABCD", Some("ABCD"));
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita:ABCD.\n\
+View transport messages with: hcom events --remote-fetch --device ABCD --participant pita --type message"
+        );
     }
 
     #[test]
