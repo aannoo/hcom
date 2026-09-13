@@ -361,6 +361,74 @@ fn intent_and_reply_to_roundtrip() {
 }
 
 #[test]
+fn remote_reply_to_origin_resolves_imported_event_row() {
+    let h = Hcom::new();
+    let a = h.start();
+    let b = h.start();
+
+    // Direct SQLite access to seed colliding local event and imported remote event
+    let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open hcom db");
+
+    // Colliding local message at id = 42
+    let local_data = serde_json::json!({
+        "from": a,
+        "text": "colliding local message",
+        "intent": "request"
+    });
+    conn.execute(
+        "INSERT INTO events (id, type, instance, timestamp, data) VALUES (42, 'message', ?1, '2026-09-04T00:00:00Z', ?2)",
+        rusqlite::params![a, local_data.to_string()],
+    )
+    .expect("insert colliding local event");
+
+    // Imported relay message at id = 100 with origin 42 and device short BOXE
+    let remote_data = serde_json::json!({
+        "from": "remote:BOXE",
+        "text": "remote request",
+        "intent": "request",
+        "_relay": {
+            "id": 42,
+            "short": "BOXE",
+            "device": "dev-uuid-boxe"
+        }
+    });
+    conn.execute(
+        "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote:BOXE', '2026-09-04T00:00:01Z', ?1)",
+        rusqlite::params![remote_data.to_string()],
+    )
+    .expect("insert remote imported event");
+
+    // Reply using remote token 42:BOXE
+    let (c, _, e) = h.run([
+        "send",
+        &format!("@{a}"),
+        "--name",
+        &b,
+        "--intent",
+        "ack",
+        "--reply-to",
+        "42:BOXE",
+        "--",
+        "pong",
+    ]);
+    assert_eq!(c, 0, "ack send with remote reply-to failed: stderr={e}");
+
+    let (_, ack_out, _) = h.run(["events", "--intent", "ack", "--last", "5", "--full"]);
+    let ack: serde_json::Value = ack_out
+        .lines()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .expect("ack event present");
+
+    assert_eq!(ack["data"]["intent"], "ack");
+    assert_eq!(ack["data"]["reply_to"], "42:BOXE");
+    assert_eq!(
+        ack["data"]["reply_to_local"].as_i64(),
+        Some(100),
+        "reply_to_local must resolve to imported event id 100, not colliding local id 42; ack={ack}"
+    );
+}
+
+#[test]
 fn lifecycle_events_emitted_for_start_and_stop() {
     // Wiki contract (agent-lifecycle.md + event-model.md): start emits
     // life.started, stop emits life.stopped — filterable via --action.
