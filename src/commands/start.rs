@@ -843,7 +843,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        let mut env = HashMap::new();
         for (k, v) in tool_env {
             env.insert((*k).to_string(), (*v).to_string());
         }
@@ -853,8 +853,7 @@ mod tests {
     /// Claude context carrying exactly one session-id source, so an ambient
     /// value from the shell running the tests cannot decide the outcome.
     fn make_claude_ctx(session: Option<(&str, &str)>, cwd: &str) -> HcomContext {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
-        env.remove("CLAUDE_CODE_SESSION_ID");
+        let mut env = HashMap::new();
         env.insert("CLAUDECODE".to_string(), "1".to_string());
         if let Some((key, value)) = session {
             env.insert(key.to_string(), value.to_string());
@@ -1280,33 +1279,43 @@ mod tests {
     #[test]
     #[serial]
     fn test_start_rebind_allows_matching_stopped_snapshot_reclaim() {
-        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let db = HcomDb::open().unwrap();
+        for session_id in [None, Some("sid-current")] {
+            let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+            let db = HcomDb::open().unwrap();
 
-        log_stopped_snapshot(
-            &db,
-            "nova",
-            "claude",
-            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
-            "sid-nova",
-            77,
-        );
+            log_stopped_snapshot(
+                &db,
+                "nova",
+                "claude",
+                "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
+                "sid-nova",
+                77,
+            );
 
-        let ctx = make_ctx(
-            &[("CLAUDECODE", "1")],
-            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
-        );
+            let ctx = make_claude_ctx(
+                session_id.map(|sid| ("CLAUDE_CODE_SESSION_ID", sid)),
+                "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
+            );
 
-        let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
-        assert_eq!(exit_code, 0);
+            let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
+            assert_eq!(exit_code, 0);
 
-        let inst = db.get_instance_full("nova").unwrap().unwrap();
-        assert_eq!(inst.tool, "claude");
-        assert_eq!(
-            inst.directory,
-            "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes"
-        );
-        assert_eq!(inst.last_event_id, 77);
+            let inst = db.get_instance_full("nova").unwrap().unwrap();
+            assert_eq!(
+                inst.tool,
+                if session_id.is_some() {
+                    "claude"
+                } else {
+                    "adhoc"
+                }
+            );
+            assert_eq!(inst.session_id.as_deref(), session_id);
+            assert_eq!(
+                inst.directory,
+                "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes"
+            );
+            assert_eq!(inst.last_event_id, 77);
+        }
     }
 
     #[test]
