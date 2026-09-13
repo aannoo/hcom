@@ -64,6 +64,10 @@ const CODEX_NATIVE: &[EnvPredicate] = &[
         var: "CODEX_THREAD_ID",
         condition: EnvMatch::Set,
     },
+    EnvPredicate {
+        var: "CODEX_SESSION_ID",
+        condition: EnvMatch::Set,
+    },
 ];
 const OPENCODE_NATIVE: &[EnvPredicate] = &[EnvPredicate {
     var: "OPENCODE",
@@ -149,6 +153,7 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
             "CODEX_MANAGED_BY_NPM",
             "CODEX_MANAGED_BY_BUN",
             "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
         ],
     },
     ToolDetectionRule {

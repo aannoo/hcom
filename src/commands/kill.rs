@@ -77,7 +77,7 @@ fn resolve_initiator(db: &HcomDb, explicit_name: Option<&str>) -> String {
     if let Some(name) = explicit_name {
         return name.to_string();
     }
-    match identity::resolve_identity(db, None, None, None, None, None, None) {
+    match identity::resolve_identity(db, None, None, None, None, None) {
         Ok(id) if matches!(id.kind, crate::shared::SenderKind::Instance) => id.name,
         _ => "cli".to_string(),
     }

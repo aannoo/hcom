@@ -20,7 +20,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, value};
 
 use crate::db::{HcomDb, InstanceRow};
-use crate::hooks::{HookPayload, HookResult, common, family};
+use crate::hooks::{HookPayload, HookResult, common};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
@@ -251,51 +251,13 @@ fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> O
     )
 }
 
-fn bind_vanilla_instance_codex(
-    db: &HcomDb,
-    session_id: &str,
-    transcript_path: Option<&str>,
-) -> Option<String> {
-    let pending = common::get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
-    }
-
-    let derived_path = if transcript_path.is_none() || transcript_path == Some("") {
-        derive_codex_transcript_path(session_id)
-    } else {
-        None
-    };
-    let effective_path = transcript_path
-        .filter(|s| !s.is_empty())
-        .or(derived_path.as_deref())?;
-    let effective_path = normalize_codex_transcript_path(effective_path);
-
-    let instance_name = common::find_last_bind_marker(&effective_path)?;
-
-    family::bind_vanilla_instance(
-        db,
-        &instance_name,
-        Some(session_id).filter(|s| !s.is_empty()),
-        Some(&effective_path),
-        "codex",
-        "codex-sessionstart",
-    )
-}
-
 fn resolve_codex_instance(
     db: &HcomDb,
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> Option<InstanceRow> {
     let session_id = payload.session_id.as_deref().unwrap_or("");
-    if let Some(instance) = resolve_instance_codex(db, ctx, session_id) {
-        return Some(instance);
-    }
-
-    let bound_name =
-        bind_vanilla_instance_codex(db, session_id, payload.transcript_path.as_deref())?;
-    db.get_instance_full(&bound_name).ok().flatten()
+    resolve_instance_codex(db, ctx, session_id)
 }
 
 fn update_codex_position(

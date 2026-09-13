@@ -700,7 +700,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     if from_name.is_some() {
         let actor_from_ctx = ctx.and_then(|c| c.identity.clone());
         let actor = actor_from_ctx
-            .or_else(|| identity::resolve_identity(db, None, None, None, None, None, None).ok());
+            .or_else(|| identity::resolve_identity(db, None, None, None, None, None).ok());
         match actor {
             Some(ref actor) if matches!(actor.kind, SenderKind::Instance) => {
                 if let Some(ref data) = actor.instance_data
@@ -843,7 +843,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     } else if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
         id.clone()
     } else if let Some(name) = explicit_name {
-        match identity::resolve_identity(db, Some(name), None, None, None, None, None) {
+        match identity::resolve_identity(db, Some(name), None, None, None, None) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -851,7 +851,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             }
         }
     } else {
-        match identity::resolve_identity(db, None, None, None, None, None, None) {
+        match identity::resolve_identity(db, None, None, None, None, None) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("Error: {e}");

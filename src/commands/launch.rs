@@ -321,7 +321,7 @@ pub(crate) fn resolve_launcher_name(
         })
         .or_else(|| flags.name.clone())
         .unwrap_or_else(|| {
-            identity::resolve_identity(db, None, None, None, process_id, None, None)
+            identity::resolve_identity(db, None, None, None, process_id, None)
                 .map(|id| id.name)
                 .unwrap_or_else(|_| "user".to_string())
         })

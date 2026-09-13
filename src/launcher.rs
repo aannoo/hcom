@@ -1846,15 +1846,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
         let process_id = std::env::var("HCOM_PROCESS_ID").ok();
-        match crate::identity::resolve_identity(
-            db,
-            None,
-            None,
-            None,
-            process_id.as_deref(),
-            None,
-            None,
-        ) {
+        match crate::identity::resolve_identity(db, None, None, None, process_id.as_deref(), None) {
             Ok(id) => id.name,
             Err(_) => "api".to_string(),
         }
@@ -2499,6 +2491,7 @@ mod tests {
                 "CODEX_MANAGED_BY_NPM",
                 "CODEX_MANAGED_BY_BUN",
                 "CODEX_THREAD_ID",
+                "CODEX_SESSION_ID",
                 "OPENCODE",
                 "KILO",
                 "CURSOR_AGENT",

@@ -56,14 +56,13 @@ pub fn build_ctx_for_command(
                 None,
                 process_id,
                 codex_thread_id,
-                None,
             )?)
         } else {
             None
         }
     } else {
         // No explicit name: best-effort, swallow errors
-        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok()
+        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id).ok()
     };
 
     Ok(CommandContext {

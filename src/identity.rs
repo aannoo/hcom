@@ -276,7 +276,6 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 /// * `session_id` - Explicit session_id (for hook context, bypasses env detection)
 /// * `process_id` - HCOM_PROCESS_ID (for launched instances)
 /// * `codex_thread_id` - Codex thread ID for opportunistic session binding
-/// * `transcript_fallback` - Optional closure for transcript marker resolution
 ///
 /// # Priority
 ///
@@ -284,9 +283,8 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 /// 2. `session_id` - explicit session (internal use)
 /// 3. `name` (--name) - strict instance lookup
 /// 4. Auto-detect from `process_id` (HCOM_PROCESS_ID)
-/// 5. `transcript_fallback` - transcript marker scan (hook extension point)
-/// 6. Error if no identity
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// 5. Error if no identity
+#[allow(clippy::too_many_arguments)]
 fn resolve_identity_with_expectation(
     db: &HcomDb,
     name: Option<&str>,
@@ -295,7 +293,6 @@ fn resolve_identity_with_expectation(
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
     identity_expected: bool,
-    transcript_fallback: Option<&dyn Fn(&HcomDb) -> Option<SenderIdentity>>,
 ) -> Result<SenderIdentity, HcomError> {
     // 1. System sender (internal use)
     if let Some(sender) = system_sender {
@@ -452,14 +449,7 @@ fn resolve_identity_with_expectation(
         }
     }
 
-    // 5. Transcript marker fallback (hook extension point)
-    if let Some(fallback) = transcript_fallback
-        && let Some(identity) = fallback(db)
-    {
-        return Ok(identity);
-    }
-
-    // 6. No identity
+    // 5. No identity
     if identity_expected {
         crate::log::log_warn(
             "identity",
@@ -477,7 +467,6 @@ fn resolve_identity_with_expectation(
     ))
 }
 
-#[allow(clippy::type_complexity)]
 pub fn resolve_identity(
     db: &HcomDb,
     name: Option<&str>,
@@ -485,7 +474,6 @@ pub fn resolve_identity(
     session_id: Option<&str>,
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
-    transcript_fallback: Option<&dyn Fn(&HcomDb) -> Option<SenderIdentity>>,
 ) -> Result<SenderIdentity, HcomError> {
     resolve_identity_with_expectation(
         db,
@@ -495,7 +483,6 @@ pub fn resolve_identity(
         process_id,
         codex_thread_id,
         crate::shared::is_inside_ai_tool(),
-        transcript_fallback,
     )
 }
 
@@ -700,7 +687,7 @@ mod tests {
         let (db, _dir) = make_test_db();
 
         let identity =
-            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None, None).unwrap();
+            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::System));
         assert_eq!(identity.name, "hcom-launcher");
     }
@@ -711,7 +698,7 @@ mod tests {
         insert_instance(&db, "luna", Some("sess-1"), None);
         insert_session_binding(&db, "sess-1", "luna");
 
-        let identity = resolve_identity(&db, None, None, Some("sess-1"), None, None, None).unwrap();
+        let identity = resolve_identity(&db, None, None, Some("sess-1"), None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::Instance));
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
@@ -722,7 +709,7 @@ mod tests {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", None, None);
 
-        let identity = resolve_identity(&db, Some("luna"), None, None, None, None, None).unwrap();
+        let identity = resolve_identity(&db, Some("luna"), None, None, None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 
@@ -732,8 +719,7 @@ mod tests {
         insert_instance(&db, "luna", Some("sess-1"), None);
         insert_process_binding(&db, "pid-123", "luna");
 
-        let identity =
-            resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap();
+        let identity = resolve_identity(&db, None, None, None, Some("pid-123"), None).unwrap();
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
     }
@@ -745,16 +731,8 @@ mod tests {
         insert_instance(&db, "luna", None, None);
         insert_process_binding(&db, "pid-123", "luna");
 
-        let identity = resolve_identity(
-            &db,
-            None,
-            None,
-            None,
-            Some("pid-123"),
-            Some("thread-abc"),
-            None,
-        )
-        .unwrap();
+        let identity =
+            resolve_identity(&db, None, None, None, Some("pid-123"), Some("thread-abc")).unwrap();
         assert_eq!(identity.name, "luna");
         // Session should now be bound
         assert_eq!(identity.session_id.as_deref(), Some("thread-abc"));
@@ -769,34 +747,15 @@ mod tests {
         let (db, _dir) = make_test_db();
         // No process binding exists
 
-        let err = resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap_err();
+        let err = resolve_identity(&db, None, None, None, Some("pid-123"), None).unwrap_err();
         assert!(err.to_string().contains("expired"));
-    }
-
-    #[test]
-    fn test_resolve_identity_transcript_fallback() {
-        let (db, _dir) = make_test_db();
-        insert_instance(&db, "nova", Some("sess-2"), None);
-
-        let fallback = |_db: &HcomDb| -> Option<SenderIdentity> {
-            Some(SenderIdentity {
-                kind: SenderKind::Instance,
-                name: "nova".to_string(),
-                instance_data: None,
-                session_id: Some("sess-2".to_string()),
-            })
-        };
-
-        let identity =
-            resolve_identity(&db, None, None, None, None, None, Some(&fallback)).unwrap();
-        assert_eq!(identity.name, "nova");
     }
 
     #[test]
     fn test_resolve_identity_no_identity() {
         let (db, _dir) = make_test_db();
 
-        let err = resolve_identity(&db, None, None, None, None, None, None).unwrap_err();
+        let err = resolve_identity(&db, None, None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("No hcom identity"));
     }
 
@@ -806,16 +765,8 @@ mod tests {
         insert_instance(&db, "luna", None, None);
 
         // system_sender takes priority over name
-        let identity = resolve_identity(
-            &db,
-            Some("luna"),
-            Some("hcom-launcher"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let identity =
+            resolve_identity(&db, Some("luna"), Some("hcom-launcher"), None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::System));
         assert_eq!(identity.name, "hcom-launcher");
     }
@@ -829,7 +780,7 @@ mod tests {
 
         // session_id takes priority over name
         let identity =
-            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None, None).unwrap();
+            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 
@@ -898,7 +849,6 @@ mod tests {
             None,
             Some("pid-codex"),
             Some("thread-resume"),
-            None,
         )
         .unwrap();
 
@@ -925,7 +875,6 @@ mod tests {
             None,
             Some("pid-codex"),
             Some("thread-same"),
-            None,
         )
         .unwrap();
 
