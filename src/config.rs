@@ -1977,6 +1977,7 @@ mod tests {
             "wezterm",
             "tmux",
             "alacritty",
+            "ptyxis",
             "terminal.app",
             "iterm",
         ] {

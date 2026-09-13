@@ -194,6 +194,8 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         "GHOSTTY_RESOURCES_DIR",
         "ITERM_SESSION_ID",
         "ALACRITTY_WINDOW_ID",
+        "PTYXIS_PROFILE",
+        "PTYXIS_VERSION",
         "GNOME_TERMINAL_SCREEN",
         "KONSOLE_DBUS_WINDOW",
         "TERMINATOR_UUID",
