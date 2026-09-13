@@ -1165,3 +1165,207 @@ fn pi_e2e_hook_dispatch() {
         .unwrap_or_else(|| panic!("stopped event missing: {stdout}"));
     assert_eq!(stopped["data"]["action"].as_str(), Some("stopped"));
 }
+
+enum UnreadTiming {
+    Preexisting,
+    ArrivingAfterReadiness,
+}
+
+struct ChildGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().unwrap().try_wait()
+    }
+
+    /// Wait for the child to exit up to `timeout`. Kills and reaps if the deadline is exceeded.
+    /// Captures all stdout and stderr.
+    fn wait_bounded(mut self, timeout: Duration) -> (i32, String, String) {
+        let deadline = Instant::now() + timeout;
+        let mut child = self.child.take().unwrap();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        use std::io::Read;
+                        let _ = out.read_to_end(&mut stdout);
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = err.read_to_end(&mut stderr);
+                    }
+                    return (
+                        status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&stdout).into_owned(),
+                        String::from_utf8_lossy(&stderr).into_owned(),
+                    );
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "events --wait CLI child process exceeded bounded deadline of {timeout:?}"
+                    );
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("events --wait CLI child try_wait error: {e}");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn run_events_wait_cli_oracle(timing: UnreadTiming, wait_secs: u64, expected_code: i32) {
+    let h = Hcom::new();
+    let me = h.start();
+    let other = h.start();
+    let db_path = h.hcom_dir.join("hcom.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open test db");
+
+    conn.execute("DELETE FROM events", []).unwrap();
+    conn.execute(
+        "UPDATE instances SET last_event_id = 0 WHERE name IN (?1, ?2)",
+        rusqlite::params![me, other],
+    )
+    .unwrap();
+
+    let mut send_code = None;
+    if matches!(timing, UnreadTiming::Preexisting) {
+        let (sc, _, _) = h.run(["send", &format!("@{me}"), "--name", &other, "--", "pre"]);
+        send_code = Some(sc);
+    }
+
+    let initial_cursor: i64 = conn
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?1",
+            rusqlite::params![me],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let child = h
+        .cmd()
+        .args([
+            "events",
+            "--wait",
+            &wait_secs.to_string(),
+            "--sql",
+            "data LIKE '%sol002_target%'",
+            "--name",
+            &me,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn events wait");
+    let mut child = ChildGuard::new(child);
+
+    let mut endpoint_ready = false;
+    if matches!(timing, UnreadTiming::ArrivingAfterReadiness) {
+        for _ in 0..100 {
+            if let Ok(c) = rusqlite::Connection::open(&db_path)
+                && c.query_row(
+                    "SELECT 1 FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_wait' LIMIT 1",
+                    rusqlite::params![me],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false)
+            {
+                endpoint_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            endpoint_ready,
+            "waiter notify endpoint must be registered before sending arriving message"
+        );
+
+        let (sc, _, _) = h.run(["send", &format!("@{me}"), "--name", &other, "--", "arr"]);
+        send_code = Some(sc);
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    let mid_wait_cursor: i64 = conn
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?1",
+            rusqlite::params![me],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let premature_exit = child.try_wait().unwrap_or(None);
+
+    if expected_code == 0
+        && premature_exit.is_none()
+        && let Ok(c) = rusqlite::Connection::open(&db_path)
+    {
+        let data = serde_json::json!({"status": "active", "detail": "sol002_target"});
+        let _ = c.execute(
+            "INSERT INTO events (timestamp, type, instance, data) VALUES (datetime('now'), 'status', ?1, ?2)",
+            rusqlite::params![me, serde_json::to_string(&data).unwrap()],
+        );
+        let port: Option<u16> = c
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_wait'",
+                rusqlite::params![me],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(p) = port {
+            let _ = std::net::TcpStream::connect(("127.0.0.1", p));
+        }
+    }
+
+    let deadline_secs = wait_secs + 2;
+    let (code, stdout, stderr) = child.wait_bounded(Duration::from_secs(deadline_secs));
+
+    let preview_pattern = format!("<hcom>{other} → {me}</hcom>");
+    let preview_count = stdout.matches(&preview_pattern).count();
+
+    let send_ok = send_code.is_none_or(|c| c == 0);
+    let pending = premature_exit.is_none();
+    // Composite oracle: first establish send_ok and pending mid-wait.
+    // In GREEN, pending=true implies cursor unchanged, preview_count <= 1 (no duplicate preview),
+    // and expected final code. Endpoint registration is diagnostic-only and not required.
+    // In RED, premature_exit is Some(ExitStatus(0)), failing immediately on pending=false.
+    let oracle_passed = send_ok
+        && pending
+        && mid_wait_cursor == initial_cursor
+        && preview_count <= 1
+        && code == expected_code;
+
+    assert!(
+        oracle_passed,
+        "events --wait oracle failed (pending={pending}, premature_exit={premature_exit:?}, mid_cursor={mid_wait_cursor}, initial_cursor={initial_cursor}, preview_count={preview_count}, code={code}, expected_code={expected_code}, endpoint_ready={endpoint_ready}): stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn events_wait_cli_preexisting_unread_times_out_with_one() {
+    run_events_wait_cli_oracle(UnreadTiming::Preexisting, 2, 1);
+}
+
+#[test]
+fn events_wait_cli_arriving_unread_then_matching_status_exits_zero() {
+    run_events_wait_cli_oracle(UnreadTiming::ArrivingAfterReadiness, 4, 0);
+}
