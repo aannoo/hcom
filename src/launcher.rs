@@ -1028,8 +1028,10 @@ fn create_runner_script_windows(
          Set-Location {cwd}\n\
          {unset_line}\n\
          {env_block}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] environment ready' }}\n\
          {sidecar_source}\n\
          {path_line}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] starting PTY wrapper' }}\n\
          \n\
          {run_line}\n",
         cwd = terminal::ps_quote(cwd),
@@ -1227,20 +1229,23 @@ pub fn create_runner_script(
 }
 
 /// Build the command that runs a generated runner script in the launched
-/// terminal: PowerShell on Windows, bash elsewhere.
-fn runner_invocation_command(script_file: &str) -> String {
-    if cfg!(windows) {
-        format!(
-            "powershell {} {}",
-            crate::terminal::POWERSHELL_SCRIPT_FLAGS.join(" "),
-            crate::terminal::ps_quote(script_file)
-        )
+/// terminal. On Windows the outer launcher is already PowerShell, so invoke
+/// the runner in that process instead of starting a second PowerShell host.
+/// Besides avoiding needless startup cost, this removes a launch stage that
+/// can intermittently stall before `hcom pty` is reached.
+fn runner_invocation_command_for_platform(script_file: &str, windows: bool) -> String {
+    if windows {
+        format!("& {}", crate::terminal::ps_quote(script_file))
     } else {
         format!(
             "bash {}",
             crate::tools::args_common::shell_quote(script_file)
         )
     }
+}
+
+fn runner_invocation_command(script_file: &str) -> String {
+    runner_invocation_command_for_platform(script_file, cfg!(windows))
 }
 
 /// Launch a tool via PTY wrapper in a terminal.
@@ -3391,6 +3396,17 @@ mod tests {
             content.contains("exit $LASTEXITCODE"),
             "runner must surface the wrapped process's real exit code, not always report success"
         );
+        let environment_ready = content
+            .find("[hcom runner] environment ready")
+            .expect("background launches should expose the environment stage");
+        let sidecar_source = content
+            .find("Test-Path '")
+            .expect("ambient env should be sourced from a sidecar file");
+        let wrapper_start = content
+            .find("[hcom runner] starting PTY wrapper")
+            .expect("background launches should expose the wrapper stage");
+        assert!(environment_ready < sidecar_source);
+        assert!(sidecar_source < wrapper_start);
 
         let sidecar = content
             .split("Test-Path '")
@@ -3414,6 +3430,22 @@ mod tests {
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(sidecar).ok();
+    }
+
+    #[test]
+    fn test_windows_runner_invocation_reuses_outer_powershell() {
+        let command = runner_invocation_command_for_platform(r"C:\tmp\it's runner.ps1", true);
+        assert_eq!(command, r"& 'C:\tmp\it''s runner.ps1'");
+        assert!(
+            !command.to_ascii_lowercase().contains("powershell"),
+            "the outer PowerShell must not launch a redundant nested host"
+        );
+    }
+
+    #[test]
+    fn test_unix_runner_invocation_uses_bash() {
+        let command = runner_invocation_command_for_platform("/tmp/it's runner.sh", false);
+        assert_eq!(command, "bash '/tmp/it'\\''s runner.sh'");
     }
 
     // Tool args must travel via the JSON sidecar, never inline on the run
