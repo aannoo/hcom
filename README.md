@@ -121,8 +121,6 @@ Any other AI tool without hooks can join by running `hcom start`. Any process ca
 
 Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning. **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
 
-On Linux, **Ptyxis** is auto-detected and supported for opening agent windows. It is open-only because Ptyxis does not expose an API for closing a specific window or tab by ID.
-
 To configure a custom terminal open/close setup, tell an agent to run:
 
 ```bash

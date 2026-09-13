@@ -370,6 +370,16 @@ fn normalize_terminal_mode_for_launch(
     if opens_new_window {
         if terminal_mode == "default"
             && let Some(detected) = detect_terminal_from_env()
+            // Ptyxis is commonly installed as a Flatpak. Such shells export
+            // PTYXIS_VERSION even when no host-side `ptyxis` launcher exists,
+            // so environment detection alone is not enough to launch a new
+            // window. Keep `default` in that case and use the normal Linux
+            // fallback selection below. A configured `ptyxis.binary` override
+            // (for example, a wrapper around `flatpak run`) is honored.
+            && (detected != "ptyxis"
+                || crate::config::get_merged_preset("ptyxis")
+                    .and_then(|preset| preset.binary)
+                    .is_some_and(|binary| which_bin(&binary).is_some()))
         {
             terminal_mode = detected;
         }
@@ -3200,6 +3210,24 @@ mod tests {
         }
 
         assert_eq!(detect_terminal_from_env().as_deref(), Some("ptyxis"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_auto_detected_ptyxis_requires_host_launcher_for_new_window() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        let _path = EnvGuard::clear(&["PATH"]);
+        let empty_path = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PTYXIS_VERSION", "50.1");
+            std::env::set_var("PATH", empty_path.path());
+        }
+
+        let (mode, socket) = normalize_terminal_mode_for_launch("default".to_string(), true, false);
+
+        assert_eq!(mode, "default");
+        assert!(socket.is_empty());
     }
 
     #[test]
