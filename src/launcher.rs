@@ -383,7 +383,7 @@ where
     // HCOM_* settings from config.toml
     for (key, value) in hcom_config.to_env_dict() {
         if !value.is_empty() {
-            env.insert(key, value);
+            insert_effective_env(&mut env, key, value, cfg!(windows));
         }
     }
 
@@ -391,7 +391,7 @@ where
     let env_path = paths::hcom_path(&["env"]);
     for (key, value) in config::load_env_extras(&env_path) {
         if !value.is_empty() {
-            env.insert(key, value);
+            insert_effective_env(&mut env, key, value, cfg!(windows));
         }
     }
 
@@ -453,6 +453,36 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
     Some(root.join(dirname))
 }
 
+/// Insert an environment override using the target platform's key semantics.
+/// Windows environment names are case-insensitive, while `HashMap` keys are
+/// not; remove an earlier spelling so the child receives one authoritative
+/// value instead of an order-dependent pair.
+fn insert_effective_env(
+    env: &mut HashMap<String, String>,
+    key: String,
+    value: String,
+    case_insensitive: bool,
+) {
+    if case_insensitive {
+        env.retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+    }
+    env.insert(key, value);
+}
+
+fn effective_env_value<'a>(
+    env: &'a HashMap<String, String>,
+    key: &str,
+    case_insensitive: bool,
+) -> Option<&'a str> {
+    if case_insensitive {
+        env.iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    } else {
+        env.get(key).map(String::as_str)
+    }
+}
+
 /// Make the tool config directory explicit in the child environment.
 ///
 /// Some launch backends clear the inherited environment while others do not.
@@ -462,18 +492,22 @@ fn ensure_tool_config_env(tool: &LaunchTool, env: &mut HashMap<String, String>) 
     let Some(env_var) = tool.spec().launch.config_dir_env else {
         return;
     };
-    if env.contains_key(env_var) {
+    let case_insensitive = cfg!(windows);
+    if let Some(value) = effective_env_value(env, env_var, case_insensitive).map(str::to_owned) {
+        insert_effective_env(env, env_var.to_string(), value, case_insensitive);
         return;
     }
     if let Some(value) = std::env::var(env_var)
         .ok()
         .filter(|value| !value.is_empty())
     {
-        env.insert(env_var.to_string(), value);
+        insert_effective_env(env, env_var.to_string(), value, case_insensitive);
     } else if let Some(config_dir) = isolated_tool_config_dir(tool) {
-        env.insert(
+        insert_effective_env(
+            env,
             env_var.to_string(),
             config_dir.to_string_lossy().to_string(),
+            case_insensitive,
         );
     }
 }
@@ -1752,19 +1786,31 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         launch_env_regime(base_env_run_here, inside_ai_tool),
     );
     if let Some(ref caller_env) = params.env {
-        base_env.extend(caller_env.clone());
+        for (key, value) in caller_env {
+            insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
+        }
     }
     base_env.remove("HCOM_TERMINAL");
     ensure_tool_config_env(&normalized, &mut base_env);
 
+    let working_dir = params.cwd.as_deref().unwrap_or(".");
+    let canonical_dir = std::fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
+
     // Codex preflight and hook setup must use the same effective CODEX_HOME as
     // the child, including overrides from ~/.hcom/env and caller-provided env.
     let codex_home = if matches!(normalized, LaunchTool::Codex) {
-        crate::tools::codex_preprocessing::resolve_codex_home_from_env(&base_env)
+        crate::tools::codex_preprocessing::resolve_codex_home_from_env(&base_env, &canonical_dir)
     } else {
         None
     };
     if let Some((ref path, explicit_env)) = codex_home {
+        insert_effective_env(
+            &mut base_env,
+            "CODEX_HOME".to_string(),
+            path.to_string_lossy().into_owned(),
+            cfg!(windows),
+        );
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
@@ -1808,9 +1854,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
     }
 
-    let working_dir = params.cwd.as_deref().unwrap_or(".");
-    let canonical_dir = std::fs::canonicalize(working_dir)
-        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
     // Folder trust: on first run each tool shows a "do you trust this folder?"
     // prompt — the user accepts to continue or declines and it exits. When an
     // agent launches another agent via hcom, auto-approve the prompt for the
@@ -3095,6 +3138,27 @@ mod tests {
         assert_eq!(
             env.get("CODEX_HOME").map(String::as_str),
             Some("/isolated/codex-home")
+        );
+    }
+
+    #[test]
+    fn test_windows_env_override_replaces_different_key_casing() {
+        let mut env = HashMap::from([(
+            "CODEX_HOME".to_string(),
+            r"C:\ambient-codex-home".to_string(),
+        )]);
+
+        insert_effective_env(
+            &mut env,
+            "Codex_Home".to_string(),
+            r"C:\caller-codex-home".to_string(),
+            true,
+        );
+
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            effective_env_value(&env, "CODEX_HOME", true),
+            Some(r"C:\caller-codex-home")
         );
     }
 

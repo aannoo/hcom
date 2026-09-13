@@ -200,17 +200,51 @@ fn resolve_codex_home() -> Option<(PathBuf, bool)> {
 /// environment, including values supplied through `~/.hcom/env` or `--env`.
 pub(crate) fn resolve_codex_home_from_env(
     env: &HashMap<String, String>,
+    launch_dir: &Path,
 ) -> Option<(PathBuf, bool)> {
-    if let Some(val) = env.get("CODEX_HOME").filter(|val| !val.is_empty()) {
-        return Some((PathBuf::from(val), true));
-    }
-    env.get("HOME")
-        .or_else(|| env.get("USERPROFILE"))
-        .filter(|val| !val.is_empty())
+    // `dirs::home_dir()` reads HOME on Unix but uses the platform profile API
+    // on Windows. Reproduce that distinction from the child's effective env.
+    #[cfg(windows)]
+    let default_home = dirs::home_dir();
+    #[cfg(not(windows))]
+    let default_home = env
+        .get("HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .or_else(|| Some(crate::runtime_env::tool_config_root()))
-        .map(|home| (home.join(".codex"), false))
+        .or_else(dirs::home_dir);
+    resolve_codex_home_from_env_with(
+        env,
+        launch_dir,
+        default_home.or_else(|| Some(crate::runtime_env::tool_config_root())),
+        cfg!(windows),
+    )
+}
+
+fn resolve_codex_home_from_env_with(
+    env: &HashMap<String, String>,
+    launch_dir: &Path,
+    default_home: Option<PathBuf>,
+    case_insensitive: bool,
+) -> Option<(PathBuf, bool)> {
+    let configured = if case_insensitive {
+        env.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("CODEX_HOME"))
+            .map(|(_, value)| value.as_str())
+    } else {
+        env.get("CODEX_HOME").map(String::as_str)
+    };
+    if let Some(value) = configured.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        return Some((
+            if path.is_absolute() {
+                path
+            } else {
+                launch_dir.join(path)
+            },
+            true,
+        ));
+    }
+    default_home.map(|home| (home.join(".codex"), false))
 }
 
 /// Probe whether `CODEX_HOME` is writable before launching codex.
@@ -861,10 +895,49 @@ mod tests {
             ),
         ]);
 
-        let resolved = resolve_codex_home_from_env(&env).unwrap();
+        let resolved = resolve_codex_home_from_env(&env, Path::new("/workspace")).unwrap();
 
         assert_eq!(resolved.0, PathBuf::from("/writable-child-codex-home"));
         assert!(resolved.1);
+    }
+
+    #[test]
+    fn test_resolve_codex_home_uses_platform_home_not_child_home_env() {
+        let env = HashMap::from([
+            ("HOME".to_string(), "/different-child-home".to_string()),
+            (
+                "USERPROFILE".to_string(),
+                r"C:\different-child-home".to_string(),
+            ),
+        ]);
+
+        let resolved = resolve_codex_home_from_env_with(
+            &env,
+            Path::new("/workspace"),
+            Some(PathBuf::from("/platform-home")),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, (PathBuf::from("/platform-home/.codex"), false));
+    }
+
+    #[test]
+    fn test_resolve_codex_home_handles_windows_key_casing_and_child_cwd() {
+        let env = HashMap::from([("Codex_Home".to_string(), "relative-home".to_string())]);
+
+        let resolved = resolve_codex_home_from_env_with(
+            &env,
+            Path::new("/child-workspace"),
+            Some(PathBuf::from("/platform-home")),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            (PathBuf::from("/child-workspace/relative-home"), true)
+        );
     }
 
     /// Resolve the hook-trust decision and apply it, the way the launcher does
