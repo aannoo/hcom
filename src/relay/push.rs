@@ -16,6 +16,49 @@ use super::{device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status, 
 
 const RETAINED_EVENT_TAIL: i64 = 50;
 
+// MQTT clients advertise a 128 KiB maximum packet. Keep the encrypted application payload
+// comfortably below that so the topic and MQTT framing cannot push a QoS1 publish over the
+// broker limit and permanently occupy the in-flight window.
+const MAX_SEALED_PAYLOAD_BYTES: usize = 112 * 1024;
+
+fn seal_bounded_payload(
+    state: &Value,
+    events: &mut Vec<Value>,
+    last_push_id: i64,
+    psk: &[u8; 32],
+    relay_id: &str,
+    topic: &str,
+    now_secs: u64,
+) -> Result<Vec<u8>, String> {
+    loop {
+        let payload = json!({
+            "state": state,
+            "events": events,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {e}"))?;
+        let sealed = crypto::seal(psk, relay_id, topic, &payload_bytes, now_secs)
+            .map_err(|e| format!("seal: {e}"))?;
+        if sealed.len() <= MAX_SEALED_PAYLOAD_BYTES {
+            return Ok(sealed);
+        }
+
+        // Retained tail events have already advanced the local cursor. Drop the oldest of those
+        // first so a large tail cannot starve new events forever. If only new events remain, trim
+        // from the end and publish the earliest prefix; the cursor advances only through that
+        // prefix and the remainder is sent on the next drain iteration.
+        if let Some(index) = events
+            .iter()
+            .position(|event| event["id"].as_i64().is_some_and(|id| id <= last_push_id))
+        {
+            events.remove(index);
+        } else if events.pop().is_none() {
+            return Err(format!(
+                "relay state exceeds safe MQTT payload budget of {MAX_SEALED_PAYLOAD_BYTES} bytes"
+            ));
+        }
+    }
+}
+
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
 pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
@@ -184,19 +227,30 @@ pub fn push(
     is_worker: bool,
     mqtt_connected: bool,
 ) -> Result<(bool, bool), String> {
-    let (state, events, max_id, has_more) = build_push_payload(db, device_uuid);
-
-    let payload = json!({
-        "state": state,
-        "events": events,
-    });
-    let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {}", e))?;
+    let last_push_id = safe_kv_get(db, "relay_last_push_id")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let (state, mut events, _unbounded_max_id, source_has_more) =
+        build_push_payload(db, device_uuid);
+    let source_event_count = events.len();
 
     let topic = state_topic(relay_id, device_uuid);
     let now_secs = crate::shared::time::now_epoch_f64() as u64;
-    let sealed = crypto::seal(psk, relay_id, &topic, &payload_bytes, now_secs)
-        .map_err(|e| format!("seal: {}", e))?;
+    let sealed = seal_bounded_payload(
+        &state,
+        &mut events,
+        last_push_id,
+        psk,
+        relay_id,
+        &topic,
+        now_secs,
+    )?;
     let payload_len = sealed.len();
+    let max_id = events
+        .iter()
+        .filter_map(|event| event["id"].as_i64())
+        .fold(last_push_id, i64::max);
+    let has_more = source_has_more || events.len() < source_event_count;
 
     let t0 = Instant::now();
 
@@ -294,5 +348,52 @@ mod tests {
                 .iter()
                 .any(|event| event["id"].as_i64() == Some(recent_id))
         );
+    }
+
+    #[test]
+    fn sealed_payload_is_byte_bounded_and_new_events_advance() {
+        let state = json!({"instances": {}});
+        let last_push_id = 50;
+        let mut events: Vec<Value> = (1..=100)
+            .map(|id| json!({"id": id, "data": {"text": "x".repeat(4096)}}))
+            .collect();
+        let sealed = seal_bounded_payload(
+            &state,
+            &mut events,
+            last_push_id,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert!(sealed.len() <= MAX_SEALED_PAYLOAD_BYTES);
+        assert!(events.len() < 100);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["id"].as_i64().unwrap() > last_push_id)
+        );
+        assert_eq!(events.first().unwrap()["id"].as_i64(), Some(51));
+        assert!(events.last().unwrap()["id"].as_i64().unwrap() > last_push_id);
+    }
+
+    #[test]
+    fn oversized_state_fails_instead_of_publishing_an_invalid_packet() {
+        let state = json!({"instances": {"oversized": "x".repeat(MAX_SEALED_PAYLOAD_BYTES)}});
+        let mut events = Vec::new();
+        let error = seal_bounded_payload(
+            &state,
+            &mut events,
+            0,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeds safe MQTT payload budget"));
     }
 }
