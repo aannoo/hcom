@@ -472,7 +472,7 @@ pub fn handle_state_message(
     let should_push = super::control::handle_control_events(db, &events, &own_short_id, device_id);
 
     // Import remote events with dedup
-    import_remote_events(
+    let imported_new_events = import_remote_events(
         db,
         device_id,
         &short_id,
@@ -518,8 +518,13 @@ pub fn handle_state_message(
         ],
     );
 
-    // Wake local TCP instances so they see new messages immediately.
-    crate::notify::wake_all(db);
+    // A retained state snapshot arrives on every peer heartbeat. Waking every
+    // local endpoint for a snapshot whose event cursor did not advance turns
+    // relay liveness traffic into a permanent TCP fan-out storm on large
+    // registries. Wake only when the snapshot actually changed local work.
+    if should_push || imported_new_events {
+        crate::notify::wake_all(db);
+    }
 
     should_push
 }
@@ -532,7 +537,7 @@ fn import_remote_events(
     events: &[Value],
     local_reset_ts: f64,
     own_short_id: &str,
-) {
+) -> bool {
     let mut last_event_id: i64 = safe_kv_get(db, &format!("relay_events_{}", device_id))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -689,13 +694,15 @@ fn import_remote_events(
         max_event_id = max_event_id.max(event_id);
     }
 
-    if max_event_id > last_event_id {
+    let imported_new_events = max_event_id > last_event_id;
+    if imported_new_events {
         safe_kv_set(
             db,
             &format!("relay_events_{}", device_id),
             Some(&max_event_id.to_string()),
         );
     }
+    imported_new_events
 }
 
 /// Reverse lookup: find short_id for a device UUID.

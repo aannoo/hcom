@@ -262,8 +262,23 @@ impl MqttRelay {
                 if hb_db.is_none() {
                     hb_db = HcomDb::open().ok();
                 }
-                if let Some(ref db) = hb_db {
-                    super::write_worker_heartbeat(db);
+                let heartbeat_ok = if let Some(ref mut db) = hb_db {
+                    // A reset or schema recovery can atomically replace hcom.db while the
+                    // long-lived relay worker still owns this connection.  Without this
+                    // check heartbeat writes continue against the unlinked database and
+                    // the live worker is reported stale forever.
+                    db.reconnect_if_stale();
+                    super::write_worker_heartbeat(db)
+                } else {
+                    false
+                };
+                if !heartbeat_ok {
+                    log::log_warn(
+                        "relay",
+                        "relay.heartbeat_write_failed",
+                        "heartbeat write failed; reopening the database on the next tick",
+                    );
+                    hb_db = None;
                 }
                 last_heartbeat = Some(Instant::now());
             }
@@ -484,6 +499,18 @@ impl MqttRelay {
                     false
                 }
                 Packet::Publish(publish) => {
+                    // A broker-delivered publish is positive proof that this MQTT session
+                    // is live.  Reassert the state here as well as on ConnAck so a
+                    // transient/local state loss cannot leave periodic outbound sync
+                    // disabled while inbound sync continues normally.
+                    if !*connected {
+                        log::log_info(
+                            "relay",
+                            "relay.inbound_reconnected",
+                            "inbound MQTT traffic re-established connected state",
+                        );
+                        *connected = true;
+                    }
                     let topic = String::from_utf8_lossy(&publish.topic).to_string();
                     let payload = publish.payload.to_vec();
                     self.handle_incoming_message(&topic, &payload)
@@ -938,5 +965,34 @@ mod tests {
 
         assert!(payload["state"].is_null());
         assert_eq!(payload["events"], json!([]));
+    }
+
+    #[test]
+    fn inbound_publish_reasserts_connected_state() {
+        let options = MqttOptions::new("relay-unit-test", "127.0.0.1", 1883);
+        let (client, _connection) = Client::new(options, 10);
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let relay = MqttRelay {
+            client,
+            relay_id: "expected-relay".to_string(),
+            device_uuid: "device-a".to_string(),
+            psk: Mutex::new([0x42; 32]),
+            replay_guard: Mutex::new(ReplayGuard::default()),
+            cmd_rx,
+            push_interval: Duration::from_secs(5),
+        };
+        let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+            "other-relay/device-b",
+            QoS::AtMostOnce,
+            Vec::new(),
+            None,
+        );
+        let mut connected = false;
+
+        assert!(!relay.handle_event(Event::Incoming(Packet::Publish(publish)), &mut connected));
+        assert!(
+            connected,
+            "broker-delivered traffic proves the session is live"
+        );
     }
 }

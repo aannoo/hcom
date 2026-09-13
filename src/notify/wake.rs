@@ -23,6 +23,10 @@ pub const WAKE_FANOUT_MS: u64 = 50;
 /// until the next event, so we trade latency for reliability.
 pub const WAKE_TARGETED_MS: u64 = 100;
 
+/// Bound simultaneous connect attempts while preventing one unreachable endpoint
+/// from serially consuming the full timeout for every other endpoint.
+const MAX_WAKE_FANOUT_WORKERS: usize = 32;
+
 /// SQL fragment listing the wake kinds — used to filter `notify_endpoints`
 /// queries so inject ports are never pinged with connect-drop.
 fn wake_kinds_sql_list() -> String {
@@ -81,14 +85,18 @@ pub fn snapshot_wake_ports(db: &HcomDb, instance: &str) -> Vec<u16> {
 /// Connect-and-close on each port to fire a wake. Best-effort; errors ignored.
 pub fn wake_ports(ports: &[u16], timeout_ms: u64) {
     let timeout = Duration::from_millis(timeout_ms);
-    for &port in ports {
-        if port == 0 {
-            continue;
-        }
-        let addr = format!("127.0.0.1:{port}");
-        if let Ok(addr) = addr.parse() {
-            let _ = TcpStream::connect_timeout(&addr, timeout);
-        }
+    let valid_ports: Vec<u16> = ports.iter().copied().filter(|port| *port > 0).collect();
+    for ports in valid_ports.chunks(MAX_WAKE_FANOUT_WORKERS) {
+        std::thread::scope(|scope| {
+            for &port in ports {
+                scope.spawn(move || {
+                    let addr = format!("127.0.0.1:{port}");
+                    if let Ok(addr) = addr.parse() {
+                        let _ = TcpStream::connect_timeout(&addr, timeout);
+                    }
+                });
+            }
+        });
     }
 }
 

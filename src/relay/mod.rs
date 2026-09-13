@@ -281,9 +281,9 @@ pub(crate) fn safe_kv_set(db: &HcomDb, key: &str, value: Option<&str>) {
 
 /// Record a fresh worker heartbeat. Called by the worker's main loop ~once per second
 /// and once at pidfile-write so the startup window doesn't look stale.
-pub(crate) fn write_worker_heartbeat(db: &HcomDb) {
+pub(crate) fn write_worker_heartbeat(db: &HcomDb) -> bool {
     let now = crate::shared::time::now_epoch_f64();
-    safe_kv_set(db, HEARTBEAT_KEY, Some(&format!("{now}")));
+    db.kv_set(HEARTBEAT_KEY, Some(&format!("{now}"))).is_ok()
 }
 
 /// Clear the heartbeat on clean worker shutdown so readers see "no worker" immediately

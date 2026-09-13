@@ -36,7 +36,7 @@ fn write_pid_file_for(pid: u32) {
     // (before the main loop starts ticking) don't see pid-alive + no-heartbeat
     // and falsely declare the worker dead.
     if let Ok(db) = HcomDb::open() {
-        super::write_worker_heartbeat(&db);
+        let _ = super::write_worker_heartbeat(&db);
     }
 }
 
