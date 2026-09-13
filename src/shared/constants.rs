@@ -43,10 +43,6 @@ pub fn extract_mentions(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Binding marker for vanilla sessions: [hcom:<name>].
-pub static BIND_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[hcom:([a-z0-9_]+)\]").unwrap());
-
 // Released-tool lists moved to `crate::integration_spec` —
 // see `released_tool_names()` / `released_background_tool_names()`.
 
@@ -216,17 +212,6 @@ mod tests {
     #[test]
     fn test_mention_pattern_start_of_string() {
         assert_eq!(extract_mentions("@luna hello"), vec!["luna"]);
-    }
-
-    #[test]
-    fn test_bind_marker() {
-        let caps = BIND_MARKER_RE.captures("[hcom:luna]");
-        assert_eq!(caps.unwrap()[1].to_string(), "luna");
-    }
-
-    #[test]
-    fn test_bind_marker_no_legacy() {
-        assert!(BIND_MARKER_RE.captures("[HCOM:BIND:test_name]").is_none());
     }
 
     #[test]

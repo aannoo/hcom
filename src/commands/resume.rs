@@ -3230,7 +3230,7 @@ mod tests {
                 .initial_prompt
                 .as_deref()
                 .unwrap_or("")
-                .contains(&format!("[hcom:{reserved_name}]"))
+                .contains(&format!("Your hcom name is {reserved_name}."))
         );
     }
 

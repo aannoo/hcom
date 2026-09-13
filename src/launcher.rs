@@ -1911,24 +1911,27 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // resume re-injects the current path via the same call.
     inject_omp_extension_args(&normalized, &mut params.args);
 
+    // Resolved here, before any trust injection, and threaded to
+    // preprocess_codex_args below. Codex's hook-trust bypass is invocation-wide,
+    // so a bypass hcom grants on the strength of a local hook scan must not be
+    // paired with a project layer that hcom itself just marked trusted — that
+    // layer could contribute a hook source the scan never saw.
+    let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
+        codex_preprocessing::resolve_codex_hook_trust(&params.args, &canonical_dir)
+    } else {
+        codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
+    };
+
     inject_workspace_trust_args(
         &normalized,
         &canonical_dir,
         &mut params.args,
-        hcom_config.auto_trust_workspace,
+        hcom_config.auto_trust_workspace && !codex_hook_trust.suppresses_workspace_trust(),
     );
     let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
         let process_id = std::env::var("HCOM_PROCESS_ID").ok();
-        match crate::identity::resolve_identity(
-            db,
-            None,
-            None,
-            None,
-            process_id.as_deref(),
-            None,
-            None,
-        ) {
+        match crate::identity::resolve_identity(db, None, None, None, process_id.as_deref(), None) {
             Ok(id) => id.name,
             Err(_) => "api".to_string(),
         }
@@ -2263,6 +2266,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &effective_args,
                         &bootstrap,
                         &sandbox_mode,
+                        codex_hook_trust,
                     );
 
                     instances::update_instance_position(
@@ -2624,6 +2628,7 @@ mod tests {
                 "CODEX_MANAGED_BY_NPM",
                 "CODEX_MANAGED_BY_BUN",
                 "CODEX_THREAD_ID",
+                "CODEX_SESSION_ID",
                 "OPENCODE",
                 "KILO",
                 "CURSOR_AGENT",
@@ -3444,8 +3449,12 @@ mod tests {
             false,
         );
 
-        let args =
-            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
+        let args = crate::tools::codex_preprocessing::preprocess_codex_args(
+            &[],
+            &bootstrap,
+            "workspace",
+            crate::tools::codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded,
+        );
 
         // Locate the `-c developer_instructions=<TOML>` value and decode it.
         // preprocess also injects sandbox `-c` args, so match by prefix rather

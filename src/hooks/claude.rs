@@ -24,7 +24,6 @@ use crate::instances;
 use crate::log;
 use crate::messages;
 use crate::paths;
-use crate::shared::constants::BIND_MARKER_RE;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
@@ -80,16 +79,6 @@ fn child_visibly_invokes_hcom(payload: &HookPayload) -> bool {
             .is_some_and(visibly_invokes_hcom)
 }
 
-fn persist_claude_session_env(ctx: &HcomContext, session_id: &str) {
-    if let Some(ref env_file) = ctx.claude_env_file
-        && !session_id.is_empty()
-        && let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(env_file)
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "export HCOM_CLAUDE_UNIX_SESSION_ID={session_id}");
-    }
-}
-
 fn powershell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -138,27 +127,15 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    // Build context and payload before the participation gate. SessionStart
-    // must quietly export the vanilla Claude session id even when hcom has no
-    // active rows yet, or the first `hcom start` cannot bind immediately.
     let ctx = HcomContext::from_os();
     let mut payload = HookPayload::from_claude(raw);
-    if hook_type == HOOK_SESSIONSTART {
-        let use_fork_env_session = should_use_fork_env_session_id(&db, &ctx, &payload.raw);
-        let session_id = get_real_session_id(
-            &payload.raw,
-            ctx.claude_env_file.as_deref(),
-            use_fork_env_session,
-        );
-        persist_claude_session_env(&ctx, &session_id);
-    }
 
     // Keep ordinary nonparticipants completely silent. The sole exception is
     // a visible hcom attempt from a child: let it reach routing so it receives
     // the actionable "start hcom in the parent first" denial even with an
     // otherwise empty database.
-    if !common::hook_gate_check(&ctx, &db)
-        && !(hook_type == HOOK_PRE && child_visibly_invokes_hcom(&payload))
+    if !(common::hook_gate_check(&ctx, &db)
+        || (hook_type == HOOK_PRE && child_visibly_invokes_hcom(&payload)))
     {
         return 0;
     }
@@ -463,35 +440,8 @@ fn route_claude_hook(
     );
     timing.resolve_ms = Some(resolve_start.elapsed().as_secs_f64() * 1000.0);
 
-    // Vanilla marker binding is only a bootstrap path for a genuinely unbound
-    // non-hcom launch. Never let an ambiguous, poisoned, or historical hook
-    // mutate bindings before the primary-generation guard below.
-    let bind_start = Instant::now();
-    let allow_vanilla_marker_bind = instance_name.is_none()
-        && ctx.process_id.is_none()
-        && matches!(db.get_session_binding(&session_id), Ok(None));
-    let (instance_name, updates) =
-        if hook_type == HOOK_POST && is_shell_tool(tool_name) && allow_vanilla_marker_bind {
-            let bound =
-                bind_vanilla_from_marker(db, &payload.raw, &session_id, instance_name.as_deref());
-            match bound {
-                Some(name) => {
-                    let mut u = updates;
-                    u.entry("directory".to_string())
-                        .or_insert_with(|| Value::String(ctx.cwd.to_string_lossy().to_string()));
-                    if let Some(ref tp) = payload.transcript_path {
-                        u.entry("transcript_path".to_string())
-                            .or_insert_with(|| Value::String(tp.clone()));
-                    }
-                    (Some(name), u)
-                }
-                None => (instance_name, updates),
-            }
-        } else {
-            (instance_name, updates)
-        };
-    timing.bind_ms = Some(bind_start.elapsed().as_secs_f64() * 1000.0);
-
+    // Participation requires a trusted session/process binding. Shell output
+    // can quote another participant's marker and is not identity evidence.
     let Some(ref instance_name) = instance_name else {
         timing.result = Some("no_instance");
         if hook_type == HOOK_USERPROMPTSUBMIT && is_bare_hcom_wake(payload) {
@@ -2698,88 +2648,6 @@ fn subagent_posttooluse(db: &HcomDb, subagent_name: &str) -> (i32, String, Optio
     )
 }
 
-/// Detect and process vanilla instance binding from `hcom start` output.
-fn bind_vanilla_from_marker(
-    db: &HcomDb,
-    raw: &Value,
-    session_id: &str,
-    current_instance: Option<&str>,
-) -> Option<String> {
-    // Skip if no pending instances
-    let pending = common::get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
-    }
-
-    let tool_response = raw.get("tool_response")?;
-    let response_text = if tool_response.is_string() {
-        tool_response.as_str().unwrap_or("").to_string()
-    } else if tool_response.is_object() {
-        tool_response
-            .get("stdout")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        return None;
-    };
-
-    if response_text.is_empty() {
-        return None;
-    }
-
-    let caps = BIND_MARKER_RE.captures(&response_text)?;
-    let instance_name = caps.get(1)?.as_str();
-
-    // Don't rebind if already bound to a different instance
-    if let Some(current) = current_instance
-        && current != instance_name
-    {
-        return None;
-    }
-
-    if session_id.is_empty() {
-        return current_instance
-            .map(|s| s.to_string())
-            .or_else(|| Some(instance_name.to_string()));
-    }
-
-    // Verify instance exists and is pending (session_id IS NULL)
-    let inst = db.get_instance_full(instance_name).ok()??;
-    if inst.session_id.is_some() {
-        return None; // Already bound
-    }
-
-    if let Err(e) = db.rebind_instance_session(instance_name, session_id) {
-        log::log_error(
-            "hooks",
-            "bind.fail",
-            &format!("instance={} err={}", instance_name, e),
-        );
-        return None;
-    }
-
-    log::log_info(
-        "hooks",
-        "bind.session",
-        &format!("instance={} session_id={}", instance_name, session_id),
-    );
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("session_id".into(), Value::String(session_id.to_string()));
-    updates.insert("tool".into(), Value::String("claude".to_string()));
-    instances::update_instance_position(db, instance_name, &updates);
-    if let Err(error) = db.mark_claude_session_validated(session_id, instance_name) {
-        log::log_warn(
-            "hooks",
-            "bind.validation_cache_failed",
-            &format!("instance={} err={}", instance_name, error),
-        );
-    }
-
-    Some(instance_name.to_string())
-}
-
 //
 // Manages hook installation in ~/.claude/settings.json.
 
@@ -3195,6 +3063,24 @@ pub enum SetupError {
 /// - Sets HCOM environment variable
 /// - Optionally adds permission patterns
 /// - Uses atomic write for concurrent safety
+///
+/// Installation does not grant workspace trust. Interactive Claude sessions
+/// hold back settings-file hooks, including these user-level hooks, until the
+/// directory or an ancestor is trusted. `hcom claude -b` uses `-p`, where this
+/// settings-file trust gate does not apply. See:
+/// https://code.claude.com/docs/en/hooks#workspace-trust
+///
+/// If hooks are installed but the session never binds, check Claude's trust
+/// prompt and debug log before reinstalling. Tool-permission bypass flags do
+/// not accept workspace trust. In the reconstructed Claude source,
+/// `showSetupScreens` also skips the trust dialog when `IS_DEMO` is set; in an
+/// untrusted directory this can leave hooks disabled without a visible prompt.
+/// This internal environment variable is not a supported trust mechanism.
+///
+/// hcom leaves trust acceptance to Claude's dialog rather than coupling this
+/// installer to Claude's internal trust-state schema. PTY launches can report
+/// a stalled prompt through `launch_blocked`; ordinary `hcom claude` launches
+/// use the user's terminal directly, without that watcher.
 pub fn try_setup_claude_hooks(include_permissions: bool) -> Result<(), SetupError> {
     let settings_path = get_claude_settings_path();
     if let Some(parent) = settings_path.parent() {
@@ -4184,26 +4070,44 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_vanilla_string_response() {
-        // Test that tool_response as string works
-        let _raw = serde_json::json!({
-            "tool_response": "output [hcom:luna] done"
-        });
-        // Can't test full bind without DB, but can verify marker extraction
-        let caps = BIND_MARKER_RE.captures("output [hcom:luna] done");
-        assert!(caps.is_some());
-        assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "luna");
-    }
-
-    #[test]
-    fn test_bind_vanilla_dict_response() {
-        let _raw = serde_json::json!({
-            "tool_response": {"stdout": "[hcom:nova]", "stderr": ""}
-        });
-        let response_text = "[hcom:nova]";
-        let caps = BIND_MARKER_RE.captures(response_text);
-        assert!(caps.is_some());
-        assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "nova");
+    #[serial]
+    fn passive_markers_cannot_adopt_pending_identity() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_delivery_test_db();
+        let ctx = make_ctx();
+        for tool in ["claude", "codex", "gemini"] {
+            db.conn()
+                .execute(
+                    "UPDATE instances SET session_id = NULL, tool = ? WHERE name = 'nova'",
+                    [tool],
+                )
+                .unwrap();
+            for command in ["ps -eo pid,command", "hcom transcript nova", "hcom start"] {
+                let transcript = _dir.path().join("passive.jsonl");
+                std::fs::write(&transcript, "[hcom:nova]").unwrap();
+                let mut payload = HookPayload::from_claude(serde_json::json!({
+                    "session_id": "unjoined-session",
+                    "transcript_path": transcript,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                    "tool_response": {"stdout": "[hcom:nova]"}
+                }));
+                let (code, stdout, ack, _) = route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
+                assert_eq!(code, 0);
+                assert!(stdout.is_empty());
+                assert!(ack.is_none());
+                assert!(
+                    db.get_session_binding("unjoined-session")
+                        .unwrap()
+                        .is_none()
+                );
+                let row = db.get_instance_full("nova").unwrap().unwrap();
+                assert!(row.session_id.is_none());
+                assert_eq!(row.tool, tool);
+                assert_eq!(delivery_cursor(&db), 0);
+                assert_eq!(db.get_unread_messages("nova").len(), 1);
+            }
+        }
     }
 
     #[test]
@@ -5208,28 +5112,6 @@ mod tests {
                 "non-hcom token must not trigger instrumentation: {command}"
             );
         }
-    }
-
-    #[test]
-    fn test_session_env_is_persisted_without_requiring_participation() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_file = dir.path().join("claude-session-env.sh");
-        std::fs::write(&env_file, "").unwrap();
-        let env = std::collections::HashMap::from([
-            ("CLAUDECODE".to_string(), "1".to_string()),
-            (
-                "CLAUDE_ENV_FILE".to_string(),
-                env_file.to_string_lossy().to_string(),
-            ),
-        ]);
-        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
-
-        persist_claude_session_env(&ctx, "sess-vanilla");
-
-        assert_eq!(
-            std::fs::read_to_string(env_file).unwrap(),
-            "export HCOM_CLAUDE_UNIX_SESSION_ID=sess-vanilla\n"
-        );
     }
 
     #[test]

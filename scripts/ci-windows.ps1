@@ -15,6 +15,7 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $root "target/ci-logs"
 New-Item -ItemType Directory -Force $logDir | Out-Null
+Write-Host "[ci] logs: $logDir\<step>.log"
 
 # The pinned real tools install to the npm prefix root on Windows (not
 # prefix/bin as on Unix), and must outrank any ambient install of the same tool.
@@ -46,7 +47,15 @@ function Unlock-DevBinary {
     }
 }
 
+$known = [System.Collections.Generic.List[string]]::new()
+$ran = 0
+$skipped = 0
+$total = [Diagnostics.Stopwatch]::StartNew()
+
 function Step([string] $name, [scriptblock] $body) {
+    # Recorded before the filter, so the unknown-step check at the end sees every
+    # step name whether or not this run executed it.
+    $known.Add($name)
     if ($Only -and $Only -notcontains $name) { return }
     $log = Join-Path $logDir "$name.log"
     Write-Host ("[ci] {0,-20} " -f $name) -NoNewline
@@ -54,6 +63,7 @@ function Step([string] $name, [scriptblock] $body) {
     # judged by whatever the previous step's last process returned.
     $global:LASTEXITCODE = 0
     $code = 0
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
     try {
         & $body *> $log
         $code = $LASTEXITCODE
@@ -64,13 +74,21 @@ function Step([string] $name, [scriptblock] $body) {
         $_ | Out-String | Add-Content $log
         $code = 1
     }
+    $secs = [int] $elapsed.Elapsed.TotalSeconds
     if ($code -ne 0) {
-        Write-Host "FAILED (exit $code)"
+        Write-Host "FAILED (exit $code, ${secs}s)"
         Write-Host "----- last 40 lines: $log -----"
         Get-Content $log -Tail 40
         exit $code
     }
-    Write-Host "ok"
+    # A skipped check must not report as a pass (mirrors the `ci` recipe).
+    if (Select-String -Path $log -Pattern '(^|: )SKIPPED\b' -Quiet) {
+        Write-Host "skipped (${secs}s)"
+        $script:skipped++
+        return
+    }
+    Write-Host "ok (${secs}s)"
+    $script:ran++
 }
 
 Unlock-DevBinary
@@ -83,4 +101,17 @@ Step real_tool_codex      { cargo test --locked --test real_tool_codex -- --igno
 Step real_tool_claude     { cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1 }
 Step test_relay_roundtrip { cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1 }
 
-Write-Host "[ci] all checks passed"
+foreach ($want in $Only) {
+    if ($known -notcontains $want) {
+        Write-Host "[ci] unknown step: $want"
+        Write-Host ("[ci] steps: {0}" -f ($known -join " "))
+        exit 2
+    }
+}
+
+$secs = [int] $total.Elapsed.TotalSeconds
+if ($skipped -gt 0) {
+    Write-Host ("[ci] {0} step(s) passed, {1} skipped, in {2}s" -f $ran, $skipped, $secs)
+} else {
+    Write-Host ("[ci] {0} step(s) passed in {1}s" -f $ran, $secs)
+}

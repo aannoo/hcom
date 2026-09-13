@@ -31,6 +31,17 @@ pub const HEARTBEAT_THRESHOLD_TCP: i64 = 35;
 /// Heartbeat timeout without TCP listener (adhoc instances).
 pub const HEARTBEAT_THRESHOLD_NO_TCP: i64 = 10;
 
+/// Heartbeat slack for instances parked in a non-listening status (2 min).
+///
+/// `status_time` only advances on hook traffic, so an instance left `active`
+/// across a long tool call — or a system sleep — can carry an hours-old status
+/// while its delivery loop is healthy; there the heartbeat is the only real
+/// liveness signal. [`HEARTBEAT_THRESHOLD_TCP`] is sized for the *listening*
+/// path and leaves only 5s over the 30s poll, which a scheduler hiccup on wake
+/// eats easily. 4x the poll interval instead, so a couple of missed polls can't
+/// fake death.
+pub const ACTIVE_HEARTBEAT_GRACE: i64 = 120;
+
 /// Heartbeat age when last_stop is missing (marker for unreliable data).
 pub const UNKNOWN_HEARTBEAT_AGE: i64 = 999999;
 
@@ -77,13 +88,53 @@ static WAKE_STATE: Mutex<WakeState> = Mutex::new(WakeState {
     grace_until_mono: None,
 });
 
-/// Detect sleep/wake via wall-vs-monotonic drift and report whether grace is active.
-pub fn is_in_wake_grace() -> bool {
-    is_in_wake_grace_with_persistence(None)
+/// Clear the process-local wake state so a test can drive the first-call path.
+#[cfg(test)]
+fn reset_wake_state_for_test() {
+    if let Ok(mut state) = WAKE_STATE.lock() {
+        state.last_mono = None;
+        state.last_wall = 0.0;
+        state.grace_until_mono = None;
+    }
 }
 
-/// Wake-grace detection with optional DB persistence for short-lived processes.
-pub fn is_in_wake_grace_with_persistence(db: Option<&crate::db::HcomDb>) -> bool {
+/// Detect sleep/wake via wall-vs-monotonic drift and report whether grace is active.
+///
+/// Process-local: the drift comparison needs an earlier sample taken by *this*
+/// process, so a one-shot CLI can never detect a wake this way — its first call
+/// only seeds the state and reports false. Short-lived callers want
+/// [`is_in_wake_grace_shared`] instead.
+pub fn is_in_wake_grace() -> bool {
+    wake_grace(None, false)
+}
+
+/// Wake-grace check for short-lived processes.
+///
+/// Reads the window published by the long-lived delivery loops
+/// (`_wake_grace_until`), falling back to a gap in their liveness beacon
+/// (`_wake_last_wall`) for the sub-second race where a CLI runs after the wake
+/// but before any loop has noticed it.
+///
+/// Never publishes the beacon. A one-shot that wrote `_wake_last_wall` would
+/// make every infrequent invocation look like a wake to the next one, and
+/// cleanup would grace itself into never running. The one write it does make is
+/// `_wake_beacon_armed`, recording that a given beacon value has already been
+/// graced so a frozen beacon cannot suppress cleanup indefinitely.
+pub fn is_in_wake_grace_shared(db: &crate::db::HcomDb) -> bool {
+    wake_grace(Some(db), false)
+}
+
+/// Wake-grace check for long-lived loops, which also publishes the shared state
+/// that [`is_in_wake_grace_shared`] reads.
+///
+/// Call it every poll: the beacon write is what tells short-lived processes that
+/// a loop is running and up to date, and the drift branch is what arms the grace
+/// window for them the instant this process observes a wake.
+pub fn is_in_wake_grace_publishing(db: &crate::db::HcomDb) -> bool {
+    wake_grace(Some(db), true)
+}
+
+fn wake_grace(db: Option<&crate::db::HcomDb>, publish: bool) -> bool {
     let now_mono = Instant::now();
     let now_wall = now_epoch_f64();
 
@@ -92,30 +143,70 @@ pub fn is_in_wake_grace_with_persistence(db: Option<&crate::db::HcomDb>) -> bool
         Err(_) => return false,
     };
 
-    if state.last_mono.is_none()
-        && let Some(db) = db
-        && let Ok(Some(persisted_wall)) = db.kv_get("_wake_last_wall")
-        && let Ok(last_wall) = persisted_wall.parse::<f64>()
-    {
-        let wall_elapsed = now_wall - last_wall;
-        if wall_elapsed > 30.0 && wall_elapsed < 3600.0 {
-            crate::log::log_info(
-                "cleanup",
-                "sleep_wake_detected",
-                &format!(
-                    "drift={:.0}s (cross-process), grace={:.0}s",
-                    wall_elapsed, WAKE_GRACE_PERIOD
-                ),
-            );
-            state.grace_until_mono =
-                Some(now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD));
+    // Only the read-only callers consult the shared state, and they consult it
+    // on every call: they are one-shots that ask once or twice per process, and
+    // keying this off "first call in this process" made the answer depend on
+    // whoever happened to touch WAKE_STATE first. Publishing callers are
+    // long-lived loops that detect drift from their own samples.
+    if !publish && let Some(db) = db {
+        let mut extend_grace = |deadline: Instant| {
+            if state
+                .grace_until_mono
+                .is_none_or(|existing| deadline > existing)
+            {
+                state.grace_until_mono = Some(deadline);
+            }
+        };
+
+        // Beacon gap: the backstop for the race where a one-shot runs after a
+        // wake but before any loop has republished. A gap means either the
+        // machine was asleep or no loop is running, and one reading cannot tell
+        // those apart — so arm at most once per distinct beacon value. A live
+        // loop advances the beacon within a poll, closing the gap on its own; a
+        // frozen beacon (last loop exited, stale value left behind) therefore
+        // grants exactly one grace, then never again.
+        //
+        // No upper bound on the gap. Being spent-once is what keeps a frozen
+        // beacon from suppressing cleanup, so capping the age would only punch
+        // a hole in the protection at the sleeps most likely to happen —
+        // overnight ones, where the gap is hours and the wake is real.
+        if let Ok(Some(persisted_wall)) = db.kv_get("_wake_last_wall")
+            && let Ok(last_wall) = persisted_wall.parse::<f64>()
+        {
+            let wall_elapsed = now_wall - last_wall;
+            let already_armed = db
+                .kv_get("_wake_beacon_armed")
+                .ok()
+                .flatten()
+                .is_some_and(|armed| armed == persisted_wall);
+            if wall_elapsed > 30.0 && !already_armed {
+                crate::log::log_info(
+                    "cleanup",
+                    "sleep_wake_detected",
+                    &format!(
+                        "drift={:.0}s (cross-process), grace={:.0}s",
+                        wall_elapsed, WAKE_GRACE_PERIOD
+                    ),
+                );
+                // Marks this beacon value as spent. Not a beacon write: it
+                // never makes a later invocation read a wake that did not
+                // happen, which is the reason one-shots must not publish
+                // `_wake_last_wall` itself.
+                let _ = db.kv_set("_wake_beacon_armed", Some(&persisted_wall));
+                extend_grace(now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD));
+            }
         }
+
+        // An explicit window from a loop that already saw the wake. Read
+        // independently of the beacon: a window that was published must still
+        // be honored when the beacon is missing (fresh db, after `hcom reset`),
+        // and it must never shorten a grace the beacon already granted.
         if let Ok(Some(grace_until)) = db.kv_get("_wake_grace_until")
             && let Ok(grace_wall) = grace_until.parse::<f64>()
             && now_wall < grace_wall
         {
             let remaining = grace_wall - now_wall;
-            state.grace_until_mono = Some(now_mono + std::time::Duration::from_secs_f64(remaining));
+            extend_grace(now_mono + std::time::Duration::from_secs_f64(remaining));
         }
     }
 
@@ -133,7 +224,7 @@ pub fn is_in_wake_grace_with_persistence(db: Option<&crate::db::HcomDb>) -> bool
             let grace_deadline = now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD);
             state.grace_until_mono = Some(grace_deadline);
 
-            if let Some(db) = db {
+            if publish && let Some(db) = db {
                 let grace_wall = now_wall + WAKE_GRACE_PERIOD;
                 let _ = db.kv_set("_wake_grace_until", Some(&grace_wall.to_string()));
             }
@@ -143,7 +234,7 @@ pub fn is_in_wake_grace_with_persistence(db: Option<&crate::db::HcomDb>) -> bool
     state.last_mono = Some(now_mono);
     state.last_wall = now_wall;
 
-    if let Some(db) = db {
+    if publish && let Some(db) = db {
         let _ = db.kv_set("_wake_last_wall", Some(&now_wall.to_string()));
     }
 
@@ -248,7 +339,7 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
 
         if status_age > STATUS_ACTIVITY_TIMEOUT && data.origin_device_id.is_none() {
             let last_stop = data.last_stop;
-            if last_stop > 0 && (now - last_stop) < HEARTBEAT_THRESHOLD_TCP {
+            if last_stop > 0 && (now - last_stop) < ACTIVE_HEARTBEAT_GRACE {
                 // Fresh heartbeat means the process is alive even if the status is old.
             } else if wake_grace {
                 // Grace: heartbeat should refresh after wake.
@@ -670,7 +761,9 @@ pub fn cleanup_stale_instances(
     max_stale_seconds: i64,
     max_inactive_seconds: i64,
 ) -> i32 {
-    if is_in_wake_grace() {
+    // Short-lived callers dominate this path (it runs from `hcom list`), and
+    // they cannot detect a wake on their own — see is_in_wake_grace_shared.
+    if is_in_wake_grace_shared(db) {
         return 0;
     }
 
@@ -689,26 +782,51 @@ pub fn cleanup_stale_instances(
             let context = &computed.context;
             let age = computed.age_seconds;
 
-            if matches!(
+            let reason = if matches!(
                 context.as_str(),
                 "killed" | "closed" | "timeout" | "interrupted" | "session_switch"
             ) && age > 60
             {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "exit_cleanup");
-                deleted += 1;
-                return deleted;
+                "exit_cleanup"
+            } else if context == "stale" && max_stale_seconds > 0 && age > max_stale_seconds {
+                "stale_cleanup"
+            } else if max_inactive_seconds > 0 && age > max_inactive_seconds {
+                "inactive_cleanup"
+            } else {
+                continue;
+            };
+
+            // Staleness is a clock inference, not an observed death: a wedged
+            // heartbeat (system sleep, a starved delivery loop) is
+            // indistinguishable from an exited tool by timestamps alone. Losing
+            // that bet is unrecoverable for the session — the row and both
+            // bindings are deleted, and every later hook resolves to
+            // no_instance with no path back — so let the clock lose to a live
+            // PID. Exit contexts are exempt: those record an end that was
+            // observed, not inferred.
+            //
+            // Tradeoff: a recycled PID can keep a dead row listed. That costs a
+            // stale line in `hcom list`; the opposite mistake costs a running
+            // agent.
+            if reason != "exit_cleanup"
+                && let Some(pid) = data.pid
+                && crate::sys::process::is_alive(pid as u32)
+            {
+                crate::log::log_info(
+                    "cleanup",
+                    "skip_live_pid",
+                    &format!(
+                        "instance={} reason={} context={} age={}s pid={}",
+                        data.name, reason, context, age, pid
+                    ),
+                );
+                continue;
             }
 
-            if context == "stale" && max_stale_seconds > 0 && age > max_stale_seconds {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "stale_cleanup");
+            if crate::hooks::common::stop_instance(db, &data.name, "system", reason)
+                == crate::hooks::common::StopOutcome::Stopped
+            {
                 deleted += 1;
-                return deleted;
-            }
-
-            if max_inactive_seconds > 0 && age > max_inactive_seconds {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "inactive_cleanup");
-                deleted += 1;
-                return deleted;
             }
         }
     }
@@ -777,6 +895,252 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// `WAKE_STATE` is process-global, so a test that arms grace would leak it
+    /// into any reaper test running beside it. Serialize the ones that care.
+    static WAKE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn wake_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = WAKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_wake_state_for_test();
+        guard
+    }
+
+    /// A PID above every platform's pid_max, so it names no live process.
+    const DEAD_PID: i64 = 4_194_305;
+
+    /// Insert an instance parked in `active` with a stale status clock — the
+    /// shape a launched agent has when its heartbeat froze (system sleep).
+    fn insert_stale_active(db: &HcomDb, name: &str, status_age: i64, heartbeat_age: i64, pid: i64) {
+        let now = now_epoch_i64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, status_time, last_stop, created_at, pid, tcp_mode)
+                 VALUES (?, 'claude', ?, 'tool:Bash', ?, ?, ?, ?, 1)",
+                rusqlite::params![
+                    name,
+                    ST_ACTIVE,
+                    now - status_age,
+                    now - heartbeat_age,
+                    (now - status_age) as f64,
+                    pid,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn instance_exists(db: &HcomDb, name: &str) -> bool {
+        db.get_instance_full(name).unwrap().is_some()
+    }
+
+    #[test]
+    fn test_cleanup_spares_stale_instance_with_live_pid() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        // Our own PID is unambiguously alive.
+        insert_stale_active(&db, "alive", 3700, 2400, std::process::id() as i64);
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 0, "a live process must never be unlinked");
+        assert!(instance_exists(&db, "alive"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_reaps_stale_instance_with_dead_pid() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        insert_stale_active(&db, "dead", 3700, 2400, DEAD_PID);
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 1);
+        assert!(!instance_exists(&db, "dead"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_reaps_every_expired_instance_in_one_pass() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        insert_stale_active(&db, "dead1", 3700, 3700, DEAD_PID);
+        insert_stale_active(&db, "dead2", 3800, 3800, DEAD_PID);
+        insert_stale_active(&db, "dead3", 3900, 3900, DEAD_PID);
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 3, "one pass should not leave expired rows behind");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_honors_wake_grace_published_by_another_process() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        insert_stale_active(&db, "sleeper", 3700, 2400, DEAD_PID);
+
+        // What a delivery loop writes the moment it observes a wake.
+        let grace_until = now_epoch_f64() + WAKE_GRACE_PERIOD;
+        db.kv_set("_wake_grace_until", Some(&grace_until.to_string()))
+            .unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 0, "cleanup must yield to a published wake window");
+        assert!(instance_exists(&db, "sleeper"));
+
+        reset_wake_state_for_test();
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_beacon_gap_grace_arms_once_per_beacon_value() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        insert_stale_active(&db, "dead", 3700, 3700, DEAD_PID);
+
+        // A beacon frozen by the last delivery loop exiting: the gap sits in
+        // the wake range but no wake is coming.
+        let frozen = now_epoch_f64() - 120.0;
+        db.kv_set("_wake_last_wall", Some(&frozen.to_string()))
+            .unwrap();
+
+        assert_eq!(
+            cleanup_stale_instances(&db, 3600, 3600),
+            0,
+            "first sighting of a beacon gap should still grace"
+        );
+        assert!(instance_exists(&db, "dead"));
+
+        // A later `hcom list` is a fresh process, so it starts from a clean
+        // WAKE_STATE and re-reads the same unchanged beacon.
+        reset_wake_state_for_test();
+
+        assert_eq!(
+            cleanup_stale_instances(&db, 3600, 3600),
+            1,
+            "an unchanged beacon must not keep suppressing cleanup"
+        );
+        assert!(!instance_exists(&db, "dead"));
+
+        reset_wake_state_for_test();
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_beacon_gap_grace_covers_sleeps_longer_than_an_hour() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        // No PID, so the liveness gate cannot protect this row — the beacon is
+        // the only thing standing between an overnight sleep and a reclaim.
+        insert_stale_active(&db, "adopted", 7300, 7300, DEAD_PID);
+        db.conn()
+            .execute(
+                "UPDATE instances SET pid = NULL WHERE name = 'adopted'",
+                rusqlite::params![],
+            )
+            .unwrap();
+
+        let slept_two_hours = now_epoch_f64() - 7200.0;
+        db.kv_set("_wake_last_wall", Some(&slept_two_hours.to_string()))
+            .unwrap();
+
+        assert_eq!(
+            cleanup_stale_instances(&db, 3600, 3600),
+            0,
+            "a multi-hour sleep is still a wake worth gracing"
+        );
+        assert!(instance_exists(&db, "adopted"));
+
+        reset_wake_state_for_test();
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_publishing_wake_grace_leaves_state_a_one_shot_can_read() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        is_in_wake_grace_publishing(&db);
+
+        assert!(
+            db.kv_get("_wake_last_wall").unwrap().is_some(),
+            "long-lived loops must publish the liveness beacon"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_shared_wake_grace_never_publishes() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        is_in_wake_grace_shared(&db);
+
+        assert!(
+            db.kv_get("_wake_last_wall").unwrap().is_none(),
+            "a one-shot writing the beacon would grace every later invocation"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_active_status_survives_heartbeat_gap_within_grace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let data = InstanceRow {
+            name: "busy".into(),
+            status: ST_ACTIVE.into(),
+            status_context: "tool:Bash".into(),
+            status_time: now - 3700,
+            last_stop: now - (ACTIVE_HEARTBEAT_GRACE - 20),
+            tcp_mode: 1,
+            ..default_instance()
+        };
+
+        let computed = get_instance_status(&data, &db);
+
+        assert_eq!(
+            computed.status, ST_ACTIVE,
+            "a heartbeat inside the grace window still proves life"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_active_status_goes_stale_past_heartbeat_grace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let data = InstanceRow {
+            name: "gone".into(),
+            status: ST_ACTIVE.into(),
+            status_context: "tool:Bash".into(),
+            status_time: now - 3700,
+            last_stop: now - (ACTIVE_HEARTBEAT_GRACE + 60),
+            tcp_mode: 1,
+            ..default_instance()
+        };
+
+        let computed = get_instance_status(&data, &db);
+
+        assert_eq!(computed.status, ST_INACTIVE);
+        assert_eq!(computed.context, "stale");
+        cleanup(path);
     }
 
     fn default_instance() -> InstanceRow {
@@ -1109,6 +1473,7 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
     #[test]
     fn test_status_listening_stale_heartbeat() {
+        let _guard = wake_test_guard();
         let (db, path) = setup_test_db();
         let now = now_epoch_i64();
 
@@ -1133,6 +1498,7 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
     #[test]
     fn test_status_active_stale_activity() {
+        let _guard = wake_test_guard();
         let (db, path) = setup_test_db();
         let now = now_epoch_i64();
 

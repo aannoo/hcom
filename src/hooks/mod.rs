@@ -189,10 +189,10 @@ pub mod test_helpers {
 
 // Re-export key types.
 pub use common::{
-    deliver_pending_messages, finalize_session, find_last_bind_marker, get_pending_instances,
-    init_hook_context, inject_bootstrap_once, poll_messages, stop_instance,
+    deliver_pending_messages, finalize_session, init_hook_context, inject_bootstrap_once,
+    poll_messages, stop_instance,
 };
-pub use family::{bind_vanilla_instance, extract_tool_detail};
+pub use family::extract_tool_detail;
 pub use utils::{HOOK_REGISTRY, HookCategory, HookInfo};
 
 /// Delivery cursor/status update to apply after hook output is written.

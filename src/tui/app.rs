@@ -224,13 +224,17 @@ impl App {
 
             if dirty && resize_cooldown == 0 {
                 if is_inline {
-                    crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
+                    // Must run BEFORE the synchronized-update frame: Terminal::clear()
+                    // queries the cursor position (ESC[6n), and wezterm holds every
+                    // action — replies included — until the frame ends, so a query
+                    // inside the frame deadlocks until crossterm's 2s timeout errors out.
                     if self.ui.needs_clear_replay {
                         self.ui.needs_clear_replay = false;
                         super::clear_for_resize(viewport_height)?;
                         // We externally cleared terminal content; force a full viewport repaint.
                         terminal.clear()?;
                     }
+                    crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
                     if self.ui.inline_filter_changed {
                         self.ui.inline_filter_changed = false;
                         self.update_search();

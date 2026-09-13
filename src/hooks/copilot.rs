@@ -17,6 +17,16 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 const HCOM_TRIGGER: &str = "<hcom>";
 const HOOK_TIMEOUT_SECS: u64 = 15;
+// PascalCase selects Copilot's VS Code-compatible payload format; changing to
+// camelCase also changes payload fields, so it requires checking
+// HookPayload::from_copilot_native, not just renaming entries in this table.
+// `command` is the documented cross-platform fallback; explicit `bash` and
+// `powershell` fields take precedence on their respective platforms.
+// https://docs.github.com/en/copilot/reference/hooks-reference
+//
+// Keep Notification, PermissionRequest and PostToolUseFailure: their handlers
+// support idle delivery, approval detection and tool-failure status. These CLI
+// events are documented; the cloud agent supports a smaller event set.
 const COPILOT_HOOK_COMMANDS: &[(&str, &str, bool, Option<&str>)] = &[
     ("SessionStart", "copilot-sessionstart", false, None),
     ("UserPromptSubmit", "copilot-userpromptsubmit", false, None),

@@ -739,9 +739,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let process_id = std::env::var("HCOM_PROCESS_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let codex_thread_id = std::env::var("CODEX_THREAD_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let codex_thread_id = crate::shared::context::HcomContext::from_os().codex_thread_id;
     let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(

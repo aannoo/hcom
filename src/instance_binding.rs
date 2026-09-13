@@ -947,7 +947,7 @@ pub fn resolve_process_binding(db: &HcomDb, process_id: Option<&str>) -> Option<
     db.get_process_binding(pid).ok()?
 }
 
-/// Resolve instance via process binding, session binding, or transcript marker.
+/// Resolve instance via process or session binding.
 pub fn resolve_instance_from_binding(
     db: &HcomDb,
     session_id: Option<&str>,

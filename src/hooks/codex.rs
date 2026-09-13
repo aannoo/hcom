@@ -20,7 +20,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, value};
 
 use crate::db::{HcomDb, InstanceRow};
-use crate::hooks::{HookPayload, HookResult, common, family};
+use crate::hooks::{HookPayload, HookResult, common};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
@@ -53,6 +53,42 @@ const HCOM_TOOL_NAMES: &[&str] = &[
 ];
 const CODEX_HOOKS_FEATURE_RENAME_VERSION: (u64, u64, u64) = (0, 129, 0);
 const CODEX_HOOK_TRUST_MIN_VERSION: (u64, u64, u64) = (0, 131, 0);
+/// Wire value of Codex's `HookSource::User` variant.
+///
+/// `codex_protocol::protocol::HookSource` is `rename_all = "snake_case"`
+/// (codex-rs/protocol/src/protocol.rs:1528) and the app-server v2 mirror is
+/// `rename_all = "camelCase"` (the `v2_enum_from_core!` macro in
+/// codex-rs/app-server-protocol/src/protocol/v2/shared.rs:21-48, applied at
+/// v2/hook.rs:42). Both encodings render the single-word `User` variant as
+/// "user", so one literal covers the whole protocol surface.
+const CODEX_HOOK_SOURCE_USER: &str = "user";
+/// Trust statuses Codex already permits without the bypass flag. Everything
+/// else (`untrusted`, `modified`, or a status hcom does not recognize) is what
+/// `--dangerously-bypass-hook-trust` would newly unlock — see the gate at
+/// codex-rs/hooks/src/engine/discovery.rs:565-571.
+const CODEX_ALREADY_PERMITTED_TRUST_STATUSES: &[&str] = &["trusted", "managed"];
+/// Every Codex hook event that can carry declarations in a hooks.json file or a
+/// `[hooks]` TOML table (codex-rs/config/src/hook_config.rs:36-59). Wider than
+/// `CODEX_HOOK_COMMANDS`, which lists only the events hcom itself installs.
+const CODEX_ALL_HOOK_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+];
+/// Subdirectories of `$CODEX_HOME/plugins` that hold installed plugins
+/// (codex-rs/core-plugins/src/store.rs:21-22).
+const CODEX_PLUGIN_STORE_DIRS: &[&str] = &["cache", "data"];
+/// Codex's default `project_root_markers`
+/// (codex-rs/config/src/project_root_markers.rs:5).
+const CODEX_DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 const HCOM_CODEX_CLI_VERSION_KEY: &str = "hcom_codex_cli_version";
 const HCOM_HOOK_DEFINITION_HASH_KEY: &str = "hcom_hook_definition_hash";
 #[cfg(not(test))]
@@ -66,6 +102,40 @@ struct CodexHookTrustEntry {
     key: String,
     command: String,
     current_hash: String,
+}
+
+/// One hook from a `codex app-server hooks/list` response, reduced to the
+/// fields hcom needs to tell its own hooks apart from everyone else's and to
+/// predict what `--dangerously-bypass-hook-trust` would unlock.
+///
+/// Field names on the wire are camelCase (`HookMetadata` in
+/// codex-rs/app-server-protocol/src/protocol/v2/plugin.rs:513-542); the
+/// snake_case spellings of the core protocol are accepted too.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexHookListEntry {
+    key: Option<String>,
+    command: Option<String>,
+    source: Option<String>,
+    source_path: Option<PathBuf>,
+    enabled: bool,
+    trust_status: Option<String>,
+    current_hash: Option<String>,
+}
+
+/// hcom's launch-time verdict on Codex's hook-trust gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CodexHookTrustState {
+    /// Nothing to do: Codex predates the trust gate, or hcom's own trust state
+    /// in `hooks.state` is exact and its hooks will run on their own.
+    Trusted,
+    /// Codex's own `hooks/list` inventory says the invocation-wide bypass would
+    /// unlock nothing except hcom's hooks.
+    BypassSafeFromHooksList,
+    /// `hooks/list` was unavailable, but a purely local scan of every hook
+    /// definition that could be in scope found only hcom's own.
+    BypassSafeFromLocalScan,
+    /// The bypass would — or might — unlock a hook hcom does not own.
+    BypassUnsafe { reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,51 +251,13 @@ fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> O
     )
 }
 
-fn bind_vanilla_instance_codex(
-    db: &HcomDb,
-    session_id: &str,
-    transcript_path: Option<&str>,
-) -> Option<String> {
-    let pending = common::get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
-    }
-
-    let derived_path = if transcript_path.is_none() || transcript_path == Some("") {
-        derive_codex_transcript_path(session_id)
-    } else {
-        None
-    };
-    let effective_path = transcript_path
-        .filter(|s| !s.is_empty())
-        .or(derived_path.as_deref())?;
-    let effective_path = normalize_codex_transcript_path(effective_path);
-
-    let instance_name = common::find_last_bind_marker(&effective_path)?;
-
-    family::bind_vanilla_instance(
-        db,
-        &instance_name,
-        Some(session_id).filter(|s| !s.is_empty()),
-        Some(&effective_path),
-        "codex",
-        "codex-sessionstart",
-    )
-}
-
 fn resolve_codex_instance(
     db: &HcomDb,
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> Option<InstanceRow> {
     let session_id = payload.session_id.as_deref().unwrap_or("");
-    if let Some(instance) = resolve_instance_codex(db, ctx, session_id) {
-        return Some(instance);
-    }
-
-    let bound_name =
-        bind_vanilla_instance_codex(db, session_id, payload.transcript_path.as_deref())?;
-    db.get_instance_full(&bound_name).ok().flatten()
+    resolve_instance_codex(db, ctx, session_id)
 }
 
 fn update_codex_position(
@@ -536,6 +568,78 @@ pub fn get_codex_hooks_path() -> PathBuf {
 /// Get path to Codex execpolicy rules directory.
 pub fn get_codex_rules_path() -> PathBuf {
     codex_config_dir().join("rules")
+}
+
+/// Strip a Windows verbatim prefix and collapse `.`/`..` components.
+///
+/// Purely lexical, so it works on paths that do not exist.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let text = path.to_string_lossy();
+    let plain = text
+        .strip_prefix(r"\\?\UNC\")
+        .map(|unc| format!(r"\\{unc}"))
+        .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string));
+    let plain = plain.map(PathBuf::from);
+    let path = plain.as_deref().unwrap_or(path);
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether two paths name the same file, without requiring either to exist.
+///
+/// Codex passes hook source paths through `AbsolutePathBuf::from_absolute_path`
+/// (codex-rs/utils/absolute-path/src/lib.rs:58), which absolutizes lexically but
+/// does not resolve symlinks, so a `sourcePath` from Codex can differ from
+/// hcom's own `get_codex_hooks_path()` by a `.`/`..` component, a verbatim
+/// Windows prefix, or by one side having been canonicalized. Compare lexically
+/// first and only then pay for canonicalization.
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    if a == b || lexically_normalized(a) == lexically_normalized(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether a `hooks.state` key names a handler inside hcom's own hooks.json.
+///
+/// Codex derives these keys as
+/// `hook_key(&source.key_source, event_name, group_index, handler_index)` —
+/// `"<key_source>:<event_label>:<group>:<handler>"`
+/// (codex-rs/hooks/src/lib.rs:105-115) — and for a JSON hook source the
+/// key_source is that file's path (codex-rs/hooks/src/engine/discovery.rs:148).
+/// Splitting from the right keeps Windows drive colons inside the path part.
+fn hook_state_key_belongs_to_hcom_hooks_json(key: &str, hooks_path: &Path) -> bool {
+    let mut parts = key.rsplitn(4, ':');
+    let (Some(handler_index), Some(group_index), Some(event_label), Some(key_source)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if handler_index.parse::<usize>().is_err() || group_index.parse::<usize>().is_err() {
+        return false;
+    }
+    if !CODEX_HOOK_COMMANDS
+        .iter()
+        .any(|(event, _, _)| codex_hook_event_state_label(event) == event_label)
+    {
+        return false;
+    }
+    paths_equivalent(Path::new(key_source), hooks_path)
 }
 
 fn build_codex_hook_command(command: &str) -> String {
@@ -857,9 +961,30 @@ fn expected_hcom_hook_commands() -> HashSet<String> {
         .collect()
 }
 
-fn parse_hcom_hook_entries_from_hooks_list(
-    value: &Value,
-) -> Result<Vec<CodexHookTrustEntry>, String> {
+/// `(hooks.state event label, command)` for each hook hcom installs. Lets tests
+/// in other modules build realistic hooks/list responses.
+#[cfg(test)]
+pub(crate) fn test_expected_hook_specs() -> Vec<(&'static str, String)> {
+    CODEX_HOOK_COMMANDS
+        .iter()
+        .map(|(event, command, _)| {
+            (
+                codex_hook_event_state_label(event),
+                build_codex_hook_command(command),
+            )
+        })
+        .collect()
+}
+
+/// Read one string field, accepting the camelCase wire spelling and the
+/// snake_case spelling of the core protocol.
+fn hook_list_str_field<'a>(hook: &'a Value, camel: &str, snake: &str) -> Option<&'a str> {
+    hook.get(camel)
+        .or_else(|| hook.get(snake))
+        .and_then(|v| v.as_str())
+}
+
+fn parse_codex_hook_list_entries(value: &Value) -> Result<Vec<CodexHookListEntry>, String> {
     let hooks = value
         .pointer("/result/data/0/hooks")
         .or_else(|| value.pointer("/data/0/hooks"))
@@ -867,32 +992,130 @@ fn parse_hcom_hook_entries_from_hooks_list(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "codex hooks/list response did not contain hooks".to_string())?;
 
+    Ok(hooks
+        .iter()
+        .map(|hook| CodexHookListEntry {
+            key: hook_list_str_field(hook, "key", "key").map(str::to_string),
+            command: hook_list_str_field(hook, "command", "command").map(str::to_string),
+            source: hook_list_str_field(hook, "source", "source").map(str::to_string),
+            source_path: hook_list_str_field(hook, "sourcePath", "source_path").map(PathBuf::from),
+            // Codex only treats an explicit `false` as disabled; absent means
+            // enabled (default_enabled in the v2 protocol shared module).
+            enabled: hook
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            trust_status: hook_list_str_field(hook, "trustStatus", "trust_status")
+                .map(str::to_string),
+            current_hash: hook_list_str_field(hook, "currentHash", "current_hash")
+                .map(str::to_string),
+        })
+        .collect())
+}
+
+/// Whether a `hooks/list` entry is one of hcom's own hook handlers.
+///
+/// Command equality alone is not identity: any repository can ship a
+/// `.codex/hooks.json` containing `{"command": "hcom codex-pretooluse"}`, and a
+/// command-only test would let that entry collect hcom's trust state or pass as
+/// "already ours" when deciding on the bypass. The entry must also come from the
+/// user layer and from hcom's own hooks.json, the single file hcom writes.
+fn hook_list_entry_is_hcom_owned(
+    entry: &CodexHookListEntry,
+    expected_commands: &HashSet<String>,
+    hooks_path: &Path,
+) -> bool {
+    entry
+        .command
+        .as_deref()
+        .is_some_and(|command| expected_commands.contains(command))
+        && entry.source.as_deref() == Some(CODEX_HOOK_SOURCE_USER)
+        && entry
+            .source_path
+            .as_deref()
+            .is_some_and(|path| paths_equivalent(path, hooks_path))
+}
+
+fn describe_hook_list_entry(entry: &CodexHookListEntry) -> String {
+    let what = entry
+        .command
+        .as_deref()
+        .or(entry.key.as_deref())
+        .unwrap_or("<unnamed hook>");
+    match entry.source_path.as_deref() {
+        Some(path) => format!("{what} in {}", path.display()),
+        None => what.to_string(),
+    }
+}
+
+/// Hooks that `--dangerously-bypass-hook-trust` would unlock and hcom does not
+/// own.
+///
+/// The flag is invocation-wide for every non-managed hook source — user layer,
+/// project layer, and plugins alike (codex-rs/hooks/src/engine/discovery.rs:150,
+/// :245, :565-571) — and it also suppresses Codex's own "Hooks need review"
+/// prompt (codex-rs/tui/src/startup_hooks_review.rs:245-247). Codex's own help
+/// text spells out the contract: "Intended only for automation that already vets
+/// hook sources." This is that vetting step, so the flag is only safe when every
+/// hook it would newly permit belongs to hcom.
+///
+/// Note that foreign hooks routinely live in hcom's own hooks.json — hcom merges
+/// its entries into whatever file is already there — so the source path alone is
+/// never identity.
+fn foreign_hooks_unlocked_by_bypass(
+    entries: &[CodexHookListEntry],
+    hooks_path: &Path,
+) -> Vec<String> {
     let expected = expected_hcom_hook_commands();
-    let mut entries = Vec::new();
-    for hook in hooks {
-        let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !expected.contains(command) {
+    entries
+        .iter()
+        .filter(|entry| {
+            // A status hcom does not recognize counts as unlockable: hcom must
+            // not reimplement Codex's currentHash algorithm, so it cannot prove
+            // such a hook is already trusted.
+            let unlockable = entry
+                .trust_status
+                .as_deref()
+                .is_none_or(|status| !CODEX_ALREADY_PERMITTED_TRUST_STATUSES.contains(&status));
+            entry.enabled
+                && unlockable
+                && !hook_list_entry_is_hcom_owned(entry, &expected, hooks_path)
+        })
+        .map(describe_hook_list_entry)
+        .collect()
+}
+
+fn hcom_trust_entries_from_hook_list(
+    entries: &[CodexHookListEntry],
+    hooks_path: &Path,
+) -> Result<Vec<CodexHookTrustEntry>, String> {
+    let expected = expected_hcom_hook_commands();
+    let mut trust_entries = Vec::new();
+    for entry in entries {
+        if !hook_list_entry_is_hcom_owned(entry, &expected, hooks_path) {
             continue;
         }
-        let key = hook
-            .get("key")
-            .and_then(|v| v.as_str())
+        // Ownership implies a command was present.
+        let command = entry.command.clone().unwrap_or_default();
+        let key = entry
+            .key
+            .clone()
             .ok_or_else(|| format!("hcom hook {command} missing key"))?;
-        let current_hash = hook
-            .get("currentHash")
-            .or_else(|| hook.get("current_hash"))
-            .and_then(|v| v.as_str())
+        let current_hash = entry
+            .current_hash
+            .clone()
             .ok_or_else(|| format!("hcom hook {command} missing currentHash"))?;
-        entries.push(CodexHookTrustEntry {
-            key: key.to_string(),
-            command: command.to_string(),
-            current_hash: current_hash.to_string(),
+        trust_entries.push(CodexHookTrustEntry {
+            key,
+            command,
+            current_hash,
         });
     }
 
-    let found: HashSet<&str> = entries.iter().map(|entry| entry.command.as_str()).collect();
+    let found: HashSet<&str> = trust_entries
+        .iter()
+        .map(|entry| entry.command.as_str())
+        .collect();
     let missing: Vec<String> = expected
         .iter()
         .filter(|command| !found.contains(command.as_str()))
@@ -905,13 +1128,21 @@ fn parse_hcom_hook_entries_from_hooks_list(
         ));
     }
 
-    Ok(entries)
+    Ok(trust_entries)
 }
 
 #[cfg(test)]
-fn test_hcom_hook_entries_from_hooks_json(
-    hooks_path: &Path,
+fn parse_hcom_hook_entries_from_hooks_list(
+    value: &Value,
 ) -> Result<Vec<CodexHookTrustEntry>, String> {
+    let entries = parse_codex_hook_list_entries(value)?;
+    hcom_trust_entries_from_hook_list(&entries, &get_codex_hooks_path())
+}
+
+/// Synthesize the hooks/list response Codex would return for hcom's own
+/// hooks.json, so unit tests exercise the real identity checks without an RPC.
+#[cfg(test)]
+fn test_hook_list_from_hooks_json(hooks_path: &Path) -> Result<Vec<CodexHookListEntry>, String> {
     let content = std::fs::read_to_string(hooks_path).map_err(|e| e.to_string())?;
     let json: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     let keys = hcom_hook_state_keys_from_hooks_json(&json, hooks_path);
@@ -928,32 +1159,34 @@ fn test_hcom_hook_entries_from_hooks_json(
     Ok(keys
         .into_iter()
         .enumerate()
-        .map(|(index, key)| CodexHookTrustEntry {
-            key,
-            command: format!("test-hcom-hook-{index}"),
-            current_hash: format!("sha256:test-{index}"),
+        .map(|(index, key)| CodexHookListEntry {
+            command: Some(hcom_command_for_hook_state_key(&key)),
+            key: Some(key),
+            source: Some(CODEX_HOOK_SOURCE_USER.to_string()),
+            source_path: Some(hooks_path.to_path_buf()),
+            enabled: true,
+            trust_status: Some("untrusted".to_string()),
+            current_hash: Some(format!("sha256:test-{index}")),
         })
         .collect())
 }
 
-fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
+fn fetch_codex_hook_list(cwd: &Path) -> Result<Vec<CodexHookListEntry>, String> {
     #[cfg(test)]
     {
+        let _ = cwd;
         if let Ok(value) = std::env::var("HCOM_TEST_CODEX_HOOKS_LIST_JSON") {
             if value == "__fail__" {
                 return Err("test hook list failure".to_string());
             }
             let json: Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
-            return parse_hcom_hook_entries_from_hooks_list(&json);
+            return parse_codex_hook_list_entries(&json);
         }
-        test_hcom_hook_entries_from_hooks_json(&get_codex_hooks_path())
+        test_hook_list_from_hooks_json(&get_codex_hooks_path())
     }
 
     #[cfg(not(test))]
     {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // TODO: If Codex changes hooks/list discovery to depend on each launch
-        // cwd, pass the target launch cwd through instead of using hcom's cwd.
         let mut child = crate::terminal::executable_command("codex")
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
@@ -1018,8 +1251,13 @@ fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        parse_hcom_hook_entries_from_hooks_list(&response?)
+        parse_codex_hook_list_entries(&response?)
     }
+}
+
+fn fetch_codex_hcom_hook_entries(cwd: &Path) -> Result<Vec<CodexHookTrustEntry>, String> {
+    let entries = fetch_codex_hook_list(cwd)?;
+    hcom_trust_entries_from_hook_list(&entries, &get_codex_hooks_path())
 }
 
 #[cfg(not(test))]
@@ -1206,11 +1444,30 @@ fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
 
 fn write_hcom_hook_trust_state(
     config_path: &Path,
+    hooks_path: &Path,
     entries: &[CodexHookTrustEntry],
     stale_keys: &HashSet<String>,
     codex_cli_version: &str,
     definition_hashes: &HashMap<String, String>,
 ) -> Result<(), String> {
+    // Defense in depth. `hooks.state` lives in the user's global config.toml and
+    // each entry written here both trusts a hook and force-enables it, so a key
+    // belonging to any other source — a repo's `.codex/hooks.json`, a plugin —
+    // must never reach this table, no matter how the entry was identified
+    // upstream. Fail loudly instead of silently skipping: a caller that hands
+    // over a foreign key has a bug worth surfacing.
+    if let Some(foreign) = entries
+        .iter()
+        .find(|entry| !hook_state_key_belongs_to_hcom_hooks_json(&entry.key, hooks_path))
+    {
+        return Err(format!(
+            "refusing to write Codex hook trust state for '{}' ({}): key does not belong to hcom's own hooks file {}",
+            foreign.key,
+            foreign.command,
+            hooks_path.display()
+        ));
+    }
+
     let mut doc: DocumentMut = if config_path.exists() {
         std::fs::read_to_string(config_path)
             .map_err(|e| e.to_string())?
@@ -1261,36 +1518,364 @@ fn write_hcom_hook_trust_state(
     paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())
 }
 
-pub(crate) fn ensure_codex_hcom_hooks_trusted() -> Result<(), String> {
-    let Some(codex_cli_version) = codex_hook_trust_version()? else {
-        return Ok(());
-    };
-
-    let entries = fetch_codex_hcom_hook_entries()?;
-    let definition_hashes = hcom_hook_definition_hashes_from_hooks_path(&get_codex_hooks_path())
-        .map_err(|e| e.to_string())?;
-    let config_path = get_codex_config_path();
+/// Rewrite hcom's own `hooks.state` entries from an authoritative hooks/list
+/// inventory, so Codex's `currentHash` values land in the trusted hashes.
+fn write_hcom_trust_state_from_hook_list(
+    hook_list: &[CodexHookListEntry],
+    codex_cli_version: &str,
+) -> Result<(), String> {
+    let hooks_path = get_codex_hooks_path();
+    let entries = hcom_trust_entries_from_hook_list(hook_list, &hooks_path)?;
+    let definition_hashes =
+        hcom_hook_definition_hashes_from_hooks_path(&hooks_path).map_err(|e| e.to_string())?;
     write_hcom_hook_trust_state(
-        &config_path,
+        &get_codex_config_path(),
+        &hooks_path,
         &entries,
         &HashSet::new(),
-        &codex_cli_version,
+        codex_cli_version,
         &definition_hashes,
     )
 }
 
-pub(crate) fn codex_hcom_hooks_trusted_locally() -> bool {
+/// Decide, once per launch, what hcom may do about Codex's hook-trust gate for a
+/// codex started in `launch_dir`.
+///
+/// Exact trust state is always preferred; the invocation-wide bypass flag is a
+/// last resort and is only permitted when hcom can show that nothing but its own
+/// hooks would be unlocked by it.
+pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrustState {
     let codex_cli_version = match codex_hook_trust_version() {
-        Ok(Some(version)) => version,
-        Ok(None) => {
-            return true;
-        }
-        Err(_) => {
-            return false;
+        // Codex predates the trust gate — nothing is holding hcom's hooks back.
+        Ok(None) => return CodexHookTrustState::Trusted,
+        Ok(Some(version)) => Some(version),
+        // Without a version hcom cannot write valid trust state at all, so treat
+        // this exactly like an unavailable hooks/list and decide locally.
+        Err(e) => {
+            log::log_warn(
+                "codex",
+                "codex.hook_trust_version_unknown",
+                &format!("could not determine Codex version for hook trust: {e}"),
+            );
+            None
         }
     };
 
-    codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version)
+    if let Some(codex_cli_version) = codex_cli_version {
+        // This is the launch-time guardrail. Cheap status/verify paths only
+        // inspect local metadata, but before opening Codex we ask Codex for
+        // authoritative currentHash values and rewrite hcom's trust entries.
+        match fetch_codex_hook_list(launch_dir) {
+            Ok(hook_list) => {
+                match write_hcom_trust_state_from_hook_list(&hook_list, &codex_cli_version) {
+                    Ok(()) if codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version) => {
+                        return CodexHookTrustState::Trusted;
+                    }
+                    Ok(()) => log::log_warn(
+                        "codex",
+                        "codex.hook_trust_self_heal_incomplete",
+                        "Codex hook trust self-heal completed but trusted state still looks incomplete",
+                    ),
+                    Err(e) => log::log_warn(
+                        "codex",
+                        "codex.hook_trust_self_heal_failed",
+                        &format!("Codex hook trust self-heal failed: {e}"),
+                    ),
+                }
+
+                // Self-heal did not land, but Codex just reported every hook it
+                // can see along with its trust status, so the bypass can be
+                // judged precisely instead of guessed at.
+                let foreign = foreign_hooks_unlocked_by_bypass(&hook_list, &get_codex_hooks_path());
+                return if foreign.is_empty() {
+                    CodexHookTrustState::BypassSafeFromHooksList
+                } else {
+                    CodexHookTrustState::BypassUnsafe {
+                        reason: format!(
+                            "Codex reports enabled but untrusted hooks that are not hcom's: {}",
+                            foreign.join(", ")
+                        ),
+                    }
+                };
+            }
+            Err(e) => {
+                // hooks/list is how hcom *refreshes* trust state, not how it
+                // checks it. When the RPC is unavailable but the state already
+                // on disk is exact for this Codex version, hcom's hooks run on
+                // their own and nothing is degraded — going blind here would
+                // warn the user and weigh up a bypass that is not needed at all.
+                // Worth its own step because a flaky or slow app-server is the
+                // ordinary failure here, and it must not turn every launch into
+                // a false alarm.
+                if codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version) {
+                    log::log_warn(
+                        "codex",
+                        "codex.hook_list_unavailable_state_exact",
+                        &format!(
+                            "codex hooks/list unavailable, but hcom's persisted hook trust is already exact; launching unchanged: {e}"
+                        ),
+                    );
+                    return CodexHookTrustState::Trusted;
+                }
+                log::log_warn(
+                    "codex",
+                    "codex.hook_list_unavailable",
+                    &format!(
+                        "codex hooks/list unavailable; falling back to a local hook scan: {e}"
+                    ),
+                );
+            }
+        }
+    }
+
+    // Blind mode: no authoritative inventory. Only bypass when a purely local
+    // scan proves that nothing but hcom's own hooks could be in scope.
+    match scan_local_codex_hook_definitions(launch_dir) {
+        Ok(foreign) if foreign.is_empty() => CodexHookTrustState::BypassSafeFromLocalScan,
+        Ok(foreign) => CodexHookTrustState::BypassUnsafe {
+            reason: format!(
+                "local scan found hook definitions that are not hcom's: {}",
+                foreign.join(", ")
+            ),
+        },
+        Err(e) => CodexHookTrustState::BypassUnsafe {
+            reason: format!("local hook scan was inconclusive: {e}"),
+        },
+    }
+}
+
+/// Enumerate every Codex hook definition that could be in scope for a launch in
+/// `launch_dir` without talking to Codex, and describe each one hcom does not
+/// own.
+///
+/// Covers the three source kinds `--dangerously-bypass-hook-trust` unlocks:
+/// - the user layer — `$CODEX_HOME/hooks.json` and a `[hooks]` table in
+///   `$CODEX_HOME/config.toml`
+/// - project layers — `.codex/hooks.json` and `[hooks]` in `.codex/config.toml`
+///   (codex-rs/config/src/loader/mod.rs:1214 `load_project_layers`)
+/// - plugins, which hcom cannot resolve into declarations — see
+///   `note_possible_plugin_hooks`
+///
+/// hcom writes exactly one hooks file, so only handlers in that file with a
+/// command hcom installs are hcom's; everything found anywhere else is foreign.
+/// `Err` means the scan could not be completed and the caller must fail closed.
+fn scan_local_codex_hook_definitions(launch_dir: &Path) -> Result<Vec<String>, String> {
+    let codex_home = codex_config_dir();
+    let hcom_hooks_path = get_codex_hooks_path();
+    let expected = expected_hcom_hook_commands();
+    let mut foreign = Vec::new();
+
+    collect_foreign_hooks_from_hooks_json(&hcom_hooks_path, &expected, true, &mut foreign)?;
+    let user_config_path = codex_home.join("config.toml");
+    let user_config = read_toml_value_if_present(&user_config_path)?;
+    if let Some(config) = user_config.as_ref() {
+        collect_foreign_hooks_from_config_toml(&user_config_path, config, &expected, &mut foreign)?;
+        note_declared_plugins(&user_config_path, config, &mut foreign);
+    }
+    note_possible_plugin_hooks(&codex_home, &mut foreign);
+
+    let markers = codex_project_root_markers(user_config.as_ref())?;
+    for dir in codex_project_layer_dirs(launch_dir, &markers)? {
+        let dot_codex = dir.join(".codex");
+        // Codex skips a project `.codex` that resolves to CODEX_HOME itself
+        // (codex-rs/config/src/loader/mod.rs:1256-1259).
+        if paths_equivalent(&dot_codex, &codex_home) || !dot_codex.is_dir() {
+            continue;
+        }
+        collect_foreign_hooks_from_hooks_json(
+            &dot_codex.join("hooks.json"),
+            &expected,
+            false,
+            &mut foreign,
+        )?;
+        let config_path = dot_codex.join("config.toml");
+        if let Some(config) = read_toml_value_if_present(&config_path)? {
+            collect_foreign_hooks_from_config_toml(&config_path, &config, &expected, &mut foreign)?;
+            note_declared_plugins(&config_path, &config, &mut foreign);
+        }
+    }
+
+    Ok(foreign)
+}
+
+/// Codex's project-root markers for this machine.
+///
+/// Codex reads `project_root_markers` from the *merged* config
+/// (codex-rs/config/src/loader/mod.rs:305-307); hcom can only see the user layer,
+/// so a managed layer overriding the key is out of reach. An explicitly empty
+/// array disables root detection, which Codex honors.
+fn codex_project_root_markers(user_config: Option<&toml::Value>) -> Result<Vec<String>, String> {
+    let Some(markers) = user_config.and_then(|config| config.get("project_root_markers")) else {
+        return Ok(CODEX_DEFAULT_PROJECT_ROOT_MARKERS
+            .iter()
+            .map(|marker| (*marker).to_string())
+            .collect());
+    };
+    markers
+        .as_array()
+        .ok_or_else(|| "project_root_markers in Codex config.toml is not an array".to_string())?
+        .iter()
+        .map(|marker| {
+            marker.as_str().map(str::to_string).ok_or_else(|| {
+                "project_root_markers in Codex config.toml is not an array of strings".to_string()
+            })
+        })
+        .collect()
+}
+
+/// Directories whose `.codex` folder Codex would load as a project layer: every
+/// directory from the project root down to `launch_dir`
+/// (codex-rs/config/src/loader/mod.rs:1214-1235). The project root is the nearest
+/// ancestor of `launch_dir` holding one of `markers`, or `launch_dir` itself when
+/// no marker is found or the marker list is empty
+/// (codex-rs/config/src/loader/mod.rs:1154 `find_project_root`).
+fn codex_project_layer_dirs(launch_dir: &Path, markers: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    for ancestor in launch_dir.ancestors() {
+        // A `.git` file rather than directory means a linked worktree or a
+        // submodule. For linked worktrees Codex reads hook declarations from the
+        // *root* checkout's `.codex`, somewhere else on disk entirely
+        // (`root_checkout_hooks_folder_for_dir`,
+        // codex-rs/config/src/loader/mod.rs:925-935). hcom does not follow that
+        // indirection, so the scan cannot claim to be complete.
+        if ancestor.join(".git").is_file() {
+            return Err(format!(
+                "{} is a linked worktree or submodule, so its project hook layer may live in another checkout",
+                ancestor.display()
+            ));
+        }
+        dirs.push(ancestor.to_path_buf());
+        if markers.is_empty() || markers.iter().any(|marker| ancestor.join(marker).exists()) {
+            return Ok(dirs);
+        }
+    }
+    // No marker anywhere up the tree: Codex treats the launch dir as the root.
+    Ok(vec![launch_dir.to_path_buf()])
+}
+
+fn read_toml_value_if_present(path: &Path) -> Result<Option<toml::Value>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    toml::from_str(&content)
+        .map(Some)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))
+}
+
+fn collect_foreign_hooks_from_hooks_json(
+    path: &Path,
+    expected_commands: &HashSet<String>,
+    hcom_owns_file: bool,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    let json: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))?;
+    let Some(events) = json.get("hooks") else {
+        return Ok(());
+    };
+    collect_foreign_hook_events(path, events, expected_commands, hcom_owns_file, out)
+}
+
+fn collect_foreign_hooks_from_config_toml(
+    path: &Path,
+    config: &toml::Value,
+    expected_commands: &HashSet<String>,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(events) = config.get("hooks") else {
+        return Ok(());
+    };
+    // A `[hooks]` TOML table has the same shape as the `hooks` object of a
+    // hooks.json (both deserialize into `HookEventsToml`,
+    // codex-rs/config/src/hook_config.rs:36), so re-encode it and reuse one
+    // walker. hcom never writes hook declarations into config.toml, so nothing
+    // found here is hcom's.
+    let events = serde_json::to_value(events)
+        .map_err(|e| format!("could not read [hooks] from {}: {e}", path.display()))?;
+    collect_foreign_hook_events(path, &events, expected_commands, false, out)
+}
+
+fn collect_foreign_hook_events(
+    source: &Path,
+    events: &Value,
+    expected_commands: &HashSet<String>,
+    hcom_owns_file: bool,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(events) = events.as_object() else {
+        return Err(format!("hooks in {} is not a table", source.display()));
+    };
+    for (event, groups) in events {
+        // `hooks.state` is trust bookkeeping; only PascalCase event names carry
+        // declarations.
+        if !CODEX_ALL_HOOK_EVENTS.contains(&event.as_str()) {
+            continue;
+        }
+        let Some(groups) = groups.as_array() else {
+            return Err(format!(
+                "event '{event}' in {} is not an array of matcher groups",
+                source.display()
+            ));
+        };
+        for group in groups {
+            let Some(handlers) = group.get("hooks").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for handler in handlers {
+                let command = handler.get("command").and_then(|v| v.as_str());
+                // Handlers with no command are Codex's prompt/agent kinds, which
+                // hcom cannot inspect — count them as foreign, the fail-closed
+                // direction.
+                if hcom_owns_file
+                    && command.is_some_and(|command| expected_commands.contains(command))
+                {
+                    continue;
+                }
+                out.push(format!(
+                    "{} in {}",
+                    command.unwrap_or("<hook with no command>"),
+                    source.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `[plugins]` table in any in-scope layer can activate plugin hook sources.
+/// Resolving those into declarations needs each plugin's manifest plus
+/// marketplace state (codex-rs/core-plugins/src/loader.rs:199-229), so hcom
+/// treats the declaration itself as disqualifying.
+fn note_declared_plugins(source: &Path, config: &toml::Value, out: &mut Vec<String>) {
+    let declared = config
+        .get("plugins")
+        .and_then(|plugins| plugins.as_table())
+        .is_some_and(|plugins| !plugins.is_empty());
+    if declared {
+        out.push(format!("[plugins] declared in {}", source.display()));
+    }
+}
+
+/// Installed plugins can contribute hook sources without appearing in any config
+/// file hcom reads, so a non-empty plugin store is disqualifying on its own.
+fn note_possible_plugin_hooks(codex_home: &Path, out: &mut Vec<String>) {
+    let plugins_root = codex_home.join("plugins");
+    let populated = CODEX_PLUGIN_STORE_DIRS.iter().any(|sub| {
+        std::fs::read_dir(plugins_root.join(sub)).is_ok_and(|mut entries| entries.next().is_some())
+    });
+    if populated {
+        out.push(format!(
+            "installed plugins under {}",
+            plugins_root.display()
+        ));
+    }
 }
 
 fn codex_hcom_hooks_trusted_locally_for_version(codex_cli_version: &str) -> bool {
@@ -1901,7 +2486,8 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
         Ok(Some(codex_cli_version)) => {
             let definition_hashes =
                 hcom_hook_definition_hashes_from_hooks_json(&hooks_json, &hooks_path);
-            match fetch_codex_hcom_hook_entries().and_then(|entries| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match fetch_codex_hcom_hook_entries(&cwd).and_then(|entries| {
                 let current_keys: HashSet<String> =
                     entries.iter().map(|entry| entry.key.clone()).collect();
                 let stale_keys: HashSet<String> = old_hcom_hook_keys
@@ -1910,6 +2496,7 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
                     .collect();
                 write_hcom_hook_trust_state(
                     &config_path,
+                    &hooks_path,
                     &entries,
                     &stale_keys,
                     &codex_cli_version,
@@ -2263,6 +2850,212 @@ mod tests {
                 .get("statusMessage")
                 .is_none()
         );
+    }
+
+    // ── GHSA-pwv3-8r7h-p373: hook identity must be source-scoped ────────────
+
+    /// hooks/list entries for hcom's own five hooks, plus whatever `extra` adds.
+    fn hooks_list_value(hooks_path: &Path, extra: Vec<Value>) -> Value {
+        let mut hooks: Vec<Value> = test_expected_hook_specs()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (event_label, command))| {
+                serde_json::json!({
+                    "key": format!("{}:{event_label}:0:0", hooks_path.display()),
+                    "command": command,
+                    "source": "user",
+                    "sourcePath": hooks_path.to_string_lossy(),
+                    "enabled": true,
+                    "trustStatus": "untrusted",
+                    "currentHash": format!("sha256:list-{index}"),
+                })
+            })
+            .collect();
+        hooks.extend(extra);
+        serde_json::json!({ "result": { "data": [{ "hooks": hooks }] } })
+    }
+
+    #[test]
+    #[serial]
+    fn test_impersonating_project_hook_gets_no_trust_entry() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        let impersonated = test_expected_hook_specs()[0].1.clone();
+        let response = hooks_list_value(
+            &hooks_path,
+            vec![serde_json::json!({
+                "key": "/repo/.codex/hooks.json:pre_tool_use:0:0",
+                "command": impersonated,
+                "source": "project",
+                "sourcePath": "/repo/.codex/hooks.json",
+                "enabled": true,
+                "trustStatus": "untrusted",
+                "currentHash": "sha256:impostor",
+            })],
+        );
+
+        let entries = parse_hcom_hook_entries_from_hooks_list(&response).unwrap();
+        assert_eq!(entries.len(), CODEX_HOOK_COMMANDS.len());
+        assert!(
+            entries.iter().all(|entry| !entry.key.contains("/repo/")),
+            "a project hook copying an hcom command must not receive trust state"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_hcom_commands_from_another_source_path_are_not_hcom() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        // Same commands, same user layer, but a different file: not hcom's.
+        let response = hooks_list_value(Path::new("/elsewhere/hooks.json"), Vec::new());
+
+        let error = parse_hcom_hook_entries_from_hooks_list(&response)
+            .expect_err("entries from a foreign hooks file must not count as hcom's");
+        assert!(error.contains("missing hcom hooks"), "{error}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_write_hook_trust_state_refuses_foreign_key() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
+
+        let entries = vec![CodexHookTrustEntry {
+            key: "/repo/.codex/hooks.json:pre_tool_use:0:0".to_string(),
+            command: test_expected_hook_specs()[0].1.clone(),
+            current_hash: "sha256:impostor".to_string(),
+        }];
+        let error = write_hcom_hook_trust_state(
+            &config_path,
+            &hooks_path,
+            &entries,
+            &HashSet::new(),
+            "0.131.0",
+            &HashMap::new(),
+        )
+        .expect_err("a key outside hcom's hooks.json must be refused");
+        assert!(
+            error.contains("does not belong to hcom's own hooks file"),
+            "{error}"
+        );
+        assert!(
+            !std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("trusted_hash"),
+            "the refused entry must not have been written"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_state_key_ownership() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        assert!(hook_state_key_belongs_to_hcom_hooks_json(&key, &hooks_path));
+        // Same file, but an event hcom does not install.
+        assert!(!hook_state_key_belongs_to_hcom_hooks_json(
+            &format!("{}:session_end:0:0", hooks_path.display()),
+            &hooks_path
+        ));
+        // A different file entirely.
+        assert!(!hook_state_key_belongs_to_hcom_hooks_json(
+            "/repo/.codex/hooks.json:pre_tool_use:0:0",
+            &hooks_path
+        ));
+        // Malformed positional suffix.
+        assert!(!hook_state_key_belongs_to_hcom_hooks_json(
+            &format!("{}:pre_tool_use:x:0", hooks_path.display()),
+            &hooks_path
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_foreign_hooks_unlocked_by_bypass_ignores_trusted_and_hcom() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        let response = hooks_list_value(
+            &hooks_path,
+            vec![
+                // Already trusted — the flag changes nothing for it.
+                serde_json::json!({
+                    "key": "/repo/.codex/hooks.json:stop:0:0",
+                    "command": "trusted-tool",
+                    "source": "project",
+                    "sourcePath": "/repo/.codex/hooks.json",
+                    "enabled": true,
+                    "trustStatus": "trusted",
+                    "currentHash": "sha256:a",
+                }),
+                // Disabled — the flag does not enable it.
+                serde_json::json!({
+                    "key": "/repo/.codex/hooks.json:stop:1:0",
+                    "command": "disabled-tool",
+                    "source": "project",
+                    "sourcePath": "/repo/.codex/hooks.json",
+                    "enabled": false,
+                    "trustStatus": "untrusted",
+                    "currentHash": "sha256:b",
+                }),
+            ],
+        );
+        let entries = parse_codex_hook_list_entries(&response).unwrap();
+        assert!(foreign_hooks_unlocked_by_bypass(&entries, &hooks_path).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_foreign_hooks_unlocked_by_bypass_flags_modified_and_unknown() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        let response = hooks_list_value(
+            &hooks_path,
+            vec![
+                serde_json::json!({
+                    "key": "/repo/.codex/hooks.json:stop:0:0",
+                    "command": "modified-tool",
+                    "source": "project",
+                    "sourcePath": "/repo/.codex/hooks.json",
+                    "enabled": true,
+                    "trustStatus": "modified",
+                    "currentHash": "sha256:a",
+                }),
+                // No trustStatus at all: hcom cannot prove it is safe.
+                serde_json::json!({
+                    "key": "/plugin/hooks.json:stop:0:0",
+                    "command": "plugin-tool",
+                    "source": "plugin",
+                    "sourcePath": "/plugin/hooks.json",
+                    "enabled": true,
+                    "currentHash": "sha256:b",
+                }),
+            ],
+        );
+        let entries = parse_codex_hook_list_entries(&response).unwrap();
+        let foreign = foreign_hooks_unlocked_by_bypass(&entries, &hooks_path);
+        assert_eq!(foreign.len(), 2, "{foreign:?}");
+        assert!(foreign.iter().any(|f| f.contains("modified-tool")));
+        assert!(foreign.iter().any(|f| f.contains("plugin-tool")));
+    }
+
+    #[test]
+    fn test_paths_equivalent_handles_dot_components() {
+        assert!(paths_equivalent(
+            Path::new("/home/u/.codex/./hooks.json"),
+            Path::new("/home/u/.codex/hooks.json")
+        ));
+        assert!(paths_equivalent(
+            Path::new("/home/u/other/../.codex/hooks.json"),
+            Path::new("/home/u/.codex/hooks.json")
+        ));
+        assert!(!paths_equivalent(
+            Path::new("/home/u/.codex/hooks.json"),
+            Path::new("/repo/.codex/hooks.json")
+        ));
     }
 
     #[test]

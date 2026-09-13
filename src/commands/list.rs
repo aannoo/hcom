@@ -106,7 +106,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     let (sender_identity, current_name) = if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
         (Some(id.clone()), Some(id.name.clone()))
     } else if let Some(name) = explicit_name {
-        match identity::resolve_identity(db, Some(name), None, None, None, None, None) {
+        match identity::resolve_identity(db, Some(name), None, None, None, None) {
             Ok(id) => {
                 let n = id.name.clone();
                 (Some(id), Some(n))
@@ -117,7 +117,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
         }
     } else {
-        identity::resolve_identity(db, None, None, None, None, None, None)
+        identity::resolve_identity(db, None, None, None, None, None)
             .map(|id| {
                 let n = id.name.clone();
                 (Some(id), Some(n))

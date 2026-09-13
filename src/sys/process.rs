@@ -48,6 +48,17 @@ fn process_identity_platform(pid: u32) -> Option<String> {
 
 #[cfg(windows)]
 fn process_identity_platform(pid: u32) -> Option<String> {
+    creation_ticks_win(pid).map(|ticks| format!("windows:{ticks}"))
+}
+
+/// Process creation time in FILETIME ticks (100 ns units), or `None` when the
+/// process cannot be opened for query — it has exited, or it is not ours.
+///
+/// Serves both the process identity above (a PID is only unique alongside the
+/// creation time of the incarnation holding it) and the parent/child link check
+/// in [`kill_tree_win_checked`].
+#[cfg(windows)]
+fn creation_ticks_win(pid: u32) -> Option<u64> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -66,10 +77,7 @@ fn process_identity_platform(pid: u32) -> Option<String> {
         let mut user: FILETIME = std::mem::zeroed();
         let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
         CloseHandle(handle);
-        ok.then(|| {
-            let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
-            format!("windows:{ticks}")
-        })
+        ok.then_some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
     }
 }
 
@@ -475,6 +483,28 @@ pub fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Ch
     }
 }
 
+/// Whether `child` can really be a child of `parent`, judged by creation time.
+///
+/// A process cannot be older than the process that created it, so a candidate
+/// whose creation time precedes its claimed parent's is a stale parent link:
+/// the recorded parent PID belonged to a process that has since exited and had
+/// its PID recycled by the (younger) process now holding it. Windows keeps
+/// reporting the numeric PID of the original parent, so the orphan looks like a
+/// child of whatever inherited that number.
+///
+/// `None` on either side means the process could not be opened for query, so
+/// the link can neither be confirmed nor disproved — those are accepted, which
+/// leaves the pre-existing behaviour untouched wherever this check has nothing
+/// to say. A process we cannot query is one we generally cannot terminate
+/// either.
+#[cfg(windows)]
+fn child_link_is_plausible(parent_ticks: Option<u64>, child_ticks: Option<u64>) -> bool {
+    match (parent_ticks, child_ticks) {
+        (Some(parent), Some(child)) => child >= parent,
+        _ => true,
+    }
+}
+
 /// Number of extra re-scan rounds run after the initial kill pass, to catch
 /// descendants spawned after the first snapshot (see [`kill_tree_win_checked`]).
 #[cfg(windows)]
@@ -497,8 +527,11 @@ const RESCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(75);
 /// `NotFound` if no live process had the root PID. Like `killpg`, individual
 /// termination failures are best-effort and don't change the result.
 ///
-/// Caveat: PID reuse can make a parent link stale; this shares the same
-/// theoretical race as `taskkill /T`, which is the accepted Windows approach.
+/// Caveat: PID reuse can make a parent link stale, the same theoretical race
+/// `taskkill /T` carries. Links that claim a *pre-existing* process as a child
+/// are rejected on creation time (see `child_link_is_plausible`), which covers
+/// the direction that can reach a long-lived bystander; what remains is a
+/// straggler spawned by whoever recycled a PID this walk already terminated.
 #[cfg(windows)]
 fn kill_tree_win(root: u32) -> GroupSignal {
     kill_tree_win_checked(root).0
@@ -560,13 +593,28 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
         return (GroupSignal::NotFound, false);
     }
 
-    // Collect root + all descendants (BFS over the parent links).
+    // Collect root + all descendants (BFS over the parent links), rejecting any
+    // candidate that is older than the tree member claiming it — that link is
+    // stale, not a real parent/child edge (see `child_link_is_plausible`).
+    //
+    // Creation times are cached per PID, and the cache is what makes the check
+    // hold up across the re-scan rounds below: it keeps each tree member's time
+    // as read while that member was still alive, so a candidate is always
+    // compared against the incarnation this walk actually decided to kill.
+    let mut ticks: std::collections::HashMap<u32, Option<u64>> = std::collections::HashMap::new();
     let mut tree = vec![root];
     let mut i = 0;
     while i < tree.len() {
         let current = tree[i];
+        let parent_ticks = *ticks
+            .entry(current)
+            .or_insert_with(|| creation_ticks_win(current));
         for (&pid, &ppid) in &parents {
-            if ppid == current && !tree.contains(&pid) {
+            if ppid != current || tree.contains(&pid) {
+                continue;
+            }
+            let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
+            if child_link_is_plausible(parent_ticks, child_ticks) {
                 tree.push(pid);
             }
         }
@@ -591,12 +639,11 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     // `terminate_win` -> sleep -> re-snapshot cycle, so there's more elapsed
     // time in which a PID this function just terminated could be recycled by
     // an unrelated process that happens to be parented under another PID
-    // still in `tree`. `KillOnDropJob` (see `pty::win::job`) remains as a
-    // backstop that reaps the real tree regardless of this race, so this is
-    // treated as an acceptable, documented widening rather than something to
-    // engineer away here — doing so would need per-candidate parent-identity
-    // confirmation (e.g. `GetProcessTimes` creation-time checks) for a
-    // vanishingly unlikely window (tens of milliseconds).
+    // still in `tree`. The creation-time check applies here too, against the
+    // times cached while each tree member was alive, so nothing older than the
+    // member claiming it can be swept up; a process spawned *by* whoever
+    // recycled such a PID is younger and still passes. `KillOnDropJob` (see
+    // `pty::win::job`) remains the backstop that reaps the real tree regardless.
     //
     // Always run all RESCAN_ROUNDS —
     // round N finding nothing new doesn't mean a straggler can't still appear
@@ -615,7 +662,14 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
         loop {
             let start_len = tree.len();
             for (&pid, &ppid) in &parents {
-                if tree.contains(&ppid) && !tree.contains(&pid) {
+                if !tree.contains(&ppid) || tree.contains(&pid) {
+                    continue;
+                }
+                let parent_ticks = *ticks
+                    .entry(ppid)
+                    .or_insert_with(|| creation_ticks_win(ppid));
+                let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
+                if child_link_is_plausible(parent_ticks, child_ticks) {
                     tree.push(pid);
                 }
             }
@@ -691,6 +745,25 @@ mod tests {
         drop(child);
     }
 
+    /// A child that stays alive until something kills it, so tests that kill it
+    /// are testing the kill rather than racing the child's own exit.
+    ///
+    /// Not `timeout`: it refuses to run at all when stdin is redirected ("ERROR:
+    /// Input redirection is not supported"), which is how every test harness
+    /// runs it, and then exits within milliseconds. `ping` reads no input. All
+    /// three stdio handles are detached so nothing the child prints lands in the
+    /// test output and nothing it does depends on how the harness was invoked.
+    #[cfg(windows)]
+    fn spawn_long_lived_child() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "ping -n 31 127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
     // Reproduces the bug fixed above: kill_tree_win's terminate_win writes the
     // hcom-kill sentinel exit code 130. A trailing child.kill() (a second,
     // competing TerminateProcess on the same PID) could overwrite it before
@@ -698,16 +771,49 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_kill_child_group_preserves_sentinel_exit_code() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "timeout /T 30"])
-            .spawn()
-            .unwrap();
+        let mut child = spawn_long_lived_child();
         kill_child_group(&mut child);
         let status = child.wait().unwrap();
         assert_eq!(
             status.code(),
             Some(130),
             "kill_child_group must not let a second kill overwrite the hcom-kill sentinel"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_link_plausibility_rejects_candidates_older_than_their_claimed_parent() {
+        assert!(
+            !child_link_is_plausible(Some(500), Some(499)),
+            "a process created before its claimed parent cannot be its child"
+        );
+        assert!(child_link_is_plausible(Some(500), Some(500)));
+        assert!(child_link_is_plausible(Some(500), Some(501)));
+        // Unqueryable on either side: nothing to disprove, so the link stands
+        // and the walk behaves as it did before the check existed.
+        assert!(child_link_is_plausible(None, Some(1)));
+        assert!(child_link_is_plausible(Some(500), None));
+    }
+
+    // The case that matters in practice, against real `GetProcessTimes` data: a
+    // stale parent link pointing at a freshly spawned PID would otherwise offer
+    // up long-lived bystanders — here the test runner itself — as descendants
+    // to terminate.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_child_never_adopts_a_process_that_predates_it() {
+        let mut child = spawn_long_lived_child();
+        let claimed_parent = creation_ticks_win(child.id());
+        let bystander = creation_ticks_win(std::process::id());
+        kill_child_group(&mut child);
+        let _ = child.wait();
+
+        assert!(claimed_parent.is_some(), "spawned child must be queryable");
+        assert!(bystander.is_some(), "our own process must be queryable");
+        assert!(
+            !child_link_is_plausible(claimed_parent, bystander),
+            "a process that predates the PID claiming it must not join the kill tree"
         );
     }
 }

@@ -483,7 +483,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
     } else if let Some(name) = caller_name {
         name.to_string()
     } else {
-        match crate::identity::resolve_identity(db, None, None, None, None, None, None) {
+        match crate::identity::resolve_identity(db, None, None, None, None, None) {
             Ok(id) => id.name,
             Err(_) => {
                 eprintln!("Error: Cannot create subscription without identity.");
@@ -766,7 +766,7 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
     // Resolve launcher
     let launcher = instance_name.map(|s| s.to_string()).or_else(|| {
         if crate::shared::is_inside_ai_tool() {
-            crate::identity::resolve_identity(db, None, None, None, None, None, None)
+            crate::identity::resolve_identity(db, None, None, None, None, None)
                 .ok()
                 .map(|id| id.name)
         } else {

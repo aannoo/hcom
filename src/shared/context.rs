@@ -99,7 +99,10 @@ impl HcomContext {
             tool,
             claude_env_file: get_nonempty("CLAUDE_ENV_FILE"),
             is_fork: is_eq("HCOM_IS_FORK", "1"),
-            codex_thread_id: get_nonempty("CODEX_THREAD_ID"),
+            // Current Codex hooks report the shared root session ID; older
+            // builds expose only the thread ID. Keep this legacy field name.
+            codex_thread_id: get_nonempty("CODEX_SESSION_ID")
+                .or_else(|| get_nonempty("CODEX_THREAD_ID")),
             launched_by: get_nonempty("HCOM_LAUNCHED_BY"),
             launch_batch_id: get_nonempty("HCOM_LAUNCH_BATCH_ID"),
             launch_event_id: get_nonempty("HCOM_LAUNCH_EVENT_ID"),
