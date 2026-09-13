@@ -383,7 +383,7 @@ where
     // HCOM_* settings from config.toml
     for (key, value) in hcom_config.to_env_dict() {
         if !value.is_empty() {
-            env.insert(key, value);
+            insert_effective_env(&mut env, key, value, cfg!(windows));
         }
     }
 
@@ -391,7 +391,7 @@ where
     let env_path = paths::hcom_path(&["env"]);
     for (key, value) in config::load_env_extras(&env_path) {
         if !value.is_empty() {
-            env.insert(key, value);
+            insert_effective_env(&mut env, key, value, cfg!(windows));
         }
     }
 
@@ -451,6 +451,65 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
     };
     Some(root.join(dirname))
+}
+
+/// Insert an environment override using the target platform's key semantics.
+/// Windows environment names are case-insensitive, while `HashMap` keys are
+/// not; remove an earlier spelling so the child receives one authoritative
+/// value instead of an order-dependent pair.
+fn insert_effective_env(
+    env: &mut HashMap<String, String>,
+    key: String,
+    value: String,
+    case_insensitive: bool,
+) {
+    if case_insensitive {
+        env.retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+    }
+    env.insert(key, value);
+}
+
+fn effective_env_value<'a>(
+    env: &'a HashMap<String, String>,
+    key: &str,
+    case_insensitive: bool,
+) -> Option<&'a str> {
+    if case_insensitive {
+        env.iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    } else {
+        env.get(key).map(String::as_str)
+    }
+}
+
+/// Make the tool config directory explicit in the child environment.
+///
+/// Some launch backends clear the inherited environment while others do not.
+/// Copying an ambient override into the effective launch map keeps preflight,
+/// hook setup, and the child process on the same directory in both cases.
+fn ensure_tool_config_env(tool: &LaunchTool, env: &mut HashMap<String, String>) {
+    let Some(env_var) = tool.spec().launch.config_dir_env else {
+        return;
+    };
+    let case_insensitive = cfg!(windows);
+    if let Some(value) = effective_env_value(env, env_var, case_insensitive).map(str::to_owned) {
+        insert_effective_env(env, env_var.to_string(), value, case_insensitive);
+        return;
+    }
+    if let Some(value) = std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        insert_effective_env(env, env_var.to_string(), value, case_insensitive);
+    } else if let Some(config_dir) = isolated_tool_config_dir(tool) {
+        insert_effective_env(
+            env,
+            env_var.to_string(),
+            config_dir.to_string_lossy().to_string(),
+            case_insensitive,
+        );
+    }
 }
 
 /// Get system prompt file path for Gemini/Codex.
@@ -550,7 +609,11 @@ fn format_plugin_install_error(
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
+fn ensure_hooks_installed(
+    tool: &LaunchTool,
+    include_permissions: bool,
+    codex_home: Option<&std::path::Path>,
+) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => {
             if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
@@ -605,12 +668,15 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::Codex => {
-            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
-                && crate::hooks::codex::codex_current_feature_enabled()
+            let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
+            if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
+                && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
             {
                 return Ok(());
             }
-            if let Err(e) = crate::hooks::codex::try_setup_codex_hooks(include_permissions) {
+            if let Err(e) =
+                crate::hooks::codex::try_setup_codex_hooks_at(include_permissions, codex_home)
+            {
                 if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
                     crate::log::log_warn(
                         "codex",
@@ -623,8 +689,8 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
                     let diag = install_diag_context(
                         tool,
                         &[
-                            ("config_path", crate::hooks::codex::get_codex_config_path()),
-                            ("hooks_path", crate::hooks::codex::get_codex_hooks_path()),
+                            ("config_path", codex_home.join("config.toml")),
+                            ("hooks_path", codex_home.join("hooks.json")),
                         ],
                     );
                     bail!(
@@ -1705,14 +1771,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         c
     });
 
-    // For Codex: probe CODEX_HOME writability synchronously. Sandboxed parent
-    // codex would otherwise spawn a child that hangs on the readonly-state-DB
-    // repair prompt. Failing here lets the parent's sandbox-escalation flow
-    // surface the denial to the user.
-    if matches!(normalized, LaunchTool::Codex) {
-        crate::tools::codex_preprocessing::ensure_codex_home_writable()?;
-    }
-
     let inside_ai_tool = crate::shared::context::HcomContext::from_os().is_inside_ai_tool();
     let terminal_mode = params
         .terminal
@@ -1726,9 +1784,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         inside_ai_tool,
     );
 
-    // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
-
     // Build base environment for the current launch regime, then overlay
     // config.toml + ~/.hcom/env which win.
     let mut base_env = build_launch_env(
@@ -1736,22 +1791,40 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         launch_env_regime(base_env_run_here, inside_ai_tool),
     );
     if let Some(ref caller_env) = params.env {
-        base_env.extend(caller_env.clone());
+        for (key, value) in caller_env {
+            insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
+        }
     }
     base_env.remove("HCOM_TERMINAL");
-    if let Some(env_var) = normalized.spec().launch.config_dir_env
-        && !base_env.contains_key(env_var)
-        && std::env::var(env_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_none()
-        && let Some(config_dir) = isolated_tool_config_dir(&normalized)
-    {
-        base_env.insert(
-            env_var.to_string(),
-            config_dir.to_string_lossy().to_string(),
+    ensure_tool_config_env(&normalized, &mut base_env);
+
+    let working_dir = params.cwd.as_deref().unwrap_or(".");
+    let canonical_dir = std::fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
+
+    // Codex preflight and hook setup must use the same effective CODEX_HOME as
+    // the child, including overrides from ~/.hcom/env and caller-provided env.
+    let codex_home = if matches!(normalized, LaunchTool::Codex) {
+        crate::tools::codex_preprocessing::resolve_codex_home_from_env(&base_env, &canonical_dir)
+    } else {
+        None
+    };
+    if let Some((ref path, explicit_env)) = codex_home {
+        insert_effective_env(
+            &mut base_env,
+            "CODEX_HOME".to_string(),
+            path.to_string_lossy().into_owned(),
+            cfg!(windows),
         );
+        crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
+
+    // Ensure hooks are installed (strict: refuse to launch without hooks)
+    ensure_hooks_installed(
+        &normalized,
+        hcom_config.auto_approve,
+        codex_home.as_ref().map(|(path, _)| path.as_path()),
+    )?;
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1786,9 +1859,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
     }
 
-    let working_dir = params.cwd.as_deref().unwrap_or(".");
-    let canonical_dir = std::fs::canonicalize(working_dir)
-        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
     // Folder trust: on first run each tool shows a "do you trust this folder?"
     // prompt — the user accepts to continue or declines and it exits. When an
     // agent launches another agent via hcom, auto-approve the prompt for the
@@ -1837,7 +1907,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // paired with a project layer that hcom itself just marked trusted — that
     // layer could contribute a hook source the scan never saw.
     let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
-        codex_preprocessing::resolve_codex_hook_trust(&params.args, &canonical_dir)
+        codex_preprocessing::resolve_codex_hook_trust_at(
+            &params.args,
+            &canonical_dir,
+            codex_home
+                .as_ref()
+                .map(|(path, _)| path.as_path())
+                .expect("Codex launch must resolve CODEX_HOME"),
+        )
     } else {
         codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
     };
@@ -3044,6 +3121,42 @@ mod tests {
         assert_eq!(
             env.get("RORI_RESOLVED_AUTH").map(String::as_str),
             Some("auth-token")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_tool_config_env_copies_ambient_override_into_clean_child_env() {
+        let _guard = EnvVarGuard::remove(vec!["CODEX_HOME".to_string()]);
+        unsafe { std::env::set_var("CODEX_HOME", "/isolated/codex-home") };
+        let mut env = HashMap::from([("HOME".to_string(), "/clean-shell-home".to_string())]);
+
+        ensure_tool_config_env(&LaunchTool::Codex, &mut env);
+
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/isolated/codex-home")
+        );
+    }
+
+    #[test]
+    fn test_windows_env_override_replaces_different_key_casing() {
+        let mut env = HashMap::from([(
+            "CODEX_HOME".to_string(),
+            r"C:\ambient-codex-home".to_string(),
+        )]);
+
+        insert_effective_env(
+            &mut env,
+            "Codex_Home".to_string(),
+            r"C:\caller-codex-home".to_string(),
+            true,
+        );
+
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            effective_env_value(&env, "CODEX_HOME", true),
+            Some(r"C:\caller-codex-home")
         );
     }
 
