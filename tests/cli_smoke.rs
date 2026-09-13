@@ -212,6 +212,57 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
 }
 
 #[test]
+fn non_destructive_reset_paths_deliver_pending_messages() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let process_id = "reset-pending-delivery-process";
+    let recipient = h.start_with_process_id(process_id);
+
+    let send_message = |text: &str| {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            "--name",
+            &sender,
+            &format!("@{recipient}"),
+            "--",
+            text,
+        ]);
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    };
+
+    send_message("pending during reset preview");
+    let mut preview = h.cmd();
+    preview
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .arg("reset");
+    let output = preview.output().expect("run reset preview");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("RESET PREVIEW"), "stdout={stdout}");
+    assert!(
+        stdout.contains("pending during reset preview"),
+        "stdout={stdout}"
+    );
+
+    send_message("pending during reset hooks");
+    let mut hooks = h.cmd();
+    hooks
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .args(["--go", "reset", "hooks"]);
+    let output = hooks.output().expect("run reset hooks");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("pending during reset hooks"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
 fn start_send_events_roundtrip() {
     let h = Hcom::new();
     let sender = h.start();

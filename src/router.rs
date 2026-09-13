@@ -863,7 +863,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
         "reset" => match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
-            Ok(args) => return crate::commands::reset::cmd_reset(db, &args, Some(&ctx)),
+            Ok(args) => {
+                if let Some(exit_code) =
+                    crate::commands::reset::try_cmd_reset_preserving_db(&db, &args, Some(&ctx))
+                {
+                    exit_code
+                } else {
+                    return crate::commands::reset::cmd_reset(db, &args, Some(&ctx));
+                }
+            }
             Err(e) => {
                 e.print().ok();
                 let code = if e.use_stderr() { 1 } else { 0 };
