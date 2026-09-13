@@ -22,4 +22,4 @@ pub(crate) use config::{
     kimi_permission_patterns, merge_hcom_hooks, merge_hcom_permissions, remove_hcom_permissions,
 };
 #[cfg(test)]
-pub(crate) use handlers::{get_handler, handle_sessionend, handle_stop};
+pub(crate) use handlers::{get_handler, handle_sessionend, handle_sessionstart, handle_stop};

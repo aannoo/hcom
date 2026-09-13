@@ -165,21 +165,39 @@ impl HcomDb {
             return Err(anyhow::anyhow!("test_injected_migrate_notify_fail"));
         }
 
-        let tx = self.conn.unchecked_transaction()?;
-        // Drop target rows for kinds the source will bring (source wins), keeping
-        // target-only kinds like `plugin`.
-        tx.execute(
-            "DELETE FROM notify_endpoints
+        // A savepoint provides the same all-or-nothing merge while allowing
+        // callers to include endpoint migration in a larger identity-binding
+        // transaction.
+        self.conn
+            .execute_batch("SAVEPOINT hcom_migrate_notify_endpoints")?;
+        let merge = (|| -> Result<()> {
+            // Drop target rows for kinds the source will bring (source wins), keeping
+            // target-only kinds like `plugin`.
+            self.conn.execute(
+                "DELETE FROM notify_endpoints
              WHERE instance = ?2
                AND kind IN (SELECT kind FROM notify_endpoints WHERE instance = ?1)",
-            params![old_name, new_name],
-        )?;
-        // Move the source's (now conflict-free) rows onto the target.
-        tx.execute(
-            "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
-            params![old_name, new_name],
-        )?;
-        tx.commit()?;
+                params![old_name, new_name],
+            )?;
+            // Move the source's (now conflict-free) rows onto the target.
+            self.conn.execute(
+                "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
+                params![old_name, new_name],
+            )?;
+            Ok(())
+        })();
+
+        if let Err(error) = merge {
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO hcom_migrate_notify_endpoints");
+            let _ = self
+                .conn
+                .execute_batch("RELEASE hcom_migrate_notify_endpoints");
+            return Err(error);
+        }
+        self.conn
+            .execute_batch("RELEASE hcom_migrate_notify_endpoints")?;
 
         Ok(())
     }
@@ -1307,6 +1325,24 @@ mod tests {
         db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
 
         db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));
+        assert_eq!(endpoint_count_for(&db, "mozi"), 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_migrate_notify_endpoints_can_join_outer_transaction() {
+        let (db, db_path) = setup_full_test_db();
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+
+        let outer = db.conn().unchecked_transaction().unwrap();
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+        outer.commit().unwrap();
 
         assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
         assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));

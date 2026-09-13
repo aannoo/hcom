@@ -10,6 +10,15 @@ use crate::instances::update_instance_position;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 use crate::shared::{ST_INACTIVE, ST_LISTENING};
 
+/// Result of binding a session when the caller requires every existing owner
+/// to belong to one tool family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCheckedBind {
+    Bound(String),
+    Unbound,
+    Rejected,
+}
+
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
 /// The launcher owns the authoritative preset decision. launch_context is only
@@ -630,6 +639,155 @@ pub fn bind_session_to_process(
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");
     None
+}
+
+/// Bind a session without allowing a hook from one tool to adopt another
+/// tool's process, live session, or stopped-session identity.
+///
+/// The ownership checks and the existing binding operation share one SQLite
+/// transaction. A disagreement therefore rolls back any mutation performed by
+/// `bind_session_to_process`, including placeholder retirement and rebinding.
+pub fn bind_session_to_process_for_tool(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+    expected_tool: &str,
+    create_if_unbound: bool,
+) -> ToolCheckedBind {
+    let transaction = match db.conn().unchecked_transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            crate::log::log_error(
+                "binding",
+                "bind_for_tool.transaction",
+                &format!("session_id={session_id} expected_tool={expected_tool} err={error}"),
+            );
+            return ToolCheckedBind::Rejected;
+        }
+    };
+
+    let owner_matches = |kind: &str, name: &str, tool: Option<&str>| {
+        if tool == Some(expected_tool) {
+            return true;
+        }
+        crate::log::log_warn(
+            "binding",
+            "bind_for_tool.owner_rejected",
+            &format!(
+                "kind={kind} instance={name} actual_tool={tool:?} expected_tool={expected_tool} session_id={session_id} process_id={process_id:?}"
+            ),
+        );
+        false
+    };
+
+    if let Some(pid) = process_id {
+        match db.get_process_binding(pid) {
+            Ok(Some(name)) => {
+                let tool = db
+                    .get_instance_full(&name)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.tool);
+                if !owner_matches("process", &name, tool.as_deref()) {
+                    return ToolCheckedBind::Rejected;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.process_owner",
+                    &format!("process_id={pid} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
+    }
+
+    let session_owner = match db.get_session_binding(session_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            crate::log::log_error(
+                "binding",
+                "bind_for_tool.session_owner",
+                &format!("session_id={session_id} err={error}"),
+            );
+            return ToolCheckedBind::Rejected;
+        }
+    };
+    if let Some(ref name) = session_owner {
+        let tool = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| row.tool);
+        if !owner_matches("session", name, tool.as_deref()) {
+            return ToolCheckedBind::Rejected;
+        }
+    } else {
+        match db.find_stopped_instance_by_session_id(session_id) {
+            Ok(Some(name)) => {
+                let tool = db
+                    .conn()
+                    .query_row(
+                        "SELECT json_extract(data, '$.snapshot.tool') FROM events
+                         WHERE type = 'life'
+                           AND instance = ?1
+                           AND json_extract(data, '$.action') = 'stopped'
+                           AND json_extract(data, '$.snapshot.session_id') = ?2
+                         ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![name, session_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                if !owner_matches("stopped_session", &name, tool.as_deref()) {
+                    return ToolCheckedBind::Rejected;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.stopped_owner",
+                    &format!("session_id={session_id} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
+    }
+
+    let bound = bind_session_to_process(db, session_id, process_id).or_else(|| {
+        if create_if_unbound {
+            create_orphaned_pty_identity(db, session_id, process_id, expected_tool)
+        } else {
+            None
+        }
+    });
+    if let Some(ref name) = bound {
+        let tool = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| row.tool);
+        if !owner_matches("bound", name, tool.as_deref()) {
+            return ToolCheckedBind::Rejected;
+        }
+    }
+
+    if let Err(error) = transaction.commit() {
+        crate::log::log_error(
+            "binding",
+            "bind_for_tool.commit",
+            &format!("session_id={session_id} expected_tool={expected_tool} err={error}"),
+        );
+        return ToolCheckedBind::Rejected;
+    }
+
+    match bound {
+        Some(name) => ToolCheckedBind::Bound(name),
+        None => ToolCheckedBind::Unbound,
+    }
 }
 
 /// Rebind process/session after soft-finalize cleared bindings but left the

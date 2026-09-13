@@ -75,7 +75,11 @@ fn update_position(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload, instan
     }
 }
 
-fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+pub(crate) fn handle_sessionstart(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> HookResult {
     if ctx.process_id.is_none() {
         return HookResult::Allow {
             additional_context: Some(format!(
@@ -92,60 +96,42 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         None => return hook_noop(),
     };
 
-    let prior_tool = ctx.process_id.as_deref().and_then(|pid| {
-        db.get_process_binding(pid)
-            .ok()
-            .flatten()
-            .and_then(|name| db.get_instance_full(&name).ok().flatten())
-            .map(|row| row.tool)
-    });
+    let env_tool = ctx.raw_env.get("HCOM_TOOL").cloned();
+    if env_tool.as_deref().is_some_and(|tool| tool != "kimi") {
+        log::log_warn(
+            "hooks",
+            "kimi.sessionstart.tool_env_refused",
+            &format!(
+                "session_id={} process_id={:?} env_tool={:?}",
+                session_id, ctx.process_id, env_tool
+            ),
+        );
+        return hook_noop();
+    }
 
-    let instance_name =
-        instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref());
+    let bind = instance_binding::bind_session_to_process_for_tool(
+        db,
+        session_id,
+        ctx.process_id.as_deref(),
+        "kimi",
+        true,
+    );
 
     log::log_info(
         "hooks",
         "kimi.sessionstart.bind",
         &format!(
             "instance={:?} session_id={} process_id={:?}",
-            instance_name, session_id, ctx.process_id,
+            bind, session_id, ctx.process_id,
         ),
     );
 
-    let instance_name = match instance_name {
-        Some(name) => name,
-        None => {
-            if let Some(ref pid) = ctx.process_id {
-                let env_tool = std::env::var("HCOM_TOOL").ok();
-                let refuse = prior_tool.as_deref().is_some_and(|t| t != "kimi")
-                    || env_tool.as_deref().is_some_and(|t| t != "kimi");
-                if refuse {
-                    log::log_warn(
-                        "hooks",
-                        "kimi.sessionstart.orphan_refused",
-                        &format!(
-                            "session_id={} process_id={} prior_tool={:?} env_tool={:?}",
-                            session_id, pid, prior_tool, env_tool
-                        ),
-                    );
-                    return hook_noop();
-                }
-                match instance_binding::create_orphaned_pty_identity(
-                    db,
-                    session_id,
-                    Some(pid.as_str()),
-                    "kimi",
-                ) {
-                    Some(name) => name,
-                    None => return hook_noop(),
-                }
-            } else {
-                return hook_noop();
-            }
-        }
+    let instance_name = match bind {
+        instance_binding::ToolCheckedBind::Bound(name) => name,
+        instance_binding::ToolCheckedBind::Rejected => return hook_noop(),
+        instance_binding::ToolCheckedBind::Unbound => return hook_noop(),
     };
 
-    let _ = db.rebind_instance_session(&instance_name, session_id);
     instance_binding::capture_and_store_launch_context(db, &instance_name);
     update_position(db, ctx, payload, &instance_name);
 
@@ -361,24 +347,12 @@ pub(crate) fn handle_sessionend(
         return hook_noop();
     }
 
-    let os_pid_alive = instance
-        .pid
-        .and_then(|p| u32::try_from(p).ok())
-        .map(crate::sys::process::is_alive)
-        .unwrap_or(false);
-    let launched_live = std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1")
-        && ctx
-            .process_id
-            .as_deref()
-            .and_then(|pid| db.get_process_binding(pid).ok().flatten())
-            .as_deref()
-            == Some(instance_name);
-
-    if os_pid_alive || launched_live {
-        common::soft_finalize_session(db, instance_name, "sessionend", None, true);
-    } else {
-        common::finalize_session(db, instance_name, "sessionend", None);
-    }
+    // Current Kimi emits SessionEnd for a real session close (`exit` or
+    // `archive`). The process is necessarily still alive while this synchronous
+    // hook runs, so PID liveness cannot identify a resumable transition. A new
+    // in-process session starts before the old SessionEnd and is protected by
+    // the historical-session guard above.
+    common::finalize_session(db, instance_name, "sessionend", None);
 
     hook_noop()
 }

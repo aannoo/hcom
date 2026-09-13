@@ -1,7 +1,8 @@
 use super::{
     HOOK_TIMEOUT_SECS, KIMI_HOOK_COMMANDS, build_kimi_hook_command, get_handler,
-    get_kimi_settings_path, handle_sessionend, handle_stop, is_hcom_kimi_command,
-    kimi_permission_patterns, merge_hcom_hooks, merge_hcom_permissions, remove_hcom_permissions,
+    get_kimi_settings_path, handle_sessionend, handle_sessionstart, handle_stop,
+    is_hcom_kimi_command, kimi_permission_patterns, merge_hcom_hooks, merge_hcom_permissions,
+    remove_hcom_permissions,
 };
 use crate::db::HcomDb;
 use crate::hooks::HookResult;
@@ -327,6 +328,18 @@ fn instance_last_event_id(db: &HcomDb, name: &str) -> i64 {
         .unwrap()
 }
 
+fn stopped_event_count(db: &HcomDb, name: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE type = 'life' AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn assert_allow_no_delivery(result: HookResult) {
     match result {
         HookResult::Allow {
@@ -503,6 +516,182 @@ fn stop_without_pending_sets_listening() {
 }
 
 #[test]
+fn sessionstart_rejects_foreign_process_owner_without_mutation() {
+    let (_dir, db) = make_test_db();
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, status_context, created_at, tool, session_id)
+             VALUES ('movi', 'active', 'foreign-work', ?1, 'omp', 'sess-old')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+             VALUES ('pid-foreign', 'sess-old', 'movi', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.rebind_session("sess-old", "movi").unwrap();
+
+    assert_allow_no_delivery(handle_sessionstart(
+        &db,
+        &ctx_with_process("pid-foreign"),
+        &kimi_payload("sess-new", "kimi-sessionstart"),
+    ));
+
+    let owner = db.get_instance_full("movi").unwrap().unwrap();
+    assert_eq!(owner.tool, "omp");
+    assert_eq!(owner.session_id.as_deref(), Some("sess-old"));
+    assert_eq!(owner.status, ST_ACTIVE);
+    assert_eq!(owner.status_context, "foreign-work");
+    assert_eq!(db.get_session_binding("sess-new").unwrap(), None);
+    assert_eq!(
+        db.get_process_binding("pid-foreign").unwrap().as_deref(),
+        Some("movi")
+    );
+}
+
+#[test]
+fn sessionstart_rejects_foreign_canonical_owner_without_mutation() {
+    let (_dir, db) = make_test_db();
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, status_context, created_at, tool)
+             VALUES ('kima', 'listening', 'ready_observed', ?1, 'kimi')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+             VALUES ('pid-kimi', '', 'kima', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, status_context, created_at, tool, session_id)
+             VALUES ('movi', 'inactive', 'exit:closed', ?1, 'omp', 'sess-foreign')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.rebind_session("sess-foreign", "movi").unwrap();
+
+    assert_allow_no_delivery(handle_sessionstart(
+        &db,
+        &ctx_with_process("pid-kimi"),
+        &kimi_payload("sess-foreign", "kimi-sessionstart"),
+    ));
+
+    let placeholder = db.get_instance_full("kima").unwrap().unwrap();
+    assert_eq!(placeholder.session_id, None);
+    assert_eq!(placeholder.status, ST_LISTENING);
+    let canonical = db.get_instance_full("movi").unwrap().unwrap();
+    assert_eq!(canonical.tool, "omp");
+    assert_eq!(canonical.session_id.as_deref(), Some("sess-foreign"));
+    assert_eq!(
+        db.get_session_binding("sess-foreign").unwrap().as_deref(),
+        Some("movi")
+    );
+    assert_eq!(
+        db.get_process_binding("pid-kimi").unwrap().as_deref(),
+        Some("kima")
+    );
+}
+
+#[test]
+fn sessionstart_rejects_foreign_stopped_owner_without_mutation() {
+    let (_dir, db) = make_test_db();
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, status_context, created_at, tool)
+             VALUES ('kima', 'listening', 'ready_observed', ?1, 'kimi')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+             VALUES ('pid-kimi', '', 'kima', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    let stopped = serde_json::json!({
+        "action": "stopped",
+        "by": "session",
+        "reason": "exit:closed",
+        "snapshot": {
+            "name": "movi",
+            "session_id": "sess-stopped-foreign",
+            "tool": "omp"
+        }
+    });
+    db.log_event("life", "movi", &stopped).unwrap();
+
+    assert_allow_no_delivery(handle_sessionstart(
+        &db,
+        &ctx_with_process("pid-kimi"),
+        &kimi_payload("sess-stopped-foreign", "kimi-sessionstart"),
+    ));
+
+    let placeholder = db.get_instance_full("kima").unwrap().unwrap();
+    assert_eq!(placeholder.session_id, None);
+    assert_eq!(placeholder.status, ST_LISTENING);
+    assert_eq!(
+        db.get_session_binding("sess-stopped-foreign").unwrap(),
+        None
+    );
+    assert_eq!(
+        db.get_process_binding("pid-kimi").unwrap().as_deref(),
+        Some("kima")
+    );
+    assert!(db.get_instance_full("movi").unwrap().is_none());
+}
+
+#[test]
+fn sessionstart_accepts_kimi_canonical_owner_and_migrates_placeholder() {
+    let (_dir, db) = make_test_db();
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, status_context, created_at, tool)
+             VALUES ('temp', 'listening', 'ready_observed', ?1, 'kimi')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+             VALUES ('pid-kimi', '', 'temp', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.upsert_notify_endpoint("temp", "pty", 51_234).unwrap();
+    seed_bound_kimi_instance(&db, "kima", "sess-kimi", "pid-old");
+
+    assert_allow_no_delivery(handle_sessionstart(
+        &db,
+        &ctx_with_process("pid-kimi"),
+        &kimi_payload("sess-kimi", "kimi-sessionstart"),
+    ));
+
+    assert!(db.get_instance_full("temp").unwrap().is_none());
+    let canonical = db.get_instance_full("kima").unwrap().unwrap();
+    assert_eq!(canonical.tool, "kimi");
+    assert_eq!(canonical.session_id.as_deref(), Some("sess-kimi"));
+    assert_eq!(canonical.status, ST_LISTENING);
+    assert_eq!(
+        db.get_process_binding("pid-kimi").unwrap().as_deref(),
+        Some("kima")
+    );
+    assert!(db.has_notify_endpoint_kind("kima", "pty"));
+}
+
+#[test]
 fn sessionend_ignores_non_kimi_tool() {
     let (_dir, db) = make_test_db();
     let now = chrono::Utc::now().timestamp() as f64;
@@ -538,7 +727,7 @@ fn sessionend_ignores_non_kimi_tool() {
 }
 
 #[test]
-fn sessionend_soft_keeps_row_when_pid_alive() {
+fn sessionend_finalizes_once_even_while_pid_is_alive() {
     let (_dir, db) = make_test_db();
     let now = chrono::Utc::now().timestamp() as f64;
     let pid = std::process::id() as i64;
@@ -564,11 +753,8 @@ fn sessionend_soft_keeps_row_when_pid_alive() {
         &kimi_payload("sess-soft", "kimi-sessionend"),
     );
     assert_eq!(result.exit_code(), 0);
-    let inst = db.get_instance_full("kima").unwrap().unwrap();
-    assert_eq!(inst.status, crate::shared::ST_INACTIVE);
-    assert_eq!(
-        db.get_process_binding("pid-soft").unwrap().as_deref(),
-        Some("kima"),
-        "soft finalize must keep process binding"
-    );
+    assert!(db.get_instance_full("kima").unwrap().is_none());
+    assert_eq!(db.get_process_binding("pid-soft").unwrap(), None);
+    assert_eq!(db.get_session_binding("sess-soft").unwrap(), None);
+    assert_eq!(stopped_event_count(&db, "kima"), 1);
 }
