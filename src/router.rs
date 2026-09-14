@@ -849,6 +849,13 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
+    // Surface an identity that drifted away from this shell. This is a warning,
+    // not a refusal: an explicit --name stays authoritative, because a human or
+    // a relay may legitimately act for another instance.
+    if let Some(ref warning) = ctx.identity_warning {
+        eprintln!("{warning}");
+    }
+
     // Identity gating: block unregistered sessions from gated commands
     if let Err(e) = crate::cli_context::check_identity_gate(cmd, &ctx, has_from_flag, is_inside_ai)
     {

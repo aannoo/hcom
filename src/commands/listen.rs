@@ -764,6 +764,7 @@ mod tests {
             explicit_name: Some("luna".into()),
             identity: None,
             go: false,
+            identity_warning: None,
         };
 
         // Message mode, quiet timeout.
@@ -817,6 +818,7 @@ mod tests {
             explicit_name: Some(name.into()),
             identity: None,
             go: false,
+            identity_warning: None,
         }
     }
 

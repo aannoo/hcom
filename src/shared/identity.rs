@@ -58,6 +58,9 @@ pub struct CommandContext {
     pub identity: Option<SenderIdentity>,
     /// Whether --go flag was provided.
     pub go: bool,
+    /// Warning to print when `--name` disagrees with the identity this shell
+    /// resolves to. `None` when they agree or the shell has no identity.
+    pub identity_warning: Option<String>,
 }
 
 #[cfg(test)]

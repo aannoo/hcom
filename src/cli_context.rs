@@ -42,6 +42,8 @@ pub fn build_ctx_for_command(
         claude_actor::ensure_explicit_matches(db, actor, name)?;
     }
 
+    let had_verified_actor = verified_actor.is_some();
+
     let identity = if let Some(actor) = verified_actor {
         Some(actor)
     } else if let Some(name) = explicit_name {
@@ -63,11 +65,67 @@ pub fn build_ctx_for_command(
         identity::resolve_identity(db, None, None, None, process_id, codex_thread_id).ok()
     };
 
+    let identity_warning = identity.as_ref().and_then(|resolved| {
+        drift_warning(
+            db,
+            resolved,
+            had_verified_actor,
+            process_id,
+            codex_thread_id,
+        )
+    });
+
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
         identity,
         go,
+        identity_warning,
     })
+}
+
+/// Warn when an explicit `--name` resolves to one instance while this shell's own
+/// process or session binding resolves to another.
+///
+/// An explicit `--name` overrides whatever the shell is bound to. That is
+/// intentional, but it is also how an identity drifts unnoticed: a session keeps
+/// sending under the name it was told at start while its row has since been
+/// rebound or recovered under another one. Saying so beats silently accepting it.
+///
+/// Returns `None` when there is nothing to report:
+/// - the shell has no identity of its own to disagree with;
+/// - the two agree;
+/// - the sender is a subagent, which shares the parent's shell and so always
+///   resolves to the parent row.
+fn drift_warning(
+    db: &HcomDb,
+    resolved: &SenderIdentity,
+    had_verified_actor: bool,
+    process_id: Option<&str>,
+    codex_thread_id: Option<&str>,
+) -> Option<String> {
+    // A verified Claude actor is the exact acting agent for this shell call, so
+    // the shell's own binding is not a second opinion to weigh against it. A
+    // subagent acting through the actor env resolves to a name other than the
+    // parent row that binding names, and comparing the two only manufactures a
+    // warning on every call.
+    if had_verified_actor {
+        return None;
+    }
+    let ambient =
+        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id).ok()?;
+    if !matches!(ambient.kind, SenderKind::Instance) || ambient.name == resolved.name {
+        return None;
+    }
+    if db.was_subagent_name(&resolved.name) {
+        return None;
+    }
+    Some(format!(
+        concat!(
+            "[hcom] warning: sending as '{}', but this shell resolves to '{}'. ",
+            "If '{}' is stale, run 'hcom start --as {}' to reclaim it."
+        ),
+        resolved.name, ambient.name, resolved.name, resolved.name
+    ))
 }
 
 /// Check identity gating for a CLI command.
@@ -701,6 +759,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("list", &ctx, false, false).is_ok());
     }
@@ -711,6 +770,7 @@ mod tests {
             explicit_name: Some("luna".to_string()),
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -721,6 +781,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("send", &ctx, true, false).is_ok());
     }
@@ -731,6 +792,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         let err = check_identity_gate("send", &ctx, false, false).unwrap_err();
         assert!(err.contains("identity not found"));
@@ -747,6 +809,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -757,6 +820,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         let err = check_identity_gate("listen", &ctx, false, true).unwrap_err();
         assert!(err.contains("start --as"));
@@ -777,6 +841,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         // listen is in skip list — should not change status
         set_hookless_command_status(&db, "listen", &ctx);
@@ -798,6 +863,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -818,6 +884,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "events", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -838,6 +905,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -864,6 +932,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("sub1").unwrap().unwrap();
@@ -1004,6 +1073,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, true), Ok(false));
     }
@@ -1020,6 +1090,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
     }
@@ -1031,7 +1102,132 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
+    }
+
+    #[test]
+    fn build_ctx_warns_when_explicit_name_disagrees_with_this_shell() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("riko"), false, Some("pid-1"), None)
+                .unwrap();
+
+        let warning = ctx
+            .identity_warning
+            .expect("a --name that disagrees with this shell must warn");
+        assert!(
+            warning.contains("riko"),
+            "warning names the sender: {warning}"
+        );
+        assert!(
+            warning.contains("voni"),
+            "warning names this shell: {warning}"
+        );
+    }
+
+    #[test]
+    fn build_ctx_is_quiet_when_explicit_name_matches_this_shell() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("voni"), false, Some("pid-1"), None)
+                .unwrap();
+        assert!(ctx.identity_warning.is_none());
+    }
+
+    #[test]
+    fn build_ctx_is_quiet_when_this_shell_has_no_identity() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("riko"), false, None, None).unwrap();
+        assert!(
+            ctx.identity_warning.is_none(),
+            "an unbound shell has nothing to disagree with"
+        );
+    }
+
+    #[test]
+    fn build_ctx_is_quiet_for_a_subagent_acting_under_its_own_row() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "voni", "claude");
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, parent_name, agent_id, status, created_at, tool)
+                 VALUES ('voni_task_1', 'voni', 'a6d9caf', 'active', ?1, 'claude')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("voni_task_1"),
+            false,
+            Some("pid-1"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            ctx.identity_warning.is_none(),
+            "a subagent legitimately differs from the parent row its shell resolves to"
+        );
+    }
+
+    #[test]
+    fn drift_warning_is_quiet_for_a_verified_claude_actor() {
+        // A verified actor is the exact acting agent for this shell call. A Claude
+        // subagent acting through the actor env legitimately resolves to a name
+        // other than the parent row its process binding names, so comparing the
+        // two is meaningless here.
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let resolved = identity::resolve_from_name(&db, "riko").unwrap();
+        assert!(
+            drift_warning(&db, &resolved, true, Some("pid-1"), None).is_none(),
+            "a verified actor must not be compared against the shell's process binding"
+        );
+    }
+
+    #[test]
+    fn drift_warning_still_fires_without_a_verified_actor() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let resolved = identity::resolve_from_name(&db, "riko").unwrap();
+        let warning = drift_warning(&db, &resolved, false, Some("pid-1"), None)
+            .expect("an explicit --name that disagrees with this shell must still warn");
+        assert!(warning.contains("riko") && warning.contains("voni"));
+    }
+
+    #[test]
+    fn drift_warning_text_has_no_stray_whitespace() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let resolved = identity::resolve_from_name(&db, "riko").unwrap();
+        let warning = drift_warning(&db, &resolved, false, Some("pid-1"), None).unwrap();
+        assert!(
+            !warning.contains("  "),
+            "the warning is printed to a terminal; it must not carry a run of spaces: {warning:?}"
+        );
     }
 }
