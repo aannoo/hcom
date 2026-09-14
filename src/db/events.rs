@@ -5,6 +5,14 @@ use rusqlite::params;
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
 
+fn adapter_generation_matches(receipt: f64, current: f64) -> bool {
+    receipt.is_finite()
+        && current.is_finite()
+        && receipt >= 0.0
+        && current >= 0.0
+        && receipt.to_bits().abs_diff(current.to_bits()) <= 1
+}
+
 /// Message from the events table
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -92,6 +100,66 @@ impl HcomDb {
                 continue;
             }
             if Self::should_deliver_to(&json, name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return whether the current instance generation has a valid Droid adapter receipt.
+    pub fn has_adapter_attestation(&self, name: &str, created_at: f64) -> bool {
+        let Ok(mut stmt) = self.conn().prepare(
+            "SELECT id, data FROM events \
+             WHERE type = 'receipt' AND instance = ?1 ORDER BY id DESC",
+        ) else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return false;
+        };
+
+        for row in rows.flatten() {
+            let (receipt_id, raw_receipt) = row;
+            let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&raw_receipt) else {
+                continue;
+            };
+            let Some(request_id) = receipt.get("request_id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let valid_envelope = receipt.get("channel").and_then(|v| v.as_str())
+                == Some("adapter_hook")
+                && matches!(
+                    receipt.get("hook").and_then(|v| v.as_str()),
+                    Some("UserPromptSubmit" | "Stop")
+                )
+                && receipt
+                    .get("instance_created_at")
+                    .and_then(|v| v.as_f64())
+                    .is_some_and(|token| adapter_generation_matches(token, created_at))
+                && request_id < receipt_id;
+            if !valid_envelope {
+                continue;
+            }
+            let request_data = self.conn().query_row(
+                "SELECT data FROM events WHERE id = ?1 AND type = 'message'",
+                [request_id],
+                |row| row.get::<_, String>(0),
+            );
+            let Ok(raw_request) = request_data else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&raw_request) else {
+                continue;
+            };
+            let addressed = ["delivered_to", "mentions"].iter().any(|field| {
+                request
+                    .get(field)
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(name)))
+            });
+            if addressed {
                 return true;
             }
         }
@@ -761,6 +829,249 @@ mod tests {
         )
         .unwrap();
         assert!(db.has_direct_unread("luna_reviewer_1"));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_adapter_attestation_accepts_generation_bound_addressed_receipt() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('pita', 100.0)",
+                [],
+            )
+            .unwrap();
+
+        let request_id = db
+            .log_event(
+                "message",
+                "suki",
+                &serde_json::json!({
+                    "from": "suki",
+                    "mentions": ["pita"],
+                    "delivered_to": ["pita"],
+                    "text": "review"
+                }),
+            )
+            .unwrap();
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": 100.0
+            }),
+        )
+        .unwrap();
+
+        assert!(db.has_adapter_attestation("pita", 100.0));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_adapter_attestation_accepts_one_ulp_generation_variance_only() {
+        let (db, db_path) = setup_full_test_db();
+        let receipt_generation = 1_788_315_180.618_200_3_f64;
+        let one_ulp_higher = f64::from_bits(receipt_generation.to_bits() + 1);
+        let two_ulps_higher = f64::from_bits(receipt_generation.to_bits() + 2);
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('pita', ?1)",
+                [one_ulp_higher],
+            )
+            .unwrap();
+
+        let request_id = db
+            .log_event(
+                "message",
+                "suki",
+                &serde_json::json!({
+                    "from": "suki",
+                    "mentions": ["pita"],
+                    "delivered_to": ["pita"],
+                    "text": "review"
+                }),
+            )
+            .unwrap();
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": receipt_generation
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", two_ulps_higher));
+        assert!(db.has_adapter_attestation("pita", one_ulp_higher));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_adapter_attestation_rejects_untrusted_evidence() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('pita', 100.0)",
+                [],
+            )
+            .unwrap();
+
+        let addressed_request_id = db
+            .log_event(
+                "message",
+                "suki",
+                &serde_json::json!({
+                    "from": "suki",
+                    "mentions": ["pita"],
+                    "delivered_to": ["pita"],
+                    "text": "review"
+                }),
+            )
+            .unwrap();
+
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": addressed_request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop"
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": addressed_request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": 200.0
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": addressed_request_id,
+                "channel": "adapter_hook",
+                "hook": "Keepalive",
+                "instance_created_at": 100.0
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        db.log_event(
+            "receipt",
+            "other",
+            &serde_json::json!({
+                "request_id": addressed_request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": 100.0
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        let unaddressed_request_id = db
+            .log_event(
+                "message",
+                "suki",
+                &serde_json::json!({
+                    "from": "suki",
+                    "mentions": ["other"],
+                    "delivered_to": ["other"],
+                    "text": "review"
+                }),
+            )
+            .unwrap();
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": unaddressed_request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": 100.0
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        db.conn
+            .execute("DROP TRIGGER events_fts_insert", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) \
+                 VALUES ('2026-09-01T00:00:00Z', 'receipt', 'pita', '{malformed')",
+                [],
+            )
+            .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) \
+                 VALUES ('2026-09-01T00:00:00Z', 'message', 'suki', '{malformed')",
+                [],
+            )
+            .unwrap();
+        let malformed_request_id = db.conn.last_insert_rowid();
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": malformed_request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": 100.0
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", 100.0));
+
+        let future_request_id = db.get_last_event_id() + 2;
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": future_request_id,
+                "channel": "adapter_hook",
+                "hook": "UserPromptSubmit",
+                "instance_created_at": 100.0
+            }),
+        )
+        .unwrap();
+        let actual_request_id = db
+            .log_event(
+                "message",
+                "suki",
+                &serde_json::json!({
+                    "from": "suki",
+                    "mentions": ["pita"],
+                    "delivered_to": ["pita"],
+                    "text": "late request"
+                }),
+            )
+            .unwrap();
+        assert_eq!(actual_request_id, future_request_id);
+        assert!(!db.has_adapter_attestation("pita", 100.0));
 
         cleanup_test_db(db_path);
     }

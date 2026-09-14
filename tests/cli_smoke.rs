@@ -83,6 +83,93 @@ fn list_json_empty() {
 }
 
 #[test]
+fn droid_attestation_requires_current_generation_adapter_receipt() {
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_secs_f64();
+    let conn = rusqlite::Connection::open(h.path().join("hcom.db")).expect("open hcom db");
+    conn.execute(
+        "INSERT INTO instances \
+         (name, tag, tool, created_at, status, status_time, last_seen) \
+         VALUES ('pita', 'droid', 'adhoc', ?1, 'active', CAST(?1 AS INTEGER), CAST(?1 AS INTEGER))",
+        [created_at],
+    )
+    .expect("seed Droid adapter instance");
+    conn.execute("DROP TRIGGER events_fts_insert", [])
+        .expect("allow malformed ledger fixture");
+    conn.execute(
+        "INSERT INTO events (timestamp, type, instance, data) \
+         VALUES ('2026-09-01T00:00:00Z', 'receipt', 'pita', '{malformed')",
+        [],
+    )
+    .expect("seed malformed receipt");
+    let request = serde_json::json!({
+        "from": "suki",
+        "mentions": ["pita"],
+        "delivered_to": ["pita"],
+        "text": "review"
+    });
+    conn.execute(
+        "INSERT INTO events (timestamp, type, instance, data) \
+         VALUES ('2026-09-01T00:00:01Z', 'message', 'suki', ?1)",
+        [request.to_string()],
+    )
+    .expect("seed addressed request");
+    let request_id = conn.last_insert_rowid();
+
+    let (code, stdout, stderr) = h.run(["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let list: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
+    let instance = &list.as_array().expect("list array")[0];
+    assert_eq!(instance["name"], "droid-pita");
+    assert!(instance["adapter_attestation"].is_null());
+
+    let receipt = serde_json::json!({
+        "request_id": request_id,
+        "channel": "adapter_hook",
+        "hook": "Stop",
+        "instance_created_at": created_at
+    });
+    conn.execute(
+        "INSERT INTO events (timestamp, type, instance, data) \
+         VALUES ('2026-09-01T00:00:02Z', 'receipt', 'pita', ?1)",
+        [receipt.to_string()],
+    )
+    .expect("seed current-generation adapter receipt");
+
+    let (code, stdout, stderr) = h.run(["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let list: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
+    let instance = &list.as_array().expect("list array")[0];
+    assert_eq!(instance["adapter_attestation"], "droid");
+
+    let (code, stdout, stderr) = h.run(["list"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("droid-pita [adapter-attested]"), "{stdout}");
+
+    let (code, stdout, stderr) = h.run(["list", "--names"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.trim(), "droid-pita");
+
+    let (code, stdout, stderr) = h.run(["list", "droid-pita", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let instance: serde_json::Value = serde_json::from_str(&stdout).expect("instance json");
+    assert_eq!(instance["adapter_attestation"], "droid");
+
+    let (code, stdout, stderr) = h.run(["list", "droid-pita"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("Attestation: droid (adapter_hook receipt)"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

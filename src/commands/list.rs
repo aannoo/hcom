@@ -148,6 +148,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         match db.get_instance_full(&lookup_name) {
             Ok(Some(data)) => {
+                let adapter_attestation = db
+                    .has_adapter_attestation(&data.name, data.created_at)
+                    .then_some("droid");
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
                     "session_id": data.session_id,
@@ -157,6 +160,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     "parent_name": data.parent_name,
                     "agent_id": data.agent_id,
                     "tool": data.tool,
+                    "adapter_attestation": adapter_attestation,
                 });
 
                 if is_self
@@ -231,6 +235,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             // Get binding status
             let hooks_bound = db.has_session_binding(&data.name);
             let process_bound = db.has_process_binding_for_instance(&data.name);
+            let adapter_attestation = db
+                .has_adapter_attestation(&data.name, data.created_at)
+                .then_some("droid");
 
             // Parse launch_context JSON
             let launch_context: serde_json::Value = data
@@ -262,6 +269,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "hooks_bound": hooks_bound,
                 "process_bound": process_bound,
                 "launch_context": launch_context,
+                "adapter_attestation": adapter_attestation,
             });
             result_list.push(payload);
         }
@@ -352,6 +360,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     let mut max_name_len = 0;
     for data in &sorted_instances {
         let mut n = get_full_name(data).len();
+        if db.has_adapter_attestation(&data.name, data.created_at) {
+            n += " [adapter-attested]".len();
+        }
         if data.background != 0 {
             n += 11; // " [headless]"
         }
@@ -405,6 +416,14 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         };
 
         // Badges
+        let adapter_attestation = db
+            .has_adapter_attestation(&data.name, data.created_at)
+            .then_some("droid");
+        let attestation_badge = if adapter_attestation.is_some() {
+            " [adapter-attested]"
+        } else {
+            ""
+        };
         let headless_badge = if data.background != 0 {
             " [headless]"
         } else {
@@ -452,7 +471,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             String::new()
         };
 
-        let name_part = format!("{name}{headless_badge}{remote_badge}{unread_str}");
+        let name_part =
+            format!("{name}{attestation_badge}{headless_badge}{remote_badge}{unread_str}");
         let status_text =
             format!("{age_display}{desc_sep}{description}{listening_since}{timeout_marker}");
 
@@ -635,6 +655,10 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
         && !tag.is_empty()
     {
         println!("  Tag:         {tag}");
+    }
+
+    if db.has_adapter_attestation(&data.name, data.created_at) {
+        println!("  Attestation: droid (adapter_hook receipt)");
     }
 
     // Status & Connection
