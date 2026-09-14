@@ -147,12 +147,36 @@ pub(crate) fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> 
     Some(data_dir.join("opencode.db"))
 }
 
+// Records the name each `set_terminal_title` call would have written, so
+// tests can assert that a code path renames its pane. Under `cfg(test)` the
+// escape codes are recorded instead of written: a test run must not repaint
+// the developer's own terminal.
+#[cfg(test)]
+thread_local! {
+    static LAST_TERMINAL_TITLE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take and clear the name of the last `set_terminal_title` call on this thread.
+#[cfg(test)]
+pub(crate) fn take_last_terminal_title() -> Option<String> {
+    LAST_TERMINAL_TITLE.with(|cell| cell.borrow_mut().take())
+}
+
 /// Set terminal title via escape codes written to /dev/tty.
 pub(crate) fn set_terminal_title(instance_name: &str) {
-    let title = format!("hcom: {}", instance_name);
-    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        use std::io::Write;
-        let _ = write!(tty, "\x1b]1;{}\x07\x1b]2;{}\x07", title, title);
+    #[cfg(test)]
+    LAST_TERMINAL_TITLE.with(|cell| {
+        *cell.borrow_mut() = Some(instance_name.to_string());
+    });
+
+    #[cfg(not(test))]
+    {
+        let title = format!("hcom: {}", instance_name);
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            use std::io::Write;
+            let _ = write!(tty, "\x1b]1;{}\x07\x1b]2;{}\x07", title, title);
+        }
     }
 }
 

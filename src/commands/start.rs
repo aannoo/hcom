@@ -309,6 +309,10 @@ fn start_from_orphan(
     // Core DB registration
     let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
 
+    // The hook bind paths rename the pane on every bind; recovery must too, or
+    // a recovered PTY keeps advertising whatever name it carried before.
+    crate::runtime_env::set_terminal_title(&name);
+
     db.log_event(
         "life",
         &name,
@@ -560,6 +564,10 @@ fn start_rebind(
 
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
+
+    // The hook bind paths rename the pane on every bind; a rebind must too, or
+    // the pane keeps advertising the identity this rebind just replaced.
+    crate::runtime_env::set_terminal_title(&target_name);
 
     // Print bootstrap
     let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {
@@ -1501,6 +1509,27 @@ mod tests {
         assert!(!orphan_can_reuse_name(&db, "riko", &orphan).unwrap());
     }
 
+    #[test]
+    #[serial]
+    fn rebind_renames_the_pane_to_the_reclaimed_name() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-title")),
+            "/tmp/project",
+        );
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+
+        let _ = crate::runtime_env::take_last_terminal_title();
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(
+            crate::runtime_env::take_last_terminal_title().as_deref(),
+            Some("nova"),
+            "a rebind must rename the pane, or the pane keeps advertising the old name"
+        );
+    }
 
     /// Register a live PTY in the orphan pidfile so `start_from_orphan` can
     /// find it. The test process's own PID is used because it is alive.
@@ -1514,6 +1543,37 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    #[serial]
+    fn orphan_recovery_renames_the_pane_to_the_recovered_name() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let pid = std::process::id();
+        write_orphan_pidfile(
+            &hcom_dir,
+            pid,
+            json!({
+                "tool": "claude",
+                "names": ["riko"],
+                "launched_at": crate::shared::time::now_epoch_f64(),
+                "directory": "/tmp/project",
+                "process_id": "proc-riko",
+                "session_id": "sess-riko",
+            }),
+        );
+
+        let ctx = make_ctx(&[], "/tmp/project");
+        let _ = crate::runtime_env::take_last_terminal_title();
+        assert_eq!(
+            start_from_orphan(&db, &hcom_dir, &pid.to_string(), &ctx).unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::runtime_env::take_last_terminal_title().as_deref(),
+            Some("riko"),
+            "orphan recovery must rename the pane, or the pane keeps the old name"
+        );
+    }
 
     #[test]
     #[serial]
