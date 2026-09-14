@@ -206,6 +206,46 @@ fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
     Ok(0)
 }
 
+/// Decide whether an orphan recovery may keep the name the PTY last used.
+///
+/// A row that still carries the preferred name is only a conflict when it
+/// belongs to some *other* PTY. When it is this PTY's own row, minting a new
+/// name splits one agent across two identities: the old name keeps receiving
+/// replies while the recovered session answers under the new one.
+fn orphan_can_reuse_name(
+    db: &HcomDb,
+    preferred_name: &str,
+    orphan: &pidtrack::OrphanProcess,
+) -> Result<bool> {
+    if preferred_name.is_empty() || !identity::is_valid_base_name(preferred_name) {
+        return Ok(false);
+    }
+    let Some(row) = db.get_instance_full(preferred_name)? else {
+        return Ok(true);
+    };
+
+    // Evidence 1: the live process binding still names this row.
+    if !orphan.process_id.is_empty() {
+        let bound_name = db
+            .get_process_binding_full(&orphan.process_id)?
+            .map(|(_, instance_name)| instance_name);
+        if bound_name.as_deref() == Some(preferred_name) {
+            return Ok(true);
+        }
+    }
+
+    // Evidence 2: the row still carries this PTY's session id. An orphan has
+    // usually lost its process binding already, so this is the link that
+    // survives in practice.
+    if !orphan.session_id.is_empty()
+        && row.session_id.as_deref() == Some(orphan.session_id.as_str())
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 /// Recover orphaned PTY process by PID or name.
 fn start_from_orphan(
     db: &HcomDb,
@@ -259,9 +299,7 @@ fn start_from_orphan(
     }
 
     let preferred_name = orphan.names.last().cloned().unwrap_or_default();
-    let can_reuse = !preferred_name.is_empty()
-        && identity::is_valid_base_name(&preferred_name)
-        && db.get_instance_full(&preferred_name)?.is_none();
+    let can_reuse = orphan_can_reuse_name(db, &preferred_name, orphan)?;
     let name = if can_reuse {
         preferred_name
     } else {
@@ -270,6 +308,10 @@ fn start_from_orphan(
 
     // Core DB registration
     let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+
+    // The hook bind paths rename the pane on every bind; recovery must too, or
+    // a recovered PTY keeps advertising whatever name it carried before.
+    crate::runtime_env::set_terminal_title(&name);
 
     db.log_event(
         "life",
@@ -522,6 +564,10 @@ fn start_rebind(
 
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
+
+    // The hook bind paths rename the pane on every bind; a rebind must too, or
+    // the pane keeps advertising the identity this rebind just replaced.
+    crate::runtime_env::set_terminal_title(&target_name);
 
     // Print bootstrap
     let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {
@@ -1360,5 +1406,218 @@ mod tests {
             real.to_string_lossy().as_ref(),
             alias.to_string_lossy().as_ref()
         ));
+    }
+
+    fn orphan_with(process_id: &str, session_id: &str, names: &[&str]) -> pidtrack::OrphanProcess {
+        pidtrack::OrphanProcess {
+            pid: 4242,
+            tool: "claude".to_string(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            process_id: process_id.to_string(),
+            session_id: session_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_reclaims_name_when_live_row_is_the_same_pty() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at) VALUES ('riko', 'claude', 'active', ?1)",
+                params![crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+        db.set_process_binding("proc-riko", "sess-riko", "riko")
+            .unwrap();
+
+        let orphan = orphan_with("proc-riko", "sess-riko", &["riko"]);
+        assert!(
+            orphan_can_reuse_name(&db, "riko", &orphan).unwrap(),
+            "a live row bound to this same PTY must be reclaimed, not treated as a conflict"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_mints_new_name_when_live_row_is_another_pty() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at) VALUES ('riko', 'claude', 'active', ?1)",
+                params![crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+        db.set_process_binding("proc-other", "sess-other", "riko")
+            .unwrap();
+
+        let orphan = orphan_with("proc-riko", "sess-riko", &["riko"]);
+        assert!(
+            !orphan_can_reuse_name(&db, "riko", &orphan).unwrap(),
+            "a live row owned by a different PTY must not be stolen"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_reuses_name_when_no_row_exists() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let orphan = orphan_with("proc-riko", "sess-riko", &["riko"]);
+        assert!(orphan_can_reuse_name(&db, "riko", &orphan).unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_reclaims_name_when_row_carries_the_same_session_id() {
+        // The real incident: the PTY was orphaned precisely because its process
+        // binding was gone, so session_id is the only surviving link.
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, created_at)
+                 VALUES ('riko', 'sess-riko', 'claude', 'active', ?1)",
+                params![crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+
+        let orphan = orphan_with("proc-riko", "sess-riko", &["riko"]);
+        assert!(
+            orphan_can_reuse_name(&db, "riko", &orphan).unwrap(),
+            "an orphan whose process binding is gone must still reclaim via session_id"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_mints_new_name_when_row_carries_another_session_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, created_at)
+                 VALUES ('riko', 'sess-someone-else', 'claude', 'active', ?1)",
+                params![crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+
+        let orphan = orphan_with("proc-riko", "sess-riko", &["riko"]);
+        assert!(!orphan_can_reuse_name(&db, "riko", &orphan).unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn rebind_renames_the_pane_to_the_reclaimed_name() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-title")),
+            "/tmp/project",
+        );
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+
+        let _ = crate::runtime_env::take_last_terminal_title();
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(
+            crate::runtime_env::take_last_terminal_title().as_deref(),
+            Some("nova"),
+            "a rebind must rename the pane, or the pane keeps advertising the old name"
+        );
+    }
+
+    /// Register a live PTY in the orphan pidfile so `start_from_orphan` can
+    /// find it. The test process's own PID is used because it is alive.
+    fn write_orphan_pidfile(hcom_dir: &std::path::Path, pid: u32, entry: serde_json::Value) {
+        let tmp = hcom_dir.join(".tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("launched_pids.json"),
+            serde_json::to_string(&json!({ pid.to_string(): entry })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_renames_the_pane_to_the_recovered_name() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let pid = std::process::id();
+        write_orphan_pidfile(
+            &hcom_dir,
+            pid,
+            json!({
+                "tool": "claude",
+                "names": ["riko"],
+                "launched_at": crate::shared::time::now_epoch_f64(),
+                "directory": "/tmp/project",
+                "process_id": "proc-riko",
+                "session_id": "sess-riko",
+            }),
+        );
+
+        let ctx = make_ctx(&[], "/tmp/project");
+        let _ = crate::runtime_env::take_last_terminal_title();
+        assert_eq!(
+            start_from_orphan(&db, &hcom_dir, &pid.to_string(), &ctx).unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::runtime_env::take_last_terminal_title().as_deref(),
+            Some("riko"),
+            "orphan recovery must rename the pane, or the pane keeps the old name"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_keeps_the_name_of_its_own_live_row() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, created_at)
+                 VALUES ('riko', 'sess-riko', 'claude', 'active', ?1)",
+                params![crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+
+        let pid = std::process::id();
+        write_orphan_pidfile(
+            &hcom_dir,
+            pid,
+            json!({
+                "tool": "claude",
+                "names": ["riko"],
+                "launched_at": crate::shared::time::now_epoch_f64(),
+                "directory": "/tmp/project",
+                "process_id": "proc-riko",
+                "session_id": "sess-riko",
+            }),
+        );
+
+        let ctx = make_ctx(&[], "/tmp/project");
+        assert_eq!(
+            start_from_orphan(&db, &hcom_dir, &pid.to_string(), &ctx).unwrap(),
+            0
+        );
+
+        let names: Vec<String> = db
+            .iter_instances_full()
+            .unwrap()
+            .iter()
+            .map(|row| row.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["riko".to_string()],
+            "recovering a PTY must not leave a second identity behind"
+        );
     }
 }
