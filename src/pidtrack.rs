@@ -44,7 +44,7 @@ fn is_zero(v: &u16) -> bool {
 }
 
 /// Orphan process info (enriched with PID).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrphanProcess {
     pub pid: u32,
     pub tool: String,
