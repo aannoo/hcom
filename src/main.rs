@@ -176,9 +176,19 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         command = resolved;
         extra_args = vec![];
     }
+    let mut child_env = pty_child_env();
+    let grok_acp = if target.known_tool() == Some(tool::Tool::Grok) && instance_name.is_some() {
+        let launch = delivery::grok::Launch::new(&command, &extra_args, &tool_args)?;
+        child_env.extend(launch.child_env());
+        Some(launch)
+    } else {
+        None
+    };
+    let leader_args = grok_acp.as_ref().map(|l| l.tui_args()).unwrap_or_default();
     let full_args: Vec<&str> = extra_args
         .iter()
         .map(|s| s.as_str())
+        .chain(leader_args.iter().map(String::as_str))
         .chain(tool_args.iter().copied())
         .collect();
 
@@ -191,7 +201,8 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             ready_pattern,
             instance_name,
             target,
-            env_vars: pty_child_env(),
+            env_vars: child_env,
+            grok_acp,
         },
     ) {
         Ok(proxy) => proxy,

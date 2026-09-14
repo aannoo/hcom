@@ -71,6 +71,62 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "--new-terminal",
 ];
 
+/// True when this process is a Grok **hook** (Claude-compat or native).
+///
+/// Grok injects `GROK_HOOK_EVENT` / `GROK_HOOK_NAME` on hook invocations and
+/// also loads `~/.claude/settings.json`. Those hook-only vars distinguish a
+/// Grok-spawned hook from a descendant tool that merely inherited
+/// `GROK_SESSION_ID` (e.g. Claude started via grok `run_terminal_command`).
+pub fn is_grok_host() -> bool {
+    std::env::var_os("GROK_HOOK_EVENT").is_some() || std::env::var_os("GROK_HOOK_NAME").is_some()
+}
+
+#[cfg(test)]
+mod grok_host_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn is_grok_host_false_without_env() {
+        // Clear any residual vars from other tests in this process.
+        unsafe {
+            std::env::remove_var("GROK_SESSION_ID");
+            std::env::remove_var("GROK_HOOK_EVENT");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        assert!(!is_grok_host());
+    }
+
+    #[test]
+    #[serial]
+    fn is_grok_host_false_with_session_id_alone() {
+        unsafe {
+            std::env::set_var("GROK_SESSION_ID", "sess-1");
+            std::env::remove_var("GROK_HOOK_EVENT");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        assert!(!is_grok_host());
+        unsafe {
+            std::env::remove_var("GROK_SESSION_ID");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn is_grok_host_true_with_hook_event() {
+        unsafe {
+            std::env::remove_var("GROK_SESSION_ID");
+            std::env::set_var("GROK_HOOK_EVENT", "Stop");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        assert!(is_grok_host());
+        unsafe {
+            std::env::remove_var("GROK_HOOK_EVENT");
+        }
+    }
+}
+
 /// Pre-gate check: should hooks proceed?
 ///
 ///

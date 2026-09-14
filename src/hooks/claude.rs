@@ -286,6 +286,13 @@ fn route_claude_hook(
     let dispatch_start = Instant::now();
     let mut timing = DispatchTiming::default();
 
+    // Grok also loads ~/.claude/settings.json. Native grok-* owns lifecycle
+    // and Stop additionalContext; Claude-compat must not write status or ack.
+    if common::is_grok_host() {
+        timing.result = Some("grok_compat_noop");
+        return (0, String::new(), None, timing);
+    }
+
     // Ensure directories and init DB
     if !paths::ensure_hcom_directories() {
         return (0, String::new(), None, timing);
@@ -1629,6 +1636,12 @@ fn handle_permission_denied(
 }
 
 fn handle_stop_failure(db: &HcomDb, payload: &HookPayload, instance_name: &str) -> (i32, String) {
+    // Grok loads Claude-compat StopFailure too. After rate-limit / API errors it
+    // sits on a modal and stops emitting hooks, so ST_INACTIVE here is terminal
+    // (alive process, no snapshot, `hcom r` fails). Native grok-stop owns status.
+    if common::is_grok_host() {
+        return (0, String::new());
+    }
     let error = payload
         .raw
         .get("error")
@@ -1730,6 +1743,11 @@ fn inject_bootstrap_if_needed(
 
 /// Check for unread messages to deliver at PostToolUse.
 fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<(Value, DeliveryAck)> {
+    // Grok: PostToolUse is observe-only; native grok-stop owns delivery.
+    if common::is_grok_host() {
+        return None;
+    }
+
     let prepared = common::prepare_pending_messages(db, instance_name)?;
     let model_context =
         common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
@@ -1804,13 +1822,18 @@ fn handle_poll(
         "hooks",
         "stop.enter",
         &format!(
-            "instance={} is_headless={} pty_mode={}",
-            instance_name, ctx.is_background, ctx.is_pty_mode
+            "instance={} is_headless={} pty_mode={} grok_host={}",
+            instance_name,
+            ctx.is_background,
+            ctx.is_pty_mode,
+            common::is_grok_host()
         ),
     );
 
-    // PTY mode: exit immediately, PTY wrapper handles injection
-    if ctx.is_pty_mode {
+    // Grok loads Claude-compat Stop hooks, but native `grok-stop` is the sole
+    // delivery owner (StopHookJson.additionalContext). Claude-compat only
+    // flips listening + notifies — no followup_message (not in Grok's schema).
+    if common::is_grok_host() || ctx.is_pty_mode {
         lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
         common::notify_hook_instance_with_db(db, instance_name);
         return (0, String::new(), None);
@@ -1844,6 +1867,7 @@ fn handle_poll(
     // Always exit 0: Claude ignores stdout JSON on exit 2 for Stop, so a
     // delivered message must go out as exit 0 + decision:block, with the ack
     // committed by write_hook_output only after that stdout is flushed.
+    // (Grok hosts already returned above — native grok-stop owns delivery.)
     (0, stdout, result.ack)
 }
 
@@ -1877,7 +1901,14 @@ fn handle_userpromptsubmit(
         paths::increment_flag_counter("instance_count");
     }
 
-    // PTY mode: deliver messages
+    // Grok host: UPS is observe-only (stdout discarded). Status is handled by
+    // native grok-userpromptsubmit; leave pending for grok-stop additionalContext.
+    if common::is_grok_host() {
+        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        return (0, String::new(), None);
+    }
+
+    // PTY mode: deliver pending via Claude-compatible UPS payload.
     if ctx.is_pty_mode
         && let Some(prepared) = common::prepare_pending_messages(db, instance_name)
     {
@@ -4966,6 +4997,47 @@ mod tests {
         db.set_session_binding(session_id, instance_name).unwrap();
         db.mark_claude_session_validated(session_id, instance_name)
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn grok_compat_hooks_are_total_noops() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, last_seen, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'grok', 'active', 'prompt', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        unsafe {
+            std::env::set_var("GROK_HOOK_EVENT", "Stop");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        let mut payload = HookPayload::from_claude(serde_json::json!({
+            "session_id": "sess-1",
+        }));
+        let (code, stdout, ack, timing) =
+            route_claude_hook(&db, &make_ctx(), HOOK_POLL, &mut payload);
+        unsafe {
+            std::env::remove_var("GROK_HOOK_EVENT");
+        }
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+        assert_eq!(timing.result, Some("grok_compat_noop"));
+        let (status, context): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context FROM instances WHERE name = 'nova'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(context, "prompt");
     }
 
     #[test]

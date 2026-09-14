@@ -2,8 +2,9 @@
 
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
+pub(crate) mod grok;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -707,10 +708,25 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
         "not_ready" => "prompt not visible",
         "output_unstable" => "output still streaming",
         "prompt_has_text" => "uncommitted text in prompt",
+        "prompt_unverified" => {
+            "Grok composer cannot be verified; idle wake requires an unattended --headless worker"
+        }
         "approval" => "waiting for user approval",
         "nav_overlay" => "waiting for subagent nav / session switcher to close",
         _ => "blocked",
     }
+}
+
+/// Short PTY sentinel for Grok idle wake — no angle brackets (WT paste hazard).
+///
+/// Real message bodies are **not** pasted into the composer. They are delivered
+/// from native `grok-stop` via `hookSpecificOutput.additionalContext` after a
+/// genuine end-of-turn Stop (observe-only hooks discard stdout).
+pub(crate) const GROK_WAKE_TRIGGER: &str = "hcom: wake";
+
+/// PTY inject text for Grok: always the short wake sentinel.
+pub(crate) fn build_grok_inject_text(_db: &HcomDb, _recipient: &str) -> String {
+    GROK_WAKE_TRIGGER.to_string()
 }
 
 /// Build PTY wake text for tools whose delivery path is not human-visible.
@@ -904,6 +920,9 @@ pub struct GateResult {
 /// Shared state for delivery thread
 pub struct DeliveryState {
     pub screen: Arc<std::sync::RwLock<ScreenState>>,
+    /// Explicit headless Grok worker with no interactive terminal on stdin.
+    pub grok_unattended: bool,
+    pub grok_acp: Option<grok::Launch>,
     /// True while the launch outcome is still Pending. Cleared once any
     /// terminal outcome (ready/failed/blocked) fires, so the PTY proxy can
     /// stop computing launch-only signals (e.g. `visible_tail`).
@@ -978,6 +997,8 @@ pub struct ScreenState {
     pub input_text: Option<String>,
     pub visible_tail: Option<String>,
     pub last_user_input: Instant,
+    /// Sticky for this PTY lifetime: a cooldown cannot prove a draft was cleared.
+    pub user_input_seen: bool,
     /// Timestamp of last output (for stability-based recovery)
     pub last_output: Instant,
     /// Terminal width in columns
@@ -1016,6 +1037,7 @@ impl Default for ScreenState {
             input_text: None,
             visible_tail: None,
             last_user_input: Instant::now(),
+            user_input_seen: false,
             last_output: Instant::now(),
             cols: 80,
             last_prompt_submit: None,
@@ -1138,6 +1160,16 @@ pub(crate) fn evaluate_gate(
         return GateResult {
             safe: false,
             reason: "not_ready",
+        };
+    }
+    if config.tool == "grok" && !grok_prompt_owned(&screen, state.grok_unattended, "") {
+        return GateResult {
+            safe: false,
+            reason: if screen.input_text.is_some() {
+                "prompt_has_text"
+            } else {
+                "prompt_unverified"
+            },
         };
     }
     if config.require_prompt_empty && !screen.prompt_empty {
@@ -1417,6 +1449,56 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
+/// Wait this long after the first Enter for UPS (`prompt`/`trigger`) before
+/// a single retry Enter. First-turn hooks bind lazily (~4s).
+const GROK_UPS_WAIT: Duration = Duration::from_secs(4);
+/// If Stop never acks this pending batch, allow one more PTY wake.
+const GROK_AWAIT_STOP: Duration = Duration::from_secs(15);
+const GROK_MAX_ENTER_ATTEMPTS: u32 = 2;
+
+/// True when we already submitted a wake for this unread batch and must wait
+/// for grok-stop to ack instead of typing another `hcom: wake`.
+fn grok_should_skip_rewake(
+    awaiting_at: Option<i64>,
+    current_cursor: i64,
+    has_pending: bool,
+) -> bool {
+    has_pending && awaiting_at == Some(current_cursor)
+}
+
+fn grok_turn_started(status: &str, context: &str) -> bool {
+    if status != ST_ACTIVE && status != "active" {
+        // Allow any non-listening non-active that clearly means mid-turn tools.
+        // Primary success path is ST_ACTIVE + prompt/trigger from UPS.
+        return false;
+    }
+    matches!(context, "prompt" | "trigger")
+        || context.starts_with("tool:")
+        || context.starts_with("approved:")
+}
+
+/// Acknowledged internal wake commands let the PTY distinguish automation from
+/// operator input and re-check ownership at the actual write boundary.
+pub(crate) fn inject_grok_command(port: u16, enter: bool) -> bool {
+    let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) else {
+        return false;
+    };
+    let timeout = Some(Duration::from_secs(2));
+    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
+        return false;
+    }
+    let command: &[u8] = if enter {
+        b"\0GROK_ENTER"
+    } else {
+        b"\0GROK_WAKE"
+    };
+    if stream.write_all(command).is_err() || stream.shutdown(std::net::Shutdown::Write).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    stream.take(64).read_to_string(&mut response).is_ok() && response == "ok\n"
+}
+
 /// Inject Enter key to PTY via TCP
 pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
@@ -1454,6 +1536,23 @@ fn prompt_ownership(input_text: Option<&str>, injected_text: &str) -> PromptOwne
             PromptOwnership::Mixed
         }
         _ => PromptOwnership::Other,
+    }
+}
+
+pub(crate) fn grok_prompt_owned(screen: &ScreenState, unattended: bool, expected: &str) -> bool {
+    match screen.input_text.as_deref() {
+        Some(input) => input == expected,
+        None => unattended && !screen.user_input_seen,
+    }
+}
+
+impl DeliveryState {
+    /// Both the first Enter and every retry must retain submit authority.
+    fn grok_can_submit(&self, injected_text: &str) -> bool {
+        let screen = self.screen.read().unwrap();
+        !self.is_user_active_with_guard(&screen)
+            && !screen.approval
+            && grok_prompt_owned(&screen, self.grok_unattended, injected_text)
     }
 }
 
@@ -1666,7 +1765,23 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(
+    if let Some(launch) = state.grok_acp.as_ref().filter(|_| config.tool == "grok") {
+        grok::run(
+            launch,
+            &running,
+            db,
+            notify,
+            state,
+            &process_id,
+            &mut current_name,
+            config,
+            &shared_name,
+            &shared_status,
+            &title_wake,
+            &mut host_label,
+            &mut launch_outcome,
+        );
+    } else if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
     ) {
@@ -1770,6 +1885,12 @@ pub fn run_delivery_loop(
         let mut injected_text = String::new();
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
+        // After a Grok wake sentinel is submitted, Stop owns the pending batch.
+        // Remember the delivery cursor so Idle/notify does not re-type `hcom: wake`
+        // when Stop flips listening (same batch still unread until additionalContext
+        // is flushed). Cleared when pending drains or the cursor advances.
+        let mut grok_awaiting_stop_at: Option<i64> = None;
+        let mut grok_awaiting_stop_since: Option<Instant> = None;
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
@@ -1854,7 +1975,42 @@ pub fn run_delivery_loop(
 
                     // Check for pending messages
                     let has_pending = db.has_pending(&current_name);
-                    if has_pending {
+                    if !has_pending {
+                        grok_awaiting_stop_at = None;
+                        grok_awaiting_stop_since = None;
+                    }
+                    let skip_rewake = has_pending
+                        && config.tool == "grok"
+                        && grok_should_skip_rewake(
+                            grok_awaiting_stop_at,
+                            db.get_cursor(&current_name),
+                            has_pending,
+                        );
+                    let skip_expired = skip_rewake
+                        && grok_awaiting_stop_since
+                            .is_some_and(|since| since.elapsed() >= GROK_AWAIT_STOP);
+                    if skip_expired {
+                        log_info(
+                            "native",
+                            "delivery.grok_await_stop_timeout",
+                            &format!(
+                                "Stop did not ack pending batch after {:?}; allowing another wake",
+                                GROK_AWAIT_STOP
+                            ),
+                        );
+                        grok_awaiting_stop_at = None;
+                        grok_awaiting_stop_since = None;
+                    }
+                    if skip_rewake && !skip_expired {
+                        log_info(
+                            "native",
+                            "delivery.grok_await_stop",
+                            &format!(
+                                "Already woke this pending batch (cursor={}); waiting for Stop additionalContext",
+                                db.get_cursor(&current_name)
+                            ),
+                        );
+                    } else if has_pending {
                         log_info(
                             "native",
                             "delivery.wake",
@@ -1885,6 +2041,8 @@ pub fn run_delivery_loop(
                             "delivery.no_pending",
                             &format!("No pending messages for {}", current_name),
                         );
+                        grok_awaiting_stop_at = None;
+                        grok_awaiting_stop_since = None;
                         delivery_state = State::Idle;
                         attempt = 0;
                         continue;
@@ -1927,13 +2085,23 @@ pub fn run_delivery_loop(
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
+                            // Grok: short wake sentinel only; body via Stop additionalContext.
+                            Some(Tool::Grok) => build_grok_inject_text(db, &current_name),
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
                             | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi)
                             | Some(Tool::Omp) => "<hcom>".to_string(),
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
-                        if inject_text(state.inject_port, &text) {
+                        // No Ctrl-U clear for Grok: cannot observe composer; risk
+                        // partial draft deletion. Sentinel is short and idle-gated.
+                        let inject_ok = if config.tool == "grok" {
+                            inject_grok_command(state.inject_port, false)
+                        } else {
+                            inject_text(state.inject_port, &text)
+                        };
+
+                        if inject_ok {
                             log_info(
                                 "native",
                                 "delivery.injected",
@@ -1941,7 +2109,7 @@ pub fn run_delivery_loop(
                                     "Injected '{}' (len={}, inject_attempt={})",
                                     truncate_chars(&text, 40),
                                     text.len(),
-                                    inject_attempt
+                                    inject_attempt,
                                 ),
                             );
                             injected_text = text;
@@ -2113,6 +2281,142 @@ pub fn run_delivery_loop(
 
                 State::WaitTextRender => {
                     let elapsed = phase_started_at.elapsed();
+
+                    // Grok: an unobserved composer is only owned by a headless
+                    // worker that has never received human input.
+                    // Protocol (owner review): PTY only submits a short wake
+                    // sentinel; real body is delivered from grok-stop via
+                    // hookSpecificOutput.additionalContext. Never force-ack.
+                    if config.tool == "grok" {
+                        if enter_attempt > 0 {
+                            let still_pending = db.has_pending(&current_name);
+                            let turn_started = match db.get_status(&current_name) {
+                                Ok(Some((status, ctx))) => grok_turn_started(&status, &ctx),
+                                _ => false,
+                            };
+                            // Success for PTY wake: turn started (UPS trigger/prompt)
+                            // or Stop already acked (pending cleared). Do NOT ack here.
+                            if turn_started || !still_pending {
+                                log_info(
+                                    "native",
+                                    "delivery.grok_wake_done",
+                                    &format!(
+                                        "Grok wake complete (enter_attempt={enter_attempt}, turn_started={turn_started}, pending={still_pending})"
+                                    ),
+                                );
+                                inject_attempt = 0;
+                                attempt = 0;
+                                // If still pending, Stop will deliver the body. Do not
+                                // re-inject when Stop notifies + sets listening — that
+                                // notify is for the same unread batch.
+                                if still_pending {
+                                    grok_awaiting_stop_at = Some(db.get_cursor(&current_name));
+                                    grok_awaiting_stop_since = Some(Instant::now());
+                                } else {
+                                    grok_awaiting_stop_at = None;
+                                    grok_awaiting_stop_since = None;
+                                }
+                                delivery_state = State::Idle;
+                                phase_started_at = Instant::now();
+                                continue;
+                            }
+
+                            if elapsed < GROK_UPS_WAIT {
+                                std::thread::sleep(Duration::from_millis(50));
+                                continue;
+                            }
+
+                            if enter_attempt < GROK_MAX_ENTER_ATTEMPTS {
+                                let user_active = state.is_user_active();
+                                let approval =
+                                    state.screen.read().map(|s| s.approval).unwrap_or(false);
+                                if !state.grok_can_submit(&injected_text) {
+                                    if elapsed > PHASE1_TIMEOUT {
+                                        log_warn(
+                                            "native",
+                                            "delivery.grok_enter_retry_blocked",
+                                            &format!(
+                                                "Grok Enter retry lacks submit authority (user_active={user_active}, approval={approval}); pending kept"
+                                            ),
+                                        );
+                                        delivery_state = State::Pending;
+                                        inject_attempt += 1;
+                                        attempt += 1;
+                                    } else {
+                                        std::thread::sleep(Duration::from_millis(50));
+                                    }
+                                    continue;
+                                }
+                                log_info(
+                                    "native",
+                                    "delivery.grok_retry_enter",
+                                    &format!(
+                                        "Grok still pending after {:?}; re-Enter sentinel (attempt={}/{})",
+                                        elapsed,
+                                        enter_attempt + 1,
+                                        GROK_MAX_ENTER_ATTEMPTS,
+                                    ),
+                                );
+                                // Single Enter only — double Enter can queue two wakes.
+                                inject_grok_command(state.inject_port, true);
+                                enter_attempt += 1;
+                                phase_started_at = Instant::now();
+                                continue;
+                            }
+
+                            log_warn(
+                                "native",
+                                "delivery.grok_wake_unconfirmed",
+                                &format!(
+                                    "Grok wake unconfirmed after {GROK_MAX_ENTER_ATTEMPTS} Enters; leaving pending (no force-ack)"
+                                ),
+                            );
+                            // Leave messages pending for a later idle cycle.
+                            delivery_state = State::Pending;
+                            inject_attempt += 1;
+                            attempt += 1;
+                            phase_started_at = Instant::now();
+                            continue;
+                        }
+
+                        // First Enter after short settle for tiny sentinel.
+                        let settle = Duration::from_millis(400);
+                        if elapsed < settle {
+                            std::thread::sleep(Duration::from_millis(25));
+                            continue;
+                        }
+                        let user_active = state.is_user_active();
+                        let approval = state.screen.read().map(|s| s.approval).unwrap_or(false);
+                        if !state.grok_can_submit(&injected_text) {
+                            if elapsed > PHASE1_TIMEOUT {
+                                log_warn(
+                                    "native",
+                                    "delivery.grok_enter_blocked",
+                                    &format!(
+                                        "Grok Enter lacks submit authority (user_active={user_active}, approval={approval}); pending kept"
+                                    ),
+                                );
+                                delivery_state = State::Pending;
+                                inject_attempt += 1;
+                                attempt += 1;
+                            } else {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            continue;
+                        }
+                        log_info(
+                            "native",
+                            "delivery.grok_force_enter",
+                            &format!(
+                                "Forcing Enter after wake sentinel (bytes={}) — body via Stop additionalContext",
+                                injected_text.len(),
+                            ),
+                        );
+                        inject_grok_command(state.inject_port, true);
+                        enter_attempt = 1;
+                        phase_started_at = Instant::now();
+                        continue;
+                    }
 
                     // Inspect the latest screen before applying the deadline. This
                     // avoids rejecting a render that completed at the timeout edge.
@@ -2644,7 +2948,9 @@ mod tests {
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
         DeliveryState {
+            grok_acp: None,
             screen: Arc::new(std::sync::RwLock::new(screen)),
+            grok_unattended: false,
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             inject_port: 0,
             user_activity_cooldown_ms: cooldown_ms,
@@ -2660,6 +2966,7 @@ mod tests {
             input_text: None,
             visible_tail: None,
             last_user_input: Instant::now() - Duration::from_secs(10),
+            user_input_seen: false,
             last_output: Instant::now() - Duration::from_secs(10),
             cols: 80,
             last_prompt_submit: None,
@@ -2784,6 +3091,122 @@ mod tests {
     }
 
     // ---- phase-1 ownership tests ----
+
+    #[test]
+    fn grok_turn_started_ignores_premature_deliver_ack() {
+        // commit_delivery_ack sets active + deliver:sender — must NOT count.
+        assert!(!grok_turn_started(ST_ACTIVE, "deliver:vomu"));
+        assert!(!grok_turn_started(ST_LISTENING, ""));
+        // Real UPS contexts.
+        assert!(grok_turn_started(ST_ACTIVE, "prompt"));
+        assert!(grok_turn_started(ST_ACTIVE, "trigger"));
+        assert!(grok_turn_started(ST_ACTIVE, "tool:Bash"));
+    }
+
+    #[test]
+    fn grok_wake_trigger_has_no_angle_brackets() {
+        assert!(!GROK_WAKE_TRIGGER.contains('<'));
+    }
+
+    #[test]
+    fn grok_skips_rewake_until_stop_advances_cursor() {
+        assert!(grok_should_skip_rewake(Some(42), 42, true));
+        assert!(!grok_should_skip_rewake(Some(42), 99, true));
+        assert!(!grok_should_skip_rewake(Some(42), 42, false));
+        assert!(!grok_should_skip_rewake(None, 42, true));
+        assert!(!GROK_WAKE_TRIGGER.contains('>'));
+        assert_eq!(GROK_WAKE_TRIGGER, "hcom: wake");
+    }
+
+    #[test]
+    fn grok_interactive_unknown_composer_blocks_wake_after_cooldown() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        let state = make_state(safe_screen(), 500);
+        let gate = evaluate_gate(&config, &state, true);
+        assert!(!gate.safe);
+        assert_eq!(gate.reason, "prompt_unverified");
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
+
+    #[test]
+    fn grok_headless_unknown_composer_retains_automatic_wake() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        let mut screen = safe_screen();
+        screen.prompt_empty = false;
+        let mut state = make_state(screen, 500);
+        state.grok_unattended = true;
+        assert!(evaluate_gate(&config, &state, true).safe);
+        assert!(state.grok_can_submit(GROK_WAKE_TRIGGER));
+        assert!(!evaluate_gate(&config, &state, false).safe);
+
+        state.screen.write().unwrap().approval = true;
+        assert!(!evaluate_gate(&config, &state, true).safe);
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
+
+    #[test]
+    fn grok_launch_readiness_does_not_require_an_idle_injection_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let config = ToolConfig::for_tool(Tool::Grok);
+        for unattended in [false, true] {
+            let mut screen = safe_screen();
+            screen.prompt_empty = false;
+            let mut state = make_state(screen, 500);
+            state.grok_unattended = unattended;
+            assert!(launch_ready_observed(&db, "nova", &config, &state));
+            assert_eq!(evaluate_gate(&config, &state, true).safe, unattended);
+        }
+    }
+
+    #[test]
+    fn grok_human_input_permanently_revokes_unknown_composer_ownership() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        let mut state = make_state(safe_screen(), 500);
+        state.grok_unattended = true;
+        assert!(state.grok_can_submit(GROK_WAKE_TRIGGER));
+        {
+            let mut screen = state.screen.write().unwrap();
+            screen.user_input_seen = true;
+            screen.last_user_input = Instant::now() - Duration::from_secs(60);
+        }
+        assert!(!evaluate_gate(&config, &state, true).safe);
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
+
+    #[test]
+    fn grok_headless_never_overrides_an_observed_draft() {
+        let config = ToolConfig::for_tool(Tool::Grok);
+        for unattended in [false, true] {
+            for draft in [
+                "private draft",
+                "private draft\nhcom: wake",
+                "hcom: wake private draft",
+            ] {
+                let mut screen = safe_screen();
+                screen.prompt_empty = false;
+                screen.input_text = Some(draft.into());
+                let mut state = make_state(screen, 500);
+                state.grok_unattended = unattended;
+                assert!(!evaluate_gate(&config, &state, true).safe);
+                assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+            }
+        }
+    }
+
+    #[test]
+    fn grok_verified_sentinel_loses_submit_authority_when_draft_changes() {
+        let mut screen = safe_screen();
+        screen.prompt_empty = false;
+        screen.input_text = Some(GROK_WAKE_TRIGGER.into());
+        let state = make_state(screen, 500);
+        assert!(state.grok_can_submit(GROK_WAKE_TRIGGER));
+        state.screen.write().unwrap().input_text = Some("hcom: wake edited by user".into());
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+        state.screen.write().unwrap().input_text = None;
+        assert!(!state.grok_can_submit(GROK_WAKE_TRIGGER));
+    }
 
     #[test]
     fn phase1_timeout_is_ten_seconds() {

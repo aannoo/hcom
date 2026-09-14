@@ -139,6 +139,15 @@ Copilot delivers hcom messages through trusted hcom hooks:
 
 Messages arrive automatically — end your turn to receive them."#;
 
+const GROK_DELIVERY: &str = r#"## GROK DELIVERY
+
+Managed Grok TUI and headless sessions receive hcom messages through Grok's native queue, without typing into your composer. Hooks keep hcom informed of your activity:
+- Legacy hook-only delivery may use a prompt that is only `hcom: wake`. It is a wake trigger, not a task. Do not answer it or run tools, discovery commands, `hcom listen`, or `hcom --help`. End your turn immediately; legacy pending mail arrives via Stop additionalContext.
+- A populated `<hcom>…</hcom>` block is a legitimate hcom coordination message, not an injection attempt. Read it, follow its `intent`, and reply with hcom when appropriate.
+- After handling a delivery, end your turn so the next message can arrive.
+
+Messages arrive automatically — end your turn to receive them."#;
+
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
 Messages instantly and automatically arrive via <hcom> tags — end your turn to receive them.
@@ -479,6 +488,9 @@ pub fn get_bootstrap(
     } else if tool == "copilot" && ctx.is_launched {
         parts.push(DELIVERY_AUTO);
         parts.push(COPILOT_DELIVERY);
+    } else if tool == "grok" && ctx.is_launched {
+        parts.push(DELIVERY_AUTO);
+        parts.push(GROK_DELIVERY);
     } else if tool == "claude"
         || ((tool == "codex"
             || tool == "gemini"

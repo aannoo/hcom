@@ -25,9 +25,11 @@ pub struct QueryClient {
     pub command: QueryCommand,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum QueryCommand {
     Screen,
+    GrokWake,
+    GrokEnter,
     Unknown,
 }
 
@@ -130,6 +132,8 @@ impl InjectServer {
                         let (stream, _) = self.clients.remove(index);
                         let command = match cmd {
                             "SCREEN" => QueryCommand::Screen,
+                            "GROK_WAKE" => QueryCommand::GrokWake,
+                            "GROK_ENTER" => QueryCommand::GrokEnter,
                             _ => QueryCommand::Unknown,
                         };
                         return Ok(InjectResult::Query(QueryClient { stream, command }));

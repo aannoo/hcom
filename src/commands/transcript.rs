@@ -1656,6 +1656,10 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
                 "/home/user/.copilot/session-state/abc/events.jsonl",
                 "copilot",
             ),
+            (
+                "/home/user/.grok/sessions/%2Fhome%2Fuser%2Fproj/019f-uuid/updates.jsonl",
+                "grok",
+            ),
             ("/home/user/.pi/agent/sessions/x/20260603_abc.jsonl", "pi"),
             ("/home/user/.omp/agent/sessions/x/20260603_abc.jsonl", "omp"),
         ];

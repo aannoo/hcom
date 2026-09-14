@@ -1039,12 +1039,121 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
         crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
         crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
+        crate::tool::Tool::Grok => merge_grok_args(original, resume),
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
         crate::tool::Tool::Omp => merge_omp_args(original, resume),
         crate::tool::Tool::Adhoc => {
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
     }
+}
+
+/// Merge grok original launch args with resume args.
+///
+/// Drop session selectors, one-shot flags, and worktree flags (the session
+/// already lives in that tree). `-w`/`--worktree` take an optional value.
+fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--model",
+        "-m",
+        "--cwd",
+        "--rules",
+        "--agent",
+        "--permission-mode",
+        "--reasoning-effort",
+        "--effort",
+        "--max-turns",
+        "--output-format",
+        "--disallowed-tools",
+        "--tools",
+        "--allow",
+        "--deny",
+        "--sandbox",
+        "--leader-socket",
+        "--debug-file",
+        "--system-prompt-override",
+    ];
+    const DROP_WITH_VALUE: &[&str] = &[
+        "--resume",
+        "-r",
+        "--session-id",
+        "-s",
+        "--single",
+        "-p",
+        "--prompt-file",
+        "--prompt-json",
+        "--worktree",
+        "-w",
+        "--worktree-ref",
+        "--ref",
+    ];
+    const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session", "--restore-code"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+
+    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip_next = false;
+    for token in resume {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let bare = lower.split('=').next().unwrap_or(&lower).to_string();
+            if VALUE_FLAGS.contains(&bare.as_str()) {
+                skip_next = !token.contains('=');
+            }
+            if !DROP_WITH_VALUE.contains(&bare.as_str()) && !DROP_BOOLEAN.contains(&bare.as_str()) {
+                resume_flags.insert(bare);
+            }
+        }
+    }
+
+    let mut filtered_original: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
+                (lower[..pos].to_string(), true)
+            } else {
+                (lower.clone(), false)
+            };
+            if DROP_WITH_VALUE.contains(&bare.as_str()) {
+                i += 1;
+                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            if DROP_BOOLEAN.contains(&bare.as_str()) {
+                i += 1;
+                continue;
+            }
+            if resume_flags.contains(&bare) {
+                i += 1;
+                if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            filtered_original.push(token.clone());
+            i += 1;
+            if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                filtered_original.push(original[i].clone());
+                i += 1;
+            }
+        } else {
+            // Drop bare positional task prompt from original launch.
+            i += 1;
+        }
+    }
+
+    let mut result = resume.to_vec();
+    result.extend(filtered_original);
+    result
 }
 
 /// Merge copilot original launch args with resume args.
@@ -3565,6 +3674,36 @@ mod tests {
         // copilot has fork: None, so build_resume_args returns resume-only args
         let args = build_resume_args("copilot", "sess-abc", true);
         assert_eq!(args, s(&["--resume", "sess-abc"]));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_worktree_and_keeps_rules() {
+        let original = s(&["--worktree", "feat", "--rules", "BOOT", "--always-approve"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.iter().any(|t| t == "--worktree" || t == "feat"));
+        assert!(merged.contains(&"--rules".to_string()));
+        assert!(merged.contains(&"BOOT".to_string()));
+        assert!(merged.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_bare_worktree_does_not_eat_model() {
+        let original = s(&["--worktree", "--model", "grok-build"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.contains(&"--worktree".to_string()));
+        assert!(merged.contains(&"--model".to_string()));
+        assert!(merged.contains(&"grok-build".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_short_worktree_drops_name() {
+        let original = s(&["-w", "mytree", "--always-approve"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.iter().any(|t| t == "-w" || t == "mytree"));
+        assert!(merged.contains(&"--always-approve".to_string()));
     }
 
     #[test]

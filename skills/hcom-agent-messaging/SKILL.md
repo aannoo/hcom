@@ -12,7 +12,7 @@ AI agents running in separate terminals are isolated. hcom connects them via hoo
 
 ```bash
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot, hcom grok
 hcom              # TUI dashboard
 ```
 
@@ -59,6 +59,8 @@ run `hcom --help` for full command syntax and flags.
 | kilo code | automatic | `hcom kilo` |
 | antigravity | automatic | `hcom agy` |
 | cursor | automatic | `hcom cursor-agent` |
+| copilot | automatic | `hcom copilot` |
+| grok build | automatic | `hcom grok` |
 | any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
@@ -173,7 +175,7 @@ with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
 | file | when to read |
 |------|-------------|
 | `references/patterns.md` | writing multi-agent scripts — 6 tested patterns with full code and real event JSON |
-| `references/cross-tool.md` | claude + codex + gemini + opencode + kilo + pi + omp + antigravity + cursor + kimi + copilot collaboration details and per-tool quirks |
+| `references/cross-tool.md` | claude + codex + gemini + opencode + kilo + pi + omp + antigravity + cursor + kimi + copilot + grok collaboration details and per-tool quirks |
 | `references/gotchas.md` | debugging scripts — timing, message delivery, intent system, cleanup |
 | `references/script-template.md` | writing a new script from scratch — full template with commentary |
 | `references/scripts/` | 6 tested, working example scripts |

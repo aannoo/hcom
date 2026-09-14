@@ -13,6 +13,29 @@ pub(crate) enum RejectedArgKind {
     RootSubcommand,
 }
 
+pub(crate) const GROK_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "-p",
+        reason: "exits after one prompt; not a persistent hcom agent",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--single",
+        reason: "exits after one prompt; not a persistent hcom agent",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--prompt-file",
+        reason: "one-shot prompt from a file; not a persistent hcom agent",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--prompt-json",
+        reason: "one-shot JSON prompt; not a persistent hcom agent",
+        kind: RejectedArgKind::Flag,
+    },
+];
+
 pub(crate) const KIMI_REJECTED_ARGS: &[RejectedArg] = &[
     RejectedArg {
         token: "-p",
