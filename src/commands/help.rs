@@ -485,7 +485,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / hermes_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -615,6 +615,26 @@ const UPDATE_HELP: &[HelpEntry] = &[
     ("", "  uv tool install → uv tool upgrade hcom"),
     ("", "  pip install     → pip install -U hcom"),
     ("", "  curl installer  → re-run hcom-installer.sh"),
+];
+
+const COMPLETION_HELP: &[HelpEntry] = &[
+    ("completion zsh", "Generate Zsh completion script to stdout"),
+    ("", ""),
+    ("", "Source the script to activate completions immediately:"),
+    ("", "  eval \"$(hcom completion zsh)\""),
+    ("", ""),
+    ("", "Install permanently:"),
+    ("", "  hcom completion zsh --install"),
+    (
+        "",
+        "  # or:  hcom completion zsh > /usr/local/share/zsh/site-functions/_hcom",
+    ),
+    ("", "  compinit"),
+    ("", ""),
+    (
+        "",
+        "Once installed, tab-complete hcom commands, tools, and flags.",
+    ),
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[
@@ -856,6 +876,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "relay",
     "run",
     "update",
+    "completion",
     "claude",
     "gemini",
     "codex",
@@ -872,6 +893,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "cursor-agent",
     "kimi",
     "copilot",
+    "hermes",
 ];
 
 fn resumable_tool_names() -> String {
@@ -932,7 +954,8 @@ Commands:\n\
   hooks        Add or remove hooks\n\
   status       Installation and diagnostics\n\
   term         View/inject into agent PTY screens\n\
-  update       Check and apply updates",
+   update       Check and apply updates\n\
+   completion   Generate shell completion scripts",
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -1048,6 +1071,7 @@ pub fn get_command_help(name: &str) -> String {
         "run" => Some(RUN_HELP),
         "status" => Some(STATUS_HELP),
         "update" => Some(UPDATE_HELP),
+        "completion" => Some(COMPLETION_HELP),
         "hooks" => None,
         "term" => Some(TERM_HELP),
         _ => None,
@@ -1163,13 +1187,17 @@ mod tests {
             "term",
             "relay",
             "run",
+            "update",
+            "completion",
             "claude",
             "gemini",
             "codex",
             "opencode",
+            "kilo",
             "agy",
             "antigravity",
             "kimi",
+            "hermes",
         ];
         for cmd in commands {
             let help = get_command_help(cmd);
