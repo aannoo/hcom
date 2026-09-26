@@ -54,7 +54,7 @@ fn seal_bounded_payload(
         } else if events.len() > 1 {
             events.pop();
         } else if let Some(only) = events.first_mut()
-            && shrink_level(only) < 2
+            && shrink_level(only) < SHRINK_LAST_LEVEL
         {
             // One new event larger than the whole budget used to be popped
             // here. The cursor then stayed below it, every later push rebuilt
@@ -76,22 +76,31 @@ const SHRINK_STRING_CHARS: usize = 4096;
 /// Top-level data fields at or under this size survive the second level.
 const SHRINK_KEEP_FIELD_BYTES: usize = 512;
 const SHRINK_MARKER: &str = "_relay_truncated";
+/// Fields the last level keeps: enough for a waiter to match and fail an RPC.
+const SHRINK_ALWAYS_KEEP: [&str; 4] = ["request_id", "action", "ok", "error"];
+pub(crate) const SHRINK_LAST_LEVEL: u64 = 3;
 
-fn shrink_level(event: &Value) -> u64 {
+pub(crate) fn shrink_level(event: &Value) -> u64 {
     event["data"][SHRINK_MARKER]["level"].as_u64().unwrap_or(0)
 }
 
-/// Make an oversized event fit, in two steps. Level 1 cuts every long string
-/// in `data`. Level 2 keeps only the small top-level fields (sender, ids,
-/// request ids) and drops the rest. Both leave a marker saying how big the
-/// original was, so a reader can tell a relayed copy was cut.
-fn shrink_event(event: &mut Value) {
+/// Make an oversized event fit, in up to three steps. Level 1 cuts every long
+/// string in `data`. Level 2 keeps only the small top-level fields (sender,
+/// ids, request ids) and drops the rest. Level 3 keeps only the RPC routing
+/// fields, because many small fields can still add up past the budget and
+/// there must be a step that always fits (short of an oversized state). Each
+/// level leaves a marker saying how big the original was, so a reader can tell
+/// a relayed copy was cut. An rpc_result that loses its `result` is turned
+/// into an explicit failure: `ok: true` with no result would let the requester
+/// report success on an answer it never received.
+pub(crate) fn shrink_event(event: &mut Value) {
+    let is_rpc_result = event["type"].as_str() == Some("rpc_result");
     let original_bytes = serde_json::to_string(&event["data"])
         .map(|s| s.len())
         .unwrap_or(0);
     let level = shrink_level(event) + 1;
     let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut()) else {
-        event["data"] = json!({ SHRINK_MARKER: {"level": 2, "original_bytes": original_bytes} });
+        event["data"] = json!({ SHRINK_MARKER: {"level": SHRINK_LAST_LEVEL, "original_bytes": original_bytes} });
         return;
     };
     let original_bytes = data
@@ -99,6 +108,8 @@ fn shrink_event(event: &mut Value) {
         .and_then(|m| m["original_bytes"].as_u64())
         .map(|b| b as usize)
         .unwrap_or(original_bytes);
+    // Read what earlier levels dropped BEFORE removing their marker.
+    let already_dropped = event_marker_dropped(data).unwrap_or_default();
     data.remove(SHRINK_MARKER);
     let mut dropped: Vec<String> = Vec::new();
     if level == 1 {
@@ -106,26 +117,60 @@ fn shrink_event(event: &mut Value) {
             shrink_strings(value);
         }
     } else {
-        let large: Vec<String> = data
+        let doomed: Vec<String> = data
             .iter()
-            .filter(|(_, v)| {
-                serde_json::to_string(v)
-                    .map(|s| s.len())
-                    .unwrap_or(usize::MAX)
-                    > SHRINK_KEEP_FIELD_BYTES
+            .filter(|(k, v)| {
+                if level >= SHRINK_LAST_LEVEL {
+                    !SHRINK_ALWAYS_KEEP.contains(&k.as_str())
+                } else {
+                    serde_json::to_string(v)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX)
+                        > SHRINK_KEEP_FIELD_BYTES
+                }
             })
             .map(|(k, _)| k.clone())
             .collect();
-        for key in large {
+        for key in doomed {
             data.remove(&key);
             dropped.push(key);
         }
     }
+    if is_rpc_result
+        && (dropped.iter().any(|k| k == "result") || already_dropped.iter().any(|k| k == "result"))
+    {
+        data.insert("ok".to_string(), json!(false));
+        let error = format!(
+            "rpc result too large to relay ({original_bytes} bytes); the relayed copy was cut"
+        );
+        match data.get_mut("error") {
+            Some(Value::String(existing)) if !existing.is_empty() => {
+                existing.push_str("; ");
+                existing.push_str(&error);
+            }
+            _ => {
+                data.insert("error".to_string(), json!(error));
+            }
+        }
+    }
+    let mut all_dropped = already_dropped;
+    all_dropped.extend(dropped);
     let mut marker = json!({"level": level, "original_bytes": original_bytes});
-    if !dropped.is_empty() {
-        marker["dropped"] = json!(dropped);
+    if !all_dropped.is_empty() {
+        marker["dropped"] = json!(all_dropped);
     }
     data.insert(SHRINK_MARKER.to_string(), marker);
+}
+
+/// Field names an earlier shrink level already dropped, so the marker keeps the
+/// full list across levels.
+fn event_marker_dropped(data: &serde_json::Map<String, Value>) -> Option<Vec<String>> {
+    data.get(SHRINK_MARKER)?["dropped"].as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 fn shrink_strings(value: &mut Value) {
@@ -298,6 +343,27 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
     (state, events, max_id, has_more)
 }
 
+/// Events past the cursor (the retained tail is at or below it).
+fn new_event_count(events: &[Value], last_push_id: i64) -> usize {
+    events
+        .iter()
+        .filter(|event| event["id"].as_i64().is_some_and(|id| id > last_push_id))
+        .count()
+}
+
+/// Whether another drain iteration has work. Only NEW events count: a retained-tail event
+/// dropped to fit the budget was already sent, and counting it as "more" made the drain loop
+/// republish the same state for its whole time budget after every oversized event, then the
+/// periodic timer started another drain (upstream review of PR #144).
+fn more_to_send(
+    source_has_more: bool,
+    source_new_events: usize,
+    sent: &[Value],
+    last_push_id: i64,
+) -> bool {
+    source_has_more || new_event_count(sent, last_push_id) < source_new_events
+}
+
 /// Push state and events via MQTT. Returns (success, has_more).
 /// `is_worker` should be true when called from the daemon relay thread.
 /// `mqtt_connected` indicates whether the MQTT connection is known to be live.
@@ -318,7 +384,7 @@ pub fn push(
         .unwrap_or(0);
     let (state, mut events, _unbounded_max_id, source_has_more) =
         build_push_payload(db, device_uuid);
-    let source_event_count = events.len();
+    let source_new_events = new_event_count(&events, last_push_id);
 
     let topic = state_topic(relay_id, device_uuid);
     let now_secs = crate::shared::time::now_epoch_f64() as u64;
@@ -336,7 +402,7 @@ pub fn push(
         .iter()
         .filter_map(|event| event["id"].as_i64())
         .fold(last_push_id, i64::max);
-    let has_more = source_has_more || events.len() < source_event_count;
+    let has_more = more_to_send(source_has_more, source_new_events, &events, last_push_id);
 
     let t0 = Instant::now();
 
@@ -534,6 +600,95 @@ mod tests {
         assert!(data.get("result").is_none());
         assert_eq!(data["_relay_truncated"]["level"], 2);
         assert_eq!(data["_relay_truncated"]["dropped"], json!(["result"]));
+        // The requester must see a FAILURE, never ok:true with the result silently gone.
+        assert_eq!(data["ok"], false);
+        assert!(
+            data["error"]
+                .as_str()
+                .unwrap()
+                .contains("too large to relay")
+        );
+    }
+
+    #[test]
+    fn many_small_fields_reach_a_last_level_that_always_fits() {
+        // Thousands of top-level fields, each under the level-2 keep size: level 2 drops
+        // nothing, so without a third level the relay stopped publishing for good.
+        let state = json!({"instances": {}});
+        let mut data = serde_json::Map::new();
+        data.insert("request_id".into(), json!("req-9"));
+        data.insert("action".into(), json!("events"));
+        data.insert("ok".into(), json!(true));
+        for i in 0..6000 {
+            data.insert(format!("k{i:05}"), json!("v".repeat(40)));
+        }
+        let mut events = vec![json!({"id": 9, "type": "rpc_result", "data": data})];
+        let sealed = seal_bounded_payload(
+            &state,
+            &mut events,
+            8,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert!(sealed.len() <= MAX_SEALED_PAYLOAD_BYTES);
+        let data = events[0]["data"].as_object().unwrap();
+        assert_eq!(data["_relay_truncated"]["level"], 3);
+        assert_eq!(data["request_id"], "req-9");
+        assert_eq!(data["action"], "events");
+        assert_eq!(
+            data["ok"], true,
+            "no result field was ever present, so nothing was lost"
+        );
+        let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["_relay_truncated", "action", "ok", "request_id"]);
+    }
+
+    #[test]
+    fn an_rpc_result_that_loses_its_result_at_any_level_is_a_failure() {
+        let mut event = json!({"id": 3, "type": "rpc_result", "data": {
+            "request_id": "req-2", "ok": true, "result": {"big": "x".repeat(2000)}
+        }});
+        shrink_event(&mut event); // level 1: strings cut, result kept
+        assert_eq!(event["data"]["ok"], true);
+        shrink_event(&mut event); // level 2: result (> 512 B) dropped
+        assert_eq!(event["data"]["ok"], false);
+        shrink_event(&mut event); // level 3: the dropped list survives across levels
+        assert_eq!(event["data"]["ok"], false);
+        assert_eq!(
+            event["data"]["_relay_truncated"]["dropped"],
+            json!(["result"])
+        );
+        // A non-RPC event is never rewritten into a failure.
+        let mut message = json!({"id": 4, "type": "message", "data": {"text": "y".repeat(2000)}});
+        shrink_event(&mut message);
+        shrink_event(&mut message);
+        assert!(message["data"].get("ok").is_none());
+    }
+
+    #[test]
+    fn a_dropped_tail_event_is_not_more_work_but_a_dropped_new_event_is() {
+        let tail = json!({"id": 10, "data": {}});
+        let new_a = json!({"id": 11, "data": {}});
+        let new_b = json!({"id": 12, "data": {}});
+        let source = vec![tail.clone(), new_a.clone(), new_b.clone()];
+        let source_new = new_event_count(&source, 10);
+        assert_eq!(source_new, 2);
+        // The oversized tail row was dropped to fit: both new events went out.
+        assert!(!more_to_send(
+            false,
+            source_new,
+            &[new_a.clone(), new_b.clone()],
+            10
+        ));
+        // A new event was trimmed: the drain loop must run again.
+        assert!(more_to_send(false, source_new, &[tail, new_a], 10));
+        // The source itself had more rows.
+        assert!(more_to_send(true, source_new, &[new_b], 10));
     }
 
     #[test]
