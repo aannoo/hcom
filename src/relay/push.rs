@@ -51,11 +51,97 @@ fn seal_bounded_payload(
             .position(|event| event["id"].as_i64().is_some_and(|id| id <= last_push_id))
         {
             events.remove(index);
-        } else if events.pop().is_none() {
+        } else if events.len() > 1 {
+            events.pop();
+        } else if let Some(only) = events.first_mut()
+            && shrink_level(only) < 2
+        {
+            // One new event larger than the whole budget used to be popped
+            // here. The cursor then stayed below it, every later push rebuilt
+            // the same batch and dropped the same event, and only the state
+            // snapshot went out: the device stopped relaying events for good
+            // while its instances still looked healthy. Send a shrunk copy so
+            // the cursor moves past it; the local row keeps the full event.
+            shrink_event(only);
+        } else {
             return Err(format!(
                 "relay state exceeds safe MQTT payload budget of {MAX_SEALED_PAYLOAD_BYTES} bytes"
             ));
         }
+    }
+}
+
+/// Longest string kept by the first shrink level.
+const SHRINK_STRING_CHARS: usize = 4096;
+/// Top-level data fields at or under this size survive the second level.
+const SHRINK_KEEP_FIELD_BYTES: usize = 512;
+const SHRINK_MARKER: &str = "_relay_truncated";
+
+fn shrink_level(event: &Value) -> u64 {
+    event["data"][SHRINK_MARKER]["level"].as_u64().unwrap_or(0)
+}
+
+/// Make an oversized event fit, in two steps. Level 1 cuts every long string
+/// in `data`. Level 2 keeps only the small top-level fields (sender, ids,
+/// request ids) and drops the rest. Both leave a marker saying how big the
+/// original was, so a reader can tell a relayed copy was cut.
+fn shrink_event(event: &mut Value) {
+    let original_bytes = serde_json::to_string(&event["data"])
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let level = shrink_level(event) + 1;
+    let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut()) else {
+        event["data"] = json!({ SHRINK_MARKER: {"level": 2, "original_bytes": original_bytes} });
+        return;
+    };
+    let original_bytes = data
+        .get(SHRINK_MARKER)
+        .and_then(|m| m["original_bytes"].as_u64())
+        .map(|b| b as usize)
+        .unwrap_or(original_bytes);
+    data.remove(SHRINK_MARKER);
+    let mut dropped: Vec<String> = Vec::new();
+    if level == 1 {
+        for value in data.values_mut() {
+            shrink_strings(value);
+        }
+    } else {
+        let large: Vec<String> = data
+            .iter()
+            .filter(|(_, v)| {
+                serde_json::to_string(v)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX)
+                    > SHRINK_KEEP_FIELD_BYTES
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in large {
+            data.remove(&key);
+            dropped.push(key);
+        }
+    }
+    let mut marker = json!({"level": level, "original_bytes": original_bytes});
+    if !dropped.is_empty() {
+        marker["dropped"] = json!(dropped);
+    }
+    data.insert(SHRINK_MARKER.to_string(), marker);
+}
+
+fn shrink_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            let chars = s.chars().count();
+            if chars > SHRINK_STRING_CHARS {
+                let kept: String = s.chars().take(SHRINK_STRING_CHARS).collect();
+                *s = format!(
+                    "{kept}\n[truncated by hcom relay: {chars} characters, too large to relay]"
+                );
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(shrink_strings),
+        Value::Object(map) => map.values_mut().for_each(shrink_strings),
+        _ => {}
     }
 }
 
@@ -377,6 +463,76 @@ mod tests {
         );
         assert_eq!(events.first().unwrap()["id"].as_i64(), Some(51));
         assert!(events.last().unwrap()["id"].as_i64().unwrap() > last_push_id);
+    }
+
+    #[test]
+    fn a_single_oversized_new_event_is_shrunk_so_the_cursor_moves_past_it() {
+        // Before the fix this event was popped, the payload went out with no
+        // events, and every later push repeated that: the device never relayed
+        // another event.
+        let state = json!({"instances": {}});
+        let last_push_id = 70;
+        let mut events = vec![
+            json!({"id": 60, "data": {"text": "tail"}}),
+            json!({"id": 71, "type": "message", "data": {
+                "from": "luna", "text": "y".repeat(MAX_SEALED_PAYLOAD_BYTES * 2)
+            }}),
+        ];
+        let sealed = seal_bounded_payload(
+            &state,
+            &mut events,
+            last_push_id,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert!(sealed.len() <= MAX_SEALED_PAYLOAD_BYTES);
+        assert_eq!(events.len(), 1);
+        let only = &events[0];
+        assert_eq!(only["id"].as_i64(), Some(71), "the new event is still sent");
+        assert_eq!(only["data"]["from"], "luna");
+        let text = only["data"]["text"].as_str().unwrap();
+        assert!(text.contains("truncated by hcom relay"), "marker present");
+        assert!(text.len() < 10_000);
+        assert_eq!(only["data"]["_relay_truncated"]["level"], 1);
+        assert_eq!(
+            only["data"]["_relay_truncated"]["original_bytes"].as_u64(),
+            Some((MAX_SEALED_PAYLOAD_BYTES * 2 + r#"{"from":"luna","text":""}"#.len()) as u64)
+        );
+    }
+
+    #[test]
+    fn many_small_strings_fall_back_to_keeping_only_small_fields() {
+        // An events RPC answer from an older peer: no single long string, but
+        // too large overall. Level 2 keeps request_id so the waiter learns of
+        // the failure instead of timing out.
+        let state = json!({"instances": {}});
+        let rows: Vec<Value> = (0..4000)
+            .map(|i| json!({"id": i, "data": {"text": format!("message {i} ").repeat(4)}}))
+            .collect();
+        let mut events = vec![json!({"id": 5, "type": "rpc_result", "data": {
+            "request_id": "req-1", "action": "events", "ok": true,
+            "result": {"events": rows, "count": 4000}
+        }})];
+        seal_bounded_payload(
+            &state,
+            &mut events,
+            4,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let data = &events[0]["data"];
+        assert_eq!(data["request_id"], "req-1");
+        assert!(data.get("result").is_none());
+        assert_eq!(data["_relay_truncated"]["level"], 2);
+        assert_eq!(data["_relay_truncated"]["dropped"], json!(["result"]));
     }
 
     #[test]

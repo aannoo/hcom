@@ -6,6 +6,7 @@
 //!   {relay_id}/{device_uuid}  — retained state per device
 //!   {relay_id}/control        — non-retained control events (stop/kill)
 
+pub mod backfill;
 pub mod broker;
 pub mod client;
 pub mod control;

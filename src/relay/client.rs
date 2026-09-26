@@ -117,6 +117,9 @@ impl MqttRelay {
     /// events flow.
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
 
+    /// How often the worker advances catch-up backfill for skipped event ranges.
+    const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
+
     /// Create and connect the MQTT relay client.
     ///
     /// Returns (MqttRelay, Connection, command_sender). The Connection must be
@@ -235,6 +238,7 @@ impl MqttRelay {
         let mut backoff = Backoff::new();
         let mut backoff_until = Instant::now();
         let mut last_push = Instant::now();
+        let mut last_backfill = Instant::now();
         let mut pending_push_at: Option<Instant> = None;
         let mut connected = false;
         // Track last time we received ANY event (success or error) from the
@@ -314,6 +318,13 @@ impl MqttRelay {
                 self.do_push_cycle(connected);
                 last_push = Instant::now();
                 pending_push_at = None;
+            }
+
+            // Catch-up backfill runs here, never in the inbound handler: its
+            // answers arrive through that handler.
+            if connected && last_backfill.elapsed() >= Self::BACKFILL_INTERVAL {
+                self.do_backfill_cycle();
+                last_backfill = Instant::now();
             }
 
             // During backoff, skip event processing and just sleep.
@@ -668,6 +679,54 @@ impl MqttRelay {
                     break;
                 }
             }
+        }
+    }
+
+    /// Advance catch-up backfill for skipped event ranges (see relay::backfill).
+    fn do_backfill_cycle(&self) {
+        let db = match HcomDb::open() {
+            Ok(db) => db,
+            Err(e) => {
+                log::log_error("relay", "relay.db_err", &format!("{}", e));
+                return;
+            }
+        };
+        if super::backfill::devices_with_gaps(&db).is_empty() {
+            return;
+        }
+        let config = HcomConfig::load(None).unwrap_or_default();
+        let own_short_id = super::device_short_id_for_db(&db, &self.device_uuid);
+        let now = crate::shared::time::now_epoch_f64();
+        let summary =
+            super::backfill::tick(&db, &own_short_id, now, &mut |short, request_id, params| {
+                let Some((topic, payload)) = super::control::build_rpc_control_payload(
+                    &db,
+                    &config,
+                    super::control::rpc_action::EVENTS,
+                    short,
+                    request_id,
+                    params,
+                ) else {
+                    return false;
+                };
+                // try_publish never blocks the worker loop on a full request queue.
+                self.client
+                    .try_publish(topic, QoS::AtLeastOnce, false, payload)
+                    .is_ok()
+            });
+        if summary.requests_sent > 0 || summary.events_imported > 0 || summary.gaps_abandoned > 0 {
+            log::log_with_fields(
+                "INFO",
+                "relay",
+                "relay.backfill_tick",
+                "",
+                &[
+                    ("requests", &summary.requests_sent.to_string()),
+                    ("imported", &summary.events_imported.to_string()),
+                    ("closed", &summary.gaps_closed.to_string()),
+                    ("abandoned", &summary.gaps_abandoned.to_string()),
+                ],
+            );
         }
     }
 

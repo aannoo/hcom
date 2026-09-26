@@ -220,6 +220,13 @@ pub fn get_rpc_result(db: &HcomDb, request_id: &str) -> Option<Value> {
     serde_json::from_str(&data).ok()
 }
 
+/// Consume an RPC answer if it has arrived: return it and delete the row.
+pub(crate) fn take_rpc_result(db: &HcomDb, request_id: &str) -> Option<Value> {
+    let result = get_rpc_result(db, request_id)?;
+    delete_rpc_result(db, request_id);
+    Some(result)
+}
+
 fn delete_rpc_result(db: &HcomDb, request_id: &str) {
     // rpc_result rows are single-use rendezvous points. Deleting on consume prevents
     // accumulation and keeps _rpc events out of the push loop entirely.
@@ -569,6 +576,23 @@ fn check_remote_action_for_db(
         CachedCapabilities::NotSynced => Err(format!(
             "device {target_device_short_id}{detail} has not yet synced remote capabilities — try again in a few seconds"
         )),
+    }
+}
+
+/// Whether a peer can take `action` right now, without waiting: `Some(true)`
+/// yes, `Some(false)` never (it advertises capabilities without the action),
+/// `None` not yet (offline, or its capabilities have not synced).
+pub(crate) fn peer_accepts_action(
+    db: &HcomDb,
+    target_device_short_id: &str,
+    action: &str,
+) -> Option<bool> {
+    match read_remote_capabilities(db, target_device_short_id) {
+        Ok(CachedCapabilities::Advertised(capabilities)) => {
+            Some(capabilities.iter().any(|cap| cap == action))
+        }
+        Ok(CachedCapabilities::Legacy) => Some(true),
+        Ok(CachedCapabilities::Stale(_)) | Ok(CachedCapabilities::NotSynced) | Err(_) => None,
     }
 }
 
@@ -1030,6 +1054,10 @@ fn handle_remote_events(
         _ => crate::core::filters::FilterMap::new(),
     };
     let sql = optional_param(params, "sql").map(|s| s.to_string());
+    // Callers whose answer must share a snapshot with other data (catch-up
+    // backfill) ask for a smaller byte budget; the hard cap still applies.
+    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
+        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
     let mut last_n = usize_param(params, "last", 20);
     if last_n == 0 {
         last_n = 20;
@@ -1099,7 +1127,7 @@ fn handle_remote_events(
     };
     let mut out = build_envelope(&events, truncated);
     let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
-    while serialized_len > REMOTE_EVENTS_BYTE_CAP && !events.is_empty() {
+    while serialized_len > byte_cap && !events.is_empty() {
         events.pop();
         truncated = true;
         out = build_envelope(&events, truncated);
@@ -1965,6 +1993,44 @@ mod tests {
             envelope_len <= REMOTE_EVENTS_BYTE_CAP,
             "envelope {envelope_len} bytes exceeds cap"
         );
+    }
+
+    #[test]
+    fn test_handle_remote_events_honours_a_smaller_byte_budget() {
+        let db = test_db();
+        let big = "x".repeat(8_000);
+        for _ in 0..20 {
+            db.log_event("message", "luna", &json!({"blob": big}))
+                .unwrap();
+        }
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 20, "max_bytes": 32 * 1024}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        let envelope_len = serde_json::to_string(&out).unwrap().len();
+        assert!(envelope_len <= 32 * 1024, "envelope {envelope_len} bytes");
+        // Newest first, oldest dropped: the survivors are the newest rows.
+        let ids: Vec<i64> = out["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect();
+        assert!(ids.windows(2).all(|w| w[0] > w[1]), "{ids:?}");
+
+        // A budget above the hard cap is clamped to it.
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 20, "max_bytes": 10_000_000}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
     }
 
     #[test]
