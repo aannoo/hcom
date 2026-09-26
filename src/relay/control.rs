@@ -1129,7 +1129,16 @@ fn handle_remote_events(
     let mut out = build_envelope(&events, truncated);
     let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     while serialized_len > byte_cap && !events.is_empty() {
-        events.pop();
+        if events.len() == 1
+            && super::push::shrink_level(&events[0]) < super::push::SHRINK_LAST_LEVEL
+        {
+            // The newest event alone is larger than the budget. An empty answer made a
+            // catch-up backfill give up on an event of ~100 KiB that the normal publish
+            // (112 KiB) had carried, so send a cut copy with the same marker a push uses.
+            super::push::shrink_event(&mut events[0]);
+        } else {
+            events.pop();
+        }
         truncated = true;
         out = build_envelope(&events, truncated);
         serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
@@ -2032,6 +2041,31 @@ mod tests {
         )
         .unwrap();
         assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+    }
+
+    #[test]
+    fn test_handle_remote_events_sends_a_cut_copy_of_one_event_larger_than_the_budget() {
+        // ~100 KiB: inside the 112 KiB publish budget, over every backfill answer budget.
+        let db = test_db();
+        db.log_event(
+            "message",
+            "luna",
+            &json!({"from": "luna", "text": "x".repeat(100_000)}),
+        )
+        .unwrap();
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 1, "max_bytes": 96 * 1024 - 2_000}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "a cut copy, not an empty answer");
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        assert_eq!(events[0]["data"]["from"], "luna");
+        assert_eq!(events[0]["data"]["_relay_truncated"]["level"], 1);
+        assert!(serde_json::to_string(&out).unwrap().len() <= 96 * 1024 - 2_000);
     }
 
     #[test]
