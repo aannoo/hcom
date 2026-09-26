@@ -224,11 +224,29 @@ fn setup_notify_listener(cmd_tx: &std::sync::mpsc::Sender<RelayCommand>) -> Opti
 fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: Arc<AtomicBool>) {
     let mut consecutive_empty = 0u32;
     let mut db = HcomDb::open().ok();
+    // An install replaces the executable file under a running worker. Exit when
+    // that happens and the next hcom call (every hook calls ensure_worker)
+    // starts a worker from the new build, so an upgrade needs no manual restart
+    // and none of the elevation that killing a worker can need.
+    let exe_path = std::env::current_exe().ok();
+    let started_with = exe_path.as_deref().and_then(exe_fingerprint);
 
     loop {
         std::thread::sleep(Duration::from_secs(30));
 
         if shutdown.load(Ordering::Relaxed) {
+            let _ = cmd_tx.send(RelayCommand::Shutdown);
+            return;
+        }
+
+        if let (Some(path), Some(start)) = (exe_path.as_deref(), started_with)
+            && binary_replaced(path, start)
+        {
+            log::log_info(
+                "relay",
+                "relay_worker.binary_changed",
+                "executable replaced; exiting so a worker from the new build takes over",
+            );
             let _ = cmd_tx.send(RelayCommand::Shutdown);
             return;
         }
@@ -268,6 +286,20 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             consecutive_empty = 0;
         }
     }
+}
+
+type ExeFingerprint = (u64, std::time::SystemTime);
+
+/// Size and modification time of an executable file.
+fn exe_fingerprint(path: &std::path::Path) -> Option<ExeFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// True when the file at `path` is no longer the one the worker started from.
+/// A missing file (mid-swap) is not a replacement yet.
+fn binary_replaced(path: &std::path::Path, started_with: ExeFingerprint) -> bool {
+    exe_fingerprint(path).is_some_and(|now| now != started_with)
 }
 
 /// Check if relay is enabled in the current config (non-empty relay_id + relay_enabled flag).
@@ -541,6 +573,26 @@ pub fn stop_relay_worker_blocking() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_executable_is_detected_and_a_missing_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hcom.exe");
+        std::fs::write(&exe, b"old build").unwrap();
+        let start = exe_fingerprint(&exe).unwrap();
+        assert!(!binary_replaced(&exe, start), "unchanged file");
+
+        // Mid-swap: the running file was renamed away and the new one is not
+        // there yet.
+        std::fs::rename(&exe, dir.path().join("hcom.exe.pre-old")).unwrap();
+        assert!(
+            !binary_replaced(&exe, start),
+            "missing file is not a replacement"
+        );
+
+        std::fs::write(&exe, b"the new, longer build").unwrap();
+        assert!(binary_replaced(&exe, start), "new file in place");
+    }
 
     #[test]
     fn test_pid_file_path() {
