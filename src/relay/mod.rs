@@ -144,6 +144,70 @@ pub fn get_broker_from_config(config: &HcomConfig) -> Option<(String, u16, bool)
     parse_broker_url(&config.relay)
 }
 
+/// KV key naming the broker the relay worker last connected to: "primary" or "backup".
+pub const ACTIVE_BROKER_KEY: &str = "relay_active_broker";
+
+/// The backup broker from `relay_backup`, when the relay is enabled and one is configured.
+pub fn get_backup_broker_from_config(config: &HcomConfig) -> Option<(String, u16, bool)> {
+    if !is_relay_enabled(config) {
+        return None;
+    }
+    parse_broker_url(config.relay_backup.trim())
+}
+
+/// A broker to connect to, and whether it is the backup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerChoice {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub backup: bool,
+}
+
+/// Pick the broker for a new relay connection: the primary whenever it answers,
+/// else the backup when one is configured and answers, else the primary (the
+/// worker keeps retrying it). `answers` is an MQTT-level probe (CONNACK, so a
+/// broker that takes TCP but refuses the login does not count), injected so the
+/// policy can be tested without brokers.
+pub fn choose_broker(
+    config: &HcomConfig,
+    answers: &dyn Fn(&str, u16, bool) -> bool,
+) -> Option<BrokerChoice> {
+    let (host, port, tls) = get_broker_from_config(config)?;
+    let primary = BrokerChoice {
+        host,
+        port,
+        tls,
+        backup: false,
+    };
+    let Some((b_host, b_port, b_tls)) = get_backup_broker_from_config(config) else {
+        return Some(primary);
+    };
+    if answers(&primary.host, primary.port, primary.tls) {
+        return Some(primary);
+    }
+    if answers(&b_host, b_port, b_tls) {
+        return Some(BrokerChoice {
+            host: b_host,
+            port: b_port,
+            tls: b_tls,
+            backup: true,
+        });
+    }
+    Some(primary)
+}
+
+/// The broker the relay worker is on, for one-shot clients that must reach the
+/// same peers: the backup while the worker has failed over to it, else the primary.
+pub fn active_broker(config: &HcomConfig, db: &HcomDb) -> Option<(String, u16, bool)> {
+    if safe_kv_get(db, ACTIVE_BROKER_KEY).as_deref() == Some("backup")
+        && let Some(backup) = get_backup_broker_from_config(config)
+    {
+        return Some(backup);
+    }
+    get_broker_from_config(config)
+}
+
 /// Get or create persistent device UUID
 /// Reads from ~/.hcom/.tmp/device_id; creates with a new UUID if missing or empty.
 ///
@@ -1265,5 +1329,65 @@ mod tests {
             Some("1700000001.0")
         );
         assert!(safe_kv_get(&db, "relay_status").is_none());
+    }
+    fn relay_config(primary: &str, backup: &str) -> HcomConfig {
+        HcomConfig {
+            relay: primary.to_string(),
+            relay_backup: backup.to_string(),
+            relay_id: "relay-test".to_string(),
+            relay_enabled: true,
+            ..HcomConfig::default()
+        }
+    }
+
+    #[test]
+    fn without_a_backup_the_primary_is_chosen_and_nothing_is_probed() {
+        let config = relay_config("mqtt://primary.example:1883", "");
+        let choice =
+            choose_broker(&config, &|_, _, _| panic!("no probe without a backup")).unwrap();
+        assert_eq!(choice.host, "primary.example");
+        assert!(!choice.backup);
+    }
+
+    #[test]
+    fn the_primary_wins_whenever_it_answers() {
+        let config = relay_config("mqtt://primary.example:1883", "mqtts://backup.example:8883");
+        let choice = choose_broker(&config, &|_, _, _| true).unwrap();
+        assert_eq!(
+            (choice.host.as_str(), choice.backup),
+            ("primary.example", false)
+        );
+    }
+
+    #[test]
+    fn a_silent_primary_fails_over_to_an_answering_backup() {
+        let config = relay_config("mqtt://primary.example:1883", "mqtts://backup.example:8883");
+        let choice = choose_broker(&config, &|host, _, _| host == "backup.example").unwrap();
+        assert_eq!(choice.host, "backup.example");
+        assert_eq!(choice.port, 8883);
+        assert!(choice.tls);
+        assert!(choice.backup);
+    }
+
+    #[test]
+    fn when_neither_answers_the_worker_keeps_retrying_the_primary() {
+        let config = relay_config("mqtt://primary.example:1883", "mqtts://backup.example:8883");
+        let choice = choose_broker(&config, &|_, _, _| false).unwrap();
+        assert!(!choice.backup);
+    }
+
+    #[test]
+    fn one_shot_clients_follow_the_worker_to_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let config = relay_config("mqtt://primary.example:1883", "mqtts://backup.example:8883");
+
+        assert_eq!(active_broker(&config, &db).unwrap().0, "primary.example");
+        safe_kv_set(&db, ACTIVE_BROKER_KEY, Some("backup"));
+        assert_eq!(active_broker(&config, &db).unwrap().0, "backup.example");
+
+        // A backup removed from config while the flag is still set falls back safely.
+        let no_backup = relay_config("mqtt://primary.example:1883", "");
+        assert_eq!(active_broker(&no_backup, &db).unwrap().0, "primary.example");
     }
 }

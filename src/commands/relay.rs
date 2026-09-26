@@ -210,6 +210,30 @@ fn relay_status(db: &HcomDb) -> i32 {
     } else {
         println!("Broker:    auto (public fallback)");
     }
+    if !config.relay_backup.trim().is_empty() {
+        let on_backup = db
+            .kv_get(relay::ACTIVE_BROKER_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("backup");
+        let reach = match relay::parse_broker_url(config.relay_backup.trim()) {
+            Some((host, port, use_tls)) => match ping_broker(&host, port, use_tls) {
+                Some(ms) => format!("{ms}ms"),
+                None => "unreachable".to_string(),
+            },
+            None => "invalid URL".to_string(),
+        };
+        println!(
+            "Backup:    {} ({reach}){}",
+            config.relay_backup.trim(),
+            if on_backup {
+                " - ACTIVE: the primary did not answer"
+            } else {
+                ""
+            }
+        );
+    }
 
     println!("Device:    {}", get_device_short_id(db));
 
@@ -752,6 +776,7 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
 fn relay_toml_key(field: &str) -> (&str, &str) {
     match field {
         "relay" => ("relay", "url"),
+        "relay_backup" => ("relay", "backup"),
         "relay_id" => ("relay", "id"),
         "relay_token" => ("relay", "token"),
         "relay_psk" => ("relay", "psk"),

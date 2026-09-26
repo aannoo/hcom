@@ -256,6 +256,18 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             db = HcomDb::open().ok();
         }
 
+        // On the backup broker and the primary answers again: go back, so the
+        // peers do not stay split across two brokers longer than needed.
+        if db.as_ref().is_some_and(primary_is_back) {
+            log::log_info(
+                "relay",
+                "relay_worker.failback",
+                "primary broker answers again; exiting so the next worker connects to it",
+            );
+            let _ = cmd_tx.send(RelayCommand::Shutdown);
+            return;
+        }
+
         let count = match &db {
             Some(d) => local_instance_count(d),
             None => {
@@ -286,6 +298,21 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             consecutive_empty = 0;
         }
     }
+}
+
+/// True when this worker failed over to the backup broker and the primary
+/// accepts a login again.
+fn primary_is_back(db: &HcomDb) -> bool {
+    if super::safe_kv_get(db, super::ACTIVE_BROKER_KEY).as_deref() != Some("backup") {
+        return false;
+    }
+    let Ok(config) = HcomConfig::load(None) else {
+        return false;
+    };
+    let Some((host, port, tls)) = super::get_broker_from_config(&config) else {
+        return false;
+    };
+    super::client::broker_answers(&config.relay_token, &host, port, tls)
 }
 
 type ExeFingerprint = (u64, std::time::SystemTime);

@@ -931,6 +931,7 @@ fn reject_remote_secret_field(field: &str) -> Result<(), String> {
         "HCOM_RELAY_TOKEN" => "relay_token",
         "HCOM_RELAY_ID" => "relay_id",
         "HCOM_RELAY" => "relay",
+        "HCOM_RELAY_BACKUP" => "relay_backup",
         _ => return Ok(()),
     };
     Err(format!("{secret} is not remotely queryable"))
