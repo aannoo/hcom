@@ -66,7 +66,23 @@ pub(crate) fn load_or_create_keypair_at(path: &Path) -> Option<Ed25519KeyPair> {
         std::fs::create_dir_all(parent).ok()?;
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, pkcs8.as_ref()).ok()?;
+    // Private from the first byte: the final path is a hard link to this inode, so its mode
+    // must not depend on the umask or on the directory staying private (upstream review).
+    #[cfg(unix)]
+    let written = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(pkcs8.as_ref()))
+    };
+    #[cfg(not(unix))]
+    let written = std::fs::write(&tmp, pkcs8.as_ref());
+    written.ok()?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     if linked.is_err() && !path.exists() {
@@ -247,6 +263,17 @@ mod tests {
         let first = load_or_create_keypair_at(&path).unwrap();
         let again = load_or_create_keypair_at(&path).unwrap();
         assert_eq!(first.public_key().as_ref(), again.public_key().as_ref());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_key_file_is_private_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_sign.pk8");
+        load_or_create_keypair_at(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key file mode {mode:o}");
     }
 
     #[test]
