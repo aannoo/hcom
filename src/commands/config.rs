@@ -227,6 +227,11 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "timeout" => Some("preferences.timeout"),
         "auto_approve" => Some("preferences.auto_approve"),
         "name_export" => Some("preferences.name_export"),
+        // Any other mapped field lands where the loader reads it. Without this a
+        // field added to TOML_KEY_MAP but not here (relay_backup did) was written
+        // as a flat top-level key the loader never reads. relay_psk keeps its
+        // existing behaviour: it is set through `hcom relay`, not `hcom config`.
+        other if other != "relay_psk" => crate::config::toml_path_for_field(other),
         _ => None,
     }
 }
@@ -2247,6 +2252,38 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mapped_field_is_set_where_the_loader_reads_it() {
+        for (field, path) in crate::config::TOML_KEY_MAP {
+            if *field == "relay_psk" {
+                continue;
+            }
+            assert_eq!(
+                toml_path_for_key(field),
+                Some(*path),
+                "`hcom config {field}` must write {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_backup_is_written_under_the_relay_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[relay]\nurl = \"mqtt://primary.example:1883\"\n").unwrap();
+        config_set_at_path(&path, "HCOM_RELAY_BACKUP", "mqtt://backup.example:1883").unwrap();
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["relay"]["backup"].as_str(),
+            Some("mqtt://backup.example:1883")
+        );
+        assert_eq!(
+            doc["relay"]["url"].as_str(),
+            Some("mqtt://primary.example:1883")
+        );
+        assert!(doc.get("relay_backup").is_none(), "no flat top-level key");
+    }
 
     #[test]
     fn test_normalize_key() {

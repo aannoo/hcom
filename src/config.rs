@@ -120,7 +120,7 @@ fn test_default_hcom_dir() -> PathBuf {
 }
 
 /// Bidirectional mapping: HcomConfig field name <-> TOML dotted path.
-const TOML_KEY_MAP: &[(&str, &str)] = &[
+pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("terminal", "terminal.active"),
     ("tag", "launch.tag"),
     ("hints", "launch.hints"),
@@ -152,6 +152,14 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("auto_trust_workspace", "launch.auto_trust_workspace"),
     ("title_mode", "terminal.title_mode"),
 ];
+
+/// TOML dotted path for a config field, from TOML_KEY_MAP.
+pub(crate) fn toml_path_for_field(field_name: &str) -> Option<&'static str> {
+    TOML_KEY_MAP
+        .iter()
+        .find(|(field, _)| *field == field_name)
+        .map(|(_, path)| *path)
+}
 
 /// Mapping: HcomConfig field name -> HCOM_* env var key.
 const FIELD_TO_ENV: &[(&str, &str)] = &[
