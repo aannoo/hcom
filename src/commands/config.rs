@@ -165,6 +165,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_RELAY_BACKUP",
+        "Backup relay MQTT broker URL, used when the primary does not answer (config file only)",
+        "string",
+    ),
+    (
         "HCOM_RELAY_ID",
         "Relay group identifier (config file only)",
         "string",
@@ -1476,6 +1481,20 @@ Set automatically by 'hcom relay new' (pins first working broker).
 Stored in [relay] in config.toml. Environment overrides are ignored for relay fields.
 
 Private broker: hcom relay new --broker mqtts://host:port",
+        ),
+
+        "HCOM_RELAY_BACKUP" => Some(
+            "\
+HCOM_RELAY_BACKUP - Backup MQTT broker URL
+
+Empty = no backup. When the primary broker (HCOM_RELAY) does not accept a login,
+the relay worker connects here instead, and moves back once the primary answers.
+Every device in the relay group should name the same backup, or peers can split
+across the two brokers. Stored in [relay] in config.toml. Environment overrides
+are ignored for relay fields. A running worker picks up a change on its next probe.
+
+Usage:
+  hcom config relay_backup mqtt://host:1883",
         ),
 
         "HCOM_RELAY_ID" => Some(
