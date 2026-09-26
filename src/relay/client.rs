@@ -107,6 +107,8 @@ pub struct MqttRelay {
     push_interval: Duration,
     /// The configured broker this worker is NOT on, if any (primary or backup).
     alternate_broker: Option<(String, u16, bool)>,
+    /// Connected to the backup broker, so the alternate is the primary.
+    on_backup: bool,
     /// Broker login, for probing the alternate broker.
     relay_token: String,
 }
@@ -128,6 +130,26 @@ impl MqttRelay {
 
     /// How often the worker advances catch-up backfill for skipped event ranges.
     const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
+
+    /// The broker this worker did NOT connect to, read from the config NOW, so a backup set
+    /// with `hcom config relay_backup` after the worker started is still probed (upstream
+    /// review of PR #144). Falls back to the one captured at connect if the config cannot load.
+    fn current_alternate(&self) -> Option<(String, u16, bool, String)> {
+        match HcomConfig::load(None) {
+            Ok(config) => {
+                let alternate = if self.on_backup {
+                    super::get_broker_from_config(&config)
+                } else {
+                    super::get_backup_broker_from_config(&config)
+                };
+                alternate.map(|(host, port, tls)| (host, port, tls, config.relay_token.clone()))
+            }
+            Err(_) => self
+                .alternate_broker
+                .clone()
+                .map(|(host, port, tls)| (host, port, tls, self.relay_token.clone())),
+        }
+    }
 
     /// Create and connect the MQTT relay client.
     ///
@@ -221,6 +243,7 @@ impl MqttRelay {
             cmd_rx,
             push_interval: Duration::from_secs(5),
             alternate_broker: alternate,
+            on_backup: choice.backup,
             relay_token: config.relay_token.clone(),
         };
 
@@ -367,13 +390,17 @@ impl MqttRelay {
             } else if disconnected_since.is_none() {
                 disconnected_since = Some(Instant::now());
             }
-            if let (Some(since), Some((host, port, tls))) =
-                (disconnected_since, self.alternate_broker.as_ref())
+            if let Some(since) = disconnected_since
                 && since.elapsed() >= Self::SWITCH_BROKER_AFTER
                 && last_switch_probe.is_none_or(|t| t.elapsed() >= Self::SWITCH_BROKER_AFTER)
+                && let Some((host, port, tls, token)) = self.current_alternate()
             {
                 last_switch_probe = Some(Instant::now());
-                if broker_answers(&self.relay_token, host, *port, *tls) {
+                let answers = broker_answers(&token, &host, port, tls);
+                // The probe can wait seconds for a CONNACK; write a heartbeat at once
+                // after it so a slow probe is never read as a stale worker.
+                last_heartbeat = None;
+                if answers {
                     log::log_warn(
                         "relay",
                         "relay.switch_broker",
@@ -382,6 +409,7 @@ impl MqttRelay {
                             since.elapsed().as_secs()
                         ),
                     );
+                    super::worker::request_handoff();
                     self.shutdown_graceful(&event_rx);
                     return;
                 }
@@ -1154,6 +1182,7 @@ mod tests {
             cmd_rx,
             push_interval: Duration::from_secs(5),
             alternate_broker: None,
+            on_backup: false,
             relay_token: String::new(),
         };
         let publish = rumqttc::v5::mqttbytes::v5::Publish::new(

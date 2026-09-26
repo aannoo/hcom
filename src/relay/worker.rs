@@ -18,6 +18,17 @@ use crate::db::HcomDb;
 use crate::log;
 use crate::relay::client::RelayCommand;
 
+/// Set by a deliberate self-exit (new build installed, failback, broker switch): the exiting
+/// worker spawns its successor after its pidfile is gone. Leaving the restart to the next hook
+/// left an idle device (no active local instance, so `ensure_worker(true)` never spawns) without
+/// a relay worker at all (upstream review of PR #144).
+static HANDOFF_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Ask the worker to start a successor when it exits.
+pub(crate) fn request_handoff() {
+    HANDOFF_ON_EXIT.store(true, Ordering::SeqCst);
+}
+
 // ── PID file helpers ────────────────────────────────────────────────
 
 fn pid_file_path() -> PathBuf {
@@ -117,7 +128,7 @@ pub fn run() -> i32 {
 
     // Write PID file (guard removes on exit)
     write_pid_file();
-    let _pid_guard = PidFileGuard;
+    let pid_guard = PidFileGuard;
 
     log::log_info(
         "relay",
@@ -175,6 +186,17 @@ pub fn run() -> i32 {
     }
 
     log::log_info("relay", "relay_worker.stop", "exited cleanly");
+    if HANDOFF_ON_EXIT.load(Ordering::SeqCst) {
+        // The successor refuses to start while this worker's pidfile names a live PID,
+        // so release it first.
+        drop(pid_guard);
+        let spawned = do_spawn();
+        log::log_info(
+            "relay",
+            "relay_worker.handoff",
+            &format!("successor spawned={spawned}"),
+        );
+    }
     0
 }
 
@@ -247,6 +269,7 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
                 "relay_worker.binary_changed",
                 "executable replaced; exiting so a worker from the new build takes over",
             );
+            request_handoff();
             let _ = cmd_tx.send(RelayCommand::Shutdown);
             return;
         }
@@ -264,6 +287,7 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
                 "relay_worker.failback",
                 "primary broker answers again; exiting so the next worker connects to it",
             );
+            request_handoff();
             let _ = cmd_tx.send(RelayCommand::Shutdown);
             return;
         }
