@@ -345,8 +345,9 @@ pub fn push(
     // the message may sit in the internal buffer and be delivered on reconnect,
     // but we cannot guarantee it — so we only advance the cursor when
     // mqtt_connected is true.
+    let props = super::signing::publish_properties(&sealed).unwrap_or_default();
     client
-        .publish(&topic, QoS::AtLeastOnce, true, sealed)
+        .publish_with_properties(&topic, QoS::AtLeastOnce, true, sealed, props)
         .map_err(|e| format!("publish: {}", e))?;
 
     let publish_ms = t0.elapsed().as_millis();

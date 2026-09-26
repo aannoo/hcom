@@ -21,6 +21,8 @@ pub struct InboundContext<'a> {
     pub relay_id: &'a str,
     pub topic: &'a str,
     pub replay_guard: &'a mut ReplayGuard,
+    /// MQTT v5 user properties of the publish (carries the sender's signature).
+    pub user_properties: &'a [(String, String)],
 }
 
 struct OpenedEnvelope {
@@ -166,6 +168,10 @@ pub fn handle_control_message(
     if source_device == own_device {
         return false;
     }
+    // Checked only now: the AEAD open above proved a relay member sealed it.
+    if source_device != "unknown" {
+        super::signing::observe(db, source_device, payload, ctx.user_properties);
+    }
 
     let own_short_id = device_short_id_for_db(db, own_device);
     let events = if let Some(arr) = data.get("events").and_then(|v| v.as_array()) {
@@ -208,6 +214,10 @@ pub fn handle_state_message(
             return false;
         }
     };
+
+    // Checked only after the AEAD open, so a stranger without the PSK can
+    // never get a key pinned for this device.
+    super::signing::observe(db, device_id, payload, ctx.user_properties);
 
     if data.get("state").is_some() && data["state"].is_null() {
         handle_device_gone(db, device_id);
@@ -891,6 +901,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         );
 
@@ -935,6 +946,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         ));
 
@@ -978,6 +990,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         ));
 
@@ -1046,6 +1059,7 @@ mod tests {
                     relay_id: "relay-test",
                     topic: &topic,
                     replay_guard: &mut guard,
+                    user_properties: &[],
                 },
             ));
             assert!(
@@ -1105,6 +1119,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         ));
 
@@ -1146,6 +1161,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         ));
         assert_eq!(
@@ -1164,6 +1180,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         ));
         assert_eq!(guard.len(), 1);
@@ -1203,6 +1220,7 @@ mod tests {
                 relay_id: "relay-test",
                 topic,
                 replay_guard: &mut guard,
+                user_properties: &[],
             },
         ));
 
@@ -1298,5 +1316,72 @@ mod tests {
         let events = vec![own_event(3, "fresh")];
         import_remote_events(&db, "device-1234", "ABCD", &events, 0.0, "MINE");
         assert!(crate::relay::backfill::load_gaps(&db, "device-1234").is_empty());
+    }
+    fn state_payload() -> serde_json::Value {
+        json!({"state": {"short_id": "ABCD", "reset_ts": 0.0, "instances": {}}, "events": []})
+    }
+
+    #[test]
+    #[serial]
+    fn a_signed_snapshot_pins_its_key_after_the_aead_open() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let topic = "relay-test/device-1234";
+        let envelope = seal_for_test(&state_payload(), topic, "relay-test");
+        let props = crate::relay::signing::publish_properties(&envelope)
+            .expect("test device key")
+            .user_properties;
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+                user_properties: &props,
+            },
+        );
+        assert!(safe_kv_get(&db, "relay_sigkey_device-1234").is_some());
+        assert_eq!(
+            safe_kv_get(&db, "relay_sigstatus_device-1234").as_deref(),
+            Some("valid")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_snapshot_sealed_without_the_psk_pins_nothing() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let topic = "relay-test/device-1234";
+        let bytes = serde_json::to_vec(&state_payload()).unwrap();
+        let now = crate::shared::time::now_epoch_f64() as u64;
+        let forged =
+            crate::relay::crypto::seal(&[0x77; 32], "relay-test", topic, &bytes, now).unwrap();
+        let props = crate::relay::signing::publish_properties(&forged)
+            .expect("test device key")
+            .user_properties;
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "device-1234",
+            &forged,
+            "own-device-5678",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+                user_properties: &props,
+            },
+        );
+        assert!(safe_kv_get(&db, "relay_sigkey_device-1234").is_none());
+        assert!(safe_kv_get(&db, "relay_sigstatus_device-1234").is_none());
     }
 }

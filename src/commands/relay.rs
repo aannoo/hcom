@@ -236,6 +236,12 @@ fn relay_status(db: &HcomDb) -> i32 {
     }
 
     println!("Device:    {}", get_device_short_id(db));
+    if let Some(fp) = relay::signing::own_key_fingerprint() {
+        println!("Signing:   this device signs with key {fp} (peers checked, not yet enforced)");
+    }
+    for line in relay::signing::status_lines(db) {
+        println!("           {line}");
+    }
 
     // Queued events
     let last_push_id: i64 = db
