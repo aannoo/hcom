@@ -188,6 +188,16 @@ pub(crate) fn apply_answer(
     gap: &mut Gap,
     response: &Value,
 ) -> Result<AnswerOutcome, String> {
+    // An answer the publishing peer had to shrink to fit its sealed payload (answer + its
+    // state) has had strings inside `result.events` cut while `ok` stayed true. Importing it
+    // would store partial events as if whole, and the gap would close. Refuse it: the gap is
+    // retried and, if it never fits, abandoned honestly (upstream review of #144, round 3).
+    if response.get("_relay_truncated").is_some() {
+        return Err(
+            "the answer was cut to fit the peer's publish; not importing partial events"
+                .to_string(),
+        );
+    }
     let result = response.get("result").cloned().unwrap_or(Value::Null);
     if !response
         .get("ok")
@@ -607,6 +617,32 @@ mod tests {
             Ok(AnswerOutcome::Done { imported: 0 })
         );
         assert_eq!(imported_texts(&db), vec!["only"]);
+    }
+
+    #[test]
+    #[serial]
+    fn an_answer_cut_in_transit_is_refused_not_imported() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut gap = Gap {
+            after: 10,
+            before: 20,
+            short_id: "ABCD".into(),
+            detected_at: 0.0,
+            request_id: None,
+            sent_at: 0.0,
+            attempts: 1,
+            recovered: 0,
+            wide: true,
+        };
+        // What push's shrink leaves when answer + state overflow the sealed payload:
+        // ok stays true, strings inside result.events are cut, and the marker is added.
+        let mut response = answer("r2", vec![message(15, "cut short")], false);
+        response["_relay_truncated"] = json!({"level": 1, "original_bytes": 120_000});
+        let outcome = apply_answer(&db, PEER, "MINE", &mut gap, &response);
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(imported_texts(&db).is_empty(), "no partial event stored");
+        assert_eq!(gap.recovered, 0);
     }
 
     #[test]
