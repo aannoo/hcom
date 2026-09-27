@@ -795,7 +795,13 @@ fn emit_device_event(
     if reconnect {
         data["reconnect"] = serde_json::json!(true);
     }
-    let _ = db.log_event("life", "", &data);
+    // A lifecycle event is new local work that `hcom events --wait` may be waiting for.
+    // The snapshot handler wakes only when the event cursor moved or a push is due, and a
+    // join, reconnect or leave moves neither, so wake here. These are rare, so this cannot
+    // turn heartbeat snapshots into a wake storm (upstream review of #144, round 3).
+    if db.log_event("life", "", &data).is_ok() {
+        crate::notify::wake_all(db);
+    }
 }
 
 /// Strip own device suffix from a name (case-insensitive).
@@ -839,6 +845,32 @@ mod tests {
         let bytes = serde_json::to_vec(payload).unwrap();
         let now = crate::shared::time::now_epoch_f64() as u64;
         crate::relay::crypto::seal(&psk, relay_id, topic, &bytes, now).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn a_device_lifecycle_event_wakes_event_waiters() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.set_nonblocking(true).unwrap();
+        db.upsert_notify_endpoint("waiter", "pty", probe.local_addr().unwrap().port())
+            .unwrap();
+
+        // A device leaving logs a lifecycle event and returns before the snapshot
+        // handler's own wake; the waiter must still be woken.
+        handle_device_gone(&db, "0123456789abcdef-device");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut woken = false;
+        while std::time::Instant::now() < deadline {
+            if probe.accept().is_ok() {
+                woken = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(woken, "a device lifecycle event must wake event waiters");
     }
 
     #[test]
