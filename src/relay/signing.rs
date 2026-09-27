@@ -65,7 +65,14 @@ pub(crate) fn load_or_create_keypair_at(path: &Path) -> Option<Ed25519KeyPair> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // A random suffix as well as the PID: PIDs are reused (quickly on Windows), and with
+    // exclusive creation a leftover temp file from a crashed process that had the same PID
+    // would otherwise leave this worker publishing unsigned for its whole life (upstream
+    // review of #144, round 3). The name is not predictable, so exclusivity still holds.
+    let mut nonce = [0u8; 8];
+    ring::rand::SecureRandom::fill(&rng, &mut nonce).ok()?;
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), nonce));
     // Private from the first byte: the final path is a hard link to this inode, so its mode
     // must not depend on the umask or on the directory staying private. And EXCLUSIVE: an
     // existing file at the temp path (on Windows a shared HCOM_DIR is not restricted) is never
@@ -276,17 +283,30 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_temp_file_is_refused_not_overwritten() {
+    fn a_leftover_temp_file_neither_blocks_signing_nor_is_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("device_sign.pk8");
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, b"planted").unwrap();
-        assert!(load_or_create_keypair_at(&path).is_none());
-        assert_eq!(std::fs::read(&tmp).unwrap(), b"planted", "left untouched");
+        // A leftover from a crashed process that had this PID (the old, PID-only name).
+        let leftover = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&leftover, b"planted").unwrap();
         assert!(
-            !path.exists(),
-            "no key written through a file it did not create"
+            load_or_create_keypair_at(&path).is_some(),
+            "a leftover temp file must not leave this process unsigned"
         );
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::read(&leftover).unwrap(),
+            b"planted",
+            "left untouched"
+        );
+        // No temp file of this call is left behind (only the planted leftover remains).
+        let temps: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("device_sign.tmp-"))
+            .collect();
+        assert_eq!(temps.len(), 1, "{temps:?}");
     }
 
     #[cfg(unix)]
