@@ -407,3 +407,66 @@ fn external_sender_delivers_to_process_bound_instance() {
         assert_eq!(cursor(&db, &receiver), id, "{tool}");
     }
 }
+
+/// A message arriving after the batch is taken gets a notice in the same output.
+#[cfg(unix)]
+#[test]
+fn message_arriving_mid_send_is_noticed() {
+    use std::io::Read;
+    use std::os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::net::UnixStream,
+    };
+    use std::process::Stdio;
+    use std::time::Duration;
+    let (h, db, sender, receiver) = setup("adhoc");
+    for i in 0..50 {
+        queue(
+            &db,
+            &sender,
+            &receiver,
+            &format!("sentinel-{i:03}-{}", "x".repeat(8192)),
+        );
+    }
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    let size: libc::c_int = 4096;
+    // Smaller than the batch, so the first byte arrives while send is still blocked.
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut child = h
+        .cmd()
+        .args([
+            "send",
+            "--name",
+            &receiver,
+            &format!("@{sender}"),
+            "--",
+            "reply",
+        ])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .spawn()
+        .unwrap();
+    let mut first = [0];
+    reader.read_exact(&mut first).unwrap();
+    let late = queue(&db, &sender, &receiver, "late-sentinel");
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(!rest.contains("late-sentinel"));
+    assert!(!rest.contains("more unread"));
+    assert!(rest.contains("new message(s) arrived"), "{rest}");
+    assert!(cursor(&db, &receiver) < late);
+}

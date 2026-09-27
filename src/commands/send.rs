@@ -1096,6 +1096,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             .map(|(actor, tool)| (actor, Some(tool)))
     };
     let batch = receiver.and_then(|(r, _)| InlineBatch::take(db, &r.name));
+    let noted_remaining = batch.as_ref().is_some_and(|b| b.remaining > 0);
     if let (Some((receiver, status_tool)), Some(batch)) = (receiver, batch) {
         let subagent_names: std::collections::HashSet<String> = db
             .conn()
@@ -1148,6 +1149,18 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         println!("  Correct syntax (--name goes BEFORE --):");
         println!("    hcom send --name {sender_name} @target -- your message");
         println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
+    }
+
+    // Messages that arrived after the batch was taken are not in the output or
+    // the remaining note. Say so, or an adhoc caller won't know until its next command.
+    if let Some((receiver, _)) = receiver
+        && !noted_remaining
+        && !db.get_unread_messages(&receiver.name).is_empty()
+    {
+        println!(
+            "[hcom] new message(s) arrived — run: hcom listen --name {}",
+            receiver.name
+        );
     }
 
     // Show intent tip
