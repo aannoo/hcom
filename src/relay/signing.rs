@@ -67,22 +67,32 @@ pub(crate) fn load_or_create_keypair_at(path: &Path) -> Option<Ed25519KeyPair> {
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     // Private from the first byte: the final path is a hard link to this inode, so its mode
-    // must not depend on the umask or on the directory staying private (upstream review).
+    // must not depend on the umask or on the directory staying private. And EXCLUSIVE: an
+    // existing file at the temp path (on Windows a shared HCOM_DIR is not restricted) is never
+    // truncated and written into, it is refused and this process publishes unsigned
+    // (upstream review of #144).
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    let written = {
-        use std::io::Write;
+    {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut file| file.write_all(pkcs8.as_ref()))
-    };
-    #[cfg(not(unix))]
-    let written = std::fs::write(&tmp, pkcs8.as_ref());
-    written.ok()?;
+        options.mode(0o600);
+    }
+    let written = options.open(&tmp).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(pkcs8.as_ref())
+    });
+    if written.is_err() {
+        log::log_warn(
+            "relay",
+            "relay.sig_key_tmp_refused",
+            &format!(
+                "{} could not be created exclusively; publishing unsigned",
+                tmp.display()
+            ),
+        );
+        return None;
+    }
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     if linked.is_err() && !path.exists() {
@@ -263,6 +273,20 @@ mod tests {
         let first = load_or_create_keypair_at(&path).unwrap();
         let again = load_or_create_keypair_at(&path).unwrap();
         assert_eq!(first.public_key().as_ref(), again.public_key().as_ref());
+    }
+
+    #[test]
+    fn an_existing_temp_file_is_refused_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_sign.pk8");
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, b"planted").unwrap();
+        assert!(load_or_create_keypair_at(&path).is_none());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"planted", "left untouched");
+        assert!(
+            !path.exists(),
+            "no key written through a file it did not create"
+        );
     }
 
     #[cfg(unix)]
