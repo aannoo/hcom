@@ -305,3 +305,40 @@ fn review_late_send_cannot_rewind_a_newer_cursor() {
     assert_eq!(cursor(&db, &receiver), newest);
     assert!(!send(&h, &receiver, &sender, "reply2").contains("sentinel-050-"));
 }
+
+/// Relay references are reply IDs; only the cursor uses local database IDs.
+#[test]
+fn review_relay_reply_ids_survive_inline_receive() {
+    for tool in ["codex", "adhoc"] {
+        for external in [false, true] {
+            for count in [1, 2] {
+                let (h, db, sender, receiver) = setup(tool);
+                for i in 0..count {
+                    let data = serde_json::json!({
+                        "from":"remote:BOXE", "text":format!("relay-sentinel-{i}"),
+                        "scope":"mentions", "mentions":[receiver], "delivered_to":[receiver],
+                        "sender_kind":"instance", "intent":"request",
+                        "_relay":{"id":42+i,"short":"BOXE","device":"remote-device"}
+                    });
+                    db.execute("INSERT INTO events(id,timestamp,type,instance,data) VALUES(?,datetime('now'),'message','remote:BOXE',?)",params![100+i,data.to_string()]).unwrap();
+                }
+                let mut args = vec!["send", "--name", &receiver];
+                if external {
+                    args.extend(["--from", "operator"]);
+                }
+                let target = format!("@{sender}");
+                args.extend([&target, "--", "reply"]);
+                let (code, out, err) = h.run(args);
+                assert_eq!(code, 0, "{err}");
+                for i in 0..count {
+                    assert!(
+                        out.contains(&format!("[request #{}:BOXE]", 42 + i)),
+                        "{tool}/{external}/{count}: {out}"
+                    );
+                    assert!(!out.contains(&format!("[request #{}]", 100 + i)));
+                }
+                assert_eq!(cursor(&db, &receiver), 99 + count);
+            }
+        }
+    }
+}

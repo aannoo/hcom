@@ -1155,14 +1155,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             }
             // Commit only the emitted prefix after successful output. A retry
             // after partial output may duplicate messages, but cannot skip them.
-            if let Some(id) = batch.last().and_then(|m| m.event_id) {
-                if let Err(error) = db.advance_instance_cursor(&receiver.name, id) {
-                    eprintln!(
-                        "Message sent and incoming output written, but receive acknowledgment failed: {error}"
-                    );
-                    crate::relay::worker::ensure_worker(true);
-                    return 1;
-                }
+            if let Some(id) = batch.last().and_then(|m| m.event_id)
+                && let Err(error) = db.advance_instance_cursor(&receiver.name, id)
+            {
+                eprintln!(
+                    "Message sent and incoming output written, but receive acknowledgment failed: {error}"
+                );
+                crate::relay::worker::ensure_worker(true);
+                return 1;
             }
             // Preserve the delivery status formerly set by the router for
             // external sends made by a participating Codex/adhoc instance.
@@ -1245,8 +1245,11 @@ fn format_messages_for_hook(
     if messages.len() == 1 {
         let msg = messages[0];
         let sender_display = identity::get_display_name(db, &msg.from);
-        let prefix =
-            cli_context_build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
+        let prefix = crate::cli_context::format_envelope_prefix(
+            msg.intent.as_deref(),
+            msg.thread.as_deref(),
+            msg.reply_id().as_deref(),
+        );
         format!(
             "{prefix} {sender_display} → {recipient_display}: {}",
             msg.text
@@ -1256,10 +1259,10 @@ fn format_messages_for_hook(
             .iter()
             .map(|msg| {
                 let sender_display = identity::get_display_name(db, &msg.from);
-                let prefix = cli_context_build_prefix(
+                let prefix = crate::cli_context::format_envelope_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),
-                    msg.event_id,
+                    msg.reply_id().as_deref(),
                 );
                 format!(
                     "{prefix} {sender_display} → {recipient_display}: {}",
@@ -1268,25 +1271,6 @@ fn format_messages_for_hook(
             })
             .collect();
         format!("[{} new messages] | {}", parts.len(), parts.join(" | "))
-    }
-}
-
-fn cli_context_build_prefix(
-    intent: Option<&str>,
-    thread: Option<&str>,
-    event_id: Option<i64>,
-) -> String {
-    let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
-    let prefix = match (intent, thread) {
-        (Some(i), Some(t)) => format!("{i}:{t}"),
-        (Some(i), None) => i.to_string(),
-        (None, Some(t)) => format!("thread:{t}"),
-        (None, None) => "new message".to_string(),
-    };
-    if id_ref.is_empty() {
-        format!("[{prefix}]")
-    } else {
-        format!("[{prefix} {id_ref}]")
     }
 }
 
