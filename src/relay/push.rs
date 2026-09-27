@@ -143,7 +143,11 @@ pub(crate) fn shrink_event(event: &mut Value) {
         let error = format!(
             "rpc result too large to relay ({original_bytes} bytes); the relayed copy was cut"
         );
+        // Callers and backfill read the reason from `result.error`; a top-level `error`
+        // alone left them reporting "unknown remote error" (upstream review of #144).
+        data.insert("result".to_string(), json!({ "error": error }));
         match data.get_mut("error") {
+            Some(Value::String(existing)) if existing.contains(&error) => {}
             Some(Value::String(existing)) if !existing.is_empty() => {
                 existing.push_str("; ");
                 existing.push_str(&error);
@@ -154,7 +158,11 @@ pub(crate) fn shrink_event(event: &mut Value) {
         }
     }
     let mut all_dropped = already_dropped;
-    all_dropped.extend(dropped);
+    for key in dropped {
+        if !all_dropped.contains(&key) {
+            all_dropped.push(key);
+        }
+    }
     let mut marker = json!({"level": level, "original_bytes": original_bytes});
     if !all_dropped.is_empty() {
         marker["dropped"] = json!(all_dropped);
@@ -597,13 +605,17 @@ mod tests {
 
         let data = &events[0]["data"];
         assert_eq!(data["request_id"], "req-1");
-        assert!(data.get("result").is_none());
+        assert!(
+            data["result"].get("events").is_none(),
+            "the oversized result is gone"
+        );
         assert_eq!(data["_relay_truncated"]["level"], 2);
         assert_eq!(data["_relay_truncated"]["dropped"], json!(["result"]));
-        // The requester must see a FAILURE, never ok:true with the result silently gone.
+        // The requester must see a FAILURE, never ok:true with the result silently gone,
+        // and the reason must be where callers read it: result.error.
         assert_eq!(data["ok"], false);
         assert!(
-            data["error"]
+            data["result"]["error"]
                 .as_str()
                 .unwrap()
                 .contains("too large to relay")
@@ -663,6 +675,10 @@ mod tests {
             event["data"]["_relay_truncated"]["dropped"],
             json!(["result"])
         );
+        let reason = event["data"]["result"]["error"].as_str().unwrap();
+        assert!(reason.contains("too large to relay"), "{reason}");
+        let top = event["data"]["error"].as_str().unwrap();
+        assert_eq!(top.matches("too large to relay").count(), 1, "{top}");
         // A non-RPC event is never rewritten into a failure.
         let mut message = json!({"id": 4, "type": "message", "data": {"text": "y".repeat(2000)}});
         shrink_event(&mut message);
