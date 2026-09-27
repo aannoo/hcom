@@ -9,8 +9,8 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::HcomConfig;
@@ -23,6 +23,19 @@ use crate::relay::client::RelayCommand;
 /// left an idle device (no active local instance, so `ensure_worker(true)` never spawns) without
 /// a relay worker at all (upstream review of PR #144).
 static HANDOFF_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// The executable path this worker was started from, captured ONCE at start. The upgrade
+/// watchdog fingerprints it and the hand-off spawns it. Asking the OS again at exit is wrong
+/// after an upgrade: a rename-then-install swap leaves the running image under its new
+/// (old-build) name, and on Linux an atomic replace makes /proc/self/exe read "... (deleted)",
+/// so the successor could run the old build or fail to start (upstream review of #144).
+static INSTALL_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn install_path() -> Option<PathBuf> {
+    INSTALL_PATH
+        .get_or_init(|| std::env::current_exe().ok())
+        .clone()
+}
 
 /// Ask the worker to start a successor when it exits.
 pub(crate) fn request_handoff() {
@@ -129,6 +142,8 @@ pub fn run() -> i32 {
     // Write PID file (guard removes on exit)
     write_pid_file();
     let pid_guard = PidFileGuard;
+    // Capture the install path now, before any upgrade can move or replace the file.
+    let _ = install_path();
 
     log::log_info(
         "relay",
@@ -190,7 +205,7 @@ pub fn run() -> i32 {
         // The successor refuses to start while this worker's pidfile names a live PID,
         // so release it first.
         drop(pid_guard);
-        let spawned = do_spawn();
+        let spawned = do_spawn_with(install_path());
         log::log_info(
             "relay",
             "relay_worker.handoff",
@@ -250,7 +265,7 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
     // that happens and the next hcom call (every hook calls ensure_worker)
     // starts a worker from the new build, so an upgrade needs no manual restart
     // and none of the elevation that killing a worker can need.
-    let exe_path = std::env::current_exe().ok();
+    let exe_path = install_path();
     let started_with = exe_path.as_deref().and_then(exe_fingerprint);
 
     loop {
@@ -381,6 +396,11 @@ fn local_instance_count(db: &HcomDb) -> i64 {
 /// Detaches via setsid() so the worker survives terminal close.
 /// Returns true if spawned successfully, false if already running or spawn failed.
 fn do_spawn() -> bool {
+    do_spawn_with(std::env::current_exe().ok())
+}
+
+/// `do_spawn` for a given executable: the hand-off passes the install path captured at start.
+fn do_spawn_with(binary: Option<PathBuf>) -> bool {
     let lock_path = spawn_lock_path();
     if let Some(parent) = lock_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -430,9 +450,8 @@ fn do_spawn() -> bool {
         return false;
     }
 
-    let binary = match std::env::current_exe() {
-        Ok(b) => b,
-        Err(_) => return false,
+    let Some(binary) = binary else {
+        return false;
     };
 
     let mut cmd = Command::new(&binary);
