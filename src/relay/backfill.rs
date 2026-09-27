@@ -34,6 +34,8 @@ pub(crate) const BACKFILL_MAX_BYTES: usize = 32 * 1024;
 /// Budget for the one-event request used when a single event is larger than
 /// `BACKFILL_MAX_BYTES`.
 pub(crate) const BACKFILL_WIDE_MAX_BYTES: usize = 96 * 1024;
+/// Floor for the normal byte budget once answers have come back cut to fit the peer's publish.
+pub(crate) const BACKFILL_MIN_BYTES: usize = 4 * 1024;
 /// Seconds to wait for an answer before asking again.
 pub(crate) const BACKFILL_RETRY_SECS: f64 = 30.0;
 /// Requests without progress before a gap is given up (and logged).
@@ -61,6 +63,12 @@ pub(crate) struct Gap {
     /// Next request asks for a single event with the wide byte budget.
     #[serde(default)]
     pub wide: bool,
+    /// Answers that came back cut to fit the peer's publish. Each one halves the next normal
+    /// request's byte budget, down to `BACKFILL_MIN_BYTES`, so a large peer state leaves room
+    /// for a smaller answer instead of every retry failing the same way until the gap is
+    /// abandoned (upstream review of #144, round 4).
+    #[serde(default)]
+    pub shrink: u32,
 }
 
 fn gap_key(device_id: &str) -> String {
@@ -107,6 +115,7 @@ pub(crate) fn record_gap(db: &HcomDb, device_id: &str, short_id: &str, after: i6
         attempts: 0,
         recovered: 0,
         wide: false,
+        shrink: 0,
     });
     while gaps.len() > MAX_GAPS_PER_DEVICE {
         let dropped = gaps.remove(0);
@@ -136,11 +145,19 @@ pub(crate) fn record_gap(db: &HcomDb, device_id: &str, short_id: &str, after: i6
 /// Parameters for the peer's `events` RPC covering the gap. The filter is the
 /// push loop's own-origin filter, so the answer is exactly what the missed
 /// snapshots would have carried.
+/// The normal byte budget after `shrink` cut answers: halved each time, never below the floor.
+fn shrunk_budget(shrink: u32) -> usize {
+    BACKFILL_MAX_BYTES
+        .checked_shr(shrink)
+        .unwrap_or(0)
+        .max(BACKFILL_MIN_BYTES)
+}
+
 pub(crate) fn request_params(gap: &Gap) -> Value {
     let (last, max_bytes) = if gap.wide {
         (1, BACKFILL_WIDE_MAX_BYTES)
     } else {
-        (BACKFILL_BATCH, BACKFILL_MAX_BYTES)
+        (BACKFILL_BATCH, shrunk_budget(gap.shrink))
     };
     json!({
         "sql": format!(
@@ -190,13 +207,16 @@ pub(crate) fn apply_answer(
 ) -> Result<AnswerOutcome, String> {
     // An answer the publishing peer had to shrink to fit its sealed payload (answer + its
     // state) has had strings inside `result.events` cut while `ok` stayed true. Importing it
-    // would store partial events as if whole, and the gap would close. Refuse it: the gap is
-    // retried and, if it never fits, abandoned honestly (upstream review of #144, round 3).
+    // would store partial events as if whole, and the gap would close. Refuse it (round 3),
+    // and ask for less next time: the peer's state does not shrink between retries, so the
+    // same budget would be cut the same way every time (upstream review of #144, round 4).
     if response.get("_relay_truncated").is_some() {
-        return Err(
-            "the answer was cut to fit the peer's publish; not importing partial events"
-                .to_string(),
-        );
+        gap.shrink = gap.shrink.saturating_add(1);
+        return Err(format!(
+            "the answer was cut to fit the peer's publish; not importing partial events \
+             (next request asks for {} bytes)",
+            shrunk_budget(gap.shrink)
+        ));
     }
     let result = response.get("result").cloned().unwrap_or(Value::Null);
     if !response
@@ -606,6 +626,7 @@ mod tests {
             attempts: 1,
             recovered: 0,
             wide: false,
+            shrink: 0,
         };
         let response = answer("r1", vec![message(15, "only")], false);
         assert_eq!(
@@ -634,6 +655,7 @@ mod tests {
             attempts: 1,
             recovered: 0,
             wide: true,
+            shrink: 0,
         };
         // What push's shrink leaves when answer + state overflow the sealed payload:
         // ok stays true, strings inside result.events are cut, and the marker is added.
@@ -643,6 +665,47 @@ mod tests {
         assert!(outcome.is_err(), "{outcome:?}");
         assert!(imported_texts(&db).is_empty(), "no partial event stored");
         assert_eq!(gap.recovered, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn a_cut_answer_halves_the_next_budget_down_to_a_floor() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut gap = Gap {
+            after: 10,
+            before: 20,
+            short_id: "ABCD".into(),
+            detected_at: 0.0,
+            request_id: None,
+            sent_at: 0.0,
+            attempts: 1,
+            recovered: 0,
+            wide: false,
+            shrink: 0,
+        };
+        assert_eq!(request_params(&gap)["max_bytes"], json!(BACKFILL_MAX_BYTES));
+        let mut response = answer("r3", vec![message(15, "cut short")], false);
+        response["_relay_truncated"] = json!({"level": 1, "original_bytes": 60_000});
+        let mut budgets = Vec::new();
+        for _ in 0..BACKFILL_MAX_ATTEMPTS {
+            assert!(apply_answer(&db, PEER, "MINE", &mut gap, &response).is_err());
+            budgets.push(request_params(&gap)["max_bytes"].as_u64().unwrap());
+        }
+        // A large peer state leaves less room each time; the budget follows it down instead
+        // of repeating the answer that was just cut, and never asks for less than the floor.
+        assert_eq!(budgets, vec![16_384, 8_192, 4_096, 4_096, 4_096, 4_096]);
+        assert!(
+            imported_texts(&db).is_empty(),
+            "no partial event stored on the way down"
+        );
+        // A gap persisted before this field existed reads back with no shrink.
+        let old: Gap = serde_json::from_value(json!({
+            "after": 1, "before": 5, "short_id": "ABCD", "detected_at": 0.0
+        }))
+        .unwrap();
+        assert_eq!(old.shrink, 0);
+        assert_eq!(request_params(&old)["max_bytes"], json!(BACKFILL_MAX_BYTES));
     }
 
     #[test]
