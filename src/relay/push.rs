@@ -79,6 +79,8 @@ const SHRINK_MARKER: &str = "_relay_truncated";
 /// Fields the last level keeps: enough for a waiter to match and fail an RPC.
 const SHRINK_ALWAYS_KEEP: [&str; 4] = ["request_id", "action", "ok", "error"];
 pub(crate) const SHRINK_LAST_LEVEL: u64 = 3;
+/// Field names listed in the marker; the rest are only counted.
+const SHRINK_DROPPED_NAMES: usize = 16;
 
 pub(crate) fn shrink_level(event: &Value) -> u64 {
     event["data"][SHRINK_MARKER]["level"].as_u64().unwrap_or(0)
@@ -110,6 +112,10 @@ pub(crate) fn shrink_event(event: &mut Value) {
         .unwrap_or(original_bytes);
     // Read what earlier levels dropped BEFORE removing their marker.
     let already_dropped = event_marker_dropped(data).unwrap_or_default();
+    let already_count = data
+        .get(SHRINK_MARKER)
+        .and_then(|m| m["dropped_count"].as_u64())
+        .unwrap_or(0) as usize;
     data.remove(SHRINK_MARKER);
     let mut dropped: Vec<String> = Vec::new();
     if level == 1 {
@@ -157,15 +163,29 @@ pub(crate) fn shrink_event(event: &mut Value) {
             }
         }
     }
+    // Bounded: a level-3 shrink of an event with thousands of small fields would otherwise
+    // copy every name into the marker, which could overflow the budget the shrink exists to
+    // meet. The count stays exact; `result` is listed first so a cut RPC answer is always
+    // named (upstream review of #144, round 3).
+    let mut total_dropped = already_count.max(already_dropped.len());
     let mut all_dropped = already_dropped;
     for key in dropped {
         if !all_dropped.contains(&key) {
             all_dropped.push(key);
+            total_dropped += 1;
         }
     }
+    if let Some(i) = all_dropped.iter().position(|k| k == "result") {
+        let result = all_dropped.remove(i);
+        all_dropped.insert(0, result);
+    }
+    all_dropped.truncate(SHRINK_DROPPED_NAMES);
     let mut marker = json!({"level": level, "original_bytes": original_bytes});
     if !all_dropped.is_empty() {
         marker["dropped"] = json!(all_dropped);
+    }
+    if total_dropped > all_dropped.len() {
+        marker["dropped_count"] = json!(total_dropped);
     }
     data.insert(SHRINK_MARKER.to_string(), marker);
 }
@@ -658,6 +678,10 @@ mod tests {
         let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["_relay_truncated", "action", "ok", "request_id"]);
+        // The marker itself stays small: 6000 dropped names are counted, not listed.
+        let marker = &data["_relay_truncated"];
+        assert!(marker["dropped"].as_array().unwrap().len() <= 16);
+        assert_eq!(marker["dropped_count"], 6000);
     }
 
     #[test]
