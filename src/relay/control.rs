@@ -1130,11 +1130,15 @@ fn handle_remote_events(
     let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     while serialized_len > byte_cap && !events.is_empty() {
         if events.len() == 1
+            && byte_cap >= REMOTE_EVENTS_BYTE_CAP
             && super::push::shrink_level(&events[0]) < super::push::SHRINK_LAST_LEVEL
         {
-            // The newest event alone is larger than the budget. An empty answer made a
-            // catch-up backfill give up on an event of ~100 KiB that the normal publish
-            // (112 KiB) had carried, so send a cut copy with the same marker a push uses.
+            // The newest event alone is larger than the WIDEST budget, so no request can
+            // carry it whole: send a cut copy with the same marker a push uses rather than
+            // an empty answer that makes a catch-up backfill abandon the gap. Below the
+            // widest budget the empty, truncated answer is still returned, because that is
+            // what sends backfill to the wide request that recovers the event intact
+            // (upstream review of #144: cutting at 32 KiB lost events a wide ask would get).
             super::push::shrink_event(&mut events[0]);
         } else {
             events.pop();
@@ -2055,7 +2059,7 @@ mod tests {
         .unwrap();
         let out = handle_remote_events(
             &db,
-            &json!({"last": 1, "max_bytes": 96 * 1024 - 2_000}),
+            &json!({"last": 1, "max_bytes": REMOTE_EVENTS_BYTE_CAP}),
             "initiator",
             &HcomConfig::default(),
         )
@@ -2065,7 +2069,44 @@ mod tests {
         assert_eq!(out["truncated"].as_bool(), Some(true));
         assert_eq!(events[0]["data"]["from"], "luna");
         assert_eq!(events[0]["data"]["_relay_truncated"]["level"], 1);
-        assert!(serde_json::to_string(&out).unwrap().len() <= 96 * 1024 - 2_000);
+        assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+    }
+
+    #[test]
+    fn test_handle_remote_events_below_the_widest_budget_never_cuts_an_event() {
+        // 50 KB: over the 32 KiB normal backfill budget, well under the widest one. A cut
+        // copy here would be imported and the intact event never fetched; the empty,
+        // truncated answer is what sends backfill to the wide request.
+        let db = test_db();
+        db.log_event(
+            "message",
+            "luna",
+            &json!({"from": "luna", "text": "y".repeat(50_000)}),
+        )
+        .unwrap();
+        let narrow = handle_remote_events(
+            &db,
+            &json!({"last": 1, "max_bytes": 32 * 1024}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(narrow["events"].as_array().unwrap().len(), 0);
+        assert_eq!(narrow["truncated"].as_bool(), Some(true));
+        let wide = handle_remote_events(
+            &db,
+            &json!({"last": 1, "max_bytes": REMOTE_EVENTS_BYTE_CAP}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let events = wide["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]["data"].get("_relay_truncated").is_none(),
+            "intact"
+        );
+        assert_eq!(events[0]["data"]["text"].as_str().unwrap().len(), 50_000);
     }
 
     #[test]
