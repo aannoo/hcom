@@ -910,9 +910,13 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // Deliver pending messages AFTER command for hookless codex/adhoc instances.
     // This appends unread hcom messages to the command's stdout — keep in mind
     // when changing output contracts or adding machine-readable modes.
-    // send owns its receive batch and output acknowledgment. A second drain
-    // would bypass its cap, quiet flag, or failed-write protection.
-    if cmd != "send"
+    // Once send has persisted its message it owns the receive batch and output
+    // acknowledgment. A second drain would bypass its cap, quiet flag, or
+    // failed-write protection. Failed sends still get delivery here.
+    let send_owns_delivery = cmd == "send"
+        && crate::commands::send::SENT_OWNS_INLINE_DELIVERY
+            .load(std::sync::atomic::Ordering::Relaxed);
+    if !send_owns_delivery
         && let Some(output) =
             crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
     {

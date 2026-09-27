@@ -15,6 +15,14 @@ use crate::shared::{
     is_inside_ai_tool, status_icon,
 };
 
+/// Set once the outgoing message is persisted. From then on send owns the
+/// receiver's inline delivery: it delivers the batch itself, or deliberately
+/// leaves it unread (--quiet, --json, failed output write). The router's
+/// after-command delivery must not run again. A send that fails earlier leaves
+/// it false, so the router still delivers.
+pub static SENT_OWNS_INLINE_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const SEND_AFTER_HELP: &str = "\
 Target matching:
     @luna                          exact base name
@@ -1058,6 +1066,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+    SENT_OWNS_INLINE_DELIVERY.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // ── Feedback ──
     if args.json {

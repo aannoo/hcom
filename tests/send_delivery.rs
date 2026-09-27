@@ -351,3 +351,59 @@ fn relay_reply_ids_survive_inline_receive() {
         }
     }
 }
+
+/// A send that fails before persisting still delivers pending messages.
+#[test]
+fn failed_send_still_delivers_pending_messages() {
+    for tool in ["codex", "adhoc"] {
+        let (h, db, sender, receiver) = setup(tool);
+        let id = queue(&db, &sender, &receiver, "pending-sentinel");
+        let (code, out, _) = h.run([
+            "send",
+            "--name",
+            &receiver,
+            "--intent",
+            "bogus",
+            &format!("@{sender}"),
+            "--",
+            "reply",
+        ]);
+        assert_ne!(code, 0, "{tool}");
+        assert!(out.contains("pending-sentinel"), "{tool}: {out}");
+        assert_eq!(cursor(&db, &receiver), id, "{tool}");
+    }
+}
+
+/// --from delivers to the process-bound invoking instance, not only --name.
+#[test]
+fn external_sender_delivers_to_process_bound_instance() {
+    for tool in ["codex", "adhoc"] {
+        let h = Hcom::new();
+        let sender = h.start();
+        let process_id = format!("send-delivery-{tool}");
+        let receiver = h.start_with_process_id(&process_id);
+        let db = Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+        db.execute(
+            "UPDATE instances SET tool=? WHERE name=?",
+            params![tool, receiver],
+        )
+        .unwrap();
+        let id = queue(&db, &sender, &receiver, "bound-sentinel");
+        let (code, out, err) = h.run_as_process(
+            &process_id,
+            [
+                "send",
+                "--from",
+                "operator",
+                &format!("@{sender}"),
+                "--intent",
+                "inform",
+                "--",
+                "external-outgoing",
+            ],
+        );
+        assert_eq!(code, 0, "{tool}: {err}");
+        assert!(out.contains("bound-sentinel"), "{tool}: {out}");
+        assert_eq!(cursor(&db, &receiver), id, "{tool}");
+    }
+}
