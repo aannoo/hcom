@@ -788,6 +788,16 @@ impl HcomDb {
         Ok(rows > 0)
     }
 
+    /// Acknowledge an emitted batch without rewinding a concurrent delivery.
+    /// The comparison and update are one SQLite operation, not a read/modify/write.
+    pub fn advance_instance_cursor(&self, name: &str, event_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?) WHERE name = ?",
+            params![event_id, name],
+        )?;
+        Ok(())
+    }
+
     /// Update specific fields on an instance row.
     /// Uses a JSON Value map for flexible field specification.
     pub fn update_instance_fields(

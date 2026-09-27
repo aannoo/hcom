@@ -3,6 +3,7 @@ mod support;
 use rusqlite::{Connection, params};
 use support::Hcom;
 
+/// Create two isolated identities and select the receiver command-routing mode.
 fn setup(tool: &str) -> (Hcom, Connection, String, String) {
     let h = Hcom::new();
     let sender = h.start();
@@ -17,6 +18,7 @@ fn setup(tool: &str) -> (Hcom, Connection, String, String) {
     (h, db, sender, receiver)
 }
 
+/// Send an informational message and capture all inline receive output.
 fn send(h: &Hcom, from: &str, to: &str, body: &str) -> String {
     let (code, out, err) = h.run([
         "send",
@@ -32,6 +34,7 @@ fn send(h: &Hcom, from: &str, to: &str, body: &str) -> String {
     out
 }
 
+/// Read the persisted receive position without consuming messages.
 fn cursor(db: &Connection, receiver: &str) -> i64 {
     db.query_row(
         "SELECT last_event_id FROM instances WHERE name=?",
@@ -41,6 +44,7 @@ fn cursor(db: &Connection, receiver: &str) -> i64 {
     .unwrap()
 }
 
+/// Verify batch boundaries and sequential exactly-once output for each routing mode.
 #[test]
 fn send_delivers_one_contiguous_prefix_before_advancing_cursor() {
     for tool in ["claude", "codex", "adhoc"] {
@@ -79,6 +83,7 @@ fn send_delivers_one_contiguous_prefix_before_advancing_cursor() {
     }
 }
 
+/// Main and child senders cannot create holes in a shared cursor prefix.
 #[test]
 fn mixed_main_and_child_messages_share_one_batch_limit() {
     let (h, db, sender, receiver) = setup("claude");
@@ -108,6 +113,7 @@ fn mixed_main_and_child_messages_share_one_batch_limit() {
     }
 }
 
+/// Quiet sends leave pending receive data available to the next command.
 #[test]
 fn quiet_send_preserves_incoming_messages() {
     for tool in ["claude", "codex", "adhoc"] {
@@ -130,6 +136,7 @@ fn quiet_send_preserves_incoming_messages() {
     }
 }
 
+/// A failed output write does not acknowledge the queued incoming message.
 #[cfg(unix)]
 #[test]
 fn failed_stdout_write_preserves_incoming_messages() {
@@ -162,4 +169,139 @@ fn failed_stdout_write_preserves_incoming_messages() {
         assert_eq!(cursor(&db, &receiver), before, "{tool}");
         assert!(send(&h, &receiver, &sender, "reply2").contains("incoming-sentinel"));
     }
+}
+
+/// An external outgoing name must not replace the invoking instance's inbox.
+#[test]
+fn review_external_sender_preserves_hookless_receive_delivery() {
+    for tool in ["codex", "adhoc"] {
+        let (h, db, sender, receiver) = setup(tool);
+        send(&h, &sender, &receiver, "external-incoming-sentinel");
+        let before = cursor(&db, &receiver);
+        for mode in ["--quiet", "--json"] {
+            let (code, out, err) = h.run([
+                "send",
+                "--name",
+                &receiver,
+                "--from",
+                "operator",
+                mode,
+                &format!("@{sender}"),
+                "--",
+                "control",
+            ]);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(cursor(&db, &receiver), before);
+            if mode == "--quiet" {
+                assert!(out.is_empty());
+            } else {
+                let _: serde_json::Value = serde_json::from_str(&out).unwrap();
+            }
+        }
+        let (code, out, err) = h.run([
+            "send",
+            "--name",
+            &receiver,
+            "--from",
+            "operator",
+            &format!("@{sender}"),
+            "--intent",
+            "inform",
+            "--",
+            "external-outgoing",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("external-incoming-sentinel"), "{tool}: {out}");
+        let (status, context): (String, String) = db
+            .query_row(
+                "SELECT status,status_context FROM instances WHERE name=?",
+                [&receiver],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status,
+            if tool == "codex" {
+                "active"
+            } else {
+                "inactive"
+            }
+        );
+        assert!(context.starts_with("deliver:"), "{context}");
+        let from: String = db.query_row(
+            "SELECT json_extract(data,'$.from') FROM events WHERE type='message' AND json_extract(data,'$.text')='external-outgoing'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(from, "operator");
+    }
+}
+
+/// Hold stdout mid-write, advance the cursor elsewhere, then release the writer.
+#[cfg(unix)]
+#[test]
+fn review_late_send_cannot_rewind_a_newer_cursor() {
+    use std::io::Read;
+    use std::os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::net::UnixStream,
+    };
+    use std::process::Stdio;
+    use std::time::Duration;
+    let (h, db, sender, receiver) = setup("claude");
+    for i in 0..51 {
+        let data = serde_json::json!({"from":sender,"text":format!("sentinel-{i:03}-{}", "x".repeat(8192)),"scope":"mentions","mentions":[receiver],"delivered_to":[receiver],"sender_kind":"instance","intent":"inform"});
+        db.execute("INSERT INTO events(timestamp,type,instance,data) VALUES(datetime('now'),'message',?,?)", params![sender,data.to_string()]).unwrap();
+    }
+    let newest: i64 = db
+        .query_row("SELECT MAX(id) FROM events WHERE type='message'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let before = cursor(&db, &receiver);
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    let size: libc::c_int = 4096;
+    // Keep the socket smaller than one output batch, so its first byte proves
+    // selection happened while the process still cannot finish writing.
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut child = h
+        .cmd()
+        .args([
+            "send",
+            "--name",
+            &receiver,
+            &format!("@{sender}"),
+            "--",
+            "reply",
+        ])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .spawn()
+        .unwrap();
+    let mut first = [0];
+    reader.read_exact(&mut first).unwrap();
+    assert_eq!(cursor(&db, &receiver), before);
+    // Deterministic interleaving: another delivery commits the 51st event.
+    db.execute(
+        "UPDATE instances SET last_event_id=? WHERE name=?",
+        params![newest, receiver],
+    )
+    .unwrap();
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(cursor(&db, &receiver), newest);
+    assert!(!send(&h, &receiver, &sender, "reply2").contains("sentinel-050-"));
 }

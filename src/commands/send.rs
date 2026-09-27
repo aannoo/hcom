@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Read as IoRead, Write as IoWrite};
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instances;
+use crate::instance_lifecycle as lifecycle;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
     validate_intent, validate_message,
@@ -1076,9 +1076,25 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     let feedback = get_recipient_feedback(db, &delivered_to);
 
-    // Show unread messages if instance context (full delivery with cursor advance)
-    if matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
+    // --from changes the outgoing author, not the invoking hookless instance's
+    // inbox. Keep its receive path here so output/cap/quiet protections apply.
+    let receiver = if matches!(sender_identity.kind, SenderKind::Instance) {
+        Some(&sender_identity)
+    } else {
+        ctx.and_then(|ctx| ctx.identity.as_ref()).filter(|actor| {
+            matches!(actor.kind, SenderKind::Instance)
+                && matches!(
+                    actor
+                        .instance_data
+                        .as_ref()
+                        .and_then(|data| data.get("tool"))
+                        .and_then(|tool| tool.as_str()),
+                    Some("codex" | "adhoc")
+                )
+        })
+    };
+    if let Some(receiver) = receiver {
+        let messages = db.get_unread_messages(&receiver.name);
         if !messages.is_empty() {
             // Select one chronological prefix before grouping by sender. A single
             // cursor cannot safely acknowledge independently capped groups.
@@ -1091,7 +1107,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                 .prepare("SELECT name FROM instances WHERE parent_name = ?")
                 .ok()
                 .map(|mut stmt| {
-                    stmt.query_map(rusqlite::params![&sender_identity.name], |row| row.get(0))
+                    stmt.query_map(rusqlite::params![&receiver.name], |row| row.get(0))
                         .ok()
                         .into_iter()
                         .flatten()
@@ -1114,13 +1130,13 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             if !main_msgs.is_empty() {
                 output.push_str(&format!(
                     "\n{}",
-                    format_messages_for_hook(db, &main_msgs, &sender_identity.name)
+                    format_messages_for_hook(db, &main_msgs, &receiver.name)
                 ));
             }
             if !sub_msgs.is_empty() {
                 output.push_str(&format!(
                     "\n[Subagent messages]\n{}",
-                    format_messages_for_hook(db, &sub_msgs, &sender_identity.name)
+                    format_messages_for_hook(db, &sub_msgs, &receiver.name)
                 ));
             }
             output.push('\n');
@@ -1140,9 +1156,40 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             // Commit only the emitted prefix after successful output. A retry
             // after partial output may duplicate messages, but cannot skip them.
             if let Some(id) = batch.last().and_then(|m| m.event_id) {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, &sender_identity.name, &updates);
+                if let Err(error) = db.advance_instance_cursor(&receiver.name, id) {
+                    eprintln!(
+                        "Message sent and incoming output written, but receive acknowledgment failed: {error}"
+                    );
+                    crate::relay::worker::ensure_worker(true);
+                    return 1;
+                }
+            }
+            // Preserve the delivery status formerly set by the router for
+            // external sends made by a participating Codex/adhoc instance.
+            if !matches!(sender_identity.kind, SenderKind::Instance) {
+                let tool = receiver
+                    .instance_data
+                    .as_ref()
+                    .and_then(|data| data.get("tool"))
+                    .and_then(|tool| tool.as_str());
+                let sender_display = identity::get_display_name(db, &batch[0].from);
+                lifecycle::set_status(
+                    db,
+                    &receiver.name,
+                    if tool == Some("codex") {
+                        crate::shared::ST_ACTIVE
+                    } else {
+                        crate::shared::ST_INACTIVE
+                    },
+                    &format!("deliver:{sender_display}"),
+                    lifecycle::StatusUpdate {
+                        msg_ts: batch
+                            .last()
+                            .and_then(|m| m.timestamp.as_deref())
+                            .unwrap_or(""),
+                        ..Default::default()
+                    },
+                );
             }
         } else {
             println!("{feedback}");
