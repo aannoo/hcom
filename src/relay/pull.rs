@@ -127,14 +127,17 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     safe_kv_set(db, &format!("relay_uuid_short_{}", device_id), None);
     let prefix = super::device_id_prefix(device_id);
     let label = short_id.as_deref().unwrap_or(prefix);
-    emit_device_event(
+    // The leave is fully applied above, so waiters can be woken as soon as it is logged.
+    if emit_device_event(
         db,
         super::ACTION_DEVICE_LEAVE,
         label,
         prefix,
         &format!("device {} left the relay", label),
         false,
-    );
+    ) {
+        crate::notify::wake_all(db);
+    }
     log::log_info("relay", "relay.device_gone", &format!("device={}", prefix));
 }
 
@@ -246,6 +249,9 @@ pub fn handle_state_message(
 
     // Check short_id collision (two different devices with same short_id)
     let cached_device = safe_kv_get(db, &format!("relay_short_{}", short_id));
+    // A join or reconnect is logged here, before the peer's instances, capabilities and sync
+    // time are applied below, so it is woken for at the END of this handler, not now.
+    let mut lifecycle_logged = false;
     if let Some(ref cached) = cached_device {
         if cached != device_id {
             log::log_warn(
@@ -267,7 +273,7 @@ pub fn handle_state_message(
         let now = crate::shared::time::now_epoch_f64();
         if last_sync > 0.0 && (now - last_sync) > super::DEVICE_STALE_SECS {
             let prefix = super::device_id_prefix(device_id);
-            emit_device_event(
+            lifecycle_logged = emit_device_event(
                 db,
                 super::ACTION_DEVICE_JOIN,
                 &short_id,
@@ -279,7 +285,7 @@ pub fn handle_state_message(
     } else {
         safe_kv_set(db, &format!("relay_short_{}", short_id), Some(device_id));
         let prefix = super::device_id_prefix(device_id);
-        emit_device_event(
+        lifecycle_logged = emit_device_event(
             db,
             super::ACTION_DEVICE_JOIN,
             &short_id,
@@ -532,8 +538,11 @@ pub fn handle_state_message(
     // A retained state snapshot arrives on every peer heartbeat. Waking every
     // local endpoint for a snapshot whose event cursor did not advance turns
     // relay liveness traffic into a permanent TCP fan-out storm on large
-    // registries. Wake only when the snapshot actually changed local work.
-    if should_push || imported_new_events {
+    // registries. Wake only when the snapshot actually changed local work. A join or
+    // reconnect logged above counts as local work, and waking for it HERE, after the peer's
+    // state is applied, means a waiter that acts on it finds the peer synced (upstream review
+    // of #144, round 4).
+    if should_push || imported_new_events || lifecycle_logged {
         crate::notify::wake_all(db);
     }
 
@@ -777,7 +786,8 @@ fn resolve_short_id(db: &HcomDb, device_id: &str) -> Option<String> {
     None
 }
 
-/// Emit a relay device lifecycle event.
+/// Emit a relay device lifecycle event. Returns whether it was logged; the CALLER wakes waiters
+/// once the change the event announces has been applied.
 fn emit_device_event(
     db: &HcomDb,
     action: &str,
@@ -785,7 +795,7 @@ fn emit_device_event(
     device_id_prefix: &str,
     text: &str,
     reconnect: bool,
-) {
+) -> bool {
     let mut data = serde_json::json!({
         "action": action,
         "short_id": short_id,
@@ -795,13 +805,11 @@ fn emit_device_event(
     if reconnect {
         data["reconnect"] = serde_json::json!(true);
     }
-    // A lifecycle event is new local work that `hcom events --wait` may be waiting for.
-    // The snapshot handler wakes only when the event cursor moved or a push is due, and a
-    // join, reconnect or leave moves neither, so wake here. These are rare, so this cannot
-    // turn heartbeat snapshots into a wake storm (upstream review of #144, round 3).
-    if db.log_event("life", "", &data).is_ok() {
-        crate::notify::wake_all(db);
-    }
+    // A lifecycle event is new local work that `hcom events --wait` may be waiting for
+    // (upstream review of #144, round 3), but waking here was too early for a join or
+    // reconnect: the snapshot handler logs those before it applies the peer's state, so a
+    // waiter could act on the event and still be told the peer is unsynced (round 4).
+    db.log_event("life", "", &data).is_ok()
 }
 
 /// Strip own device suffix from a name (case-insensitive).
@@ -871,6 +879,81 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(woken, "a device lifecycle event must wake event waiters");
+    }
+
+    #[test]
+    #[serial]
+    fn logging_a_lifecycle_event_does_not_wake_by_itself() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.set_nonblocking(true).unwrap();
+        db.upsert_notify_endpoint("waiter", "pty", probe.local_addr().unwrap().port())
+            .unwrap();
+
+        // The caller wakes once the change is applied; logging alone must not.
+        assert!(emit_device_event(
+            &db,
+            super::super::ACTION_DEVICE_JOIN,
+            "ABCD",
+            "device-1",
+            "new device ABCD joined the relay",
+            false,
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            probe.accept().is_err(),
+            "logging a lifecycle event must not wake anyone"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_joining_peer_wakes_waiters_after_its_state_is_applied() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.set_nonblocking(true).unwrap();
+        db.upsert_notify_endpoint("waiter", "pty", probe.local_addr().unwrap().port())
+            .unwrap();
+
+        // A new peer with no events and no control traffic: the only local work is its join.
+        let payload = json!({
+            "state": {"short_id": "ABCD", "reset_ts": 0.0, "capabilities": ["launch"], "instances": {}},
+            "events": []
+        });
+        let topic = "relay-test/device-1234";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+                user_properties: &[],
+            },
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut woken = false;
+        while std::time::Instant::now() < deadline {
+            if probe.accept().is_ok() {
+                woken = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(woken, "a join must still wake event waiters");
+        assert!(
+            safe_kv_get(&db, "relay_sync_time_device-1234").is_some(),
+            "the peer's sync time is applied by the time anyone is woken"
+        );
     }
 
     #[test]
