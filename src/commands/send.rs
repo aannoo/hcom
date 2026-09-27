@@ -1,6 +1,6 @@
 //! `hcom send` command — send messages to hcom instances.
 
-use std::io::{IsTerminal, Read as IoRead};
+use std::io::{IsTerminal, Read as IoRead, Write as IoWrite};
 
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
@@ -1080,14 +1080,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     if matches!(sender_identity.kind, SenderKind::Instance) {
         let messages = db.get_unread_messages(&sender_identity.name);
         if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last()
-                && let Some(id) = last.event_id
-            {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, &sender_identity.name, &updates);
-            }
+            // Select one chronological prefix before grouping by sender. A single
+            // cursor cannot safely acknowledge independently capped groups.
+            const MAX_MSGS: usize = 50;
+            let batch: Vec<_> = messages.iter().take(MAX_MSGS).collect();
 
             // Separate subagent messages from main messages
             let subagent_names: std::collections::HashSet<String> = db
@@ -1106,7 +1102,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
             let mut main_msgs = Vec::new();
             let mut sub_msgs = Vec::new();
-            for msg in &messages {
+            for &msg in &batch {
                 if subagent_names.contains(&msg.from) {
                     sub_msgs.push(msg);
                 } else {
@@ -1114,21 +1110,39 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                 }
             }
 
-            const MAX_MSGS: usize = 50;
-
-            print!("{feedback}");
+            let mut output = feedback.clone();
             if !main_msgs.is_empty() {
-                let capped: Vec<&_> = main_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n{formatted}");
+                output.push_str(&format!(
+                    "\n{}",
+                    format_messages_for_hook(db, &main_msgs, &sender_identity.name)
+                ));
             }
             if !sub_msgs.is_empty() {
-                let capped: Vec<&_> = sub_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n[Subagent messages]\n{formatted}");
+                output.push_str(&format!(
+                    "\n[Subagent messages]\n{}",
+                    format_messages_for_hook(db, &sub_msgs, &sender_identity.name)
+                ));
             }
-            if main_msgs.is_empty() && sub_msgs.is_empty() {
-                println!();
+            output.push('\n');
+            let write_result = {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(output.as_bytes())
+                    .and_then(|_| stdout.flush())
+            };
+            if let Err(error) = write_result {
+                eprintln!(
+                    "Message sent, but incoming message output failed; unread messages retained: {error}"
+                );
+                crate::relay::worker::ensure_worker(true);
+                return 1;
+            }
+            // Commit only the emitted prefix after successful output. A retry
+            // after partial output may duplicate messages, but cannot skip them.
+            if let Some(id) = batch.last().and_then(|m| m.event_id) {
+                let mut updates = serde_json::Map::new();
+                updates.insert("last_event_id".into(), serde_json::json!(id));
+                instances::update_instance_position(db, &sender_identity.name, &updates);
             }
         } else {
             println!("{feedback}");

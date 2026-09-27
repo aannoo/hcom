@@ -910,7 +910,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // Deliver pending messages AFTER command for hookless codex/adhoc instances.
     // This appends unread hcom messages to the command's stdout — keep in mind
     // when changing output contracts or adding machine-readable modes.
-    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
+    // send owns its receive batch and output acknowledgment. A second drain
+    // would bypass its cap, quiet flag, or failed-write protection.
+    if cmd != "send"
+        && let Some(output) =
+            crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
+    {
         print!("{output}");
     }
 
