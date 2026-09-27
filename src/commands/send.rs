@@ -11,7 +11,8 @@ use crate::messages::{
     validate_intent, validate_message,
 };
 use crate::shared::{
-    CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
+    CommandContext, MAX_MESSAGES_PER_DELIVERY, SENDER, SenderIdentity, SenderKind,
+    is_inside_ai_tool, status_icon,
 };
 
 const SEND_AFTER_HELP: &str = "\
@@ -1076,123 +1077,53 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     let feedback = get_recipient_feedback(db, &delivered_to);
 
-    // --from changes the outgoing author, not the invoking hookless instance's
-    // inbox. Keep its receive path here so output/cap/quiet protections apply.
+    // Deliver the receiver's unread messages inline. With --from the outgoing
+    // author is external, but the invoking codex/adhoc instance still receives.
+    // The router skips its own delivery for send, so --quiet leaves messages unread.
     let receiver = if matches!(sender_identity.kind, SenderKind::Instance) {
-        Some(&sender_identity)
+        Some((&sender_identity, None))
     } else {
-        ctx.and_then(|ctx| ctx.identity.as_ref()).filter(|actor| {
-            matches!(actor.kind, SenderKind::Instance)
-                && matches!(
-                    actor
-                        .instance_data
-                        .as_ref()
-                        .and_then(|data| data.get("tool"))
-                        .and_then(|tool| tool.as_str()),
-                    Some("codex" | "adhoc")
-                )
-        })
+        ctx.and_then(crate::cli_context::inline_receiver)
+            .map(|(actor, tool)| (actor, Some(tool)))
     };
-    if let Some(receiver) = receiver {
-        let messages = db.get_unread_messages(&receiver.name);
-        if !messages.is_empty() {
-            // Select one chronological prefix before grouping by sender. A single
-            // cursor cannot safely acknowledge independently capped groups.
-            const MAX_MSGS: usize = 50;
-            let batch: Vec<_> = messages.iter().take(MAX_MSGS).collect();
+    let batch = receiver.and_then(|(r, _)| InlineBatch::take(db, &r.name));
+    if let (Some((receiver, status_tool)), Some(batch)) = (receiver, batch) {
+        let subagent_names: std::collections::HashSet<String> = db
+            .conn()
+            .prepare("SELECT name FROM instances WHERE parent_name = ?")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(rusqlite::params![&receiver.name], |row| row.get(0))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (sub_msgs, main_msgs): (Vec<_>, Vec<_>) = batch
+            .messages
+            .iter()
+            .partition(|msg| subagent_names.contains(&msg.from));
 
-            // Separate subagent messages from main messages
-            let subagent_names: std::collections::HashSet<String> = db
-                .conn()
-                .prepare("SELECT name FROM instances WHERE parent_name = ?")
-                .ok()
-                .map(|mut stmt| {
-                    stmt.query_map(rusqlite::params![&receiver.name], |row| row.get(0))
-                        .ok()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|r| r.ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut main_msgs = Vec::new();
-            let mut sub_msgs = Vec::new();
-            for &msg in &batch {
-                if subagent_names.contains(&msg.from) {
-                    sub_msgs.push(msg);
-                } else {
-                    main_msgs.push(msg);
-                }
-            }
-
-            let mut output = feedback.clone();
-            if !main_msgs.is_empty() {
-                output.push_str(&format!(
-                    "\n{}",
-                    format_messages_for_hook(db, &main_msgs, &receiver.name)
-                ));
-            }
-            if !sub_msgs.is_empty() {
-                output.push_str(&format!(
-                    "\n[Subagent messages]\n{}",
-                    format_messages_for_hook(db, &sub_msgs, &receiver.name)
-                ));
-            }
-            output.push('\n');
-            let write_result = {
-                let mut stdout = std::io::stdout().lock();
-                stdout
-                    .write_all(output.as_bytes())
-                    .and_then(|_| stdout.flush())
-            };
-            if let Err(error) = write_result {
-                eprintln!(
-                    "Message sent, but incoming message output failed; unread messages retained: {error}"
-                );
-                crate::relay::worker::ensure_worker(true);
-                return 1;
-            }
-            // Commit only the emitted prefix after successful output. A retry
-            // after partial output may duplicate messages, but cannot skip them.
-            if let Some(id) = batch.last().and_then(|m| m.event_id)
-                && let Err(error) = db.advance_instance_cursor(&receiver.name, id)
-            {
-                eprintln!(
-                    "Message sent and incoming output written, but receive acknowledgment failed: {error}"
-                );
-                crate::relay::worker::ensure_worker(true);
-                return 1;
-            }
-            // Preserve the delivery status formerly set by the router for
-            // external sends made by a participating Codex/adhoc instance.
-            if !matches!(sender_identity.kind, SenderKind::Instance) {
-                let tool = receiver
-                    .instance_data
-                    .as_ref()
-                    .and_then(|data| data.get("tool"))
-                    .and_then(|tool| tool.as_str());
-                let sender_display = identity::get_display_name(db, &batch[0].from);
-                lifecycle::set_status(
-                    db,
-                    &receiver.name,
-                    if tool == Some("codex") {
-                        crate::shared::ST_ACTIVE
-                    } else {
-                        crate::shared::ST_INACTIVE
-                    },
-                    &format!("deliver:{sender_display}"),
-                    lifecycle::StatusUpdate {
-                        msg_ts: batch
-                            .last()
-                            .and_then(|m| m.timestamp.as_deref())
-                            .unwrap_or(""),
-                        ..Default::default()
-                    },
-                );
-            }
-        } else {
-            println!("{feedback}");
+        let mut output = feedback.clone();
+        if !main_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n{}",
+                format_messages_for_hook(db, &main_msgs, &receiver.name)
+            ));
+        }
+        if !sub_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n[Subagent messages]\n{}",
+                format_messages_for_hook(db, &sub_msgs, &receiver.name)
+            ));
+        }
+        output.push('\n');
+        if let Err(e) = batch.emit(db, &receiver.name, &output, status_tool) {
+            eprintln!("Message sent, but {e}");
+            crate::relay::worker::ensure_worker(true);
+            return 1;
         }
     } else {
         println!("{feedback}");
@@ -1210,17 +1141,6 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
     }
 
-    // Adhoc unread delivery: for --name instances, show unread preview
-    if explicit_name.is_some() && matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            println!("\n{}", "─".repeat(40));
-            println!("[hcom] new message(s)");
-            println!("{}", "─".repeat(40));
-            println!("\nRun: hcom listen --name {}", sender_identity.name);
-        }
-    }
-
     // Show intent tip
     if let Some(ref intent) = envelope.intent
         && matches!(sender_identity.kind, SenderKind::Instance)
@@ -1232,6 +1152,92 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     crate::relay::worker::ensure_worker(true);
 
     0
+}
+
+/// One chronological prefix of an instance's unread messages, capped per delivery.
+///
+/// A single cursor acknowledges everything up to the batch's last event, so the
+/// batch must be a prefix: capping per sender or per group would skip messages.
+struct InlineBatch {
+    messages: Vec<crate::db::Message>,
+    /// Unread messages left after this batch.
+    remaining: usize,
+}
+
+impl InlineBatch {
+    fn take(db: &HcomDb, name: &str) -> Option<Self> {
+        let mut messages = db.get_unread_messages(name);
+        if messages.is_empty() {
+            return None;
+        }
+        let remaining = messages.len().saturating_sub(MAX_MESSAGES_PER_DELIVERY);
+        messages.truncate(MAX_MESSAGES_PER_DELIVERY);
+        Some(Self {
+            messages,
+            remaining,
+        })
+    }
+
+    /// Write `output` (plus a note about remaining messages) to stdout, then
+    /// acknowledge the batch.
+    ///
+    /// Nothing is acknowledged if the write fails, so a retry after partial
+    /// output may duplicate messages but never skips them. The cursor only moves
+    /// forward, so a slow writer cannot rewind a newer concurrent delivery.
+    ///
+    /// `status_tool` sets delivery status for a receiver other than the sender
+    /// (--from), matching the router's codex/adhoc delivery.
+    fn emit(
+        &self,
+        db: &HcomDb,
+        name: &str,
+        output: &str,
+        status_tool: Option<&str>,
+    ) -> Result<(), String> {
+        let mut output = output.to_string();
+        if self.remaining > 0 {
+            output.push_str(&format!(
+                "[+{} more unread — run: hcom listen --name {name}]\n",
+                self.remaining
+            ));
+        }
+        let written = {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(output.as_bytes())
+                .and_then(|_| stdout.flush())
+        };
+        if let Err(e) = written {
+            return Err(format!(
+                "incoming message output failed; unread messages retained: {e}"
+            ));
+        }
+
+        let last = self.messages.last();
+        if let Some(id) = last.and_then(|m| m.event_id) {
+            db.advance_instance_cursor(name, id)
+                .map_err(|e| format!("receive acknowledgment failed: {e}"))?;
+        }
+
+        if let Some(tool) = status_tool {
+            let sender_display = identity::get_display_name(db, &self.messages[0].from);
+            lifecycle::set_status(
+                db,
+                name,
+                if tool == "codex" {
+                    crate::shared::ST_ACTIVE
+                } else {
+                    crate::shared::ST_INACTIVE
+                },
+                &format!("deliver:{sender_display}"),
+                lifecycle::StatusUpdate {
+                    msg_ts: last.and_then(|m| m.timestamp.as_deref()).unwrap_or(""),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Format messages for hook display (no ANSI).

@@ -11,7 +11,6 @@ use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
-#[cfg(test)]
 use crate::shared::SenderIdentity;
 use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
 use crate::shared::{
@@ -176,13 +175,26 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
     lifecycle::set_status(db, &identity.name, status, &context, Default::default());
 }
 
-/// For hookless instances (codex/adhoc): append unread messages after command output.
+/// The invoking instance and its tool, if it receives hcom messages inline in
+/// its hcom command output (codex/adhoc).
 ///
-/// Codex and adhoc instances have no delivery hooks, so messages are delivered
-/// via CLI command output. Skips for --json output to preserve machine-readable format.
+/// Adhoc instances have no hooks, so this is their only delivery path. Codex
+/// also delivers via its UserPromptSubmit/PostToolUse hooks; for hcom commands
+/// the inline delivery runs first, so those messages arrive in command output.
+pub fn inline_receiver(ctx: &CommandContext) -> Option<(&SenderIdentity, &str)> {
+    let identity = ctx.identity.as_ref()?;
+    if !matches!(identity.kind, SenderKind::Instance) {
+        return None;
+    }
+    let tool = identity.instance_data.as_ref()?.get("tool")?.as_str()?;
+    matches!(tool, "codex" | "adhoc").then_some((identity, tool))
+}
+
+/// For codex/adhoc instances: append unread messages after command output.
+///
+/// Skips for --json output to preserve machine-readable format.
 ///
 /// Not display-only: also advances the instance cursor and updates delivery status.
-/// This is the hookless counterpart to hook-based delivery.
 ///
 /// Returns formatted output string if messages were delivered, None otherwise.
 pub fn maybe_deliver_pending_messages(
@@ -194,20 +206,7 @@ pub fn maybe_deliver_pending_messages(
         return None;
     }
 
-    let identity = ctx.identity.as_ref()?;
-    if !matches!(identity.kind, SenderKind::Instance) {
-        return None;
-    }
-
-    let instance_data = identity.instance_data.as_ref()?;
-    let tool = instance_data
-        .get("tool")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if tool != "codex" && tool != "adhoc" {
-        return None;
-    }
+    let (identity, tool) = inline_receiver(ctx)?;
 
     // Get unread messages
     let messages = db.get_unread_messages(&identity.name);

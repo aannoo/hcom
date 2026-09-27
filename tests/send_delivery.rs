@@ -34,6 +34,17 @@ fn send(h: &Hcom, from: &str, to: &str, body: &str) -> String {
     out
 }
 
+/// Queue a direct message by inserting its event, without spawning hcom.
+fn queue(db: &Connection, from: &str, to: &str, text: &str) -> i64 {
+    let data = serde_json::json!({"from":from,"text":text,"scope":"mentions","mentions":[to],"delivered_to":[to],"sender_kind":"instance","intent":"inform"});
+    db.execute(
+        "INSERT INTO events(timestamp,type,instance,data) VALUES(datetime('now'),'message',?,?)",
+        params![from, data.to_string()],
+    )
+    .unwrap();
+    db.last_insert_rowid()
+}
+
 /// Read the persisted receive position without consuming messages.
 fn cursor(db: &Connection, receiver: &str) -> i64 {
     db.query_row(
@@ -48,20 +59,18 @@ fn cursor(db: &Connection, receiver: &str) -> i64 {
 #[test]
 fn send_delivers_one_contiguous_prefix_before_advancing_cursor() {
     for tool in ["claude", "codex", "adhoc"] {
-        for count in [50, 51, 101] {
+        for count in [50usize, 51, 101] {
             let (h, db, sender, receiver) = setup(tool);
-            let mut ids = Vec::new();
-            for i in 0..count {
-                send(&h, &sender, &receiver, &format!("sentinel-{i:03}-end"));
-                ids.push(
-                    db.query_row("SELECT MAX(id) FROM events WHERE type='message'", [], |r| {
-                        r.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-                );
-            }
+            let ids: Vec<i64> = (0..count)
+                .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
+                .collect();
             let first = send(&h, &receiver, &sender, "reply");
             assert_eq!(cursor(&db, &receiver), ids[49], "{tool}/{count}");
+            assert_eq!(
+                first.contains(&format!("[+{} more unread", count.saturating_sub(50))),
+                count > 50,
+                "{tool}/{count}: remaining note"
+            );
             for i in 0..count {
                 assert_eq!(
                     first.contains(&format!("sentinel-{i:03}-end")),
@@ -94,8 +103,8 @@ fn mixed_main_and_child_messages_share_one_batch_limit() {
     )
     .unwrap();
     for i in 0..103 {
-        send(
-            &h,
+        queue(
+            &db,
             if i % 3 == 0 { &child } else { &sender },
             &receiver,
             &format!("sentinel-{i:03}-end"),
@@ -118,7 +127,7 @@ fn mixed_main_and_child_messages_share_one_batch_limit() {
 fn quiet_send_preserves_incoming_messages() {
     for tool in ["claude", "codex", "adhoc"] {
         let (h, db, sender, receiver) = setup(tool);
-        send(&h, &sender, &receiver, "incoming-sentinel");
+        queue(&db, &sender, &receiver, "incoming-sentinel");
         let before = cursor(&db, &receiver);
         let (code, out, err) = h.run([
             "send",
@@ -144,7 +153,7 @@ fn failed_stdout_write_preserves_incoming_messages() {
     use std::process::Stdio;
     for tool in ["claude", "codex", "adhoc"] {
         let (h, db, sender, receiver) = setup(tool);
-        send(&h, &sender, &receiver, "incoming-sentinel");
+        queue(&db, &sender, &receiver, "incoming-sentinel");
         let before = cursor(&db, &receiver);
         let (writer, reader) = UnixStream::pair().unwrap();
         drop(reader);
@@ -173,10 +182,10 @@ fn failed_stdout_write_preserves_incoming_messages() {
 
 /// An external outgoing name must not replace the invoking instance's inbox.
 #[test]
-fn review_external_sender_preserves_hookless_receive_delivery() {
+fn external_sender_preserves_inline_receive_delivery() {
     for tool in ["codex", "adhoc"] {
         let (h, db, sender, receiver) = setup(tool);
-        send(&h, &sender, &receiver, "external-incoming-sentinel");
+        queue(&db, &sender, &receiver, "external-incoming-sentinel");
         let before = cursor(&db, &receiver);
         for mode in ["--quiet", "--json"] {
             let (code, out, err) = h.run([
@@ -239,7 +248,7 @@ fn review_external_sender_preserves_hookless_receive_delivery() {
 /// Hold stdout mid-write, advance the cursor elsewhere, then release the writer.
 #[cfg(unix)]
 #[test]
-fn review_late_send_cannot_rewind_a_newer_cursor() {
+fn late_send_cannot_rewind_a_newer_cursor() {
     use std::io::Read;
     use std::os::{
         fd::{AsRawFd, OwnedFd},
@@ -308,7 +317,7 @@ fn review_late_send_cannot_rewind_a_newer_cursor() {
 
 /// Relay references are reply IDs; only the cursor uses local database IDs.
 #[test]
-fn review_relay_reply_ids_survive_inline_receive() {
+fn relay_reply_ids_survive_inline_receive() {
     for tool in ["codex", "adhoc"] {
         for external in [false, true] {
             for count in [1, 2] {
