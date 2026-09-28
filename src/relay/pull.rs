@@ -198,12 +198,13 @@ pub fn handle_state_message(
 ) -> bool {
     let t0 = std::time::Instant::now();
 
+    let watermark = state_ts_watermark(db, device_id);
     let opened = match open_envelope_for_handler(
         ctx,
         device_id,
         payload,
         ReplayPolicy::State {
-            min_accepted_ts: state_ts_watermark(db, device_id),
+            min_accepted_ts: watermark,
         },
     ) {
         Some(p) => p,
@@ -246,6 +247,31 @@ pub fn handle_state_message(
         .get("reset_ts")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+
+    // A snapshot sealed in the same second as the newest one applied passes the watermark
+    // (equal timestamps must, so a broker can re-deliver that same snapshot). If it also ends
+    // below the events already imported and announces no newer reset than the one already
+    // applied, it is an earlier snapshot arriving out of order, for example a stale retained
+    // copy after a broker failover. Skip it before the peer's state or events are applied, so
+    // it can neither roll that state back nor trip the id-regression reset in
+    // import_remote_events. A snapshot announcing a newer reset is a new database generation
+    // and always reaches the reset handling below, whatever second it was sealed in.
+    let cached_reset = cached_reset_ts(db, device_id);
+    if watermark == Some(opened.ts_secs)
+        && reset_ts <= cached_reset
+        && ends_below_cursor(db, device_id, &events)
+    {
+        log::log_info(
+            "relay",
+            "relay.stale_snapshot",
+            &format!(
+                "device={} ts={}",
+                super::device_id_prefix(device_id),
+                opened.ts_secs
+            ),
+        );
+        return false;
+    }
 
     // Check short_id collision (two different devices with same short_id)
     let cached_device = safe_kv_get(db, &format!("relay_short_{}", short_id));
@@ -311,10 +337,6 @@ pub fn handle_state_message(
     }
 
     // Check for device reset — clean old data before importing
-    let cached_reset: f64 = safe_kv_get(db, &format!("relay_reset_{}", device_id))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
-
     if reset_ts > cached_reset {
         if let Err(e) = db.conn().execute(
             "DELETE FROM instances WHERE origin_device_id = ?",
@@ -549,6 +571,38 @@ pub fn handle_state_message(
     should_push
 }
 
+/// The reset generation already applied for a peer (0.0 when none has been seen).
+fn cached_reset_ts(db: &HcomDb, device_id: &str) -> f64 {
+    safe_kv_get(db, &format!("relay_reset_{}", device_id))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// The imported-event cursor for a peer (0 before first contact or after a reset).
+fn event_cursor(db: &HcomDb, device_id: &str) -> i64 {
+    safe_kv_get(db, &format!("relay_events_{}", device_id))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The highest event id a snapshot carries, control events excepted (0 when it carries none).
+fn remote_max_event_id(events: &[Value]) -> i64 {
+    events
+        .iter()
+        .filter(|e| e.get("type").and_then(|v| v.as_str()) != Some("control"))
+        .filter_map(|e| e.get("id").and_then(|v| v.as_i64()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// True when a snapshot's events end below what was already imported from that peer: the
+/// condition import_remote_events treats as a recreated peer database.
+fn ends_below_cursor(db: &HcomDb, device_id: &str, events: &[Value]) -> bool {
+    let cursor = event_cursor(db, device_id);
+    let remote_max_id = remote_max_event_id(events);
+    cursor > 0 && remote_max_id > 0 && remote_max_id < cursor
+}
+
 /// Import remote events with cursor-based dedup.
 fn import_remote_events(
     db: &HcomDb,
@@ -558,18 +612,11 @@ fn import_remote_events(
     local_reset_ts: f64,
     own_short_id: &str,
 ) -> bool {
-    let mut last_event_id: i64 = safe_kv_get(db, &format!("relay_events_{}", device_id))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let mut last_event_id = event_cursor(db, device_id);
 
     // Detect ID regression (remote DB recreated without proper reset event)
     if !events.is_empty() && last_event_id > 0 {
-        let remote_max_id: i64 = events
-            .iter()
-            .filter(|e| e.get("type").and_then(|v| v.as_str()) != Some("control"))
-            .filter_map(|e| e.get("id").and_then(|v| v.as_i64()))
-            .max()
-            .unwrap_or(0);
+        let remote_max_id = remote_max_event_id(events);
 
         if remote_max_id > 0 && remote_max_id < last_event_id {
             // Cursor regression: remote DB was recreated/reset. Drop cached
@@ -1432,6 +1479,124 @@ mod tests {
         import_remote_events(&db, "device-1234", "ABCD", &events, 0.0, "MINE");
         assert!(crate::relay::backfill::load_gaps(&db, "device-1234").is_empty());
     }
+
+    fn apply_snapshot_at(db: &HcomDb, events: Vec<serde_json::Value>, ts_secs: u64) {
+        apply_snapshot_with_reset_at(db, events, ts_secs, 0.0);
+    }
+
+    fn apply_snapshot_with_reset_at(
+        db: &HcomDb,
+        events: Vec<serde_json::Value>,
+        ts_secs: u64,
+        reset_ts: f64,
+    ) {
+        let topic = "relay-test/device-1234";
+        let payload = json!({
+            "state": {"short_id": "ABCD", "reset_ts": reset_ts, "instances": {}},
+            "events": events
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let psk = fixture_psk();
+        let envelope =
+            crate::relay::crypto::seal(&psk, "relay-test", topic, &bytes, ts_secs).unwrap();
+        let mut guard = ReplayGuard::default();
+        handle_state_message(
+            db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+                user_properties: &[],
+            },
+        );
+    }
+
+    fn imported_from_peer(db: &HcomDb) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE json_extract(data, '$._relay.device') = 'device-1234'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn a_same_second_older_snapshot_is_skipped_not_treated_as_a_reset() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        apply_snapshot_at(&db, vec![own_event(10, "a"), own_event(11, "b")], 2000);
+        crate::relay::backfill::record_gap(&db, "device-1234", "ABCD", 3, 9);
+        assert_eq!(imported_from_peer(&db), 2);
+
+        // An earlier snapshot from the same second arrives late, carrying only id 5.
+        apply_snapshot_at(&db, vec![own_event(5, "old")], 2000);
+
+        assert_eq!(imported_from_peer(&db), 2, "imported events must survive");
+        assert_eq!(
+            safe_kv_get(&db, "relay_events_device-1234").as_deref(),
+            Some("11"),
+            "the cursor must not be reset"
+        );
+        assert_eq!(
+            crate::relay::backfill::load_gaps(&db, "device-1234").len(),
+            1,
+            "pending gaps must stay scheduled"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_same_second_snapshot_announcing_a_newer_reset_still_resets() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        apply_snapshot_at(&db, vec![own_event(10, "a"), own_event(11, "b")], 2000);
+        crate::relay::backfill::record_gap(&db, "device-1234", "ABCD", 3, 9);
+
+        // The peer reset its database within the same second: its snapshot announces the reset
+        // and restarts its ids below our cursor. It is a new generation, not a stale snapshot.
+        apply_snapshot_with_reset_at(&db, vec![own_event(3, "fresh")], 2000, 1999.5);
+
+        assert_eq!(
+            imported_from_peer(&db),
+            1,
+            "the old generation is dropped and the new one imported"
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_events_device-1234").as_deref(),
+            Some("3")
+        );
+        assert!(crate::relay::backfill::load_gaps(&db, "device-1234").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_later_snapshot_below_the_cursor_still_resets() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        apply_snapshot_at(&db, vec![own_event(10, "a"), own_event(11, "b")], 2000);
+        crate::relay::backfill::record_gap(&db, "device-1234", "ABCD", 3, 9);
+
+        // The peer's database was recreated: a later snapshot restarts its ids.
+        apply_snapshot_at(&db, vec![own_event(3, "fresh")], 2001);
+
+        assert_eq!(
+            imported_from_peer(&db),
+            1,
+            "the old history is dropped and the new one imported"
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_events_device-1234").as_deref(),
+            Some("3")
+        );
+        assert!(crate::relay::backfill::load_gaps(&db, "device-1234").is_empty());
+    }
+
     fn state_payload() -> serde_json::Value {
         json!({"state": {"short_id": "ABCD", "reset_ts": 0.0, "instances": {}}, "events": []})
     }
