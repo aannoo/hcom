@@ -9,9 +9,15 @@
 //! Each device therefore also signs the exact sealed bytes it publishes with its
 //! own Ed25519 key, carried in MQTT v5 user properties so older builds ignore
 //! it. Receivers check the signature only AFTER the AEAD open succeeded (so a
-//! stranger without the PSK can never get a key pinned), pin each device's key
-//! the first time they see it, and report a missing signature from a device
-//! that has signed before, an invalid signature, or a changed key.
+//! stranger without the PSK can never get a key pinned), and report a missing
+//! signature from a device that has signed before, an invalid signature, or a
+//! changed key.
+//!
+//! The user properties sit outside the AEAD, so a broker could re-sign authentic
+//! sealed bytes with a key of its own. A key is therefore pinned only when the
+//! device's sealed state snapshot names it (`state.sig_key`, inside the AEAD):
+//! then only a relay member could have chosen the key being pinned. Control
+//! messages never pin; they are checked against the key a snapshot pinned.
 //!
 //! This build only observes and reports; nothing is rejected. Enforcement comes
 //! once every device signs and the reports stay clean.
@@ -133,6 +139,12 @@ pub(crate) fn publish_properties(sealed: &[u8]) -> Option<PublishProperties> {
     device_keypair().map(|pair| properties_with(pair, sealed))
 }
 
+/// This device's public key (base64), for its sealed state snapshot to name. None when no key
+/// is available, in which case the device publishes unsigned.
+pub(crate) fn own_public_key_b64() -> Option<String> {
+    device_keypair().map(|pair| B64.encode(pair.public_key().as_ref()))
+}
+
 /// Short fingerprint of this device's public key, for status output.
 pub(crate) fn own_key_fingerprint() -> Option<String> {
     device_keypair().map(|pair| fingerprint(&B64.encode(pair.public_key().as_ref())))
@@ -156,6 +168,11 @@ pub(crate) enum Verdict {
     Invalid,
     /// Valid signature, but by a different key than the one pinned.
     KeyChanged,
+    /// Valid signature, nothing pinned yet, and no sealed state names the key (a control
+    /// message, or a build that does not name it), so it is not pinned.
+    Unbound,
+    /// Valid signature by a key other than the one the sealed state names.
+    NotTheSealedKey,
 }
 
 impl Verdict {
@@ -166,6 +183,8 @@ impl Verdict {
             Verdict::Missing { pinned: true } => "MISSING after signing before",
             Verdict::Invalid => "INVALID signature",
             Verdict::KeyChanged => "KEY CHANGED since pinned",
+            Verdict::Unbound => "signed, key not yet named in a sealed state",
+            Verdict::NotTheSealedKey => "KEY DIFFERS from the one its sealed state names",
         }
     }
 }
@@ -177,12 +196,15 @@ fn prop<'a>(props: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Judge one authenticated publish from `device_id`. Pins the key on first sight.
+/// Judge one authenticated publish from `device_id`. `sealed_key` is the key the publish's own
+/// sealed state names (None for control messages and for builds that do not name one); a first
+/// key is pinned only when it matches.
 pub(crate) fn check(
     db: &HcomDb,
     device_id: &str,
     sealed: &[u8],
     props: &[(String, String)],
+    sealed_key: Option<&str>,
 ) -> Verdict {
     let pin_key = format!("{PIN_PREFIX}{device_id}");
     let pinned = safe_kv_get(db, &pin_key);
@@ -200,11 +222,15 @@ pub(crate) fn check(
     {
         return Verdict::Invalid;
     }
+    if sealed_key.is_some_and(|named| named != key_b64) {
+        return Verdict::NotTheSealedKey;
+    }
     match pinned {
-        None => {
+        None if sealed_key == Some(key_b64) => {
             safe_kv_set(db, &pin_key, Some(key_b64));
             Verdict::FirstSeen
         }
+        None => Verdict::Unbound,
         Some(p) if p == key_b64 => Verdict::Valid,
         Some(_) => Verdict::KeyChanged,
     }
@@ -217,8 +243,9 @@ pub(crate) fn observe(
     device_id: &str,
     sealed: &[u8],
     props: &[(String, String)],
+    sealed_key: Option<&str>,
 ) -> Verdict {
-    let verdict = check(db, device_id, sealed, props);
+    let verdict = check(db, device_id, sealed, props, sealed_key);
     let status_key = format!("{STATUS_PREFIX}{device_id}");
     let label = verdict.label();
     if safe_kv_get(db, &status_key).as_deref() != Some(label) {
@@ -229,9 +256,10 @@ pub(crate) fn observe(
             label
         );
         match verdict {
-            Verdict::Valid | Verdict::FirstSeen | Verdict::Missing { pinned: false } => {
-                log::log_info("relay", "relay.sig", &detail)
-            }
+            Verdict::Valid
+            | Verdict::FirstSeen
+            | Verdict::Missing { pinned: false }
+            | Verdict::Unbound => log::log_info("relay", "relay.sig", &detail),
             _ => log::log_warn("relay", "relay.sig", &detail),
         }
     }
@@ -329,14 +357,27 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"not a key");
     }
 
+    fn key_of(pair: &Ed25519KeyPair) -> String {
+        B64.encode(pair.public_key().as_ref())
+    }
+
     #[test]
     fn first_signature_pins_then_verifies() {
         let (dir, db) = test_db();
         let pair = fresh_pair(dir.path(), "a.pk8");
+        let key = key_of(&pair);
         let sealed = b"sealed envelope bytes";
         let props = props_of(&pair, sealed);
-        assert_eq!(check(&db, "dev-a", sealed, &props), Verdict::FirstSeen);
-        assert_eq!(check(&db, "dev-a", sealed, &props), Verdict::Valid);
+        assert_eq!(
+            check(&db, "dev-a", sealed, &props, Some(&key)),
+            Verdict::FirstSeen
+        );
+        assert_eq!(
+            check(&db, "dev-a", sealed, &props, Some(&key)),
+            Verdict::Valid
+        );
+        // Once pinned, a publish that names no key (a control message) verifies against the pin.
+        assert_eq!(check(&db, "dev-a", sealed, &props, None), Verdict::Valid);
     }
 
     #[test]
@@ -344,7 +385,10 @@ mod tests {
         let (dir, db) = test_db();
         let pair = fresh_pair(dir.path(), "a.pk8");
         let props = props_of(&pair, b"original");
-        assert_eq!(check(&db, "dev-a", b"tampered", &props), Verdict::Invalid);
+        assert_eq!(
+            check(&db, "dev-a", b"tampered", &props, Some(&key_of(&pair))),
+            Verdict::Invalid
+        );
         assert!(
             safe_kv_get(&db, "relay_sigkey_dev-a").is_none(),
             "nothing pinned"
@@ -356,10 +400,63 @@ mod tests {
         let (dir, db) = test_db();
         let owner = fresh_pair(dir.path(), "owner.pk8");
         let impostor = fresh_pair(dir.path(), "impostor.pk8");
-        check(&db, "dev-a", b"one", &props_of(&owner, b"one"));
+        check(
+            &db,
+            "dev-a",
+            b"one",
+            &props_of(&owner, b"one"),
+            Some(&key_of(&owner)),
+        );
         assert_eq!(
-            check(&db, "dev-a", b"two", &props_of(&impostor, b"two")),
+            check(&db, "dev-a", b"two", &props_of(&impostor, b"two"), None),
             Verdict::KeyChanged
+        );
+    }
+
+    #[test]
+    fn a_key_no_sealed_state_names_is_never_pinned() {
+        let (dir, db) = test_db();
+        let pair = fresh_pair(dir.path(), "a.pk8");
+        assert_eq!(
+            check(&db, "dev-a", b"x", &props_of(&pair, b"x"), None),
+            Verdict::Unbound
+        );
+        assert!(safe_kv_get(&db, "relay_sigkey_dev-a").is_none());
+    }
+
+    #[test]
+    fn a_broker_re_signing_with_its_own_key_is_not_pinned() {
+        // The broker cannot change the sealed state, which names the device's key, but it can
+        // replace the user properties with its own signature over the same sealed bytes.
+        let (dir, db) = test_db();
+        let device = fresh_pair(dir.path(), "device.pk8");
+        let broker = fresh_pair(dir.path(), "broker.pk8");
+        let sealed = b"sealed state naming the device key";
+        assert_eq!(
+            check(
+                &db,
+                "dev-a",
+                sealed,
+                &props_of(&broker, sealed),
+                Some(&key_of(&device))
+            ),
+            Verdict::NotTheSealedKey
+        );
+        assert!(safe_kv_get(&db, "relay_sigkey_dev-a").is_none());
+        // The genuine publish still pins the device's own key.
+        assert_eq!(
+            check(
+                &db,
+                "dev-a",
+                sealed,
+                &props_of(&device, sealed),
+                Some(&key_of(&device))
+            ),
+            Verdict::FirstSeen
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_sigkey_dev-a"),
+            Some(key_of(&device))
         );
     }
 
@@ -367,13 +464,19 @@ mod tests {
     fn unsigned_is_benign_until_a_device_has_signed() {
         let (dir, db) = test_db();
         assert_eq!(
-            check(&db, "dev-a", b"x", &[]),
+            check(&db, "dev-a", b"x", &[], None),
             Verdict::Missing { pinned: false }
         );
         let pair = fresh_pair(dir.path(), "a.pk8");
-        check(&db, "dev-a", b"x", &props_of(&pair, b"x"));
+        check(
+            &db,
+            "dev-a",
+            b"x",
+            &props_of(&pair, b"x"),
+            Some(&key_of(&pair)),
+        );
         assert_eq!(
-            check(&db, "dev-a", b"y", &[]),
+            check(&db, "dev-a", b"y", &[], None),
             Verdict::Missing { pinned: true }
         );
     }
@@ -382,13 +485,14 @@ mod tests {
     fn observe_records_each_transition_once() {
         let (dir, db) = test_db();
         let pair = fresh_pair(dir.path(), "a.pk8");
-        observe(&db, "dev-a", b"x", &[]);
+        let key = key_of(&pair);
+        observe(&db, "dev-a", b"x", &[], None);
         assert_eq!(
             safe_kv_get(&db, "relay_sigstatus_dev-a").as_deref(),
             Some("unsigned (older build)")
         );
-        observe(&db, "dev-a", b"x", &props_of(&pair, b"x"));
-        observe(&db, "dev-a", b"y", &props_of(&pair, b"y"));
+        observe(&db, "dev-a", b"x", &props_of(&pair, b"x"), Some(&key));
+        observe(&db, "dev-a", b"y", &props_of(&pair, b"y"), Some(&key));
         assert_eq!(
             safe_kv_get(&db, "relay_sigstatus_dev-a").as_deref(),
             Some("valid")
