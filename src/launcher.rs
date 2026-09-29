@@ -362,7 +362,8 @@ fn inject_grok_rules(args: &mut Vec<String>, extra: &str) {
         return;
     }
     let mut i = 0;
-    while i < args.len() {
+    // Flags only: after `--` it is the prompt, whatever it looks like.
+    while i < args.len() && args[i] != "--" {
         let token = &args[i];
         if token == "--rules" {
             if i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -3273,6 +3274,19 @@ mod tests {
         let mut literal = vec!["--".to_string(), "--resume".to_string()];
         ensure_grok_session_id(&mut literal);
         assert_eq!(literal[0], "--session-id");
+    }
+
+    #[test]
+    fn grok_prompt_that_looks_like_a_flag_stays_a_prompt() {
+        let mut args = Vec::new();
+        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--rules=x".into()).unwrap();
+        assert_eq!(args, ["--", "--rules=x"]);
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(args, ["--rules", "BOOT", "--", "--rules=x"]);
+        let mut args = Vec::new();
+        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--continue".into()).unwrap();
+        ensure_grok_session_id(&mut args);
+        assert_eq!(args[0], "--session-id");
     }
 
     #[test]

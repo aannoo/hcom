@@ -1098,7 +1098,7 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     launch: LaunchSpec {
         args_env: Some("HCOM_GROK_ARGS"),
         config_dir_env: Some("GROK_HOME"),
-        initial_prompt: InitialPromptShape::Positional,
+        initial_prompt: InitialPromptShape::DashDashPositional,
         uses_pty_default: true,
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
