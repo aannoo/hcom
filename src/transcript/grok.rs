@@ -47,13 +47,74 @@ fn encode_path_component(value: &str) -> String {
         .collect()
 }
 
+/// Grok's longest percent-encoded cwd directory name; longer cwds get a
+/// `<slug>-<blake3 prefix>` name instead (`encode_cwd_dirname`).
+const MAX_DIRNAME_BYTES: usize = 255;
+
 /// Where Grok stores a session's `updates.jsonl`.
 pub(crate) fn session_transcript_path(cwd: &str, session_id: &str) -> PathBuf {
-    grok_config_dir()
-        .join("sessions")
-        .join(encode_path_component(cwd))
-        .join(session_id)
-        .join("updates.jsonl")
+    let sessions = grok_config_dir().join("sessions");
+    let encoded = encode_path_component(cwd);
+    let dir = if encoded.len() <= MAX_DIRNAME_BYTES {
+        sessions.join(encoded).join(session_id)
+    } else {
+        // Hashed name: find the session by id instead of re-deriving it.
+        std::fs::read_dir(&sessions)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join(session_id))
+            .find(|dir| dir.is_dir())
+            .unwrap_or_else(|| sessions.join(encoded).join(session_id))
+    };
+    dir.join("updates.jsonl")
+}
+
+/// The lines of `updates.jsonl` still on the live branch. A `rewind_marker`
+/// discards everything from the start of its target prompt, as Grok's own
+/// replay does (`session/storage` `filter_rewind_by`): prompts are counted by
+/// runs of user chunks, keyed by `promptIndex` once any chunk carries one.
+pub(crate) fn live_lines(content: &str) -> Vec<&str> {
+    let lines: Vec<&str> = content.lines().collect();
+    if !content.contains("rewind_marker") {
+        return lines;
+    }
+    let mut live: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut prompt_starts: Vec<usize> = Vec::new();
+    let (mut seen_index, mut in_user, mut run_index) = (false, false, None);
+    for line in lines {
+        let value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let xai = value["method"] == "_x.ai/session/update";
+        let update = &value["params"]["update"];
+        let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+        if xai
+            && kind == "rewind_marker"
+            && let Some(target) = update["target_prompt_index"].as_u64()
+        {
+            let target = target as usize;
+            live.truncate(prompt_starts.get(target).copied().unwrap_or(live.len()));
+            prompt_starts.truncate(target);
+            in_user = false;
+            continue;
+        }
+        if !xai && kind == "user_message_chunk" && update["_meta"]["hostTurn"] != true {
+            let index = update["_meta"]["promptIndex"].as_u64();
+            seen_index |= index.is_some();
+            let new_run = !in_user || ((seen_index || index.is_some()) && index != run_index);
+            if new_run {
+                run_index = index;
+                if !seen_index || index.is_some() {
+                    prompt_starts.push(live.len());
+                }
+            }
+            in_user = true;
+        } else {
+            in_user = false;
+        }
+        live.push(line);
+    }
+    live
 }
 
 fn text_of(content: &Value) -> String {
@@ -153,7 +214,7 @@ pub(crate) fn parse_grok_updates_jsonl(
         }
     };
 
-    for line in content.lines() {
+    for line in live_lines(&content) {
         let Ok(root) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
@@ -226,7 +287,8 @@ pub(crate) fn parse_grok_updates_jsonl(
                     .get("stop_reason")
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn");
-                if reason != "end_turn" {
+                // An interrupt (`cancelled`) is the user's choice, not an error.
+                if !matches!(reason, "end_turn" | "cancelled") {
                     turn.ended_on_error = true;
                     turn.errors.push(json!({ "stop_reason": reason }));
                 }
@@ -323,7 +385,7 @@ mod tests {
             result("a", "completed", "file.txt"),
             call("b", "false"),
             result("b", "failed", "exit 1"),
-            update(json!({"sessionUpdate": "turn_completed", "stop_reason": "cancelled"})),
+            update(json!({"sessionUpdate": "turn_completed", "stop_reason": "rate_limit"})),
         ];
         let exchanges = parse(&lines, true);
         let turn = &exchanges[0];
@@ -336,5 +398,61 @@ mod tests {
         assert!(turn.ended_on_error);
         assert_eq!(turn.errors.len(), 2);
         assert!(parse(&lines, false)[0].tools[0].output.is_none());
+
+        let interrupted = [
+            chunk("user_message_chunk", "go"),
+            update(json!({"sessionUpdate": "turn_completed", "stop_reason": "cancelled"})),
+        ];
+        let turn = &parse(&interrupted, false)[0];
+        assert!(!turn.ended_on_error);
+        assert!(turn.errors.is_empty());
+    }
+
+    #[test]
+    fn rewound_turns_are_dropped() {
+        let user = |text: &str, index: u64| {
+            json!({"method": "session/update", "params": {"update": {
+                "sessionUpdate": "user_message_chunk", "content": {"text": text},
+                "_meta": {"promptIndex": index}}}})
+            .to_string()
+        };
+        let end = || update(json!({"sessionUpdate": "turn_completed", "stop_reason": "end_turn"}));
+        let rewind = |target: u64| {
+            json!({"method": "_x.ai/session/update", "params": {"update": {
+                "sessionUpdate": "rewind_marker", "target_prompt_index": target}}})
+            .to_string()
+        };
+        let lines = [
+            user("first", 0),
+            end(),
+            user("abandoned", 1),
+            chunk("agent_message_chunk", "gone"),
+            end(),
+            rewind(1),
+            user("retry", 1),
+            end(),
+        ];
+        let exchanges = parse(&lines, false);
+        let users: Vec<&str> = exchanges.iter().map(|e| e.user.as_str()).collect();
+        assert_eq!(users, ["first", "retry"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn long_cwds_are_found_by_session_id() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let home = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("GROK_HOME", home.path()) };
+        let long = format!("/{}", "a".repeat(300));
+        let hashed = home.path().join("sessions/aaaa-0123456789abcdef/s1");
+        std::fs::create_dir_all(&hashed).unwrap();
+        assert_eq!(
+            session_transcript_path(&long, "s1"),
+            hashed.join("updates.jsonl")
+        );
+        assert_eq!(
+            session_transcript_path("/a b", "s2"),
+            home.path().join("sessions/%2Fa%20b/s2/updates.jsonl")
+        );
     }
 }

@@ -706,7 +706,9 @@ impl Tracker {
 
 /// A queued batch awaiting evidence that Grok ran it.
 struct InFlight {
-    request_id: u64,
+    /// The `session/prompt` request on the current connection; `None` once
+    /// that connection is gone (ids restart on the next one).
+    request_id: Option<u64>,
     session: String,
     prompt_id: String,
     /// The exact prompt text. It carries the batch's message ids, so it
@@ -719,10 +721,17 @@ struct InFlight {
     /// the prompt ahead of it (which then runs its text). Only a combined-turn
     /// snapshot tells them apart, and it may arrive after the response.
     removed_at: Option<Instant>,
+    /// When the ACP connection that queued it dropped. Grok keeps a queued
+    /// prompt when its client disconnects, so the batch is followed through
+    /// the reconnected client's queue snapshots, not treated as dropped.
+    detached_at: Option<Instant>,
 }
 
 /// How long to wait after `removedFromQueue` for the snapshot showing a merge.
 const MERGE_EVIDENCE_WAIT: Duration = Duration::from_secs(2);
+/// How long a batch whose connection dropped waits for a queue snapshot
+/// before the transcript decides.
+const DETACHED_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -740,9 +749,21 @@ fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
     let merged = params["runningCombinedTexts"]
         .as_array()
         .is_some_and(|texts| texts.iter().any(|t| t.as_str() == Some(&flight.text)));
+    if running || merged {
+        return Some(Outcome::Delivered);
+    }
+    // After a reconnect nothing else will report it: still listed means
+    // still queued; gone means it ran (the transcript will show it) or was
+    // removed.
+    if flight.detached_at.is_some() {
+        let queued = params["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|e| e["id"] == flight.prompt_id));
+        return (!queued).then(|| Outcome::Dropped("gone from Grok's queue".into()));
+    }
     // Absence proves nothing, even after `removedFromQueue`: the merge
     // snapshot can come later. `MERGE_EVIDENCE_WAIT` decides that case.
-    (running || merged).then_some(Outcome::Delivered)
+    None
 }
 
 /// Whether the session transcript shows the prompt text as sent: durable
@@ -752,16 +773,20 @@ fn ran_in_transcript(path: &std::path::Path, text: &str) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
-    content.lines().rev().any(|line| {
-        line.contains("user_message_chunk")
-            && serde_json::from_str::<Value>(line).is_ok_and(|value| {
-                let update = &value["params"]["update"];
-                update["sessionUpdate"] == "user_message_chunk"
-                    && update["content"]["text"]
-                        .as_str()
-                        .is_some_and(|sent| sent.contains(text))
-            })
-    })
+    // Only the live branch: a rewound batch is gone from the agent's context.
+    crate::transcript::grok::live_lines(&content)
+        .into_iter()
+        .rev()
+        .any(|line| {
+            line.contains("user_message_chunk")
+                && serde_json::from_str::<Value>(line).is_ok_and(|value| {
+                    let update = &value["params"]["update"];
+                    update["sessionUpdate"] == "user_message_chunk"
+                        && update["content"]["text"]
+                            .as_str()
+                            .is_some_and(|sent| sent.contains(text))
+                })
+        })
 }
 
 /// What the `session/prompt` response proves. `None`: removed from the queue,
@@ -1014,7 +1039,8 @@ pub(super) fn run(
                         },
                         None => {
                             if let Some(flight) = in_flight.as_mut()
-                                && id == Some(flight.request_id)
+                                && id.is_some()
+                                && id == flight.request_id
                             {
                                 outcome = response_outcome(&value);
                                 if outcome.is_none() {
@@ -1126,8 +1152,9 @@ pub(super) fn run(
         if let Some(error) = closed {
             client = None;
             retry_at = Instant::now() + Duration::from_secs(1);
-            if in_flight.is_some() && outcome.is_none() {
-                outcome = Some(Outcome::Dropped(format!("{error} before the prompt ran")));
+            if let Some(flight) = in_flight.as_mut() {
+                flight.request_id = None;
+                flight.detached_at.get_or_insert_with(Instant::now);
             }
             log_warn("native", "grok.acp.disconnected", &error);
         }
@@ -1138,6 +1165,16 @@ pub(super) fn run(
                 .is_some_and(|at| at.elapsed() >= MERGE_EVIDENCE_WAIT)
         {
             outcome = Some(Outcome::Dropped("removed from Grok's queue".into()));
+        }
+        if outcome.is_none()
+            && in_flight
+                .as_ref()
+                .and_then(|flight| flight.detached_at)
+                .is_some_and(|at| at.elapsed() >= DETACHED_WAIT)
+        {
+            outcome = Some(Outcome::Dropped(
+                "no queue evidence after reconnecting".into(),
+            ));
         }
         if let Some(outcome) = outcome
             && let Some(flight) = in_flight.take()
@@ -1242,7 +1279,7 @@ pub(super) fn run(
                         .cloned()
                         .unwrap_or_else(|| instance.directory.clone());
                     in_flight = Some(InFlight {
-                        request_id,
+                        request_id: Some(request_id),
                         transcript: crate::transcript::grok::session_transcript_path(
                             &cwd, &session,
                         ),
@@ -1251,6 +1288,7 @@ pub(super) fn run(
                         text: prepared.formatted,
                         ack: prepared.ack,
                         removed_at: None,
+                        detached_at: None,
                     });
                 }
                 Err(error) => {
@@ -1274,7 +1312,7 @@ mod tests {
 
     fn flight(removed: bool) -> InFlight {
         InFlight {
-            request_id: 4,
+            request_id: Some(4),
             session: "s".into(),
             prompt_id: "hcom-1".into(),
             text: BATCH.into(),
@@ -1287,6 +1325,7 @@ mod tests {
                 mark_announced: false,
             },
             removed_at: removed.then(Instant::now),
+            detached_at: None,
         }
     }
 
@@ -1329,6 +1368,22 @@ mod tests {
             queue_outcome(&merged, &flight(true)),
             Some(Outcome::Delivered)
         );
+    }
+
+    #[test]
+    fn detached_batch_follows_the_reconnected_queue() {
+        let mut detached = flight(false);
+        detached.detached_at = Some(Instant::now());
+        let still_queued = json!({"sessionId": "s", "runningPromptId": "user-1",
+                                  "entries": [{"id": "hcom-1"}]});
+        assert_eq!(queue_outcome(&still_queued, &detached), None);
+        let running = json!({"sessionId": "s", "runningPromptId": "hcom-1", "entries": []});
+        assert_eq!(queue_outcome(&running, &detached), Some(Outcome::Delivered));
+        let gone = json!({"sessionId": "s", "runningPromptId": "user-2", "entries": []});
+        assert!(matches!(
+            queue_outcome(&gone, &detached),
+            Some(Outcome::Dropped(_))
+        ));
     }
 
     #[test]
