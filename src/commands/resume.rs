@@ -1135,6 +1135,10 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < original.len() {
         let token = &original[i];
+        // The launch prompt follows `--`, whatever it looks like: drop it all.
+        if token == "--" {
+            break;
+        }
         if is_flag(token) {
             let lower = token.to_lowercase();
             let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
@@ -2337,11 +2341,14 @@ fn build_adopt_plan(
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
-                 - Grok:     ~/.grok/sessions/*/{sid}/updates.jsonl\n  \
+                 - Grok:     {grok}/*/{sid}/updates.jsonl\n  \
                  - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
                  - Pi:       ~/.pi/agent/sessions/**/*{sid}*.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
+                grok = crate::transcript::grok::grok_config_dir()
+                    .join("sessions")
+                    .display(),
                 short = session_id.split('-').next().unwrap_or(session_id),
             )
         }
@@ -3814,6 +3821,14 @@ mod tests {
         let merged = merge_resume_args("grok", &original, &resume);
         assert!(!merged.iter().any(|t| t == "-w" || t == "mytree"));
         assert!(merged.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_prompt_after_separator() {
+        let original = s(&["--model", "grok-4", "--", "-x looks like a flag"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert_eq!(merged, s(&["--resume", "sess-1", "--model", "grok-4"]));
     }
 
     #[test]

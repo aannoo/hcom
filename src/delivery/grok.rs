@@ -146,7 +146,7 @@ impl Launch {
     ///
     /// Grok leaders run with `--no-exit-on-disconnect` (they are meant to be
     /// shared), so this one would outlive the agent. The leader writes its
-    /// PID to `<socket>.lock`.
+    /// PID to the socket's sibling `.lock` (`x.sock` -> `x.lock`).
     pub(crate) fn stop_leader(&self) {
         let socket = std::path::Path::new(&self.socket);
         let lock = socket.with_extension("lock");
@@ -942,7 +942,9 @@ pub(super) fn run(
             tool: &config.tool,
             host_label,
         });
-        if client.is_some() && tracker.bound.is_some() {
+        // Ready once the bound session is loaded: until then it is not
+        // subscribed and nothing can be delivered.
+        if client.is_some() && tracker.bound.as_ref().is_some_and(|s| loaded.contains(s)) {
             super::drive_launch_outcome(
                 db,
                 state,
