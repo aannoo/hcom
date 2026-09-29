@@ -125,9 +125,12 @@ pub(crate) fn parse_grok_updates_jsonl(
             continue;
         };
         if let Some(ts) = root.get("timestamp").and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_i64().map(|n| n.to_string()))
+            v.as_str().map(str::to_string).or_else(|| {
+                v.as_i64().and_then(|seconds| {
+                    chrono::DateTime::from_timestamp(seconds, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                })
+            })
         }) {
             timestamp = ts;
         }
@@ -247,6 +250,19 @@ mod tests {
         assert_eq!(exchanges[0].action, "Hello world");
         assert_eq!(exchanges[1].position, 2);
         assert!(!exchanges[0].ended_on_error);
+    }
+
+    #[test]
+    fn numeric_timestamps_use_utc_iso_format_for_timeline() {
+        let lines = [
+            json!({"timestamp": 1790689536, "params": {"update": {
+                "sessionUpdate": "user_message_chunk", "content": {"text": "go"}
+            }}})
+            .to_string(),
+            update(json!({"sessionUpdate": "turn_completed"})),
+        ];
+        let exchanges = parse(&lines, false);
+        assert_eq!(exchanges[0].timestamp, "2026-09-29T13:45:36Z");
     }
 
     #[test]
