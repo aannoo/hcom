@@ -556,7 +556,18 @@ fn kill_single(
     // Resolve display name
     let name = identity::resolve_display_name(db, target).unwrap_or_else(|| target.to_string());
 
-    let inst = match db.get_instance_full(&name)? {
+    // A PID may name a live row: a PTY that rejoined gets its pid back on claim.
+    let mut found = db.get_instance_full(&name)?;
+    if found.is_none()
+        && let Ok(pid) = target.parse::<i64>()
+    {
+        found = db
+            .iter_instances_full()?
+            .into_iter()
+            .find(|inst| inst.pid == Some(pid));
+    }
+    let name = found.as_ref().map_or(name, |inst| inst.name.clone());
+    let inst = match found {
         Some(inst) => inst,
         None => {
             // Check orphans

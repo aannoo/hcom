@@ -404,7 +404,6 @@ fn adopt_orphan(
     orphan: &OrphanProcess,
     instance_name: &str,
 ) -> Result<(), String> {
-    attach_runtime_state(db, orphan, instance_name)?;
     if !orphan.process_id.is_empty()
         && db
             .get_process_binding(&orphan.process_id)
@@ -416,55 +415,18 @@ fn adopt_orphan(
         db.set_process_binding(&orphan.process_id, &orphan.session_id, instance_name)
             .map_err(|e| format!("failed to set process binding: {}", e))?;
     }
-    Ok(())
+    attach_runtime_state(db, orphan, instance_name)
 }
 
-/// Point a row at a tracked PTY: pid, terminal context and notify endpoints.
+/// Point a row at a tracked PTY: notify endpoints, terminal context and pid.
+///
+/// The pid is written last and must succeed: once a row has it, the pidfile
+/// entry is dropped, so every other route to the process has to be in place.
 fn attach_runtime_state(
     db: &crate::db::HcomDb,
     orphan: &OrphanProcess,
     instance_name: &str,
 ) -> Result<(), String> {
-    let mut updates = serde_json::Map::new();
-    updates.insert("pid".into(), serde_json::json!(orphan.pid));
-    if !orphan.terminal_preset.is_empty() {
-        updates.insert(
-            "terminal_preset_effective".into(),
-            serde_json::json!(orphan.terminal_preset),
-        );
-    }
-    let mut launch_context = serde_json::Map::new();
-    if !orphan.process_id.is_empty() {
-        launch_context.insert("process_id".into(), serde_json::json!(orphan.process_id));
-    }
-    if !orphan.pane_id.is_empty() {
-        launch_context.insert("pane_id".into(), serde_json::json!(orphan.pane_id));
-    }
-    if !orphan.terminal_id.is_empty() {
-        launch_context.insert("terminal_id".into(), serde_json::json!(orphan.terminal_id));
-    }
-    if !orphan.kitty_listen_on.is_empty() {
-        launch_context.insert(
-            "kitty_listen_on".into(),
-            serde_json::json!(orphan.kitty_listen_on),
-        );
-    }
-    if !orphan.zellij_session_name.is_empty() {
-        launch_context.insert(
-            "env".into(),
-            serde_json::json!({ "ZELLIJ_SESSION_NAME": orphan.zellij_session_name }),
-        );
-    }
-    if !launch_context.is_empty() {
-        updates.insert(
-            "launch_context".into(),
-            serde_json::json!(
-                serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())
-            ),
-        );
-    }
-    crate::instances::update_instance_position(db, instance_name, &updates);
-
     if orphan.notify_port != 0 {
         db.register_notify_port(instance_name, orphan.notify_port)
             .map_err(|e| format!("failed to register notify port: {}", e))?;
@@ -473,6 +435,53 @@ fn attach_runtime_state(
         db.register_inject_port(instance_name, orphan.inject_port)
             .map_err(|e| format!("failed to register inject port: {}", e))?;
     }
+
+    let mut updates = serde_json::Map::new();
+    updates.insert("pid".into(), serde_json::json!(orphan.pid));
+    if !orphan.terminal_preset.is_empty() {
+        updates.insert(
+            "terminal_preset_effective".into(),
+            serde_json::json!(orphan.terminal_preset),
+        );
+    }
+
+    // Merge into whatever a hook already captured (tty, env, git branch).
+    let existing = db
+        .get_instance_full(instance_name)
+        .map_err(|e| format!("failed to read instance '{}': {}", instance_name, e))?
+        .and_then(|row| row.launch_context)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.as_object().cloned());
+    let mut launch_context = existing.clone().unwrap_or_default();
+    for (key, value) in [
+        ("process_id", &orphan.process_id),
+        ("pane_id", &orphan.pane_id),
+        ("terminal_id", &orphan.terminal_id),
+        ("kitty_listen_on", &orphan.kitty_listen_on),
+    ] {
+        if !value.is_empty() {
+            launch_context.insert(key.into(), serde_json::json!(value));
+        }
+    }
+    if !orphan.zellij_session_name.is_empty() {
+        let env = launch_context
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}));
+        if !env.is_object() {
+            *env = serde_json::json!({});
+        }
+        env["ZELLIJ_SESSION_NAME"] = serde_json::json!(orphan.zellij_session_name);
+    }
+    if Some(&launch_context) != existing.as_ref() && !launch_context.is_empty() {
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(
+                serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())
+            ),
+        );
+    }
+    db.update_instance_fields(instance_name, &updates)
+        .map_err(|e| format!("failed to attach pid to '{}': {}", instance_name, e))?;
     Ok(())
 }
 

@@ -765,13 +765,19 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
         Some((ts, ref cached)) if ts.elapsed() < ORPHAN_CACHE_TTL => Some(cached.clone()),
         _ => None,
     });
-    let tracked = cached.unwrap_or_else(|| {
-        let tracked = read_tracked_ptys();
-        if let Ok(mut guard) = ORPHAN_CACHE.lock() {
-            *guard = Some((std::time::Instant::now(), tracked.clone()));
+    let tracked = match cached {
+        Some(tracked) => tracked,
+        None => {
+            // A missing or unreadable pidfile is retried on the next load.
+            let Some(tracked) = read_tracked_ptys() else {
+                return vec![];
+            };
+            if let Ok(mut guard) = ORPHAN_CACHE.lock() {
+                *guard = Some((std::time::Instant::now(), tracked.clone()));
+            }
+            tracked
         }
-        tracked
-    });
+    };
 
     // Ownership is checked on every call: the DB changes faster than the cache.
     let active_db_pids: Vec<u32> = conn
@@ -791,16 +797,10 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
         .collect()
 }
 
-fn read_tracked_ptys() -> Vec<TrackedPty> {
-    let content = match std::fs::read_to_string(paths::pidtrack_path()) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
+fn read_tracked_ptys() -> Option<Vec<TrackedPty>> {
+    let content = std::fs::read_to_string(paths::pidtrack_path()).ok()?;
     let pidmap: std::collections::HashMap<String, serde_json::Value> =
-        match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
+        serde_json::from_str(&content).ok()?;
 
     let mut tracked = Vec::new();
     for (pid_str, info) in &pidmap {
@@ -840,7 +840,7 @@ fn read_tracked_ptys() -> Vec<TrackedPty> {
             session_id: json_str(info, "session_id", "").to_string(),
         });
     }
-    tracked
+    Some(tracked)
 }
 
 // ── Timeline ────────────────────────────────────────────────────
