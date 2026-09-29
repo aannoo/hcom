@@ -656,6 +656,8 @@ struct InFlight {
     /// identifies this batch inside a combined turn.
     text: String,
     ack: DeliveryAck,
+    /// The session's `updates.jsonl`, checked before re-queueing.
+    transcript: std::path::PathBuf,
     /// When Grok answered `removedFromQueue`: either removed, or merged into
     /// the prompt ahead of it (which then runs its text). Only a combined-turn
     /// snapshot tells them apart, and it may arrive after the response.
@@ -681,13 +683,28 @@ fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
     let merged = params["runningCombinedTexts"]
         .as_array()
         .is_some_and(|texts| texts.iter().any(|t| t.as_str() == Some(&flight.text)));
-    if running || merged {
-        Some(Outcome::Delivered)
-    } else if flight.removed_at.is_some() {
-        Some(Outcome::Dropped("removed from Grok's queue".into()))
-    } else {
-        None
-    }
+    // Absence proves nothing, even after `removedFromQueue`: the merge
+    // snapshot can come later. `MERGE_EVIDENCE_WAIT` decides that case.
+    (running || merged).then_some(Outcome::Delivered)
+}
+
+/// Whether the session transcript shows the prompt text as sent: durable
+/// proof it ran when the live evidence was lost (bridge disconnect, a merge
+/// snapshot that never arrived).
+fn ran_in_transcript(path: &std::path::Path, text: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.lines().rev().any(|line| {
+        line.contains("user_message_chunk")
+            && serde_json::from_str::<Value>(line).is_ok_and(|value| {
+                let update = &value["params"]["update"];
+                update["sessionUpdate"] == "user_message_chunk"
+                    && update["content"]["text"]
+                        .as_str()
+                        .is_some_and(|sent| sent.contains(text))
+            })
+    })
 }
 
 /// What the `session/prompt` response proves. `None`: removed from the queue,
@@ -1051,6 +1068,12 @@ pub(super) fn run(
         if let Some(outcome) = outcome
             && let Some(flight) = in_flight.take()
         {
+            let outcome = match outcome {
+                Outcome::Dropped(_) if ran_in_transcript(&flight.transcript, &flight.text) => {
+                    Outcome::Delivered
+                }
+                other => other,
+            };
             match outcome {
                 Outcome::Delivered => {
                     common::commit_delivery_ack(db, &flight.ack);
@@ -1142,8 +1165,18 @@ pub(super) fn run(
                             prepared.ack.last_event_id
                         ),
                     );
+                    let cwd = tracker
+                        .resident
+                        .as_ref()
+                        .and_then(|resident| resident.get(&session))
+                        .filter(|cwd| !cwd.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| instance.directory.clone());
                     in_flight = Some(InFlight {
                         request_id,
+                        transcript: crate::transcript::grok::session_transcript_path(
+                            &cwd, &session,
+                        ),
                         session,
                         prompt_id,
                         text: prepared.formatted,
@@ -1176,6 +1209,7 @@ mod tests {
             session: "s".into(),
             prompt_id: "hcom-1".into(),
             text: BATCH.into(),
+            transcript: std::path::PathBuf::new(),
             ack: DeliveryAck {
                 instance_name: "nova".into(),
                 last_event_id: 7,
@@ -1213,10 +1247,8 @@ mod tests {
     fn removed_prompt_is_delivered_only_if_merged_into_the_running_turn() {
         let unrelated = json!({"sessionId": "s", "runningPromptId": "user-1",
                                "runningCombinedTexts": ["fix it", "and test it"], "entries": []});
-        assert!(matches!(
-            queue_outcome(&unrelated, &flight(true)),
-            Some(Outcome::Dropped(_))
-        ));
+        // Not yet: a later snapshot may still show the merge.
+        assert_eq!(queue_outcome(&unrelated, &flight(true)), None);
         let merged = json!({"sessionId": "s", "runningPromptId": "user-1",
                             "runningCombinedTexts": ["fix it", BATCH], "entries": []});
         // The merge snapshot may arrive before or after the removal response.
@@ -1228,6 +1260,23 @@ mod tests {
             queue_outcome(&merged, &flight(true)),
             Some(Outcome::Delivered)
         );
+    }
+
+    #[test]
+    fn transcript_proves_a_batch_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        let chunk = |text: &str| {
+            json!({"method": "session/update", "params": {"update": {
+                "sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": text}}}})
+            .to_string()
+        };
+        std::fs::write(&path, format!("{}\n", chunk("fix it"))).unwrap();
+        assert!(!ran_in_transcript(&path, BATCH));
+        // Merged into a combined turn.
+        std::fs::write(&path, format!("{}\n", chunk(&format!("fix it\n\n{BATCH}")))).unwrap();
+        assert!(ran_in_transcript(&path, BATCH));
+        assert!(!ran_in_transcript(&dir.path().join("missing"), BATCH));
     }
 
     #[test]

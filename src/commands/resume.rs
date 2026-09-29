@@ -1076,7 +1076,6 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
     const VALUE_FLAGS: &[&str] = &[
         "--model",
         "-m",
-        "--cwd",
         "--rules",
         "--agent",
         "--permission-mode",
@@ -1093,7 +1092,9 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
         "--agents",
         "--json-schema",
     ];
+    // `--cwd`: hcom already starts a resume/fork in the right directory.
     const DROP_WITH_VALUE: &[&str] = &[
+        "--cwd",
         "--resume",
         "-r",
         "--session-id",
@@ -3786,6 +3787,14 @@ mod tests {
         assert!(merged.contains(&"--rules".to_string()));
         assert!(merged.contains(&"BOOT".to_string()));
         assert!(merged.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_cwd() {
+        let original = s(&["--cwd", "/old", "--model", "grok-build"]);
+        let merged = merge_resume_args("grok", &original, &s(&["--resume", "sess-1"]));
+        assert!(!merged.iter().any(|arg| arg == "--cwd" || arg == "/old"));
+        assert!(merged.contains(&"grok-build".to_string()));
     }
 
     #[test]
