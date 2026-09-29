@@ -715,8 +715,8 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
 
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
-/// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
-/// print the full message in the TUI. Gemini, Antigravity, and OpenCode bootstrap
+/// Claude and Codex inject the plain `<hcom>` trigger because their hooks show
+/// the full message in the TUI. Gemini, Antigravity, and OpenCode bootstrap
 /// need a human-visible prompt line, but it must stay prompt-safe: metadata only,
 /// no message body, no `@` autocomplete triggers, and no wrapping. If the compact
 /// preview will not fit the current input width, use the same minimal trigger.
@@ -1005,6 +1005,10 @@ pub struct ScreenState {
     /// set. Only ever true for Claude (see `ScreenTracker::is_claude_subagent_nav_visible`
     /// / `is_claude_session_switcher_visible`).
     pub nav_overlay: bool,
+    /// Codex is still starting with nothing to answer (see
+    /// `ScreenTracker::is_codex_startup_loading`); the launch-blocked heuristic
+    /// waits it out rather than reading a quiet loading screen as settled.
+    pub startup_loading: bool,
 }
 
 impl Default for ScreenState {
@@ -1021,6 +1025,7 @@ impl Default for ScreenState {
             last_prompt_submit: None,
             approval_scrape_latched: false,
             nav_overlay: false,
+            startup_loading: false,
         }
     }
 }
@@ -1374,6 +1379,9 @@ fn maybe_emit_launch_blocked(
     }
 
     let screen = state.screen.read().unwrap();
+    if screen.startup_loading {
+        return;
+    }
     let tail_text = screen.visible_tail.as_deref().unwrap_or("");
     // Gemini's animated startup banner keeps emitting output for ~60s, defeating
     // the settle heuristic. Its trust prompt is distinctive — fire immediately
@@ -1917,7 +1925,7 @@ pub fn run_delivery_loop(
                             continue;
                         }
 
-                        // Claude/Codex hooks show full delivery in the TUI, so
+                        // Claude/Codex hooks show the full delivery in the TUI, so
                         // they only need a trigger. Gemini-style paths use a
                         // compact, prompt-safe preview for human visibility.
                         use crate::tool::Tool;
@@ -2539,37 +2547,45 @@ fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &s
 }
 
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
+///
+/// Publishes through the same atomic delete gate as `stop_instance`, so a
+/// concurrent `hcom kill` and this cleanup produce exactly one stopped event.
 pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
-    let snapshot = match db.get_instance_snapshot(current_name) {
-        Ok(Some(snap)) => Some(snap),
-        Ok(None) => {
-            log_info(
-                "native",
-                "delivery.cleanup_skipped",
-                &format!(
-                    "Skipping PTY stop event for {} because the instance row is already gone",
-                    current_name
-                ),
-            );
-            return;
-        }
+    let skip = |why: &str| {
+        log_info(
+            "native",
+            "delivery.cleanup_skipped",
+            &format!("Skipping PTY stop event for {current_name} because {why}"),
+        );
+    };
+    let inst = match db.get_instance_full(current_name) {
+        Ok(Some(inst)) => inst,
+        Ok(None) => return skip("the instance row is already gone"),
         Err(e) => {
             log_error(
                 "native",
                 "delivery.cleanup",
-                &format!("DB error getting instance snapshot: {}", e),
+                &format!("DB error loading instance {current_name}: {e}"),
             );
-            None
+            return;
         }
     };
+    let snapshot = db.get_instance_snapshot(current_name).ok().flatten();
 
-    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    // `hcom kill` records exit:killed + its initiator before signalling.
+    let kill_recorded = inst.status_context == "exit:killed";
+    let was_killed = kill_recorded || EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
         ("exit:killed", "killed")
     } else {
         ("exit:closed", "closed")
     };
-    if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
+    let by = if kill_recorded && !inst.status_detail.is_empty() {
+        inst.status_detail.clone()
+    } else {
+        "pty".to_string()
+    };
+    if !kill_recorded && let Err(e) = db.set_status(current_name, "inactive", exit_context) {
         log_warn(
             "native",
             "delivery.set_status_fail",
@@ -2577,25 +2593,31 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         );
     }
 
-    if let Err(e) = db.delete_notify_endpoints(current_name) {
-        log_warn(
-            "native",
-            "delivery.cleanup_endpoints_fail",
-            &format!("{}", e),
-        );
-    }
     if let Err(e) = db.cleanup_subscriptions(current_name) {
         log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
     }
-    if let Err(e) = db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot) {
-        log_warn(
+    let mut event_data = serde_json::json!({
+        "action": "stopped",
+        "by": by,
+        "reason": exit_reason,
+    });
+    if let Some(snapshot) = snapshot {
+        event_data["snapshot"] = snapshot;
+    }
+    match db.finalize_instance_stop(
+        current_name,
+        inst.created_at,
+        inst.session_id.as_deref(),
+        inst.agent_id.as_deref(),
+        &event_data,
+    ) {
+        Ok(true) => {}
+        Ok(false) => skip("another stop finalized it first"),
+        Err(e) => log_warn(
             "native",
             "delivery.life_event_fail",
-            &format!("Failed to log life event: {}", e),
-        );
-    }
-    if let Err(e) = db.delete_instance(current_name) {
-        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+            &format!("Failed to finalize stop for {current_name}: {e}"),
+        ),
     }
 }
 
@@ -2665,6 +2687,7 @@ mod tests {
             last_prompt_submit: None,
             approval_scrape_latched: false,
             nav_overlay: false,
+            startup_loading: false,
         }
     }
 
@@ -2756,6 +2779,43 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn pty_cleanup_keeps_kill_reason_and_initiator_with_single_stop_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('kiro', 'codex', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+        // `hcom kill` records the reason before signalling; the PTY cleanup
+        // can then win the race without having seen the signal itself.
+        db.mark_killed("kiro", "samu").unwrap();
+
+        cleanup_deleted_instance(&mut db, "kiro");
+        // The kill path's own finalize loses the gate and logs nothing.
+        crate::hooks::common::stop_instance(&db, "kiro", "samu", "killed");
+
+        let stops: Vec<(String, String)> = db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = 'kiro'
+                   AND json_extract(data, '$.action') = 'stopped'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(stops, vec![("samu".to_string(), "killed".to_string())]);
+        assert!(db.get_instance_full("kiro").unwrap().is_none());
     }
 
     #[test]

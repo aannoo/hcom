@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::bootstrap;
@@ -15,6 +16,7 @@ use crate::shared::context::HcomContext;
 
 use super::common;
 use super::common::finalize_session;
+use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
 
 fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
     argv.iter()
@@ -341,6 +343,14 @@ pub fn dispatch_pi_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
 pub const PLUGIN_SOURCE: &str = include_str!("../pi_plugin/hcom.ts");
 const PLUGIN_FILENAME: &str = "hcom.ts";
 
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &["-e", "--extension"],
+    strip_legacy_args: None,
+};
+
 fn current_home_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(std::path::PathBuf::from)
@@ -366,38 +376,55 @@ pub fn get_pi_plugin_path() -> std::path::PathBuf {
     pi_plugin_dir().join(PLUGIN_FILENAME)
 }
 
-fn plugin_matches_source(path: &std::path::Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(content) => content == PLUGIN_SOURCE,
-        Err(_) => false,
+fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
+    let agent_dir = ctx.path_var("PI_CODING_AGENT_DIR").unwrap_or_else(|| {
+        ctx.var("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_default()
+            .join(".pi")
+            .join("agent")
+    });
+    agent_dir.join("extensions").join(PLUGIN_FILENAME)
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    let path = runtime::publish_file("pi", PLUGIN_FILENAME, PLUGIN_SOURCE.as_bytes())
+        .context("Cannot publish Pi runtime extension")?;
+    let mut args = ctx.args.clone();
+    runtime::insert_before_separator(
+        &mut args,
+        ["-e".to_string(), path.to_string_lossy().into_owned()],
+    );
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+/// Legacy installs went to the launch's agent dir, or to `<tool root>/.pi/`
+/// under a project-local HCOM_DIR ([`get_pi_plugin_path`]); check both.
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    let mut paths = vec![effective_plugin_path(ctx)];
+    let installer_path = get_pi_plugin_path();
+    if !paths.contains(&installer_path) {
+        paths.push(installer_path);
     }
+    crate::hooks::runtime::remove_owned_files(paths, is_hcom_owned)
 }
 
-pub fn verify_pi_plugin_installed() -> bool {
-    plugin_matches_source(&get_pi_plugin_path())
+/// True when `path` holds an hcom Pi plugin: the current source or any earlier
+/// version (all carry the `hcom-bootstrap` message type).
+pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
+    crate::hooks::runtime::file_is_hcom_owned(path, |content| {
+        content == PLUGIN_SOURCE || content.contains("customType: \"hcom-bootstrap\"")
+    })
 }
 
-pub fn install_pi_plugin() -> std::io::Result<bool> {
-    let target_dir = pi_plugin_dir();
-    let target = target_dir.join(PLUGIN_FILENAME);
-    std::fs::create_dir_all(&target_dir)?;
-    if target.is_symlink() || target.exists() {
-        std::fs::remove_file(&target)?;
-    }
-    std::fs::write(&target, PLUGIN_SOURCE)?;
-    Ok(true)
-}
-
-pub fn ensure_pi_plugin_installed() -> bool {
-    if verify_pi_plugin_installed() {
-        return true;
-    }
-    install_pi_plugin().unwrap_or(false)
-}
-
+/// Remove hcom's plugin file. A user file with the same name is left alone.
 pub fn remove_pi_plugin() -> std::io::Result<()> {
     let path = get_pi_plugin_path();
-    if path.exists() {
+    if is_hcom_owned(&path)? {
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -464,6 +491,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_stops_only_on_quit() {
+        assert!(PLUGIN_SOURCE.contains("event.reason === undefined || event.reason === \"quit\""));
+        assert!(PLUGIN_SOURCE.contains("if (instanceName && terminal)"));
+    }
+
+    #[test]
     fn plugin_delivery_reports_active_edge() {
         assert!(PLUGIN_SOURCE.contains("reportStatus(ctx, \"active\""));
         assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));
@@ -505,6 +538,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(accepted);
+
+        cleanup(path);
+    }
+
+    /// reload/new keep the process alive and skip pi-stop, so the next pi-start
+    /// must rebind the same identity through the process binding.
+    #[test]
+    fn start_handler_keeps_identity_across_same_process_session_restart() {
+        let (db, path) = setup_test_db();
+        let temp = tempfile::TempDir::new().unwrap();
+        save_test_instance(&db, "soba", ST_LISTENING);
+        db.set_process_binding("pid-1", "", "soba").unwrap();
+
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".to_string(), "pid-1".to_string()),
+            ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+            ("HCOM_TOOL".to_string(), "pi".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+        let start = |sid: &str| {
+            let (code, output) = handle_start(&ctx, &db, &["--session-id".into(), sid.into()]);
+            assert_eq!(code, 0);
+            serde_json::from_str::<Value>(&output).unwrap()["name"]
+                .as_str()
+                .map(str::to_string)
+        };
+
+        // initial bind, /reload (same session), /new (fresh session)
+        for sid in ["sid-1", "sid-1", "sid-2"] {
+            assert_eq!(start(sid).as_deref(), Some("soba"));
+            let inst = db.get_instance_full("soba").unwrap().unwrap();
+            assert_eq!(inst.session_id.as_deref(), Some(sid));
+            assert_eq!(
+                db.get_session_binding(sid).unwrap().as_deref(),
+                Some("soba")
+            );
+        }
 
         cleanup(path);
     }
@@ -567,5 +637,75 @@ mod tests {
         assert_eq!(rebound.directory, temp.path().to_string_lossy());
 
         cleanup(path);
+    }
+
+    #[test]
+    fn test_is_hcom_owned_matches_hcom_plugins_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current.ts");
+        let older = dir.path().join("older.ts");
+        let user = dir.path().join("user.ts");
+        std::fs::write(&current, PLUGIN_SOURCE).unwrap();
+        std::fs::write(&older, "sendMessage({ customType: \"hcom-bootstrap\" })").unwrap();
+        std::fs::write(&user, "export default function mine() {}").unwrap();
+        assert!(is_hcom_owned(&current).unwrap());
+        assert!(is_hcom_owned(&older).unwrap());
+        assert!(!is_hcom_owned(&user).unwrap());
+        assert!(!is_hcom_owned(&dir.path().join("missing.ts")).unwrap());
+        // Something unreadable in the way is an error, not "not ours".
+        assert!(is_hcom_owned(dir.path()).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn per_run_injection_uses_runtime_extension_before_separator() {
+        let (_dir, hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::Pi,
+            env: [("HOME".to_string(), home.to_string_lossy().into_owned())]
+                .into_iter()
+                .collect(),
+            cwd: home,
+            args: vec!["--model".into(), "x".into(), "--".into(), "prompt".into()],
+            auto_approve: false,
+        };
+        let injection = (PER_RUN.prepare)(&ctx).unwrap();
+        assert_eq!(&injection.args[..2], &["--model", "x"]);
+        assert_eq!(injection.args[2], "-e");
+        let path = std::path::Path::new(&injection.args[3]);
+        assert!(path.starts_with(hcom.join("integrations").join("pi")));
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("hcom.ts"));
+        assert_eq!(&injection.args[4..], &["--", "prompt"]);
+    }
+
+    #[test]
+    fn per_run_cleanup_uses_launch_env_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("work");
+        let plugin = cwd
+            .join("relative-agent")
+            .join("extensions")
+            .join("hcom.ts");
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, PLUGIN_SOURCE).unwrap();
+
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::Pi,
+            env: [
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+                (
+                    "PI_CODING_AGENT_DIR".to_string(),
+                    "relative-agent".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            cwd,
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        (PER_RUN.cleanup_legacy)(&ctx).unwrap();
+        assert!(!plugin.exists());
     }
 }

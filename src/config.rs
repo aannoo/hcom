@@ -205,7 +205,7 @@ const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r']
 use crate::shared::terminal_presets::TERMINAL_PRESETS;
 
 /// Valid codex sandbox modes.
-pub const VALID_SANDBOX_MODES: &[&str] = &["workspace", "untrusted", "danger-full-access", "none"];
+pub const VALID_SANDBOX_MODES: &[&str] = &["workspace", "danger-full-access", "none"];
 
 /// TOML file header comment.
 const TOML_HEADER: &str = "\
@@ -556,8 +556,10 @@ impl HcomConfig {
             "kimi_args" => self.kimi_args = value.to_string(),
             "copilot_args" => self.copilot_args = value.to_string(),
             "codex_sandbox_mode" => {
-                // Normalize legacy value
-                self.codex_sandbox_mode = if value == "full-auto" {
+                // Retired modes fall back to the default rather than turning an
+                // existing config into an error. `untrusted` relied on Codex's
+                // `-a untrusted`, which Codex 0.152 removed.
+                self.codex_sandbox_mode = if matches!(value, "full-auto" | "untrusted") {
                     "workspace".to_string()
                 } else {
                     value.to_string()
@@ -2006,10 +2008,12 @@ mod tests {
     }
 
     #[test]
-    fn test_set_field_full_auto_normalization() {
-        let mut config = HcomConfig::default();
-        config.set_field("codex_sandbox_mode", "full-auto").unwrap();
-        assert_eq!(config.codex_sandbox_mode, "workspace");
+    fn test_set_field_retired_sandbox_modes_normalize_to_workspace() {
+        for retired in ["full-auto", "untrusted"] {
+            let mut config = HcomConfig::default();
+            config.set_field("codex_sandbox_mode", retired).unwrap();
+            assert_eq!(config.codex_sandbox_mode, "workspace", "{retired}");
+        }
     }
 
     #[test]
@@ -2384,14 +2388,13 @@ auto_approve = false
     }
 
     #[test]
-    fn test_hcom_config_from_env_dict_with_full_auto() {
-        let mut data = HcomConfig::default().to_env_dict();
-        data.insert(
-            "HCOM_CODEX_SANDBOX_MODE".to_string(),
-            "full-auto".to_string(),
-        );
-        let config = HcomConfig::from_env_dict(&data).unwrap();
-        assert_eq!(config.codex_sandbox_mode, "workspace");
+    fn test_hcom_config_from_env_dict_with_retired_sandbox_modes() {
+        for retired in ["full-auto", "untrusted"] {
+            let mut data = HcomConfig::default().to_env_dict();
+            data.insert("HCOM_CODEX_SANDBOX_MODE".to_string(), retired.to_string());
+            let config = HcomConfig::from_env_dict(&data).unwrap();
+            assert_eq!(config.codex_sandbox_mode, "workspace", "{retired}");
+        }
     }
 
     #[test]

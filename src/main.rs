@@ -45,8 +45,26 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    // Hooks of an agent nested under an hcom-launched one must not act as it.
+    // Runs first: every later env reader should see only the child's view.
+    let nested = std::env::args()
+        .nth(1)
+        .and_then(|arg| tool::Tool::from_hook_name(&arg))
+        .and_then(shared::nested::scrub_inherited_identity);
+
     // Initialize global config from environment variables
     config::Config::init();
+
+    if let Some(nested) = nested {
+        log::log_info(
+            "identity",
+            "nested_agent.scrubbed",
+            &format!(
+                "child={} parent={}: ignoring inherited hcom identity",
+                nested.child, nested.parent
+            ),
+        );
+    }
 
     // Set custom panic hook to log to file instead of stderr (prevents TUI corruption)
     panic::set_hook(Box::new(|panic_info| {

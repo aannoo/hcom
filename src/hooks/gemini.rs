@@ -184,18 +184,11 @@ fn resolve_hook_directory(payload: &HookPayload, ctx: &HcomContext) -> Option<St
 /// Handle Gemini SessionStart hook.
 ///
 /// HCOM-launched: bind session_id, inject bootstrap if not announced.
-/// Vanilla: show hcom hint.
+/// Plain runs: no-op.
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    // Persistent hooks also fire in plain runs; stay out of those.
     if ctx.process_id.is_none() {
-        // Vanilla instance - show hint
-        return HookResult::Allow {
-            additional_context: Some(format!(
-                "[hcom available - run '{} start' to participate]",
-                crate::runtime_env::build_hcom_command()
-            )),
-            system_message: None,
-            delivery_ack: None,
-        };
+        return hook_noop();
     }
 
     let session_id = match payload.session_id.as_deref() {

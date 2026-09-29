@@ -379,6 +379,33 @@ fn retire_true_placeholder_after_canonical_bind(
     delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data);
 }
 
+/// Retire a live identity whose process switched to another session's identity.
+/// Unlike a launch placeholder it is a real agent row, so it is soft-stopped
+/// (kept, inactive) rather than deleted. The stopped event records its session so
+/// resuming that session later restores this identity instead of the current one.
+/// The process's pid and terminal context move to the new identity so
+/// `hcom kill <new>` still works and `hcom kill <old>` can't reach a process it
+/// no longer owns.
+fn retire_switched_identity(
+    db: &HcomDb,
+    name: &str,
+    new_name: &str,
+    old_data: Option<&InstanceRow>,
+) {
+    migrate_placeholder_runtime_state(db, new_name, old_data);
+    let mut clear_pid = serde_json::Map::new();
+    clear_pid.insert("pid".into(), serde_json::Value::Null);
+    update_instance_position(db, name, &clear_pid);
+    crate::hooks::common::soft_finalize_session(db, name, "session_switch", None, false);
+    if let Err(e) = db.delete_session_bindings_for_instance(name) {
+        crate::log::log_error(
+            "binding",
+            "session_switch.delete_session_bindings",
+            &format!("{e}"),
+        );
+    }
+}
+
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
 fn recreate_instance_from_placeholder(
     db: &HcomDb,
@@ -526,20 +553,7 @@ pub fn bind_session_to_process(
                         &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
                     );
                 }
-                crate::instance_lifecycle::set_status(
-                    db,
-                    ph_name,
-                    ST_INACTIVE,
-                    "exit:session_switch",
-                    Default::default(),
-                );
-                if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.delete_session_bindings",
-                        &format!("{e}"),
-                    );
-                }
+                retire_switched_identity(db, ph_name, canonical_name, placeholder_data.as_ref());
             }
         }
 
@@ -573,6 +587,17 @@ pub fn bind_session_to_process(
             session_id,
             placeholder_data.as_ref(),
         );
+        // Without a live placeholder there is nothing to restore into (e.g. the
+        // instance was stopped while its process kept running). Binding anyway
+        // would point the process at a missing row and report a bogus identity.
+        if db.get_instance_full(&stopped_name).ok().flatten().is_none() {
+            crate::log::log_warn(
+                "binding",
+                "restore_stopped.no_instance",
+                &format!("stopped_name={stopped_name}, session_id={session_id}"),
+            );
+            return None;
+        }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
@@ -599,6 +624,15 @@ pub fn bind_session_to_process(
             &stopped_name,
             placeholder_data.as_ref(),
         );
+        // Session switch into a stopped identity (e.g. Pi /resume): the process now
+        // belongs to stopped_name, so the identity it had must not stay listening.
+        if let Some(ph_name) = placeholder_name.as_ref()
+            && *ph_name != stopped_name
+            && placeholder_data.is_some()
+            && !is_true_launch_placeholder(placeholder_data.as_ref())
+        {
+            retire_switched_identity(db, ph_name, &stopped_name, placeholder_data.as_ref());
+        }
 
         return Some(stopped_name);
     }
@@ -1731,6 +1765,92 @@ mod tests {
         cleanup(path);
     }
 
+    /// A stopped instance whose process lost its binding has no row to restore
+    /// into: binding must fail rather than point the process at a missing row.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_without_placeholder_does_not_bind() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let snapshot = serde_json::json!({"session_id": "ses-pi-1", "tool": "pi"});
+        db.log_life_event("miro", "stopped", "session", "exit:reload", Some(snapshot))
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-pi-1", Some("pid-pi"));
+        assert_eq!(result, None);
+        assert!(db.get_instance_full("miro").unwrap().is_none());
+        assert_eq!(db.get_session_binding("ses-pi-1").unwrap(), None);
+        assert_eq!(db.get_process_binding("pid-pi").unwrap(), None);
+
+        cleanup(path);
+    }
+
+    /// A live process resuming another agent's stopped session takes that identity;
+    /// its previous identity is retired instead of left listening without a process.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_retires_switched_live_identity() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut nene = serde_json::Map::new();
+        nene.insert("name".into(), serde_json::json!("nene"));
+        nene.insert("tool".into(), serde_json::json!("pi"));
+        nene.insert("session_id".into(), serde_json::json!("ses-nene"));
+        nene.insert("created_at".into(), serde_json::json!(now));
+        nene.insert("status".into(), serde_json::json!("listening"));
+        nene.insert("pid".into(), serde_json::json!(4242));
+        db.save_instance_named("nene", &nene).unwrap();
+        db.rebind_session("ses-nene", "nene").unwrap();
+        db.set_process_binding("pid-pi", "ses-nene", "nene")
+            .unwrap();
+
+        let snapshot = serde_json::json!({"session_id": "ses-zumi", "tool": "pi"});
+        db.log_life_event("zumi", "stopped", "session", "exit:closed", Some(snapshot))
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-zumi", Some("pid-pi"));
+        assert_eq!(result, Some("zumi".to_string()));
+        assert_eq!(
+            db.get_process_binding("pid-pi").unwrap(),
+            Some("zumi".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-zumi").unwrap(),
+            Some("zumi".to_string())
+        );
+
+        let nene = db.get_instance_full("nene").unwrap().unwrap();
+        assert_eq!(nene.status, ST_INACTIVE);
+        assert_eq!(nene.status_context, "exit:session_switch");
+        assert_eq!(db.get_session_binding("ses-nene").unwrap(), None);
+        assert_eq!(nene.pid, None, "retired identity must not keep the process");
+        let zumi = db.get_instance_full("zumi").unwrap().unwrap();
+        assert_eq!(zumi.pid, Some(4242), "new identity must stay killable");
+
+        // Resuming the previous session switches back to its original identity.
+        let result = bind_session_to_process(&db, "ses-nene", Some("pid-pi"));
+        assert_eq!(result, Some("nene".to_string()));
+        assert_eq!(
+            db.get_process_binding("pid-pi").unwrap(),
+            Some("nene".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-nene").unwrap(),
+            Some("nene".to_string())
+        );
+        assert_eq!(db.get_session_binding("ses-zumi").unwrap(), None);
+        let nene = db.get_instance_full("nene").unwrap().unwrap();
+        assert_eq!(nene.pid, Some(4242));
+        let zumi = db.get_instance_full("zumi").unwrap().unwrap();
+        assert_eq!(zumi.status_context, "exit:session_switch");
+        assert_eq!(zumi.pid, None);
+
+        cleanup(path);
+    }
+
     #[test]
     #[serial]
     fn test_restore_stopped_migrates_pid_and_launch_context_to_canonical() {
@@ -2114,7 +2234,7 @@ mod tests {
     #[serial]
     fn new_row_honors_configured_hcom_timeout() {
         // Regression test for issue #71: a brand-new instance row (the path
-        // used by vanilla `hcom start`, launched, and resumed sessions) must
+        // used by adhoc `hcom start`, launched, and resumed sessions) must
         // carry the effective HCOM_TIMEOUT rather than silently falling back
         // to the old always-86400 schema default.
         let _env = EnvVarGuard::set("HCOM_TIMEOUT", "30");

@@ -6,14 +6,14 @@
 #   2. Calibrator = Fresh instance, analyzes transcript only (baseline)
 #   3. Judge = Compares both reports, sends verdict
 #
-# Fork mode (--fork, Claude only):
+# Fork mode (--fork, tools that support hcom f):
 #   1. Confessor = Fork with full memory
 #   2. Calibrator = Fresh instance
 #   3. Judge = Compares both reports
 #
 # Usage: hcom run confess                         # I confess, 2 agents spawned
 #        hcom run confess --task "specific task"  # evaluate specific task
-#        hcom run confess --fork                  # use fork (Claude only, 3 agents)
+#        hcom run confess --fork                  # use fork (3 agents)
 #        hcom run confess --target nova           # evaluate nova (requires --fork)
 
 set -euo pipefail
@@ -49,14 +49,14 @@ DEFAULT MODE (caller as confessor):
   - CALIBRATOR: Analyzes your transcript independently (baseline)
   - JUDGE: Compares both reports, sends verdict back to you
 
-FORK MODE (--fork, Claude only):
+FORK MODE (--fork, tools that support `hcom f`):
   Spawns 3 agents - a forked confessor with your memory does the confession.
 
 Options:
   --target NAME           Instance to evaluate (requires --fork)
   --name NAME             Your identity
   --task TEXT             Which task to evaluate (default: most recent)
-  --fork                  Use fork mode: spawn confessor with memory (Claude only)
+  --fork                  Use fork mode: spawn confessor with memory
   --tool TOOL             AI tool for spawned agents (default: claude)
   -h, --help              Show this help
 
@@ -191,13 +191,12 @@ Instructions:
 
   confessor_prompt="Identify the task, broadcast RANGE to others, then generate your ConfessionReport. Send to @judge via hcom."
 
-  launch_out=$(hcom 1 claude --tag confessor --go \
+  launch_out=$(hcom f "$instance_name" --tag confessor --go \
     --batch-id "$batch_id" \
     --hcom-system-prompt "$confessor_system" \
     --hcom-prompt "$confessor_prompt" \
-    --resume "$session_id" --fork-session \
-    --headless -p \
-    ${target_dir:+-C "$target_dir"} 2>&1) || {
+    --headless \
+    ${target_dir:+--dir "$target_dir"} 2>&1) || {
     echo "Error: Failed to launch confessor" >&2
     exit 1
   }

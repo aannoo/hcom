@@ -288,12 +288,12 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 
 /// Commit a deferred delivery ack — advance cursor and set status.
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
-    if ack.mark_announced {
-        updates.insert("name_announced".into(), serde_json::json!(true));
+    // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
+    // Cursor and announcement move together so a partial ack can't re-announce.
+    if let Err(e) = db.ack_hook_delivery(&ack.instance_name, ack.last_event_id, ack.mark_announced)
+    {
+        crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}"));
     }
-    instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
         db,
@@ -382,7 +382,7 @@ pub struct PollResult {
 
 /// Stop hook polling loop — NOT used by main PTY path.
 ///
-/// Runs for: headless instances, vanilla tool instances, subagent polling.
+/// Runs for: headless instances and subagent polling.
 /// Main PTY path bypasses this (HCOM_PTY_MODE=1, PTY wrapper handles injection).
 ///
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
@@ -791,15 +791,12 @@ pub(crate) struct ClaudeIdentityEvidence {
 /// local to each resolution path.
 pub(crate) fn load_claude_identity_evidence(
     db: &HcomDb,
-    process_id: Option<&str>,
+    process_id: &str,
     session_id: &str,
     transcript_path: &str,
     should_scan_lineage: impl FnOnce(&ClaudeIdentityEvidence) -> bool,
 ) -> Result<ClaudeIdentityEvidence> {
-    let process_binding = match process_id.filter(|value| !value.is_empty()) {
-        Some(process_id) => db.get_process_binding_full(process_id)?,
-        None => None,
-    };
+    let process_binding = db.get_process_binding_full(process_id)?;
     let process_session_id = process_binding
         .as_ref()
         .and_then(|(session_id, _)| session_id.clone());
@@ -844,21 +841,28 @@ pub(crate) fn load_claude_identity_evidence(
 
 /// Initialize instance context from hook data via binding lookup.
 ///
-/// Structured session/transcript identity wins over a conflicting process
+/// Hooks only run in hcom-launched Claude processes, but one process can
+/// switch sessions (`/resume`, `/clear`, `/branch`, `--fork-session`) while
+/// its process binding still names the previous generation's owner. So
+/// structured session/transcript identity wins over a conflicting process
 /// binding. Transcript scanning stays off the common hot path: it runs only
 /// when the session is unbound or its binding has not yet been validated.
 ///
-/// Returns (instance_name, metadata_updates, is_matched_resume).
+/// Returns (instance_name, metadata_updates, is_matched_resume). A hook with
+/// no hcom process id never resolves an identity.
 pub fn init_hook_context(
     db: &HcomDb,
     ctx: &HcomContext,
     session_id: &str,
     transcript_path: &str,
 ) -> (Option<String>, serde_json::Map<String, Value>, bool) {
+    let Some(process_id) = ctx.process_id.as_deref() else {
+        return (None, serde_json::Map::new(), false);
+    };
     let start = Instant::now();
     let evidence = match load_claude_identity_evidence(
         db,
-        ctx.process_id.as_deref(),
+        process_id,
         session_id,
         transcript_path,
         |evidence| {
@@ -1784,13 +1788,16 @@ mod tests {
     }
 
     #[test]
-    fn hook_context_uses_session_owner_with_empty_process_id() {
+    fn hook_context_requires_hcom_process_id() {
+        // Per-run Claude hooks only load in hcom launches, which always set
+        // HCOM_PROCESS_ID; a hook without one is not an hcom participant.
         let (dir, db) = make_test_db();
         insert_bound_claude_instance(&db, "niza", "session-niza", "");
-        let ctx = context_with_process_id(dir.path(), Some(""));
-
-        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
-        assert_eq!(owner.as_deref(), Some("niza"));
+        for process_id in [None, Some("")] {
+            let ctx = context_with_process_id(dir.path(), process_id);
+            let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+            assert_eq!(owner, None);
+        }
     }
 
     #[test]
@@ -2471,10 +2478,9 @@ mod tests {
         let transcript = dir.path().join("transcript.jsonl");
         std::fs::write(&transcript, "assistant output [hcom:luna]\n").unwrap();
 
-        let ctx = crate::shared::context::HcomContext::from_env(
-            &std::collections::HashMap::new(),
-            dir.path().to_path_buf(),
-        );
+        // A launched process with no binding: only structured lineage could
+        // name an owner, and marker text is never lineage.
+        let ctx = context_with_process_id(dir.path(), Some("process-unbound"));
         let (instance_name, _updates, _matched_resume) =
             init_hook_context(&db, &ctx, "sess-fresh", transcript.to_str().unwrap());
 

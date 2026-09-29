@@ -37,16 +37,9 @@ impl Tool {
     }
 
     /// Hook command names listed for this tool. Some tools borrow another
-    /// tool's names; use `owns_hook` for routing ownership.
+    /// tool's names; use `from_hook_name` for routing ownership.
     pub fn hooks(&self) -> &'static [&'static str] {
         self.spec().hooks.names
-    }
-
-    /// True if this tool owns `name` for routing. Borrowed hook names do not
-    /// count as ownership.
-    pub fn owns_hook(&self, name: &str) -> bool {
-        let hooks = &self.spec().hooks;
-        hooks.shared_hooks_with.is_none() && hooks.names.contains(&name)
     }
 
     /// Resolve the tool that owns a hook command name.
@@ -73,26 +66,26 @@ impl Tool {
     // helpers so new tools only need a hooks module + a spec + a match arm,
     // not a fresh parallel block per dispatch site.
     //
-    // Setup/installation error detail (codex hook-trust fallback, claude
-    // diagnostic context, etc.) intentionally stays in `launcher::ensure_hooks_installed`
-    // — those error shapes vary per tool and aren't suitable for a uniform trait.
+    // Setup/installation error detail for persistent tools intentionally stays
+    // in `launcher::ensure_hooks_installed`; per-run tools report through
+    // `hooks::runtime::plan`.
 
-    /// Verify hooks are installed for this tool. `include_permissions` controls
-    /// whether the auto-approve permission block is also checked.
+    /// Verify a persistent tool's global hook install. `include_permissions`
+    /// controls whether the auto-approve permission block is also checked.
+    /// Per-run tools (`hooks::runtime::is_per_run`) have no install; callers
+    /// must branch on that first.
     pub fn verify_hooks_installed(&self, include_permissions: bool) -> bool {
         match self {
-            Tool::Claude => {
-                crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions)
-            }
             Tool::Gemini => {
                 crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions)
             }
-            Tool::Codex => {
-                crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
-                    && crate::hooks::codex::codex_current_feature_enabled()
-            }
-            Tool::OpenCode => crate::hooks::opencode::verify_opencode_plugin_installed(),
-            Tool::Kilo => crate::hooks::opencode::verify_kilo_plugin_installed(),
+            Tool::Claude
+            | Tool::Codex
+            | Tool::Copilot
+            | Tool::Pi
+            | Tool::Omp
+            | Tool::OpenCode
+            | Tool::Kilo => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
@@ -100,35 +93,24 @@ impl Tool {
                 crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
             }
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
-            Tool::Copilot => {
-                crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
-            }
-            Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
-            Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
             Tool::Adhoc => false,
         }
     }
 
-    /// Try to install hooks for this tool. Returns `Err(message)` on failure.
+    /// Install a persistent tool's global hooks. Returns `Err(message)` on
+    /// failure. Per-run tools have nothing to install (see above).
     /// `Tool::Adhoc` always errors — adhoc has no hook surface.
     pub fn try_setup_hooks(&self, include_permissions: bool) -> Result<(), String> {
         match self {
-            Tool::Claude => crate::hooks::claude::try_setup_claude_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
             Tool::Gemini => crate::hooks::gemini::try_setup_gemini_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::Codex => crate::hooks::codex::try_setup_codex_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
-            Tool::OpenCode => match crate::hooks::opencode::install_opencode_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
-            Tool::Kilo => match crate::hooks::opencode::install_kilo_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
+            Tool::Claude
+            | Tool::Codex
+            | Tool::Copilot
+            | Tool::Pi
+            | Tool::Omp
+            | Tool::OpenCode
+            | Tool::Kilo => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
@@ -137,18 +119,6 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::Copilot => crate::hooks::copilot::try_setup_copilot_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
-            Tool::Pi => match crate::hooks::pi::install_pi_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
-            Tool::Omp => match crate::hooks::omp::install_omp_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -176,30 +146,40 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Omp => crate::hooks::omp::remove_omp_plugin()
                 .map(|_| true)
-                .map_err(|e| e.to_string()),
+                .map_err(|e| format!("{e:#}")),
             Tool::Adhoc => Ok(false),
         }
     }
 
-    /// Filesystem path the hook integration writes to (settings/config file or
-    /// plugin location). Empty for `Tool::Adhoc`.
+    /// Filesystem path a persistent tool's global install writes to (settings
+    /// file or plugin location). Empty for `Tool::Adhoc`. Per-run tools have
+    /// none (see above).
     pub fn hooks_settings_path(&self) -> String {
         let path_buf = match self {
-            Tool::Claude => crate::hooks::claude::get_claude_settings_path(),
+            Tool::Claude
+            | Tool::Codex
+            | Tool::Copilot
+            | Tool::Pi
+            | Tool::Omp
+            | Tool::OpenCode
+            | Tool::Kilo => per_run_has_no_install(*self),
             Tool::Gemini => crate::hooks::gemini::get_gemini_settings_path(),
-            Tool::Codex => crate::hooks::codex::get_codex_config_path(),
-            Tool::OpenCode => crate::hooks::opencode::get_opencode_plugin_path(),
-            Tool::Kilo => crate::hooks::opencode::get_kilo_plugin_path(),
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
-            Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
-            Tool::Pi => crate::hooks::pi::get_pi_plugin_path(),
-            Tool::Omp => crate::hooks::omp::get_omp_plugin_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()
     }
+}
+
+/// Per-run tools load hooks per launch (`hooks::runtime`) and have no global
+/// install to verify, set up or locate; callers branch on `is_per_run` first.
+fn per_run_has_no_install(tool: Tool) -> ! {
+    unreachable!(
+        "{} uses per-run hooks and has no persistent install",
+        tool.as_str()
+    )
 }
 
 impl FromStr for Tool {
@@ -261,8 +241,6 @@ mod tests {
 
     #[test]
     fn antigravity_borrows_gemini_hooks_without_owning_them() {
-        assert!(Tool::Gemini.owns_hook("gemini-beforeagent"));
-        assert!(!Tool::Antigravity.owns_hook("gemini-beforeagent"));
         assert_eq!(
             Tool::from_hook_name("gemini-beforeagent"),
             Some(Tool::Gemini)
@@ -314,7 +292,6 @@ mod tests {
     #[test]
     fn kilo_shares_opencode_hooks() {
         assert_eq!(Tool::Kilo.hooks(), Tool::OpenCode.hooks());
-        assert!(!Tool::Kilo.owns_hook("opencode-start"));
         assert_eq!(Tool::from_hook_name("opencode-start"), Some(Tool::OpenCode));
     }
 }

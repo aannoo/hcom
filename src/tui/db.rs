@@ -15,6 +15,30 @@ use crate::tui::status;
 use crate::paths;
 use crate::shared::ST_ACTIVE;
 
+// An open SQLite connection continues to address an unlinked database on Unix.
+// Keep the file identity from when the connection was opened so the TUI can
+// reconnect after `hcom reset` replaces hcom.db from another terminal.
+#[cfg(unix)]
+type DbFileId = (u64, u64);
+
+#[cfg(unix)]
+fn db_file_id(path: &std::path::Path) -> Option<DbFileId> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+// On Windows reset cannot replace a database while another process holds it
+// open: remove_file reports the lock error and leaves the original DB intact.
+#[cfg(not(unix))]
+type DbFileId = ();
+
+#[cfg(not(unix))]
+fn db_file_id(_path: &std::path::Path) -> Option<DbFileId> {
+    None
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -31,6 +55,9 @@ fn read_device_uuid(conn: &Connection) -> String {
 pub struct DbDataSource {
     db_path: PathBuf,
     conn: Option<Connection>,
+    db_file_id: Option<DbFileId>,
+    #[cfg(test)]
+    after_next_open: Option<Box<dyn FnOnce() + Send>>,
     last_data_version: u64,
     cached: Option<DataState>,
     last_error: Option<String>,
@@ -49,6 +76,9 @@ impl DbDataSource {
         Self {
             db_path: paths::db_path(),
             conn: None,
+            db_file_id: None,
+            #[cfg(test)]
+            after_next_open: None,
             last_data_version: 0,
             cached: None,
             last_error: None,
@@ -57,45 +87,96 @@ impl DbDataSource {
         }
     }
 
-    /// Lazy-open persistent connection; reconnects on failure.
+    /// Lazy-open a persistent connection, retrying if reset replaces the file
+    /// while SQLite is opening it.
     fn ensure_conn(&mut self) -> Option<&Connection> {
         if self.conn.is_none() {
             // Harden before opening: the TUI is the no-arg default entry point,
             // so it must apply the same owner-only permission boundary as the
             // CLI rather than letting SQLite create/leave a broad db.
-            let hcom_dir = paths::hcom_dir();
-            if let Err(e) = paths::ensure_private_directory(&hcom_dir)
+            let hcom_dir = self.db_path.parent().unwrap_or(std::path::Path::new("."));
+            if let Err(e) = paths::ensure_private_directory(hcom_dir)
                 .and_then(|()| paths::ensure_private_db(&self.db_path))
             {
                 self.last_error = Some(format!("secure {}: {}", self.db_path.display(), e));
                 return None;
             }
-            let conn = match Connection::open(&self.db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.last_error = Some(format!("open {}: {}", self.db_path.display(), e));
+            // On Unix, opening an unlinked database can succeed while reset is
+            // creating its replacement. Record the pathname identity on both
+            // sides of the open so we never associate that old handle with the
+            // replacement file's identity.
+            for _ in 0..3 {
+                let before_open = db_file_id(&self.db_path);
+                let conn = match Connection::open(&self.db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.last_error = Some(format!("open {}: {}", self.db_path.display(), e));
+                        return None;
+                    }
+                };
+                // query_only=ON: TUI is read-only; any accidental write will
+                // error immediately rather than silently succeed.
+                if let Err(e) = conn.execute_batch(
+                    "PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL; PRAGMA query_only=ON;",
+                ) {
+                    self.last_error = Some(format!(
+                        "init database pragmas {}: {}",
+                        self.db_path.display(),
+                        e
+                    ));
                     return None;
                 }
-            };
-            // query_only=ON: TUI is read-only; any accidental write will
-            // error immediately rather than silently succeed.
-            if let Err(e) = conn.execute_batch(
-                "PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL; PRAGMA query_only=ON;",
-            ) {
+                #[cfg(test)]
+                if let Some(after_open) = self.after_next_open.take() {
+                    after_open();
+                }
+                let after_open = db_file_id(&self.db_path);
+                if before_open != after_open {
+                    continue;
+                }
+
+                self.conn = Some(conn);
+                self.db_file_id = after_open;
+                // Force full reload on new connection
+                self.last_data_version = 0;
+                self.cached = None;
+                self.last_error = None;
+                break;
+            }
+            if self.conn.is_none() {
                 self.last_error = Some(format!(
-                    "init database pragmas {}: {}",
-                    self.db_path.display(),
-                    e
+                    "database changed repeatedly while opening {}",
+                    self.db_path.display()
                 ));
                 return None;
             }
-            self.conn = Some(conn);
-            // Force full reload on new connection
-            self.last_data_version = 0;
-            self.cached = None;
-            self.last_error = None;
         }
         self.conn.as_ref()
+    }
+
+    /// Drop a connection to a database that `hcom reset` has replaced.
+    ///
+    /// A missing file is intentionally ignored: reset briefly removes the old
+    /// file before bootstrapping the new one, and opening it during that window
+    /// would create an empty database from the read-only TUI process.
+    fn reconnect_if_database_replaced(&mut self) -> bool {
+        #[cfg(unix)]
+        let replaced = matches!(
+            (self.db_file_id, db_file_id(&self.db_path)),
+            (Some(opened), Some(current)) if opened != current
+        );
+        #[cfg(not(unix))]
+        let replaced = false;
+        if !replaced {
+            return false;
+        }
+
+        self.conn = None;
+        self.db_file_id = None;
+        self.last_data_version = 0;
+        self.cached = None;
+        self.last_error = None;
+        true
     }
 
     /// Check PRAGMA data_version and config.toml mtime for changes.
@@ -147,6 +228,7 @@ impl DataSource for DbDataSource {
     }
 
     fn load_all_stopped(&mut self) -> Vec<Agent> {
+        self.reconnect_if_database_replaced();
         let conn = match self.ensure_conn() {
             Some(c) => c,
             None => return vec![],
@@ -155,14 +237,16 @@ impl DataSource for DbDataSource {
     }
 
     fn load_if_changed(&mut self) -> Option<DataState> {
+        let replaced = self.reconnect_if_database_replaced();
+
         // Ensure we have a connection (lazy open / reconnect)
         if self.ensure_conn().is_none() {
             self.cached = Some(DataState::empty());
             return self.cached.clone();
         }
 
-        // Fast path: DB unchanged
-        if !self.data_version_changed() {
+        // Fast path: DB unchanged. A reconnection always needs a full snapshot.
+        if !replaced && !self.data_version_changed() {
             return None;
         }
 
@@ -177,6 +261,7 @@ impl DataSource for DbDataSource {
     }
 
     fn search_timeline(&mut self, query: &str, limit: usize) -> (Vec<Message>, Vec<Event>) {
+        self.reconnect_if_database_replaced();
         if self.ensure_conn().is_none() {
             return (vec![], vec![]);
         }
@@ -1475,6 +1560,73 @@ mod tests {
             "TUI open left db broad: {:?}",
             ds.last_error
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnects_when_database_is_replaced_during_or_after_open() {
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+
+        let first = Connection::open(&db_path).unwrap();
+        first.execute_batch("PRAGMA application_id = 101;").unwrap();
+        drop(first);
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path.clone();
+
+        let replacement_path = hcom_dir.join("replacement.db");
+        let replacement = Connection::open(&replacement_path).unwrap();
+        replacement
+            .execute_batch("PRAGMA application_id = 202;")
+            .unwrap();
+        drop(replacement);
+
+        // Force the narrow race: SQLite has opened the old 101 database, but
+        // reset replaces the pathname before DbDataSource records its identity.
+        let source_path = replacement_path.clone();
+        let target_path = db_path.clone();
+        ds.after_next_open = Some(Box::new(move || {
+            for sidecar in [
+                target_path.with_file_name("hcom.db-wal"),
+                target_path.with_file_name("hcom.db-shm"),
+            ] {
+                let _ = std::fs::remove_file(sidecar);
+            }
+            std::fs::rename(source_path, target_path).unwrap();
+        }));
+        ds.ensure_conn().unwrap();
+        let raced_replacement_id: i64 = ds
+            .conn
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raced_replacement_id, 202);
+
+        let later_replacement_path = hcom_dir.join("later-replacement.db");
+        let later_replacement = Connection::open(&later_replacement_path).unwrap();
+        later_replacement
+            .execute_batch("PRAGMA application_id = 303;")
+            .unwrap();
+        drop(later_replacement);
+        for sidecar in [
+            db_path.with_file_name("hcom.db-wal"),
+            db_path.with_file_name("hcom.db-shm"),
+        ] {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        std::fs::rename(&later_replacement_path, &db_path).unwrap();
+
+        assert!(ds.reconnect_if_database_replaced());
+        ds.ensure_conn().unwrap();
+        let later_replacement_id: i64 = ds
+            .conn
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(later_replacement_id, 303);
     }
 
     fn setup_conn() -> Connection {

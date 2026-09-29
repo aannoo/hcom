@@ -37,10 +37,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use support::claude_mock::{
-    ClaudeStartupAnswers, MODEL, claude_startup_gate, claude_text, claude_tool_use,
-    latest_user_turn,
+    ClaudeStartupAnswers, ClaudeStartupGate, MODEL, claude_startup_gate, claude_text,
+    claude_tool_use, latest_user_turn, trust_accept_selected,
 };
 use support::mock_http::{MockHttp, RecordedRequest, Reply};
+use support::pins;
 
 // ── Logging ────────────────────────────────────────────────────────────
 
@@ -652,6 +653,19 @@ fn drive_claude_startup(hcom_dir: &str, name: &str, timeout: Duration) {
             && gate.is_none()
         {
             return;
+        }
+        // Same as ClaudeCase::drive_startup: the trust dialog preselects
+        // "No, exit", so move onto the accepting option before any Enter.
+        if gate == Some(ClaudeStartupGate::Trust) && !trust_accept_selected(&last_screen) {
+            let down = hcom_with_dir(&format!("term inject {name} \u{1b}[B"), hcom_dir);
+            assert!(
+                down.status.success(),
+                "drive startup trust-option move failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&down.stdout),
+                String::from_utf8_lossy(&down.stderr)
+            );
+            thread::sleep(Duration::from_millis(800));
+            continue;
         }
         if gate.is_some_and(|gate| answers.answer_once(gate)) {
             // A successful inject delivered Enter to the PTY. Do not repeat it
@@ -1357,12 +1371,10 @@ fn test_relay_roundtrip() {
     // ── Phase 7: Device A remotely launches on Device B ──────────
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
-    let claude_version =
-        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.216".to_string());
     assert_tool_pinned(
         "claude",
-        &claude_version,
-        &format!("scripts/install-mock-tools.sh @anthropic-ai/claude-code@{claude_version}"),
+        pins::pinned_version("@anthropic-ai/claude-code"),
+        pins::INSTALL_HINT,
     );
 
     let baseline_event_b = last_event_id(&path_b);
@@ -1403,7 +1415,7 @@ fn test_relay_roundtrip() {
 
     // Wait for the launched claude on Device B to actually be usable.
     // Without this, the rest of the phases race the tool's boot and see
-    // "No inject port for ..." errors that silently get swallowed by weak
+    // "no terminal registered yet" errors that silently get swallowed by weak
     // assertions. The lifecycle ready event is the canonical signal —
     // screen["ready"] is unreliable when the user has dontAsk mode on, but
     // the life event fires from hooks regardless.
@@ -1536,7 +1548,12 @@ fn test_relay_roundtrip() {
     // real message separately via `hcom send`, so this enter only flushes
     // the marker and doesn't step on the test.
     let clear_out = hcom_with_dir(&format!("term inject {remote_name} --enter"), &path_a);
-    assert!(clear_out.status.success());
+    assert!(
+        clear_out.status.success(),
+        "remote term inject (enter) failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&clear_out.stdout),
+        String::from_utf8_lossy(&clear_out.stderr)
+    );
     let rpc_inject_enter = poll_rpc_result_on_device(&path_b, "term_inject");
     assert_eq!(
         rpc_inject_enter["ok"].as_bool(),
@@ -1850,8 +1867,8 @@ fn test_relay_roundtrip() {
     let kill_output = check("A", &format!("kill {remote_name}"), &path_a);
     logln!(log, "{}", kill_output.trim_end());
     assert!(
-        kill_output.contains("Sent SIGTERM")
-            || kill_output.contains("already terminated")
+        kill_output.contains("Sent SIGTERM to '")
+            || kill_output.contains("had already exited")
             || kill_output.contains("already_dead"),
         "Unexpected remote kill output:\n{kill_output}"
     );

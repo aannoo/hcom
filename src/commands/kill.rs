@@ -141,7 +141,7 @@ pub fn kill_tracked_instance(
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
     let is_headless = inst.background != 0;
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-        kill_instance(db, name, pid, &inst, is_headless);
+        kill_instance(db, name, pid, &inst, is_headless, initiator);
     stop_instance(db, name, initiator, "killed");
 
     Ok(KillTrackedResult {
@@ -182,7 +182,7 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
         return Ok(1);
     }
 
-    let lines = render_remote_kill_feedback(name, pid, kill_result, &pane_info)?;
+    let lines = render_remote_kill_feedback(name, kill_result, &pane_info)?;
     for line in lines {
         println!("{line}");
     }
@@ -209,23 +209,16 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
 
 fn render_remote_kill_feedback(
     name: &str,
-    pid: u64,
     kill_result: &str,
     pane_info: &str,
 ) -> Result<Vec<String>> {
     match kill_result {
         "sent" => Ok(vec![
-            format!(
-                "Sent SIGTERM to process group {} for '{}'{}",
-                pid, name, pane_info
-            ),
+            format!("Sent SIGTERM to \'{}\'{}", name, pane_info),
             format!("  To resume: hcom r {}", name),
         ]),
         "already_dead" => Ok(vec![
-            format!(
-                "Process group {} not found for '{}' (already terminated){}",
-                pid, name, pane_info
-            ),
+            format!("\'{}\' had already exited{}", name, pane_info),
             format!("  To resume: hcom r {}", name),
         ]),
         other => bail!("Remote kill failed for {name}: unexpected kill_result {other}"),
@@ -293,6 +286,41 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     Ok(worst_exit)
 }
 
+/// Whether a tracked orphan process belongs to `target`: a base name, a
+/// `tag-name` (the tag is tracked separately from the names), a process id,
+/// or a PID (the TUI kills orphans by PID).
+///
+/// Same semantics as agent names everywhere else: the base name is the
+/// identity and `tag-name` is an alias that must match the tracked tag.
+fn orphan_matches(orphan: &pidtrack::OrphanProcess, target: &str) -> bool {
+    orphan
+        .names
+        .iter()
+        .any(|n| n == target || (!orphan.tag.is_empty() && format!("{}-{n}", orphan.tag) == target))
+        || orphan.process_id == target
+        || target.parse::<u32>().ok() == Some(orphan.pid)
+}
+
+/// Display label for an orphan: `tag-name` when tagged, else the base name.
+fn orphan_label(orphan: &pidtrack::OrphanProcess) -> String {
+    let name = orphan.names.first().map(String::as_str).unwrap_or("?");
+    if orphan.tag.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}-{name}", orphan.tag)
+    }
+}
+
+/// The still-running process left behind by a specific stopped session.
+pub(crate) fn find_orphan_for_session(session_id: &str) -> Option<pidtrack::OrphanProcess> {
+    if session_id.is_empty() {
+        return None;
+    }
+    pidtrack::get_orphan_processes(&paths::hcom_dir(), None)
+        .into_iter()
+        .find(|o| o.session_id == session_id)
+}
+
 /// Format pane close info
 fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String {
     if pane_closed {
@@ -336,21 +364,15 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-                kill_instance(db, &inst.name, pid as u32, inst, is_headless);
+                kill_instance(db, &inst.name, pid as u32, inst, is_headless, initiator);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
                 terminal::KillResult::Sent => {
-                    println!(
-                        "Sent SIGTERM to process group {} for '{}'{}",
-                        pid, inst.name, pane_info
-                    );
+                    println!("Sent SIGTERM to \'{}\'{}", inst.name, pane_info);
                     killed += 1;
                 }
                 terminal::KillResult::AlreadyDead => {
-                    println!(
-                        "Process group {} not found for '{}' (already terminated){}",
-                        pid, inst.name, pane_info
-                    );
+                    println!("\'{}\' had already exited{}", inst.name, pane_info);
                     killed += 1;
                 }
                 terminal::KillResult::PermissionDenied => {
@@ -394,17 +416,11 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         };
         match result {
             terminal::KillResult::Sent => {
-                println!(
-                    "Sent SIGTERM to orphan process group {}{}",
-                    orphan.pid, label
-                );
+                println!("Sent SIGTERM to orphan process {}{}", orphan.pid, label);
                 killed += 1;
             }
             terminal::KillResult::AlreadyDead => {
-                println!(
-                    "Orphan process group {} already terminated{}",
-                    orphan.pid, label
-                );
+                println!("Orphan process {} had already exited{}", orphan.pid, label);
                 killed += 1;
             }
             terminal::KillResult::PermissionDenied => {
@@ -447,21 +463,15 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-                kill_instance(db, &inst.name, pid as u32, inst, is_headless);
+                kill_instance(db, &inst.name, pid as u32, inst, is_headless, initiator);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
                 terminal::KillResult::Sent => {
-                    println!(
-                        "Sent SIGTERM to process group {} for '{}'{}",
-                        pid, inst.name, pane_info
-                    );
+                    println!("Sent SIGTERM to \'{}\'{}", inst.name, pane_info);
                     killed += 1;
                 }
                 terminal::KillResult::AlreadyDead => {
-                    println!(
-                        "Process group {} already terminated for '{}'",
-                        pid, inst.name
-                    );
+                    println!("\'{}\' had already exited", inst.name);
                     killed += 1;
                 }
                 terminal::KillResult::PermissionDenied => {
@@ -505,16 +515,13 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         match result {
             terminal::KillResult::Sent => {
                 println!(
-                    "Sent SIGTERM to stopped process group {} for '{}'{}",
-                    orphan.pid, names, pane_info
+                    "Sent SIGTERM to leftover process of stopped agent \'{}\'{}",
+                    names, pane_info
                 );
                 killed += 1;
             }
             terminal::KillResult::AlreadyDead => {
-                println!(
-                    "Process group {} already terminated for '{}'",
-                    orphan.pid, names
-                );
+                println!("\'{}\' had already exited", names);
             }
             terminal::KillResult::PermissionDenied => {
                 eprintln!("Permission denied to kill process group {}", orphan.pid);
@@ -551,12 +558,24 @@ fn kill_single(
             // Check orphans
             let orphans = pidtrack::get_orphan_processes(hcom_dir, None);
             // Also match by PID number (TUI sends kill by PID for orphans)
-            let target_pid = target.parse::<u32>().ok();
-            if let Some(orphan) = orphans.iter().find(|o| {
-                o.names.contains(&target.to_string())
-                    || o.process_id == target
-                    || target_pid == Some(o.pid)
-            }) {
+            let matches: Vec<&pidtrack::OrphanProcess> = orphans
+                .iter()
+                .filter(|o| orphan_matches(o, target))
+                .collect();
+            // Only reachable after a base name was reused: refuse to guess which
+            // incarnation's process to signal.
+            if matches.len() > 1 {
+                let options: Vec<String> = matches
+                    .iter()
+                    .map(|o| format!("{} (pid {})", orphan_label(o), o.pid))
+                    .collect();
+                bail!(
+                    "'{target}' matches {} leftover processes: {}\n  Kill one by PID: hcom kill <pid>",
+                    matches.len(),
+                    options.join(", ")
+                );
+            }
+            if let Some(orphan) = matches.first().copied() {
                 let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
                     &orphan.terminal_preset,
@@ -572,15 +591,12 @@ fn kill_single(
                 match result {
                     terminal::KillResult::Sent => {
                         println!(
-                            "Sent SIGTERM to process group {} for stopped instance '{}'{}",
-                            orphan.pid, target, pane_info
+                            "Sent SIGTERM to leftover process of stopped agent \'{}\'{}",
+                            target, pane_info
                         );
                     }
                     terminal::KillResult::AlreadyDead => {
-                        println!(
-                            "Process group {} not found for '{}' (already terminated){}",
-                            orphan.pid, target, pane_info
-                        );
+                        println!("\'{}\' had already exited{}", target, pane_info);
                     }
                     terminal::KillResult::PermissionDenied => {
                         eprintln!("Permission denied to kill process group {}", orphan.pid);
@@ -597,7 +613,14 @@ fn kill_single(
                     },
                 );
             }
-            bail!("Agent '{}' not found", target);
+            // The goal of a kill is already met for a stopped agent: say when and
+            // by whom instead of failing, so retries don't look like errors.
+            if let Some(stopped) = identity::last_stopped(db, target) {
+                println!("'{target}' {}", stopped.summary());
+                println!("  To resume: hcom r {}", stopped.display_name());
+                return Ok(0);
+            }
+            bail!("{}", identity::describe_missing_agent(db, target));
         }
     };
 
@@ -637,18 +660,12 @@ fn kill_single(
     let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
     let exit = match result {
         terminal::KillResult::Sent => {
-            println!(
-                "Sent SIGTERM to process group {} for '{}'{}",
-                pid, name, pane_info
-            );
+            println!("Sent SIGTERM to \'{}\'{}", name, pane_info);
             println!("  To resume: hcom r {}", name);
             0
         }
         terminal::KillResult::AlreadyDead => {
-            println!(
-                "Process group {} not found for '{}' (already terminated){}",
-                pid, name, pane_info
-            );
+            println!("\'{}\' had already exited{}", name, pane_info);
             println!("  To resume: hcom r {}", name);
             0
         }
@@ -672,12 +689,23 @@ fn kill_single(
 /// Kill a process and close its terminal pane.
 /// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
 fn kill_instance(
-    _db: &HcomDb,
+    db: &HcomDb,
     name: &str,
     pid: u32,
     instance: &crate::db::InstanceRow,
     is_headless: bool,
+    initiator: &str,
 ) -> (terminal::KillResult, bool, Option<String>, String, String) {
+    // The PTY cleanup thread may run as soon as the signal lands. Record the
+    // requested reason and initiator first so it cannot turn an explicit kill
+    // into a stopped snapshot with reason "closed" or by "pty".
+    if let Err(e) = db.mark_killed(name, initiator) {
+        log_info(
+            "kill",
+            "lifecycle.kill_status",
+            &format!("name={name} err={e}"),
+        );
+    }
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
@@ -737,6 +765,41 @@ fn kill_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn orphan(name: &str, tag: &str) -> pidtrack::OrphanProcess {
+        pidtrack::OrphanProcess {
+            pid: 4242,
+            tool: "claude".into(),
+            names: vec![name.into()],
+            directory: String::new(),
+            process_id: "proc-1".into(),
+            terminal_preset: String::new(),
+            pane_id: String::new(),
+            terminal_id: String::new(),
+            kitty_listen_on: String::new(),
+            zellij_session_name: String::new(),
+            session_id: String::new(),
+            notify_port: 0,
+            inject_port: 0,
+            tag: tag.into(),
+        }
+    }
+
+    #[test]
+    fn orphan_match_uses_hcom_name_semantics() {
+        let untagged = orphan("tuna", "");
+        let tagged = orphan("tuna", "api");
+        // Base name is the identity; tag-name is an alias that must match.
+        assert!(orphan_matches(&untagged, "tuna"));
+        assert!(orphan_matches(&tagged, "tuna"));
+        assert!(orphan_matches(&tagged, "api-tuna"));
+        assert!(!orphan_matches(&untagged, "api-tuna"));
+        assert!(!orphan_matches(&tagged, "web-tuna"));
+        assert!(orphan_matches(&tagged, "4242"));
+        assert!(orphan_matches(&tagged, "proc-1"));
+        assert_eq!(orphan_label(&tagged), "api-tuna");
+        assert_eq!(orphan_label(&untagged), "tuna");
+    }
     use serde_json::json;
 
     #[test]
@@ -831,13 +894,12 @@ mod tests {
 
     #[test]
     fn test_render_remote_kill_feedback_sent_matches_cli_contract() {
-        let lines = render_remote_kill_feedback("luna:ABCD", 42, "sent", " (closed kitty pane @1)")
-            .unwrap();
+        let lines =
+            render_remote_kill_feedback("luna:ABCD", "sent", " (closed kitty pane @1)").unwrap();
         assert_eq!(
             lines,
             vec![
-                "Sent SIGTERM to process group 42 for 'luna:ABCD' (closed kitty pane @1)"
-                    .to_string(),
+                "Sent SIGTERM to \'luna:ABCD\' (closed kitty pane @1)".to_string(),
                 "  To resume: hcom r luna:ABCD".to_string(),
             ]
         );
@@ -845,11 +907,11 @@ mod tests {
 
     #[test]
     fn test_render_remote_kill_feedback_already_dead_matches_cli_contract() {
-        let lines = render_remote_kill_feedback("luna:ABCD", 42, "already_dead", "").unwrap();
+        let lines = render_remote_kill_feedback("luna:ABCD", "already_dead", "").unwrap();
         assert_eq!(
             lines,
             vec![
-                "Process group 42 not found for 'luna:ABCD' (already terminated)".to_string(),
+                "\'luna:ABCD\' had already exited".to_string(),
                 "  To resume: hcom r luna:ABCD".to_string(),
             ]
         );

@@ -195,6 +195,9 @@ pub(crate) fn clear_full_reset_artifacts() {
 
     let instance_count_file = hcom_dir().join(FLAGS_DIR).join("instance_count");
     let _ = fs::remove_file(&instance_count_file);
+
+    // Every instance was stopped first, so no running agent loads these.
+    let _ = fs::remove_dir_all(crate::hooks::runtime::integrations_dir());
 }
 
 pub(crate) fn bootstrap_fresh_db() {
@@ -232,6 +235,16 @@ mod tests {
         assert!(ts.len() >= 15);
         assert!(ts.contains('-'));
         assert!(ts.contains('_'));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_reset_deletes_per_run_artifacts() {
+        let (_tmp, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let artifact = crate::hooks::runtime::publish_file("pi", "hcom.ts", b"x").unwrap();
+        clear_full_reset_artifacts();
+        assert!(!artifact.exists());
+        assert!(!crate::hooks::runtime::integrations_dir().exists());
     }
 
     #[test]

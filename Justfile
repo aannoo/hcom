@@ -44,8 +44,9 @@ windows-log-dir := justfile_directory() + "/target/ci-logs"
 default:
     @just --list --unsorted
 
+[unix]
 [group("setup")]
-[doc("Install the pinned real CLIs that the real-tool tests run against")]
+[doc("Install the pinned real CLIs (scripts/mock-tools.pins) the real-tool tests run against")]
 mock-tools:
     HCOM_MOCK_TOOLS_PREFIX="{{mock-prefix}}" HCOM_MOCK_TOOLS_NPM_CACHE="{{mock-cache}}" bash ./scripts/install-mock-tools.sh
 
@@ -68,6 +69,20 @@ msrv:
 [doc("Apply rustfmt (the ci fmt step only checks)")]
 fmt:
     cargo fmt --all
+
+[unix]
+[group("checks")]
+[doc("Run every local check except mock setup and real-tool tests")]
+check:
+    @just ci dist-check typecheck fmt clippy test msrv
+
+# scripts/ci-windows.ps1 has no dist-check/typecheck/msrv steps and rejects
+# unknown step names, so Windows runs the subset it has.
+[windows]
+[group("checks")]
+[doc("Run every local check except mock setup and real-tool tests")]
+check:
+    just ci fmt clippy test
 
 [unix]
 [group("checks")]
@@ -96,14 +111,26 @@ ci *steps:
     mkdir -p "$log_dir"
     echo "[ci] logs: $log_dir/<step>.log"
 
-    declare -a known=()
+    # Every step below, in order. Named steps are validated against this up
+    # front, so a typo fails before anything runs rather than after the rest of
+    # the requested steps have taken minutes; step() rejects a name missing here.
+    known=(dist-check typecheck fmt clippy test msrv mock-tools real_tool_codex real_tool_claude test_relay_roundtrip)
+    for want in $only_steps; do
+        if [[ " ${known[*]} " != *" $want "* ]]; then
+            echo "[ci] unknown step: $want" >&2
+            echo "[ci] steps: ${known[*]}" >&2
+            exit 2
+        fi
+    done
+
     ran=0
     skipped=0
     step() {
         local name="$1"; shift
-        # Recorded before the filter, so the unknown-step check at the end sees
-        # every step name whether or not this run executed it.
-        known+=("$name")
+        if [[ " ${known[*]} " != *" $name "* ]]; then
+            echo "[ci] step $name is missing from known" >&2
+            exit 2
+        fi
         if [[ -n "$only_steps" && " $only_steps " != *" $name "* ]]; then
             return
         fi
@@ -151,13 +178,6 @@ ci *steps:
     step real_tool_claude     cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
     step test_relay_roundtrip cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
 
-    for want in $only_steps; do
-        if [[ " ${known[*]} " != *" $want "* ]]; then
-            echo "[ci] unknown step: $want" >&2
-            echo "[ci] steps: ${known[*]}" >&2
-            exit 2
-        fi
-    done
     if (( skipped > 0 )); then
         printf '[ci] %d step(s) passed, %d skipped, in %ds\n' "$ran" "$skipped" "$SECONDS"
     else
@@ -179,14 +199,14 @@ ci-logs step="":
 
 [windows]
 [group("setup")]
-[doc("Install the pinned real CLIs that the real-tool tests run against")]
-mock-tools-windows:
+[doc("Install the pinned real CLIs (scripts/mock-tools.pins) the real-tool tests run against")]
+mock-tools:
     & "{{ justfile_directory() }}/scripts/install-mock-tools.ps1"
 
 [windows]
 [group("checks")]
 [doc("Run just the real-tool tests against the pinned CLIs")]
-real-tool-tests-windows: mock-tools-windows
+real-tool-tests-windows: mock-tools
     $env:PATH = "{{ windows-mock-bin }};" + $env:PATH; cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1
     $env:PATH = "{{ windows-mock-bin }};" + $env:PATH; cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
     $env:PATH = "{{ windows-mock-bin }};" + $env:PATH; cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1

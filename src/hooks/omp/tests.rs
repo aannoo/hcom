@@ -660,15 +660,25 @@ fn plugin_dir_respects_pi_coding_agent_dir() {
 }
 
 #[test]
-fn extension_inject_args_contains_absolute_plugin_path() {
-    with_isolated_omp_env(|_| {
-        let args = extension_inject_args();
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[0], "-e");
-        let path = std::path::Path::new(&args[1]);
-        assert!(path.is_absolute());
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("hcom.ts"));
-    });
+#[serial_test::serial]
+fn per_run_injection_uses_runtime_extension_before_separator() {
+    let (_dir, hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    let ctx = crate::hooks::runtime::LaunchCtx {
+        tool: crate::tool::Tool::Omp,
+        env: [("HOME".to_string(), home.to_string_lossy().into_owned())]
+            .into_iter()
+            .collect(),
+        cwd: home,
+        args: vec!["--foo".into(), "--".into(), "prompt".into()],
+        auto_approve: false,
+    };
+    let injection = (PER_RUN.prepare)(&ctx).unwrap();
+    assert_eq!(injection.args[0], "--foo");
+    assert_eq!(injection.args[1], "-e");
+    let path = std::path::Path::new(&injection.args[2]);
+    assert!(path.starts_with(hcom.join("integrations").join("omp")));
+    assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("hcom.ts"));
+    assert_eq!(&injection.args[3..], &["--", "prompt"]);
 }
 
 #[test]
@@ -728,51 +738,52 @@ fn plugin_source_handles_omp_session_switch_and_shutdown_shape() {
 }
 
 #[test]
-fn install_writes_plugin_source() {
-    with_isolated_omp_env(|_| {
-        assert!(install_omp_plugin().unwrap());
-        let content = std::fs::read_to_string(get_omp_plugin_path()).unwrap();
-        assert_eq!(content, PLUGIN_SOURCE);
-        assert!(verify_omp_plugin_installed());
-    });
-}
+fn per_run_cleanup_uses_profile_and_preserves_other_effective_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("work");
+    let coding_agent_dir = dir.path().join("custom-agent");
+    let profile_plugin = home
+        .join(".omp")
+        .join("profiles")
+        .join("review")
+        .join("agent")
+        .join("extensions")
+        .join("hcom.ts");
+    let coding_agent_plugin = coding_agent_dir.join("extensions").join("hcom.ts");
+    std::fs::create_dir_all(profile_plugin.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(coding_agent_plugin.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(&profile_plugin, PLUGIN_SOURCE).unwrap();
+    std::fs::write(&coding_agent_plugin, PLUGIN_SOURCE).unwrap();
 
-#[test]
-fn install_refuses_to_overwrite_non_hcom_file() {
-    with_isolated_omp_env(|_| {
-        let path = get_omp_plugin_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "// user's custom plugin").unwrap();
-
-        let result = install_omp_plugin();
-        assert!(result.is_err());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "// user's custom plugin",
-        );
-        assert!(!verify_omp_plugin_installed());
-    });
-}
-
-#[test]
-fn install_upgrades_stale_hcom_owned_plugin() {
-    with_isolated_omp_env(|_| {
-        let path = get_omp_plugin_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Old hcom plugin: has the ownership marker but doesn't match current source.
-        std::fs::write(&path, r#"const x = customType: "hcom-bootstrap";"#).unwrap();
-
-        assert!(install_omp_plugin().unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), PLUGIN_SOURCE,);
-        assert!(verify_omp_plugin_installed());
-    });
+    let ctx = crate::hooks::runtime::LaunchCtx {
+        tool: crate::tool::Tool::Omp,
+        env: [
+            ("HOME".to_string(), home.to_string_lossy().into_owned()),
+            ("OMP_PROFILE".to_string(), "review".to_string()),
+            (
+                "PI_CODING_AGENT_DIR".to_string(),
+                coding_agent_dir.to_string_lossy().into_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        cwd,
+        args: Vec::new(),
+        auto_approve: false,
+    };
+    (PER_RUN.cleanup_legacy)(&ctx).unwrap();
+    assert!(!profile_plugin.exists());
+    assert!(coding_agent_plugin.exists());
 }
 
 #[test]
 fn remove_deletes_hcom_plugin() {
     with_isolated_omp_env(|_| {
-        install_omp_plugin().unwrap();
         let path = get_omp_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, PLUGIN_SOURCE).unwrap();
         assert!(path.exists());
 
         remove_omp_plugin().unwrap();
@@ -789,5 +800,71 @@ fn remove_preserves_non_hcom_file() {
 
         remove_omp_plugin().unwrap();
         assert!(path.exists(), "non-hcom file must not be removed");
+    });
+}
+
+#[test]
+fn replayed_legacy_extension_arg_is_stripped_before_injection() {
+    with_isolated_omp_env(|_| {
+        // Older hcom baked `-e ~/.omp/agent/extensions/hcom.ts` into stored
+        // args; legacy cleanup deletes that file, so replaying it would fail.
+        let mut args: Vec<String> = vec![
+            "-e".into(),
+            "/old/home/.omp/agent/extensions/hcom.ts".into(),
+            "-e".into(),
+            "/home/u/mine.ts".into(),
+        ];
+        crate::hooks::runtime::strip_replayed_args(&PER_RUN, &mut args);
+        assert_eq!(args, vec!["-e".to_string(), "/home/u/mine.ts".to_string()]);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn remove_and_cleanup_cover_project_local_legacy_install() {
+    let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    let project = home.join("project");
+    unsafe {
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::set_var("HCOM_DIR", project.join(".hcom"));
+    }
+    let legacy = project.join(".omp").join("extensions").join("hcom.ts");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, PLUGIN_SOURCE).unwrap();
+
+    let ctx = crate::hooks::runtime::LaunchCtx::ambient(crate::tool::Tool::Omp, false);
+    (PER_RUN.cleanup_legacy)(&ctx).unwrap();
+    assert!(!legacy.exists());
+
+    std::fs::write(&legacy, PLUGIN_SOURCE).unwrap();
+    remove_omp_plugin().unwrap();
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn strip_leaves_prompt_text_after_separator() {
+    with_isolated_omp_env(|_| {
+        let mut args: Vec<String> = vec![
+            "-e".into(),
+            "/old/extensions/hcom.ts".into(),
+            "--".into(),
+            "-e".into(),
+            "/old/extensions/hcom.ts".into(),
+        ];
+        strip_managed_extension_args(&mut args);
+        assert_eq!(args, vec!["--", "-e", "/old/extensions/hcom.ts"]);
+    });
+}
+
+#[test]
+fn strip_keeps_user_extension_at_pi_plugin_path() {
+    with_isolated_omp_env(|_| {
+        let pi_path = crate::hooks::pi::get_pi_plugin_path();
+        std::fs::create_dir_all(pi_path.parent().unwrap()).unwrap();
+        std::fs::write(&pi_path, "export default () => {} // mine").unwrap();
+        let arg = pi_path.to_string_lossy().into_owned();
+        let mut args = vec!["-e".to_string(), arg.clone()];
+        strip_managed_extension_args(&mut args);
+        assert_eq!(args, vec!["-e".to_string(), arg]);
     });
 }

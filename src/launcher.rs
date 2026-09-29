@@ -429,6 +429,9 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
         strip.insert((*v).to_string());
     }
     strip.insert("HCOM_LAUNCHED_PRESET".to_string());
+    // A new plugin host must claim ownership itself; an inherited marker would
+    // make hcom's OpenCode/Kilo plugin stay inert in the process hcom launched.
+    strip.insert(crate::hooks::runtime::PLUGIN_HOST_PID_ENV.to_string());
 
     strip
 }
@@ -580,61 +583,13 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
     out
 }
 
-fn format_plugin_install_error(
-    label: &str,
-    tool: &str,
-    target: &std::path::Path,
-    error: &std::io::Error,
-    diag: &str,
-) -> String {
-    use std::io::ErrorKind;
-
-    let mut message = format!(
-        "Failed to install {label} plugin at {}: {error}",
-        target.display()
-    );
-    if matches!(
-        error.kind(),
-        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
-    ) {
-        message.push_str(
-            "\nThe current process cannot write to the tool's config directory. If an AI agent ran this command inside a sandbox, retry the original hcom launch with approval or elevated permission to write this path.",
-        );
-    }
-    message.push_str(&format!("\nManual retry: hcom hooks add {tool}\n{diag}"));
-    message
-}
-
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(
-    tool: &LaunchTool,
-    include_permissions: bool,
-    codex_home: Option<&std::path::Path>,
-) -> Result<()> {
+fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
     match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => {
-            if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::claude::try_setup_claude_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "settings_path",
-                        crate::hooks::claude::get_claude_settings_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Claude hooks: {e}\n\
-                     Run: hcom hooks add claude\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Claude | LaunchTool::ClaudePty => unreachable!("Claude uses per-run hooks"),
         LaunchTool::Gemini => {
             if !crate::hooks::gemini::is_gemini_version_supported() {
                 if let Some(ver) = crate::hooks::gemini::get_gemini_version() {
@@ -667,99 +622,11 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Codex => {
-            let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
-            if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
-                && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
-            {
-                return Ok(());
-            }
-            if let Err(e) =
-                crate::hooks::codex::try_setup_codex_hooks_at(include_permissions, codex_home)
-            {
-                if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
-                    crate::log::log_warn(
-                        "codex",
-                        "codex.hook_trust_setup_warn",
-                        &format!(
-                            "Codex hook setup could not write trust state; launch preprocessing may fall back to hook-trust bypass: {e}"
-                        ),
-                    );
-                } else {
-                    let diag = install_diag_context(
-                        tool,
-                        &[
-                            ("config_path", codex_home.join("config.toml")),
-                            ("hooks_path", codex_home.join("hooks.json")),
-                        ],
-                    );
-                    bail!(
-                        "Failed to setup Codex hooks: {e}\n\
-                         Run: hcom hooks add codex\n\
-                         {diag}"
-                    );
-                }
-            }
-            Ok(())
-        }
-        LaunchTool::OpenCode => {
-            match crate::hooks::opencode::ensure_plugin_installed("opencode") {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(error) => {
-                    let target = crate::hooks::opencode::get_opencode_plugin_path();
-                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
-                    bail!(
-                        "{}",
-                        format_plugin_install_error("OpenCode", "opencode", &target, &error, &diag,)
-                    );
-                }
-            }
-            let diag = install_diag_context(
-                tool,
-                &[(
-                    "plugin_path",
-                    crate::hooks::opencode::get_opencode_plugin_path(),
-                )],
-            );
-            bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
-        }
-        LaunchTool::Kilo => {
-            match crate::hooks::opencode::ensure_plugin_installed("kilo") {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(error) => {
-                    let target = crate::hooks::opencode::get_kilo_plugin_path();
-                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
-                    bail!(
-                        "{}",
-                        format_plugin_install_error("Kilo Code", "kilo", &target, &error, &diag,)
-                    );
-                }
-            }
-            let diag = install_diag_context(
-                tool,
-                &[(
-                    "plugin_path",
-                    crate::hooks::opencode::get_kilo_plugin_path(),
-                )],
-            );
-            bail!("Failed to setup Kilo Code plugin. Run: hcom hooks add kilo\n{diag}");
-        }
-        LaunchTool::Pi => {
-            if crate::hooks::pi::ensure_pi_plugin_installed() {
-                return Ok(());
-            }
-            let diag = install_diag_context(tool, &[]);
-            bail!("Failed to setup Pi plugin. Run: hcom hooks add pi\n{diag}");
-        }
-        LaunchTool::Omp => {
-            if crate::hooks::omp::ensure_omp_plugin_installed() {
-                return Ok(());
-            }
-            let diag = install_diag_context(tool, &[]);
-            bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
-        }
+        LaunchTool::Codex => unreachable!("Codex uses per-run hooks"),
+        LaunchTool::OpenCode => unreachable!("OpenCode uses per-run hooks"),
+        LaunchTool::Kilo => unreachable!("Kilo uses per-run hooks"),
+        LaunchTool::Pi => unreachable!("Pi uses per-run hooks"),
+        LaunchTool::Omp => unreachable!("OMP uses per-run hooks"),
         LaunchTool::Antigravity => {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
                 return Ok(());
@@ -816,26 +683,7 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Copilot => {
-            if crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::copilot::try_setup_copilot_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "hooks_path",
-                        crate::hooks::copilot::get_copilot_hooks_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Copilot hooks: {e}\n\
-                     Run: hcom hooks add copilot\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
     }
 }
 
@@ -1711,23 +1559,6 @@ fn validate_launch_count(tool: &LaunchTool, count: usize) -> Result<()> {
     Ok(())
 }
 
-fn inject_omp_extension_args(tool: &LaunchTool, args: &mut Vec<String>) {
-    if !matches!(tool, LaunchTool::Omp) {
-        return;
-    }
-    let extension_args = crate::hooks::omp::extension_inject_args();
-    let plugin_path = extension_args
-        .get(1)
-        .map(String::as_str)
-        .unwrap_or_default();
-    let already_present = args
-        .windows(2)
-        .any(|window| matches!(window, [flag, path] if flag == "-e" && path == plugin_path));
-    if !already_present {
-        args.extend(extension_args);
-    }
-}
-
 fn append_initial_prompt_args(
     tool: &LaunchTool,
     args: &mut Vec<String>,
@@ -1878,12 +1709,36 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
-    // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(
-        &normalized,
-        hcom_config.auto_approve,
-        codex_home.as_ref().map(|(path, _)| path.as_path()),
-    )?;
+    // Hooks: per-run tools get a fresh injection built from the effective env,
+    // cwd and args (applied to args after the persisted snapshot below);
+    // persistent tools must have their global install (strict: refuse to launch
+    // without hooks).
+    let runtime_injection = match crate::hooks::runtime::adapter(normalized.tool()) {
+        Some(adapter) => {
+            // Replayed args (resume/fork) may carry hcom-injected values from a
+            // previous launch; drop them so the injection is rebuilt, not doubled.
+            crate::hooks::runtime::strip_replayed_args(adapter, &mut params.args);
+            if let Some(persisted) = params.persisted_args.as_mut() {
+                crate::hooks::runtime::strip_replayed_args(adapter, persisted);
+            }
+            let ctx = crate::hooks::runtime::LaunchCtx {
+                tool: normalized.tool(),
+                env: base_env.clone(),
+                cwd: canonical_dir.clone(),
+                args: params.args.clone(),
+                auto_approve: hcom_config.auto_approve,
+            };
+            let injection = crate::hooks::runtime::plan(adapter, &ctx)?;
+            for (key, value) in &injection.env {
+                insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
+            }
+            Some(injection)
+        }
+        None => {
+            ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
+            None
+        }
+    };
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1931,58 +1786,28 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
 
-    // Scrub any hcom-managed OMP extension arg a previous hcom version may have
-    // baked into the stored args, from BOTH the live and the persisted vectors
-    // (the snapshot below prefers persisted_args, and resume supplies that
-    // historical vector separately). Without this, replaying an old session can
-    // pass a stale `-e <old hcom.ts>` alongside the freshly injected current
-    // path — failing startup or loading hcom twice. User extensions are kept.
-    if matches!(normalized, LaunchTool::Omp) {
-        crate::hooks::omp::strip_managed_extension_args(&mut params.args);
-        if let Some(persisted) = params.persisted_args.as_mut() {
-            crate::hooks::omp::strip_managed_extension_args(persisted);
-        }
-    }
-
     // Capture the persistable args BEFORE any hcom launch injection below.
     // Resume replays only user/config args; workspace-trust injection
-    // (gemini `--skip-trust`, codex `-c projects=…trust_level`), the OMP
-    // delivery-extension path (`-e <abs hcom.ts>`), and the `--hcom-prompt`
+    // (gemini `--skip-trust`, codex `-c projects=…trust_level`) and the `--hcom-prompt`
     // translation are session/path-specific and must not be baked into
-    // launch_args, or they would replay stale state on resume/fork (e.g. a
-    // stale plugin path if PI_CODING_AGENT_DIR or the install location moves).
+    // launch_args, or they would replay stale state on resume/fork.
     let stored_launch_args = params
         .persisted_args
         .clone()
         .unwrap_or_else(|| params.args.clone());
 
-    // Injected after the snapshot so the internal plugin path is never persisted;
-    // resume re-injects the current path via the same call.
-    inject_omp_extension_args(&normalized, &mut params.args);
-
-    // Resolved here, before any trust injection, and threaded to
-    // preprocess_codex_args below. Codex's hook-trust bypass is invocation-wide,
-    // so a bypass hcom grants on the strength of a local hook scan must not be
-    // paired with a project layer that hcom itself just marked trusted — that
-    // layer could contribute a hook source the scan never saw.
-    let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
-        codex_preprocessing::resolve_codex_hook_trust_at(
-            &params.args,
-            &canonical_dir,
-            codex_home
-                .as_ref()
-                .map(|(path, _)| path.as_path())
-                .expect("Codex launch must resolve CODEX_HOME"),
-        )
-    } else {
-        codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
-    };
+    // Same for per-run hook injection: `injection.args` is the complete argv
+    // (caller args + hcom's merged flags), built from `params.args` above.
+    // Every instance of `hcom N <tool>` shares it; it holds no per-instance state.
+    if let Some(injection) = runtime_injection {
+        params.args = injection.args;
+    }
 
     inject_workspace_trust_args(
         &normalized,
         &canonical_dir,
         &mut params.args,
-        hcom_config.auto_trust_workspace && !codex_hook_trust.suppresses_workspace_trust(),
+        hcom_config.auto_trust_workspace,
     );
     let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
@@ -2322,7 +2147,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &effective_args,
                         &bootstrap,
                         &sandbox_mode,
-                        codex_hook_trust,
                     );
 
                     instances::update_instance_position(
@@ -2362,6 +2186,15 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         hcom_config.auto_approve,
                     );
+                    let effective_args = if normalized == LaunchTool::OpenCode {
+                        opencode_preprocessing::preprocess_opencode_args(
+                            &params.args,
+                            &mut instance_env,
+                            std::path::Path::new(working_dir),
+                        )?
+                    } else {
+                        params.args.clone()
+                    };
 
                     instances::update_instance_position(
                         db,
@@ -2385,7 +2218,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             handles: &mut handles,
                         },
                         &mut instance_env,
-                        &params.args,
+                        &effective_args,
                         &params,
                         inside_ai_tool,
                     )
@@ -2716,39 +2549,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_permission_error_tells_sandboxed_agents_how_to_retry() {
-        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sandbox denied");
-        let message = format_plugin_install_error(
-            "OpenCode",
-            "opencode",
-            std::path::Path::new("/home/test/.config/opencode/plugins/hcom.ts"),
-            &error,
-            "Diagnostic context:\n",
-        );
-
-        assert!(message.contains("sandbox denied"));
-        assert!(
-            message.contains("retry the original hcom launch with approval or elevated permission")
-        );
-        assert!(message.contains("Manual retry: hcom hooks add opencode"));
-    }
-
-    #[test]
-    fn plugin_non_permission_error_preserves_cause_without_sandbox_advice() {
-        let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad plugin data");
-        let message = format_plugin_install_error(
-            "OpenCode",
-            "opencode",
-            std::path::Path::new("/tmp/hcom.ts"),
-            &error,
-            "Diagnostic context:\n",
-        );
-
-        assert!(message.contains("bad plugin data"));
-        assert!(!message.contains("run outside the sandbox"));
-    }
-
-    #[test]
     fn launch_count_uses_per_tool_spec_limit() {
         assert!(validate_launch_count(&LaunchTool::Kimi, 10).is_ok());
         let err = validate_launch_count(&LaunchTool::Kimi, 11).unwrap_err();
@@ -2862,18 +2662,6 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--print"));
         assert!(validate_tool_args(&LaunchTool::Pi, &["--fork".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn omp_extension_args_are_injected_once() {
-        let mut args = vec!["--model".to_string(), "opus".to_string()];
-        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
-        assert!(args.iter().any(|arg| arg == "-e"));
-        assert!(args.iter().any(|arg| arg.ends_with("hcom.ts")));
-
-        let once = args.clone();
-        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
-        assert_eq!(args, once);
     }
 
     #[test]
@@ -3419,12 +3207,8 @@ mod tests {
             false,
         );
 
-        let args = crate::tools::codex_preprocessing::preprocess_codex_args(
-            &[],
-            &bootstrap,
-            "workspace",
-            crate::tools::codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded,
-        );
+        let args =
+            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
 
         // Locate the `-c developer_instructions=<TOML>` value and decode it.
         // preprocess also injects sandbox `-c` args, so match by prefix rather

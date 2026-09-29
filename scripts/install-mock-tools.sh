@@ -7,14 +7,37 @@ CACHE="${HCOM_MOCK_TOOLS_NPM_CACHE:-$ROOT/target/npm-cache}"
 
 mkdir -p "$PREFIX" "$CACHE"
 
-if [[ "$#" -gt 0 ]]; then
-  packages=("$@")
-else
-  packages=(
-    "@openai/codex@0.145.0"
-    "@anthropic-ai/claude-code@2.1.216"
-  )
+# Pinned `<package>@<version>` specs; comments and blank lines skipped.
+pins=()
+while IFS= read -r line; do
+  [[ -z "$line" || "$line" == \#* ]] || pins+=("$line")
+done < <(sed 's/[[:space:]]*$//' "$ROOT/scripts/mock-tools.pins")
+
+pin_for() {
+  local package="$1" pin
+  for pin in "${pins[@]}"; do
+    if [[ "$pin" == "$package@"* ]]; then
+      printf '%s\n' "$pin"
+      return
+    fi
+  done
+  printf 'no pin for %s in scripts/mock-tools.pins\n' "$package" >&2
+  exit 1
+}
+
+# No args installs every pin. An arg is a tool name (`codex`, `claude`) that
+# resolves to its pin, or an explicit npm spec used as given.
+packages=()
+if [[ "$#" -eq 0 ]]; then
+  packages=("${pins[@]}")
 fi
+for arg in "$@"; do
+  case "$arg" in
+    codex) packages+=("$(pin_for @openai/codex)") ;;
+    claude | @anthropic-ai/claude-code) packages+=("$(pin_for @anthropic-ai/claude-code)") ;;
+    *) packages+=("$arg") ;;
+  esac
+done
 
 claude_version=""
 has_claude_native=0
@@ -30,9 +53,6 @@ for package in "${packages[@]}"; do
       ;;
     @anthropic-ai/claude-code@*)
       claude_version="${package##*@}"
-      ;;
-    @anthropic-ai/claude-code)
-      claude_version="2.1.216"
       ;;
     @anthropic-ai/claude-code-*)
       has_claude_native=1
@@ -77,13 +97,18 @@ fi
 # revalidates registry metadata and reifies the installed packages on every
 # invocation. The real-tool gate needs exact pins, so a successful version
 # check is enough to reuse an already-installed, platform-specific tool.
+#
+# A version is one whitespace-separated token of the output (`claude` prints
+# `2.1.283 (Claude Code)`, `codex` prints `codex-cli 0.157.1`), matched exactly
+# as the tests' pin check does, so 2.1.28 never passes for 2.1.283.
 installed_pin_matches() {
-  local tool="$1" wanted="$2" launcher="$PREFIX/bin/$1" reported
+  local tool="$1" wanted="$2" launcher="$PREFIX/bin/$1" reported token
   [[ -x "$launcher" ]] || return 1
-  reported="$("$launcher" --version 2>&1 || true)"
-  reported="${reported#"${reported%%[! ]*}"}"   # trim leading whitespace
-  reported="${reported%"${reported##*[! ]}"}"   # trim trailing whitespace
-  [[ "$reported" == "$wanted" ]]
+  reported="$("$launcher" --version 2>&1)" || return 1
+  for token in $reported; do
+    [[ "${token#v}" == "$wanted" ]] && return 0
+  done
+  return 1
 }
 
 # Build tool→version map from packages and check all of them.

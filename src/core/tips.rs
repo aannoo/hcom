@@ -22,7 +22,7 @@ pub fn get_tip(key: &str) -> Option<&'static str> {
               \u{25a0} blocked (needs human user approval)  \u{25cb} inactive (dead)  \u{25e6} unknown (neutral)",
         ),
         "list:types" => Some(
-            "[tip] Types show the detected integration. Managed launches and installed hooks enable automatic delivery; ad-hoc sessions use manual hcom start/listen.",
+            "[tip] Tool labels: [CLAUDE] etc. get messages automatically; a * means not bound yet or lost (hcom list <name>); [AD-HOC] checks manually with hcom listen.",
         ),
         // Send-side
         "send:intent:request" => Some(

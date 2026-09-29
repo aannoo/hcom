@@ -4,6 +4,7 @@
 //! Manages hook installation across every released hook-bearing integration.
 
 use crate::db::HcomDb;
+use crate::hooks::runtime::{self, HookMode};
 use crate::shared::CommandContext;
 use crate::tool::Tool;
 
@@ -45,14 +46,23 @@ fn valid_hook_options() -> String {
     names.join(", ")
 }
 
-/// Refresh permission state for hook integrations that are already installed.
+/// Refresh permission state after `auto_approve` changes.
 ///
-/// This is used after `auto_approve` changes. It intentionally skips tools
-/// without installed hooks so changing one preference does not install new
-/// integrations as a side effect.
+/// Per-run tools sync their permission-only files unconditionally (they have no
+/// install to gate on). Persistent tools are skipped when their hooks aren't
+/// installed, so changing one preference does not install new integrations as
+/// a side effect.
 pub(crate) fn refresh_installed_hook_permissions(enabled: bool) -> Vec<(&'static str, String)> {
     let mut failures = Vec::new();
     for tool in hook_tools() {
+        if let Some(adapter) = runtime::adapter(tool) {
+            if let Some(ensure_permissions) = adapter.ensure_permissions
+                && let Err(error) = ensure_permissions(&runtime::LaunchCtx::ambient(tool, enabled))
+            {
+                failures.push((tool.as_str(), format!("{error:#}")));
+            }
+            continue;
+        }
         if !tool.verify_hooks_installed(false) {
             continue;
         }
@@ -63,12 +73,13 @@ pub(crate) fn refresh_installed_hook_permissions(enabled: bool) -> Vec<(&'static
     failures
 }
 
-/// Get hook installation status for each tool.
+/// Get hook installation status for each persistent-mode tool.
 ///
-/// Routes status checks through the typed hook adapter for every registry tool.
+/// Per-run tools have no install to check and are excluded.
 fn get_tool_status() -> Vec<(Tool, bool, String)> {
     hook_tools()
         .into_iter()
+        .filter(|tool| !runtime::is_per_run(*tool))
         .map(|tool| {
             (
                 tool,
@@ -79,14 +90,20 @@ fn get_tool_status() -> Vec<(Tool, bool, String)> {
         .collect()
 }
 
-/// Show hook installation status for all tools.
+/// Show hook mode and, for persistent tools, installation status.
 fn cmd_hooks_status() -> i32 {
     let status = get_tool_status();
-    for (tool, installed, path) in &status {
-        if *installed {
-            println!("{}:  installed    ({path})", tool.spec().label);
-        } else {
-            println!("{}:  not installed", tool.spec().label);
+    for tool in hook_tools() {
+        let label = tool.spec().label;
+        match status.iter().find(|(t, _, _)| *t == tool) {
+            None => println!("{label}:  {}", HookMode::PerRun.label()),
+            Some((_, true, path)) => println!(
+                "{label}:  {}, installed    ({path})",
+                HookMode::Persistent.label()
+            ),
+            Some((_, false, _)) => {
+                println!("{label}:  {}, not installed", HookMode::Persistent.label())
+            }
         }
     }
     0
@@ -122,6 +139,17 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
     }
     let mut results: Vec<(Tool, AddResult)> = Vec::new();
     for tool in &tools {
+        if runtime::is_per_run(*tool) {
+            // Only report on an explicit request; `add all` skips silently.
+            if tools.len() == 1 {
+                println!(
+                    "{} loads hcom's hooks per launch (hcom {}); nothing to install.",
+                    tool.spec().label,
+                    tool.as_str()
+                );
+            }
+            continue;
+        }
         if tool.verify_hooks_installed(include_permissions) {
             results.push((*tool, AddResult::Already));
             continue;
@@ -192,6 +220,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
     let pre_status = get_tool_status();
     let mut fail_count = 0;
     for tool in &tools {
+        let per_run = runtime::is_per_run(*tool);
         let was_installed = pre_status
             .iter()
             .find(|(t, _, _)| t == tool)
@@ -208,7 +237,9 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
             }
         };
         if ok {
-            if was_installed {
+            if per_run {
+                println!("Removed any legacy {name} hooks");
+            } else if was_installed {
                 println!("Removed {name} hooks");
             } else {
                 println!("{name} hooks already removed");
@@ -237,22 +268,7 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
     let first = argv[0].as_str();
 
     if first == "--help" || first == "-h" {
-        let options = valid_hook_options();
-        println!(
-            "hcom hooks - Manage tool hooks for hcom integration\n\n\
-             Hooks enable automatic message delivery and status tracking. Without hooks,\n\
-             you can still use hcom in ad-hoc mode (run hcom start in any ai tool).\n\n\
-             Usage:\n  \
-             hcom hooks                  Show hook status for all tools\n  \
-             hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks ({options})\n  \
-             hcom hooks remove [tool]    Remove hooks ({options})\n\n\
-             Examples:\n  \
-             hcom hooks add claude       Add Claude Code hooks only\n  \
-             hcom hooks add              Auto-detect tool or add all\n  \
-             hcom hooks remove all       Remove all hooks\n\n\
-             After adding, restart the tool to activate hooks."
-        );
+        crate::commands::help::print_command_help("hooks");
         return 0;
     }
 

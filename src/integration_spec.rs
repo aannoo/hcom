@@ -45,8 +45,8 @@ pub struct HooksSpec {
     /// should resolve those names to the owner, not the borrowing tool.
     ///
     /// Antigravity borrows Gemini hook names and is identified out-of-band by
-    /// `ANTIGRAVITY_AGENT`, so `Tool::Antigravity.owns_hook("gemini-*")` must
-    /// stay false even though this spec lists Gemini's hook names.
+    /// `ANTIGRAVITY_AGENT`, so `Tool::from_hook_name("gemini-*")` must resolve
+    /// to Gemini even though this spec lists Gemini's hook names.
     pub shared_hooks_with: Option<Tool>,
     pub invocation: HookInvocation,
 }
@@ -306,6 +306,7 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-pretooluse",
     "copilot-permissionrequest",
     "copilot-posttooluse",
+    "copilot-erroroccurred",
     "copilot-posttoolusefailure",
     "copilot-notification",
     "copilot-agentstop",
@@ -316,13 +317,10 @@ const COPILOT_HOOKS: &[&str] = &[
 
 // ── Help examples / extra-env tables ────────────────────────────────────
 
-const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
-    (
-        "hcom claude --model sonnet|opus|haiku",
-        "Use a specific model",
-    ),
-];
+const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom claude --model fable|opus|sonnet|haiku",
+    "Flags forwarded to claude",
+)];
 const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
     "HCOM_SUBAGENT_TIMEOUT",
     "Seconds subagents keep-alive after task",
@@ -331,23 +329,17 @@ const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
 const GEMINI_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom N gemini --yolo", "Flags forwarded to gemini"),
     (
-        "hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash",
+        "hcom gemini --model pro|flash|flash-lite",
         "Use a specific model",
     ),
 ];
 const GEMINI_HELP_EXTRA_ENV: &[HelpEntry] =
     &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")];
 
-const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[
-    (
-        "hcom codex --sandbox danger-full-access",
-        "Flags forwarded to codex",
-    ),
-    (
-        "hcom codex --model gpt-5.4|gpt-5.4-mini",
-        "Use a specific model",
-    ),
-];
+const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom codex --sandbox danger-full-access",
+    "Flags forwarded to codex",
+)];
 const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     (
         "HCOM_CODEX_SYSTEM_PROMPT",
@@ -355,25 +347,21 @@ const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     ),
     (
         "HCOM_CODEX_SANDBOX_MODE",
-        "workspace | untrusted | danger-full-access | none",
+        "workspace | danger-full-access | none",
     ),
 ];
 
-const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[(
-    "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
-    "Use a specific model",
-)];
+const OPENCODE_HELP_EXAMPLES: &[HelpEntry] =
+    &[("hcom opencode --agent plan", "Flags forwarded to opencode")];
 
 const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
     "hcom kilo --model kilo/kilo-auto/free",
-    "Use Kilo's free auto model",
+    "Flags forwarded to kilo",
 )];
 
-const PI_HELP_EXAMPLES: &[HelpEntry] =
-    &[("hcom pi --model claude-3-5-sonnet", "Use a specific model")];
+const PI_HELP_EXAMPLES: &[HelpEntry] = &[("hcom pi --thinking high", "Flags forwarded to pi")];
 
-const OMP_HELP_EXAMPLES: &[HelpEntry] =
-    &[("hcom omp --model claude-3-5-sonnet", "Use a specific model")];
+const OMP_HELP_EXAMPLES: &[HelpEntry] = &[("hcom omp --thinking high", "Flags forwarded to omp")];
 
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
@@ -382,23 +370,28 @@ const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
 ];
 
 const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom cursor-agent --model sonnet-4", "Use a specific model"),
+    ("hcom cursor-agent --model auto", "Use a specific model"),
     (
         "hcom cursor-agent --force",
         "Allow commands unless explicitly denied",
     ),
+    (
+        "hcom cursor-agent --plan",
+        "Flags forwarded to cursor-agent",
+    ),
 ];
 
 const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom kimi --model kimi-k2.6", "Use a specific model"),
-    ("hcom kimi --yolo", "Bypass permission prompts"),
+    (
+        "hcom kimi --yolo",
+        "Auto-run routine actions; risky ones still ask",
+    ),
+    ("hcom kimi --auto", "Never ask for approval"),
+    ("hcom kimi --plan", "Flags forwarded to kimi"),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
-    (
-        "hcom copilot --model claude-haiku-4.5",
-        "Use a specific model",
-    ),
+    ("hcom copilot --model auto", "Use a specific model"),
     (
         "hcom copilot --allow-tool 'shell(hcom:*)'",
         "Flags forwarded to copilot",
@@ -534,7 +527,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         invocation: HookInvocation::JsonStdin,
     },
     // - require_ready_prompt=false: "? for shortcuts" hides in narrow terminals.
-    // - require_prompt_empty=true: VT100 dim detection on the `›` prompt char.
+    // - require_prompt_empty=true: VT100 dim detection after `›` or `»`.
     gates: GatesSpec {
         require_idle: true,
         require_ready_prompt: false,
@@ -1459,14 +1452,18 @@ mod tests {
 
     #[test]
     fn drift_released_tools_have_hook_dispatch() {
-        // Every released hook-bearing tool must round-trip through Tool's
-        // hook-ops adapter: settings_path resolves to a non-empty path and
-        // verify_hooks_installed() can be called without panicking.
+        // Every released hook-bearing tool is either per-run (it has a
+        // runtime adapter) or persistent, in which case it must round-trip
+        // through Tool's install ops: settings_path resolves to a non-empty
+        // path and verify_hooks_installed() can be called without panicking.
         // Borrowed-hooks specs (Antigravity → Gemini) are checked via their
         // owning Tool — Antigravity has its own hook module but borrows the
         // hook command names.
         for spec in ALL {
             if !spec.released || spec.hooks.names.is_empty() {
+                continue;
+            }
+            if crate::hooks::runtime::is_per_run(spec.tool) {
                 continue;
             }
             let path = spec.tool.hooks_settings_path();

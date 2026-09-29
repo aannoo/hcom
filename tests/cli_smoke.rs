@@ -330,6 +330,8 @@ fn start_send_events_roundtrip() {
     assert_eq!(delivered.len(), 1, "listen output={listen_out}");
     assert_eq!(delivered[0]["from"], sender.as_str());
     assert_eq!(delivered[0]["text"], "hello there");
+    let event_id = delivered[0]["event_id"].as_i64().expect("event_id");
+    assert_eq!(delivered[0]["reply_id"], event_id.to_string());
 
     let (c7, list_after_listen_out, _) = h.run(["list", "--json"]);
     assert_eq!(c7, 0);
@@ -609,9 +611,25 @@ fn bigboss_send_bypasses_identity_gate() {
 }
 
 #[test]
-fn config_unknown_key_is_not_set() {
+fn config_unknown_key_is_rejected() {
     let h = Hcom::new();
-    let (code, stdout, _stderr) = h.run(["config", "no_such_key"]);
+    let (code, _stdout, stderr) = h.run(["config", "no_such_key"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Unknown config key 'no_such_key'"),
+        "stderr={stderr}"
+    );
+
+    // Setting a typo must not write it to config.toml either.
+    let (code, _stdout, stderr) = h.run(["config", "timout", "60"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Did you mean: timeout?"), "stderr={stderr}");
+}
+
+#[test]
+fn config_known_unset_key_reports_not_set() {
+    let h = Hcom::new();
+    let (code, stdout, _stderr) = h.run(["config", "hints"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("(not set)"), "stdout={stdout}");
 }
@@ -778,11 +796,11 @@ fn antigravity_e2e_hook_dispatch() {
     assert_eq!(parsed, serde_json::json!({ "decision": "allow" }));
 
     // 3. AfterTool cannot inject context for Antigravity, so it must not ack delivery.
+    // Send from bigboss: self-sends are never delivered, so they'd leave nothing pending.
     let (send_code, _, send_stderr) = h.run([
         "send",
         &format!("@{me}"),
-        "--name",
-        &me,
+        "-b",
         "--intent",
         "request",
         "--",
@@ -1487,4 +1505,107 @@ fn events_wait_cli_preexisting_unread_times_out_with_one() {
 #[test]
 fn events_wait_cli_arriving_unread_then_matching_status_exits_zero() {
     run_events_wait_cli_oracle(UnreadTiming::ArrivingAfterReadiness, 4, 0);
+}
+
+#[test]
+fn commands_on_stopped_agent_explain_when_and_how_to_resume() {
+    let h = Hcom::new();
+    let me = h.start();
+    let gone = h.start();
+    let (cs, _, es) = h.run(["stop", &gone]);
+    assert_eq!(cs, 0, "stop failed: {es}");
+
+    // kill/stop of an already-stopped agent is a no-op success, not "not found".
+    for cmd in ["kill", "stop"] {
+        let (code, stdout, stderr) = h.run([cmd, &gone]);
+        assert_eq!(code, 0, "{cmd}: stdout={stdout} stderr={stderr}");
+        assert!(
+            stdout.contains(&format!("'{gone}' stopped ")),
+            "{cmd}: stdout={stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("hcom r {gone}")),
+            "{cmd}: stdout={stdout}"
+        );
+    }
+
+    for args in [vec!["list", gone.as_str()], vec!["term", gone.as_str()]] {
+        let (code, _stdout, stderr) = h.run(args.clone());
+        assert_eq!(code, 1, "{args:?}");
+        assert!(
+            stderr.contains(&format!("'{gone}' stopped ")),
+            "{args:?}: stderr={stderr}"
+        );
+    }
+
+    let (code, _stdout, stderr) = h.run(["send", &format!("@{gone}"), "--name", &me, "--", "hi"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("@{gone} stopped")) && stderr.contains(&format!("hcom r {gone}")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn unknown_agent_gets_typo_suggestion() {
+    let h = Hcom::new();
+    let me = h.start();
+    let typo: String = {
+        let mut c: Vec<char> = me.chars().collect();
+        c.swap(1, 2);
+        c.into_iter().collect()
+    };
+    if typo == me {
+        return; // name with repeated letters; swap is a no-op
+    }
+    let (code, _stdout, stderr) = h.run(["kill", &typo]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("No agent named '{typo}'"))
+            && stderr.contains(&format!("Did you mean: {me}?")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn send_rejects_ambiguous_bare_word_and_self_target() {
+    let h = Hcom::new();
+    let me = h.start();
+    let other = h.start();
+
+    // A lone word without '@' or '--' must not silently broadcast.
+    let (code, _stdout, stderr) = h.run(["send", &other, "--name", &me]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("Did you mean @{other}?")),
+        "stderr={stderr}"
+    );
+
+    let (code, _stdout, stderr) = h.run(["send", "hello", "--name", &me]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("hcom send -- hello"), "stderr={stderr}");
+
+    let (code, _stdout, stderr) = h.run(["send", &format!("@{me}"), "--name", &me, "--", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is you"), "stderr={stderr}");
+
+    // bigboss:DEVICE routes to bigboss, so it is also a self-only target.
+    let (code, _stdout, stderr) = h.run(["send", "-b", "@bigboss:ABCD", "--", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is you"), "stderr={stderr}");
+}
+
+#[test]
+fn unknown_command_and_tool_suggest_corrections() {
+    let h = Hcom::new();
+    let (code, _stdout, stderr) = h.run(["lst"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Did you mean: list?"), "stderr={stderr}");
+
+    let (code, _stdout, stderr) = h.run(["1", "claud"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Unknown tool 'claud'") && stderr.contains("Did you mean: claude?"),
+        "stderr={stderr}"
+    );
 }

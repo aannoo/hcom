@@ -479,16 +479,19 @@ pub fn get_bootstrap(
     } else if tool == "copilot" && ctx.is_launched {
         parts.push(DELIVERY_AUTO);
         parts.push(COPILOT_DELIVERY);
-    } else if tool == "claude"
-        || ((tool == "codex"
-            || tool == "gemini"
-            || tool == "opencode"
-            || tool == "kilo"
-            || tool == "antigravity"
-            || tool == "kimi"
-            || tool == "pi"
-            || tool == "omp")
-            && ctx.is_launched)
+    } else if ctx.is_launched
+        && matches!(
+            tool,
+            "claude"
+                | "codex"
+                | "gemini"
+                | "opencode"
+                | "kilo"
+                | "antigravity"
+                | "kimi"
+                | "pi"
+                | "omp"
+        )
     {
         parts.push(DELIVERY_AUTO);
     } else {

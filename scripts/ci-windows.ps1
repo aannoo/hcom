@@ -47,15 +47,23 @@ function Unlock-DevBinary {
     }
 }
 
-$known = [System.Collections.Generic.List[string]]::new()
+# Every step below, in order. Named steps are validated against this up front,
+# so a typo fails before anything runs; Step rejects a name missing here.
+$known = @("fmt", "clippy", "test", "mock-tools", "real_tool_codex", "real_tool_claude", "test_relay_roundtrip")
+foreach ($want in $Only) {
+    if ($known -notcontains $want) {
+        Write-Host "[ci] unknown step: $want"
+        Write-Host ("[ci] steps: {0}" -f ($known -join " "))
+        exit 2
+    }
+}
+
 $ran = 0
 $skipped = 0
 $total = [Diagnostics.Stopwatch]::StartNew()
 
 function Step([string] $name, [scriptblock] $body) {
-    # Recorded before the filter, so the unknown-step check at the end sees every
-    # step name whether or not this run executed it.
-    $known.Add($name)
+    if ($known -notcontains $name) { throw "step $name is missing from `$known" }
     if ($Only -and $Only -notcontains $name) { return }
     $log = Join-Path $logDir "$name.log"
     Write-Host ("[ci] {0,-20} " -f $name) -NoNewline
@@ -100,14 +108,6 @@ Step mock-tools { & (Join-Path $PSScriptRoot "install-mock-tools.ps1") }
 Step real_tool_codex      { cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1 }
 Step real_tool_claude     { cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1 }
 Step test_relay_roundtrip { cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1 }
-
-foreach ($want in $Only) {
-    if ($known -notcontains $want) {
-        Write-Host "[ci] unknown step: $want"
-        Write-Host ("[ci] steps: {0}" -f ($known -join " "))
-        exit 2
-    }
-}
 
 $secs = [int] $total.Elapsed.TotalSeconds
 if ($skipped -gt 0) {

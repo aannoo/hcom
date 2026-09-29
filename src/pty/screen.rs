@@ -166,6 +166,24 @@ pub struct ScreenTracker {
     instance_name: Option<String>,
 }
 
+/// Codex (0.157+) draws its composer, ready pattern included, before startup
+/// finishes: input typed then is held as a draft ("Waiting for startup"), and a
+/// folder-trust screen can still take over the TUI. Its header reads
+/// `model: loading` until startup completes, and its onboarding screens, drawn
+/// over a composer whose ready-pattern row can survive underneath, end in an
+/// `enter continue · esc quit` footer. Either line means not ready.
+fn is_codex_startup_line(line: &str) -> bool {
+    is_codex_loading_header(line) || is_codex_onboarding_footer(line)
+}
+
+fn is_codex_loading_header(line: &str) -> bool {
+    line.contains("model:") && line.contains("loading") && line.contains("/model to change")
+}
+
+fn is_codex_onboarding_footer(line: &str) -> bool {
+    line.contains("enter continue") && line.contains("esc quit")
+}
+
 impl ScreenTracker {
     /// Create a new screen tracker with instance name (for debug logging)
     pub fn new_with_instance(
@@ -346,12 +364,25 @@ impl ScreenTracker {
         let screen = self.parser.screen();
         let (_rows, cols) = screen.size();
 
+        let mut pattern_visible = false;
         for line in screen.rows(0, cols) {
-            if line.contains(&self.ready_pattern) {
-                return true;
+            if is_codex_startup_line(&line) {
+                return false;
             }
+            pattern_visible |= line.contains(&self.ready_pattern)
+                || (self.ready_pattern == "› " && line.contains("» "));
         }
-        false
+        pattern_visible
+    }
+
+    /// Codex is still starting and nothing needs answering yet: its header
+    /// says `model: loading` and no onboarding screen has taken over. Startup
+    /// can sit here for seconds (the folder-trust lookup runs first), which must
+    /// not read as a launch that settled without becoming ready.
+    pub fn is_codex_startup_loading(&self) -> bool {
+        let lines = self.get_screen_lines();
+        lines.iter().any(|line| is_codex_loading_header(line))
+            && !lines.iter().any(|line| is_codex_onboarding_footer(line))
     }
 
     /// Check if the latest complete OSC terminal title requires action.
@@ -862,37 +893,50 @@ impl ScreenTracker {
 
     /// Extract Codex input text.
     ///
-    /// Codex uses `›` (U+203A) as prompt character. Placeholder text is rendered
-    /// with dim attribute, real user input is not dim.
+    /// Codex uses `›` (U+203A) as its normal prompt character and `»` (U+00BB)
+    /// at Ultra reasoning effort. Placeholder text is rendered with dim
+    /// attribute, real user input is not dim.
     ///
     /// Uses vt100's cell-level dim attribute to distinguish placeholder from
     /// real input, avoiding race conditions where ready pattern is still visible
     /// during PTY injection.
     fn get_codex_input_text(&self) -> Option<String> {
         let lines = self.get_screen_lines();
+        // The startup composer's placeholder reads as an empty prompt, but
+        // input there is held as a draft and an onboarding screen can still
+        // take over. Unknown input keeps both launch readiness and delivery
+        // waiting until startup is done.
+        if lines.iter().any(|line| is_codex_startup_line(line)) {
+            return None;
+        }
 
-        // Search bottom-to-top for › prompt character
-        // › (U+203A, SINGLE RIGHT-POINTING ANGLE QUOTATION MARK) = 3 bytes UTF-8 + 1 space = 4 bytes total
+        // Submitted history can contain `›` above a live `»` composer.
+        // Search bottom-to-top so the live prompt wins.
         for (row_idx, line) in lines.iter().enumerate().rev() {
             let trimmed = line.trim_start();
-            if let Some(text) = trimmed.strip_prefix("› ") {
-                let text = trim_with_nbsp(text);
+            let (prompt_char, text) = if let Some(text) = trimmed.strip_prefix("› ") {
+                ("›", text)
+            } else if let Some(text) = trimmed.strip_prefix("» ") {
+                ("»", text)
+            } else {
+                continue;
+            };
+            let text = trim_with_nbsp(text);
 
-                if text.is_empty() {
-                    return Some(String::new());
-                }
+            if text.is_empty() {
+                return Some(String::new());
+            }
 
-                // Dim text = placeholder, not real input
-                match self.is_dim_after_prompt(row_idx as u16, "›") {
-                    Some(true) => return Some(String::new()),
-                    Some(false) => return Some(text.to_string()),
-                    None => {
-                        // Can't locate prompt glyph, fall back to ready-pattern logic
-                        if self.is_ready() {
-                            return Some(String::new());
-                        }
-                        return Some(text.to_string());
+            // Dim text = placeholder, not real input.
+            match self.is_dim_after_prompt(row_idx as u16, prompt_char) {
+                Some(true) => return Some(String::new()),
+                Some(false) => return Some(text.to_string()),
+                None => {
+                    // Can't locate prompt glyph, fall back to ready-pattern logic.
+                    if self.is_ready() {
+                        return Some(String::new());
                     }
+                    return Some(text.to_string());
                 }
             }
         }
@@ -966,14 +1010,41 @@ impl ScreenTracker {
 
     /// Extract GitHub Copilot CLI input text.
     ///
-    /// Copilot uses `❯` as the prompt glyph and has no dim placeholder in the
-    /// empty state: an empty prompt is just a bare `❯` line.
+    /// Copilot has shipped both a `❯` box with `─` borders and a `┃` box
+    /// with half-block borders. Anchor to the bottom border near the footer so
+    /// prompt-looking text in the transcript cannot be mistaken for input.
     fn get_copilot_input_text(&self) -> Option<String> {
         let lines = self.get_screen_lines();
-        for line in lines.iter().rev() {
-            let trimmed = line.trim_start();
-            if let Some(text) = trimmed.strip_prefix('❯') {
-                return Some(trim_with_nbsp(text.trim_start()).to_string());
+        for bottom in (0..lines.len()).rev().take(4) {
+            let border = lines[bottom].trim();
+            let prompt = if border.starts_with('╹') && border.contains('▀') {
+                '┃'
+            } else if border.chars().count() >= 3 && border.chars().all(|c| c == '─') {
+                '❯'
+            } else {
+                continue;
+            };
+
+            for top in (bottom.saturating_sub(12)..bottom).rev() {
+                let upper = lines[top].trim();
+                let matching_top = if prompt == '┃' {
+                    upper.starts_with('╻') && upper.contains('▄')
+                } else {
+                    upper.chars().count() >= 3 && upper.chars().all(|c| c == '─')
+                };
+                if !matching_top {
+                    continue;
+                }
+                let Some(first) = lines[top + 1].trim_start().strip_prefix(prompt) else {
+                    break;
+                };
+                let mut text = vec![trim_with_nbsp(first).to_string()];
+                for line in &lines[top + 2..bottom] {
+                    let continuation = line.trim_start();
+                    let continuation = continuation.strip_prefix(prompt).unwrap_or(continuation);
+                    text.push(trim_with_nbsp(continuation).to_string());
+                }
+                return Some(text.join("\n").trim().to_string());
             }
         }
         None
@@ -1571,6 +1642,72 @@ mod tests {
     }
 
     #[test]
+    fn codex_ultra_dim_placeholder_wins_over_submitted_history() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› submitted prompt\r\n» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
+
+        assert_eq!(t.get_codex_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("codex"));
+    }
+
+    #[test]
+    fn codex_ultra_prompt_satisfies_ready_pattern() {
+        let mut t = make_tracker(24, 80, "› ");
+        t.process("» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
+
+        assert!(t.is_ready());
+        assert!(t.is_prompt_empty("codex"));
+    }
+
+    #[test]
+    fn codex_ultra_non_dim_draft_wins_over_submitted_history() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› submitted prompt\r\n» Summarize recent commits\r\n".as_bytes());
+
+        assert_eq!(
+            t.get_codex_input_text(),
+            Some("Summarize recent commits".to_string())
+        );
+        assert!(!t.is_prompt_empty("codex"));
+    }
+
+    #[test]
+    fn codex_not_ready_while_startup_header_is_loading() {
+        let header = |model: &str| {
+            format!(
+                "\u{2502} model:     {model}   /model to change \u{2502}\r\n\
+                 \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n  ? for shortcuts\r\n"
+            )
+        };
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(header("loading").as_bytes());
+        assert!(!t.is_ready(), "composer drawn during startup is not ready");
+        assert!(t.is_codex_startup_loading());
+        assert_eq!(
+            t.get_codex_input_text(),
+            None,
+            "a startup draft is not an empty prompt"
+        );
+
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(header("GPT-5.5 default").as_bytes());
+        assert!(t.is_ready());
+        assert_eq!(t.get_codex_input_text(), Some(String::new()));
+
+        // A folder-trust screen over the composer, stale ready row included.
+        t.process(
+            "\u{203a} 1. Open restricted\r\n  2. Quit\r\n  enter continue \u{b7} esc quit\r\n"
+                .as_bytes(),
+        );
+        assert!(!t.is_ready(), "onboarding screen is not ready");
+        assert!(
+            !t.is_codex_startup_loading(),
+            "a screen awaiting an answer is not loading"
+        );
+        assert_eq!(t.get_codex_input_text(), None);
+    }
+
+    #[test]
     fn codex_no_prompt_no_ready() {
         let t = make_tracker(24, 80, "? for shortcuts");
         assert_eq!(t.get_codex_input_text(), None);
@@ -1608,6 +1745,53 @@ mod tests {
     }
 
     // ---- Cursor input extraction ----
+
+    #[test]
+    fn copilot_extracts_current_framed_prompt() {
+        let mut t = make_tracker(24, 80, "/ commands");
+        let mut lines = vec![""; 19];
+        lines.extend_from_slice(&[
+            " ~/Dev/project                                      Session: 0 AIC used",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯ hello copilot",
+            "────────────────────────────────────────────────────────────────────────────────",
+            " ← open sidebar · / commands · ? help                              Auto",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_copilot_input_text().as_deref(), Some("hello copilot"));
+        assert!(!t.is_prompt_empty("copilot"));
+    }
+
+    #[test]
+    fn copilot_extracts_half_block_prompt() {
+        let mut t = make_tracker(24, 80, "/ commands");
+        let mut lines = vec![""; 20];
+        lines.extend_from_slice(&[
+            "╻▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+            "┃",
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " @ files · # issues               / commands                     Auto",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_copilot_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("copilot"));
+    }
+
+    #[test]
+    fn copilot_ignores_prompt_glyph_in_transcript() {
+        let mut t = make_tracker(24, 80, "/ commands");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "❯ Thought for 4s … ┃",
+            "╻▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+            "┃ actual draft",
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " @ files · # issues               / commands                     Auto",
+            "",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_copilot_input_text().as_deref(), Some("actual draft"));
+    }
 
     #[test]
     fn cursor_extracts_non_dim_text_after_prompt() {

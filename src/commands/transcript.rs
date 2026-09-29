@@ -236,6 +236,21 @@ fn attribute_disk_match(
     owner
 }
 
+/// Explain an empty range result against the exchanges that do exist.
+fn range_miss_message(
+    exchanges: &[Exchange],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+) -> Option<String> {
+    let start = range_start?;
+    let end = range_end.unwrap_or(start);
+    let last = exchanges.iter().map(|e| e.position).max()?;
+    Some(format!(
+        "No exchanges in range {start}-{end}; this transcript has 1-{last} (e.g. --last 5 or {}-{last})",
+        last.saturating_sub(4).max(1)
+    ))
+}
+
 /// Build an appropriate error message when transcript resolution fails.
 /// Uses resolve_display_name_or_stopped (which handles exact base and tag-name
 /// resolution) to check if the instance exists without a transcript.
@@ -261,7 +276,7 @@ fn no_transcript_error(
             "No model transcript is registered for {display_name}.\nView transport messages with: {command}"
         )
     } else {
-        format!("Agent '{display_name}' not found")
+        crate::identity::describe_missing_agent(db, name)
     }
 }
 
@@ -901,7 +916,7 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     if json_mode {
         println!(
             "{}",
-            serde_json::to_string_pretty(&all_entries).unwrap_or_default()
+            serde_json::to_string(&all_entries).unwrap_or_default()
         );
         return 0;
     }
@@ -1111,6 +1126,14 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         exchanges.iter().collect()
     };
 
+    // Checked before output-mode branching so --json callers see the same error.
+    if filtered.is_empty()
+        && let Some(msg) = range_miss_message(&exchanges, range_start, range_end)
+    {
+        eprintln!("Error: {msg}");
+        return 1;
+    }
+
     if json_mode {
         let json_output: Vec<Value> = filtered
             .iter()
@@ -1150,7 +1173,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json_output).unwrap_or_default()
+            serde_json::to_string(&json_output).unwrap_or_default()
         );
         return 0;
     }
@@ -1321,6 +1344,12 @@ fn render_instance_transcript_impl(
         exchanges.iter().collect()
     };
 
+    if filtered.is_empty()
+        && let Some(msg) = range_miss_message(&exchanges, range_start, range_end)
+    {
+        return Err(msg);
+    }
+
     if opts.json_mode {
         let json_output: Vec<Value> = filtered
             .iter()
@@ -1358,7 +1387,7 @@ fn render_instance_transcript_impl(
                 obj
             })
             .collect();
-        return serde_json::to_string_pretty(&json_output).map_err(|e| e.to_string());
+        return serde_json::to_string(&json_output).map_err(|e| e.to_string());
     }
 
     if filtered.is_empty() {

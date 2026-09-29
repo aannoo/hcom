@@ -88,6 +88,9 @@ pub(super) fn update_delivery_state(
         state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
             && (screen.is_claude_subagent_nav_visible()
                 || screen.is_claude_session_switcher_visible());
+        state.startup_loading = matches!(target.known_tool(), Some(Tool::Codex))
+            && launch_phase_active.load(Ordering::Acquire)
+            && screen.is_codex_startup_loading();
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {

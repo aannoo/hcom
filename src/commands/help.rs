@@ -43,17 +43,29 @@ const FILTER_HELP: &[HelpEntry] = &[
 ];
 
 // ── Per-command help registries ─────────────────────────────────────────
+//
+// A command page is a list of sections; a subcommand page (`SUBCOMMAND_HELP`)
+// reuses the same sections, so `hcom X --help` and `hcom X sub --help` can't
+// drift apart.
 
-const EVENTS_HELP: &[HelpEntry] = &[
+const FILTERS_HEADER: &[HelpEntry] = &[(
+    "Filters (same flag repeated = OR, different flags = AND):",
+    "",
+)];
+
+const EVENTS_QUERY: &[HelpEntry] = &[
     (
         "",
         "Query the event stream (messages, status changes, file edits, lifecycle)",
     ),
-    ("", ""),
     ("Query:", ""),
-    ("  events", "Last 20 events as JSON"),
+    (
+        "  events",
+        "Last 20 events as JSON Lines (one object per line)",
+    ),
     ("  --last N", "Limit count (default: 20)"),
     ("  --all", "Include archived sessions"),
+    ("  --full", "Full event JSON (default: streamlined)"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (
@@ -62,56 +74,70 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ),
 ];
 
-// events help continued after FILTER_HELP splice
-const EVENTS_HELP_2: &[HelpEntry] = &[
-    ("", ""),
+const EVENTS_SHORTCUTS: &[HelpEntry] = &[
     ("Shortcuts:", ""),
     ("  --idle NAME", "--agent NAME --status listening"),
     ("  --blocked NAME", "--agent NAME --status blocked"),
-    ("", ""),
+];
+
+const EVENTS_LAUNCH: &[HelpEntry] = &[
     ("Wait for a launch batch:", ""),
     (
-        "  events launch [batch_id]",
+        "events launch [batch_id]",
         "Block until batch reaches a terminal state (JSON LaunchResult)",
     ),
-    ("    --timeout SEC", "Max seconds to wait (default: 30)"),
+    ("  --timeout SEC", "Max seconds to wait (default: 30)"),
     (
         "",
-        "  Exit codes: 0 ready, 1 error/no_launches, 2 timeout/blocked",
+        "Exit codes: 0 ready, 1 error/no_launches, 2 timeout/blocked",
     ),
-    ("", ""),
+];
+
+const EVENTS_SUB: &[HelpEntry] = &[
     (
-        "Subscribe (next matching event delivered as messages from [hcom-events]):",
+        "Subscribe (next matching event arrives as a message from [hcom-events]):",
         "",
     ),
-    ("  events sub list", "List active subscriptions"),
+    ("events sub list", "List active subscriptions"),
+    ("events sub [filters]", "Subscribe using filter flags"),
+    ("events sub \"SQL WHERE\"", "Subscribe using raw SQL"),
+    ("  --once", "Auto-remove after first match"),
+    ("  --for <name>", "Subscribe on behalf of another agent"),
     (
-        "  events sub [filters] [--once]",
-        "Subscribe using filter flags (listed above)",
+        "  --on-hit <text>",
+        "Also send this message each time it fires (@mentions ok)",
     ),
     (
-        "  events sub \"SQL WHERE\" [--once]",
-        "Subscribe using raw SQL",
-    ),
-    ("    --once", "Auto-remove after first match"),
-    ("    --for <name>", "Subscribe on behalf of another agent"),
-    (
-        "    --device ID",
-        "Install/list sub on remote device (requires --for for create)",
+        "  --as <name> / -b",
+        "Own the sub without an agent identity, e.g. from a shell (-b = bigboss)",
     ),
     (
-        "  events unsub <id> [--device ID]",
-        "Remove subscription (local or remote)",
+        "  --device ID",
+        "Install/list on a remote device (create requires --for, --as, or -b)",
     ),
-    ("", ""),
-    ("Examples:", ""),
-    ("  events --cmd git --agent peso", ""),
-    ("  events sub --idle peso", "Notified when peso goes idle"),
+];
+
+const EVENTS_UNSUB: &[HelpEntry] = &[
+    ("events unsub <id>", "Remove a subscription"),
+    ("  --device ID", "Remove it from a remote device"),
+];
+
+const EXAMPLES_HEADER: &[HelpEntry] = &[("Examples:", "")];
+
+const EVENTS_EXAMPLES: &[HelpEntry] = &[("  hcom events --cmd git --agent peso", "")];
+
+const EVENTS_SUB_EXAMPLES: &[HelpEntry] = &[
     (
-        "  events sub --file '*.py' --once",
+        "  hcom events sub --idle peso",
+        "Notified when peso goes idle",
+    ),
+    (
+        "  hcom events sub --file '*.py' --once",
         "One-shot: next .py file write",
     ),
-    ("", ""),
+];
+
+const EVENTS_SQL_REFERENCE: &[HelpEntry] = &[
     ("SQL reference (events_v view):", ""),
     ("  Base", "id, timestamp, type, instance"),
     (
@@ -138,6 +164,32 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
         "delivered_to/mentions are JSON arrays \u{2014} query exact values with json_each(...)",
     ),
     ("", "Use <> instead of != for SQL negation"),
+];
+
+const EVENTS_SQL_POINTER: &[HelpEntry] = &[("", ""), ("", "SQL columns: hcom events --help")];
+
+const EVENTS_PAGE: &[&[HelpEntry]] = &[
+    EVENTS_QUERY,
+    FILTERS_HEADER,
+    FILTER_HELP,
+    EVENTS_SHORTCUTS,
+    EVENTS_LAUNCH,
+    EVENTS_SUB,
+    EVENTS_UNSUB,
+    EXAMPLES_HEADER,
+    EVENTS_EXAMPLES,
+    EVENTS_SUB_EXAMPLES,
+    EVENTS_SQL_REFERENCE,
+];
+
+const EVENTS_SUB_PAGE: &[&[HelpEntry]] = &[
+    EVENTS_SUB,
+    FILTERS_HEADER,
+    FILTER_HELP,
+    EVENTS_SHORTCUTS,
+    EXAMPLES_HEADER,
+    EVENTS_SUB_EXAMPLES,
+    EVENTS_SQL_POINTER,
 ];
 
 const LIST_HELP: &[HelpEntry] = &[
@@ -191,13 +243,13 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched, automatic delivery",
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
+        "[CLAUDE*]   hooks or process not bound (starting up, or lost); see: list <name>",
     ),
-    ("", "[AD-HOC]                              manual polling"),
+    ("", "[AD-HOC]    no hooks, checks messages manually"),
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
@@ -240,7 +292,8 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     ("", ""),
     ("Sender:", ""),
-    ("  --from <name>", "External sender identity (alias: -b)"),
+    ("  --from <name>", "External sender identity"),
+    ("  -b", "Shorthand for --from bigboss"),
     ("  --name <name>", "Your identity (agent name or UUID)"),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),
@@ -271,18 +324,25 @@ const SEND_HELP: &[HelpEntry] = &[
     ("  EOF", ""),
 ];
 
-const BUNDLE_HELP: &[HelpEntry] = &[
-    ("bundle", "List recent bundles (alias: bundle list)"),
+const BLANK: &[HelpEntry] = &[("", "")];
+
+const BUNDLE_DEFAULT: &[HelpEntry] = &[("bundle", "List recent bundles (same as bundle list)")];
+
+const BUNDLE_LIST: &[HelpEntry] = &[
     ("bundle list", "List recent bundles"),
     ("  --last N", "Limit count (default: 20)"),
     ("  --json", "Output JSON"),
-    ("", ""),
+];
+
+const BUNDLE_CAT: &[HelpEntry] = &[
     ("bundle cat <id>", "Expand full bundle content"),
     (
         "",
         "Shows: metadata, files (metadata only), transcript (respects detail level), events",
     ),
-    ("", ""),
+];
+
+const BUNDLE_PREPARE: &[HelpEntry] = &[
     ("bundle prepare", "Show recent context, suggest template"),
     (
         "  --for <agent>",
@@ -290,11 +350,11 @@ const BUNDLE_HELP: &[HelpEntry] = &[
     ),
     (
         "  --last-transcript N",
-        "Transcript entries to suggest (default: 20)",
+        "Transcript exchanges to suggest (default: 40)",
     ),
     (
         "  --last-events N",
-        "Events to scan per category (default: 30)",
+        "Events to scan per category (default: 10)",
     ),
     ("  --json", "Output JSON"),
     ("  --compact", "Hide how-to section"),
@@ -307,10 +367,14 @@ const BUNDLE_HELP: &[HelpEntry] = &[
         "",
         "TIP: Skip 'bundle create' \u{2014} use bundle flags directly in 'hcom send'",
     ),
-    ("", ""),
+];
+
+const BUNDLE_SHOW: &[HelpEntry] = &[
     ("bundle show <id>", "Show bundle by id/prefix"),
     ("  --json", "Output JSON"),
-    ("", ""),
+];
+
+const BUNDLE_CREATE: &[HelpEntry] = &[
     (
         "bundle create \"title\"",
         "Create bundle (positional or --title)",
@@ -341,10 +405,20 @@ const BUNDLE_HELP: &[HelpEntry] = &[
         "    normal = truncated | full = complete text | detailed = tool I/O+edits+errors",
     ),
     ("  --extends <id>", "Parent bundle for chaining"),
-    ("  --bundle JSON", "Create from JSON payload"),
-    ("  --bundle-file FILE", "Create from JSON file"),
+    ("  --bundle JSON", "Create from JSON payload (format below)"),
+    (
+        "  --bundle-file FILE",
+        "Create from JSON file (format below)",
+    ),
     ("  --json", "Output JSON"),
-    ("", ""),
+];
+
+const BUNDLE_CHAIN: &[HelpEntry] = &[
+    ("bundle chain <id>", "Show bundle lineage"),
+    ("  --json", "Output JSON"),
+];
+
+const BUNDLE_JSON_FORMAT: &[HelpEntry] = &[
     ("JSON format:", ""),
     ("", "{"),
     ("", "  \"title\": \"Bundle Title\","),
@@ -365,9 +439,22 @@ const BUNDLE_HELP: &[HelpEntry] = &[
     ("", "  },"),
     ("", "  \"extends\": \"bundle:abc123\""),
     ("", "}"),
-    ("", ""),
-    ("bundle chain <id>", "Show bundle lineage"),
-    ("  --json", "Output JSON"),
+];
+
+const BUNDLE_PAGE: &[&[HelpEntry]] = &[
+    BUNDLE_DEFAULT,
+    BUNDLE_LIST,
+    BLANK,
+    BUNDLE_CAT,
+    BLANK,
+    BUNDLE_PREPARE,
+    BLANK,
+    BUNDLE_SHOW,
+    BLANK,
+    BUNDLE_CREATE,
+    BLANK,
+    BUNDLE_CHAIN,
+    BUNDLE_JSON_FORMAT,
 ];
 
 const STOP_HELP: &[HelpEntry] = &[
@@ -376,7 +463,6 @@ const STOP_HELP: &[HelpEntry] = &[
     ("stop <n1> <n2> ...", "Disconnect multiple"),
     ("stop tag:<name>", "Disconnect all with tag"),
     ("stop all", "Disconnect all agents"),
-    ("", ""),
 ];
 
 const START_HELP: &[HelpEntry] = &[
@@ -402,10 +488,12 @@ const START_HELP: &[HelpEntry] = &[
 ];
 
 const KILL_HELP: &[HelpEntry] = &[
-    ("kill <name>", "Kill process (+ close terminal pane)"),
+    (
+        "kill <name>...",
+        "Kill one or more processes (+ close terminal panes)",
+    ),
     ("kill tag:<name>", "Kill all with tag"),
     ("kill all", "Kill all with tracked PIDs"),
-    ("", ""),
 ];
 
 const LISTEN_HELP: &[HelpEntry] = &[
@@ -467,13 +555,21 @@ const CONFIG_HELP: &[HelpEntry] = &[
     ("config <key>", "Get one key"),
     ("config <key> <value>", "Set one key"),
     ("config <key> --info", "Detailed help for a key"),
-    ("  --json / --edit / --reset", ""),
+    (
+        "  --json / --edit / --reset",
+        "JSON output / open in $EDITOR / archive + restore defaults",
+    ),
     ("", ""),
     ("Per-agent:", ""),
     (
         "config -i <name|self> [key] [val]",
         "tag, timeout, hints, subagent_timeout",
     ),
+];
+
+/// Keys a user sets by hand. Every CONFIG_KEYS entry must appear here or in
+/// CONFIG_KEYS_NOT_IN_HELP (enforced by `config_help_covers_registry_keys`).
+const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     ("", ""),
     ("Keys:", ""),
     ("  tag", "Group/label (agents become tag-*)"),
@@ -486,7 +582,15 @@ const CONFIG_HELP: &[HelpEntry] = &[
     ),
     (
         "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args",
-        "",
+        "Default launch args per tool",
+    ),
+    (
+        "  gemini_system_prompt / codex_system_prompt",
+        "Default system prompt",
+    ),
+    (
+        "  codex_sandbox_mode",
+        "workspace | danger-full-access | none",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
     ("  auto_subscribe", "Event auto-subscribe presets"),
@@ -499,9 +603,17 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "  title_mode",
         "Terminal/tab title: combined, label, or off",
     ),
-    ("", "hcom config <key> --info for details"),
-    ("", ""),
-    ("", "Precedence: defaults < config.toml < env vars"),
+];
+
+/// Registry keys left out of help: relay keys are managed by `hcom relay`;
+/// `timeout` only affects headless/vanilla Claude (see `config timeout --info`).
+#[cfg(test)]
+const CONFIG_KEYS_NOT_IN_HELP: &[&str] = &[
+    "relay",
+    "relay_id",
+    "relay_token",
+    "relay_enabled",
+    "timeout",
 ];
 
 // config help continued with dynamic config files hint
@@ -510,30 +622,34 @@ const CONFIG_HELP_2: &[HelpEntry] = &[(
     "HCOM_DIR: isolate per project (see 'hcom reset --help')",
 )];
 
-const RELAY_HELP: &[HelpEntry] = &[
-    ("relay", "Show status and token"),
+const RELAY_MAIN: &[HelpEntry] = &[
+    ("relay", "Show relay status"),
     ("relay new", "Create new relay group"),
+    ("relay token", "Show join token for other devices"),
     ("relay connect <token>", "Join relay group"),
-    ("relay on / off", "Enable/disable sync"),
-    ("", ""),
+    ("relay on", "Re-enable sync"),
+    ("relay off", "Disable sync"),
+    ("  --all", "Also disable on all known peers"),
     ("Setup:", ""),
     ("", "1. 'relay new' to get token"),
     ("", "2. 'relay connect <token>' on each device"),
-    ("", ""),
     ("Custom broker:", ""),
     (
         "relay new --broker mqtts://host:port --password <broker-auth-secret>",
         "",
     ),
-    ("relay connect <token> --password <secret>", ""),
-    ("", ""),
+    ("relay connect <token> --password <broker-auth-secret>", ""),
     ("Daemon:", ""),
+];
+
+const RELAY_DAEMON: &[HelpEntry] = &[
     ("relay daemon", "Show daemon status"),
     ("relay daemon start", "Start the relay daemon"),
     ("relay daemon stop", "Stop the daemon (SIGKILL after 5s)"),
     ("relay daemon restart", "Restart the daemon"),
-    ("", ""),
 ];
+
+const RELAY_PAGE: &[&[HelpEntry]] = &[RELAY_MAIN, RELAY_DAEMON];
 
 const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("transcript <name>", "View agent's conversation (last 10)"),
@@ -573,7 +689,10 @@ const ARCHIVE_HELP: &[HelpEntry] = &[
     ("archive <name>", "Query by stable name (prefix match)"),
     ("  --here", "Filter to archives from current directory"),
     ("  --sql \"expr\"", "SQL WHERE filter"),
-    ("  --last N", "Limit events (default: 20)"),
+    (
+        "  --last N",
+        "Max archives listed (default: all); events when one is selected (default: 20)",
+    ),
     ("  --json", "JSON output"),
 ];
 
@@ -617,48 +736,143 @@ const UPDATE_HELP: &[HelpEntry] = &[
     ("", "  curl installer  → re-run hcom-installer.sh"),
 ];
 
-const HOOKS_HELP: &[HelpEntry] = &[
-    ("hooks", "Show hook status"),
+const HOOKS_STATUS: &[HelpEntry] = &[
+    ("hooks", "Show how each tool loads hcom's hooks"),
     ("hooks status", "Same as above"),
-    ("hooks add [tool]", "Add hooks ({hook_tools} | all)"),
-    ("hooks remove [tool]", "Remove hooks ({hook_tools} | all)"),
-    ("", ""),
+];
+
+const HOOKS_ADD: &[HelpEntry] = &[
     (
-        "",
-        "Hooks enable automatic message delivery and status tracking.",
+        "hooks add [tool]",
+        "Install persistent hooks ({persistent_tools} | all)",
     ),
     (
         "",
-        "Without hooks, use ad-hoc mode (run hcom start inside any AI tool).",
+        "  No tool: auto-detect the current tool, or add all outside one.",
     ),
-    ("", "Restart the tool after adding hooks to activate."),
+    ("", "  Restart the tool after adding hooks to activate."),
+];
+
+const HOOKS_REMOVE: &[HelpEntry] = &[
+    (
+        "hooks remove [tool]",
+        "Remove hooks and legacy installs ({hook_tools} | all)",
+    ),
+    ("", "  No tool: remove from all tools."),
     (
         "",
-        "Remove cleans both global (~/) and HCOM_DIR-local if set.",
+        "  Cleans both global (~/) and HCOM_DIR-local hooks if set.",
     ),
 ];
 
-const TERM_HELP: &[HelpEntry] = &[
+const HOOKS_ABOUT: &[HelpEntry] = &[
+    ("", "Per-run: {per_run_tools}"),
+    (
+        "",
+        "  Hooks load only in sessions launched with `hcom <tool>`. Nothing to",
+    ),
+    (
+        "",
+        "  install; remove clears installs left by older hcom versions.",
+    ),
+    ("", "Persistent: {persistent_list}"),
+    (
+        "",
+        "  Hooks live in the tool's config; install them with `hooks add`.",
+    ),
+    ("", ""),
+    (
+        "",
+        "Without hooks, run `hcom start` inside any AI tool (manual delivery).",
+    ),
+];
+
+const HOOKS_PAGE: &[&[HelpEntry]] = &[HOOKS_STATUS, HOOKS_ADD, HOOKS_REMOVE, BLANK, HOOKS_ABOUT];
+
+const TERM_SCREEN: &[HelpEntry] = &[
     ("term", "Screen dump (all PTY instances)"),
     ("term [name]", "Screen dump for specific agent"),
     ("  --json", "Raw JSON output"),
-    ("", ""),
+    (
+        "",
+        "    Fields: lines[], size[rows,cols], cursor[row,col], ready, prompt_empty, input_text",
+    ),
+    (
+        "  --clean",
+        "No status header or line numbers ([name] labels kept for all)",
+    ),
+];
+
+const TERM_INJECT: &[HelpEntry] = &[
     ("term inject <name> [text]", "Inject text into agent PTY"),
     (
         "  --enter",
         "Append \\r (submit). Works alone or with text.",
     ),
-    ("", ""),
+];
+
+const TERM_DEBUG: &[HelpEntry] = &[
     ("term debug on", "Enable PTY debug logging (all instances)"),
     ("term debug off", "Disable PTY debug logging"),
     ("term debug logs", "List debug log files"),
-    ("", ""),
-    ("JSON fields:", "lines[], size[rows,cols], cursor[row,col],"),
-    ("", "ready, prompt_empty, input_text"),
-    ("", ""),
-    ("", "Debug toggle; instances detect within ~10s."),
+    ("", "Instances pick up the toggle within ~10s."),
     ("", "Logs: ~/.hcom/.tmp/logs/pty_debug/"),
 ];
+
+const TERM_PAGE: &[&[HelpEntry]] = &[TERM_SCREEN, BLANK, TERM_INJECT, BLANK, TERM_DEBUG];
+
+/// Subcommands with their own `--help` page, built from their parent's sections.
+const SUBCOMMAND_HELP: &[(&str, &[&[HelpEntry]])] = &[
+    ("events sub", EVENTS_SUB_PAGE),
+    ("events unsub", &[EVENTS_UNSUB]),
+    ("events launch", &[EVENTS_LAUNCH]),
+    ("bundle list", &[BUNDLE_LIST]),
+    ("bundle show", &[BUNDLE_SHOW]),
+    ("bundle cat", &[BUNDLE_CAT]),
+    ("bundle chain", &[BUNDLE_CHAIN]),
+    ("bundle prepare", &[BUNDLE_PREPARE]),
+    ("bundle create", &[BUNDLE_CREATE, BUNDLE_JSON_FORMAT]),
+    ("relay daemon", &[RELAY_DAEMON]),
+    ("hooks add", &[HOOKS_ADD]),
+    ("hooks remove", &[HOOKS_REMOVE]),
+    ("term inject", &[TERM_INJECT]),
+    ("term debug", &[TERM_DEBUG]),
+];
+
+/// Help topic for `hcom <cmd> <args...> --help`: `"<cmd> <sub>"` when the first
+/// arg is a subcommand with its own page, otherwise just `cmd`.
+pub fn help_topic(cmd: &str, args: &[String]) -> String {
+    if let Some(sub) = args.first() {
+        let sub = match (cmd, sub.as_str()) {
+            ("bundle", "preview") => "prepare",
+            ("hooks", "install") => "add",
+            ("hooks", "uninstall") => "remove",
+            (_, sub) => sub,
+        };
+        let topic = format!("{cmd} {sub}");
+        if SUBCOMMAND_HELP.iter().any(|(t, _)| *t == topic) {
+            return topic;
+        }
+    }
+    cmd.to_string()
+}
+
+/// Fill hook-tool placeholders from released hook-bearing integrations.
+fn expand_hook_tools(text: &str) -> String {
+    let tools = crate::commands::hooks::hook_tools();
+    let names = |per_run: Option<bool>, sep: &str| {
+        tools
+            .iter()
+            .filter(|tool| per_run.is_none_or(|p| crate::hooks::runtime::is_per_run(**tool) == p))
+            .map(|tool| tool.as_str())
+            .collect::<Vec<_>>()
+            .join(sep)
+    };
+    text.replace("{hook_tools}", &names(None, " | "))
+        .replace("{persistent_tools}", &names(Some(false), " | "))
+        .replace("{persistent_list}", &names(Some(false), ", "))
+        .replace("{per_run_tools}", &names(Some(true), ", "))
+}
 
 // ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot) ─────────────────────
 
@@ -692,13 +906,14 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
 
     // Usage + examples
     lines.push("Usage:".to_string());
-    lines.push(format!(
-        "  hcom [N] {} [args...]       Launch N {} agents (default N=1)",
-        t, spec.label
+    lines.push(aligned(
+        &format!("  hcom [N] {t} [args...]"),
+        &format!("Launch N {} agents (default N=1)", spec.label),
+        38,
     ));
     lines.push(String::new());
     // Example block — all at same indent level using format helper
-    let ex = |usage: &str, desc: &str| -> String { format!("    {:<34} {}", usage, desc) };
+    let ex = |usage: &str, desc: &str| -> String { aligned(&format!("    {usage}"), desc, 38) };
     lines.push(ex(&format!("hcom {}", t), term_desc));
     lines.push(ex(&format!("hcom 3 {}", t), "Opens 3 new terminal windows"));
     for (u, d) in spec.help.unique_examples {
@@ -803,6 +1018,19 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
 
 // ── Format a single help entry ──────────────────────────────────────────
 
+/// `left` padded to `col`, then `desc`; a `left` too wide for the column
+/// puts `desc` on its own line at `col` instead of running into it.
+fn aligned(left: &str, desc: &str, col: usize) -> String {
+    let width = left.chars().count();
+    if desc.is_empty() {
+        left.trim_end().to_string()
+    } else if width < col {
+        format!("{left:<col$} {desc}")
+    } else {
+        format!("{left}\n{:col$} {desc}", "")
+    }
+}
+
 fn format_entry(usage: &str, desc: &str) -> String {
     if usage.is_empty() {
         // Empty usage: plain text or blank line
@@ -813,7 +1041,7 @@ fn format_entry(usage: &str, desc: &str) -> String {
         }
     } else if usage.starts_with("  ") {
         // Indented: option/setting line
-        format!("  {:<32} {}", usage, desc)
+        aligned(&format!("  {usage}"), desc, 34)
     } else if usage.ends_with(':') {
         // Section header
         if desc.is_empty() {
@@ -823,7 +1051,7 @@ fn format_entry(usage: &str, desc: &str) -> String {
         }
     } else {
         // Command line
-        format!("  hcom {:<26} {}", usage, desc)
+        aligned(&format!("  hcom {usage}"), desc, 33)
     }
 }
 
@@ -874,15 +1102,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "copilot",
 ];
 
-fn resumable_tool_names() -> String {
-    crate::integration_spec::ALL
-        .iter()
-        .filter(|spec| spec.released && spec.resume.is_some())
-        .map(|spec| spec.name)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn forkable_tool_names() -> String {
     crate::integration_spec::ALL
         .iter()
@@ -906,33 +1125,33 @@ pub fn get_help_text() -> String {
         "hcom (hook-comms) v{} - multi-agent communication\n\
 \n\
 Usage:\n\
-  hcom                                  TUI dashboard\n\
-  hcom <command>                        Run command\n\
+\x20 hcom                                  TUI dashboard\n\
+\x20 hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] {launchable} [flags] [tool-args]\n\
-  hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session ({forkable})\n\
-  hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
+\x20 hcom [N] {launchable} [flags] [tool-args]\n\
+\x20 hcom r <target>                       Resume stopped agent\n\
+\x20 hcom f <target>                       Fork agent session ({forkable})\n\
+\x20 hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
-  send         Send message to your buddies\n\
-  listen       Block until message or event arrives\n\
-  list         Show agents, status, unread counts\n\
-  events       Query event stream, manage subscriptions\n\
-  bundle       Structured context packages for handoffs\n\
-  transcript   Read another agent's conversation\n\
-  start        Connect to hcom (run inside any AI tool)\n\
-  stop         Disconnect from hcom\n\
-  config       Get/set global and per-agent settings\n\
-  run          Execute workflow scripts\n\
-  relay        Cross-device sync + relay daemon\n\
-  archive      Query past hcom sessions\n\
-  reset        Archive and clear database\n\
-  hooks        Add or remove hooks\n\
-  status       Installation and diagnostics\n\
-  term         View/inject into agent PTY screens\n\
-  update       Check and apply updates",
+\x20 send         Send message to your buddies\n\
+\x20 listen       Block until message or event arrives\n\
+\x20 list         Show agents, status, unread counts\n\
+\x20 events       Query event stream, manage subscriptions\n\
+\x20 bundle       Structured context packages for handoffs\n\
+\x20 transcript   Read another agent's conversation\n\
+\x20 start        Connect to hcom (run inside any AI tool)\n\
+\x20 stop         Disconnect from hcom\n\
+\x20 config       Get/set global and per-agent settings\n\
+\x20 run          Execute workflow scripts\n\
+\x20 relay        Cross-device sync + relay daemon\n\
+\x20 archive      Query past hcom sessions\n\
+\x20 reset        Archive and clear database\n\
+\x20 hooks        Add or remove hooks\n\
+\x20 status       Installation and diagnostics\n\
+\x20 term         View/inject into agent PTY screens\n\
+\x20 update       Check and apply updates",
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -958,11 +1177,6 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
 fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> String {
     let mut flags = String::new();
     for (flag, desc) in SHARED_LAUNCH_FLAGS {
-        let desc = if *flag == "--headless" {
-            "Run in background (Claude/Kimi resume or fork only)"
-        } else {
-            *desc
-        };
         flags.push_str(&format!("  {:<34}{}\n", flag, desc));
     }
     flags.push_str(&format!(
@@ -994,6 +1208,30 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
 
 /// Get formatted help for a single command.
 pub fn get_command_help(name: &str) -> String {
+    collapse_blank_lines(&command_help_raw(name))
+}
+
+/// Section headers open with a blank line and tables also carry `("", "")`
+/// spacers; collapse runs so a page never shows two blank lines in a row.
+fn collapse_blank_lines(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() && out.last().is_none_or(|l| l.trim().is_empty()) {
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+fn format_page(sections: &[&[HelpEntry]]) -> Vec<String> {
+    sections.iter().flat_map(|s| format_entries(s)).collect()
+}
+
+fn command_help_raw(name: &str) -> String {
     let mut lines = vec!["Usage:".to_string()];
 
     // Tool launch commands use the template generator
@@ -1022,47 +1260,43 @@ pub fn get_command_help(name: &str) -> String {
              Remote fork (`:<device>`) requires --dir to pin the target cwd.",
             forkable_tool_names().replace('/', ", ")
         );
-        let see_also = format!(
-            "hcom r <target>                   Resume a stopped agent ({})",
-            resumable_tool_names()
-        );
+        let see_also = "hcom r <target>                   Resume a stopped agent";
         return resume_fork_help(
             "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
             &blurb,
-            &see_also,
+            see_also,
         );
     }
 
-    let entries: Option<&[HelpEntry]> = match name {
-        "list" => Some(LIST_HELP),
-        "send" => Some(SEND_HELP),
-        "bundle" => Some(BUNDLE_HELP),
-        "stop" => Some(STOP_HELP),
-        "start" => Some(START_HELP),
-        "kill" => Some(KILL_HELP),
-        "listen" => Some(LISTEN_HELP),
-        "reset" => Some(RESET_HELP),
-        "relay" => Some(RELAY_HELP),
-        "transcript" => None,
-        "archive" => Some(ARCHIVE_HELP),
-        "run" => Some(RUN_HELP),
-        "status" => Some(STATUS_HELP),
-        "update" => Some(UPDATE_HELP),
-        "hooks" => None,
-        "term" => Some(TERM_HELP),
-        _ => None,
+    let page: Option<&[&[HelpEntry]]> = match name {
+        "list" => Some(&[LIST_HELP]),
+        "send" => Some(&[SEND_HELP]),
+        "events" => Some(EVENTS_PAGE),
+        "bundle" => Some(BUNDLE_PAGE),
+        "stop" => Some(&[STOP_HELP]),
+        "start" => Some(&[START_HELP]),
+        "kill" => Some(&[KILL_HELP]),
+        "listen" => Some(&[LISTEN_HELP]),
+        "reset" => Some(&[RESET_HELP]),
+        "relay" => Some(RELAY_PAGE),
+        "archive" => Some(&[ARCHIVE_HELP]),
+        "run" => Some(&[RUN_HELP]),
+        "status" => Some(&[STATUS_HELP]),
+        "update" => Some(&[UPDATE_HELP]),
+        "hooks" => Some(HOOKS_PAGE),
+        "term" => Some(TERM_PAGE),
+        _ => SUBCOMMAND_HELP
+            .iter()
+            .find(|(topic, _)| *topic == name)
+            .map(|(_, page)| *page),
     };
-
-    // Events is special: spliced with FILTER_HELP in the middle
-    if name == "events" || name == "events sub" {
-        lines.extend(format_entries(EVENTS_HELP));
-        lines.push(String::new()); // blank before filters header
-        lines.push(String::from(
-            "\nFilters (same flag repeated = OR, different flags = AND):",
-        ));
-        lines.extend(format_entries(FILTER_HELP));
-        lines.extend(format_entries(EVENTS_HELP_2));
-        return lines.join("\n");
+    if let Some(page) = page {
+        // A page that opens with a section header needs no "Usage:" above it.
+        if page[0][0].0.ends_with(':') {
+            lines.clear();
+        }
+        lines.extend(format_page(page));
+        return expand_hook_tools(&lines.join("\n"));
     }
 
     // Transcript agent filters come from the same canonical backend registry
@@ -1073,20 +1307,16 @@ pub fn get_command_help(name: &str) -> String {
         return lines.join("\n").replace("{transcript_agents}", &agents);
     }
 
-    // Hook help is derived from released hook-bearing integrations.
-    if name == "hooks" {
-        lines.extend(format_entries(HOOKS_HELP));
-        let tools = crate::commands::hooks::hook_tools()
-            .into_iter()
-            .map(|tool| tool.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        return lines.join("\n").replace("{hook_tools}", &tools);
-    }
-
     // Config is special: has dynamic config files hint
     if name == "config" {
         lines.extend(format_entries(CONFIG_HELP));
+        lines.extend(format_entries(CONFIG_KEYS_HELP));
+        lines.push(String::new());
+        lines.push(format_entry("", "hcom config <key> --info for details"));
+        lines.push(format_entry(
+            "",
+            "Precedence: defaults < config.toml < env vars",
+        ));
         // Dynamic: resolved config file paths
         let hcom_dir = env::var("HCOM_DIR")
             .map(std::path::PathBuf::from)
@@ -1102,19 +1332,11 @@ pub fn get_command_help(name: &str) -> String {
         return lines.join("\n");
     }
 
-    if let Some(entries) = entries {
-        lines.extend(format_entries(entries));
-        lines.join("\n")
-    } else {
-        // Try parent command (e.g. "events sub" -> "events")
-        if let Some(pos) = name.rfind(' ') {
-            let parent = &name[..pos];
-            if parent != name {
-                return get_command_help(parent);
-            }
-        }
-        format!("Usage: hcom {}", name)
+    // Try parent command (e.g. "bundle foo" -> "bundle")
+    if let Some(pos) = name.rfind(' ') {
+        return command_help_raw(&name[..pos]);
     }
+    format!("Usage: hcom {}", name)
 }
 
 /// Print help for a command to stdout.
@@ -1254,8 +1476,116 @@ mod tests {
             );
         }
 
-        let resume_help = get_command_help("r");
-        assert!(resume_help.contains("Claude/Kimi resume or fork only"));
+        // --headless works for every tool (PTY headless), so resume/fork help
+        // must not advertise a per-tool restriction.
+        for cmd in ["r", "f"] {
+            let help = get_command_help(cmd);
+            let headless_line = help
+                .lines()
+                .find(|l| l.trim_start().starts_with("--headless"))
+                .unwrap_or_else(|| panic!("{cmd} help missing --headless"));
+            assert!(
+                !headless_line.contains("only"),
+                "{cmd} help restricts --headless: {headless_line}"
+            );
+        }
+        assert!(!get_command_help("f").contains("Kimi"));
+    }
+
+    #[test]
+    fn overlong_usage_wraps_description_to_its_column() {
+        assert_eq!(
+            aligned("  hcom kill all", "Kill", 20),
+            "  hcom kill all      Kill"
+        );
+        let wrapped = aligned("  hcom events sub \"SQL WHERE\" [--once]", "Raw SQL", 20);
+        let (first, second) = wrapped.split_once('\n').expect("wrapped");
+        assert_eq!(first, "  hcom events sub \"SQL WHERE\" [--once]");
+        assert_eq!(second.find("Raw SQL"), Some(21));
+        assert_eq!(aligned("  --json ", "", 20), "  --json");
+    }
+
+    #[test]
+    fn help_topic_resolves_subcommands_and_aliases() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(help_topic("events", &args(&["sub"])), "events sub");
+        assert_eq!(help_topic("events", &args(&["--agent", "sub"])), "events");
+        assert_eq!(help_topic("bundle", &args(&["preview"])), "bundle prepare");
+        assert_eq!(help_topic("hooks", &args(&["install"])), "hooks add");
+        assert_eq!(help_topic("hooks", &args(&["uninstall"])), "hooks remove");
+        assert_eq!(help_topic("list", &args(&["self"])), "list");
+    }
+
+    #[test]
+    fn nested_help_pages_are_specific() {
+        let events_sub = get_command_help("events sub");
+        assert!(events_sub.contains("--on-hit <text>"));
+        assert!(events_sub.contains("--as <name>"));
+        assert!(!events_sub.contains("Wait for a launch batch:"));
+
+        let events_launch = get_command_help("events launch");
+        assert!(events_launch.contains("--timeout SEC"));
+        assert!(!events_launch.contains("--on-hit"));
+
+        let bundle_create = get_command_help("bundle create");
+        assert!(bundle_create.contains("--bundle-file FILE"));
+        assert!(!bundle_create.contains("bundle prepare"));
+
+        let relay_daemon = get_command_help("relay daemon");
+        assert!(relay_daemon.contains("relay daemon restart"));
+        assert!(!relay_daemon.contains("relay connect <token>"));
+    }
+
+    #[test]
+    fn subcommand_sections_appear_on_parent_page() {
+        let sub_only: &[&[HelpEntry]] = &[EVENTS_SQL_POINTER];
+        for (topic, sections) in SUBCOMMAND_HELP {
+            let parent = topic.split(' ').next().unwrap();
+            let parent_page: &[&[HelpEntry]] = match parent {
+                "events" => EVENTS_PAGE,
+                "bundle" => BUNDLE_PAGE,
+                "relay" => RELAY_PAGE,
+                "hooks" => HOOKS_PAGE,
+                "term" => TERM_PAGE,
+                other => panic!("no parent page for {other}"),
+            };
+            for section in *sections {
+                let shared = |s: &&[HelpEntry]| std::ptr::eq(*s, *section);
+                assert!(
+                    parent_page.iter().any(shared) || sub_only.iter().any(shared),
+                    "{topic}: section missing from `hcom {parent} --help`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_pages_have_no_double_blank_lines() {
+        for (topic, _) in SUBCOMMAND_HELP {
+            assert!(!get_command_help(topic).contains("\n\n\n"), "{topic}");
+        }
+        for name in [
+            "events", "bundle", "relay", "hooks", "term", "config", "start",
+        ] {
+            assert!(!get_command_help(name).contains("\n\n\n"), "{name}");
+        }
+    }
+
+    #[test]
+    fn config_help_covers_registry_keys() {
+        let help = get_command_help("config");
+        for (key, _, _) in crate::commands::config::CONFIG_KEYS {
+            let key = key
+                .strip_prefix("HCOM_")
+                .unwrap_or(key)
+                .to_ascii_lowercase();
+            let shown = help.contains(&key) || key.ends_with("_args");
+            assert!(
+                shown || CONFIG_KEYS_NOT_IN_HELP.contains(&key.as_str()),
+                "config key {key} is neither in help nor CONFIG_KEYS_NOT_IN_HELP"
+            );
+        }
+        assert!(!help.contains("relay_token") && !help.contains("dev_root"));
     }
 
     #[test]
@@ -1267,7 +1597,7 @@ mod tests {
             )
         );
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/omp)"
+            "hcom f <target>                       Fork agent session (claude/codex/opencode/kilo/pi/omp)"
         ));
         assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
         assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");

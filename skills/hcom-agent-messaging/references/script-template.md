@@ -14,7 +14,7 @@ hcom run my-script "task description"
 
 description: line 2 comment (after shebang) is shown in `hcom run` listing.
 
-user scripts shadow bundled scripts (confess, debate, fatcow) with the same name.
+user scripts shadow bundled scripts (confess, debate, fatcow, onidle) with the same name.
 
 ## full template with commentary
 

@@ -25,7 +25,7 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Payload**: JSON via stdin
 - **Session binding**: On SessionStart hook, immediate (same as Claude)
 - **Message delivery**: Hook-based auto-delivery when hcom-launched; PTY injection fallback for vanilla sessions
-- **Sandbox modes**: `workspace` (--full-auto + network), `untrusted` (--sandbox workspace-write), `danger-full-access` (--dangerously-bypass-approvals-and-sandbox), `none` (raw)
+- **Sandbox modes**: `workspace` (--sandbox workspace-write + network), `danger-full-access` (--dangerously-bypass-approvals-and-sandbox), `none` (raw)
 - **Bootstrap injection**: Via `-c developer_instructions=<bootstrap>` at launch time
 - **Transcript path**: Derived from thread ID, searched via glob in `$CODEX_HOME/sessions/`
 
