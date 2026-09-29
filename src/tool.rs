@@ -86,7 +86,8 @@ impl Tool {
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => per_run_has_no_install(*self),
+            | Tool::Kilo
+            | Tool::Grok => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
@@ -94,7 +95,6 @@ impl Tool {
                 crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
             }
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
-            Tool::Grok => crate::hooks::grok::verify_grok_hooks_installed(include_permissions),
             Tool::Adhoc => false,
         }
     }
@@ -112,7 +112,8 @@ impl Tool {
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => per_run_has_no_install(*self),
+            | Tool::Kilo
+            | Tool::Grok => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
@@ -120,8 +121,6 @@ impl Tool {
             Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
-            Tool::Grok => crate::hooks::grok::try_setup_grok_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
@@ -145,7 +144,7 @@ impl Tool {
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
-            Tool::Grok => Ok(crate::hooks::grok::remove_grok_hooks()),
+            Tool::Grok => Ok(true),
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
@@ -167,12 +166,12 @@ impl Tool {
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => per_run_has_no_install(*self),
+            | Tool::Kilo
+            | Tool::Grok => per_run_has_no_install(*self),
             Tool::Gemini => crate::hooks::gemini::get_gemini_settings_path(),
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
-            Tool::Grok => crate::hooks::grok::get_grok_hooks_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()

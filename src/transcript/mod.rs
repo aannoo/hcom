@@ -551,7 +551,7 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         TranscriptDiscovery::PiSessions => pi_session_roots(),
         TranscriptDiscovery::OmpSessions => omp_session_roots(),
         TranscriptDiscovery::GrokSessions => {
-            vec![crate::hooks::grok::grok_config_dir().join("sessions")]
+            vec![crate::transcript::grok::grok_config_dir().join("sessions")]
         }
         TranscriptDiscovery::OpenCodeDatabase | TranscriptDiscovery::KiloDatabase => Vec::new(),
     }

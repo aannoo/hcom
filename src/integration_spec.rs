@@ -315,16 +315,8 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-sessionend",
 ];
 
-const GROK_HOOKS: &[&str] = &[
-    "grok-sessionstart",
-    "grok-userpromptsubmit",
-    "grok-pretooluse",
-    "grok-posttooluse",
-    "grok-stop",
-    "grok-stopfailure",
-    "grok-stopcancelled",
-    "grok-sessionend",
-];
+/// Grok has no hooks: status and delivery come over its ACP (`delivery/grok.rs`).
+const GROK_HOOKS: &[&str] = &[];
 
 // ── Help examples / extra-env tables ────────────────────────────────────
 

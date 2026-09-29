@@ -140,8 +140,7 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             crate::hooks::copilot::dispatch_copilot_hook_native(hook),
             String::new(),
         ),
-        Tool::Grok => (crate::hooks::grok::dispatch_grok_hook(hook), String::new()),
-        Tool::Adhoc => unreachable!("adhoc has no hooks"),
+        Tool::Grok | Tool::Adhoc => unreachable!("{} has no hooks", tool.as_str()),
     }
 }
 
@@ -1019,7 +1018,7 @@ mod tests {
         let actual = crate::commands::hooks::hook_tools();
         let expected: Vec<Tool> = crate::integration_spec::ALL
             .iter()
-            .filter(|spec| spec.released && !spec.hooks.names.is_empty())
+            .filter(|spec| spec.released)
             .map(|spec| spec.tool)
             .collect();
         assert_eq!(actual, expected);

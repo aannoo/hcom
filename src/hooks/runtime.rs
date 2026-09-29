@@ -124,13 +124,11 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         Tool::Omp => Some(&crate::hooks::omp::PER_RUN),
         Tool::OpenCode => Some(&crate::hooks::opencode::OPENCODE_PER_RUN),
         Tool::Kilo => Some(&crate::hooks::opencode::KILO_PER_RUN),
+        // No hooks at all: status and delivery come over Grok's ACP.
+        Tool::Grok => Some(&crate::delivery::grok::PER_RUN),
         // Cursor stays persistent: cursor-agent loads --plugin-dir hooks
         // asynchronously and beforeSubmitPrompt/stop often never fire from them.
-        // Grok reads disk hooks only from GROK_HOME and the project; no
-        // per-invocation hook source exists.
-        Tool::Cursor | Tool::Gemini | Tool::Kimi | Tool::Antigravity | Tool::Grok | Tool::Adhoc => {
-            None
-        }
+        Tool::Cursor | Tool::Gemini | Tool::Kimi | Tool::Antigravity | Tool::Adhoc => None,
     }
 }
 
@@ -143,11 +141,15 @@ pub fn is_per_run(tool: Tool) -> bool {
 pub enum HookMode {
     PerRun,
     Persistent,
+    /// The integration uses no hooks (Grok: everything comes over its ACP).
+    None,
 }
 
 impl HookMode {
     pub fn of(tool: Tool) -> Self {
-        if is_per_run(tool) {
+        if tool.hooks().is_empty() {
+            HookMode::None
+        } else if is_per_run(tool) {
             HookMode::PerRun
         } else {
             HookMode::Persistent
@@ -159,6 +161,7 @@ impl HookMode {
         match self {
             HookMode::PerRun => "per_run",
             HookMode::Persistent => "persistent",
+            HookMode::None => "none",
         }
     }
 
@@ -166,6 +169,7 @@ impl HookMode {
         match self {
             HookMode::PerRun => "per-run",
             HookMode::Persistent => "persistent",
+            HookMode::None => "no hooks",
         }
     }
 }

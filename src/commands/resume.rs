@@ -2114,7 +2114,7 @@ fn derive_copilot_transcript_path(session_id: &str) -> Option<String> {
 
 /// Grok keeps each session in `$GROK_HOME/sessions/<url-encoded cwd>/<id>/`.
 fn derive_grok_transcript_path(session_id: &str) -> Option<String> {
-    let sessions = crate::hooks::grok::grok_config_dir().join("sessions");
+    let sessions = crate::transcript::grok::grok_config_dir().join("sessions");
     std::fs::read_dir(sessions)
         .ok()?
         .flatten()

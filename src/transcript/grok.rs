@@ -14,7 +14,7 @@
 //! completes, so `turn_completed` is the exchange boundary.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -22,6 +22,39 @@ use super::shared::{
     Exchange, ToolUse, capture_tool_output, finalize_action_text, normalize_tool_name,
     read_file_lossy, truncate_str,
 };
+
+/// `$GROK_HOME` if set, else `<tool_config_root>/.grok`.
+pub(crate) fn grok_config_dir() -> PathBuf {
+    std::env::var("GROK_HOME")
+        .ok()
+        .map(|home| home.trim().to_string())
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::runtime_env::tool_config_root().join(".grok"))
+}
+
+/// `urlencoding::encode`, which Grok uses for the cwd component of session
+/// directories: everything but RFC 3986 unreserved bytes is percent-encoded.
+fn encode_path_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Where Grok stores a session's `updates.jsonl`.
+pub(crate) fn session_transcript_path(cwd: &str, session_id: &str) -> PathBuf {
+    grok_config_dir()
+        .join("sessions")
+        .join(encode_path_component(cwd))
+        .join(session_id)
+        .join("updates.jsonl")
+}
 
 fn text_of(content: &Value) -> String {
     match content {

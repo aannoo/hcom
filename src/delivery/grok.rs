@@ -1,12 +1,25 @@
-//! Grok delivery through Grok's native prompt queue (ACP).
+//! Grok: session binding, status and message delivery, all over Grok's own ACP.
+//! hcom installs no Grok hooks.
 //!
 //! `hcom grok` runs the TUI against a private leader socket. This thread
-//! attaches a second client to the same session (`grok agent --leader
+//! attaches a second client to that leader (`grok agent --leader
 //! --leader-socket <sock> stdio`, the official stdio bridge, which handles
-//! leader framing and reconnects) and queues each mailbox batch as an ordinary
-//! prompt with `sendNow:false`. Nothing is typed into the TUI composer, so the
-//! user's draft is never touched, and a busy session simply runs the batch
-//! after its current work.
+//! leader framing and reconnects). On this leader only the TUI opens
+//! sessions, so:
+//!
+//! - **Binding.** Every visible resident session in the roster
+//!   (`x.ai/sessions/list`) belongs to the TUI. hcom loads each with
+//!   `noReplay` (live events, no history) and binds the instance to the TUI's
+//!   current one: the first to appear, then any that newly appears idle
+//!   (`/new`, `/resume` from disk). Switching the TUI to a session that is
+//!   already open emits nothing, so hcom follows that switch when a user
+//!   prompt starts running there.
+//! - **Status.** The leader broadcasts each session's queue, tool calls,
+//!   pending approvals and turn ends to every attached client.
+//! - **Delivery.** Each mailbox batch is queued as an ordinary prompt with
+//!   `sendNow:false`. Nothing is typed into the TUI composer, so the user's
+//!   draft is never touched, and a busy session runs the batch after its
+//!   current work.
 //!
 //! Grok uses our `promptId` as the queue entry id. The batch is acknowledged
 //! when Grok reports that entry running (`x.ai/queue/changed`), i.e. once it
@@ -14,6 +27,7 @@
 //! A batch that never started (removed from the queue, transport lost) stays
 //! unread and is queued again later: at-least-once, never silently dropped.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,17 +39,31 @@ use serde_json::{Value, json};
 
 use crate::db::HcomDb;
 use crate::hooks::{DeliveryAck, common};
+use crate::instance_lifecycle as lifecycle;
 use crate::notify::NotifyServer;
-use crate::shared::ST_LISTENING;
+use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
 
 use super::{DeliveryState, LaunchOutcome, TitleWake, ToolConfig, log_info, log_warn};
 
 const POLL: Duration = Duration::from_millis(100);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Fast roster poll interval: until the TUI has a session (e.g. its
+/// `--resume` picker is still open), and for a while after a hint that it
+/// opened one.
+const ROSTER_FAST_POLL: Duration = Duration::from_millis(500);
+/// The hints (setup broadcasts) can precede the new session's roster entry.
+const ROSTER_FAST_WINDOW: Duration = Duration::from_secs(5);
+/// Backstop for a switch whose hint was missed.
+const ROSTER_SLOW_POLL: Duration = Duration::from_secs(15);
 /// Wait before re-queueing a batch whose prompt was dropped before it ran
 /// (user removed it from the queue, prompt error, transport lost).
 const REQUEUE_DELAY: Duration = Duration::from_secs(10);
+/// Grok raises an approval for every gated tool call and its permission rules
+/// often answer it within milliseconds; only one still open is `blocked`.
+const BLOCKED_GRACE: Duration = Duration::from_secs(1);
+/// Prompts hcom queues carry this `promptId` prefix.
+const HCOM_PROMPT_ID_PREFIX: &str = "hcom-";
 /// Leader-mode Grok ignores these (it warns and continues). Since hcom must
 /// run Grok against a leader, reject them rather than silently drop a
 /// restriction the user asked for.
@@ -46,6 +74,23 @@ const LEADER_IGNORED_FLAGS: &[&str] = &[
     "--disallowedTools",
     "--disable-web-search",
 ];
+
+/// Grok gets nothing injected per run: everything hcom needs arrives over the
+/// ACP client above. Registering as per-run keeps it out of the global
+/// hook-install paths (`hcom hooks`, status, launch).
+pub(crate) static PER_RUN: crate::hooks::runtime::PerRunAdapter =
+    crate::hooks::runtime::PerRunAdapter {
+        prepare: |ctx| {
+            Ok(crate::hooks::runtime::RuntimeInjection {
+                args: ctx.args.clone(),
+                env: Vec::new(),
+            })
+        },
+        cleanup_legacy: |_| Ok(()),
+        ensure_permissions: None,
+        managed_value_flags: &[],
+        strip_legacy_args: None,
+    };
 
 #[derive(Clone, Debug)]
 pub(crate) struct Launch {
@@ -139,9 +184,11 @@ impl Launch {
 #[derive(Debug)]
 enum Event {
     Response(Value),
-    Queue(Value),
-    /// A request from Grok (permission prompt, ...). The TUI answers it.
-    Interaction(String),
+    /// `method` without the ext `_` prefix, `params` unwrapped.
+    Notification {
+        method: String,
+        params: Value,
+    },
     Closed(String),
 }
 
@@ -155,7 +202,6 @@ struct Client {
 impl Client {
     fn connect(
         launch: &Launch,
-        session: &str,
         cwd: &str,
         running: &AtomicBool,
         deadline: Instant,
@@ -241,17 +287,7 @@ impl Client {
                 deadline,
             )?;
         }
-        client.request(
-            "session/load",
-            json!({"sessionId": session, "cwd": cwd, "mcpServers": []}),
-            running,
-            deadline,
-        )?;
-        log_info(
-            "native",
-            "grok.acp.connected",
-            &format!("session={session}"),
-        );
+        log_info("native", "grok.acp.connected", "");
         Ok(client)
     }
 
@@ -265,6 +301,8 @@ impl Client {
         Ok(id)
     }
 
+    /// Blocking request; only for the handshake, before anything else is in
+    /// flight (other events are discarded while waiting).
     fn request(
         &mut self,
         method: &str,
@@ -299,20 +337,303 @@ impl Drop for Client {
 }
 
 fn classify_event(value: Value) -> Option<Event> {
-    match value.get("method").and_then(Value::as_str) {
-        Some("x.ai/queue/changed" | "_x.ai/queue/changed") => {
-            Some(Event::Queue(value["params"].clone()))
-        }
-        Some(method) if value.get("id").is_some() => Some(Event::Interaction(method.to_string())),
-        Some(_) => None,
-        None if value.get("id").is_some() => Some(Event::Response(value)),
-        None => None,
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return value.get("id").is_some().then_some(Event::Response(value));
+    };
+    // A request from Grok (permission prompt, question, ...): shared
+    // interactions go to every client and the TUI answers them.
+    if value.get("id").is_some() {
+        return None;
+    }
+    let mut params = value.get("params").cloned().unwrap_or(Value::Null);
+    let method = match method.strip_prefix('_') {
+        // Gateway-wrapped ext: `{"method":"_x.ai/foo","params":{"method":"x.ai/foo","params":{…}}}`.
+        Some(bare) => match params.get("method").and_then(Value::as_str) {
+            Some(inner) => {
+                let inner = inner.to_string();
+                params = params.get("params").cloned().unwrap_or(Value::Null);
+                inner
+            }
+            None => bare.to_string(),
+        },
+        None => method.to_string(),
+    };
+    Some(Event::Notification { method, params })
+}
+
+// ── Session tracking ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum Status {
+    Prompt,
+    Tool { name: String, input: Value },
+    Blocked(String),
+    Listening(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Effect {
+    /// The TUI is now on this session.
+    Bind {
+        session: String,
+        cwd: String,
+    },
+    /// Subscribe to this session's live events.
+    Load {
+        session: String,
+        cwd: String,
+    },
+    Status(Status),
+    RefreshRoster,
+}
+
+#[derive(Debug)]
+struct RosterEntry {
+    cwd: String,
+    working: bool,
+    last_change: i64,
+}
+
+/// Which session the TUI is on and what it is doing, from the leader's
+/// broadcasts. Pure: the run loop applies the effects.
+#[derive(Default)]
+struct Tracker {
+    bound: Option<String>,
+    /// Visible resident sessions (id → cwd) at the last roster; `None` before
+    /// the first roster of a connection.
+    resident: Option<HashMap<String, String>>,
+    /// Subagent sessions; their events never touch the instance's binding.
+    children: HashSet<String>,
+    /// Each session's running queue entry, to see turn starts once.
+    running: HashMap<String, String>,
+    /// For restoring the tool status once an approval is answered.
+    last_tool: Option<(String, Value)>,
+}
+
+fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+fn turn_end_context(update: &Value) -> String {
+    match str_of(update, "stop_reason").unwrap_or("end_turn") {
+        "end_turn" => String::new(),
+        "cancelled" => "cancelled".into(),
+        "error" => format!(
+            "failure:{}",
+            str_of(update, "error_kind").unwrap_or("error")
+        ),
+        // rate_limit, max_tokens, refusal, ...
+        other => format!("failure:{other}"),
     }
 }
+
+impl Tracker {
+    fn is_bound(&self, session: &str) -> bool {
+        self.bound.as_deref() == Some(session)
+    }
+
+    fn bind(&mut self, session: &str, cwd: &str) -> Effect {
+        self.bound = Some(session.to_string());
+        self.last_tool = None;
+        Effect::Bind {
+            session: session.to_string(),
+            cwd: cwd.to_string(),
+        }
+    }
+
+    /// Reset per-connection state after (re)connecting.
+    fn reconnected(&mut self) {
+        self.resident = None;
+        self.running.clear();
+    }
+
+    fn on_roster(&mut self, sessions: &[Value]) -> Vec<Effect> {
+        let visible: HashMap<String, RosterEntry> = sessions
+            .iter()
+            .filter(|entry| entry["resident"] == true)
+            .filter_map(|entry| {
+                let id = str_of(entry, "sessionId")?;
+                (!self.children.contains(id)).then(|| {
+                    (
+                        id.to_string(),
+                        RosterEntry {
+                            cwd: str_of(entry, "cwd").unwrap_or_default().to_string(),
+                            working: entry["activity"] == "working",
+                            last_change: entry["lastChangeUnixMs"].as_i64().unwrap_or(0),
+                        },
+                    )
+                })
+            })
+            .collect();
+        let previous = self.resident.replace(
+            visible
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.cwd.clone()))
+                .collect(),
+        );
+        let is_new = |id: &str| previous.as_ref().is_none_or(|prev| !prev.contains_key(id));
+        let mut effects: Vec<Effect> = visible
+            .iter()
+            .filter(|(id, _)| is_new(id))
+            .map(|(id, entry)| Effect::Load {
+                session: id.clone(),
+                cwd: entry.cwd.clone(),
+            })
+            .collect();
+        let newest = |candidates: &mut dyn Iterator<Item = (&String, &RosterEntry)>| {
+            candidates
+                .max_by_key(|(_, entry)| entry.last_change)
+                .map(|(id, entry)| (id.clone(), entry.cwd.clone()))
+        };
+        let target = if self.bound.is_none() {
+            newest(&mut visible.iter())
+        } else if previous.is_some() {
+            // Newly resident and idle: the TUI just created or resumed it. A
+            // new session that is already working is followed at its first
+            // user prompt instead.
+            newest(
+                &mut visible
+                    .iter()
+                    .filter(|(id, entry)| is_new(id) && !entry.working),
+            )
+        } else {
+            None
+        };
+        if let Some((session, cwd)) = target.filter(|(id, _)| !self.is_bound(id)) {
+            effects.push(self.bind(&session, &cwd));
+        }
+        effects
+    }
+
+    fn on_notification(&mut self, method: &str, params: &Value) -> Vec<Effect> {
+        let session = str_of(params, "sessionId").unwrap_or_default();
+        match method {
+            "x.ai/queue/changed" => {
+                let Some(prompt) = str_of(params, "runningPromptId") else {
+                    self.running.remove(session);
+                    return Vec::new();
+                };
+                if self.running.get(session).map(String::as_str) == Some(prompt) {
+                    return Vec::new();
+                }
+                self.running.insert(session.to_string(), prompt.to_string());
+                // hcom's own batches set their status on ack.
+                let user_prompt = !prompt.starts_with(HCOM_PROMPT_ID_PREFIX)
+                    && str_of(params, "runningKind").is_none_or(|kind| kind == "prompt");
+                if !user_prompt {
+                    return Vec::new();
+                }
+                if self.is_bound(session) {
+                    return vec![Effect::Status(Status::Prompt)];
+                }
+                // Only the TUI's user prompts here: it switched to this session.
+                let cwd = self
+                    .resident
+                    .as_ref()
+                    .and_then(|resident| resident.get(session))
+                    .cloned();
+                match cwd {
+                    Some(cwd) if !self.children.contains(session) => {
+                        vec![self.bind(session, &cwd), Effect::Status(Status::Prompt)]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            "session/update" if self.is_bound(session) => {
+                let update = &params["update"];
+                if update["sessionUpdate"] != "tool_call" {
+                    return Vec::new();
+                }
+                let name = update
+                    .pointer("/_meta/x.ai~1tool/name")
+                    .and_then(Value::as_str)
+                    .or_else(|| str_of(update, "title"))
+                    .unwrap_or("tool")
+                    .to_string();
+                let input = update.get("rawInput").cloned().unwrap_or(Value::Null);
+                self.last_tool = Some((name.clone(), input.clone()));
+                vec![Effect::Status(Status::Tool { name, input })]
+            }
+            "x.ai/session_notification" => {
+                let update = &params["update"];
+                let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+                if kind == "subagent_spawned" {
+                    if let Some(child) = str_of(update, "child_session_id") {
+                        self.children.insert(child.to_string());
+                    }
+                    return Vec::new();
+                }
+                // A subagent waiting on approval blocks its parent's turn too.
+                let ours = self.is_bound(session) || self.children.contains(session);
+                match kind {
+                    "pending_interaction" if ours => {
+                        let what = match update["kind"].as_str() {
+                            Some("permission") | None => "approval",
+                            Some(other) => other,
+                        };
+                        vec![Effect::Status(Status::Blocked(what.to_string()))]
+                    }
+                    "interaction_resolved" if ours => {
+                        vec![Effect::Status(match self.last_tool.clone() {
+                            Some((name, input)) => Status::Tool { name, input },
+                            None => Status::Prompt,
+                        })]
+                    }
+                    "turn_completed" if self.is_bound(session) => {
+                        // A queued prompt may already be running.
+                        let ended = str_of(update, "prompt_id");
+                        match self.running.get(session) {
+                            Some(running) if Some(running.as_str()) != ended => Vec::new(),
+                            _ => vec![Effect::Status(Status::Listening(turn_end_context(update)))],
+                        }
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            "x.ai/sessions/changed" => {
+                if let Some(resident) = self.resident.as_mut() {
+                    for removed in params["removed"].as_array().into_iter().flatten() {
+                        if let Some(id) = removed.as_str() {
+                            resident.remove(id);
+                        }
+                    }
+                }
+                let unknown = params["upserted"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| str_of(entry, "sessionId"))
+                    .any(|id| {
+                        !self.children.contains(id)
+                            && self
+                                .resident
+                                .as_ref()
+                                .is_none_or(|resident| !resident.contains_key(id))
+                    });
+                if unknown {
+                    vec![Effect::RefreshRoster]
+                } else {
+                    Vec::new()
+                }
+            }
+            // Broadcast when a session is set up, without saying which.
+            "x.ai/models/update" | "x.ai/mcp/servers_updated" | "x.ai/announcements/update" => {
+                vec![Effect::RefreshRoster]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+// ── Delivery acknowledgement ────────────────────────────────────────────
 
 /// A queued batch awaiting evidence that Grok ran it.
 struct InFlight {
     request_id: u64,
+    session: String,
     prompt_id: String,
     /// The exact prompt text. It carries the batch's message ids, so it
     /// identifies this batch inside a combined turn.
@@ -365,6 +686,74 @@ fn response_outcome(value: &Value) -> Option<Outcome> {
     Some(Outcome::Delivered)
 }
 
+// ── Run loop ────────────────────────────────────────────────────────────
+
+enum Pending {
+    Roster,
+    Load(String),
+}
+
+/// The roster result, which the stdio bridge may wrap once more.
+fn roster_sessions(result: &Value) -> &[Value] {
+    result
+        .get("sessions")
+        .or_else(|| result.pointer("/result/sessions"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Point the instance at `session`, as a hook-based SessionStart would.
+fn apply_bind(db: &HcomDb, process_id: &str, current_name: &str, session: &str, cwd: &str) {
+    let first = db
+        .get_instance_full(current_name)
+        .ok()
+        .flatten()
+        .is_none_or(|instance| instance.session_id.is_none());
+    // Resolves resume placeholders and identity switches; may rename.
+    let name = crate::instance_binding::bind_session_to_process(db, session, Some(process_id))
+        .unwrap_or_else(|| current_name.to_string());
+    let _ = db.rebind_instance_session(&name, session);
+    let mut updates = serde_json::Map::new();
+    if !cwd.is_empty() {
+        updates.insert(
+            "transcript_path".into(),
+            Value::String(
+                crate::transcript::grok::session_transcript_path(cwd, session)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        updates.insert("directory".into(), Value::String(cwd.to_string()));
+    }
+    crate::instances::update_instance_position(db, &name, &updates);
+    if first {
+        crate::instance_binding::capture_and_store_launch_context(db, &name);
+        lifecycle::set_status(db, &name, ST_LISTENING, "start", Default::default());
+        crate::relay::worker::ensure_worker(true);
+    }
+    log_info(
+        "native",
+        "grok.acp.bound",
+        &format!("instance={name} session={session}"),
+    );
+}
+
+fn apply_status(db: &HcomDb, name: &str, status: &Status) {
+    match status {
+        Status::Prompt => lifecycle::set_status(db, name, ST_ACTIVE, "prompt", Default::default()),
+        Status::Tool { name: tool, input } => {
+            common::update_tool_status(db, name, "grok", tool, input)
+        }
+        Status::Blocked(context) => {
+            lifecycle::set_status(db, name, ST_BLOCKED, context, Default::default())
+        }
+        Status::Listening(context) => {
+            lifecycle::set_status(db, name, ST_LISTENING, context, Default::default())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     launch: &Launch,
@@ -382,8 +771,13 @@ pub(super) fn run(
     launch_outcome: &mut LaunchOutcome,
 ) {
     let mut client: Option<Client> = None;
-    let mut session = String::new();
+    let mut tracker = Tracker::default();
+    let mut loaded: HashSet<String> = HashSet::new();
+    let mut pending: HashMap<u64, Pending> = HashMap::new();
+    let mut roster_due: Option<Instant> = None;
+    let mut roster_fast_until = Instant::now();
     let mut in_flight: Option<InFlight> = None;
+    let mut approval_since: Option<(Instant, String)> = None;
     let mut current_status = ST_LISTENING.to_string();
     let mut heartbeat = Instant::now();
     let mut connect_failures: u32 = 0;
@@ -402,7 +796,7 @@ pub(super) fn run(
             tool: &config.tool,
             host_label,
         });
-        if client.is_some() {
+        if client.is_some() && tracker.bound.is_some() {
             super::drive_launch_outcome(
                 db,
                 state,
@@ -428,25 +822,6 @@ pub(super) fn run(
                 continue;
             }
         };
-        // The session id arrives with Grok's SessionStart hook.
-        let Some(active_session) = instance.session_id.filter(|id| !id.is_empty()) else {
-            notify.wait(POLL);
-            continue;
-        };
-        if session != active_session {
-            // New session (/new, resume): the old prompt belongs to it.
-            if let Some(flight) = in_flight.take() {
-                log_warn(
-                    "native",
-                    "grok.acp.requeue",
-                    &format!("prompt={} session changed before it ran", flight.prompt_id),
-                );
-            }
-            client = None;
-            session = active_session;
-            connect_failures = 0;
-            retry_at = Instant::now();
-        }
         if client.is_none() {
             if Instant::now() < retry_at {
                 notify.wait(POLL);
@@ -454,7 +829,6 @@ pub(super) fn run(
             }
             match Client::connect(
                 launch,
-                &session,
                 &instance.directory,
                 running,
                 Instant::now() + SETUP_TIMEOUT,
@@ -462,6 +836,10 @@ pub(super) fn run(
                 Ok(connected) => {
                     client = Some(connected);
                     connect_failures = 0;
+                    tracker.reconnected();
+                    loaded.clear();
+                    pending.clear();
+                    roster_due = Some(Instant::now());
                 }
                 Err(error) => {
                     if !running.load(Ordering::Acquire) {
@@ -479,14 +857,10 @@ pub(super) fn run(
                     );
                     let _ = db.set_gate_status(current_name, "acp_disconnected", &detail);
                     if launch_outcome.is_pending() && launched_at.elapsed() >= SETUP_TIMEOUT {
-                        let _ = db.set_status(
-                            current_name,
-                            crate::shared::ST_BLOCKED,
-                            "launch_blocked",
-                        );
+                        let _ = db.set_status(current_name, ST_BLOCKED, "launch_blocked");
                         let _ = db.emit_launch_blocked_event(
                             current_name,
-                            crate::shared::ST_BLOCKED,
+                            ST_BLOCKED,
                             "launch_blocked",
                             "grok_acp_connection",
                             &detail,
@@ -505,6 +879,7 @@ pub(super) fn run(
             continue;
         };
 
+        let mut effects = Vec::new();
         let mut outcome = None;
         let mut closed = None;
         while let Ok(event) = conn.events.try_recv() {
@@ -513,53 +888,126 @@ pub(super) fn run(
                     closed = Some(error);
                     break;
                 }
-                Event::Queue(params) => {
-                    if params["sessionId"].as_str() != Some(session.as_str()) {
-                        continue;
-                    }
-                    if let Some(flight) = in_flight.as_ref() {
-                        outcome = queue_outcome(&params, flight);
-                    }
-                }
                 Event::Response(value) => {
-                    if let Some(flight) = in_flight.as_mut()
-                        && value["id"].as_u64() == Some(flight.request_id)
-                    {
-                        outcome = response_outcome(&value);
-                        if outcome.is_none() {
-                            flight.removed_at = Some(Instant::now());
+                    let id = value["id"].as_u64();
+                    match id.and_then(|id| pending.remove(&id)) {
+                        Some(Pending::Roster) => match value.get("error") {
+                            Some(error) => {
+                                log_warn("native", "grok.acp.roster_failed", &error.to_string())
+                            }
+                            None => {
+                                effects.extend(tracker.on_roster(roster_sessions(&value["result"])))
+                            }
+                        },
+                        Some(Pending::Load(session)) => match value.get("error") {
+                            Some(error) => log_warn(
+                                "native",
+                                "grok.acp.load_failed",
+                                &format!("session={session}: {error}"),
+                            ),
+                            None => {
+                                loaded.insert(session);
+                            }
+                        },
+                        None => {
+                            if let Some(flight) = in_flight.as_mut()
+                                && id == Some(flight.request_id)
+                            {
+                                outcome = response_outcome(&value);
+                                if outcome.is_none() {
+                                    flight.removed_at = Some(Instant::now());
+                                }
+                            }
                         }
                     }
                 }
-                Event::Interaction(method) => {
-                    // The TUI answers; hcom only reports the wait. The next
-                    // tool or turn-end hook clears it.
-                    log_info(
-                        "native",
-                        "grok.acp.interaction",
-                        &format!("TUI owns {method}"),
-                    );
-                    if method == "session/request_permission" {
-                        crate::instance_lifecycle::set_status(
-                            db,
-                            current_name,
-                            crate::shared::ST_BLOCKED,
-                            "approval",
-                            Default::default(),
-                        );
+                Event::Notification { method, params } => {
+                    if method == "x.ai/queue/changed"
+                        && let Some(flight) = in_flight.as_ref()
+                        && params["sessionId"].as_str() == Some(flight.session.as_str())
+                    {
+                        outcome = queue_outcome(&params, flight);
                     }
+                    effects.extend(tracker.on_notification(&method, &params));
                 }
             }
             if outcome.is_some() {
                 break;
             }
         }
+        for effect in effects {
+            match effect {
+                Effect::Bind { session, cwd } => {
+                    let cwd = if cwd.is_empty() {
+                        instance.directory.clone()
+                    } else {
+                        cwd
+                    };
+                    apply_bind(db, process_id, current_name, &session, &cwd);
+                }
+                Effect::Load { session, cwd } => {
+                    if loaded.contains(&session)
+                        || pending
+                            .values()
+                            .any(|p| matches!(p, Pending::Load(s) if *s == session))
+                    {
+                        continue;
+                    }
+                    let cwd = if cwd.is_empty() {
+                        instance.directory.clone()
+                    } else {
+                        cwd
+                    };
+                    match conn.send(
+                        "session/load",
+                        json!({"sessionId": session, "cwd": cwd, "mcpServers": [],
+                               "_meta": {"noReplay": true}}),
+                    ) {
+                        Ok(id) => {
+                            pending.insert(id, Pending::Load(session));
+                        }
+                        Err(error) => closed = Some(format!("write failed: {error:#}")),
+                    }
+                }
+                Effect::Status(Status::Blocked(context)) => {
+                    approval_since.get_or_insert((Instant::now(), context));
+                }
+                Effect::Status(status) => {
+                    approval_since = None;
+                    apply_status(db, current_name, &status);
+                }
+                Effect::RefreshRoster => {
+                    roster_fast_until = Instant::now() + ROSTER_FAST_WINDOW;
+                    let at = Instant::now() + ROSTER_FAST_POLL;
+                    roster_due = Some(roster_due.map_or(at, |due| due.min(at)));
+                }
+            }
+        }
+        let roster_pending = pending.values().any(|p| matches!(p, Pending::Roster));
+        if !roster_pending && roster_due.is_none() {
+            let fast = tracker.bound.is_none() || Instant::now() < roster_fast_until;
+            let interval = if fast {
+                ROSTER_FAST_POLL
+            } else {
+                ROSTER_SLOW_POLL
+            };
+            roster_due = Some(Instant::now() + interval);
+        }
+        if !roster_pending && roster_due.is_some_and(|due| Instant::now() >= due) {
+            roster_due = None;
+            match conn.send("_x.ai/sessions/list", json!({})) {
+                Ok(id) => {
+                    pending.insert(id, Pending::Roster);
+                }
+                Err(error) => closed = Some(format!("write failed: {error:#}")),
+            }
+        }
         if let Some(error) = closed {
             client = None;
             retry_at = Instant::now() + Duration::from_secs(1);
-            outcome = in_flight
-                .as_ref()
-                .map(|_| Outcome::Dropped(format!("{error} before the prompt ran")));
+            if in_flight.is_some() && outcome.is_none() {
+                outcome = Some(Outcome::Dropped(format!("{error} before the prompt ran")));
+            }
             log_warn("native", "grok.acp.disconnected", &error);
         }
         if outcome.is_none()
@@ -596,19 +1044,23 @@ pub(super) fn run(
                 }
             }
         }
+        if let Some((_, context)) =
+            approval_since.take_if(|(since, _)| since.elapsed() >= BLOCKED_GRACE)
+        {
+            apply_status(db, current_name, &Status::Blocked(context));
+        }
         let Some(conn) = client.as_mut() else {
             continue;
         };
-        if in_flight.is_none()
+        // The bound session must be loaded, or its queue events never arrive.
+        let target = tracker.bound.clone().filter(|s| loaded.contains(s));
+        if let Some(session) = target
+            && in_flight.is_none()
             && Instant::now() >= requeue_at
             && !matches!(current_status.as_str(), "stopped" | "inactive")
             && let Some(prepared) = common::prepare_pending_messages(db, current_name)
         {
-            let prompt_id = format!(
-                "{}{}",
-                crate::hooks::grok::HCOM_PROMPT_ID_PREFIX,
-                uuid::Uuid::new_v4()
-            );
+            let prompt_id = format!("{HCOM_PROMPT_ID_PREFIX}{}", uuid::Uuid::new_v4());
             match conn.send(
                 "session/prompt",
                 json!({
@@ -622,12 +1074,13 @@ pub(super) fn run(
                         "native",
                         "grok.acp.enqueued",
                         &format!(
-                            "instance={current_name} prompt={prompt_id} cursor={}",
+                            "instance={current_name} session={session} prompt={prompt_id} cursor={}",
                             prepared.ack.last_event_id
                         ),
                     );
                     in_flight = Some(InFlight {
                         request_id,
+                        session,
                         prompt_id,
                         text: prepared.formatted,
                         ack: prepared.ack,
@@ -643,7 +1096,7 @@ pub(super) fn run(
         }
         notify.wait(POLL);
     }
-    // Dropping the ACP client does not close the TUI's session.
+    // Dropping the ACP client does not close the TUI's sessions.
     drop(client);
 }
 
@@ -656,6 +1109,7 @@ mod tests {
     fn flight(removed: bool) -> InFlight {
         InFlight {
             request_id: 4,
+            session: "s".into(),
             prompt_id: "hcom-1".into(),
             text: BATCH.into(),
             ack: DeliveryAck {
@@ -738,18 +1192,241 @@ mod tests {
     }
 
     #[test]
-    fn classifies_queue_and_reverse_requests() {
-        let queue = json!({"method": "x.ai/queue/changed", "params": {"sessionId": "s"}});
-        assert!(matches!(classify_event(queue), Some(Event::Queue(_))));
+    fn classifies_notifications_and_ignores_reverse_requests() {
+        let queue = json!({"method": "_x.ai/queue/changed", "params": {"sessionId": "s"}});
+        assert!(matches!(
+            classify_event(queue),
+            Some(Event::Notification { method, params }) if method == "x.ai/queue/changed" && params["sessionId"] == "s"
+        ));
+        let wrapped = json!({"method": "_x.ai/session_notification",
+                             "params": {"method": "x.ai/session_notification", "params": {"sessionId": "s"}}});
+        assert!(matches!(
+            classify_event(wrapped),
+            Some(Event::Notification { method, params }) if method == "x.ai/session_notification" && params["sessionId"] == "s"
+        ));
         let permission =
             json!({"id": "ask-1", "method": "session/request_permission", "params": {}});
-        assert!(matches!(
-            classify_event(permission),
-            Some(Event::Interaction(_))
-        ));
+        assert!(classify_event(permission).is_none());
         let response = json!({"id": 3, "result": {}});
         assert!(matches!(classify_event(response), Some(Event::Response(_))));
-        assert!(classify_event(json!({"method": "session/update", "params": {}})).is_none());
+    }
+
+    fn entry(id: &str, activity: &str, last_change: i64) -> Value {
+        json!({"sessionId": id, "cwd": "/w", "activity": activity, "resident": true,
+               "lastChangeUnixMs": last_change})
+    }
+
+    fn binds(effects: &[Effect]) -> Vec<&str> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Bind { session, .. } => Some(session.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn loads(effects: &[Effect]) -> Vec<&str> {
+        let mut ids: Vec<&str> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Load { session, .. } => Some(session.as_str()),
+                _ => None,
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn queue(session: &str, prompt: Option<&str>) -> Value {
+        match prompt {
+            Some(p) => {
+                json!({"sessionId": session, "runningPromptId": p, "runningKind": "prompt", "entries": []})
+            }
+            None => json!({"sessionId": session, "entries": []}),
+        }
+    }
+
+    fn note(session: &str, update: Value) -> Value {
+        json!({"sessionId": session, "update": update})
+    }
+
+    #[test]
+    fn binds_the_first_resident_session_and_loads_all() {
+        let mut tracker = Tracker::default();
+        assert!(tracker.on_roster(&[]).is_empty());
+        let dormant =
+            json!({"sessionId": "old", "cwd": "/w", "activity": "dormant", "resident": false});
+        let effects = tracker.on_roster(&[dormant, entry("a", "idle", 5)]);
+        assert_eq!(binds(&effects), ["a"]);
+        assert_eq!(loads(&effects), ["a"]);
+    }
+
+    #[test]
+    fn follows_new_idle_sessions_but_not_reconnects_or_working_ones() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 1)]);
+        // /new: a fresh idle session.
+        let effects = tracker.on_roster(&[entry("a", "idle", 1), entry("b", "idle", 2)]);
+        assert_eq!(binds(&effects), ["b"]);
+        assert_eq!(loads(&effects), ["b"]);
+        // A new session that is already working waits for a user prompt.
+        let effects = tracker.on_roster(&[
+            entry("a", "idle", 1),
+            entry("b", "idle", 2),
+            entry("c", "working", 3),
+        ]);
+        assert!(binds(&effects).is_empty());
+        assert_eq!(loads(&effects), ["c"]);
+        // After a reconnect everything is reloaded, the binding kept.
+        tracker.reconnected();
+        let effects = tracker.on_roster(&[entry("a", "idle", 9), entry("b", "idle", 2)]);
+        assert!(binds(&effects).is_empty());
+        assert_eq!(loads(&effects), ["a", "b"]);
+    }
+
+    #[test]
+    fn user_prompt_in_another_open_session_moves_the_binding() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 2), entry("b", "idle", 1)]);
+        assert_eq!(tracker.bound.as_deref(), Some("a"));
+        // hcom's own batch running in b (queued before a switch) is not a switch.
+        assert!(
+            tracker
+                .on_notification("x.ai/queue/changed", &queue("b", Some("hcom-9")))
+                .is_empty()
+        );
+        let effects = tracker.on_notification("x.ai/queue/changed", &queue("b", Some("u1")));
+        assert_eq!(binds(&effects), ["b"]);
+        assert_eq!(effects.last(), Some(&Effect::Status(Status::Prompt)));
+        // The same running entry again is not a new turn.
+        assert!(
+            tracker
+                .on_notification("x.ai/queue/changed", &queue("b", Some("u1")))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subagent_sessions_never_bind_or_end_the_turn() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 1)]);
+        tracker.on_notification(
+            "x.ai/session_notification",
+            &note(
+                "a",
+                json!({"sessionUpdate": "subagent_spawned", "child_session_id": "kid"}),
+            ),
+        );
+        let effects = tracker.on_roster(&[entry("a", "working", 1), entry("kid", "idle", 2)]);
+        assert!(binds(&effects).is_empty());
+        assert!(loads(&effects).is_empty());
+        assert!(
+            tracker
+                .on_notification("x.ai/queue/changed", &queue("kid", Some("u1")))
+                .is_empty()
+        );
+        let done = json!({"sessionUpdate": "turn_completed", "prompt_id": "u1", "stop_reason": "end_turn"});
+        assert!(
+            tracker
+                .on_notification("x.ai/session_notification", &note("kid", done))
+                .is_empty()
+        );
+        // Its approval prompt does block the parent.
+        let ask = json!({"sessionUpdate": "pending_interaction", "kind": "permission"});
+        assert_eq!(
+            tracker.on_notification("x.ai/session_notification", &note("kid", ask)),
+            [Effect::Status(Status::Blocked("approval".into()))]
+        );
+    }
+
+    #[test]
+    fn status_follows_the_bound_session() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 1)]);
+        assert_eq!(
+            tracker.on_notification("x.ai/queue/changed", &queue("a", Some("u1"))),
+            [Effect::Status(Status::Prompt)]
+        );
+        let call = json!({"sessionId": "a", "update": {"sessionUpdate": "tool_call",
+            "title": "run_terminal_command", "rawInput": {"command": "ls"},
+            "_meta": {"x.ai/tool": {"name": "run_terminal_command"}}}});
+        let tool = Status::Tool {
+            name: "run_terminal_command".into(),
+            input: json!({"command": "ls"}),
+        };
+        assert_eq!(
+            tracker.on_notification("session/update", &call),
+            [Effect::Status(tool.clone())]
+        );
+        let ask = json!({"sessionUpdate": "pending_interaction", "kind": "permission"});
+        assert_eq!(
+            tracker.on_notification("x.ai/session_notification", &note("a", ask)),
+            [Effect::Status(Status::Blocked("approval".into()))]
+        );
+        let resolved = json!({"sessionUpdate": "interaction_resolved"});
+        assert_eq!(
+            tracker.on_notification("x.ai/session_notification", &note("a", resolved)),
+            [Effect::Status(tool)]
+        );
+        // A queued prompt already running: the old turn's end changes nothing.
+        tracker.on_notification("x.ai/queue/changed", &queue("a", Some("u2")));
+        let stale = json!({"sessionUpdate": "turn_completed", "prompt_id": "u1", "stop_reason": "end_turn"});
+        assert!(
+            tracker
+                .on_notification("x.ai/session_notification", &note("a", stale))
+                .is_empty()
+        );
+        tracker.on_notification("x.ai/queue/changed", &queue("a", None));
+        let failed = json!({"sessionUpdate": "turn_completed", "prompt_id": "u2",
+                            "stop_reason": "error", "error_kind": "overloaded"});
+        assert_eq!(
+            tracker.on_notification("x.ai/session_notification", &note("a", failed)),
+            [Effect::Status(Status::Listening(
+                "failure:overloaded".into()
+            ))]
+        );
+    }
+
+    #[test]
+    fn turn_end_contexts() {
+        let ctx = |reason: &str| turn_end_context(&json!({"stop_reason": reason}));
+        assert_eq!(ctx("end_turn"), "");
+        assert_eq!(ctx("cancelled"), "cancelled");
+        assert_eq!(ctx("error"), "failure:error");
+        assert_eq!(ctx("rate_limit"), "failure:rate_limit");
+    }
+
+    #[test]
+    fn roster_refresh_triggers() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 1)]);
+        let known = json!({"upserted": [entry("a", "working", 2)], "removed": []});
+        assert!(
+            tracker
+                .on_notification("x.ai/sessions/changed", &known)
+                .is_empty()
+        );
+        let unknown = json!({"upserted": [entry("b", "working", 2)], "removed": []});
+        assert_eq!(
+            tracker.on_notification("x.ai/sessions/changed", &unknown),
+            [Effect::RefreshRoster]
+        );
+        assert_eq!(
+            tracker.on_notification("x.ai/models/update", &json!({})),
+            [Effect::RefreshRoster]
+        );
+    }
+
+    #[test]
+    fn roster_result_may_be_wrapped() {
+        let sessions = json!([entry("a", "idle", 1)]);
+        assert_eq!(roster_sessions(&json!({"sessions": sessions})).len(), 1);
+        assert_eq!(
+            roster_sessions(&json!({"result": {"sessions": sessions}})).len(),
+            1
+        );
+        assert!(roster_sessions(&json!({})).is_empty());
     }
 
     #[test]

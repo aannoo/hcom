@@ -763,23 +763,7 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
-        LaunchTool::Grok => {
-            if crate::hooks::grok::verify_grok_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::grok::try_setup_grok_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[("hooks_path", crate::hooks::grok::get_grok_hooks_path())],
-                );
-                bail!(
-                    "Failed to setup Grok hooks: {e}\n\
-                     Run: hcom hooks add grok\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Grok => unreachable!("Grok has no hooks"),
     }
 }
 
