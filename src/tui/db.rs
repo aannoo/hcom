@@ -1563,7 +1563,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reconnects_when_database_is_replaced_during_or_after_open() {
-        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // Private tempdir, not isolated_test_env: that points the process-wide
+        // HCOM_DIR here, so unguarded parallel tests resolving the default db
+        // could open or lock these files mid-replacement.
+        let tmp = tempfile::tempdir().unwrap();
+        let hcom_dir = tmp.path().join(".hcom");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
         let db_path = hcom_dir.join("hcom.db");
 
         let first = Connection::open(&db_path).unwrap();
@@ -1593,7 +1598,11 @@ mod tests {
             }
             std::fs::rename(source_path, target_path).unwrap();
         }));
-        ds.ensure_conn().unwrap();
+        assert!(
+            ds.ensure_conn().is_some(),
+            "raced open failed: {:?}",
+            ds.last_error
+        );
         let raced_replacement_id: i64 = ds
             .conn
             .as_ref()
@@ -1617,7 +1626,11 @@ mod tests {
         std::fs::rename(&later_replacement_path, &db_path).unwrap();
 
         assert!(ds.reconnect_if_database_replaced());
-        ds.ensure_conn().unwrap();
+        assert!(
+            ds.ensure_conn().is_some(),
+            "reopen failed: {:?}",
+            ds.last_error
+        );
         let later_replacement_id: i64 = ds
             .conn
             .as_ref()
