@@ -169,19 +169,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
             Default::default(),
         );
 
-        let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-        let bootstrap_text = bootstrap::get_bootstrap(
-            db,
-            &ctx.hcom_dir,
-            &existing_name,
-            &tool,
-            ctx.is_background,
-            ctx.is_launched,
-            &ctx.notes,
-            &hcom_config.tag,
-            crate::relay::is_relay_enabled(&hcom_config),
-            ctx.background_name.as_deref(),
-        );
+        let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &existing_name, &tool);
 
         if let Some(port) = notify_port {
             upsert_plugin_notify_endpoint(db, &existing_name, port);
@@ -280,34 +268,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         upsert_plugin_notify_endpoint(db, &instance_name, port);
     }
 
-    // Build bootstrap text
-    let tag = db
-        .get_instance_full(&instance_name)
-        .ok()
-        .flatten()
-        .and_then(|d| d.tag.clone())
-        .unwrap_or_default();
-
-    let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-    let relay_enabled = crate::relay::is_relay_enabled(&hcom_config);
-    // Use config tag as fallback when instance has no tag
-    let effective_tag = if tag.is_empty() {
-        &hcom_config.tag
-    } else {
-        &tag
-    };
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        &instance_name,
-        &tool,
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        effective_tag,
-        relay_enabled,
-        ctx.background_name.as_deref(),
-    );
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &instance_name, &tool);
 
     // Auto-spawn relay-worker now that an instance is active
     crate::relay::worker::ensure_worker(true);

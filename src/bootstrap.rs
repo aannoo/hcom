@@ -5,11 +5,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::LazyLock;
 
 use crate::db::HcomDb;
 use crate::identity::get_full_name;
 use crate::paths;
-use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
+use crate::shared::constants::{SENDER, ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
+use crate::shared::context::HcomContext;
+use crate::tool::Tool;
 
 // Bundled script names (compile-time known).
 // User scripts are discovered at runtime from ~/.hcom/scripts/.
@@ -36,7 +39,7 @@ use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 const UNIVERSAL: &str = r#"[HCOM SESSION]
 You have access to the hcom cli communication tool.
 - Your name: {display_name}
-- Authority: Prioritize @{SENDER} over others
+- Authority: Prioritize @{SENDER} over others{launched_by}
 - Important: Include this marker anywhere in your first response only: [hcom:{instance_name}]
 
 You run hcom commands on behalf of the human user. The human uses natural language with you.
@@ -65,8 +68,8 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
-  Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
+- Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--hcom-prompt 'task']
+  Example: `hcom 1 claude --tag cool --hcom-prompt 'task'`
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   each supports --help (set prompt, system, background, forward args, etc)
 - Run workflows: run <script> [args] [--help]
@@ -78,10 +81,10 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 ## RULES
 
-1. Task via hcom → ack immediately, do work, report via hcom
-2. No filler messages (greetings, thanks, congratulations).
-3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
-4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
+1. No filler messages (greetings, thanks, congratulations).
+2. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
+3. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
+4. Don't delegate to existing agents unless asked. Need help? Spawn your own agents.
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 {active_instances}
@@ -98,7 +101,7 @@ const HEADLESS_NOTICE: &str = r#"
 Headless mode: No one sees your chat, only hcom messages. Communicate via hcom send."#;
 
 const UVX_CMD_NOTICE: &str = r#"
-Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."#;
+Note: hcom command in this environment is `{hcom_cmd}`."#;
 
 // Tool-specific delivery
 //
@@ -179,7 +182,7 @@ You are now registered with hcom."#;
 const CLAUDE_ONLY: &str = r#"## SUBAGENTS
 
 Subagents can join hcom:
-1. Run Task with background=true
+1. Run Task
 2. Tell subagent: `use hcom`
 
 Subagents get their own hcom context and a random name. DO NOT give them any specific hcom syntax.
@@ -192,7 +195,6 @@ You're participating in the hcom multi-agent network.
 - Your name: {subagent_name}
 - Your parent: {parent_name}
 - Use "--name {subagent_name}" for all hcom commands
-- Announce to parent once: send {target_parent} --intent inform -- "Connected as {subagent_name}"
 
 Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
 
@@ -214,60 +216,59 @@ Commands:
   {hcom_cmd} <cmd> --help --name {subagent_name}
 
 Rules:
-- Task via hcom → ack, work, report
 - Authority: @{SENDER} > others
 - Use --intent on sends: request (want reply), inform (FYI), ack (responding)"#;
 
 // HELPERS
 
-/// Get concise list of active instances grouped by tool.
-/// Returns empty string if no active instances, or "\nActive (snapshot): claude: a, b | codex: c".
+const ACTIVE_SNAPSHOT_LIMIT: usize = 8;
+
+/// Get concise list of active instances grouped by tool, newest first.
+/// Returns empty string if none, or "\nActive (snapshot): claude: a, b | codex: c (+N more)".
+///
+/// Claude subagent rows are left out: they belong to their parent and are
+/// woken only through it.
 fn get_active_instances(db: &HcomDb, exclude_name: &str) -> String {
     let instances = match db.iter_instances_full() {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
 
-    let now = crate::shared::time::now_epoch_f64();
-    let cutoff = now - 60.0;
+    let cutoff = crate::shared::time::now_epoch_f64() - 60.0;
+    let active: Vec<_> = instances
+        .iter()
+        .filter(|inst| inst.name != exclude_name && inst.agent_id.is_none())
+        .filter(|inst| {
+            inst.status == ST_ACTIVE
+                || inst.status == ST_LISTENING
+                || (inst.status != ST_INACTIVE && inst.status_time as f64 >= cutoff)
+        })
+        .collect();
 
-    // Collect names grouped by tool, preserving insertion order via BTreeMap
-    let mut by_tool: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut count = 0;
-
-    for inst in &instances {
-        if count >= 8 {
-            break;
-        }
-        if inst.name == exclude_name {
-            continue;
-        }
-
-        let status_time = inst.status_time as f64;
-        if inst.status == ST_ACTIVE || inst.status == ST_LISTENING || status_time >= cutoff {
-            let tool = if inst.tool.is_empty() {
-                "claude"
-            } else {
-                &inst.tool
-            };
-            by_tool
-                .entry(tool.to_string())
-                .or_default()
-                .push(get_full_name(inst));
-            count += 1;
-        }
+    if active.is_empty() {
+        return String::new();
     }
 
-    if by_tool.is_empty() {
-        return String::new();
+    let mut by_tool: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for inst in active.iter().take(ACTIVE_SNAPSHOT_LIMIT) {
+        let tool = if inst.tool.is_empty() {
+            "claude"
+        } else {
+            &inst.tool
+        };
+        by_tool.entry(tool).or_default().push(get_full_name(inst));
     }
 
     let parts: Vec<String> = by_tool
         .iter()
         .map(|(tool, names)| format!("{}: {}", tool, names.join(", ")))
         .collect();
+    let more = match active.len().saturating_sub(ACTIVE_SNAPSHOT_LIMIT) {
+        0 => String::new(),
+        n => format!(" (+{n} more: hcom list)"),
+    };
 
-    format!("\nActive (snapshot): {}", parts.join(" | "))
+    format!("\nActive (snapshot): {}{}", parts.join(" | "), more)
 }
 
 fn launch_tool_names() -> String {
@@ -325,6 +326,20 @@ fn get_scripts(hcom_dir: &std::path::Path) -> String {
     )
 }
 
+/// "\n- Launched by: @x" when another agent launched this one; empty for
+/// human/API launches (the launcher records those as api/user) and self.
+fn launched_by_line(launched_by: Option<&str>, instance_name: &str) -> String {
+    match launched_by {
+        Some(name)
+            if !matches!(name, "" | "api" | "user" | "unknown" | SENDER)
+                && name != instance_name =>
+        {
+            format!("\n- Launched by: {}", recipient_token(name))
+        }
+        _ => String::new(),
+    }
+}
+
 // CONTEXT BUILDER
 
 /// All context needed to render bootstrap templates.
@@ -334,67 +349,51 @@ struct BootstrapContext {
     tag: String,
     relay_enabled: bool,
     hcom_cmd: String,
-    is_launched: bool,
     is_headless: bool,
     active_instances: String,
     scripts: String,
     launch_tools: String,
+    launched_by: String,
     notes: String,
 }
 
 /// Build context for template substitution.
-#[allow(clippy::too_many_arguments)]
+///
+/// The instance row is the source of truth for display name and tag: `@tag-`
+/// routing matches the row, so a config tag the row doesn't carry must not be
+/// advertised.
 fn build_context(
     db: &HcomDb,
-    hcom_dir: &std::path::Path,
+    hcom_ctx: &HcomContext,
     instance_name: &str,
-    _tool: &str,
-    headless: bool,
-    is_launched: bool,
-    notes: &str,
-    tag: &str,
     relay_enabled: bool,
-    background_name: Option<&str>,
 ) -> BootstrapContext {
-    // Load instance data for display name + tag override
-    let instance_data = db
-        .iter_instances_full()
-        .ok()
-        .and_then(|instances| instances.into_iter().find(|i| i.name == instance_name));
-
-    let display_name = instance_data
-        .as_ref()
-        .map(get_full_name)
-        .unwrap_or_else(|| instance_name.to_string());
-
-    // Tag: instance-level overrides config-level
-    let effective_tag = instance_data
-        .as_ref()
-        .and_then(|d| d.tag.as_deref())
-        .filter(|t| !t.is_empty())
-        .unwrap_or(tag)
-        .to_string();
-
-    let is_headless = headless || background_name.is_some();
+    let instance = db.get_instance_full(instance_name).ok().flatten();
 
     BootstrapContext {
         instance_name: instance_name.to_string(),
-        display_name,
-        tag: effective_tag,
+        display_name: instance
+            .as_ref()
+            .map(get_full_name)
+            .unwrap_or_else(|| instance_name.to_string()),
+        tag: instance
+            .as_ref()
+            .and_then(|i| i.tag.clone())
+            .unwrap_or_default(),
         relay_enabled,
         hcom_cmd: crate::runtime_env::build_hcom_command(),
-        is_launched,
-        is_headless,
+        is_headless: hcom_ctx.is_background,
         active_instances: get_active_instances(db, instance_name),
-        scripts: get_scripts(hcom_dir),
+        scripts: get_scripts(&hcom_ctx.hcom_dir),
         launch_tools: launch_tool_names(),
-        notes: notes.to_string(),
+        launched_by: launched_by_line(hcom_ctx.launched_by.as_deref(), instance_name),
+        notes: hcom_ctx.notes.clone(),
     }
 }
 
 /// Apply string substitutions on template text.
 /// Replaces {key} patterns with context values, then unescapes {{ → { and }} → }
-/// then unescapes {{ → { and }} → } (template uses {{name}} to produce literal {name}).
+/// (template uses {{name}} to produce literal {name}).
 fn render_template(template: &str, ctx: &BootstrapContext) -> String {
     template
         .replace("{display_name}", &ctx.display_name)
@@ -405,6 +404,7 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{active_instances}", &ctx.active_instances)
         .replace("{scripts}", &ctx.scripts)
         .replace("{launch_tools}", &ctx.launch_tools)
+        .replace("{launched_by}", &ctx.launched_by)
         .replace("{target_name_s}", &recipient_token("name(s)"))
         .replace("{target_luna}", &recipient_token("luna"))
         .replace("{target_nova}", &recipient_token("nova"))
@@ -413,46 +413,72 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("}}", "}")
 }
 
+static HCOM_WORD: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\bhcom\b").expect("valid regex"));
+
+/// Rewrite bare `hcom` command references to the alternate command (e.g.
+/// `uvx hcom`), leaving the identity marker and `<hcom>` tags untouched.
+fn rewrite_hcom_command(text: &str, hcom_cmd: &str) -> String {
+    const COMMAND: &str = "__HCOM_CMD__";
+    const MARKER: &str = "__HCOM_IDENTITY_MARKER__";
+    const OPEN_TAG: &str = "__HCOM_OPEN_TAG__";
+    const CLOSE_TAG: &str = "__HCOM_CLOSE_TAG__";
+    let protected = text
+        .replace(hcom_cmd, COMMAND)
+        .replace("[hcom:", MARKER)
+        .replace("<hcom>", OPEN_TAG)
+        .replace("</hcom>", CLOSE_TAG);
+    HCOM_WORD
+        .replace_all(&protected, hcom_cmd)
+        .replace(COMMAND, hcom_cmd)
+        .replace(MARKER, "[hcom:")
+        .replace(OPEN_TAG, "<hcom>")
+        .replace(CLOSE_TAG, "</hcom>")
+}
+
+/// Extra delivery guidance for tools whose hooks wake the agent with a bare
+/// `<hcom>` prompt. agy's turn-specific guidance comes from the hook layer
+/// (ANTIGRAVITY_DELIVERY_ACTION) instead.
+fn tool_delivery_section(tool: Tool) -> Option<&'static str> {
+    match tool {
+        Tool::Cursor => Some(CURSOR_DELIVERY),
+        Tool::Copilot => Some(COPILOT_DELIVERY),
+        _ => None,
+    }
+}
+
 // PUBLIC API
 
 /// Build bootstrap text for an instance.
 ///
-/// Args:
-///   db: Database handle for reading active instances and instance data
-///   hcom_dir: Path to hcom data directory (for scripts discovery)
-///   instance_name: The instance name (as stored in DB)
-///   tool: canonical integration name, or "adhoc"
-///   headless: Whether running in headless/background mode
-///   is_launched: Whether instance was launched by hcom
-///   notes: User notes (from HCOM_NOTES env var or config)
-///   tag: Tag from config (instance-level tag overrides this)
-///   relay_enabled: Whether relay is configured and enabled
-///   background_name: Background log name (if headless via HCOM_BACKGROUND)
-#[allow(clippy::too_many_arguments)]
+/// `hcom_ctx` is the environment of the agent being bootstrapped (hook or
+/// `hcom start` process, or the launch env for codex). `tool` is the
+/// canonical integration name, or "adhoc".
 pub fn get_bootstrap(
     db: &HcomDb,
-    hcom_dir: &std::path::Path,
+    hcom_ctx: &HcomContext,
     instance_name: &str,
     tool: &str,
-    headless: bool,
-    is_launched: bool,
-    notes: &str,
-    tag: &str,
-    relay_enabled: bool,
-    background_name: Option<&str>,
 ) -> String {
-    let ctx = build_context(
+    let config = crate::config::HcomConfig::load(None).unwrap_or_default();
+    render_bootstrap(
         db,
-        hcom_dir,
+        hcom_ctx,
         instance_name,
         tool,
-        headless,
-        is_launched,
-        notes,
-        tag,
-        relay_enabled,
-        background_name,
-    );
+        crate::relay::is_relay_enabled(&config),
+    )
+}
+
+fn render_bootstrap(
+    db: &HcomDb,
+    hcom_ctx: &HcomContext,
+    instance_name: &str,
+    tool: &str,
+    relay_enabled: bool,
+) -> String {
+    let ctx = build_context(db, hcom_ctx, instance_name, relay_enabled);
+    let tool = tool.parse::<Tool>().unwrap_or(Tool::Adhoc);
 
     let mut parts: Vec<&str> = vec![UNIVERSAL];
 
@@ -470,40 +496,19 @@ pub fn get_bootstrap(
         parts.push(UVX_CMD_NOTICE);
     }
 
-    // Tool-specific delivery. cursor adds wake-trigger guidance; antigravity
-    // shares the auto-delivery section and gets its turn-specific
-    // ANTIGRAVITY_DELIVERY_ACTION preamble from the hook layer.
-    if tool == "cursor" && ctx.is_launched {
+    // Every integration delivers automatically when launched through hcom;
+    // anything else (plain `hcom start`) has to poll with `hcom listen`.
+    if hcom_ctx.is_launched && tool != Tool::Adhoc {
         parts.push(DELIVERY_AUTO);
-        parts.push(CURSOR_DELIVERY);
-    } else if tool == "copilot" && ctx.is_launched {
-        parts.push(DELIVERY_AUTO);
-        parts.push(COPILOT_DELIVERY);
-    } else if ctx.is_launched
-        && matches!(
-            tool,
-            "claude"
-                | "codex"
-                | "gemini"
-                | "opencode"
-                | "kilo"
-                | "antigravity"
-                | "kimi"
-                | "pi"
-                | "omp"
-        )
-    {
-        parts.push(DELIVERY_AUTO);
+        parts.extend(tool_delivery_section(tool));
     } else {
         parts.push(DELIVERY_ADHOC);
     }
 
-    // Claude subagent info
-    if tool == "claude" {
+    if tool == Tool::Claude {
         parts.push(CLAUDE_ONLY);
     }
 
-    // Join and substitute
     let joined = parts
         .iter()
         .map(|p| p.trim_matches('\n'))
@@ -517,26 +522,8 @@ pub fn get_bootstrap(
         result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
     }
 
-    // Rewrite hcom references if using alternate command
     if ctx.hcom_cmd != "hcom" {
-        let command_sentinel = "__HCOM_CMD__";
-        let marker_sentinel = "__HCOM_IDENTITY_MARKER__";
-        let open_tag_sentinel = "__HCOM_OPEN_TAG__";
-        let close_tag_sentinel = "__HCOM_CLOSE_TAG__";
-        result = result
-            .replace(&ctx.hcom_cmd, command_sentinel)
-            .replace("[hcom:", marker_sentinel)
-            .replace("<hcom>", open_tag_sentinel)
-            .replace("</hcom>", close_tag_sentinel);
-        result = regex::Regex::new(r"\bhcom\b")
-            .unwrap()
-            .replace_all(&result, &ctx.hcom_cmd)
-            .to_string();
-        result = result
-            .replace(command_sentinel, &ctx.hcom_cmd)
-            .replace(marker_sentinel, "[hcom:")
-            .replace(open_tag_sentinel, "<hcom>")
-            .replace(close_tag_sentinel, "</hcom>");
+        result = rewrite_hcom_command(&result, &ctx.hcom_cmd);
     }
 
     format!(
@@ -552,7 +539,6 @@ pub fn get_subagent_bootstrap(subagent_name: &str, parent_name: &str) -> String 
     let result = SUBAGENT_BOOTSTRAP
         .replace("{subagent_name}", subagent_name)
         .replace("{parent_name}", parent_name)
-        .replace("{target_parent}", &recipient_token(parent_name))
         .replace("{target_name_s}", &recipient_token("name(s)"))
         .replace("{target_luna}", &recipient_token("luna"))
         .replace("{target_nova}", &recipient_token("nova"))
@@ -667,158 +653,171 @@ mod tests {
     }
 
     #[test]
+    fn test_get_active_instances_skips_subagents_and_inactive() {
+        let (_tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "claude", None);
+        insert_instance(&db, "luna_task_1", "active", "claude", None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET agent_id = 'agent-1' WHERE name = 'luna_task_1'",
+                [],
+            )
+            .unwrap();
+        insert_instance(&db, "gone", "inactive", "codex", None);
+
+        let result = get_active_instances(&db, "other");
+        assert!(result.contains("luna"));
+        assert!(!result.contains("luna_task_1"));
+        assert!(!result.contains("gone"));
+    }
+
+    #[test]
+    fn test_get_active_instances_reports_overflow() {
+        let (_tmp, db) = setup_test_db();
+        for i in 0..ACTIVE_SNAPSHOT_LIMIT + 2 {
+            insert_instance(&db, &format!("ag{i:02}"), "active", "claude", None);
+        }
+
+        let result = get_active_instances(&db, "other");
+        assert!(result.ends_with(" (+2 more: hcom list)"), "{result}");
+    }
+
+    /// Context of the agent being bootstrapped, as its hook/start process sees it.
+    fn test_ctx(
+        hcom_dir: &std::path::Path,
+        launched: bool,
+        background: Option<&str>,
+        notes: &str,
+        launched_by: Option<&str>,
+    ) -> HcomContext {
+        let mut env = HashMap::from([(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().into_owned(),
+        )]);
+        if launched {
+            env.insert("HCOM_LAUNCHED".into(), "1".into());
+        }
+        if let Some(bg) = background {
+            env.insert("HCOM_BACKGROUND".into(), bg.into());
+        }
+        if !notes.is_empty() {
+            env.insert("HCOM_NOTES".into(), notes.into());
+        }
+        if let Some(by) = launched_by {
+            env.insert("HCOM_LAUNCHED_BY".into(), by.into());
+        }
+        HcomContext::from_env(&env, hcom_dir.to_path_buf())
+    }
+
+    /// Render for a launched, foreground agent named luna.
+    fn render(db: &HcomDb, hcom_dir: &std::path::Path, tool: &str) -> String {
+        render_bootstrap(
+            db,
+            &test_ctx(hcom_dir, true, None, "", None),
+            "luna",
+            tool,
+            false,
+        )
+    }
+
+    #[test]
     fn test_get_bootstrap_claude() {
         let (tmp, db) = setup_test_db();
+        let result = render(&db, tmp.path(), "claude");
 
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("<hcom_system_context>"));
-        assert!(result.contains("[HCOM SESSION]"));
+        assert!(result.starts_with("<hcom_system_context>"));
         assert!(result.contains("Your name: luna"));
         assert!(result.contains("--name luna"));
-        assert!(result.contains("SUBAGENTS")); // Claude-specific section
-        assert!(result.contains("Messages instantly and automatically arrive")); // Auto delivery
-        assert!(!result.contains("Headless mode")); // Not headless
-        assert!(result.contains("</hcom_system_context>"));
+        assert!(result.contains("SUBAGENTS"));
+        assert!(!result.contains("Headless mode"));
+        assert!(!result.contains("{{name}}"));
+        assert!(result.contains("{name}"));
+        assert!(result.ends_with("</hcom_system_context>"));
+    }
+
+    /// Every integration launched through hcom gets automatic delivery; the
+    /// same tool without a launch, or a plain `hcom start`, polls.
+    #[test]
+    fn test_delivery_section_follows_launch_state() {
+        let (tmp, db) = setup_test_db();
+        for spec in crate::integration_spec::ALL {
+            let launched = render(&db, tmp.path(), spec.name);
+            let unlaunched = render_bootstrap(
+                &db,
+                &test_ctx(tmp.path(), false, None, "", None),
+                "luna",
+                spec.name,
+                false,
+            );
+            assert!(
+                unlaunched.contains("Messages do NOT arrive automatically"),
+                "{}",
+                spec.name
+            );
+            let auto = launched.contains("Messages instantly and automatically arrive");
+            assert_eq!(auto, spec.tool != Tool::Adhoc, "{}", spec.name);
+            assert_eq!(
+                launched.contains("SUBAGENTS"),
+                spec.tool == Tool::Claude,
+                "{}",
+                spec.name
+            );
+        }
+
+        let cursor = render(&db, tmp.path(), "cursor");
+        assert!(cursor.contains("CURSOR DELIVERY"));
+        let copilot = render(&db, tmp.path(), "copilot");
+        assert!(copilot.contains("COPILOT DELIVERY"));
     }
 
     #[test]
-    fn test_get_bootstrap_codex_launched() {
+    fn test_get_bootstrap_shows_instance_tag() {
         let (tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "claude", Some("p0c"));
 
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "codex",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
-        assert!(!result.contains("SUBAGENTS")); // Not claude
-    }
-
-    #[test]
-    fn test_get_bootstrap_adhoc() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "kira",
-            "adhoc",
-            false,
-            false,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages do NOT arrive automatically"));
-        assert!(result.contains("CONNECTED MODE"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_with_tag() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "p0c",
-            false,
-            None,
-        );
-
+        let result = render(&db, tmp.path(), "claude");
+        assert!(result.contains("Your name: p0c-luna"));
         assert!(result.contains("tagged 'p0c'"));
         if cfg!(windows) {
-            assert!(result.contains("send '@p0c-'"));
+            assert!(result.contains("send '@p0c-' -- msg"));
         } else {
-            assert!(result.contains("send @p0c-"));
+            assert!(result.contains("send @p0c- -- msg"));
         }
+    }
+
+    #[test]
+    fn test_get_bootstrap_untagged_instance_has_no_tag_notice() {
+        let (tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "adhoc", None);
+
+        let result = render(&db, tmp.path(), "adhoc");
+        assert!(!result.contains("tagged"));
     }
 
     #[test]
     fn test_get_bootstrap_with_relay() {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            true,
-            None,
+        let ctx = test_ctx(tmp.path(), true, None, "", None);
+        assert!(
+            render_bootstrap(&db, &ctx, "luna", "claude", true)
+                .contains("Remote agents have suffix")
         );
-
-        assert!(result.contains("Remote agents have suffix"));
+        assert!(!render_bootstrap(&db, &ctx, "luna", "claude", false).contains("Remote agents"));
     }
 
     #[test]
-    fn test_get_bootstrap_headless() {
+    fn test_get_bootstrap_background_is_headless() {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            true,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Headless mode"));
+        let ctx = test_ctx(tmp.path(), true, Some("agent.log"), "", None);
+        assert!(render_bootstrap(&db, &ctx, "luna", "claude", false).contains("Headless mode"));
     }
 
     #[test]
     fn test_get_bootstrap_with_notes() {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "Remember to use bun",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("## NOTES"));
-        assert!(result.contains("Remember to use bun"));
+        let ctx = test_ctx(tmp.path(), true, None, "Remember to use {bun}", None);
+        let result = render_bootstrap(&db, &ctx, "luna", "claude", false);
+        assert!(result.contains("## NOTES\n\nRemember to use {bun}"));
     }
 
     #[test]
@@ -832,102 +831,58 @@ mod tests {
         assert!(result.contains(SENDER));
         assert!(result.contains("</hcom>"));
         if cfg!(windows) {
-            assert!(result.contains("send '@luna' --intent inform"));
             assert!(result.contains("send '@name(s)'"));
         } else {
-            assert!(result.contains("send @luna --intent inform"));
             assert!(result.contains("send @name(s)"));
+        }
+    }
+
+    fn bootstrap_launched_by(launched_by: Option<&str>) -> String {
+        let (tmp, db) = setup_test_db();
+        let ctx = test_ctx(tmp.path(), true, None, "", launched_by);
+        render_bootstrap(&db, &ctx, "luna", "claude", false)
+    }
+
+    #[test]
+    fn test_get_bootstrap_shows_launching_agent() {
+        let result = bootstrap_launched_by(Some("nova"));
+        if cfg!(windows) {
+            assert!(result.contains("- Launched by: '@nova'"));
+        } else {
+            assert!(result.contains("- Launched by: @nova"));
+        }
+    }
+
+    #[test]
+    fn test_get_bootstrap_omits_non_agent_launcher() {
+        for launcher in [None, Some("api"), Some("user"), Some(SENDER), Some("luna")] {
+            let result = bootstrap_launched_by(launcher);
+            assert!(!result.contains("Launched by"), "launcher={launcher:?}");
+            assert!(!result.contains("{launched_by}"));
         }
     }
 
     #[test]
     fn test_bootstrap_quotes_send_recipients_on_windows() {
         let (tmp, db) = setup_test_db();
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "team",
-            false,
-            None,
-        );
+        let result = render(&db, tmp.path(), "claude");
 
         if cfg!(windows) {
             assert!(result.contains("send '@name(s)'"));
             assert!(result.contains("send '@luna' '@nova'"));
-            assert!(result.contains("send '@team-' -- msg"));
         } else {
             assert!(result.contains("send @name(s)"));
             assert!(result.contains("send @luna @nova"));
-            assert!(result.contains("send @team- -- msg"));
         }
     }
 
     #[test]
-    fn test_render_template_replaces_all() {
-        let ctx = BootstrapContext {
-            instance_name: "luna".to_string(),
-            display_name: "p0c-luna".to_string(),
-            tag: "p0c".to_string(),
-            relay_enabled: false,
-            hcom_cmd: "hcom".to_string(),
-            is_launched: true,
-            is_headless: false,
-            active_instances: String::new(),
-            scripts: "Scripts: clone".to_string(),
-            launch_tools: launch_tool_names(),
-            notes: String::new(),
-        };
-
-        let result = render_template("Name: {display_name}, Instance: {instance_name}", &ctx);
-        assert_eq!(result, "Name: p0c-luna, Instance: luna");
-    }
-
-    #[test]
-    fn test_get_bootstrap_antigravity_launched_gets_auto_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "bono",
-            "antigravity",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
+    fn test_rewrite_hcom_command_keeps_marker_and_tags() {
+        let text = "run `hcom list`, marker [hcom:luna], <hcom>x</hcom>, already uvx hcom send";
+        assert_eq!(
+            rewrite_hcom_command(text, "uvx hcom"),
+            "run `uvx hcom list`, marker [hcom:luna], <hcom>x</hcom>, already uvx hcom send"
         );
-
-        // agy uses the same auto-delivery section as the other managed tools.
-        assert!(result.contains("Messages instantly and automatically arrive"));
-        assert!(result.contains("hcom <command> --help"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_omp_launched_gets_auto_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "omp",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
-        assert!(!result.contains("Messages do NOT arrive automatically"));
     }
 
     #[test]
@@ -937,215 +892,6 @@ mod tests {
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("HCOM MESSAGE"));
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("ACK alone does not complete"));
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("no turn is auto-created"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_gemini_launched_gets_auto_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "gemini",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_gemini_not_launched_gets_adhoc_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "gemini",
-            false,
-            false,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages do NOT arrive automatically"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_opencode_launched_gets_auto_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "opencode",
-            false,
-            true, // is_launched
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_opencode_vanilla_gets_adhoc_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "opencode",
-            false,
-            false, // not launched
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages do NOT arrive automatically"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_kilo_launched_gets_auto_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "kilo",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_cursor_launched_gets_hook_primary_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "cursor",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("CURSOR DELIVERY"));
-        assert!(result.contains("wake trigger"));
-        assert!(result.contains("End your turn immediately"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_background_is_headless() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            Some("agent.log"),
-        );
-
-        assert!(result.contains("Headless mode"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_instance_tag_overrides_config() {
-        let (tmp, db) = setup_test_db();
-        insert_instance(&db, "luna", "active", "claude", Some("team-a"));
-
-        // Config tag is "team-b" but instance has "team-a"
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "team-b",
-            false,
-            None,
-        );
-
-        assert!(result.contains("tagged 'team-a'"));
-        assert!(!result.contains("team-b"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_display_name_with_tag() {
-        let (tmp, db) = setup_test_db();
-        insert_instance(&db, "luna", "active", "claude", Some("p0c"));
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Your name: p0c-luna"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_unescapes_double_braces() {
-        // Template uses {{name}} {{status}} (escaped braces).
-        // render_template unescapes to {name} {status} in final output.
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("{name}"));
-        assert!(!result.contains("{{name}}"));
     }
 
     /// Catch drift between scripts::SCRIPTS const and actual files in scripts/bundled/.

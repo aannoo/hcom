@@ -1054,21 +1054,10 @@ fn bind_lineage_owner(
 }
 
 fn bootstrap_for_existing_owner(db: &HcomDb, ctx: &HcomContext, owner: &str) -> (i32, String) {
-    let Some(instance) = db.get_instance_full(owner).ok().flatten() else {
+    if db.get_instance_full(owner).ok().flatten().is_none() {
         return (0, String::new());
-    };
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        owner,
-        "claude",
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        instance.tag.as_deref().unwrap_or(""),
-        false,
-        ctx.background_name.as_deref(),
-    );
+    }
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, owner, "claude");
     let output = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -1105,20 +1094,8 @@ fn handle_compact_recovery(
         .flatten()
         .or_else(|| instance_binding::resolve_process_binding(db, Some(process_id)))?;
 
-    let inst = db.get_instance_full(&instance_name).ok()??;
-    let tag = inst.tag.as_deref().unwrap_or("");
-    let bootstrap = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        &instance_name,
-        "claude",
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        tag,
-        false,
-        ctx.background_name.as_deref(),
-    );
+    db.get_instance_full(&instance_name).ok()??;
+    let bootstrap = bootstrap::get_bootstrap(db, ctx, &instance_name, "claude");
 
     Some(serde_json::json!({
         "hookSpecificOutput": {
@@ -1183,19 +1160,7 @@ fn bind_and_bootstrap(
     crate::runtime_env::set_terminal_title(&instance_name);
 
     let is_resume = instance.name_announced != 0;
-    let tag = instance.tag.as_deref().unwrap_or("");
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        &instance_name,
-        "claude",
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        tag,
-        false,
-        ctx.background_name.as_deref(),
-    );
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &instance_name, "claude");
 
     let result = serde_json::json!({
         "hookSpecificOutput": {

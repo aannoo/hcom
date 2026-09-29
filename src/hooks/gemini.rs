@@ -260,20 +260,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         if let Some(inst) = instance.as_ref()
             && bootstrap::is_antigravity_tool(&inst.tool)
         {
-            let tag = inst.tag.as_deref().unwrap_or("");
-            let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-            let recurring = bootstrap::get_bootstrap(
-                db,
-                &ctx.hcom_dir,
-                &instance_name,
-                &inst.tool,
-                ctx.is_background,
-                ctx.is_launched,
-                &ctx.notes,
-                tag,
-                crate::relay::is_relay_enabled(&hcom_config),
-                ctx.background_name.as_deref(),
-            );
+            let recurring = bootstrap::get_bootstrap(db, ctx, &instance_name, &inst.tool);
             return HookResult::Allow {
                 additional_context: Some(recurring),
                 system_message: None,

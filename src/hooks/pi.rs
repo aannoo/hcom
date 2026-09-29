@@ -61,31 +61,7 @@ fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
 }
 
 fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String {
-    let tag = db
-        .get_instance_full(instance_name)
-        .ok()
-        .flatten()
-        .and_then(|d| d.tag.clone())
-        .unwrap_or_default();
-    let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-    let relay_enabled = crate::relay::is_relay_enabled(&hcom_config);
-    let effective_tag = if tag.is_empty() {
-        &hcom_config.tag
-    } else {
-        &tag
-    };
-    bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        instance_name,
-        "pi",
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        effective_tag,
-        relay_enabled,
-        ctx.background_name.as_deref(),
-    )
+    bootstrap::get_bootstrap(db, ctx, instance_name, "pi")
 }
 
 fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {

@@ -336,25 +336,16 @@ fn build_codex_bootstrap(
     instance_name: &str,
     background: bool,
     instance_env: &HashMap<String, String>,
-    tag: &str,
-    relay_enabled: bool,
 ) -> String {
-    let notes = instance_env
-        .get("HCOM_NOTES")
-        .map(String::as_str)
-        .unwrap_or("");
-    crate::bootstrap::get_bootstrap(
-        db,
-        hcom_dir,
-        instance_name,
-        "codex",
-        background,
-        true,
-        notes,
-        tag,
-        relay_enabled,
-        None,
-    )
+    // Codex takes its bootstrap at launch, so render it from the env the
+    // instance will run with. HCOM_BACKGROUND is only added to the runner env
+    // later, hence the explicit override.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut ctx = crate::shared::HcomContext::from_env(instance_env, cwd);
+    ctx.hcom_dir = hcom_dir.to_path_buf();
+    ctx.is_launched = true;
+    ctx.is_background = background;
+    crate::bootstrap::get_bootstrap(db, &ctx, instance_name, "codex")
 }
 
 fn build_launch_env_with_resolver<F>(
@@ -2134,8 +2125,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         params.background,
                         &instance_env,
-                        &effective_tag,
-                        hcom_config.relay_enabled,
                     );
 
                     let sandbox_mode = instance_env
@@ -3093,15 +3082,7 @@ mod tests {
             "instance-specific notes".to_string(),
         )]);
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &instance_env,
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
         assert!(bootstrap.contains("## NOTES"));
         assert!(bootstrap.contains("instance-specific notes"));
@@ -3112,15 +3093,7 @@ mod tests {
         let db = launcher_test_db();
         let hcom_dir = tempfile::tempdir().unwrap();
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &HashMap::new(),
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &HashMap::new());
 
         assert!(!bootstrap.contains("## NOTES"));
     }
@@ -3134,15 +3107,7 @@ mod tests {
         let hcom_dir = tempfile::tempdir().unwrap();
         let instance_env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &instance_env,
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
         assert!(!bootstrap.contains("## NOTES"));
     }
@@ -3197,15 +3162,7 @@ mod tests {
             "Use \"review mode\".\nWindows path: C:\\work\\repo\n{literal braces}\nSecond line";
         let instance_env = HashMap::from([("HCOM_NOTES".to_string(), notes.to_string())]);
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &instance_env,
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
         let args =
             crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");

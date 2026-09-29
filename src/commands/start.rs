@@ -15,7 +15,6 @@ use std::path::PathBuf;
 
 use crate::bootstrap;
 use crate::claude_actor;
-use crate::config::HcomConfig;
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
 use crate::instance_binding;
@@ -25,7 +24,6 @@ use crate::instances;
 use crate::log::log_info;
 use crate::paths;
 use crate::pidtrack;
-use crate::relay;
 use crate::router::GlobalFlags;
 use crate::shared::constants::ST_ACTIVE;
 use crate::shared::context::HcomContext;
@@ -149,7 +147,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         .as_ref()
         .map(|actor| actor.name.as_str())
         .or(requested_name.as_deref());
-    start_bare(&db, &hcom_dir, &ctx, effective_name)
+    start_bare(&db, &ctx, effective_name)
 }
 
 /// Resolve a live child row directly by agent_id (or by its exact row name).
@@ -368,8 +366,6 @@ fn start_rebind(
     ctx: &HcomContext,
     explicit_name: Option<&str>,
 ) -> Result<i32> {
-    let hcom_dir = paths::hcom_dir();
-
     // Resolve the target name
     let target_name = identity::resolve_display_name_or_stopped(db, rebind_target)
         .unwrap_or_else(|| rebind_target.to_string());
@@ -549,24 +545,7 @@ fn start_rebind(
     crate::runtime_env::set_terminal_title(&target_name);
 
     // Print bootstrap
-    let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {
-        let mut c = HcomConfig::default();
-        c.normalize();
-        c
-    });
-
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &hcom_dir,
-        &target_name,
-        tool,
-        false,
-        ctx.is_launched,
-        &ctx.notes,
-        &hcom_config.tag,
-        relay::is_relay_enabled(&hcom_config),
-        None,
-    );
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &target_name, tool);
 
     println!("[hcom:{}]", target_name);
     println!("{}", bootstrap_text);
@@ -702,12 +681,7 @@ fn resolve_native_session_id(ctx: &HcomContext) -> Option<String> {
 }
 
 /// Path C: Bare start — detect tool or create adhoc instance.
-fn start_bare(
-    db: &HcomDb,
-    hcom_dir: &std::path::Path,
-    ctx: &HcomContext,
-    explicit_name: Option<&str>,
-) -> Result<i32> {
+fn start_bare(db: &HcomDb, ctx: &HcomContext, explicit_name: Option<&str>) -> Result<i32> {
     let explicit_name = explicit_name
         .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
@@ -763,7 +737,7 @@ fn start_bare(
             if ctx.tool == crate::tool::Tool::Claude {
                 db.mark_claude_session_validated(session_id, &bound)?;
             }
-            print_bootstrap(db, hcom_dir, ctx, &bound, &owner.tool);
+            print_bootstrap(db, ctx, &bound, &owner.tool);
             db.log_event(
                 "life",
                 &bound,
@@ -839,7 +813,7 @@ fn start_bare(
         eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
-    print_bootstrap(db, hcom_dir, ctx, &name, tool);
+    print_bootstrap(db, ctx, &name, tool);
 
     // Log
     db.log_event(
@@ -856,32 +830,8 @@ fn start_bare(
     Ok(0)
 }
 
-fn print_bootstrap(
-    db: &HcomDb,
-    hcom_dir: &std::path::Path,
-    ctx: &HcomContext,
-    name: &str,
-    tool: &str,
-) {
-    let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
-        eprintln!("[hcom] warn: config load failed, using defaults: {e}");
-        let mut c = HcomConfig::default();
-        c.normalize();
-        c
-    });
-
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        hcom_dir,
-        name,
-        tool,
-        false,
-        ctx.is_launched,
-        &ctx.notes,
-        &hcom_config.tag,
-        relay::is_relay_enabled(&hcom_config),
-        None,
-    );
+fn print_bootstrap(db: &HcomDb, ctx: &HcomContext, name: &str, tool: &str) {
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, name, tool);
 
     println!("[hcom:{}]", name);
     println!("{}", bootstrap_text);
@@ -1050,13 +1000,13 @@ mod tests {
     #[test]
     #[serial]
     fn manual_tools_without_native_identity_start_as_adhoc() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         for tool in ["gemini", "antigravity", "claude", "codex", "pi"] {
             let env = HashMap::from([("HCOM_TOOL".to_string(), tool.to_string())]);
             let mut ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
             ctx.tool = tool.parse().unwrap();
-            assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+            assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
         }
         let rows = db.iter_instances_full().unwrap();
         assert_eq!(rows.len(), 5);
@@ -1069,7 +1019,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_plain_claude_start_joins_adhoc_without_installing_hooks() {
-        let (_dir, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
 
         // Claude is per-run: a direct `claude` run joins as adhoc without
@@ -1078,9 +1028,9 @@ mod tests {
             Some(("CLAUDE_CODE_SESSION_ID", "sess-plain")),
             "/tmp/project",
         );
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
 
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
         let rows = db.iter_instances_full().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "adhoc");
@@ -1095,12 +1045,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_plain_codex_start_reuses_adhoc_identity() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         let env = HashMap::from([("CODEX_THREAD_ID".to_string(), "thread-plain".to_string())]);
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
         let rows = db.iter_instances_full().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "adhoc");
@@ -1110,7 +1060,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_start_never_takes_over_a_live_process_binding() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         let launched_ctx = |session: Option<&str>| {
             let mut env = HashMap::from([
@@ -1124,21 +1074,18 @@ mod tests {
             HcomContext::from_env(&env, PathBuf::from("/tmp/project"))
         };
         assert_eq!(
-            start_bare(&db, &hcom_dir, &launched_ctx(Some("sess-parent")), None).unwrap(),
+            start_bare(&db, &launched_ctx(Some("sess-parent")), None).unwrap(),
             0
         );
         let parent = db.get_process_binding("pid-parent").unwrap().unwrap();
 
         // The parent's own shell without a session var: still the parent.
-        assert_eq!(
-            start_bare(&db, &hcom_dir, &launched_ctx(None), None).unwrap(),
-            0
-        );
+        assert_eq!(start_bare(&db, &launched_ctx(None), None).unwrap(), 0);
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
 
         // Another session carrying the same process id never repoints it.
         assert_eq!(
-            start_bare(&db, &hcom_dir, &launched_ctx(Some("sess-other")), None).unwrap(),
+            start_bare(&db, &launched_ctx(Some("sess-other")), None).unwrap(),
             0
         );
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
@@ -1151,7 +1098,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_start_binds_session_to_launched_placeholder() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         // Launcher pre-registered the process; SessionStart has not bound it.
         instance_binding::initialize_instance_in_position_file(
@@ -1182,7 +1129,7 @@ mod tests {
             ),
         ]);
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp/project"));
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
 
         assert_eq!(
             db.get_session_binding("sess-late").unwrap().as_deref(),
@@ -1372,14 +1319,14 @@ mod tests {
     fn test_plain_claude_rebind_moves_session_binding_to_target() {
         // Targets are longer than generated names (4-letter CVCV), so the
         // bare start's random identity can never collide with them.
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         let ctx = make_claude_ctx(
             Some(("CLAUDE_CODE_SESSION_ID", "sess-plain")),
             "/tmp/project",
         );
 
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
         let first = db.get_session_binding("sess-plain").unwrap().unwrap();
 
         assert_eq!(start_rebind(&db, "rebound", &ctx, None).unwrap(), 0);
@@ -1414,7 +1361,7 @@ mod tests {
 
         // A later bare start returns the rebound identity, and the adhoc
         // identity can be reclaimed again from the same plain Claude.
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
         assert_eq!(start_rebind(&db, "rebound", &ctx, None).unwrap(), 0);
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
@@ -1467,14 +1414,14 @@ mod tests {
     #[test]
     #[serial]
     fn rebind_renames_the_pane_to_the_reclaimed_name() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
 
         let ctx = make_claude_ctx(
             Some(("CLAUDE_CODE_SESSION_ID", "sess-title")),
             "/tmp/project",
         );
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
 
         let _ = crate::runtime_env::take_last_terminal_title();
         assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);

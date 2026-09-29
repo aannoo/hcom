@@ -642,22 +642,7 @@ pub fn inject_bootstrap_once(
         return None;
     }
 
-    let tag = instance_data.tag.as_deref().unwrap_or("");
-    let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-    let relay_enabled = crate::relay::is_relay_enabled(&hcom_config);
-
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        instance_name,
-        tool,
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        tag,
-        relay_enabled,
-        ctx.background_name.as_deref(),
-    );
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, instance_name, tool);
 
     // Mark as announced
     let mut updates = serde_json::Map::new();
