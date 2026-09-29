@@ -885,6 +885,24 @@ fn apply_bind(
     name
 }
 
+/// Report a pending launch as blocked. `drive_launch_outcome` clears it to
+/// ready once the cause goes away.
+fn block_launch(
+    db: &HcomDb,
+    state: &DeliveryState,
+    name: &str,
+    outcome: &mut LaunchOutcome,
+    reason: &str,
+    detail: &str,
+) {
+    if !outcome.is_pending() {
+        return;
+    }
+    let _ = db.set_status(name, ST_BLOCKED, "launch_blocked");
+    let _ = db.emit_launch_blocked_event(name, ST_BLOCKED, "launch_blocked", reason, detail);
+    super::mark_launch_phase_complete(state, outcome, LaunchOutcome::Blocked);
+}
+
 fn apply_status(db: &HcomDb, name: &str, status: &Status) {
     match status {
         Status::Prompt => lifecycle::set_status(db, name, ST_ACTIVE, "prompt", Default::default()),
@@ -1004,19 +1022,14 @@ pub(super) fn run(
                         &format!("attempt={connect_failures} retry_in={backoff:?}: {detail}"),
                     );
                     let _ = db.set_gate_status(current_name, "acp_disconnected", &detail);
-                    if launch_outcome.is_pending() && launched_at.elapsed() >= SETUP_TIMEOUT {
-                        let _ = db.set_status(current_name, ST_BLOCKED, "launch_blocked");
-                        let _ = db.emit_launch_blocked_event(
+                    if launched_at.elapsed() >= SETUP_TIMEOUT {
+                        block_launch(
+                            db,
+                            state,
                             current_name,
-                            ST_BLOCKED,
-                            "launch_blocked",
+                            launch_outcome,
                             "grok_acp_connection",
                             &detail,
-                        );
-                        super::mark_launch_phase_complete(
-                            state,
-                            launch_outcome,
-                            LaunchOutcome::Blocked,
                         );
                     }
                     continue;
@@ -1050,11 +1063,26 @@ pub(super) fn run(
                         Some(Pending::Load(session)) => match value.get("error") {
                             Some(error) => {
                                 load_retry_at = Instant::now() + LOAD_RETRY_DELAY;
+                                let detail = format!("Grok session/load failed: {error}");
                                 log_warn(
                                     "native",
                                     "grok.acp.load_failed",
-                                    &format!("session={session}: {error}"),
-                                )
+                                    &format!("session={session}: {detail}"),
+                                );
+                                // Readiness waits for the bound session to load,
+                                // so one that never loads would stay pending.
+                                if tracker.bound.as_deref() == Some(session.as_str())
+                                    && launched_at.elapsed() >= SETUP_TIMEOUT
+                                {
+                                    block_launch(
+                                        db,
+                                        state,
+                                        current_name,
+                                        launch_outcome,
+                                        "grok_session_load",
+                                        &detail,
+                                    );
+                                }
                             }
                             None => {
                                 loaded.insert(session);
