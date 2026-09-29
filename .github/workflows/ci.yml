@@ -19,6 +19,13 @@ on:
 permissions:
   contents: read
 
+# A new push to a branch supersedes its in-flight run; main keeps every run so
+# each commit there gets a verdict. Dispatched repeat hunts get their own group
+# so a push never cancels one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
@@ -31,7 +38,7 @@ jobs:
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
@@ -45,7 +52,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.88
         with:
           toolchain: "1.88"
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --locked --all-targets
 
   # Native Windows test gate. Release artifacts are built by cargo-dist on tags;
@@ -61,7 +68,7 @@ jobs:
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --all-targets --locked
@@ -74,9 +81,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22.23.1
+          node-version: 22.23.3
           cache: npm
       - run: bash ./scripts/typecheck.sh
 
@@ -108,37 +115,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `install` is the tool name install-mock-tools resolves against
+        # scripts/mock-tools.pins; the relay test drives a real claude.
         include:
-          - os: ubuntu-24.04
-            tool: codex
-            package: "@openai/codex@0.145.0"
-            cache: codex-0.145.0
-            test: real_tool_codex
-          - os: ubuntu-latest
-            tool: claude
-            package: "@anthropic-ai/claude-code@2.1.216"
-            cache: claude-2.1.216
-            test: real_tool_claude
-          - os: ubuntu-latest
-            tool: relay
-            package: "@anthropic-ai/claude-code@2.1.216"
-            cache: relay-claude-2.1.216
-            test: test_relay_roundtrip
-          - os: windows-latest
-            tool: codex
-            package: "@openai/codex@0.145.0"
-            cache: codex-0.145.0
-            test: real_tool_codex
-          - os: windows-latest
-            tool: claude
-            package: "@anthropic-ai/claude-code@2.1.216"
-            cache: claude-2.1.216
-            test: real_tool_claude
-          - os: windows-latest
-            tool: relay
-            package: "@anthropic-ai/claude-code@2.1.216"
-            cache: relay-claude-2.1.216
-            test: test_relay_roundtrip
+          - { os: ubuntu-24.04, tool: codex, install: codex, test: real_tool_codex }
+          - { os: ubuntu-latest, tool: claude, install: claude, test: real_tool_claude }
+          - { os: ubuntu-latest, tool: relay, install: claude, test: test_relay_roundtrip }
+          - { os: windows-latest, tool: codex, install: codex, test: real_tool_codex }
+          - { os: windows-latest, tool: claude, install: claude, test: real_tool_claude }
+          - { os: windows-latest, tool: relay, install: claude, test: test_relay_roundtrip }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -146,9 +131,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
         with:
           toolchain: "1.97.1"
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22.23.1
+          node-version: 22.23.3
       - name: Configure Codex Linux sandbox
         if: runner.os == 'Linux' && matrix.tool == 'codex'
         run: |
@@ -158,16 +143,16 @@ jobs:
             /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
             /etc/apparmor.d/bwrap-userns-restrict
           sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             target/mock-tools
             target/npm-cache
-          key: ${{ runner.os }}-mock-tools-${{ matrix.cache }}
+          key: ${{ runner.os }}-mock-tools-${{ matrix.tool }}-${{ hashFiles('scripts/mock-tools.pins') }}
       - name: Install pinned tool (Unix)
         if: runner.os != 'Windows'
-        run: ./scripts/install-mock-tools.sh '${{ matrix.package }}'
+        run: ./scripts/install-mock-tools.sh '${{ matrix.install }}'
       - name: Add pinned tool to PATH (Unix)
         if: runner.os != 'Windows'
         run: echo "$PWD/target/mock-tools/bin" >> "$GITHUB_PATH"
@@ -177,7 +162,7 @@ jobs:
       - name: Install pinned tool (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/install-mock-tools.ps1 '${{ matrix.package }}'
+        run: ./scripts/install-mock-tools.ps1 '${{ matrix.install }}'
       - name: Add pinned tool to PATH (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -190,6 +175,8 @@ jobs:
       # took the runner out from under it".
       - shell: bash
         if: runner.os != 'Windows'
+        env:
+          HCOM_TEST_KEEP_DIR: ${{ runner.temp }}/hcom-real-tool
         run: |
           for i in $(seq 1 "${{ inputs.repeat || 1 }}"); do
             echo "::group::${{ matrix.test }} attempt $i"
@@ -209,6 +196,8 @@ jobs:
           done
       - shell: pwsh
         if: runner.os == 'Windows'
+        env:
+          HCOM_TEST_KEEP_DIR: ${{ runner.temp }}/hcom-real-tool
         run: |
           foreach ($i in 1..${{ inputs.repeat || 1 }}) {
             Write-Host "::group::${{ matrix.test }} attempt $i"
@@ -223,3 +212,15 @@ jobs:
               exit $code
             }
           }
+      # Only failed tests leave a directory behind (hcom state + logs, Claude
+      # debug log, workspace, launch scripts). The log dump alone could not
+      # tell a slow Windows Bash tool from a hung one.
+      - name: Upload failed test directories
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failed-${{ matrix.test }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/hcom-real-tool
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14

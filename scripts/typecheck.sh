@@ -37,11 +37,20 @@ else
 fi
 
 cd "$project_root"
+# `npm ci`, never `npm install`: it installs exactly the lockfile and never
+# writes it. `npm install` rewrote package-lock.json in the format of
+# whichever npm ran it (npm versions disagree on recording `libc` fields),
+# leaving the checkout dirty after every local check.
 if [[ "${CI:-}" == "true" ]]; then
   npm ci --ignore-scripts
-else
+elif [[ ! node_modules/.package-lock.json -nt package-lock.json \
+  || package.json -nt node_modules/.package-lock.json ]]; then
+  # npm ci wipes node_modules (over a minute here), so locally it runs only
+  # when the manifests changed since the last install, which npm records in
+  # node_modules/.package-lock.json.
+  #
   # CI enforces the pinned Node 22 runtime. Local typechecking can also run on a
   # newer Node even when the user's global npm config enables engine-strict.
-  npm install --ignore-scripts --prefer-offline --engine-strict=false
+  npm ci --ignore-scripts --prefer-offline --engine-strict=false
 fi
 npm run typecheck

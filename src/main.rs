@@ -45,8 +45,26 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    // Hooks of an agent nested under an hcom-launched one must not act as it.
+    // Runs first: every later env reader should see only the child's view.
+    let nested = std::env::args()
+        .nth(1)
+        .and_then(|arg| tool::Tool::from_hook_name(&arg))
+        .and_then(shared::nested::scrub_inherited_identity);
+
     // Initialize global config from environment variables
     config::Config::init();
+
+    if let Some(nested) = nested {
+        log::log_info(
+            "identity",
+            "nested_agent.scrubbed",
+            &format!(
+                "child={} parent={}: ignoring inherited hcom identity",
+                nested.child, nested.parent
+            ),
+        );
+    }
 
     // Set custom panic hook to log to file instead of stderr (prevents TUI corruption)
     panic::set_hook(Box::new(|panic_info| {
@@ -108,23 +126,36 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     let tool_str = &args[0];
 
-    // Windows runner scripts pass tool args via a JSON sidecar file instead of
-    // inline argv (see create_runner_script_windows): the PowerShell →
-    // native-exe boundary corrupts arguments with embedded double quotes.
-    let sidecar_args: Vec<String>;
-    let tool_args: Vec<&str> = if args.get(1).map(String::as_str) == Some("--hcom-args-file") {
-        let Some(path) = args.get(2) else {
-            bail!("--hcom-args-file requires a path");
+    // Generated runners pin the tool resolved from the caller's PATH before
+    // installing their runtime-first PATH. Windows runner scripts additionally
+    // pass tool args via a JSON sidecar because the PowerShell → native-exe
+    // boundary corrupts arguments with embedded double quotes.
+    let mut arg_index = 1;
+    let tool_path = if args.get(arg_index).map(String::as_str) == Some("--hcom-tool-path") {
+        let Some(path) = args.get(arg_index + 1) else {
+            bail!("--hcom-tool-path requires a path");
         };
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read args file {path}"))?;
-        let _ = std::fs::remove_file(path);
-        sidecar_args = serde_json::from_str(&content)
-            .with_context(|| format!("Invalid JSON in args file {path}"))?;
-        sidecar_args.iter().map(|s| s.as_str()).collect()
+        arg_index += 2;
+        Some(path.as_str())
     } else {
-        args[1..].iter().map(|s| s.as_str()).collect()
+        None
     };
+
+    let sidecar_args: Vec<String>;
+    let tool_args: Vec<&str> =
+        if args.get(arg_index).map(String::as_str) == Some("--hcom-args-file") {
+            let Some(path) = args.get(arg_index + 1) else {
+                bail!("--hcom-args-file requires a path");
+            };
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read args file {path}"))?;
+            let _ = std::fs::remove_file(path);
+            sidecar_args = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in args file {path}"))?;
+            sidecar_args.iter().map(|s| s.as_str()).collect()
+        } else {
+            args[arg_index..].iter().map(|s| s.as_str()).collect()
+        };
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
@@ -140,7 +171,10 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         .parse::<tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool_str);
-    let resolved = terminal::which_bin(tool_exe).unwrap_or_else(|| tool_exe.to_string());
+    let resolved = tool_path
+        .map(ToString::to_string)
+        .or_else(|| terminal::which_bin(tool_exe))
+        .unwrap_or_else(|| tool_exe.to_string());
 
     // On Termux, some wrapped tools need a launcher override instead of direct exec.
     let (command, extra_args): (String, Vec<String>);
@@ -169,6 +203,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         None
     };
     let leader_args = grok_acp.as_ref().map(|l| l.tui_args()).unwrap_or_default();
+    let grok_leader = grok_acp.clone();
     let full_args: Vec<&str> = extra_args
         .iter()
         .map(|s| s.as_str())
@@ -224,10 +259,15 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         }
     };
 
-    let exit_code = proxy.run().context("PTY run failed")?;
+    let exit_code = proxy.run().context("PTY run failed");
 
     // Drop proxy to run cleanup (join delivery thread, which does DB cleanup)
     drop(proxy);
+    // Only once the TUI is gone: a live TUI would respawn its leader.
+    if let Some(launch) = grok_leader {
+        launch.stop_leader();
+    }
+    let exit_code = exit_code?;
 
     std::process::exit(exit_code);
 }

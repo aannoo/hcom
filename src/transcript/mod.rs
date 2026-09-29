@@ -266,9 +266,9 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
     // being silently assigned a parser.
     if lower.contains("antigravity") || lower.contains("/agy/") || lower.contains("/agy-") {
         Some(Tool::Antigravity)
-    } else if lower.contains("/.grok/sessions/")
-        || (file_name == "updates.jsonl" && lower.contains("/.grok/"))
-    {
+    } else if file_name == "updates.jsonl" {
+        // Only Grok writes `updates.jsonl` (`$GROK_HOME/sessions/<cwd>/<id>/`,
+        // and GROK_HOME may be anywhere).
         Some(Tool::Grok)
     } else if lower.contains("/agent-transcripts/") {
         Some(Tool::Cursor)

@@ -13,6 +13,7 @@ pub mod grok;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
+pub mod runtime;
 pub mod utils;
 
 use serde_json::Value;
@@ -179,6 +180,9 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // CODEX_HOME overrides HOME; inheriting it would write test hooks
+            // into the user's real Codex configuration.
+            std::env::remove_var("CODEX_HOME");
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();
@@ -565,6 +569,8 @@ pub enum HookResult {
     Block {
         /// Reason text (formatted messages for delivery).
         reason: String,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Update the tool input before execution (exit 0, updatedInput field).
@@ -801,11 +807,16 @@ mod tests {
     fn test_hook_result_block() {
         let result = HookResult::Block {
             reason: "<hcom>message here</hcom>".into(),
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 2);
         match &result {
-            HookResult::Block { reason } => {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
                 assert_eq!(reason, "<hcom>message here</hcom>");
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Block"),
         }

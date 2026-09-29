@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::mock_http::{MockHttp, RecordedRequest, Reply};
+use super::pins::{INSTALL_HINT, pinned_version};
 use super::{Hcom, parse_launch_names, unique_suffix};
 
 /// Final assistant-text proofs every tool emits verbatim, so the runner can
@@ -39,10 +40,9 @@ pub struct ToolMeta {
     pub tool: &'static str,
     /// Executable to version-check (`codex`, `claude`).
     pub binary: &'static str,
-    /// Exact pinned version string the oracle must report.
-    pub pinned_version: &'static str,
-    /// Copy-pasteable install command shown when the pin is missing.
-    pub install_command: &'static str,
+    /// npm package whose version in `scripts/mock-tools.pins` the oracle must
+    /// report exactly.
+    pub package: &'static str,
 }
 
 /// Tokens, file paths, and the send command the scenario is built from. Owned
@@ -129,6 +129,7 @@ fn has_exact_version(version_output: &str, expected: &str) -> bool {
 /// Panic with install instructions unless exactly the pinned oracle is present.
 pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
     let meta = case.meta();
+    let pinned = pinned_version(meta.package);
     // Name the exact file the version came from. A mock-tools prefix reused
     // across pins keeps stale launchers that outrank npm's shims in PATHEXT
     // order (`claude.exe` before `claude.cmd`), so "found 2.1.185" on its own
@@ -145,11 +146,11 @@ pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
              Resolved to: {resolved}. Install with: {install}",
             tool = meta.tool,
             binary = meta.binary,
-            version = meta.pinned_version,
-            install = meta.install_command,
+            version = pinned,
+            install = INSTALL_HINT,
         ),
     };
-    if !has_exact_version(&version, meta.pinned_version) {
+    if !has_exact_version(&version, pinned) {
         panic!(
             "real {tool} integration test requires {binary} {expected}, found `{version}` \
              at {resolved}. If that path is not the pinned install, delete it — a stale \
@@ -157,8 +158,8 @@ pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
              version with: {install}",
             tool = meta.tool,
             binary = meta.binary,
-            expected = meta.pinned_version,
-            install = meta.install_command,
+            expected = pinned,
+            install = INSTALL_HINT,
         );
     }
 }
@@ -182,10 +183,10 @@ pub fn inject_prompt_until(
     while prompt_attempts < 5 && Instant::now() < inject_deadline {
         let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter"]);
         if code != 0 {
-            let retryable = stdout.contains("No inject port")
-                || stdout.contains("No response from")
-                || stderr.contains("No inject port")
-                || stderr.contains("No response from");
+            // The PTY registers its inject port shortly after the row appears.
+            let retryable = ["no terminal registered yet", "No response from"]
+                .iter()
+                .any(|m| stdout.contains(m) || stderr.contains(m));
             if retryable {
                 std::thread::sleep(Duration::from_millis(250));
                 continue;

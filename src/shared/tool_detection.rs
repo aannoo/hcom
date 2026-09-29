@@ -153,7 +153,7 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Gemini,
         predicates: GEMINI_NATIVE,
-        clear_for_child: &["GEMINI_CLI", "GEMINI_SYSTEM_MD"],
+        clear_for_child: &["GEMINI_CLI", "GEMINI_SYSTEM_MD", "GEMINI_CLI_NO_RELAUNCH"],
     },
     ToolDetectionRule {
         tool: Tool::Codex,
@@ -170,7 +170,7 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::OpenCode,
         predicates: OPENCODE_NATIVE,
-        clear_for_child: &["OPENCODE"],
+        clear_for_child: &["OPENCODE", "OPENCODE_PID"],
     },
     ToolDetectionRule {
         tool: Tool::Kilo,
@@ -190,7 +190,13 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Grok,
         predicates: GROK_NATIVE,
-        clear_for_child: &["GROK_SESSION_ID", "GROK_HOOK_EVENT", "GROK_HOOK_NAME"],
+        clear_for_child: &[
+            "GROK_SESSION_ID",
+            "GROK_HOOK_EVENT",
+            "GROK_HOOK_NAME",
+            "GROK_AGENT",
+            "GROK_LEADER_SOCKET",
+        ],
     },
     ToolDetectionRule {
         tool: Tool::Pi,

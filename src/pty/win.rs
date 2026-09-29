@@ -756,29 +756,29 @@ impl Proxy {
                     Ok(0) => break,
                     Ok(n) => {
                         if let Ok(mut w) = writer.lock() {
-                            if n > 0 {
-                                // A genuine keystroke answering a title-detected
-                                // approval clears it immediately. Record the cleared
-                                // edge against shared state; the reader thread owns
-                                // the tracker, so request a tracker-clear via the
-                                // atomic it consumes — but ONLY when an approval was
-                                // actually standing. `clear_approval()` wipes the OSC
-                                // scrape buffer, so requesting it on every keystroke
-                                // would let a routine keypress race out an approval
-                                // edge arriving in the same window.
-                                let publish = |a: bool| {
-                                    shared::publish_approval_status(
-                                        a,
-                                        instance.as_deref(),
-                                        &current_status,
-                                    )
-                                };
-                                if shared::note_user_keystroke(&target, &screen_state, &publish) {
-                                    approval_clear_requested.store(true, Ordering::Release);
-                                }
-                            }
                             let _ = w.write_all(&buf[..n]);
                             let _ = w.flush();
+                        }
+                        if n > 0 {
+                            // A genuine keystroke answering a title-detected
+                            // approval clears it immediately. Record the cleared
+                            // edge against shared state; the reader thread owns
+                            // the tracker, so request a tracker-clear via the
+                            // atomic it consumes — but ONLY when an approval was
+                            // actually standing. `clear_approval()` wipes the OSC
+                            // scrape buffer, so requesting it on every keystroke
+                            // would let a routine keypress race out an approval
+                            // edge arriving in the same window.
+                            let publish = |a: bool| {
+                                shared::publish_approval_status(
+                                    a,
+                                    instance.as_deref(),
+                                    &current_status,
+                                )
+                            };
+                            if shared::note_user_keystroke(&target, &screen_state, &publish) {
+                                approval_clear_requested.store(true, Ordering::Release);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -817,7 +817,6 @@ impl Proxy {
                     let completed = match inject_server.read_client(index) {
                         Ok(InjectResult::Inject(text)) => {
                             if let Ok(mut w) = writer.lock() {
-                                shared::note_external_grok_input(&target, &screen_state, &text);
                                 let _ = w.write_all(text.as_bytes());
                                 let _ = w.flush();
                             }
@@ -853,27 +852,6 @@ impl Proxy {
                                         .map(|s| s.clone())
                                         .unwrap_or_default();
                                     q.respond(&dump);
-                                }
-                                QueryCommand::GrokWake | QueryCommand::GrokEnter => {
-                                    let enter = matches!(q.command, QueryCommand::GrokEnter);
-                                    let sent = if let Ok(mut w) = writer.lock() {
-                                        shared::write_grok_wake(
-                                            &target,
-                                            &screen_state,
-                                            shared::grok_unattended_surface(&target),
-                                            enter,
-                                            |bytes| {
-                                                w.write_all(bytes).and_then(|_| w.flush()).is_ok()
-                                            },
-                                        )
-                                    } else {
-                                        false
-                                    };
-                                    q.respond(if sent {
-                                        "ok\n"
-                                    } else {
-                                        "error: Grok prompt is not owned\n"
-                                    });
                                 }
                                 QueryCommand::Unknown => q.respond("error: unknown command\n"),
                             }

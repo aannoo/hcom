@@ -1235,11 +1235,6 @@ impl Proxy {
                 {
                     match self.inject_server.read_client(i)? {
                         inject::InjectResult::Inject(text) => {
-                            shared::note_external_grok_input(
-                                &self.config.target,
-                                &self.delivery_state,
-                                &text,
-                            );
                             write_all(&self.pty_master, text.as_bytes())?;
                             // Injected keystrokes reach the PTY master directly and
                             // bypass the interactive stdin handler. When one answers a
@@ -1262,22 +1257,6 @@ impl Proxy {
                                     self.inject_server.port(),
                                 );
                                 client.respond(&dump);
-                            }
-                            inject::QueryCommand::GrokWake | inject::QueryCommand::GrokEnter => {
-                                let enter =
-                                    matches!(client.command, inject::QueryCommand::GrokEnter);
-                                let sent = shared::write_grok_wake(
-                                    &self.config.target,
-                                    &self.delivery_state,
-                                    shared::grok_unattended_surface(&self.config.target),
-                                    enter,
-                                    |bytes| write_all(&self.pty_master, bytes).is_ok(),
-                                );
-                                client.respond(if sent {
-                                    "ok\n"
-                                } else {
-                                    "error: Grok prompt is not owned\n"
-                                });
                             }
                             inject::QueryCommand::Unknown => {
                                 client.respond("error: unknown command\n");

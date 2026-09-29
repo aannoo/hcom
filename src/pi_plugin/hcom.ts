@@ -353,7 +353,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
-		if (instanceName) {
+		// Only "quit" ends the process. reload/new/resume/fork are followed by
+		// session_start in the same process, whose pi-start rebinds this identity
+		// via the process binding — stopping here would delete the live instance.
+		const terminal = event.reason === undefined || event.reason === "quit";
+		if (instanceName && terminal) {
 			await hcom(["pi-stop", "--name", instanceName, "--reason", event.reason ?? "shutdown"]);
 		}
 		resetBinding();

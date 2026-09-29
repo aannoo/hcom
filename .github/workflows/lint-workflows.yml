@@ -35,17 +35,16 @@ jobs:
       - name: Install pinned actionlint
         run: |
           curl -fsSL -o actionlint.tar.gz \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
-          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  actionlint.tar.gz" | sha256sum -c -
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
-      # Pre-existing style findings in release.yml are ignored so this starts
-      # green and stays meaningful; the value here is parse/expression/context
-      # errors, which are not ignorable and are what actually take CI down.
-      # Drop an ignore once the underlying finding is fixed.
+      # The shellcheck findings are all in release.yml, which cargo-dist
+      # generates (and dist-check keeps byte-identical), so they cannot be fixed
+      # here. The value is parse/expression/context errors, which are not
+      # ignorable and are what actually take CI down.
       - name: Lint
         run: |
           ./actionlint \
-            -ignore 'label "macos-15-intel" is unknown' \
             -ignore 'SC2086' \
             -ignore 'SC2129' \
             -ignore 'SC2001'

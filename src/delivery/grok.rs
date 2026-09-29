@@ -1,4 +1,18 @@
-//! Thin native ACP transport. The existing hcom mailbox remains authoritative.
+//! Grok delivery through Grok's native prompt queue (ACP).
+//!
+//! `hcom grok` runs the TUI against a private leader socket. This thread
+//! attaches a second client to the same session (`grok agent --leader
+//! --leader-socket <sock> stdio`, the official stdio bridge, which handles
+//! leader framing and reconnects) and queues each mailbox batch as an ordinary
+//! prompt with `sendNow:false`. Nothing is typed into the TUI composer, so the
+//! user's draft is never touched, and a busy session simply runs the batch
+//! after its current work.
+//!
+//! Grok uses our `promptId` as the queue entry id. The batch is acknowledged
+//! when Grok reports that entry running (`x.ai/queue/changed`), i.e. once it
+//! is part of the model's turn, or when the prompt request returns a result.
+//! A batch that never started (removed from the queue, transport lost) stays
+//! unread and is queued again later: at-least-once, never silently dropped.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -18,6 +32,20 @@ use super::{DeliveryState, LaunchOutcome, TitleWake, ToolConfig, log_info, log_w
 
 const POLL: Duration = Duration::from_millis(100);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Wait before re-queueing a batch whose prompt was dropped before it ran
+/// (user removed it from the queue, prompt error, transport lost).
+const REQUEUE_DELAY: Duration = Duration::from_secs(10);
+/// Leader-mode Grok ignores these (it warns and continues). Since hcom must
+/// run Grok against a leader, reject them rather than silently drop a
+/// restriction the user asked for.
+const LEADER_IGNORED_FLAGS: &[&str] = &[
+    "--allow",
+    "--deny",
+    "--allowedTools",
+    "--disallowedTools",
+    "--disable-web-search",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct Launch {
@@ -25,92 +53,32 @@ pub(crate) struct Launch {
     prefix: Vec<String>,
     socket: String,
     no_subagents: bool,
-    policy_args: Vec<String>,
+}
+
+/// Flags before a `--` prompt marker.
+fn flags<'a>(args: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
+    args.iter().copied().take_while(|arg| *arg != "--")
 }
 
 impl Launch {
     pub(crate) fn validate_args(args: &[&str]) -> Result<()> {
-        if args.iter().take_while(|arg| **arg != "--").any(|arg| {
-            matches!(*arg, "--leader" | "--no-leader" | "--leader-socket")
-                || arg.starts_with("--leader-socket=")
-        }) {
-            bail!("hcom manages Grok's leader connection; remove custom leader flags");
-        }
-        Self::policy_args(args)?;
-        Ok(())
-    }
-
-    fn policy_args(args: &[&str]) -> Result<Vec<String>> {
-        let mut policy = Vec::new();
-        let mut args = args.iter().take_while(|arg| **arg != "--");
-        while let Some(arg) = args.next() {
+        for arg in flags(args) {
             let flag = arg.split('=').next().unwrap_or(arg);
-            if matches!(
-                flag,
-                "--allow"
-                    | "--deny"
-                    | "--allowedTools"
-                    | "--disallowedTools"
-                    | "--disable-web-search"
-            ) {
-                policy.push((*arg).to_string());
-                if flag != "--disable-web-search" && !arg.contains('=') {
-                    policy.push(
-                        args.next()
-                            .with_context(|| format!("{flag} requires a rule"))?
-                            .to_string(),
-                    );
-                }
+            if matches!(flag, "--leader" | "--no-leader" | "--leader-socket") {
+                bail!("hcom manages Grok's leader connection; remove {flag}");
+            }
+            if LEADER_IGNORED_FLAGS.contains(&flag) {
+                bail!(
+                    "Grok ignores {flag} when attached to a leader, which hcom needs for \
+                     message delivery; set the rule in Grok's config instead"
+                );
             }
         }
-        Ok(policy)
-    }
-
-    pub(crate) fn check_policy_support(mut command: Command, args: &[&str]) -> Result<()> {
-        if Self::policy_args(args)?.is_empty() {
-            return Ok(());
-        }
-        // Probe the actual inherited-policy CLI entry, not a version number.
-        command
-            .args(["agent", "leader", "--launch-policy", "{}", "--help"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        let mut child = command
-            .spawn()
-            .context("check native Grok policy support")?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(_)) => bail!(
-                    "This Grok binary does not support leader policy inheritance; use a policy-capable Grok build for --allow/--deny or --disable-web-search"
-                ),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("Native Grok policy support check timed out; launch stopped");
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error).context("check native Grok policy support");
-                }
-            }
-        }
+        Ok(())
     }
 
     pub(crate) fn new(command: &str, prefix: &[String], args: &[&str]) -> Result<Self> {
         Self::validate_args(args)?;
-        let mut probe = Command::new(command);
-        probe.args(prefix);
-        Self::check_policy_support(probe, args)?;
         Ok(Self {
             command: command.to_string(),
             prefix: prefix.to_vec(),
@@ -118,11 +86,7 @@ impl Launch {
                 .join(format!("hcom-grok-{}.sock", uuid::Uuid::new_v4()))
                 .to_string_lossy()
                 .into_owned(),
-            no_subagents: args
-                .iter()
-                .take_while(|arg| **arg != "--")
-                .any(|arg| *arg == "--no-subagents"),
-            policy_args: Self::policy_args(args)?,
+            no_subagents: flags(args).any(|arg| arg == "--no-subagents"),
         })
     }
 
@@ -134,18 +98,49 @@ impl Launch {
         ]
     }
 
-    pub(crate) fn child_env(&self) -> Vec<(String, String)> {
-        let mut env = vec![("HCOM_GROK_ACP".into(), "1".into())];
-        if self.no_subagents {
-            env.push(("GROK_SUBAGENTS".into(), "0".into()));
+    /// Stop this launch's private leader and remove its socket files.
+    ///
+    /// Grok leaders run with `--no-exit-on-disconnect` (they are meant to be
+    /// shared), so this one would outlive the agent. The leader writes its
+    /// PID to `<socket>.lock`.
+    pub(crate) fn stop_leader(&self) {
+        let socket = std::path::Path::new(&self.socket);
+        let lock = socket.with_extension("lock");
+        let pid = std::fs::read_to_string(&lock)
+            .ok()
+            .and_then(|content| content.trim().parse::<u32>().ok());
+        if let Some(pid) = pid.filter(|pid| crate::sys::process::is_alive(*pid)) {
+            crate::sys::process::terminate(pid);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while crate::sys::process::is_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(POLL);
+            }
+            if crate::sys::process::is_alive(pid) {
+                crate::sys::process::kill(pid);
+            }
+            log_info("native", "grok.leader.stopped", &format!("pid={pid}"));
         }
-        env
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(lock);
+    }
+
+    /// Env for the TUI and the ACP client. The leader is spawned by whichever
+    /// connects first and inherits it; `--no-subagents` itself has no effect
+    /// in leader mode.
+    pub(crate) fn child_env(&self) -> Vec<(String, String)> {
+        if self.no_subagents {
+            vec![("GROK_SUBAGENTS".into(), "0".into())]
+        } else {
+            Vec::new()
+        }
     }
 }
 
+#[derive(Debug)]
 enum Event {
     Response(Value),
     Queue(Value),
+    /// A request from Grok (permission prompt, ...). The TUI answers it.
     Interaction(String),
     Closed(String),
 }
@@ -165,42 +160,49 @@ impl Client {
         running: &AtomicBool,
         deadline: Instant,
     ) -> Result<Self> {
-        if Instant::now() >= deadline {
-            bail!("ACP setup deadline expired");
-        }
         let mut command = Command::new(&launch.command);
         command
             .args(&launch.prefix)
-            .args(&launch.policy_args)
             .args([
                 "agent",
                 "--leader",
                 "--leader-socket",
                 &launch.socket,
                 "stdio",
-            ]);
-        command
+            ])
             .current_dir(cwd)
             .envs(launch.child_env())
-            .env("HCOM_LAUNCHED", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let mut child = command.spawn().context("start native Grok ACP client")?;
+        let mut child = command.spawn().context("start Grok ACP client")?;
         let input = child.stdin.take().context("ACP stdin unavailable")?;
         let output = child.stdout.take().context("ACP stdout unavailable")?;
+        let stderr = child.stderr.take().context("ACP stderr unavailable")?;
+        // The bridge is invisible to the user; its errors only surface here.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    log_warn(
+                        "native",
+                        "grok.acp.stderr",
+                        &super::truncate_chars(&line, 500),
+                    );
+                }
+            }
+        });
         let (sender, events) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines() {
                 let event = match line {
                     Ok(line) => match serde_json::from_str::<Value>(&line) {
                         Ok(value) => classify_event(value),
-                        Err(_) => Some(Event::Closed("invalid JSON from native ACP client".into())),
+                        Err(_) => Some(Event::Closed("invalid JSON from Grok ACP client".into())),
                     },
                     Err(error) => Some(Event::Closed(format!("ACP read failed: {error}"))),
                 };
@@ -211,7 +213,7 @@ impl Client {
                     }
                 }
             }
-            let _ = sender.send(Event::Closed("native ACP client disconnected".into()));
+            let _ = sender.send(Event::Closed("Grok ACP client exited".into()));
         });
         let mut client = Self {
             child,
@@ -219,17 +221,26 @@ impl Client {
             events,
             next_id: 0,
         };
-        client.request("initialize", json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
-            "clientInfo": {"name": "hcom", "version": env!("CARGO_PKG_VERSION")}
-        }), running, deadline)?;
-        client.request(
-            "authenticate",
-            json!({"methodId": "cached_token"}),
+        let init = client.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
+                "clientInfo": {"name": "hcom", "version": env!("CARGO_PKG_VERSION")}
+            }),
             running,
             deadline,
         )?;
+        // Grok picks the method (cached login, API key, ...); re-deriving it
+        // here would break setups it already handles.
+        if let Some(method) = init["_meta"]["defaultAuthMethodId"].as_str() {
+            client.request(
+                "authenticate",
+                json!({"methodId": method}),
+                running,
+                deadline,
+            )?;
+        }
         client.request(
             "session/load",
             json!({"sessionId": session, "cwd": cwd, "mcpServers": []}),
@@ -261,9 +272,6 @@ impl Client {
         running: &AtomicBool,
         deadline: Instant,
     ) -> Result<Value> {
-        if Instant::now() >= deadline {
-            bail!("{method}: ACP setup deadline expired");
-        }
         let id = self.send(method, params)?;
         while running.load(Ordering::Acquire) && Instant::now() < deadline {
             match self.events.recv_timeout(POLL) {
@@ -274,12 +282,12 @@ impl Client {
                     return Ok(value["result"].clone());
                 }
                 Ok(Event::Closed(error)) => bail!("{error}"),
-                Ok(event) => observe_event(event),
+                Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("ACP reader stopped"),
             }
         }
-        bail!("{method}: setup timed out or PTY stopped")
+        bail!("{method}: timed out")
     }
 }
 
@@ -292,7 +300,7 @@ impl Drop for Client {
 
 fn classify_event(value: Value) -> Option<Event> {
     match value.get("method").and_then(Value::as_str) {
-        Some("_x.ai/queue/changed" | "x.ai/queue/changed") => {
+        Some("x.ai/queue/changed" | "_x.ai/queue/changed") => {
             Some(Event::Queue(value["params"].clone()))
         }
         Some(method) if value.get("id").is_some() => Some(Event::Interaction(method.to_string())),
@@ -302,72 +310,57 @@ fn classify_event(value: Value) -> Option<Event> {
     }
 }
 
-fn observe_event(event: Event) {
-    match event {
-        Event::Queue(params) => {
-            let ids = params["entries"]
-                .as_array()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|entry| entry["id"].as_str())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            log_info(
-                "native",
-                "grok.acp.queue",
-                &format!(
-                    "session={} running={} pending={ids:?}",
-                    params["sessionId"].as_str().unwrap_or(""),
-                    params["runningPromptId"].as_str().unwrap_or("")
-                ),
-            );
-        }
-        // The leader broadcasts interactions to the TUI as well. Do not race
-        // the user's answer with a synthetic approval, cancellation or error.
-        Event::Interaction(method) => log_info(
-            "native",
-            "grok.acp.interaction",
-            &format!("TUI owns {method}"),
-        ),
-        _ => {}
-    }
-}
-
+/// A queued batch awaiting evidence that Grok ran it.
 struct InFlight {
     request_id: u64,
-    session: String,
+    prompt_id: String,
     ack: DeliveryAck,
+    /// Seen waiting in Grok's queue.
+    queued: bool,
 }
 
-fn completed_response(value: &Value, id: u64) -> Option<Result<()>> {
-    if value["id"].as_u64() != Some(id) {
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// Part of a turn: acknowledge.
+    Delivered,
+    /// Dropped before it ran: leave unread and queue again later.
+    Dropped(String),
+}
+
+/// What a queue snapshot says about our prompt, if anything.
+fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
+    let running = params["runningPromptId"].as_str();
+    if running == Some(flight.prompt_id.as_str()) {
+        return Some(Outcome::Delivered);
+    }
+    let listed = params["entries"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|e| e["id"] == flight.prompt_id.as_str()));
+    if listed || !flight.queued {
         return None;
     }
-    Some(if value.get("error").is_some() {
-        Err(anyhow::anyhow!("prompt failed: {}", value["error"]))
-    } else if value["result"]["stopReason"].as_str() == Some("end_turn") {
-        Ok(())
+    // It left the queue without becoming the running prompt: either merged
+    // into a combined turn with the entries ahead of it, or removed.
+    if params["runningCombinedTexts"]
+        .as_array()
+        .is_some_and(|texts| texts.len() >= 2)
+    {
+        Some(Outcome::Delivered)
     } else {
-        Err(anyhow::anyhow!(
-            "prompt did not complete: {}",
-            value["result"]["stopReason"]
-        ))
-    })
+        Some(Outcome::Dropped("removed from Grok's queue".into()))
+    }
 }
 
-fn acknowledge(db: &HcomDb, flight: &InFlight) -> Result<()> {
-    // Native hooks already publish current activity. Commit only the existing
-    // mailbox cursor, monotonically, without overwriting a newer TUI status.
-    let changed = db.conn().execute(
-        "UPDATE instances SET last_event_id = MAX(last_event_id, ?1) WHERE name = ?2 AND session_id = ?3",
-        rusqlite::params![flight.ack.last_event_id, flight.ack.instance_name, flight.session],
-    )?;
-    if changed != 1 {
-        bail!("canonical instance/session changed before delivery acknowledgement");
+/// What the `session/prompt` response says about our prompt.
+fn response_outcome(value: &Value) -> Outcome {
+    if let Some(error) = value.get("error") {
+        return Outcome::Dropped(format!("prompt failed: {error}"));
     }
-    Ok(())
+    match value["result"]["stopReason"].as_str() {
+        // Every other stop reason ends a turn that ran the prompt.
+        Some("cancelled") => Outcome::Dropped("prompt cancelled".into()),
+        _ => Outcome::Delivered,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -389,12 +382,12 @@ pub(super) fn run(
     let mut client: Option<Client> = None;
     let mut session = String::new();
     let mut in_flight: Option<InFlight> = None;
-    let mut halted: Option<String> = None;
     let mut current_status = ST_LISTENING.to_string();
     let mut heartbeat = Instant::now();
-    let mut connect_attempts = 0;
+    let mut connect_failures: u32 = 0;
     let mut retry_at = Instant::now();
-    let mut connect_deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut requeue_at = Instant::now();
+    let launched_at = Instant::now();
     while running.load(Ordering::Acquire) {
         super::refresh_title_state(super::TitleRefresh {
             db,
@@ -407,7 +400,7 @@ pub(super) fn run(
             tool: &config.tool,
             host_label,
         });
-        if client.is_some() && halted.is_none() {
+        if client.is_some() {
             super::drive_launch_outcome(
                 db,
                 state,
@@ -424,69 +417,66 @@ pub(super) fn run(
             let _ = db.register_inject_port(current_name, state.inject_port);
             heartbeat = Instant::now();
         }
-        if let Some(error) = halted.as_deref() {
-            let _ = db.set_gate_status(current_name, "acp_unacknowledged", error);
-            notify.wait(POLL);
-            continue;
-        }
         let instance = match db.get_instance_full(current_name) {
             Ok(Some(instance)) => instance,
             Ok(None) => break,
             Err(error) => {
-                halted = Some(format!("canonical instance unreadable: {error}"));
+                log_warn("native", "grok.acp.instance_error", &format!("{error}"));
+                notify.wait(POLL);
                 continue;
             }
         };
+        // The session id arrives with Grok's SessionStart hook.
         let Some(active_session) = instance.session_id.filter(|id| !id.is_empty()) else {
             notify.wait(POLL);
             continue;
         };
-        if session != active_session || client.is_none() {
-            if in_flight.is_some() {
-                halted = Some(
-                    "session changed with an unacknowledged ACP prompt; automatic replay stopped"
-                        .into(),
+        if session != active_session {
+            // New session (/new, resume): the old prompt belongs to it.
+            if let Some(flight) = in_flight.take() {
+                log_warn(
+                    "native",
+                    "grok.acp.requeue",
+                    &format!("prompt={} session changed before it ran", flight.prompt_id),
                 );
-                continue;
             }
-            if session != active_session {
-                connect_attempts = 0;
-                retry_at = Instant::now();
-                connect_deadline = Instant::now() + SETUP_TIMEOUT;
-            }
+            client = None;
+            session = active_session;
+            connect_failures = 0;
+            retry_at = Instant::now();
+        }
+        if client.is_none() {
             if Instant::now() < retry_at {
                 notify.wait(POLL);
                 continue;
             }
-            client.take();
-            session = active_session;
-            connect_attempts += 1;
             match Client::connect(
                 launch,
                 &session,
                 &instance.directory,
                 running,
-                connect_deadline,
+                Instant::now() + SETUP_TIMEOUT,
             ) {
-                Ok(connected) => client = Some(connected),
+                Ok(connected) => {
+                    client = Some(connected);
+                    connect_failures = 0;
+                }
                 Err(error) => {
                     if !running.load(Ordering::Acquire) {
                         break;
                     }
-                    if connect_attempts < 3 && Instant::now() < connect_deadline {
-                        log_warn(
-                            "native",
-                            "grok.acp.connect_retry",
-                            &format!("attempt={connect_attempts}: {error:#}; no prompt submitted"),
-                        );
-                        retry_at = Instant::now() + Duration::from_secs(1);
-                        continue;
-                    }
-                    halted = Some(format!(
-                        "ACP connection failed: {error:#}; mailbox retained"
-                    ));
-                    if launch_outcome.is_pending() {
-                        let detail = halted.as_deref().unwrap_or("ACP setup failed");
+                    connect_failures += 1;
+                    let backoff =
+                        Duration::from_secs(1 << connect_failures.min(5)).min(RECONNECT_MAX);
+                    retry_at = Instant::now() + backoff;
+                    let detail = format!("Grok ACP connection failed: {error:#}");
+                    log_warn(
+                        "native",
+                        "grok.acp.connect_failed",
+                        &format!("attempt={connect_failures} retry_in={backoff:?}: {detail}"),
+                    );
+                    let _ = db.set_gate_status(current_name, "acp_disconnected", &detail);
+                    if launch_outcome.is_pending() && launched_at.elapsed() >= SETUP_TIMEOUT {
                         let _ = db.set_status(
                             current_name,
                             crate::shared::ST_BLOCKED,
@@ -497,7 +487,7 @@ pub(super) fn run(
                             crate::shared::ST_BLOCKED,
                             "launch_blocked",
                             "grok_acp_connection",
-                            detail,
+                            &detail,
                         );
                         super::mark_launch_phase_complete(
                             state,
@@ -505,66 +495,113 @@ pub(super) fn run(
                             LaunchOutcome::Blocked,
                         );
                     }
-                    log_warn(
-                        "native",
-                        "grok.acp.blocked",
-                        halted.as_deref().unwrap_or(""),
-                    );
                     continue;
                 }
             }
         }
-        let Some(client) = client.as_mut() else {
+        let Some(conn) = client.as_mut() else {
             continue;
         };
-        while let Ok(event) = client.events.try_recv() {
+
+        let mut outcome = None;
+        let mut closed = None;
+        while let Ok(event) = conn.events.try_recv() {
             match event {
                 Event::Closed(error) => {
-                    halted = Some(format!(
-                        "{error}; mailbox retained, automatic replay stopped"
-                    ));
+                    closed = Some(error);
                     break;
                 }
-                Event::Response(value) => {
-                    if let Some(flight) = in_flight.as_ref()
-                        && let Some(result) = completed_response(&value, flight.request_id)
-                    {
-                        match result.and_then(|()| acknowledge(db, flight)) {
-                            Ok(()) => {
-                                log_info(
-                                    "native",
-                                    "grok.acp.ack",
-                                    &format!(
-                                        "instance={} session={} cursor={}",
-                                        flight.ack.instance_name,
-                                        flight.session,
-                                        flight.ack.last_event_id
-                                    ),
-                                );
-                                in_flight = None;
-                            }
-                            Err(error) => {
-                                halted = Some(format!(
-                                    "{error:#}; mailbox retained, automatic replay stopped"
-                                ));
-                                break;
-                            }
+                Event::Queue(params) => {
+                    if params["sessionId"].as_str() != Some(session.as_str()) {
+                        continue;
+                    }
+                    if let Some(flight) = in_flight.as_mut() {
+                        flight.queued |= params["entries"].as_array().is_some_and(|entries| {
+                            entries.iter().any(|e| e["id"] == flight.prompt_id.as_str())
+                        });
+                        if let Some(result) = queue_outcome(&params, flight) {
+                            outcome = Some(result);
                         }
                     }
                 }
-                event => observe_event(event),
+                Event::Response(value) => {
+                    if let Some(flight) = in_flight.as_ref()
+                        && value["id"].as_u64() == Some(flight.request_id)
+                    {
+                        outcome = Some(response_outcome(&value));
+                    }
+                }
+                Event::Interaction(method) => {
+                    // The TUI answers; hcom only reports the wait. The next
+                    // tool or turn-end hook clears it.
+                    log_info(
+                        "native",
+                        "grok.acp.interaction",
+                        &format!("TUI owns {method}"),
+                    );
+                    if method == "session/request_permission" {
+                        crate::instance_lifecycle::set_status(
+                            db,
+                            current_name,
+                            crate::shared::ST_BLOCKED,
+                            "approval",
+                            Default::default(),
+                        );
+                    }
+                }
+            }
+            if outcome.is_some() {
+                break;
             }
         }
-        if let Some(error) = halted.as_deref() {
-            log_warn("native", "grok.acp.blocked", error);
-            continue;
+        if let Some(error) = closed {
+            client = None;
+            retry_at = Instant::now() + Duration::from_secs(1);
+            outcome = in_flight
+                .as_ref()
+                .map(|_| Outcome::Dropped(format!("{error} before the prompt ran")));
+            log_warn("native", "grok.acp.disconnected", &error);
         }
+        if let Some(outcome) = outcome
+            && let Some(flight) = in_flight.take()
+        {
+            match outcome {
+                Outcome::Delivered => {
+                    common::commit_delivery_ack(db, &flight.ack);
+                    log_info(
+                        "native",
+                        "grok.acp.ack",
+                        &format!(
+                            "instance={} prompt={} cursor={}",
+                            flight.ack.instance_name, flight.prompt_id, flight.ack.last_event_id
+                        ),
+                    );
+                }
+                Outcome::Dropped(reason) => {
+                    // Still unread; queue it again after a pause.
+                    requeue_at = Instant::now() + REQUEUE_DELAY;
+                    log_warn(
+                        "native",
+                        "grok.acp.requeue",
+                        &format!("prompt={} {reason}; kept unread", flight.prompt_id),
+                    );
+                }
+            }
+        }
+        let Some(conn) = client.as_mut() else {
+            continue;
+        };
         if in_flight.is_none()
+            && Instant::now() >= requeue_at
             && !matches!(current_status.as_str(), "stopped" | "inactive")
             && let Some(prepared) = common::prepare_pending_messages(db, current_name)
         {
-            let prompt_id = format!("hcom-{}", uuid::Uuid::new_v4());
-            match client.send(
+            let prompt_id = format!(
+                "{}{}",
+                crate::hooks::grok::HCOM_PROMPT_ID_PREFIX,
+                uuid::Uuid::new_v4()
+            );
+            match conn.send(
                 "session/prompt",
                 json!({
                     "sessionId": session,
@@ -577,63 +614,104 @@ pub(super) fn run(
                         "native",
                         "grok.acp.enqueued",
                         &format!(
-                            "instance={current_name} session={session} prompt={prompt_id} cursor={}",
+                            "instance={current_name} prompt={prompt_id} cursor={}",
                             prepared.ack.last_event_id
                         ),
                     );
                     in_flight = Some(InFlight {
                         request_id,
-                        session: session.clone(),
+                        prompt_id,
                         ack: prepared.ack,
+                        queued: false,
                     });
                 }
                 Err(error) => {
-                    halted = Some(format!(
-                        "ACP write failed: {error:#}; mailbox retained, automatic replay stopped"
-                    ));
-                    log_warn(
-                        "native",
-                        "grok.acp.blocked",
-                        halted.as_deref().unwrap_or(""),
-                    );
+                    log_warn("native", "grok.acp.write_failed", &format!("{error:#}"));
+                    client = None;
+                    retry_at = Instant::now() + Duration::from_secs(1);
                 }
             }
         }
         notify.wait(POLL);
     }
-    // Dropping the native stdio client does not close the TUI's session.
+    // Dropping the ACP client does not close the TUI's session.
     drop(client);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+
+    fn flight(queued: bool) -> InFlight {
+        InFlight {
+            request_id: 4,
+            prompt_id: "hcom-1".into(),
+            ack: DeliveryAck {
+                instance_name: "nova".into(),
+                last_event_id: 7,
+                status_context: "deliver:luna".into(),
+                msg_ts: String::new(),
+                mark_announced: false,
+            },
+            queued,
+        }
+    }
 
     #[test]
-    fn only_matching_end_turn_acknowledges_delivery() {
-        assert!(
-            completed_response(&json!({"id": 4, "result": {"stopReason": "end_turn"}}), 4)
-                .unwrap()
-                .is_ok()
-        );
-        for result in [
-            json!({"id": 4, "result": {"stopReason": "cancelled"}}),
-            json!({"id": 4, "result": {"stopReason": "max_tokens"}}),
-            json!({"id": 4, "result": {}}),
-            json!({"id": 4, "error": {"code": -32000, "message": "failed"}}),
-        ] {
-            assert!(completed_response(&result, 4).unwrap().is_err());
-        }
-        assert!(
-            completed_response(&json!({"id": 5, "result": {"stopReason": "end_turn"}}), 4)
-                .is_none()
+    fn running_prompt_is_delivered() {
+        let params = json!({"sessionId": "s", "runningPromptId": "hcom-1", "entries": []});
+        assert_eq!(
+            queue_outcome(&params, &flight(false)),
+            Some(Outcome::Delivered)
         );
     }
 
     #[test]
-    fn queue_and_permission_events_are_not_receipts() {
-        let queue = json!({"method": "_x.ai/queue/changed", "params": {"sessionId": "s", "runningPromptId": "p", "entries": []}});
+    fn queued_prompt_waits() {
+        let params =
+            json!({"sessionId": "s", "runningPromptId": "user-1", "entries": [{"id": "hcom-1"}]});
+        assert_eq!(queue_outcome(&params, &flight(false)), None);
+        assert_eq!(queue_outcome(&params, &flight(true)), None);
+    }
+
+    #[test]
+    fn prompt_leaving_queue_is_combined_or_dropped() {
+        let unrelated = json!({"sessionId": "s", "runningPromptId": "user-1", "entries": []});
+        // Not seen queued yet: the snapshot may predate our enqueue.
+        assert_eq!(queue_outcome(&unrelated, &flight(false)), None);
+        assert!(matches!(
+            queue_outcome(&unrelated, &flight(true)),
+            Some(Outcome::Dropped(_))
+        ));
+        let combined = json!({
+            "sessionId": "s",
+            "runningPromptId": "user-1",
+            "runningCombinedTexts": ["fix it", "<hcom>...</hcom>"],
+            "entries": []
+        });
+        assert_eq!(
+            queue_outcome(&combined, &flight(true)),
+            Some(Outcome::Delivered)
+        );
+    }
+
+    #[test]
+    fn response_outcomes() {
+        for reason in ["end_turn", "max_tokens", "max_turn_requests", "refusal"] {
+            let value = json!({"id": 4, "result": {"stopReason": reason}});
+            assert_eq!(response_outcome(&value), Outcome::Delivered, "{reason}");
+        }
+        for value in [
+            json!({"id": 4, "result": {"stopReason": "cancelled"}}),
+            json!({"id": 4, "error": {"code": -32000, "message": "failed"}}),
+        ] {
+            assert!(matches!(response_outcome(&value), Outcome::Dropped(_)));
+        }
+    }
+
+    #[test]
+    fn classifies_queue_and_reverse_requests() {
+        let queue = json!({"method": "x.ai/queue/changed", "params": {"sessionId": "s"}});
         assert!(matches!(classify_event(queue), Some(Event::Queue(_))));
         let permission =
             json!({"id": "ask-1", "method": "session/request_permission", "params": {}});
@@ -641,216 +719,36 @@ mod tests {
             classify_event(permission),
             Some(Event::Interaction(_))
         ));
+        let response = json!({"id": 3, "result": {}});
+        assert!(matches!(classify_event(response), Some(Event::Response(_))));
         assert!(classify_event(json!({"method": "session/update", "params": {}})).is_none());
     }
 
     #[test]
-    #[serial]
-    fn setup_failure_retries_then_reports_blocked_without_a_receipt() {
-        let (_tmp, dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let mut db = HcomDb::open().unwrap();
-        db.conn().execute(
-            "INSERT INTO instances (name, session_id, directory, tool, status, created_at, last_event_id) VALUES ('nova', 'session-1', ?1, 'grok', 'listening', 0, 0)",
-            rusqlite::params![dir.to_string_lossy()],
-        ).unwrap();
-        let launch =
-            Launch::new(dir.join("missing-grok-binary").to_str().unwrap(), &[], &[]).unwrap();
-        let running = Arc::new(AtomicBool::new(true));
-        let phase = Arc::new(AtomicBool::new(true));
-        let state = DeliveryState {
-            screen: Arc::new(RwLock::new(super::super::ScreenState::default())),
-            grok_unattended: true,
-            grok_acp: Some(launch.clone()),
-            launch_phase_active: phase.clone(),
-            inject_port: 0,
-            user_activity_cooldown_ms: 0,
-        };
-        let stop_running = running.clone();
-        let stop_phase = phase.clone();
-        let stopper = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while stop_phase.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            stop_running.store(false, Ordering::Release);
-        });
-        let mut outcome = LaunchOutcome::Pending;
-        let mut name = "nova".to_string();
-        let started = Instant::now();
-        run(
-            &launch,
-            &running,
-            &mut db,
-            &NotifyServer::new().unwrap(),
-            &state,
-            "",
-            &mut name,
-            &ToolConfig::for_tool(crate::tool::Tool::Grok),
-            &None,
-            &None,
-            &None,
-            &mut super::super::host_label::HostLabel::resolve(),
-            &mut outcome,
-        );
-        stopper.join().unwrap();
-        assert_eq!(outcome, LaunchOutcome::Blocked);
-        assert!(!phase.load(Ordering::Acquire));
-        assert!(
-            started.elapsed() >= Duration::from_secs(2),
-            "setup must receive its bounded retries"
-        );
-        assert_eq!(db.get_cursor("nova"), 0);
-    }
-
-    #[test]
-    fn silent_peer_uses_one_deadline_across_setup_requests() {
-        #[cfg(windows)]
-        let mut command = {
-            use std::os::windows::process::CommandExt;
-            let mut command = Command::new("cmd.exe");
-            command.args(["/D", "/Q"]).creation_flags(0x08000000);
-            command
-        };
-        #[cfg(not(windows))]
-        let mut command = Command::new("cat");
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take().unwrap();
-        // Keep the channel open but deliver no RPC response, as with a hung peer.
-        let (_sender, events) = mpsc::channel();
-        let mut client = Client {
-            child,
-            input,
-            events,
-            next_id: 0,
-        };
-        let running = AtomicBool::new(true);
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let error = client
-            .request("initialize", json!({}), &running, deadline)
-            .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        let sent = client.next_id;
-        assert!(
-            client
-                .request("authenticate", json!({}), &running, deadline)
-                .is_err()
-        );
-        assert_eq!(
-            client.next_id, sent,
-            "later setup steps must not reset an expired deadline"
-        );
-    }
-
-    #[test]
-    fn launch_preserves_prefix_and_rejects_competing_leader() {
-        let launch = Launch::new("grok", &["prefix".into()], &["--resume", "session"]).unwrap();
-        assert_eq!(launch.prefix, ["prefix"]);
-        assert_eq!(launch.tui_args()[0], "--leader");
-        for flag in [
-            "--leader",
-            "--no-leader",
-            "--leader-socket",
-            "--leader-socket=other",
-        ] {
-            assert!(Launch::new("grok", &[], &[flag]).is_err());
-        }
+    fn rejects_flags_leader_mode_ignores() {
         for args in [
+            vec!["--leader"],
+            vec!["--leader-socket=/tmp/x"],
             vec!["--allow", "Bash"],
             vec!["--deny=bash"],
             vec!["--allowedTools", "Read(*)"],
             vec!["--disallowedTools", "Bash(*)"],
             vec!["--disable-web-search"],
         ] {
-            assert!(Launch::validate_args(&args).is_ok());
-            assert!(!Launch::policy_args(&args).unwrap().is_empty());
+            assert!(Launch::validate_args(&args).is_err(), "{args:?}");
         }
-        assert!(Launch::policy_args(&["--no-subagents"]).unwrap().is_empty());
-        let restricted = Launch::new("grok", &[], &["--no-subagents"]).unwrap();
-        assert!(
-            restricted
-                .child_env()
-                .contains(&("GROK_SUBAGENTS".into(), "0".into()))
-        );
+        // After `--` they are prompt text.
+        assert!(Launch::validate_args(&["--", "--deny", "--leader"]).is_ok());
+        assert!(Launch::validate_args(&["--model", "grok-build", "--always-approve"]).is_ok());
     }
 
     #[test]
-    fn policy_probe_is_required_only_for_inherited_cli_restrictions() {
-        let missing = || Command::new("hcom-test-missing-grok-policy-binary");
-        assert!(Launch::check_policy_support(missing(), &["--no-subagents"]).is_ok());
-        assert!(Launch::check_policy_support(missing(), &["--deny", "Bash"]).is_err());
-    }
-
-    #[test]
-    fn policy_projection_preserves_values_and_stops_at_prompt_marker() {
-        let args = [
-            "--resume",
-            "session",
-            "--allow",
-            "Bash(Write-Output *)",
-            "--deny=Read(secret*)",
-            "--disable-web-search",
-            "--",
-            "--deny",
-            "--leader",
-            "--no-subagents",
-        ];
-        assert_eq!(
-            Launch::policy_args(&args).unwrap(),
-            [
-                "--allow",
-                "Bash(Write-Output *)",
-                "--deny=Read(secret*)",
-                "--disable-web-search"
-            ]
-        );
-        assert!(Launch::validate_args(&args).is_ok());
-        let literal = Launch::new(
-            "missing-grok-is-not-run",
-            &[],
-            &["--", "--deny", "--leader", "--no-subagents"],
-        )
-        .unwrap();
-        assert!(literal.policy_args.is_empty());
-        assert!(!literal.no_subagents);
-    }
-
-    #[test]
-    #[serial]
-    fn receipt_is_monotonic_session_scoped_and_preserves_hook_status() {
-        let (_tmp, _dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let db = HcomDb::open().unwrap();
-        db.conn().execute(
-            "INSERT INTO instances (name, session_id, tool, status, status_context, last_event_id, created_at) VALUES ('nova', 'session-1', 'grok', 'active', 'new-human-prompt', 9, 0)",
-            [],
-        ).unwrap();
-        let mut flight = InFlight {
-            request_id: 4,
-            session: "session-1".into(),
-            ack: DeliveryAck {
-                instance_name: "nova".into(),
-                last_event_id: 7,
-                status_context: "deliver:sender".into(),
-                msg_ts: String::new(),
-                mark_announced: false,
-            },
-        };
-        acknowledge(&db, &flight).unwrap();
-        assert_eq!(db.get_cursor("nova"), 9);
-        assert_eq!(
-            db.get_status("nova").unwrap().unwrap(),
-            ("active".into(), "new-human-prompt".into())
-        );
-        flight.ack.last_event_id = 12;
-        flight.session = "old-session".into();
-        assert!(acknowledge(&db, &flight).is_err());
-        assert_eq!(db.get_cursor("nova"), 9);
-        flight.session = "session-1".into();
-        acknowledge(&db, &flight).unwrap();
-        assert_eq!(db.get_cursor("nova"), 12);
+    fn no_subagents_reaches_leader_through_env() {
+        let launch = Launch::new("grok", &["prefix".into()], &["--no-subagents"]).unwrap();
+        assert_eq!(launch.prefix, ["prefix"]);
+        assert_eq!(launch.tui_args()[0], "--leader");
+        assert_eq!(launch.child_env(), [("GROK_SUBAGENTS".into(), "0".into())]);
+        let plain = Launch::new("grok", &[], &["--", "--no-subagents"]).unwrap();
+        assert!(plain.child_env().is_empty());
     }
 }

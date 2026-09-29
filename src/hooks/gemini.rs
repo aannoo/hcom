@@ -184,18 +184,11 @@ fn resolve_hook_directory(payload: &HookPayload, ctx: &HcomContext) -> Option<St
 /// Handle Gemini SessionStart hook.
 ///
 /// HCOM-launched: bind session_id, inject bootstrap if not announced.
-/// Vanilla: show hcom hint.
+/// Plain runs: no-op.
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    // Persistent hooks also fire in plain runs; stay out of those.
     if ctx.process_id.is_none() {
-        // Vanilla instance - show hint
-        return HookResult::Allow {
-            additional_context: Some(format!(
-                "[hcom available - run '{} start' to participate]",
-                crate::runtime_env::build_hcom_command()
-            )),
-            system_message: None,
-            delivery_ack: None,
-        };
+        return hook_noop();
     }
 
     let session_id = match payload.session_id.as_deref() {
@@ -267,20 +260,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         if let Some(inst) = instance.as_ref()
             && bootstrap::is_antigravity_tool(&inst.tool)
         {
-            let tag = inst.tag.as_deref().unwrap_or("");
-            let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-            let recurring = bootstrap::get_bootstrap(
-                db,
-                &ctx.hcom_dir,
-                &instance_name,
-                &inst.tool,
-                ctx.is_background,
-                ctx.is_launched,
-                &ctx.notes,
-                tag,
-                crate::relay::is_relay_enabled(&hcom_config),
-                ctx.background_name.as_deref(),
-            );
+            let recurring = bootstrap::get_bootstrap(db, ctx, &instance_name, &inst.tool);
             return HookResult::Allow {
                 additional_context: Some(recurring),
                 system_message: None,
@@ -649,7 +629,7 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
                 None
             }
         }
-        HookResult::Block { reason } => {
+        HookResult::Block { reason, .. } => {
             if is_agy {
                 Some(serde_json::json!({
                     "decision": "deny",
@@ -2878,6 +2858,7 @@ mod tests {
     fn test_antigravity_serialization_block() {
         let result = HookResult::Block {
             reason: "permission denied".to_string(),
+            delivery_ack: None,
         };
         let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
         assert_eq!(out["decision"], "deny");

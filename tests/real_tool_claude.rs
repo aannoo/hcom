@@ -109,8 +109,10 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
     let base_url = case.provider_base_url(mock.port());
     case.prepare(&h, &base_url);
 
-    // Default permission mode (no bypassPermissions) so a non-allowlisted Bash
-    // call is gated by Claude's permission UI and PermissionRequest hook.
+    // Manual permission mode so a non-allowlisted Bash call is gated by
+    // Claude's permission UI and PermissionRequest hook. Explicit because a
+    // session behind a gateway (this mock) otherwise starts in auto mode since
+    // Claude 2.1.2xx, where a classifier decides instead of a prompt.
     let (launch_code, launch_stdout, launch_stderr) = h.run([
         "claude",
         "--headless",
@@ -121,6 +123,8 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
         MODEL,
         "--setting-sources",
         "user",
+        "--permission-mode",
+        "manual",
     ]);
     assert_eq!(
         launch_code,

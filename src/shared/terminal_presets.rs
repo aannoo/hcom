@@ -293,6 +293,17 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             ),
         ),
         (
+            "ptyxis",
+            p(
+                Some("ptyxis"),
+                None,
+                argv(&["ptyxis", "--new-window", "--", "bash", "{script}"]),
+                NONE_ARGV,
+                None,
+                &["Linux"],
+            ),
+        ),
+        (
             "konsole",
             p(
                 Some("konsole"),
@@ -617,6 +628,7 @@ pub const TERMINAL_ENV_MAP: &[(&str, &str)] = &[
     ("GHOSTTY_RESOURCES_DIR", "ghostty"),
     ("ITERM_SESSION_ID", "iterm"),
     ("ALACRITTY_WINDOW_ID", "alacritty"),
+    ("PTYXIS_VERSION", "ptyxis"),
     ("GNOME_TERMINAL_SCREEN", "gnome-terminal"),
     ("KONSOLE_DBUS_WINDOW", "konsole"),
     ("TERMINATOR_UUID", "terminator"),
@@ -630,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_terminal_presets_count() {
-        assert_eq!(TERMINAL_PRESETS.len(), 28);
+        assert_eq!(TERMINAL_PRESETS.len(), 29);
     }
 
     #[test]
@@ -682,5 +694,17 @@ mod tests {
         );
         assert!(win.contains(&"powershell"));
         assert_eq!(win.first(), Some(&"mintty"));
+    }
+
+    #[test]
+    fn test_ptyxis_opens_a_new_window() {
+        let preset = get_terminal_preset("ptyxis").unwrap();
+        assert_eq!(preset.binary, Some("ptyxis"));
+        assert_eq!(
+            preset.open.select(false),
+            Some(&["ptyxis", "--new-window", "--", "bash", "{script}"] as ArgvTemplate)
+        );
+        assert!(preset.close.select(false).is_none());
+        assert!(preset.platforms.contains(&"Linux"));
     }
 }

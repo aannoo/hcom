@@ -257,7 +257,25 @@ fn events_sub_list(db: &HcomDb) -> i32 {
         return 0;
     }
 
-    println!("{:<10} {:<12} {:<10} FILTER", "ID", "FOR", "MODE");
+    let id_width = subs
+        .iter()
+        .filter_map(|sub| sub.get("id").and_then(|v| v.as_str()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(2)
+        .max(10);
+    let caller_width = subs
+        .iter()
+        .filter_map(|sub| sub.get("caller").and_then(|v| v.as_str()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(3)
+        .max(12);
+
+    println!(
+        "{:<id_width$} {:<caller_width$} {:<10} FILTER",
+        "ID", "FOR", "MODE"
+    );
     for sub in &subs {
         let id = sub.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
@@ -304,9 +322,12 @@ fn events_sub_list(db: &HcomDb) -> i32 {
             }
         };
 
-        println!("{id:<10} {caller:<12} {mode:<10} {filter_display}");
+        println!("{id:<id_width$} {caller:<caller_width$} {mode:<10} {filter_display}");
         if let Some(on_hit) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
-            println!("{:<10} {:<12} {:<10} on-hit: {on_hit:?}", "", "", "");
+            println!(
+                "{:<id_width$} {:<caller_width$} {:<10} on-hit: {on_hit:?}",
+                "", "", ""
+            );
         }
     }
 
@@ -568,6 +589,30 @@ fn cmd_events_unsub(db: &HcomDb, args: &EventsUnsubArgs) -> i32 {
     let _ = db.kv_set(&key, None);
     println!("Removed {sub_id}");
     0
+}
+
+/// An `--agent` typo otherwise looks exactly like "no events yet".
+fn warn_unknown_agent_filters(db: &HcomDb, filters: &crate::core::filters::FilterMap) {
+    let Some(names) = filters.get("instance") else {
+        return;
+    };
+    for name in names {
+        let seen = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM events WHERE instance = ? LIMIT 1",
+                rusqlite::params![name],
+                |_| Ok(()),
+            )
+            .is_ok()
+            || db.get_instance_full(name).ok().flatten().is_some();
+        if !seen {
+            eprintln!(
+                "Warning: {}",
+                crate::identity::describe_missing_agent(db, name)
+            );
+        }
+    }
 }
 
 /// Install a subscription on a remote device via SUB_CREATE RPC.
@@ -844,6 +889,7 @@ fn events_wait(
 
     let start = Instant::now();
     let mut last_id = db.get_last_event_id();
+    let mut unread_preview_shown = false;
 
     let result = loop {
         if start.elapsed() >= Duration::from_secs(wait_timeout) {
@@ -885,14 +931,16 @@ fn events_wait(
             break 0;
         }
 
-        // Check for unread messages (interrupt wait) — use <hcom> XML tag format
-        if let Some(name) = instance_name {
+        // Check for unread messages (optional preview notification) — use <hcom> XML tag format
+        if let Some(name) = instance_name
+            && !unread_preview_shown
+        {
             let messages = db.get_unread_messages(name);
             if !messages.is_empty() {
                 // Format as <hcom> XML tag
                 let preview = build_message_preview(db, name);
                 println!("{preview}");
-                break 0;
+                unread_preview_shown = true;
             }
         }
 
@@ -1028,6 +1076,11 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
     resolve_filter_names(&mut filters, db);
+    // --all also searches archives, where an agent may exist only historically;
+    // --wait may legitimately target an agent that hasn't started yet.
+    if !args.remote_fetch && !search_all && wait_timeout.is_none() {
+        warn_unknown_agent_filters(db, &filters);
+    }
 
     // Remote one-shot fetch
     if args.remote_fetch {
@@ -1207,11 +1260,17 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
         }
     }
 
-    // Sort by timestamp and limit
-    all_events.sort_by(|a, b| {
-        let ts_a = a.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        let ts_b = b.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        ts_a.cmp(ts_b)
+    // Chronological by timestamp (relay-pulled events keep their original
+    // time, so insertion order isn't chronological). Timestamps have second
+    // resolution; break ties by id to keep same-second events in write order.
+    all_events.sort_by_cached_key(|v| {
+        (
+            v.get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            v.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+        )
     });
 
     if all_events.len() > last_n {
@@ -1441,5 +1500,258 @@ mod tests {
             }
             _ => panic!("Expected Launch subcommand"),
         }
+    }
+
+    const UNRELATED_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+    struct WaiterFixture {
+        _temp: tempfile::TempDir,
+        db_path: std::path::PathBuf,
+        writer: HcomDb,
+    }
+
+    impl WaiterFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("events_wait_test.db");
+            let writer = HcomDb::open_raw(&db_path).unwrap();
+            writer.init_db().unwrap();
+            Self {
+                _temp: temp,
+                db_path,
+                writer,
+            }
+        }
+
+        fn open_reader(&self) -> HcomDb {
+            HcomDb::open_raw(&self.db_path).unwrap()
+        }
+
+        fn register_instance(&self, name: &str) {
+            self.writer
+                .conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, created_at, last_event_id) VALUES (?1, 'test', 'active', 1000.0, 0)",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+        }
+
+        fn wait_for_notify_endpoint(&self, name: &str) -> bool {
+            for _ in 0..100 {
+                if self.writer.has_notify_endpoint_kind(name, "events_wait") {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        fn send_message(&self, from: &str, text: &str) {
+            let msg_data = json!({
+                "from": from,
+                "text": text,
+                "scope": "broadcast",
+            });
+            self.writer
+                .log_event_with_ts("message", from, &msg_data, None)
+                .unwrap();
+        }
+
+        fn send_status(&self, instance: &str, status: &str, detail: &str) {
+            let status_data = json!({
+                "status": status,
+                "detail": detail,
+            });
+            self.writer
+                .log_event_with_ts("status", instance, &status_data, None)
+                .unwrap();
+        }
+
+        fn wake(&self, instance: &str) {
+            crate::notify::wake(
+                &self.writer,
+                instance,
+                &[crate::notify::WakeKind::EventsWait],
+            );
+        }
+    }
+
+    struct WaiterWorker {
+        handle: std::thread::JoinHandle<i32>,
+        rx: std::sync::mpsc::Receiver<i32>,
+    }
+
+    impl WaiterWorker {
+        fn spawn(
+            reader: HcomDb,
+            filter_query: &'static str,
+            timeout_secs: u64,
+            instance: &'static str,
+        ) -> Self {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let code = events_wait(
+                    &reader,
+                    filter_query,
+                    timeout_secs,
+                    false,
+                    &HashMap::new(),
+                    Some(instance),
+                );
+                let _ = tx.send(code);
+                code
+            });
+            Self { handle, rx }
+        }
+
+        fn probe(&self, timeout: Duration) -> Result<i32, std::sync::mpsc::RecvTimeoutError> {
+            self.rx.recv_timeout(timeout)
+        }
+
+        fn join(self) -> i32 {
+            self.handle.join().unwrap_or(-1)
+        }
+    }
+
+    #[test]
+    fn test_events_wait_unrelated_unread_arriving_after_readiness() {
+        let f = WaiterFixture::new();
+        f.register_instance("waiter_arriving");
+        let initial_cursor = f.writer.get_cursor("waiter_arriving");
+
+        let worker = WaiterWorker::spawn(
+            f.open_reader(),
+            " AND (type = 'status')",
+            5,
+            "waiter_arriving",
+        );
+        let ready = f.wait_for_notify_endpoint("waiter_arriving");
+
+        f.send_message("sender", "unrelated arriving message");
+        f.wake("waiter_arriving");
+
+        let probe = worker.probe(UNRELATED_PROBE_TIMEOUT);
+        if probe.is_err() {
+            f.send_status("waiter_arriving", "active", "matched");
+            f.wake("waiter_arriving");
+        }
+        let code = worker.join();
+        let endpoint_cleaned = !f
+            .writer
+            .has_notify_endpoint_kind("waiter_arriving", "events_wait");
+        let cursor_after = f.writer.get_cursor("waiter_arriving");
+
+        assert_eq!(cursor_after, initial_cursor);
+        assert!(
+            endpoint_cleaned,
+            "notify endpoint must be cleaned up on exit"
+        );
+        assert!(
+            ready && probe.is_err() && code == 0,
+            "waiter must remain pending on unrelated unread: ready={ready}, probe={probe:?}, code={code}"
+        );
+    }
+
+    #[test]
+    fn test_events_wait_preexisting_unrelated_unread_does_not_satisfy_filter() {
+        let f = WaiterFixture::new();
+        f.register_instance("waiter_pre");
+        f.send_message("sender", "preexisting unread message");
+        let initial_cursor = f.writer.get_cursor("waiter_pre");
+
+        let worker =
+            WaiterWorker::spawn(f.open_reader(), " AND (type = 'status')", 1, "waiter_pre");
+
+        let probe = worker.probe(UNRELATED_PROBE_TIMEOUT);
+        let code = worker.join();
+        let endpoint_cleaned = !f
+            .writer
+            .has_notify_endpoint_kind("waiter_pre", "events_wait");
+        let cursor_after = f.writer.get_cursor("waiter_pre");
+
+        assert_eq!(cursor_after, initial_cursor);
+        assert!(
+            endpoint_cleaned,
+            "notify endpoint must be cleaned up on exit"
+        );
+        assert!(
+            probe.is_err() && code == 1,
+            "events_wait must not break with 0 on preexisting unread message: probe={probe:?}, code={code}"
+        );
+    }
+
+    #[test]
+    fn test_events_wait_matching_status_after_readiness_exits_zero() {
+        let f = WaiterFixture::new();
+        f.register_instance("waiter_matching");
+        let initial_cursor = f.writer.get_cursor("waiter_matching");
+
+        let worker = WaiterWorker::spawn(
+            f.open_reader(),
+            " AND (type = 'status')",
+            5,
+            "waiter_matching",
+        );
+        let ready = f.wait_for_notify_endpoint("waiter_matching");
+
+        f.send_status("waiter_matching", "active", "ready");
+        f.wake("waiter_matching");
+
+        let code = worker.join();
+        let endpoint_cleaned = !f
+            .writer
+            .has_notify_endpoint_kind("waiter_matching", "events_wait");
+        let cursor_after = f.writer.get_cursor("waiter_matching");
+
+        assert!(ready, "endpoint must be registered");
+        assert!(
+            endpoint_cleaned,
+            "notify endpoint must be cleaned up on exit"
+        );
+        assert_eq!(cursor_after, initial_cursor);
+        assert_eq!(code, 0, "matching status event must wake and exit 0");
+    }
+
+    #[test]
+    fn test_events_wait_timeout_returns_one() {
+        let f = WaiterFixture::new();
+        f.register_instance("timeout_agent");
+        let filters = HashMap::new();
+        let reader = f.open_reader();
+        let code = events_wait(
+            &reader,
+            " AND (type = 'nonexistent')",
+            1,
+            false,
+            &filters,
+            Some("timeout_agent"),
+        );
+        assert_eq!(code, 1);
+        assert!(
+            !f.writer
+                .has_notify_endpoint_kind("timeout_agent", "events_wait")
+        );
+    }
+
+    #[test]
+    fn test_events_wait_invalid_sql_returns_two() {
+        let f = WaiterFixture::new();
+        f.register_instance("sql_agent");
+        let filters = HashMap::new();
+        let reader = f.open_reader();
+        let code = events_wait(
+            &reader,
+            " AND (invalid sql %%%)",
+            1,
+            false,
+            &filters,
+            Some("sql_agent"),
+        );
+        assert_eq!(code, 2);
+        assert!(
+            !f.writer
+                .has_notify_endpoint_kind("sql_agent", "events_wait")
+        );
     }
 }

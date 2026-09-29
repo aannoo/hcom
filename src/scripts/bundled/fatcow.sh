@@ -136,8 +136,6 @@ if [[ -n "$ask_name" ]]; then
     exit 1
   fi
 
-  fatcow_tool=$(echo "$stopped_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('data',{}).get('snapshot',{}).get('tool','claude') if isinstance(d,list) else d.get('data',{}).get('snapshot',{}).get('tool','claude'))" 2>/dev/null) || fatcow_tool="claude"
-
   # Build resume prompt
   resume_prompt="## QUESTION FROM @${caller_name}
 
@@ -149,13 +147,10 @@ ${ask_question}
 2. Send your answer: hcom send @${caller_name} -- <your answer>
 3. Stop yourself: run hcom stop"
 
-  # Resume (claude: explicit -p so --headless goes through print mode)
-  claude_p_flag=""
-  [[ "$fatcow_tool" == "claude" ]] && claude_p_flag="-p"
-  hcom 1 "$fatcow_tool" --go \
-    --resume "$ask_name" \
+  # Resume headless (claude reuses its saved -p launch args)
+  hcom r "$ask_name" --go \
     --hcom-prompt "$resume_prompt" \
-    --headless ${claude_p_flag} >/dev/null 2>&1 || {
+    --headless >/dev/null 2>&1 || {
     echo "Error: Resume failed" >&2
     exit 1
   }
@@ -345,7 +340,7 @@ fi
 hcom 1 "$tool" --tag "$tag" --go \
   --hcom-system-prompt "$system_prompt" \
   --hcom-prompt "$launch_prompt" \
-  -C "$cwd" \
+  --dir "$cwd" \
   ${bg_flag} >/dev/null 2>&1 || {
   echo "Error: Launch failed" >&2
   exit 1

@@ -175,7 +175,7 @@ pub fn format_recipients(delivered_to: &[String], max_show: usize) -> String {
 ///
 /// Without this hint, users hit `@zeli` → "non-existent" even though `zeli:ZOME`
 /// is right there in the available list and only takes a colon-suffix to reach.
-fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String {
+fn build_unmatched_error(unmatched: &[String], full_names: &[String], from_text: bool) -> String {
     let unmatched_display: Vec<String> = unmatched.iter().map(|t| format!("@{}", t)).collect();
 
     let mut suggestions: Vec<String> = Vec::new();
@@ -195,10 +195,20 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
         }
     }
 
-    let mut msg = format!(
-        "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}",
-        unmatched_display.join(", "),
-    );
+    // Plain typo suggestions against live names (`@tnua` → `@tuna`).
+    for target in unmatched {
+        for hit in crate::shared::suggest::suggest(target, full_names.iter().map(String::as_str), 3)
+        {
+            if seen.insert(hit.clone()) {
+                suggestions.push(format!("@{hit}"));
+            }
+        }
+    }
+
+    let mut msg = format!("No active agent for {}", unmatched_display.join(", "));
+    if from_text {
+        msg.push_str(" (every '@word' in a message is treated as a target; rephrase or use `--` with explicit @targets)");
+    }
     if !suggestions.is_empty() {
         msg.push_str(&format!("\nDid you mean: {}?", suggestions.join(", ")));
     }
@@ -351,7 +361,7 @@ pub fn compute_scope(
             let (matched_base_names, unmatched) = resolve_targets(targets, enabled_instances)?;
 
             if !unmatched.is_empty() {
-                return Err(build_unmatched_error(&unmatched, &full_names));
+                return Err(build_unmatched_error(&unmatched, &full_names, false));
             }
 
             if !matched_base_names.is_empty() {
@@ -413,7 +423,7 @@ pub fn compute_scope(
                     ));
                 }
 
-                return Err(build_unmatched_error(&unmatched, &full_names));
+                return Err(build_unmatched_error(&unmatched, &full_names, true));
             }
 
             return Ok(ScopeResult {
@@ -1135,7 +1145,11 @@ mod tests {
         let targets = vec!["nonexistent".to_string()];
         let result = compute_scope("hello", &instances, Some(&targets));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("non-existent or stopped"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("No active agent for @nonexistent")
+        );
     }
 
     #[test]

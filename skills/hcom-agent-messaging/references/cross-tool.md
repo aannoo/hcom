@@ -25,7 +25,7 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Payload**: JSON via stdin
 - **Session binding**: On SessionStart hook, immediate (same as Claude)
 - **Message delivery**: Hook-based auto-delivery when hcom-launched; PTY injection fallback for vanilla sessions
-- **Sandbox modes**: `workspace` (--full-auto + network), `untrusted` (--sandbox workspace-write), `danger-full-access` (--dangerously-bypass-approvals-and-sandbox), `none` (raw)
+- **Sandbox modes**: `workspace` (--sandbox workspace-write + network), `danger-full-access` (--dangerously-bypass-approvals-and-sandbox), `none` (raw)
 - **Bootstrap injection**: Via `-c developer_instructions=<bootstrap>` at launch time
 - **Transcript path**: Derived from thread ID, searched via glob in `$CODEX_HOME/sessions/`
 
@@ -67,17 +67,14 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Transcript**: cursor-agent writes JSONL under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Parser support is limited: no timestamps, `cwd`, or tool-result blocks; user prompts require wrapper removal.
 
 ### Grok Build
-- **Hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop, SessionEnd — native `~/.grok/hooks/hcom.json` (`$GROK_HOME`).
-- **Payload**: JSON via stdin. Observe events discard stdout; only Stop / SubagentStop parse `hookSpecificOutput.additionalContext`.
-- **Bootstrap**: launch `--rules` (system prompt append). SessionStart does not inject bootstrap.
-- **Message delivery**: managed `hcom grok` and `hcom grok --headless` sessions use a thin native ACP client connected to the same Grok leader/session. Message bodies enter Grok's native queue; no composer wake text or Enter is injected. Stop observes activity but does not consume the ACP-owned mailbox. Unmanaged hook-only sessions retain Stop additionalContext delivery.
-- **Delivery confirmation**: only a matching successful `end_turn` advances the existing mailbox cursor. Queue notifications alone do not acknowledge delivery. Cancellation, failed/ambiguous writes, disconnect, or a session change during delivery retain unread mail and stop automatic replay (`acp_unacknowledged`); no input-box fallback occurs. Inspect the session before restarting, since an interrupted transport may already have delivered the message.
-- **Composer and permissions**: the native TUI retains its draft/cursor and handles permission prompts. hcom never auto-approves or auto-rejects ACP permission requests. Ordinary managed sessions work with stock Grok; a custom build is not required. The final Windows integration was tested with official Grok 1.0.13: real hcom replies, multiline draft/mid-text cursor preservation through a permission dialog, busy queue, unattended headless wake, and handled transport interruption.
-- **Startup restrictions**: hcom owns the leader endpoint. `--no-subagents` is forwarded as native `GROK_SUBAGENTS=0`. Optional `--allow/--deny` (including aliases) and `--disable-web-search` require native `agent leader --launch-policy` support; hcom checks that capability only when those flags are requested. Official Grok 1.0.13 rejects these restricted launches before an agent is created, rather than silently losing restrictions. Ordinary launches do not run this capability probe. On a capable binary, both TUI and ACP receive the same restriction arguments; no hcom policy store is added.
-- **Native safety gates**: allow rules do not bypass Grok's Bash/shell preflight. PowerShell call-operator syntax (`& "program"`) can still require native confirmation when the Bash parser cannot safely decompose it. hcom does not override that decision.
-- **One-shot**: `hcom grok -p` / `--single` is rejected — process exits and cannot stay on the bus.
-- **Resume**: `--resume` / `--fork-session`. Worktree flags from the original launch are not replayed.
-- **Transcript**: `$GROK_HOME/sessions/**/updates.jsonl` (default `~/.grok/sessions`).
+- **Hooks** (status only): SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, StopFailure, StopCancelled, SessionEnd in `$GROK_HOME/hooks/hcom.json` (default `~/.grok`). Persistent: Grok has no per-run hook source.
+- **Bootstrap**: `--rules` at launch (hook output never reaches the model).
+- **Message delivery**: `hcom grok` runs the TUI on a private leader socket; a second client (`grok agent --leader stdio`) queues each batch as a normal prompt (`sendNow:false`). Nothing is typed into the composer, drafts are untouched, and a busy agent runs the batch after its current work. The batch is acked when Grok starts running it; one dropped before it ran (removed from the queue, transport lost) stays unread and is queued again.
+- **Session id**: a new `hcom grok` gets `--session-id <uuid>`. Without it the TUI sits on its welcome screen over a hidden session and never draws turns queued there.
+- **Permissions**: the TUI answers them; hcom shows the agent as blocked while one is open.
+- **Rejected flags**: `-p`/`--single`/`--prompt-file`/`--prompt-json` (one-shot), leader flags (hcom owns the leader), and `--allow`/`--deny`/`--disable-web-search` (Grok ignores them in leader mode; put rules in Grok's config). `--no-subagents` is passed as `GROK_SUBAGENTS=0`.
+- **Resume/fork**: `--resume` / `--fork-session`; worktree flags are not replayed. `hcom r <session-id>` finds sessions under `$GROK_HOME/sessions`.
+- **Transcript**: `$GROK_HOME/sessions/<url-encoded cwd>/<id>/updates.jsonl`.
 
 ## Working Patterns
 

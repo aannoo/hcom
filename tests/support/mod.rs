@@ -13,6 +13,7 @@
 pub mod claude_mock;
 pub mod codex_mock;
 pub mod mock_http;
+pub mod pins;
 pub mod real_tool;
 
 use rusqlite::OptionalExtension;
@@ -319,7 +320,16 @@ fn diagnostics_for(ctx: &DiagContext) -> String {
 impl Hcom {
     /// Build a fixture whose every writable path is below one temporary root.
     pub fn new() -> Self {
-        let root = tempfile::tempdir().expect("create temp dir");
+        // CI points HCOM_TEST_KEEP_DIR at a known path so a failed test's
+        // preserved root (see Drop) can be uploaded as an artifact; passing
+        // tests still clean up, leaving only failures behind.
+        let root = match std::env::var_os("HCOM_TEST_KEEP_DIR") {
+            Some(dir) => {
+                fs::create_dir_all(&dir).expect("create HCOM_TEST_KEEP_DIR");
+                tempfile::tempdir_in(dir).expect("create temp dir")
+            }
+            None => tempfile::tempdir().expect("create temp dir"),
+        };
         let home = root.path().join("home");
         let hcom_dir = root.path().join("hcom-state");
         let codex_home = root.path().join("codex-home");
@@ -620,11 +630,15 @@ impl Hcom {
     ///
     /// Deliberately omits `approval_policy`: approvals are hcom's job, driven by
     /// the `--sandbox <mode>` launch flag (`get_sandbox_flags` →
-    /// `--sandbox workspace-write` / `-a untrusted` / bypass). Hand-writing the
+    /// `--sandbox workspace-write` / bypass). Hand-writing the
     /// policy here would bypass that translation and let a regression in it pass
     /// unnoticed — so tests set the policy through the real hcom launch path.
     pub fn prepare_codex_config(&self, mock_base_url: &str) {
         fs::create_dir_all(&self.codex_home).expect("create isolated Codex home");
+        // The migration notice marks gpt-5.5's upgrade as already seen. Without
+        // it Codex (>= 0.157) opens a "Try new model" modal at startup that
+        // swallows the first injected prompt. Recording it as seen keeps the
+        // model, and so the request shape the mock scripts against, unchanged.
         let config = format!(
             "model = \"gpt-5.5\"\n\
              model_provider = \"mock_local\"\n\
@@ -634,7 +648,10 @@ impl Hcom {
              base_url = \"{mock_base_url}\"\n\
              env_key = \"DUMMY_KEY\"\n\
              wire_api = \"responses\"\n\
-             requires_openai_auth = false\n"
+             requires_openai_auth = false\n\
+             \n\
+             [notice.model_migrations]\n\
+             \"gpt-5.5\" = \"gpt-6-sol\"\n"
         );
         fs::write(self.codex_home.join("config.toml"), config)
             .expect("write isolated Codex config.toml");

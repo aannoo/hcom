@@ -1,0 +1,10 @@
+# Exact versions of the real CLIs the real-tool tests drive. The one place to
+# bump them: install-mock-tools.{sh,ps1}, tests/support/pins.rs and the CI
+# cache key all read this file.
+#
+# After a bump: just ci mock-tools real_tool_codex real_tool_claude test_relay_roundtrip
+@openai/codex@0.157.1
+# Claude must stay >= 2.1.198: the first release with both `prompt_id` and
+# backgrounded Agent/Task calls (tool_response.status="async_launched"), which
+# hcom's hook routing has to handle. Below that, CI never exercises either.
+@anthropic-ai/claude-code@2.1.283

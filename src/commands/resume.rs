@@ -343,13 +343,16 @@ fn prepare_resume_plan_from_source(
                 && let Ok(Some(inst)) = db.get_instance_full(name)
                 && inst.status != ST_INACTIVE
             {
-                bail!("'{}' is still active — run hcom kill {} first", name, name);
+                bail!(
+                    "'{name}' is still running.\n  Branch a copy instead: hcom f {name}\n  Or stop it first:     hcom kill {name}"
+                );
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
                 load_instance_data(db, name)?
             } else {
                 load_stopped_snapshot(db, name)?
             };
+            let tool = resolve_adhoc_resume_tool(name, tool, &sid, fork)?;
             (tool, sid, largs, tag, bg, leid, snap, name.to_string())
         }
         ResumeSource::Disk {
@@ -439,10 +442,6 @@ fn prepare_resume_plan_from_source(
     };
 
     let mut merged_args = merged_cli_args.clone();
-
-    if launch_flags.headless && tool != "claude" && tool != "kimi" {
-        bail!("--headless is only supported for Claude and Kimi resume/fork launches");
-    }
 
     let launch_tool = crate::launcher::LaunchTool::from_str(&tool)?;
     let is_headless =
@@ -774,6 +773,26 @@ fn should_preview_resume(
     !tool_args.is_empty() || *launch_flags != crate::commands::launch::HcomLaunchFlags::default()
 }
 
+/// A direct Claude/Codex run that joined with `hcom start` is stored as
+/// `adhoc` but keeps its native session id. Resolve the owning tool from the
+/// transcript on disk so resume/fork relaunches that session under hcom (with
+/// hooks) under the same name.
+fn resolve_adhoc_resume_tool(name: &str, tool: String, sid: &str, fork: bool) -> Result<String> {
+    if tool != "adhoc" {
+        return Ok(tool);
+    }
+    let op = if fork { "fork" } else { "resume" };
+    if sid.is_empty() {
+        bail!("'{name}' joined ad-hoc with no native session, so there is nothing to {op}");
+    }
+    match find_session_on_disk(sid) {
+        Some((tool, _)) => Ok(tool),
+        None => bail!(
+            "'{name}' joined ad-hoc from session {sid}, but no transcript for it was found, so hcom cannot tell which tool to {op}"
+        ),
+    }
+}
+
 fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
     let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
     let parsed = tool_lookup
@@ -978,9 +997,10 @@ fn load_stopped_snapshot(
         }
     }
 
+    let known = crate::identity::known_agent_names(db);
     bail!(
-        "No stopped snapshot found for '{name}'. Not a known hcom instance, \
-         session UUID, or recognized thread name."
+        "No agent named '{name}' to resume (not a known hcom agent, session UUID, or thread name){}\n  Stopped agents: hcom list --stopped",
+        crate::shared::suggest::did_you_mean(name, known.iter().map(String::as_str))
     )
 }
 
@@ -1066,12 +1086,12 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
         "--output-format",
         "--disallowed-tools",
         "--tools",
-        "--allow",
-        "--deny",
         "--sandbox",
-        "--leader-socket",
         "--debug-file",
         "--system-prompt-override",
+        "--system-prompt",
+        "--agents",
+        "--json-schema",
     ];
     const DROP_WITH_VALUE: &[&str] = &[
         "--resume",
@@ -1865,7 +1885,12 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
-    // 8. Pi / OMP. Attribute by root PROVENANCE, not probe order:
+    // 8. Grok
+    if let Some(path) = derive_grok_transcript_path(session_id) {
+        return Some(("grok".to_string(), Some(path)));
+    }
+
+    // 9. Pi / OMP. Attribute by root PROVENANCE, not probe order:
     //   - `PI_CODING_AGENT_SESSION_DIR` + `~/.pi`            => Pi-exclusive
     //   - XDG-omp / `~/.omp` / OMP profile trees             => OMP-exclusive
     //   - `PI_CODING_AGENT_DIR/sessions`                     => genuinely shared
@@ -2087,6 +2112,27 @@ fn derive_copilot_transcript_path(session_id: &str) -> Option<String> {
     }
 }
 
+/// Grok keeps each session in `$GROK_HOME/sessions/<url-encoded cwd>/<id>/`.
+fn derive_grok_transcript_path(session_id: &str) -> Option<String> {
+    let sessions = crate::hooks::grok::grok_config_dir().join("sessions");
+    std::fs::read_dir(sessions)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(session_id).join("updates.jsonl"))
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Grok's `summary.json`, next to `updates.jsonl`, records the session cwd.
+fn recover_grok_cwd(transcript_path: &str) -> Option<String> {
+    let summary = std::path::Path::new(transcript_path)
+        .parent()?
+        .join("summary.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(summary).ok()?).ok()?;
+    value["info"]["cwd"].as_str().map(str::to_string)
+}
+
 /// cursor transcripts carry no `cwd`, so recover it from the per-workspace
 /// `.workspace-trusted` marker cursor writes at
 /// `~/.cursor/projects/<slug>/.workspace-trusted` (`workspacePath` field). The
@@ -2146,6 +2192,7 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
         "gemini" | "antigravity" => recover_gemini_cwd(path),
         "cursor" => recover_cursor_cwd(path),
         "kimi" => None, // Kimi context.jsonl does not store cwd
+        "grok" => recover_grok_cwd(path),
         "copilot" => scan_lines_for_cwd(path, 20, |v| {
             v.get("event")
                 .or_else(|| v.get("type"))
@@ -2289,6 +2336,7 @@ fn build_adopt_plan(
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
+                 - Grok:     ~/.grok/sessions/*/{sid}/updates.jsonl\n  \
                  - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
                  - Pi:       ~/.pi/agent/sessions/**/*{sid}*.jsonl",
                 sid = session_id,
@@ -3199,6 +3247,31 @@ mod tests {
     }
 
     #[test]
+    fn test_headless_fork_allowed_for_non_claude_tools() {
+        // Every tool runs headless via the PTY runner, so `hcom f <x> --headless`
+        // must not be gated to Claude.
+        let db = test_db();
+        for (name, tool) in [("luna", "codex"), ("nova", "opencode"), ("pira", "pi")] {
+            let mut data = serde_json::Map::new();
+            data.insert("session_id".into(), json!(format!("{tool}-session")));
+            data.insert("tool".into(), json!(tool));
+            data.insert("status".into(), json!("listening"));
+            data.insert("created_at".into(), json!(1.0));
+            db.save_instance_named(name, &data).unwrap();
+
+            let plan = prepare_resume_plan(
+                &db,
+                name,
+                true,
+                &s(&["--headless"]),
+                &GlobalFlags::default(),
+            )
+            .unwrap_or_else(|e| panic!("{tool} headless fork rejected: {e}"));
+            assert!(plan.launch.background, "{tool} fork should be headless");
+        }
+    }
+
+    #[test]
     fn test_tracked_fork_plan_does_not_reserve_until_execution() {
         let db = test_db();
         let mut data = serde_json::Map::new();
@@ -3414,6 +3487,34 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn adhoc_resume_resolves_tool_from_native_session() {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let projects = cfg_dir.path().join("projects/proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("sid-plain.jsonl"), "{}\n").unwrap();
+
+        with_claude_config_dir(cfg_dir.path(), || {
+            assert_eq!(
+                resolve_adhoc_resume_tool("vibe", "adhoc".into(), "sid-plain", false).unwrap(),
+                "claude"
+            );
+            let err = resolve_adhoc_resume_tool("vibe", "adhoc".into(), "sid-gone", true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no transcript"), "got: {err}");
+        });
+        let err = resolve_adhoc_resume_tool("vibe", "adhoc".into(), "", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no native session"), "got: {err}");
+        assert_eq!(
+            resolve_adhoc_resume_tool("vibe", "codex".into(), "", false).unwrap(),
+            "codex"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_resolve_claude_thread_name_prefers_last_custom_title() {
         // A session renamed A → B → C must match for C (the current title),
         // not A or B (obsolete).
@@ -3480,7 +3581,7 @@ mod tests {
         // Remote-RPC entrypoint must walk the UUID/thread-name resolution
         // chain. A UUID with no on-disk transcript should error with the
         // adoption "Session not found" message (proving we hit find_session_on_disk),
-        // not the name-based "No stopped snapshot found" message.
+        // not the name-based "No agent named ... to resume" message.
         let db = test_db();
         let err = run_local_resume_result(
             &db,

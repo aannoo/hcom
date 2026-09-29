@@ -8,7 +8,6 @@
 //! finalization. The bodies are byte-for-byte the Unix originals apart from the
 //! `self.X` → parameter substitution; the Unix correctness rests on that.
 
-use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
@@ -89,6 +88,9 @@ pub(super) fn update_delivery_state(
         state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
             && (screen.is_claude_subagent_nav_visible()
                 || screen.is_claude_session_switcher_visible());
+        state.startup_loading = matches!(target.known_tool(), Some(Tool::Codex))
+            && launch_phase_active.load(Ordering::Acquire)
+            && screen.is_codex_startup_loading();
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {
@@ -159,7 +161,6 @@ pub(super) fn note_user_keystroke(
     let mut approval_cleared = false;
     if let Ok(mut state) = screen_state.write() {
         state.last_user_input = Instant::now();
-        state.user_input_seen = true;
         if !cursor_scrape {
             approval_cleared = state.approval;
             state.approval = false;
@@ -169,60 +170,6 @@ pub(super) fn note_user_keystroke(
         publish(false);
     }
     approval_cleared
-}
-
-pub(super) fn grok_unattended_surface(target: &PtyTarget) -> bool {
-    matches!(target.known_tool(), Some(Tool::Grok))
-        && crate::shared::context::HcomContext::from_os().is_background
-        && !std::io::stdin().is_terminal()
-}
-
-/// Raw TCP input includes `hcom term inject`; it is never an internal wake.
-pub(super) fn note_external_grok_input(
-    target: &PtyTarget,
-    state: &Arc<RwLock<ScreenState>>,
-    text: &str,
-) {
-    if matches!(target.known_tool(), Some(Tool::Grok))
-        && !text.is_empty()
-        && let Ok(mut screen) = state.write()
-    {
-        screen.user_input_seen = true;
-        screen.last_user_input = Instant::now();
-    }
-}
-
-/// Caller serializes this write with stdin/raw injections (the Unix poll loop
-/// or Windows writer mutex). Keep ownership stable until the bytes are written.
-pub(super) fn write_grok_wake(
-    target: &PtyTarget,
-    state: &Arc<RwLock<ScreenState>>,
-    unattended: bool,
-    enter: bool,
-    write: impl FnOnce(&[u8]) -> bool,
-) -> bool {
-    if !matches!(target.known_tool(), Some(Tool::Grok)) {
-        return false;
-    }
-    let Ok(screen) = state.read() else {
-        return false;
-    };
-    let expected = if enter {
-        crate::delivery::GROK_WAKE_TRIGGER
-    } else {
-        ""
-    };
-    if screen.approval
-        || screen.last_user_input.elapsed().as_millis() < USER_ACTIVITY_COOLDOWN_MS as u128
-        || !crate::delivery::grok_prompt_owned(&screen, unattended, expected)
-    {
-        return false;
-    }
-    write(if enter {
-        b"\r"
-    } else {
-        crate::delivery::GROK_WAKE_TRIGGER.as_bytes()
-    })
 }
 
 /// Publish PTY approval edges independently of the delivery queue.
@@ -469,7 +416,6 @@ pub(super) fn start_delivery_thread(
         // Create delivery state wrapper
         let state = DeliveryState {
             screen: delivery_state,
-            grok_unattended: grok_unattended_surface(&target),
             grok_acp,
             launch_phase_active,
             inject_port,
@@ -1352,111 +1298,6 @@ mod tests {
         let esc = build_title_escape("luna", "active", "codex", TitleMode::Combined, None);
         let title = format!("{} luna", icon);
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
-    }
-
-    #[test]
-    fn grok_wake_wire_protocol_preserves_workers_and_blocks_operator_drafts() {
-        use crate::pty::inject::{InjectResult, InjectServer, QueryCommand};
-        use std::io::Write;
-        use std::net::TcpStream;
-        use std::sync::Mutex;
-
-        for takeover in [false, true] {
-            let mut server = InjectServer::new().unwrap();
-            let port = server.port();
-            let captured = Arc::new(Mutex::new(Vec::new()));
-            let output = captured.clone();
-            let worker = std::thread::spawn(move || {
-                let target = PtyTarget::Known(Tool::Grok);
-                let state = Arc::new(RwLock::new(ScreenState {
-                    last_user_input: Instant::now() - Duration::from_secs(60),
-                    ..ScreenState::default()
-                }));
-                let expected = if takeover { 3 } else { 2 };
-                let mut received = 0;
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while received < expected && Instant::now() < deadline {
-                    while server.accept().unwrap() {}
-                    match server.read_client(0).unwrap() {
-                        InjectResult::Query(client) => {
-                            let enter = match client.command {
-                                QueryCommand::GrokWake => false,
-                                QueryCommand::GrokEnter => true,
-                                _ => panic!("unexpected command"),
-                            };
-                            let sent = write_grok_wake(&target, &state, true, enter, |bytes| {
-                                output.lock().unwrap().extend_from_slice(bytes);
-                                true
-                            });
-                            client.respond(if sent { "ok\n" } else { "error: not owned\n" });
-                            received += 1;
-                        }
-                        InjectResult::Inject(text) => {
-                            note_external_grok_input(&target, &state, &text);
-                            output.lock().unwrap().extend_from_slice(text.as_bytes());
-                            // Model an old, untouched draft: expiry cannot rearm wake.
-                            state.write().unwrap().last_user_input =
-                                Instant::now() - Duration::from_secs(60);
-                            received += 1;
-                        }
-                        InjectResult::Pending => std::thread::sleep(Duration::from_millis(1)),
-                    }
-                }
-                assert_eq!(received, expected);
-            });
-            assert!(crate::delivery::inject_grok_command(port, false));
-            if takeover {
-                let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
-                raw.write_all(b"private draft").unwrap();
-            }
-            assert_eq!(crate::delivery::inject_grok_command(port, true), !takeover);
-            worker.join().unwrap();
-            assert_eq!(
-                captured.lock().unwrap().as_slice(),
-                if takeover {
-                    b"hcom: wakeprivate draft".as_slice()
-                } else {
-                    b"hcom: wake\r".as_slice()
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn grok_write_boundary_rejects_unknown_interactive_prompt_and_other_tools() {
-        let state = Arc::new(RwLock::new(ScreenState {
-            last_user_input: Instant::now() - Duration::from_secs(60),
-            ..ScreenState::default()
-        }));
-        for enter in [false, true] {
-            assert!(!write_grok_wake(
-                &PtyTarget::Known(Tool::Grok),
-                &state,
-                false,
-                enter,
-                |_| panic!("must not write")
-            ));
-            assert!(!write_grok_wake(
-                &PtyTarget::Known(Tool::Claude),
-                &state,
-                true,
-                enter,
-                |_| panic!("must not write")
-            ));
-        }
-    }
-
-    #[test]
-    fn grok_user_input_is_sticky_after_typing_cooldown() {
-        let target = PtyTarget::Known(Tool::Grok);
-        let screen = Arc::new(RwLock::new(ScreenState::default()));
-        assert!(!screen.read().unwrap().user_input_seen);
-        note_user_keystroke(&target, &screen, &|_| {});
-        {
-            let mut state = screen.write().unwrap();
-            state.last_user_input = Instant::now() - Duration::from_secs(60);
-        }
-        assert!(screen.read().unwrap().user_input_seen);
     }
 
     #[test]

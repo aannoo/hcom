@@ -16,11 +16,29 @@ $cache = if ($env:HCOM_MOCK_TOOLS_NPM_CACHE) {
     Join-Path $root "target/npm-cache"
 }
 
-if (-not $Packages -or $Packages.Count -eq 0) {
-    $Packages = @(
-        "@openai/codex@0.145.0",
-        "@anthropic-ai/claude-code@2.1.216"
-    )
+# Pinned `<package>@<version>` specs; comments and blank lines skipped.
+$pins = @(Get-Content (Join-Path $PSScriptRoot "mock-tools.pins") |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -and -not $_.StartsWith("#") })
+
+function Get-Pin([string] $package) {
+    $pin = $pins | Where-Object { $_.StartsWith("$package@") } | Select-Object -First 1
+    if (-not $pin) { throw "no pin for $package in scripts/mock-tools.pins" }
+    $pin
+}
+
+# No args installs every pin. An arg is a tool name (`codex`, `claude`) that
+# resolves to its pin, or an explicit npm spec used as given.
+$Packages = if (-not $Packages -or $Packages.Count -eq 0) {
+    $pins
+} else {
+    @($Packages | ForEach-Object {
+        switch ($_) {
+            "codex" { Get-Pin "@openai/codex" }
+            { $_ -in "claude", "@anthropic-ai/claude-code" } { Get-Pin "@anthropic-ai/claude-code" }
+            default { $_ }
+        }
+    })
 }
 
 New-Item -ItemType Directory -Force $prefix, $cache | Out-Null
@@ -64,7 +82,7 @@ $pinned = @(Get-PinnedTools $Packages)
 
 # Skip the install when every pin is already satisfied. npm rewrites the whole
 # package tree, which fails with EBUSY/EPERM if any agent still has the native
-# binary mapped — and on a dev box `just windows-ci` is normally run with agents
+# binary mapped — and on a dev box `just ci` is normally run with agents
 # alive. A no-op install must not be the reason the gate cannot run. CI restores
 # this prefix from a version-keyed cache, so it takes the same fast path.
 $needsInstall = $false
