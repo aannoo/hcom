@@ -67,11 +67,13 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Transcript**: cursor-agent writes JSONL under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Parser support is limited: no timestamps, `cwd`, or tool-result blocks; user prompts require wrapper removal.
 
 ### Grok Build
-- **Hooks** (status only): SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, StopFailure, StopCancelled, SessionEnd in `$GROK_HOME/hooks/hcom.json` (default `~/.grok`). Persistent: Grok has no per-run hook source.
-- **Bootstrap**: `--rules` at launch (hook output never reaches the model).
+- **Hooks**: none. hcom installs nothing for Grok; binding, status and delivery all come over the ACP client on hcom's private leader.
+- **Session binding**: from the leader's session roster (every resident session on the private leader is the TUI's). A session that newly opens idle (`/new`, `/resume` from disk) is bound at once; switching to an already-open session (dashboard, `/resume`) emits nothing, so hcom follows it when a user prompt starts there.
+- **Status**: from the bound session's broadcasts: queue (turn start), `tool_call`, `pending_interaction` (blocked after 1s unanswered), `turn_completed` (stop reason; anything but end_turn/cancelled is `failure:<reason>`).
+- **Bootstrap**: `--rules` at launch.
 - **Message delivery**: `hcom grok` runs the TUI on a private leader socket; a second client (`grok agent --leader stdio`) queues each batch as a normal prompt (`sendNow:false`). Nothing is typed into the composer, drafts are untouched, and a busy agent runs the batch after its current work. The batch is acked when Grok starts running it; one dropped before it ran (removed from the queue, transport lost) stays unread and is queued again.
 - **Session id**: a new `hcom grok` gets `--session-id <uuid>`. Without it the TUI sits on its welcome screen over a hidden session and never draws turns queued there.
-- **Permissions**: the TUI answers them; hcom shows the agent as blocked while one is open.
+- **Permissions**: the TUI answers them.
 - **Rejected flags**: `-p`/`--single`/`--prompt-file`/`--prompt-json` (one-shot), leader flags (hcom owns the leader), and `--allow`/`--deny`/`--disable-web-search` (Grok ignores them in leader mode; put rules in Grok's config). `--no-subagents` is passed as `GROK_SUBAGENTS=0`.
 - **Resume/fork**: `--resume` / `--fork-session`; worktree flags are not replayed. `hcom r <session-id>` finds sessions under `$GROK_HOME/sessions`.
 - **Transcript**: `$GROK_HOME/sessions/<url-encoded cwd>/<id>/updates.jsonl`.

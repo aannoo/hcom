@@ -236,6 +236,10 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             // agent that ran `hcom N <tool>`) is notified immediately instead
             // of waiting on the generic stale-placeholder timeout.
             log::log_error("pty", "spawn_failed", &format!("{err:#}"));
+            // Grok may have started its persistent leader before the failure.
+            if let Some(launch) = grok_leader.as_ref() {
+                launch.stop_leader();
+            }
             if let Some(name) = instance_name_for_failure.as_deref()
                 && let Ok(db) = db::HcomDb::open()
                 && let Ok(Some(instance)) = db.get_instance_full(name)

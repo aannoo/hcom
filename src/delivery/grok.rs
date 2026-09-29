@@ -59,6 +59,8 @@ const ROSTER_SLOW_POLL: Duration = Duration::from_secs(15);
 /// Wait before re-queueing a batch whose prompt was dropped before it ran
 /// (user removed it from the queue, prompt error, transport lost).
 const REQUEUE_DELAY: Duration = Duration::from_secs(10);
+/// Wait before loading the bound session again after a failed load.
+const LOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Grok raises an approval for every gated tool call and its permission rules
 /// often answer it within milliseconds; only one still open is `blocked`.
 const BLOCKED_GRACE: Duration = Duration::from_secs(1);
@@ -408,6 +410,9 @@ struct Tracker {
     running: HashMap<String, String>,
     /// For restoring the tool status once an approval is answered.
     last_tool: Option<(String, Value)>,
+    /// Open approvals/questions (by tool call id) in the bound session and
+    /// its subagents; the turn stays blocked until all are answered.
+    interactions: HashSet<String>,
 }
 
 fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -438,6 +443,7 @@ impl Tracker {
     fn bind(&mut self, session: &str, cwd: &str) -> Effect {
         self.bound = Some(session.to_string());
         self.last_tool = None;
+        self.interactions.clear();
         Effect::Bind {
             session: session.to_string(),
             cwd: cwd.to_string(),
@@ -448,6 +454,7 @@ impl Tracker {
     fn reconnected(&mut self) {
         self.resident = None;
         self.running.clear();
+        self.interactions.clear();
     }
 
     fn on_roster(&mut self, sessions: &[Value]) -> Vec<Effect> {
@@ -570,6 +577,11 @@ impl Tracker {
                 let ours = self.is_bound(session) || self.children.contains(session);
                 match kind {
                     "pending_interaction" if ours => {
+                        self.interactions.insert(
+                            str_of(update, "tool_call_id")
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
                         let what = match update["kind"].as_str() {
                             Some("permission") | None => "approval",
                             Some(other) => other,
@@ -577,6 +589,11 @@ impl Tracker {
                         vec![Effect::Status(Status::Blocked(what.to_string()))]
                     }
                     "interaction_resolved" if ours => {
+                        self.interactions
+                            .remove(str_of(update, "tool_call_id").unwrap_or_default());
+                        if !self.interactions.is_empty() {
+                            return Vec::new();
+                        }
                         vec![Effect::Status(match self.last_tool.clone() {
                             Some((name, input)) => Status::Tool { name, input },
                             None => Status::Prompt,
@@ -704,7 +721,15 @@ fn roster_sessions(result: &Value) -> &[Value] {
 }
 
 /// Point the instance at `session`, as a hook-based SessionStart would.
-fn apply_bind(db: &HcomDb, process_id: &str, current_name: &str, session: &str, cwd: &str) {
+/// Returns the instance name, which a switch to a session bound to another
+/// identity changes.
+fn apply_bind(
+    db: &HcomDb,
+    process_id: &str,
+    current_name: &str,
+    session: &str,
+    cwd: &str,
+) -> String {
     let first = db
         .get_instance_full(current_name)
         .ok()
@@ -737,6 +762,7 @@ fn apply_bind(db: &HcomDb, process_id: &str, current_name: &str, session: &str, 
         "grok.acp.bound",
         &format!("instance={name} session={session}"),
     );
+    name
 }
 
 fn apply_status(db: &HcomDb, name: &str, status: &Status) {
@@ -778,6 +804,7 @@ pub(super) fn run(
     let mut roster_fast_until = Instant::now();
     let mut in_flight: Option<InFlight> = None;
     let mut approval_since: Option<(Instant, String)> = None;
+    let mut load_retry_at = Instant::now();
     let mut current_status = ST_LISTENING.to_string();
     let mut heartbeat = Instant::now();
     let mut connect_failures: u32 = 0;
@@ -900,11 +927,14 @@ pub(super) fn run(
                             }
                         },
                         Some(Pending::Load(session)) => match value.get("error") {
-                            Some(error) => log_warn(
-                                "native",
-                                "grok.acp.load_failed",
-                                &format!("session={session}: {error}"),
-                            ),
+                            Some(error) => {
+                                load_retry_at = Instant::now() + LOAD_RETRY_DELAY;
+                                log_warn(
+                                    "native",
+                                    "grok.acp.load_failed",
+                                    &format!("session={session}: {error}"),
+                                )
+                            }
                             None => {
                                 loaded.insert(session);
                             }
@@ -943,7 +973,7 @@ pub(super) fn run(
                     } else {
                         cwd
                     };
-                    apply_bind(db, process_id, current_name, &session, &cwd);
+                    *current_name = apply_bind(db, process_id, current_name, &session, &cwd);
                 }
                 Effect::Load { session, cwd } => {
                     if loaded.contains(&session)
@@ -1053,6 +1083,40 @@ pub(super) fn run(
             continue;
         };
         // The bound session must be loaded, or its queue events never arrive.
+        // Other sessions only matter once they are bound, so only this one
+        // is retried.
+        if let Some(session) = tracker.bound.clone()
+            && !loaded.contains(&session)
+            && !pending
+                .values()
+                .any(|p| matches!(p, Pending::Load(s) if *s == session))
+            && Instant::now() >= load_retry_at
+        {
+            let cwd = tracker
+                .resident
+                .as_ref()
+                .and_then(|resident| resident.get(&session))
+                .filter(|cwd| !cwd.is_empty())
+                .cloned()
+                .unwrap_or_else(|| instance.directory.clone());
+            load_retry_at = Instant::now() + LOAD_RETRY_DELAY;
+            match conn.send(
+                "session/load",
+                json!({"sessionId": session, "cwd": cwd, "mcpServers": [],
+                       "_meta": {"noReplay": true}}),
+            ) {
+                Ok(id) => {
+                    pending.insert(id, Pending::Load(session));
+                }
+                Err(error) => {
+                    log_warn("native", "grok.acp.write_failed", &format!("{error:#}"));
+                    client = None;
+                    retry_at = Instant::now() + Duration::from_secs(1);
+                    notify.wait(POLL);
+                    continue;
+                }
+            }
+        }
         let target = tracker.bound.clone().filter(|s| loaded.contains(s));
         if let Some(session) = target
             && in_flight.is_none()
@@ -1385,6 +1449,34 @@ mod tests {
             [Effect::Status(Status::Listening(
                 "failure:overloaded".into()
             ))]
+        );
+    }
+
+    #[test]
+    fn blocked_until_every_open_interaction_is_answered() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 1)]);
+        tracker.on_notification(
+            "x.ai/session_notification",
+            &note(
+                "a",
+                json!({"sessionUpdate": "subagent_spawned", "child_session_id": "kid"}),
+            ),
+        );
+        for (session, id) in [("a", "t1"), ("kid", "t2")] {
+            let ask = json!({"sessionUpdate": "pending_interaction", "kind": "permission", "tool_call_id": id});
+            tracker.on_notification("x.ai/session_notification", &note(session, ask));
+        }
+        let resolved =
+            |id: &str| json!({"sessionUpdate": "interaction_resolved", "tool_call_id": id});
+        assert!(
+            tracker
+                .on_notification("x.ai/session_notification", &note("a", resolved("t1")))
+                .is_empty()
+        );
+        assert_eq!(
+            tracker.on_notification("x.ai/session_notification", &note("kid", resolved("t2"))),
+            [Effect::Status(Status::Prompt)]
         );
     }
 
