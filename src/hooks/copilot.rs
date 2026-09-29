@@ -570,7 +570,9 @@ fn handle_permissionrequest(_db: &HcomDb, _ctx: &HcomContext, payload: &HookPayl
         .or_else(|| payload.tool_input.get("script"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if matches!(payload.tool_name.as_str(), "bash" | "powershell" | "shell")
+    // POSIX shells only: the check parses POSIX quoting, and PowerShell
+    // reads a backslash-escaped `;` as a statement separator.
+    if (payload.tool_name == "bash" || (payload.tool_name == "shell" && !cfg!(windows)))
         && command_looks_safe_hcom(command)
     {
         json!({ "behavior": "allow", "message": "hcom coordination command" })

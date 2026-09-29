@@ -395,9 +395,13 @@ fn permission_option(params: &Value, kind: &str) -> Option<String> {
 fn permission_command(params: &Value) -> Option<&str> {
     let call = &params["toolCall"];
     let input = &call["rawInput"];
-    let shell = call["kind"] == "execute"
-        || matches!(input["variant"].as_str(), Some("Bash" | "PowerShell"));
-    shell.then(|| str_of(input, "command")).flatten()
+    // POSIX shell only: `is_safe_hcom_command` parses POSIX quoting, and
+    // PowerShell reads `\;` as a separator, so it never auto-approves.
+    let posix = match input["variant"].as_str() {
+        Some(variant) => variant == "Bash",
+        None => call["kind"] == "execute" && !cfg!(windows),
+    };
+    posix.then(|| str_of(input, "command")).flatten()
 }
 
 // ── Session tracking ────────────────────────────────────────────────────
@@ -441,8 +445,9 @@ struct Tracker {
     /// Visible resident sessions (id → cwd) at the last roster; `None` before
     /// the first roster of a connection.
     resident: Option<HashMap<String, String>>,
-    /// Subagent sessions; their events never touch the instance's binding.
-    children: HashSet<String>,
+    /// Subagent session → the session that spawned it. Subagents never bind;
+    /// only the bound session's own subagents speak for it.
+    children: HashMap<String, String>,
     /// Each session's running queue entry, to see turn starts once.
     running: HashMap<String, String>,
     /// For restoring the tool status once an approval is answered.
@@ -500,7 +505,7 @@ impl Tracker {
             .filter(|entry| entry["resident"] == true)
             .filter_map(|entry| {
                 let id = str_of(entry, "sessionId")?;
-                (!self.children.contains(id)).then(|| {
+                (!self.children.contains_key(id)).then(|| {
                     (
                         id.to_string(),
                         RosterEntry {
@@ -564,7 +569,7 @@ impl Tracker {
         };
         let session = str_of(params, "sessionId").unwrap_or_default();
         // A subagent waiting on a human blocks its parent's turn too.
-        if !self.is_bound(session) && !self.children.contains(session) {
+        if !self.speaks_for_bound(session) {
             return Vec::new();
         }
         let call = params
@@ -579,8 +584,24 @@ impl Tracker {
     /// Whether a permission request belongs to the bound session or its
     /// subagents, i.e. is hcom's to auto-approve.
     fn owns(&self, params: &Value) -> bool {
-        let session = str_of(params, "sessionId").unwrap_or_default();
-        self.is_bound(session) || self.children.contains(session)
+        self.speaks_for_bound(str_of(params, "sessionId").unwrap_or_default())
+    }
+
+    /// The bound session itself, or a subagent (at any depth) it spawned. A
+    /// subagent of a session the TUI switched away from is not.
+    fn speaks_for_bound(&self, session: &str) -> bool {
+        let mut current = session;
+        // Bounded walk: spawn records cannot form a cycle, but never trust that.
+        for _ in 0..16 {
+            if self.is_bound(current) {
+                return true;
+            }
+            match self.children.get(current) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
     }
 
     fn on_notification(&mut self, method: &str, params: &Value) -> Vec<Effect> {
@@ -611,7 +632,7 @@ impl Tracker {
                     .and_then(|resident| resident.get(session))
                     .cloned();
                 match cwd {
-                    Some(cwd) if !self.children.contains(session) => {
+                    Some(cwd) if !self.children.contains_key(session) => {
                         vec![self.bind(session, &cwd), Effect::Status(Status::Prompt)]
                     }
                     _ => Vec::new(),
@@ -637,7 +658,7 @@ impl Tracker {
                 let kind = update["sessionUpdate"].as_str().unwrap_or_default();
                 if kind == "subagent_spawned" {
                     if let Some(child) = str_of(update, "child_session_id") {
-                        self.children.insert(child.to_string());
+                        self.children.insert(child.to_string(), session.to_string());
                     }
                     return Vec::new();
                 }
@@ -681,7 +702,7 @@ impl Tracker {
                     .flatten()
                     .filter_map(|entry| str_of(entry, "sessionId"))
                     .any(|id| {
-                        !self.children.contains(id)
+                        !self.children.contains_key(id)
                             && self
                                 .resident
                                 .as_ref()
@@ -1186,6 +1207,18 @@ pub(super) fn run(
                 other => other,
             };
             match outcome {
+                Outcome::Delivered if flight.ack.instance_name != *current_name => {
+                    // Queued under an identity a session switch retired: its
+                    // messages were delivered, but status belongs to the
+                    // current identity, so don't revive the old row.
+                    if let Err(error) = db.ack_hook_delivery(
+                        &flight.ack.instance_name,
+                        flight.ack.last_event_id,
+                        flight.ack.mark_announced,
+                    ) {
+                        log_warn("native", "grok.acp.ack_failed", &format!("{error}"));
+                    }
+                }
                 Outcome::Delivered => {
                     common::commit_delivery_ack(db, &flight.ack);
                     log_info(
@@ -1507,6 +1540,9 @@ mod tests {
         );
         let edit = json!({"toolCall": {"kind": "edit", "rawInput": {"command": "hcom list"}}});
         assert_eq!(permission_command(&edit), None);
+        let powershell = json!({"toolCall": {"kind": "execute",
+            "rawInput": {"variant": "PowerShell", "command": "hcom list \\; Write-Output x"}}});
+        assert_eq!(permission_command(&powershell), None);
     }
 
     #[test]
@@ -1654,6 +1690,36 @@ mod tests {
             [Effect::Status(Status::Listening(
                 "failure:overloaded".into()
             ))]
+        );
+    }
+
+    #[test]
+    fn subagents_of_a_session_left_behind_are_not_ours() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "idle", 1)]);
+        tracker.on_notification(
+            "x.ai/session_notification",
+            &note(
+                "a",
+                json!({"sessionUpdate": "subagent_spawned", "child_session_id": "kid"}),
+            ),
+        );
+        tracker.on_notification(
+            "x.ai/session_notification",
+            &note(
+                "kid",
+                json!({"sessionUpdate": "subagent_spawned", "child_session_id": "grandkid"}),
+            ),
+        );
+        assert!(tracker.owns(&json!({"sessionId": "grandkid"})));
+        // /new: b is bound, a's subagents keep running.
+        tracker.on_roster(&[entry("a", "working", 1), entry("b", "idle", 2)]);
+        assert_eq!(tracker.bound.as_deref(), Some("b"));
+        assert!(!tracker.owns(&json!({"sessionId": "kid"})));
+        assert!(
+            tracker
+                .on_request("session/request_permission", &ask("kid", "t1"))
+                .is_empty()
         );
     }
 
