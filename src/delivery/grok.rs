@@ -1525,7 +1525,7 @@ mod tests {
 
     fn ask(session: &str, call: &str) -> Value {
         json!({"sessionId": session, "toolCall": {"toolCallId": call, "kind": "execute",
-               "rawInput": {"command": "hcom list"}},
+               "rawInput": {"variant": "Bash", "command": "hcom list"}},
                "options": [{"optionId": "allow-once", "kind": "allow_once"},
                            {"optionId": "reject-once", "kind": "reject_once"}]})
     }
