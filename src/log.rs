@@ -123,9 +123,11 @@ pub fn log_with_fields(
         Err(_) => return,
     };
 
-    // Append to file (atomic for ≤4KB on APFS/ext4)
+    // One write per line: O_APPEND keeps a single small write whole, but
+    // `writeln!` issues the line and its newline separately, which
+    // interleaves with other processes (`…}{…` lines).
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{}", log_line);
+        let _ = file.write_all(format!("{log_line}\n").as_bytes());
     }
 }
 

@@ -61,9 +61,6 @@ const ROSTER_SLOW_POLL: Duration = Duration::from_secs(15);
 const REQUEUE_DELAY: Duration = Duration::from_secs(10);
 /// Wait before loading the bound session again after a failed load.
 const LOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
-/// Grok raises an approval for every gated tool call and its permission rules
-/// often answer it within milliseconds; only one still open is `blocked`.
-const BLOCKED_GRACE: Duration = Duration::from_secs(1);
 /// Prompts hcom queues carry this `promptId` prefix.
 const HCOM_PROMPT_ID_PREFIX: &str = "hcom-";
 /// Leader-mode Grok ignores these (it warns and continues). Since hcom must
@@ -191,6 +188,14 @@ enum Event {
         method: String,
         params: Value,
     },
+    /// A request from Grok. Shared interactions (permission, question, plan
+    /// approval) reach every client, first answer wins; the TUI answers them
+    /// unless hcom auto-approves.
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     Closed(String),
 }
 
@@ -303,6 +308,17 @@ impl Client {
         Ok(id)
     }
 
+    /// Answer a request from Grok.
+    fn respond(&mut self, id: Value, result: Value) -> Result<()> {
+        serde_json::to_writer(
+            &mut self.input,
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )?;
+        self.input.write_all(b"\n")?;
+        self.input.flush()?;
+        Ok(())
+    }
+
     /// Blocking request; only for the handshake, before anything else is in
     /// flight (other events are discarded while waiting).
     fn request(
@@ -342,11 +358,6 @@ fn classify_event(value: Value) -> Option<Event> {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return value.get("id").is_some().then_some(Event::Response(value));
     };
-    // A request from Grok (permission prompt, question, ...): shared
-    // interactions go to every client and the TUI answers them.
-    if value.get("id").is_some() {
-        return None;
-    }
     let mut params = value.get("params").cloned().unwrap_or(Value::Null);
     let method = match method.strip_prefix('_') {
         // Gateway-wrapped ext: `{"method":"_x.ai/foo","params":{"method":"x.ai/foo","params":{…}}}`.
@@ -360,7 +371,33 @@ fn classify_event(value: Value) -> Option<Event> {
         },
         None => method.to_string(),
     };
-    Some(Event::Notification { method, params })
+    Some(match value.get("id") {
+        Some(id) => Event::Request {
+            id: id.clone(),
+            method,
+            params,
+        },
+        None => Event::Notification { method, params },
+    })
+}
+
+/// The `session/request_permission` option id of the given kind.
+fn permission_option(params: &Value, kind: &str) -> Option<String> {
+    params["options"]
+        .as_array()?
+        .iter()
+        .find(|option| option["kind"] == kind)
+        .and_then(|option| str_of(option, "optionId"))
+        .map(str::to_string)
+}
+
+/// The shell command a permission request is for, if it is one.
+fn permission_command(params: &Value) -> Option<&str> {
+    let call = &params["toolCall"];
+    let input = &call["rawInput"];
+    let shell = call["kind"] == "execute"
+        || matches!(input["variant"].as_str(), Some("Bash" | "PowerShell"));
+    shell.then(|| str_of(input, "command")).flatten()
 }
 
 // ── Session tracking ────────────────────────────────────────────────────
@@ -515,6 +552,37 @@ impl Tracker {
         effects
     }
 
+    /// A shared interaction Grok is asking a human about. Only these block:
+    /// approvals Grok decides itself never reach the prompter.
+    fn on_request(&mut self, method: &str, params: &Value) -> Vec<Effect> {
+        let what = match method {
+            "session/request_permission" => "approval",
+            "x.ai/ask_user_question" => "question",
+            "x.ai/exit_plan_mode" => "plan_approval",
+            "x.ai/mcp/elicit" => "mcp_input",
+            _ => return Vec::new(),
+        };
+        let session = str_of(params, "sessionId").unwrap_or_default();
+        // A subagent waiting on a human blocks its parent's turn too.
+        if !self.is_bound(session) && !self.children.contains(session) {
+            return Vec::new();
+        }
+        let call = params
+            .pointer("/toolCall/toolCallId")
+            .and_then(Value::as_str)
+            .or_else(|| str_of(params, "toolCallId"))
+            .unwrap_or(method);
+        self.interactions.insert(call.to_string());
+        vec![Effect::Status(Status::Blocked(what.to_string()))]
+    }
+
+    /// Whether a permission request belongs to the bound session or its
+    /// subagents, i.e. is hcom's to auto-approve.
+    fn owns(&self, params: &Value) -> bool {
+        let session = str_of(params, "sessionId").unwrap_or_default();
+        self.is_bound(session) || self.children.contains(session)
+    }
+
     fn on_notification(&mut self, method: &str, params: &Value) -> Vec<Effect> {
         let session = str_of(params, "sessionId").unwrap_or_default();
         match method {
@@ -573,25 +641,14 @@ impl Tracker {
                     }
                     return Vec::new();
                 }
-                // A subagent waiting on approval blocks its parent's turn too.
-                let ours = self.is_bound(session) || self.children.contains(session);
                 match kind {
-                    "pending_interaction" if ours => {
-                        self.interactions.insert(
-                            str_of(update, "tool_call_id")
-                                .unwrap_or_default()
-                                .to_string(),
-                        );
-                        let what = match update["kind"].as_str() {
-                            Some("permission") | None => "approval",
-                            Some(other) => other,
-                        };
-                        vec![Effect::Status(Status::Blocked(what.to_string()))]
-                    }
-                    "interaction_resolved" if ours => {
-                        self.interactions
+                    // Also announced for approvals Grok decides itself (rules,
+                    // auto mode), so only the request counts (`on_request`).
+                    "interaction_resolved" => {
+                        let removed = self
+                            .interactions
                             .remove(str_of(update, "tool_call_id").unwrap_or_default());
-                        if !self.interactions.is_empty() {
+                        if !removed || !self.interactions.is_empty() {
                             return Vec::new();
                         }
                         vec![Effect::Status(match self.last_tool.clone() {
@@ -820,7 +877,6 @@ pub(super) fn run(
     let mut roster_due: Option<Instant> = None;
     let mut roster_fast_until = Instant::now();
     let mut in_flight: Option<InFlight> = None;
-    let mut approval_since: Option<(Instant, String)> = None;
     let mut load_retry_at = Instant::now();
     let mut current_status = ST_LISTENING.to_string();
     let mut heartbeat = Instant::now();
@@ -977,6 +1033,30 @@ pub(super) fn run(
                     }
                     effects.extend(tracker.on_notification(&method, &params));
                 }
+                Event::Request { id, method, params } => {
+                    let approve = (method == "session/request_permission"
+                        && tracker.owns(&params)
+                        && permission_command(&params).is_some_and(common::is_safe_hcom_command)
+                        && crate::config::load_config_snapshot().core.auto_approve)
+                        .then(|| permission_option(&params, "allow_once"))
+                        .flatten();
+                    match approve {
+                        Some(option) => {
+                            let answer =
+                                json!({"outcome": {"outcome": "selected", "optionId": option}});
+                            if let Err(error) = conn.respond(id, answer) {
+                                closed = Some(format!("write failed: {error:#}"));
+                                break;
+                            }
+                            log_info(
+                                "native",
+                                "grok.acp.auto_approved",
+                                permission_command(&params).unwrap_or_default(),
+                            );
+                        }
+                        None => effects.extend(tracker.on_request(&method, &params)),
+                    }
+                }
             }
             if outcome.is_some() {
                 break;
@@ -1016,13 +1096,7 @@ pub(super) fn run(
                         Err(error) => closed = Some(format!("write failed: {error:#}")),
                     }
                 }
-                Effect::Status(Status::Blocked(context)) => {
-                    approval_since.get_or_insert((Instant::now(), context));
-                }
-                Effect::Status(status) => {
-                    approval_since = None;
-                    apply_status(db, current_name, &status);
-                }
+                Effect::Status(status) => apply_status(db, current_name, &status),
                 Effect::RefreshRoster => {
                     roster_fast_until = Instant::now() + ROSTER_FAST_WINDOW;
                     let at = Instant::now() + ROSTER_FAST_POLL;
@@ -1096,11 +1170,6 @@ pub(super) fn run(
                     );
                 }
             }
-        }
-        if let Some((_, context)) =
-            approval_since.take_if(|(since, _)| since.elapsed() >= BLOCKED_GRACE)
-        {
-            apply_status(db, current_name, &Status::Blocked(context));
         }
         let Some(conn) = client.as_mut() else {
             continue;
@@ -1305,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_notifications_and_ignores_reverse_requests() {
+    fn classifies_notifications_requests_and_responses() {
         let queue = json!({"method": "_x.ai/queue/changed", "params": {"sessionId": "s"}});
         assert!(matches!(
             classify_event(queue),
@@ -1317,9 +1386,11 @@ mod tests {
             classify_event(wrapped),
             Some(Event::Notification { method, params }) if method == "x.ai/session_notification" && params["sessionId"] == "s"
         ));
-        let permission =
-            json!({"id": "ask-1", "method": "session/request_permission", "params": {}});
-        assert!(classify_event(permission).is_none());
+        let permission = json!({"id": "ask-1", "method": "session/request_permission", "params": {"sessionId": "s"}});
+        assert!(matches!(
+            classify_event(permission),
+            Some(Event::Request { id, method, .. }) if id == "ask-1" && method == "session/request_permission"
+        ));
         let response = json!({"id": 3, "result": {}});
         assert!(matches!(classify_event(response), Some(Event::Response(_))));
     }
@@ -1362,6 +1433,25 @@ mod tests {
 
     fn note(session: &str, update: Value) -> Value {
         json!({"sessionId": session, "update": update})
+    }
+
+    fn ask(session: &str, call: &str) -> Value {
+        json!({"sessionId": session, "toolCall": {"toolCallId": call, "kind": "execute",
+               "rawInput": {"command": "hcom list"}},
+               "options": [{"optionId": "allow-once", "kind": "allow_once"},
+                           {"optionId": "reject-once", "kind": "reject_once"}]})
+    }
+
+    #[test]
+    fn permission_request_parts() {
+        let request = ask("a", "t1");
+        assert_eq!(permission_command(&request), Some("hcom list"));
+        assert_eq!(
+            permission_option(&request, "allow_once").as_deref(),
+            Some("allow-once")
+        );
+        let edit = json!({"toolCall": {"kind": "edit", "rawInput": {"command": "hcom list"}}});
+        assert_eq!(permission_command(&edit), None);
     }
 
     #[test]
@@ -1446,9 +1536,8 @@ mod tests {
                 .is_empty()
         );
         // Its approval prompt does block the parent.
-        let ask = json!({"sessionUpdate": "pending_interaction", "kind": "permission"});
         assert_eq!(
-            tracker.on_notification("x.ai/session_notification", &note("kid", ask)),
+            tracker.on_request("session/request_permission", &ask("kid", "t1")),
             [Effect::Status(Status::Blocked("approval".into()))]
         );
     }
@@ -1472,12 +1561,24 @@ mod tests {
             tracker.on_notification("session/update", &call),
             [Effect::Status(tool.clone())]
         );
-        let ask = json!({"sessionUpdate": "pending_interaction", "kind": "permission"});
+        // Grok decided it itself (rules, auto mode): never asked, not blocked.
+        let auto = json!({"sessionUpdate": "pending_interaction", "kind": "permission", "tool_call_id": "t0"});
+        assert!(
+            tracker
+                .on_notification("x.ai/session_notification", &note("a", auto))
+                .is_empty()
+        );
+        let auto_done = json!({"sessionUpdate": "interaction_resolved", "tool_call_id": "t0"});
+        assert!(
+            tracker
+                .on_notification("x.ai/session_notification", &note("a", auto_done))
+                .is_empty()
+        );
         assert_eq!(
-            tracker.on_notification("x.ai/session_notification", &note("a", ask)),
+            tracker.on_request("session/request_permission", &ask("a", "t1")),
             [Effect::Status(Status::Blocked("approval".into()))]
         );
-        let resolved = json!({"sessionUpdate": "interaction_resolved"});
+        let resolved = json!({"sessionUpdate": "interaction_resolved", "tool_call_id": "t1"});
         assert_eq!(
             tracker.on_notification("x.ai/session_notification", &note("a", resolved)),
             [Effect::Status(tool)]
@@ -1513,9 +1614,17 @@ mod tests {
             ),
         );
         for (session, id) in [("a", "t1"), ("kid", "t2")] {
-            let ask = json!({"sessionUpdate": "pending_interaction", "kind": "permission", "tool_call_id": id});
-            tracker.on_notification("x.ai/session_notification", &note(session, ask));
+            tracker.on_request("session/request_permission", &ask(session, id));
         }
+        // Another session's question is not ours.
+        assert!(
+            tracker
+                .on_request(
+                    "x.ai/ask_user_question",
+                    &json!({"sessionId": "other", "toolCallId": "q"})
+                )
+                .is_empty()
+        );
         let resolved =
             |id: &str| json!({"sessionUpdate": "interaction_resolved", "tool_call_id": id});
         assert!(

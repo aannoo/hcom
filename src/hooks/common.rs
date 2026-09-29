@@ -71,6 +71,45 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "--new-terminal",
 ];
 
+/// Whether a shell command line is exactly one `hcom <safe command> …` (or
+/// `uvx hcom …`), for tools where hcom approves commands at runtime.
+///
+/// Anything the shell could turn into a second command fails: unquoted
+/// `; & | < > ( )`, backticks, newlines, and `$` outside single quotes. A
+/// prefix match alone would approve `hcom send @x -- hi; rm -rf ~`.
+pub(crate) fn is_safe_hcom_command(command: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\n' | '\r' => return false,
+            '\'' if !double => single = !single,
+            _ if single => {}
+            '\\' => escaped = true,
+            '"' => double = !double,
+            '$' | '`' => return false,
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' if !double => return false,
+            _ => {}
+        }
+    }
+    if single || double || escaped {
+        return false;
+    }
+    let Ok(words) = shell_words::split(command) else {
+        return false;
+    };
+    let rest = match words.as_slice() {
+        [hcom, rest @ ..] if hcom == "hcom" => rest,
+        [uvx, hcom, rest @ ..] if uvx == "uvx" && hcom == "hcom" => rest,
+        _ => return false,
+    };
+    rest.first()
+        .is_none_or(|command| SAFE_HCOM_COMMANDS.contains(&command.as_str()))
+}
+
 /// Pre-gate check: should hooks proceed?
 ///
 ///

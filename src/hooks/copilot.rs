@@ -559,19 +559,7 @@ fn handle_erroroccurred(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -
 }
 
 fn command_looks_safe_hcom(command: &str) -> bool {
-    let trimmed = command.trim();
-    for prefix in ["hcom", "uvx hcom"] {
-        if trimmed == prefix {
-            return true;
-        }
-        for safe in common::SAFE_HCOM_COMMANDS {
-            let expected = format!("{prefix} {safe}");
-            if trimmed == expected || trimmed.starts_with(&format!("{expected} ")) {
-                return true;
-            }
-        }
-    }
-    false
+    common::is_safe_hcom_command(command)
 }
 
 fn handle_permissionrequest(_db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> Value {
@@ -803,5 +791,24 @@ mod tests {
         assert!(command_looks_safe_hcom("uvx hcom list --json"));
         assert!(!command_looks_safe_hcom("hcom kill luna"));
         assert!(!command_looks_safe_hcom("echo hcom send @luna"));
+        assert!(command_looks_safe_hcom("hcom"));
+        assert!(command_looks_safe_hcom(
+            "hcom send @luna --name nova -- 'costs $5; fine (really)'"
+        ));
+        assert!(command_looks_safe_hcom(r#"hcom send @luna -- "a; b | c""#));
+        for chained in [
+            "hcom send @luna -- hi; rm -rf ~",
+            "hcom send @luna -- hi && rm -rf ~",
+            "hcom list | sh",
+            "hcom send @luna -- $(cat ~/.ssh/id_rsa)",
+            r#"hcom send @luna -- "$(whoami)""#,
+            "hcom send @luna -- `id`",
+            "hcom list > /tmp/x",
+            "hcom list\nrm -rf ~",
+            "hcom send @luna -- 'unterminated",
+            "hcomx list",
+        ] {
+            assert!(!command_looks_safe_hcom(chained), "{chained}");
+        }
     }
 }

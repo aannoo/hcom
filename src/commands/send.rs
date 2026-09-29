@@ -1157,7 +1157,18 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     // Deliver the receiver's unread messages inline. With --from the outgoing
     // author is external, but an invoking adhoc instance still receives.
     // The router skips its own delivery for send, so --quiet leaves messages unread.
-    let receiver = if matches!(sender_identity.kind, SenderKind::Instance) {
+    // Not Grok: hcom queues each batch as a Grok prompt, possibly already
+    // (not yet running), so showing it here too would deliver it twice. Its
+    // messages arrive once, as prompts.
+    let queue_delivered = sender_identity
+        .instance_data
+        .as_ref()
+        .and_then(|data| data.get("tool"))
+        .and_then(|tool| tool.as_str())
+        == Some(crate::tool::Tool::Grok.as_str());
+    let receiver = if queue_delivered {
+        None
+    } else if matches!(sender_identity.kind, SenderKind::Instance) {
         Some((&sender_identity, false))
     } else {
         ctx.and_then(crate::cli_context::inline_receiver)
