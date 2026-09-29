@@ -267,6 +267,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
     let initiator = resolve_initiator(&db, explicit_name.as_deref());
 
+    // A PTY that rejoined without recovery has a live row but no pid; give it
+    // back so killing that row reaches the process.
+    pidtrack::claim_orphans(&db, &hcom_dir);
+
     // If any target is "all", just kill all
     if targets.iter().any(|t| t == "all") {
         return kill_all(&db, &hcom_dir, &initiator);

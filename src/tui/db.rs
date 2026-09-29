@@ -747,47 +747,33 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
 
 // ── Orphan processes ────────────────────────────────────────────
 
+/// Alive pidtrack entry with the fields needed to decide whether a live row owns it.
+#[derive(Clone)]
+struct TrackedPty {
+    orphan: OrphanProcess,
+    process_id: String,
+    session_id: String,
+}
+
 /// 5-second TTL cache for pidtrack data to avoid excessive I/O in TUI polling.
-static ORPHAN_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<OrphanProcess>)>> =
+static ORPHAN_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<TrackedPty>)>> =
     std::sync::Mutex::new(None);
 const ORPHAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
-    // Check cache first
-    if let Ok(guard) = ORPHAN_CACHE.lock()
-        && let Some((ts, ref cached)) = *guard
-        && ts.elapsed() < ORPHAN_CACHE_TTL
-    {
-        // Still need to filter by active DB PIDs
-        let active_db_pids: Vec<u32> = conn
-            .prepare("SELECT pid FROM instances WHERE pid IS NOT NULL")
-            .ok()
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| row.get::<_, i64>(0))
-                    .ok()
-                    .map(|rows| rows.flatten().map(|p| p as u32).collect())
-            })
-            .unwrap_or_default();
-        return cached
-            .iter()
-            .filter(|o| !active_db_pids.contains(&o.pid))
-            .cloned()
-            .collect();
-    }
+    let cached = ORPHAN_CACHE.lock().ok().and_then(|guard| match *guard {
+        Some((ts, ref cached)) if ts.elapsed() < ORPHAN_CACHE_TTL => Some(cached.clone()),
+        _ => None,
+    });
+    let tracked = cached.unwrap_or_else(|| {
+        let tracked = read_tracked_ptys();
+        if let Ok(mut guard) = ORPHAN_CACHE.lock() {
+            *guard = Some((std::time::Instant::now(), tracked.clone()));
+        }
+        tracked
+    });
 
-    let path = paths::pidtrack_path();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-
-    let pidmap: std::collections::HashMap<String, serde_json::Value> =
-        match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
-
-    // Get active instance PIDs from DB
+    // Ownership is checked on every call: the DB changes faster than the cache.
     let active_db_pids: Vec<u32> = conn
         .prepare("SELECT pid FROM instances WHERE pid IS NOT NULL")
         .ok()
@@ -797,16 +783,31 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
                 .map(|rows| rows.flatten().map(|p| p as u32).collect())
         })
         .unwrap_or_default();
+    tracked
+        .into_iter()
+        .filter(|t| !active_db_pids.contains(&t.orphan.pid))
+        .filter(|t| crate::pidtrack::owning_instance(conn, &t.process_id, &t.session_id).is_none())
+        .map(|t| t.orphan)
+        .collect()
+}
 
-    // Build all alive orphans (before active_pids filter) for caching
-    let mut all_alive = Vec::new();
+fn read_tracked_ptys() -> Vec<TrackedPty> {
+    let content = match std::fs::read_to_string(paths::pidtrack_path()) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let pidmap: std::collections::HashMap<String, serde_json::Value> =
+        match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(_) => return vec![],
+        };
+
+    let mut tracked = Vec::new();
     for (pid_str, info) in &pidmap {
         let pid: u32 = match pid_str.parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
-
-        // Check if PID is still alive
         if !crate::pidtrack::is_alive(pid) {
             continue;
         }
@@ -827,23 +828,19 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
             .unwrap_or(0.0);
         let directory = json_str(info, "directory", "").to_string();
 
-        all_alive.push(OrphanProcess {
-            pid,
-            tool: parse_tool(tool_s),
-            names,
-            launched_at,
-            directory,
+        tracked.push(TrackedPty {
+            orphan: OrphanProcess {
+                pid,
+                tool: parse_tool(tool_s),
+                names,
+                launched_at,
+                directory,
+            },
+            process_id: json_str(info, "process_id", "").to_string(),
+            session_id: json_str(info, "session_id", "").to_string(),
         });
     }
-
-    // Update cache with all alive processes
-    if let Ok(mut guard) = ORPHAN_CACHE.lock() {
-        *guard = Some((std::time::Instant::now(), all_alive.clone()));
-    }
-
-    // Filter out active DB PIDs for return
-    all_alive.retain(|o| !active_db_pids.contains(&o.pid));
-    all_alive
+    tracked
 }
 
 // ── Timeline ────────────────────────────────────────────────────

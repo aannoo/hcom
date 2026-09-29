@@ -47,6 +47,10 @@ fn resolve_initiator(
 pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i32 {
     let explicit_name = ctx.and_then(|c| c.explicit_name.as_deref());
 
+    // Give rejoined PTYs back their pid first, so stopping one tracks its
+    // process under the name it runs as now.
+    crate::pidtrack::claim_orphans(db, &crate::paths::hcom_dir());
+
     let targets: Vec<&str> = args.targets.iter().map(|s| s.as_str()).collect();
 
     // Handle 'all' target

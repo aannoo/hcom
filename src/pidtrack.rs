@@ -44,7 +44,7 @@ fn is_zero(v: &u16) -> bool {
 }
 
 /// Orphan process info (enriched with PID).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct OrphanProcess {
     pub pid: u32,
     pub tool: String,
@@ -306,38 +306,127 @@ pub fn remove_pid(hcom_dir: &Path, pid: u32) {
     }
 }
 
-/// Re-register a single orphan into the DB.
+/// Name of the live row that already owns this PTY, if any.
 ///
-/// Creates instance row, sets PID/directory, creates process/session bindings,
-/// and sets status to listening so the PTY delivery gate can inject messages.
-/// Does NOT log events, print output, or remove from pidtrack — caller handles those.
+/// A stopped PTY can rejoin through a hook or `hcom start` without going
+/// through orphan recovery. That leaves a live row with no `pid` while the
+/// pidfile still lists the process, so it looks orphaned; recovering it again
+/// would split one agent across two identities.
 ///
-/// Returns `Err` if the critical instance INSERT fails. Caller must leave the
-/// pidtrack entry intact on failure so recovery can be retried later.
-pub fn recover_single_orphan_to_db(
+/// Only a row without a pid of its own can own the entry: through the PTY's
+/// process binding, or through its session when no other PTY is bound to it.
+pub fn owning_instance(
+    conn: &rusqlite::Connection,
+    process_id: &str,
+    session_id: &str,
+) -> Option<String> {
+    use rusqlite::OptionalExtension;
+
+    if !process_id.is_empty() {
+        let bound = conn
+            .query_row(
+                "SELECT i.name FROM process_bindings pb JOIN instances i ON i.name = pb.instance_name
+                 WHERE pb.process_id = ?1 AND i.pid IS NULL",
+                [process_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if bound.is_some() {
+            return bound;
+        }
+    }
+
+    if session_id.is_empty() {
+        return None;
+    }
+    conn.query_row(
+        "SELECT i.name FROM instances i WHERE i.session_id = ?1 AND i.pid IS NULL
+         AND NOT EXISTS (SELECT 1 FROM process_bindings pb
+                         WHERE pb.instance_name = i.name AND pb.process_id != ?2)",
+        rusqlite::params![session_id, process_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Alive orphans nothing owns, after handing owned entries back to their rows.
+///
+/// Returns the remaining orphans and each adopted entry with the row it went to.
+pub fn claim_orphans(
+    db: &crate::db::HcomDb,
+    hcom_dir: &Path,
+) -> (Vec<OrphanProcess>, Vec<(OrphanProcess, String)>) {
+    let active_pids: std::collections::HashSet<u32> = db
+        .iter_instances_full()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|i| i.pid.map(|p| p as u32))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut orphans = get_orphan_processes(hcom_dir, Some(&active_pids));
+    let mut adopted = Vec::new();
+    orphans.retain(|orphan| {
+        let Some(name) = owning_instance(db.conn(), &orphan.process_id, &orphan.session_id) else {
+            return true;
+        };
+        if let Err(e) = adopt_orphan(db, orphan, &name) {
+            crate::log::log_warn(
+                "pidtrack",
+                "orphan.adopt_failed",
+                &format!("pid={} instance={name}: {e}", orphan.pid),
+            );
+            return true;
+        }
+        remove_pid(hcom_dir, orphan.pid);
+        crate::log::log_info(
+            "pidtrack",
+            "orphan.adopted",
+            &format!("pid={} instance={name}", orphan.pid),
+        );
+        adopted.push((orphan.clone(), name));
+        false
+    });
+    (orphans, adopted)
+}
+
+/// Give a PTY back to the live row that owns it.
+///
+/// Restores what `stop` took from the row (pid, terminal, notify endpoints) so
+/// kill, pane close and wake reach the process again. Status and session
+/// bindings are left alone: the row is already live.
+fn adopt_orphan(
     db: &crate::db::HcomDb,
     orphan: &OrphanProcess,
     instance_name: &str,
 ) -> Result<(), String> {
-    use crate::instances;
-    use crate::shared::constants::ST_LISTENING;
+    attach_runtime_state(db, orphan, instance_name)?;
+    if !orphan.process_id.is_empty()
+        && db
+            .get_process_binding(&orphan.process_id)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(instance_name)
+    {
+        db.set_process_binding(&orphan.process_id, &orphan.session_id, instance_name)
+            .map_err(|e| format!("failed to set process binding: {}", e))?;
+    }
+    Ok(())
+}
 
-    let now = crate::shared::time::now_epoch_i64();
-
-    // Create instance row — this is the critical step; fail = abort recovery
-    db.conn()
-        .execute(
-            "INSERT OR IGNORE INTO instances (name, tool, status, status_context, created_at) VALUES (?1, ?2, 'inactive', 'new', ?3)",
-            rusqlite::params![instance_name, orphan.tool, now],
-        )
-        .map_err(|e| format!("failed to insert instance '{}': {}", instance_name, e))?;
-
-    // Update PID and directory
+/// Point a row at a tracked PTY: pid, terminal context and notify endpoints.
+fn attach_runtime_state(
+    db: &crate::db::HcomDb,
+    orphan: &OrphanProcess,
+    instance_name: &str,
+) -> Result<(), String> {
     let mut updates = serde_json::Map::new();
     updates.insert("pid".into(), serde_json::json!(orphan.pid));
-    if !orphan.directory.is_empty() {
-        updates.insert("directory".into(), serde_json::json!(orphan.directory));
-    }
     if !orphan.terminal_preset.is_empty() {
         updates.insert(
             "terminal_preset_effective".into(),
@@ -374,16 +463,54 @@ pub fn recover_single_orphan_to_db(
             ),
         );
     }
-    instances::update_instance_position(db, instance_name, &updates);
+    crate::instances::update_instance_position(db, instance_name, &updates);
+
+    if orphan.notify_port != 0 {
+        db.register_notify_port(instance_name, orphan.notify_port)
+            .map_err(|e| format!("failed to register notify port: {}", e))?;
+    }
+    if orphan.inject_port != 0 {
+        db.register_inject_port(instance_name, orphan.inject_port)
+            .map_err(|e| format!("failed to register inject port: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Re-register a single orphan into the DB.
+///
+/// Creates instance row, sets PID/directory, creates process/session bindings,
+/// and sets status to listening so the PTY delivery gate can inject messages.
+/// Does NOT log events, print output, or remove from pidtrack — caller handles those.
+///
+/// Returns `Err` if the critical instance INSERT fails. Caller must leave the
+/// pidtrack entry intact on failure so recovery can be retried later.
+pub fn recover_single_orphan_to_db(
+    db: &crate::db::HcomDb,
+    orphan: &OrphanProcess,
+    instance_name: &str,
+) -> Result<(), String> {
+    use crate::instances;
+    use crate::shared::constants::ST_LISTENING;
+
+    let now = crate::shared::time::now_epoch_i64();
+
+    // Create instance row — this is the critical step; fail = abort recovery
+    db.conn()
+        .execute(
+            "INSERT OR IGNORE INTO instances (name, tool, status, status_context, created_at) VALUES (?1, ?2, 'inactive', 'new', ?3)",
+            rusqlite::params![instance_name, orphan.tool, now],
+        )
+        .map_err(|e| format!("failed to insert instance '{}': {}", instance_name, e))?;
+
+    if !orphan.directory.is_empty() {
+        let mut updates = serde_json::Map::new();
+        updates.insert("directory".into(), serde_json::json!(orphan.directory));
+        instances::update_instance_position(db, instance_name, &updates);
+    }
 
     // Create process binding
     if !orphan.process_id.is_empty() {
-        let sid = if orphan.session_id.is_empty() {
-            None
-        } else {
-            Some(orphan.session_id.as_str())
-        };
-        db.set_process_binding(&orphan.process_id, sid.unwrap_or(""), instance_name)
+        db.set_process_binding(&orphan.process_id, &orphan.session_id, instance_name)
             .map_err(|e| format!("failed to set process binding: {}", e))?;
     }
 
@@ -396,15 +523,7 @@ pub fn recover_single_orphan_to_db(
         instances::update_instance_position(db, instance_name, &sid_update);
     }
 
-    // Restore notify endpoints
-    if orphan.notify_port != 0 {
-        db.register_notify_port(instance_name, orphan.notify_port)
-            .map_err(|e| format!("failed to register notify port: {}", e))?;
-    }
-    if orphan.inject_port != 0 {
-        db.register_inject_port(instance_name, orphan.inject_port)
-            .map_err(|e| format!("failed to register inject port: {}", e))?;
-    }
+    attach_runtime_state(db, orphan, instance_name)?;
 
     // Set listening so PTY delivery gate allows message injection
     lifecycle::set_status(
@@ -617,5 +736,34 @@ mod tests {
             result.is_err(),
             "expected error when DB has no instances table"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_owning_instance_ignores_rows_with_their_own_process() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = crate::db::HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, pid, tool, status, created_at)
+                 VALUES ('luna', 'sess-1', 99999999, 'claude', 'active', 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-1", "sess-1", "luna").unwrap();
+
+        // luna runs some other process, so neither link makes it this PTY's owner.
+        assert_eq!(owning_instance(db.conn(), "proc-1", "sess-1"), None);
+        assert_eq!(owning_instance(db.conn(), "proc-2", "sess-1"), None);
+
+        db.conn()
+            .execute("UPDATE instances SET pid = NULL WHERE name = 'luna'", [])
+            .unwrap();
+        assert_eq!(
+            owning_instance(db.conn(), "proc-1", "sess-1").as_deref(),
+            Some("luna")
+        );
+        // Bound to proc-1, so a PTY sharing only the session is not its owner.
+        assert_eq!(owning_instance(db.conn(), "proc-2", "sess-1"), None);
     }
 }
