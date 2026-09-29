@@ -314,10 +314,18 @@ fn classify_event(value: Value) -> Option<Event> {
 struct InFlight {
     request_id: u64,
     prompt_id: String,
+    /// The exact prompt text. It carries the batch's message ids, so it
+    /// identifies this batch inside a combined turn.
+    text: String,
     ack: DeliveryAck,
-    /// Seen waiting in Grok's queue.
-    queued: bool,
+    /// When Grok answered `removedFromQueue`: either removed, or merged into
+    /// the prompt ahead of it (which then runs its text). Only a combined-turn
+    /// snapshot tells them apart, and it may arrive after the response.
+    removed_at: Option<Instant>,
 }
+
+/// How long to wait after `removedFromQueue` for the snapshot showing a merge.
+const MERGE_EVIDENCE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -327,40 +335,34 @@ enum Outcome {
     Dropped(String),
 }
 
-/// What a queue snapshot says about our prompt, if anything.
+/// What a queue snapshot proves about our prompt. Only identity counts: our
+/// prompt id running, or our exact text among the running combined texts
+/// (Grok merges queued plain prompts into the front one).
 fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
-    let running = params["runningPromptId"].as_str();
-    if running == Some(flight.prompt_id.as_str()) {
-        return Some(Outcome::Delivered);
-    }
-    let listed = params["entries"]
+    let running = params["runningPromptId"].as_str() == Some(flight.prompt_id.as_str());
+    let merged = params["runningCombinedTexts"]
         .as_array()
-        .is_some_and(|entries| entries.iter().any(|e| e["id"] == flight.prompt_id.as_str()));
-    if listed || !flight.queued {
-        return None;
-    }
-    // It left the queue without becoming the running prompt: either merged
-    // into a combined turn with the entries ahead of it, or removed.
-    if params["runningCombinedTexts"]
-        .as_array()
-        .is_some_and(|texts| texts.len() >= 2)
-    {
+        .is_some_and(|texts| texts.iter().any(|t| t.as_str() == Some(&flight.text)));
+    if running || merged {
         Some(Outcome::Delivered)
-    } else {
+    } else if flight.removed_at.is_some() {
         Some(Outcome::Dropped("removed from Grok's queue".into()))
+    } else {
+        None
     }
 }
 
-/// What the `session/prompt` response says about our prompt.
-fn response_outcome(value: &Value) -> Outcome {
+/// What the `session/prompt` response proves. `None`: removed from the queue,
+/// pending evidence of a merge.
+fn response_outcome(value: &Value) -> Option<Outcome> {
     if let Some(error) = value.get("error") {
-        return Outcome::Dropped(format!("prompt failed: {error}"));
+        return Some(Outcome::Dropped(format!("prompt failed: {error}")));
     }
-    match value["result"]["stopReason"].as_str() {
-        // Every other stop reason ends a turn that ran the prompt.
-        Some("cancelled") => Outcome::Dropped("prompt cancelled".into()),
-        _ => Outcome::Delivered,
+    if value["result"]["_meta"]["completionKind"] == "removedFromQueue" {
+        return None;
     }
+    // Any other result, `cancelled` included, ends a turn that ran it.
+    Some(Outcome::Delivered)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -515,20 +517,18 @@ pub(super) fn run(
                     if params["sessionId"].as_str() != Some(session.as_str()) {
                         continue;
                     }
-                    if let Some(flight) = in_flight.as_mut() {
-                        flight.queued |= params["entries"].as_array().is_some_and(|entries| {
-                            entries.iter().any(|e| e["id"] == flight.prompt_id.as_str())
-                        });
-                        if let Some(result) = queue_outcome(&params, flight) {
-                            outcome = Some(result);
-                        }
+                    if let Some(flight) = in_flight.as_ref() {
+                        outcome = queue_outcome(&params, flight);
                     }
                 }
                 Event::Response(value) => {
-                    if let Some(flight) = in_flight.as_ref()
+                    if let Some(flight) = in_flight.as_mut()
                         && value["id"].as_u64() == Some(flight.request_id)
                     {
-                        outcome = Some(response_outcome(&value));
+                        outcome = response_outcome(&value);
+                        if outcome.is_none() {
+                            flight.removed_at = Some(Instant::now());
+                        }
                     }
                 }
                 Event::Interaction(method) => {
@@ -561,6 +561,14 @@ pub(super) fn run(
                 .as_ref()
                 .map(|_| Outcome::Dropped(format!("{error} before the prompt ran")));
             log_warn("native", "grok.acp.disconnected", &error);
+        }
+        if outcome.is_none()
+            && in_flight
+                .as_ref()
+                .and_then(|flight| flight.removed_at)
+                .is_some_and(|at| at.elapsed() >= MERGE_EVIDENCE_WAIT)
+        {
+            outcome = Some(Outcome::Dropped("removed from Grok's queue".into()));
         }
         if let Some(outcome) = outcome
             && let Some(flight) = in_flight.take()
@@ -605,7 +613,7 @@ pub(super) fn run(
                 "session/prompt",
                 json!({
                     "sessionId": session,
-                    "prompt": [{"type": "text", "text": prepared.formatted}],
+                    "prompt": [{"type": "text", "text": &prepared.formatted}],
                     "_meta": {"promptId": prompt_id, "sendNow": false, "clientIdentifier": "hcom"}
                 }),
             ) {
@@ -621,8 +629,9 @@ pub(super) fn run(
                     in_flight = Some(InFlight {
                         request_id,
                         prompt_id,
+                        text: prepared.formatted,
                         ack: prepared.ack,
-                        queued: false,
+                        removed_at: None,
                     });
                 }
                 Err(error) => {
@@ -642,10 +651,13 @@ pub(super) fn run(
 mod tests {
     use super::*;
 
-    fn flight(queued: bool) -> InFlight {
+    const BATCH: &str = "<hcom>[request #7] luna → nova: hi</hcom>";
+
+    fn flight(removed: bool) -> InFlight {
         InFlight {
             request_id: 4,
             prompt_id: "hcom-1".into(),
+            text: BATCH.into(),
             ack: DeliveryAck {
                 instance_name: "nova".into(),
                 last_event_id: 7,
@@ -653,7 +665,7 @@ mod tests {
                 msg_ts: String::new(),
                 mark_announced: false,
             },
-            queued,
+            removed_at: removed.then(Instant::now),
         }
     }
 
@@ -667,46 +679,62 @@ mod tests {
     }
 
     #[test]
-    fn queued_prompt_waits() {
-        let params =
-            json!({"sessionId": "s", "runningPromptId": "user-1", "entries": [{"id": "hcom-1"}]});
-        assert_eq!(queue_outcome(&params, &flight(false)), None);
-        assert_eq!(queue_outcome(&params, &flight(true)), None);
+    fn absence_alone_proves_nothing() {
+        for params in [
+            json!({"sessionId": "s", "runningPromptId": "user-1", "entries": [{"id": "hcom-1"}]}),
+            json!({"sessionId": "s", "runningPromptId": "user-1", "entries": []}),
+            // Someone else's combined turn is running.
+            json!({"sessionId": "s", "runningPromptId": "user-1",
+                   "runningCombinedTexts": ["fix it", "and test it"], "entries": []}),
+        ] {
+            assert_eq!(queue_outcome(&params, &flight(false)), None, "{params}");
+        }
     }
 
     #[test]
-    fn prompt_leaving_queue_is_combined_or_dropped() {
-        let unrelated = json!({"sessionId": "s", "runningPromptId": "user-1", "entries": []});
-        // Not seen queued yet: the snapshot may predate our enqueue.
-        assert_eq!(queue_outcome(&unrelated, &flight(false)), None);
+    fn removed_prompt_is_delivered_only_if_merged_into_the_running_turn() {
+        let unrelated = json!({"sessionId": "s", "runningPromptId": "user-1",
+                               "runningCombinedTexts": ["fix it", "and test it"], "entries": []});
         assert!(matches!(
             queue_outcome(&unrelated, &flight(true)),
             Some(Outcome::Dropped(_))
         ));
-        let combined = json!({
-            "sessionId": "s",
-            "runningPromptId": "user-1",
-            "runningCombinedTexts": ["fix it", "<hcom>...</hcom>"],
-            "entries": []
-        });
+        let merged = json!({"sessionId": "s", "runningPromptId": "user-1",
+                            "runningCombinedTexts": ["fix it", BATCH], "entries": []});
+        // The merge snapshot may arrive before or after the removal response.
         assert_eq!(
-            queue_outcome(&combined, &flight(true)),
+            queue_outcome(&merged, &flight(false)),
+            Some(Outcome::Delivered)
+        );
+        assert_eq!(
+            queue_outcome(&merged, &flight(true)),
             Some(Outcome::Delivered)
         );
     }
 
     #[test]
     fn response_outcomes() {
-        for reason in ["end_turn", "max_tokens", "max_turn_requests", "refusal"] {
-            let value = json!({"id": 4, "result": {"stopReason": reason}});
-            assert_eq!(response_outcome(&value), Outcome::Delivered, "{reason}");
-        }
-        for value in [
-            json!({"id": 4, "result": {"stopReason": "cancelled"}}),
-            json!({"id": 4, "error": {"code": -32000, "message": "failed"}}),
+        for result in [
+            json!({"stopReason": "end_turn"}),
+            json!({"stopReason": "max_tokens"}),
+            // An interrupted turn still ran the prompt.
+            json!({"stopReason": "cancelled"}),
         ] {
-            assert!(matches!(response_outcome(&value), Outcome::Dropped(_)));
+            let value = json!({"id": 4, "result": result});
+            assert_eq!(
+                response_outcome(&value),
+                Some(Outcome::Delivered),
+                "{value}"
+            );
         }
+        let removed = json!({"id": 4, "result": {"stopReason": "cancelled",
+                                                 "_meta": {"completionKind": "removedFromQueue"}}});
+        assert_eq!(response_outcome(&removed), None);
+        let error = json!({"id": 4, "error": {"code": -32000, "message": "failed"}});
+        assert!(matches!(
+            response_outcome(&error),
+            Some(Outcome::Dropped(_))
+        ));
     }
 
     #[test]

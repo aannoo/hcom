@@ -226,13 +226,9 @@ fn update_position(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload, instan
     instances::update_instance_position(db, instance_name, &updates);
 }
 
-fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
-    let instance = resolve_instance(db, ctx, payload)?;
-    update_position(db, ctx, payload, &instance.name);
-    Some(instance)
-}
-
-/// Only the session the instance is bound to may change its lifecycle.
+/// Only the session the instance is bound to may change its status. Subagent
+/// events resolve to the parent through the inherited process binding, and a
+/// background subagent can outlive the parent's turn.
 fn primary_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
     if is_subagent_event(payload) {
         return None;
@@ -273,9 +269,10 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) {
 }
 
 fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) {
-    let Some(instance) = resolved_instance(db, ctx, payload) else {
+    let Some(instance) = primary_instance(db, ctx, payload) else {
         return;
     };
+    update_position(db, ctx, payload, &instance.name);
     // hcom's own prompt: the delivery ack sets `deliver:<sender>`.
     if str_field(payload, "promptId").is_some_and(|id| id.starts_with(HCOM_PROMPT_ID_PREFIX)) {
         return;
@@ -285,7 +282,7 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
 
 /// Pre and post: post also ends a `blocked` set while Grok asked for approval.
 fn handle_tool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) {
-    if let Some(instance) = resolved_instance(db, ctx, payload) {
+    if let Some(instance) = primary_instance(db, ctx, payload) {
         common::update_tool_status(
             db,
             &instance.name,
@@ -516,6 +513,20 @@ mod tests {
         handle_turn_end(&db, &ctx, &other, "");
         handle_sessionend(&db, &ctx, &other);
         assert_eq!(status(), ("active".into(), "prompt".into()));
+
+        // A background subagent after the parent's turn ended.
+        lifecycle::set_status(&db, "nova", ST_LISTENING, "", Default::default());
+        let tool = HookPayload::from_grok(
+            "grok-pretooluse",
+            json!({"sessionId": "main", "toolName": "run_terminal_command", "subagentType": "explore"}),
+        );
+        handle_tool(&db, &ctx, &tool);
+        let prompt = HookPayload::from_grok(
+            "grok-userpromptsubmit",
+            json!({"sessionId": "main", "prompt": "look", "subagentType": "explore"}),
+        );
+        handle_userpromptsubmit(&db, &ctx, &prompt);
+        assert_eq!(status(), ("listening".into(), "".into()));
 
         let main = HookPayload::from_grok(
             "grok-stopfailure",
