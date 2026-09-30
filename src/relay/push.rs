@@ -308,9 +308,6 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
         "short_id": short_id,
         "reset_ts": reset_ts,
         "capabilities": capabilities,
-        // Named inside the AEAD so receivers pin this key, not one a broker could swap into
-        // the unsealed user properties (see relay::signing).
-        "sig_key": super::signing::own_public_key_b64(),
     })
 }
 
@@ -442,9 +439,8 @@ pub fn push(
     // the message may sit in the internal buffer and be delivered on reconnect,
     // but we cannot guarantee it — so we only advance the cursor when
     // mqtt_connected is true.
-    let props = super::signing::publish_properties(&sealed).unwrap_or_default();
     client
-        .publish_with_properties(&topic, QoS::AtLeastOnce, true, sealed, props)
+        .publish(&topic, QoS::AtLeastOnce, true, sealed)
         .map_err(|e| format!("publish: {}", e))?;
 
     let publish_ms = t0.elapsed().as_millis();
@@ -502,17 +498,6 @@ mod tests {
 
         // Invalid
         assert!(parse_iso_timestamp_to_epoch("not a date").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn the_state_names_this_devices_signing_key() {
-        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let db = HcomDb::open().unwrap();
-        let state = build_state(&db, "device-a");
-        let own = crate::relay::signing::own_public_key_b64();
-        assert!(own.is_some(), "the test device has a key");
-        assert_eq!(state["sig_key"].as_str(), own.as_deref());
     }
 
     #[test]

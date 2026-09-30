@@ -14,7 +14,6 @@ pub mod crypto;
 pub mod pull;
 pub mod push;
 pub mod replay;
-pub mod signing;
 pub mod token;
 pub mod worker;
 

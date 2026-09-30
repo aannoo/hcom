@@ -619,12 +619,7 @@ impl MqttRelay {
                     }
                     let topic = String::from_utf8_lossy(&publish.topic).to_string();
                     let payload = publish.payload.to_vec();
-                    let props = publish
-                        .properties
-                        .as_ref()
-                        .map(|p| p.user_properties.clone())
-                        .unwrap_or_default();
-                    self.handle_incoming_message(&topic, &payload, &props)
+                    self.handle_incoming_message(&topic, &payload)
                 }
                 Packet::Disconnect(_) => {
                     *connected = false;
@@ -642,12 +637,7 @@ impl MqttRelay {
     /// Topic layout: `{relay_id}/{device_uuid}` for state snapshots and
     /// `{relay_id}/control` for control events. Empty state payloads may be an
     /// ungraceful LWT, but are ignored because they are unauthenticated.
-    fn handle_incoming_message(
-        &self,
-        topic: &str,
-        payload: &[u8],
-        user_properties: &[(String, String)],
-    ) -> bool {
+    fn handle_incoming_message(&self, topic: &str, payload: &[u8]) -> bool {
         let prefix = format!("{}/", self.relay_id);
         if !topic.starts_with(&prefix) {
             return false; // Not our relay group
@@ -693,7 +683,6 @@ impl MqttRelay {
             relay_id: &self.relay_id,
             topic,
             replay_guard: &mut guard,
-            user_properties,
         };
 
         if suffix == "control" {
@@ -817,13 +806,7 @@ impl MqttRelay {
                 };
                 // try_publish never blocks the worker loop on a full request queue.
                 self.client
-                    .try_publish_with_properties(
-                        topic,
-                        QoS::AtLeastOnce,
-                        false,
-                        payload.clone(),
-                        super::signing::publish_properties(&payload).unwrap_or_default(),
-                    )
+                    .try_publish(topic, QoS::AtLeastOnce, false, payload)
                     .is_ok()
             });
         if summary.requests_sent > 0 || summary.events_imported > 0 || summary.gaps_abandoned > 0 {
@@ -862,9 +845,8 @@ impl MqttRelay {
             .and_then(|psk| seal_state_tombstone(&psk, &self.relay_id, &topic));
 
         let publish_result = tombstone.and_then(|payload| {
-            let props = super::signing::publish_properties(&payload).unwrap_or_default();
             self.client
-                .publish_with_properties(&topic, QoS::AtLeastOnce, true, payload, props)
+                .publish(&topic, QoS::AtLeastOnce, true, payload)
                 .map_err(|e| e.to_string())
         });
         if let Err(e) = publish_result {
@@ -953,11 +935,7 @@ impl EphemeralClient {
         payload: Vec<u8>,
         timeout: Duration,
     ) -> bool {
-        let props = super::signing::publish_properties(&payload).unwrap_or_default();
-        if self
-            .client
-            .publish_with_properties(topic, qos, retain, payload, props)
-            .is_err()
+        if self.client.publish(topic, qos, retain, payload).is_err()
         {
             return false;
         }
