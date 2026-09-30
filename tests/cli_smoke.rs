@@ -212,6 +212,57 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
 }
 
 #[test]
+fn non_destructive_reset_paths_deliver_pending_messages() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let process_id = "reset-pending-delivery-process";
+    let recipient = h.start_with_process_id(process_id);
+
+    let send_message = |text: &str| {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            "--name",
+            &sender,
+            &format!("@{recipient}"),
+            "--",
+            text,
+        ]);
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    };
+
+    send_message("pending during reset preview");
+    let mut preview = h.cmd();
+    preview
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .arg("reset");
+    let output = preview.output().expect("run reset preview");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("RESET PREVIEW"), "stdout={stdout}");
+    assert!(
+        stdout.contains("pending during reset preview"),
+        "stdout={stdout}"
+    );
+
+    send_message("pending during reset hooks");
+    let mut hooks = h.cmd();
+    hooks
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .args(["--go", "reset", "hooks"]);
+    let output = hooks.output().expect("run reset hooks");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("pending during reset hooks"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
 fn start_send_events_roundtrip() {
     let h = Hcom::new();
     let sender = h.start();
@@ -279,6 +330,8 @@ fn start_send_events_roundtrip() {
     assert_eq!(delivered.len(), 1, "listen output={listen_out}");
     assert_eq!(delivered[0]["from"], sender.as_str());
     assert_eq!(delivered[0]["text"], "hello there");
+    let event_id = delivered[0]["event_id"].as_i64().expect("event_id");
+    assert_eq!(delivered[0]["reply_id"], event_id.to_string());
 
     let (c7, list_after_listen_out, _) = h.run(["list", "--json"]);
     assert_eq!(c7, 0);
@@ -357,6 +410,74 @@ fn intent_and_reply_to_roundtrip() {
         ack["data"]["reply_to_local"].as_i64(),
         Some(req_id),
         "reply_to_local must resolve to request event id; ack={ack}"
+    );
+}
+
+#[test]
+fn remote_reply_to_origin_resolves_imported_event_row() {
+    let h = Hcom::new();
+    let a = h.start();
+    let b = h.start();
+
+    // Direct SQLite access to seed colliding local event and imported remote event
+    let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open hcom db");
+
+    // Colliding local message at id = 42
+    let local_data = serde_json::json!({
+        "from": a,
+        "text": "colliding local message",
+        "intent": "request"
+    });
+    conn.execute(
+        "INSERT INTO events (id, type, instance, timestamp, data) VALUES (42, 'message', ?1, '2026-09-04T00:00:00Z', ?2)",
+        rusqlite::params![a, local_data.to_string()],
+    )
+    .expect("insert colliding local event");
+
+    // Imported relay message at id = 100 with origin 42 and device short BOXE
+    let remote_data = serde_json::json!({
+        "from": "remote:BOXE",
+        "text": "remote request",
+        "intent": "request",
+        "_relay": {
+            "id": 42,
+            "short": "BOXE",
+            "device": "dev-uuid-boxe"
+        }
+    });
+    conn.execute(
+        "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote:BOXE', '2026-09-04T00:00:01Z', ?1)",
+        rusqlite::params![remote_data.to_string()],
+    )
+    .expect("insert remote imported event");
+
+    // Reply using remote token 42:BOXE
+    let (c, _, e) = h.run([
+        "send",
+        &format!("@{a}"),
+        "--name",
+        &b,
+        "--intent",
+        "ack",
+        "--reply-to",
+        "42:BOXE",
+        "--",
+        "pong",
+    ]);
+    assert_eq!(c, 0, "ack send with remote reply-to failed: stderr={e}");
+
+    let (_, ack_out, _) = h.run(["events", "--intent", "ack", "--last", "5", "--full"]);
+    let ack: serde_json::Value = ack_out
+        .lines()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .expect("ack event present");
+
+    assert_eq!(ack["data"]["intent"], "ack");
+    assert_eq!(ack["data"]["reply_to"], "42:BOXE");
+    assert_eq!(
+        ack["data"]["reply_to_local"].as_i64(),
+        Some(100),
+        "reply_to_local must resolve to imported event id 100, not colliding local id 42; ack={ack}"
     );
 }
 
@@ -490,9 +611,25 @@ fn bigboss_send_bypasses_identity_gate() {
 }
 
 #[test]
-fn config_unknown_key_is_not_set() {
+fn config_unknown_key_is_rejected() {
     let h = Hcom::new();
-    let (code, stdout, _stderr) = h.run(["config", "no_such_key"]);
+    let (code, _stdout, stderr) = h.run(["config", "no_such_key"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Unknown config key 'no_such_key'"),
+        "stderr={stderr}"
+    );
+
+    // Setting a typo must not write it to config.toml either.
+    let (code, _stdout, stderr) = h.run(["config", "timout", "60"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Did you mean: timeout?"), "stderr={stderr}");
+}
+
+#[test]
+fn config_known_unset_key_reports_not_set() {
+    let h = Hcom::new();
+    let (code, stdout, _stderr) = h.run(["config", "hints"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("(not set)"), "stdout={stdout}");
 }
@@ -659,11 +796,11 @@ fn antigravity_e2e_hook_dispatch() {
     assert_eq!(parsed, serde_json::json!({ "decision": "allow" }));
 
     // 3. AfterTool cannot inject context for Antigravity, so it must not ack delivery.
+    // Send from bigboss: self-sends are never delivered, so they'd leave nothing pending.
     let (send_code, _, send_stderr) = h.run([
         "send",
         &format!("@{me}"),
-        "--name",
-        &me,
+        "-b",
         "--intent",
         "request",
         "--",
@@ -1164,4 +1301,311 @@ fn pi_e2e_hook_dispatch() {
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap_or_else(|| panic!("stopped event missing: {stdout}"));
     assert_eq!(stopped["data"]["action"].as_str(), Some("stopped"));
+}
+
+enum UnreadTiming {
+    Preexisting,
+    ArrivingAfterReadiness,
+}
+
+struct ChildGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().unwrap().try_wait()
+    }
+
+    /// Wait for the child to exit up to `timeout`. Kills and reaps if the deadline is exceeded.
+    /// Captures all stdout and stderr.
+    fn wait_bounded(mut self, timeout: Duration) -> (i32, String, String) {
+        let deadline = Instant::now() + timeout;
+        let mut child = self.child.take().unwrap();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        use std::io::Read;
+                        let _ = out.read_to_end(&mut stdout);
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = err.read_to_end(&mut stderr);
+                    }
+                    return (
+                        status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&stdout).into_owned(),
+                        String::from_utf8_lossy(&stderr).into_owned(),
+                    );
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "events --wait CLI child process exceeded bounded deadline of {timeout:?}"
+                    );
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("events --wait CLI child try_wait error: {e}");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn run_events_wait_cli_oracle(timing: UnreadTiming, wait_secs: u64, expected_code: i32) {
+    let h = Hcom::new();
+    let me = h.start();
+    let other = h.start();
+    let db_path = h.hcom_dir.join("hcom.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open test db");
+
+    conn.execute("DELETE FROM events", []).unwrap();
+    conn.execute(
+        "UPDATE instances SET last_event_id = 0 WHERE name IN (?1, ?2)",
+        rusqlite::params![me, other],
+    )
+    .unwrap();
+
+    let mut send_code = None;
+    if matches!(timing, UnreadTiming::Preexisting) {
+        let (sc, _, _) = h.run(["send", &format!("@{me}"), "--name", &other, "--", "pre"]);
+        send_code = Some(sc);
+    }
+
+    let initial_cursor: i64 = conn
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?1",
+            rusqlite::params![me],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let child = h
+        .cmd()
+        .args([
+            "events",
+            "--wait",
+            &wait_secs.to_string(),
+            "--sql",
+            "data LIKE '%sol002_target%'",
+            "--name",
+            &me,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn events wait");
+    let mut child = ChildGuard::new(child);
+
+    let mut endpoint_ready = false;
+    if matches!(timing, UnreadTiming::ArrivingAfterReadiness) {
+        for _ in 0..100 {
+            if let Ok(c) = rusqlite::Connection::open(&db_path)
+                && c.query_row(
+                    "SELECT 1 FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_wait' LIMIT 1",
+                    rusqlite::params![me],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false)
+            {
+                endpoint_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            endpoint_ready,
+            "waiter notify endpoint must be registered before sending arriving message"
+        );
+
+        let (sc, _, _) = h.run(["send", &format!("@{me}"), "--name", &other, "--", "arr"]);
+        send_code = Some(sc);
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    let mid_wait_cursor: i64 = conn
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?1",
+            rusqlite::params![me],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let premature_exit = child.try_wait().unwrap_or(None);
+
+    if expected_code == 0
+        && premature_exit.is_none()
+        && let Ok(c) = rusqlite::Connection::open(&db_path)
+    {
+        let data = serde_json::json!({"status": "active", "detail": "sol002_target"});
+        let _ = c.execute(
+            "INSERT INTO events (timestamp, type, instance, data) VALUES (datetime('now'), 'status', ?1, ?2)",
+            rusqlite::params![me, serde_json::to_string(&data).unwrap()],
+        );
+        let port: Option<u16> = c
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_wait'",
+                rusqlite::params![me],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(p) = port {
+            let _ = std::net::TcpStream::connect(("127.0.0.1", p));
+        }
+    }
+
+    let deadline_secs = wait_secs + 2;
+    let (code, stdout, stderr) = child.wait_bounded(Duration::from_secs(deadline_secs));
+
+    let preview_pattern = format!("<hcom>{other} → {me}</hcom>");
+    let preview_count = stdout.matches(&preview_pattern).count();
+
+    let send_ok = send_code.is_none_or(|c| c == 0);
+    let pending = premature_exit.is_none();
+    // Composite oracle: first establish send_ok and pending mid-wait.
+    // In GREEN, pending=true implies cursor unchanged, preview_count <= 1 (no duplicate preview),
+    // and expected final code. Endpoint registration is diagnostic-only and not required.
+    // In RED, premature_exit is Some(ExitStatus(0)), failing immediately on pending=false.
+    let oracle_passed = send_ok
+        && pending
+        && mid_wait_cursor == initial_cursor
+        && preview_count <= 1
+        && code == expected_code;
+
+    assert!(
+        oracle_passed,
+        "events --wait oracle failed (pending={pending}, premature_exit={premature_exit:?}, mid_cursor={mid_wait_cursor}, initial_cursor={initial_cursor}, preview_count={preview_count}, code={code}, expected_code={expected_code}, endpoint_ready={endpoint_ready}): stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn events_wait_cli_preexisting_unread_times_out_with_one() {
+    run_events_wait_cli_oracle(UnreadTiming::Preexisting, 2, 1);
+}
+
+#[test]
+fn events_wait_cli_arriving_unread_then_matching_status_exits_zero() {
+    run_events_wait_cli_oracle(UnreadTiming::ArrivingAfterReadiness, 4, 0);
+}
+
+#[test]
+fn commands_on_stopped_agent_explain_when_and_how_to_resume() {
+    let h = Hcom::new();
+    let me = h.start();
+    let gone = h.start();
+    let (cs, _, es) = h.run(["stop", &gone]);
+    assert_eq!(cs, 0, "stop failed: {es}");
+
+    // kill/stop of an already-stopped agent is a no-op success, not "not found".
+    for cmd in ["kill", "stop"] {
+        let (code, stdout, stderr) = h.run([cmd, &gone]);
+        assert_eq!(code, 0, "{cmd}: stdout={stdout} stderr={stderr}");
+        assert!(
+            stdout.contains(&format!("'{gone}' stopped ")),
+            "{cmd}: stdout={stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("hcom r {gone}")),
+            "{cmd}: stdout={stdout}"
+        );
+    }
+
+    for args in [vec!["list", gone.as_str()], vec!["term", gone.as_str()]] {
+        let (code, _stdout, stderr) = h.run(args.clone());
+        assert_eq!(code, 1, "{args:?}");
+        assert!(
+            stderr.contains(&format!("'{gone}' stopped ")),
+            "{args:?}: stderr={stderr}"
+        );
+    }
+
+    let (code, _stdout, stderr) = h.run(["send", &format!("@{gone}"), "--name", &me, "--", "hi"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("@{gone} stopped")) && stderr.contains(&format!("hcom r {gone}")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn unknown_agent_gets_typo_suggestion() {
+    let h = Hcom::new();
+    let me = h.start();
+    let typo: String = {
+        let mut c: Vec<char> = me.chars().collect();
+        c.swap(1, 2);
+        c.into_iter().collect()
+    };
+    if typo == me {
+        return; // name with repeated letters; swap is a no-op
+    }
+    let (code, _stdout, stderr) = h.run(["kill", &typo]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("No agent named '{typo}'"))
+            && stderr.contains(&format!("Did you mean: {me}?")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn send_rejects_ambiguous_bare_word_and_self_target() {
+    let h = Hcom::new();
+    let me = h.start();
+    let other = h.start();
+
+    // A lone word without '@' or '--' must not silently broadcast.
+    let (code, _stdout, stderr) = h.run(["send", &other, "--name", &me]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("Did you mean @{other}?")),
+        "stderr={stderr}"
+    );
+
+    let (code, _stdout, stderr) = h.run(["send", "hello", "--name", &me]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("hcom send -- hello"), "stderr={stderr}");
+
+    let (code, _stdout, stderr) = h.run(["send", &format!("@{me}"), "--name", &me, "--", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is you"), "stderr={stderr}");
+
+    // bigboss:DEVICE routes to bigboss, so it is also a self-only target.
+    let (code, _stdout, stderr) = h.run(["send", "-b", "@bigboss:ABCD", "--", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is you"), "stderr={stderr}");
+}
+
+#[test]
+fn unknown_command_and_tool_suggest_corrections() {
+    let h = Hcom::new();
+    let (code, _stdout, stderr) = h.run(["lst"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Did you mean: list?"), "stderr={stderr}");
+
+    let (code, _stdout, stderr) = h.run(["1", "claud"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Unknown tool 'claud'") && stderr.contains("Did you mean: claude?"),
+        "stderr={stderr}"
+    );
 }

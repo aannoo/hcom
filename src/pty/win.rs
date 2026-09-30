@@ -328,6 +328,7 @@ impl Proxy {
         let launch_phase = self.launch_phase_active.clone();
         let target = self.config.target.clone();
         let instance = self.config.instance_name.clone();
+        let grok_acp = self.config.grok_acp.clone();
         let current_name = self.current_name.clone();
         let current_status = self.current_status.clone();
         let notify_port = self.notify_port.clone();
@@ -356,6 +357,7 @@ impl Proxy {
                         current_name.clone(),
                         current_status.clone(),
                         None,
+                        grok_acp.clone(),
                     ) {
                         Ok(shared::DeliveryStart::Started(h)) => {
                             *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);

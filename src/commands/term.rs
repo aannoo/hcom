@@ -67,6 +67,21 @@ fn get_pty_instances(db: &HcomDb) -> Vec<(String, i32)> {
     .unwrap_or_default()
 }
 
+/// Why `name` has no screen to read or inject into.
+fn no_terminal_error(db: &HcomDb, name: &str) -> String {
+    match db.get_instance_full(name) {
+        Ok(Some(inst)) if inst.background != 0 => {
+            format!("'{name}' is headless, so it has no terminal screen")
+        }
+        // The row can exist before the PTY registers its port, in any status,
+        // so this can't distinguish "still starting" from "not hcom-launched".
+        Ok(Some(_)) => format!(
+            "'{name}' has no terminal registered yet: it is still starting, or it runs outside an hcom-managed terminal (not launched via 'hcom <tool>')"
+        ),
+        _ => crate::identity::describe_missing_agent(db, name),
+    }
+}
+
 /// Send data on a single TCP connection.
 fn inject_raw(port: i32, data: &[u8]) -> Result<(), String> {
     let mut stream =
@@ -82,7 +97,7 @@ pub fn inject_text_remote_result(
     text: &str,
     enter: bool,
 ) -> Result<String, String> {
-    let port = get_inject_port(db, name).ok_or_else(|| format!("No inject port for '{name}'."))?;
+    let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
 
     if !text.is_empty() {
         inject_raw(port, text.as_bytes())?;
@@ -158,12 +173,7 @@ pub fn read_instance_screen(
     raw_json: bool,
     clean: bool,
 ) -> Result<String, String> {
-    let port = get_inject_port(db, name).ok_or_else(|| {
-        format!(
-            "No inject port for '{}'. Instance not running or not PTY-managed.",
-            name
-        )
-    })?;
+    let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
     let result = query_screen(port)
         .ok_or_else(|| format!("No response from '{}' (port {}).", name, port))?;
     if raw_json {
@@ -325,7 +335,7 @@ fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
         let port = match get_inject_port(db, name) {
             Some(p) => p,
             None => {
-                println!("No inject port for '{name}'. Instance not running or not PTY-managed.");
+                eprintln!("Error: {}", no_terminal_error(db, name));
                 return 1;
             }
         };
@@ -380,16 +390,7 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
     let sub = argv.first().map(|s| s.as_str());
 
     if sub == Some("--help") || sub == Some("-h") {
-        println!(
-            "hcom term - Terminal admin: screen query, text injection, debug logging\n\n\
-             Usage:\n  \
-             hcom term                  Query all PTY screens\n  \
-             hcom term <name>           Query specific instance screen\n  \
-             hcom term <name> --json    JSON output\n  \
-             hcom term <name> --clean   Plain text, no header or line numbers\n  \
-             hcom term inject <name> [text] [--enter]   Inject text/enter\n  \
-             hcom term debug on|off|logs                 PTY debug logging"
-        );
+        crate::commands::help::print_command_help("term");
         return 0;
     }
 

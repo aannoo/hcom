@@ -65,7 +65,11 @@ fn python_command() -> Result<Command, String> {
 }
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "run", about = "Run a bundled or user workflow script")]
+#[command(
+    name = "run",
+    about = "Run a bundled or user workflow script",
+    disable_help_flag = true
+)]
 pub struct RunArgs {
     /// Script name plus forwarded args
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -236,7 +240,7 @@ fn list_scripts() -> i32 {
     }
 
     if !bundled.is_empty() {
-        println!("Examples:");
+        println!("Bundled Scripts:");
         println!();
         for s in &bundled {
             let agents = bundled_agent_desc(&s.name);
@@ -672,11 +676,12 @@ mod tests {
 
     #[test]
     fn test_embedded_scripts_available() {
-        assert_eq!(scripts::SCRIPTS.len(), 3);
+        assert_eq!(scripts::SCRIPTS.len(), 4);
         let names: Vec<&str> = scripts::SCRIPTS.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"confess"));
         assert!(names.contains(&"debate"));
         assert!(names.contains(&"fatcow"));
+        assert!(names.contains(&"onidle"));
     }
 
     #[test]

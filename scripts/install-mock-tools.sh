@@ -7,14 +7,37 @@ CACHE="${HCOM_MOCK_TOOLS_NPM_CACHE:-$ROOT/target/npm-cache}"
 
 mkdir -p "$PREFIX" "$CACHE"
 
-if [[ "$#" -gt 0 ]]; then
-  packages=("$@")
-else
-  packages=(
-    "@openai/codex@0.145.0"
-    "@anthropic-ai/claude-code@2.1.216"
-  )
+# Pinned `<package>@<version>` specs; comments and blank lines skipped.
+pins=()
+while IFS= read -r line; do
+  [[ -z "$line" || "$line" == \#* ]] || pins+=("$line")
+done < <(sed 's/[[:space:]]*$//' "$ROOT/scripts/mock-tools.pins")
+
+pin_for() {
+  local package="$1" pin
+  for pin in "${pins[@]}"; do
+    if [[ "$pin" == "$package@"* ]]; then
+      printf '%s\n' "$pin"
+      return
+    fi
+  done
+  printf 'no pin for %s in scripts/mock-tools.pins\n' "$package" >&2
+  exit 1
+}
+
+# No args installs every pin. An arg is a tool name (`codex`, `claude`) that
+# resolves to its pin, or an explicit npm spec used as given.
+packages=()
+if [[ "$#" -eq 0 ]]; then
+  packages=("${pins[@]}")
 fi
+for arg in "$@"; do
+  case "$arg" in
+    codex) packages+=("$(pin_for @openai/codex)") ;;
+    claude | @anthropic-ai/claude-code) packages+=("$(pin_for @anthropic-ai/claude-code)") ;;
+    *) packages+=("$arg") ;;
+  esac
+done
 
 claude_version=""
 has_claude_native=0
@@ -30,9 +53,6 @@ for package in "${packages[@]}"; do
       ;;
     @anthropic-ai/claude-code@*)
       claude_version="${package##*@}"
-      ;;
-    @anthropic-ai/claude-code)
-      claude_version="2.1.216"
       ;;
     @anthropic-ai/claude-code-*)
       has_claude_native=1
@@ -71,6 +91,46 @@ if [[ -n "$claude_version" && "$has_claude_native" -eq 0 ]]; then
       ;;
   esac
   packages+=("@anthropic-ai/claude-code-$claude_platform@$claude_version")
+fi
+
+# npm's cache retains downloaded tarballs, but `npm install --global` still
+# revalidates registry metadata and reifies the installed packages on every
+# invocation. The real-tool gate needs exact pins, so a successful version
+# check is enough to reuse an already-installed, platform-specific tool.
+#
+# A version is one whitespace-separated token of the output (`claude` prints
+# `2.1.283 (Claude Code)`, `codex` prints `codex-cli 0.157.1`), matched exactly
+# as the tests' pin check does, so 2.1.28 never passes for 2.1.283.
+installed_pin_matches() {
+  local tool="$1" wanted="$2" launcher="$PREFIX/bin/$1" reported token
+  [[ -x "$launcher" ]] || return 1
+  reported="$("$launcher" --version 2>&1)" || return 1
+  for token in $reported; do
+    [[ "${token#v}" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+# Build tool→version map from packages and check all of them.
+declare -A pin_map=()
+[[ -z "$codex_version" ]]  || pin_map[codex]="$codex_version"
+[[ -z "$claude_version" ]] || pin_map[claude]="$claude_version"
+
+if [[ ${#pin_map[@]} -gt 0 ]]; then
+  all_cached=true
+  for tool in "${!pin_map[@]}"; do
+    if ! installed_pin_matches "$tool" "${pin_map[$tool]}"; then
+      all_cached=false
+      break
+    fi
+  done
+  if $all_cached; then
+    for tool in "${!pin_map[@]}"; do
+      printf '%s %s verified at %s\n' "$tool" "${pin_map[$tool]}" "$PREFIX/bin/$tool" >&2
+    done
+    printf '%s\n' "$PREFIX/bin"
+    exit 0
+  fi
 fi
 
 npm_platform="$(node -p 'process.platform')"
@@ -158,5 +218,28 @@ if [[ "$npm_platform" == "android" && -n "$codex_version" ]]; then
     >"$PREFIX/bin/codex"
   chmod +x "$PREFIX/bin/codex"
 fi
+
+# Verify the pin here rather than letting a real-tool test discover it: this
+# script knows which version it asked for and can name the launcher that
+# answered, which a `found 2.1.185` panic 200 lines into a test cannot.
+verify_pin() {
+  local tool="$1" wanted="$2" launcher="$PREFIX/bin/$1" reported
+  [[ -n "$wanted" ]] || return 0
+  if [[ ! -x "$launcher" ]]; then
+    printf 'installed %s@%s but no executable at %s\n' "$tool" "$wanted" "$launcher" >&2
+    exit 1
+  fi
+  # `|| true`: under `set -e` a nonzero `--version` would abort the script here
+  # with no output, losing the very text that explains what went wrong.
+  reported="$("$launcher" --version 2>&1 || true)"
+  if [[ "$reported" != *"$wanted"* ]]; then
+    printf "pinned %s@%s, but '%s' reports '%s'\n" "$tool" "$wanted" "$launcher" "$reported" >&2
+    exit 1
+  fi
+  printf '%s %s verified at %s\n' "$tool" "$wanted" "$launcher" >&2
+}
+
+verify_pin claude "$claude_version"
+verify_pin codex "$codex_version"
 
 printf '%s\n' "$PREFIX/bin"

@@ -129,18 +129,31 @@ fn get_device_short_id(db: &HcomDb) -> String {
     }
 }
 
+fn paint(code: &str, text: &str) -> String {
+    use std::io::IsTerminal;
+
+    let enabled = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").as_deref() != Ok("dumb");
+    if enabled {
+        format!("{code}{text}{RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Show relay status.
 fn relay_status(db: &HcomDb) -> i32 {
     let config = config::load_config_snapshot().core;
 
     if config.relay_id.is_empty() {
-        println!("{FG_GRAY}Relay: not configured{RESET}");
+        println!("{}", paint(FG_GRAY, "Relay: not configured"));
         println!("Run: hcom relay new");
         return 0;
     }
 
     if !config.relay_enabled {
-        println!("{FG_YELLOW}Relay: disabled{RESET}");
+        println!("{}", paint(FG_YELLOW, "Relay: disabled"));
         println!("\nRun: hcom relay connect");
         return 0;
     }
@@ -150,19 +163,26 @@ fn relay_status(db: &HcomDb) -> i32 {
     let health = relay::relay_health(&config, db);
     match &health {
         relay::RelayHealth::Connected => {
-            println!("Status:    {FG_GREEN}connected{RESET}");
+            println!("Status:    {}", paint(FG_GREEN, "connected"));
         }
         relay::RelayHealth::Starting { pid } => {
-            println!("Status:    {FG_YELLOW}starting{RESET} (PID {pid}, awaiting connect)");
+            println!(
+                "Status:    {} (PID {pid}, awaiting connect)",
+                paint(FG_YELLOW, "starting")
+            );
         }
         relay::RelayHealth::Stale { age_s, pid } => {
             println!(
-                "Status:    {FG_YELLOW}stale{RESET} — worker unresponsive (PID {pid}, {:.0}s since last heartbeat)",
+                "Status:    {} — worker unresponsive (PID {pid}, {:.0}s since last heartbeat)",
+                paint(FG_YELLOW, "stale"),
                 age_s
             );
         }
         relay::RelayHealth::Waiting => {
-            println!("Status:    {FG_YELLOW}waiting{RESET} (daemon may not be running)");
+            println!(
+                "Status:    {} (daemon may not be running)",
+                paint(FG_YELLOW, "waiting")
+            );
         }
         relay::RelayHealth::Error {
             reason,
@@ -170,7 +190,8 @@ fn relay_status(db: &HcomDb) -> i32 {
             pid,
         } => {
             println!(
-                "Status:    {FG_RED}error{RESET} — {}",
+                "Status:    {} — {}",
+                paint(FG_RED, "error"),
                 reason.clone().label(detail.as_deref(), *pid)
             );
             if matches!(reason, relay::RelayErrorReason::Reported) {
@@ -192,7 +213,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         // NotConfigured / Disabled never reach here — the early returns above
         // (config.relay_id empty / !config.relay_enabled) handled them already.
         relay::RelayHealth::NotConfigured | relay::RelayHealth::Disabled => {
-            println!("Status:    {FG_YELLOW}waiting{RESET}");
+            println!("Status:    {}", paint(FG_YELLOW, "waiting"));
         }
     }
 
@@ -336,7 +357,10 @@ fn relay_status(db: &HcomDb) -> i32 {
     if let Ok(psk) = relay::load_psk(&config) {
         println!("Key:       {}", relay::crypto::fingerprint(&psk));
     } else {
-        println!("Key:       {FG_RED}missing{RESET} (run `hcom relay new`)");
+        println!(
+            "Key:       {} (run `hcom relay new`)",
+            paint(FG_RED, "missing")
+        );
     }
 
     println!("\nShow token: hcom relay token");
@@ -452,7 +476,7 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
     }
 
     crate::relay::worker::stop_relay_worker_blocking();
-    println!("{FG_YELLOW}Relay: disabled{RESET}");
+    println!("{}", paint(FG_YELLOW, "Relay: disabled"));
     println!("\nRun 'hcom relay connect' to reconnect");
     0
 }
@@ -796,29 +820,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
     let first = argv[0].as_str();
 
     if first == "--help" || first == "-h" {
-        println!(
-            "hcom relay - Cross-device sync via MQTT pub/sub\n\n\
-             Usage:\n  \
-             hcom relay                  Show relay status\n  \
-             hcom relay status           Same as above\n  \
-             hcom relay new              Create new relay group (generates fresh key)\n  \
-             hcom relay token            Show join token\n  \
-             hcom relay connect          Re-enable existing relay\n  \
-             hcom relay connect <token>  Join relay from another device\n  \
-             hcom relay off              Disable relay sync\n  \
-             hcom relay off --all        Ask all known peers to disable this relay too, then disable locally\n  \
-             hcom relay disconnect       Disable relay sync\n  \
-             hcom relay push             Trigger an immediate relay push\n  \
-             \n\
-             Daemon:\n  \
-             hcom relay daemon           Show daemon status\n  \
-             hcom relay daemon start     Start the relay daemon\n  \
-             hcom relay daemon stop      Stop the relay daemon\n  \
-             hcom relay daemon restart   Restart the relay daemon\n\n\
-             Private broker:\n  \
-             hcom relay new --broker mqtts://host:port [--password secret]\n  \
-             hcom relay connect <token> --broker mqtts://host:port [--password secret]"
-        );
+        crate::commands::help::print_command_help("relay");
         return 0;
     }
 
@@ -837,7 +839,9 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
                 relay_connect(db, argv)
             } else {
                 eprintln!("Error: Unknown subcommand: {first}");
-                eprintln!("Usage: hcom relay [new|connect|disconnect|status|push]");
+                eprintln!(
+                    "Usage: hcom relay [new|token|connect|on|off|daemon] (see hcom relay --help)"
+                );
                 1
             }
         }

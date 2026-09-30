@@ -321,7 +321,7 @@ pub(crate) fn resolve_launcher_name(
         })
         .or_else(|| flags.name.clone())
         .unwrap_or_else(|| {
-            identity::resolve_identity(db, None, None, None, process_id, None, None)
+            identity::resolve_identity(db, None, None, None, process_id, None)
                 .map(|id| id.name)
                 .unwrap_or_else(|_| "user".to_string())
         })
@@ -380,6 +380,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
             "copilot" => preview.config.copilot_args.as_str(),
             "kimi" => preview.config.kimi_args.as_str(),
+            "grok" | "grok-build" => preview.config.grok_args.as_str(),
             _ => "",
         }
     } else {
@@ -426,6 +427,8 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             );
         }
     }
+
+    println!("\n[Preview Mode] Add --go to proceed with launch.");
 }
 
 /// Hcom-level flags extracted from launch argv.
@@ -528,6 +531,7 @@ pub(crate) fn merge_tool_args(
             append_config_args(&config.cursor_args, cli_args)
         }
         LaunchTool::Copilot => append_config_args(&config.copilot_args, cli_args),
+        LaunchTool::Grok => append_config_args(&config.grok_args, cli_args),
         LaunchTool::Pi => append_config_args(&config.pi_args, cli_args),
         LaunchTool::Omp => append_config_args(&config.omp_args, cli_args),
         LaunchTool::OpenCode => append_config_args(&config.opencode_args, cli_args),
@@ -560,6 +564,7 @@ pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> boo
         | LaunchTool::Cursor
         | LaunchTool::Kimi
         | LaunchTool::Copilot
+        | LaunchTool::Grok
         | LaunchTool::Omp => false,
     }
 }

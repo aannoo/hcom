@@ -193,6 +193,164 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
     None
 }
 
+/// Latest stop of an agent that no longer has a live row.
+#[derive(Debug, Clone)]
+pub struct StoppedAgent {
+    pub name: String,
+    pub stopped_at: Option<i64>,
+    pub by: String,
+    pub reason: String,
+    pub tool: String,
+    pub directory: String,
+    pub tag: String,
+    pub session_id: String,
+}
+
+impl StoppedAgent {
+    /// `tag-name` when the stopped incarnation had a tag, so follow-up
+    /// commands target it rather than a later reuse of the base name.
+    pub fn display_name(&self) -> String {
+        if self.tag.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}-{}", self.tag, self.name)
+        }
+    }
+
+    /// `stopped 23m ago (killed by muse) · claude · ~/Dev/x`
+    pub fn summary(&self) -> String {
+        let when = match self.stopped_at {
+            Some(ts) => {
+                let age = crate::shared::now_epoch_i64() - ts;
+                match crate::shared::format_age(age).as_str() {
+                    "now" => "just now".to_string(),
+                    a => format!("{a} ago"),
+                }
+            }
+            None => "earlier".to_string(),
+        };
+        let mut out = format!("stopped {when}");
+        match (self.reason.as_str(), self.by.as_str()) {
+            ("", "") => {}
+            (reason, "") => out.push_str(&format!(" ({reason})")),
+            ("", by) => out.push_str(&format!(" (by {by})")),
+            (reason, by) => out.push_str(&format!(" ({reason} by {by})")),
+        }
+        if !self.tool.is_empty() {
+            out.push_str(&format!(" · {}", self.tool));
+        }
+        if !self.directory.is_empty() {
+            out.push_str(&format!(
+                " · {}",
+                crate::shared::platform::shorten_path(&self.directory)
+            ));
+        }
+        out
+    }
+}
+
+/// Load the latest stop for `input_name` (base or tag-name) when it has no
+/// live row. `None` means it is live or hcom has never seen it.
+pub fn last_stopped(db: &HcomDb, input_name: &str) -> Option<StoppedAgent> {
+    if resolve_display_name(db, input_name).is_some() {
+        return None;
+    }
+    let name = resolve_display_name_or_stopped(db, input_name)?;
+    // "api-tuna" must describe the stop of that tagged incarnation, not a
+    // later reuse of the base name under another tag.
+    let tag = input_name
+        .strip_suffix(name.as_str())
+        .and_then(|prefix| prefix.strip_suffix('-'));
+    let (timestamp, data): (String, String) = db
+        .conn()
+        .query_row(
+            "SELECT timestamp, data FROM events
+             WHERE type = 'life' AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'
+               AND (?2 IS NULL OR json_extract(data, '$.snapshot.tag') = ?2)
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name, tag],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    let data: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+    let field = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    Some(StoppedAgent {
+        stopped_at: parse_event_timestamp(&timestamp),
+        by: field(&data["by"]),
+        reason: field(&data["reason"]),
+        tool: field(&data["snapshot"]["tool"]),
+        directory: field(&data["snapshot"]["directory"]),
+        tag: field(&data["snapshot"]["tag"]),
+        session_id: field(&data["snapshot"]["session_id"]),
+        name,
+    })
+}
+
+fn parse_event_timestamp(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.timestamp())
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|dt| dt.and_utc().timestamp())
+        })
+}
+
+/// Live names plus names stopped recently enough to still be worth suggesting.
+///
+/// Includes `tag-name` aliases so a mistyped tagged name (`api-tnua`) is
+/// corrected to that incarnation rather than a bare base name.
+pub fn known_agent_names(db: &HcomDb) -> Vec<String> {
+    let mut names = Vec::new();
+    for inst in db.iter_instances_full().unwrap_or_default() {
+        let full = get_full_name(&inst);
+        if full != inst.name {
+            names.push(full);
+        }
+        names.push(inst.name);
+    }
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT DISTINCT instance, COALESCE(json_extract(data, '$.snapshot.tag'), '')
+         FROM events
+         WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
+         ORDER BY id DESC LIMIT 200",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        for (name, tag) in rows.flatten() {
+            if !tag.is_empty() {
+                names.push(format!("{tag}-{name}"));
+            }
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Explain why `input_name` is not a live agent, with the next useful command.
+///
+/// Stopped: `'tuna' stopped 23m ago (killed by muse) · claude …`
+/// plus resume/transcript hints. Never seen: close-name suggestions.
+pub fn describe_missing_agent(db: &HcomDb, input_name: &str) -> String {
+    if let Some(stopped) = last_stopped(db, input_name) {
+        return format!(
+            "'{input_name}' {}\n  Resume: hcom r {name}  |  History: hcom transcript {name}",
+            stopped.summary(),
+            name = stopped.display_name()
+        );
+    }
+    let known = known_agent_names(db);
+    let mut msg = format!("No agent named '{input_name}'");
+    msg.push_str(&crate::shared::suggest::did_you_mean(
+        input_name,
+        known.iter().map(String::as_str),
+    ));
+    msg.push_str("\n  Active: hcom list  |  Stopped: hcom list --stopped");
+    msg
+}
+
 /// Resolve `--name NAME` with strict instance lookup.
 ///
 /// Resolution order:
@@ -276,7 +434,6 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 /// * `session_id` - Explicit session_id (for hook context, bypasses env detection)
 /// * `process_id` - HCOM_PROCESS_ID (for launched instances)
 /// * `codex_thread_id` - Codex thread ID for opportunistic session binding
-/// * `transcript_fallback` - Optional closure for transcript marker resolution
 ///
 /// # Priority
 ///
@@ -284,9 +441,8 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 /// 2. `session_id` - explicit session (internal use)
 /// 3. `name` (--name) - strict instance lookup
 /// 4. Auto-detect from `process_id` (HCOM_PROCESS_ID)
-/// 5. `transcript_fallback` - transcript marker scan (hook extension point)
-/// 6. Error if no identity
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// 5. Error if no identity
+#[allow(clippy::too_many_arguments)]
 fn resolve_identity_with_expectation(
     db: &HcomDb,
     name: Option<&str>,
@@ -295,7 +451,6 @@ fn resolve_identity_with_expectation(
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
     identity_expected: bool,
-    transcript_fallback: Option<&dyn Fn(&HcomDb) -> Option<SenderIdentity>>,
 ) -> Result<SenderIdentity, HcomError> {
     // 1. System sender (internal use)
     if let Some(sender) = system_sender {
@@ -452,14 +607,7 @@ fn resolve_identity_with_expectation(
         }
     }
 
-    // 5. Transcript marker fallback (hook extension point)
-    if let Some(fallback) = transcript_fallback
-        && let Some(identity) = fallback(db)
-    {
-        return Ok(identity);
-    }
-
-    // 6. No identity
+    // 5. No identity
     if identity_expected {
         crate::log::log_warn(
             "identity",
@@ -477,7 +625,6 @@ fn resolve_identity_with_expectation(
     ))
 }
 
-#[allow(clippy::type_complexity)]
 pub fn resolve_identity(
     db: &HcomDb,
     name: Option<&str>,
@@ -485,7 +632,6 @@ pub fn resolve_identity(
     session_id: Option<&str>,
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
-    transcript_fallback: Option<&dyn Fn(&HcomDb) -> Option<SenderIdentity>>,
 ) -> Result<SenderIdentity, HcomError> {
     resolve_identity_with_expectation(
         db,
@@ -495,7 +641,6 @@ pub fn resolve_identity(
         process_id,
         codex_thread_id,
         crate::shared::is_inside_ai_tool(),
-        transcript_fallback,
     )
 }
 
@@ -700,7 +845,7 @@ mod tests {
         let (db, _dir) = make_test_db();
 
         let identity =
-            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None, None).unwrap();
+            resolve_identity(&db, None, Some("hcom-launcher"), None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::System));
         assert_eq!(identity.name, "hcom-launcher");
     }
@@ -711,7 +856,7 @@ mod tests {
         insert_instance(&db, "luna", Some("sess-1"), None);
         insert_session_binding(&db, "sess-1", "luna");
 
-        let identity = resolve_identity(&db, None, None, Some("sess-1"), None, None, None).unwrap();
+        let identity = resolve_identity(&db, None, None, Some("sess-1"), None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::Instance));
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
@@ -722,7 +867,7 @@ mod tests {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", None, None);
 
-        let identity = resolve_identity(&db, Some("luna"), None, None, None, None, None).unwrap();
+        let identity = resolve_identity(&db, Some("luna"), None, None, None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 
@@ -732,8 +877,7 @@ mod tests {
         insert_instance(&db, "luna", Some("sess-1"), None);
         insert_process_binding(&db, "pid-123", "luna");
 
-        let identity =
-            resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap();
+        let identity = resolve_identity(&db, None, None, None, Some("pid-123"), None).unwrap();
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
     }
@@ -745,16 +889,8 @@ mod tests {
         insert_instance(&db, "luna", None, None);
         insert_process_binding(&db, "pid-123", "luna");
 
-        let identity = resolve_identity(
-            &db,
-            None,
-            None,
-            None,
-            Some("pid-123"),
-            Some("thread-abc"),
-            None,
-        )
-        .unwrap();
+        let identity =
+            resolve_identity(&db, None, None, None, Some("pid-123"), Some("thread-abc")).unwrap();
         assert_eq!(identity.name, "luna");
         // Session should now be bound
         assert_eq!(identity.session_id.as_deref(), Some("thread-abc"));
@@ -769,34 +905,15 @@ mod tests {
         let (db, _dir) = make_test_db();
         // No process binding exists
 
-        let err = resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap_err();
+        let err = resolve_identity(&db, None, None, None, Some("pid-123"), None).unwrap_err();
         assert!(err.to_string().contains("expired"));
-    }
-
-    #[test]
-    fn test_resolve_identity_transcript_fallback() {
-        let (db, _dir) = make_test_db();
-        insert_instance(&db, "nova", Some("sess-2"), None);
-
-        let fallback = |_db: &HcomDb| -> Option<SenderIdentity> {
-            Some(SenderIdentity {
-                kind: SenderKind::Instance,
-                name: "nova".to_string(),
-                instance_data: None,
-                session_id: Some("sess-2".to_string()),
-            })
-        };
-
-        let identity =
-            resolve_identity(&db, None, None, None, None, None, Some(&fallback)).unwrap();
-        assert_eq!(identity.name, "nova");
     }
 
     #[test]
     fn test_resolve_identity_no_identity() {
         let (db, _dir) = make_test_db();
 
-        let err = resolve_identity(&db, None, None, None, None, None, None).unwrap_err();
+        let err = resolve_identity(&db, None, None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("No hcom identity"));
     }
 
@@ -806,16 +923,8 @@ mod tests {
         insert_instance(&db, "luna", None, None);
 
         // system_sender takes priority over name
-        let identity = resolve_identity(
-            &db,
-            Some("luna"),
-            Some("hcom-launcher"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let identity =
+            resolve_identity(&db, Some("luna"), Some("hcom-launcher"), None, None, None).unwrap();
         assert!(matches!(identity.kind, SenderKind::System));
         assert_eq!(identity.name, "hcom-launcher");
     }
@@ -829,7 +938,7 @@ mod tests {
 
         // session_id takes priority over name
         let identity =
-            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None, None).unwrap();
+            resolve_identity(&db, Some("nova"), None, Some("sess-1"), None, None).unwrap();
         assert_eq!(identity.name, "luna");
     }
 
@@ -898,7 +1007,6 @@ mod tests {
             None,
             Some("pid-codex"),
             Some("thread-resume"),
-            None,
         )
         .unwrap();
 
@@ -925,7 +1033,6 @@ mod tests {
             None,
             Some("pid-codex"),
             Some("thread-same"),
-            None,
         )
         .unwrap();
 
@@ -1013,5 +1120,76 @@ mod tests {
             resolve_display_name_or_stopped(&db, "luna").as_deref(),
             Some("luna")
         );
+    }
+
+    // ── Missing-agent descriptions ─────────────────────────────────────
+
+    fn log_stop(db: &HcomDb, name: &str, by: &str, reason: &str) {
+        let snapshot = serde_json::json!({"tool": "codex", "directory": "/tmp/work"});
+        db.log_life_event(name, "stopped", by, reason, Some(snapshot))
+            .unwrap();
+    }
+
+    #[test]
+    fn last_stopped_reports_latest_stop_and_ignores_live_agents() {
+        let (db, _dir) = make_test_db();
+        log_stop(&db, "tuna", "pty", "closed");
+        log_stop(&db, "tuna", "muse", "killed");
+
+        let stopped = last_stopped(&db, "tuna").expect("stopped agent");
+        assert_eq!(stopped.by, "muse");
+        assert_eq!(stopped.reason, "killed");
+        let summary = stopped.summary();
+        assert!(summary.starts_with("stopped "), "{summary}");
+        assert!(
+            summary.contains("(killed by muse) · codex · /tmp/work"),
+            "{summary}"
+        );
+
+        insert_instance(&db, "tuna", None, None);
+        assert!(
+            last_stopped(&db, "tuna").is_none(),
+            "live agent is not stopped"
+        );
+    }
+
+    #[test]
+    fn last_stopped_by_tag_name_ignores_later_reuse_under_other_tag() {
+        let (db, _dir) = make_test_db();
+        let stop = |tag: &str, by: &str| {
+            let snapshot = serde_json::json!({"tool": "codex", "tag": tag});
+            db.log_life_event("tuna", "stopped", by, "killed", Some(snapshot))
+                .unwrap();
+        };
+        stop("api", "muse");
+        stop("web", "nazu");
+
+        let api = last_stopped(&db, "api-tuna").unwrap();
+        assert_eq!(api.by, "muse");
+        assert_eq!(api.display_name(), "api-tuna");
+        assert_eq!(last_stopped(&db, "tuna").unwrap().by, "nazu");
+    }
+
+    #[test]
+    fn describe_missing_agent_explains_stopped_and_suggests_typos() {
+        let (db, _dir) = make_test_db();
+        log_stop(&db, "tuna", "muse", "killed");
+        insert_instance(&db, "nazu", None, None);
+
+        let stopped = describe_missing_agent(&db, "tuna");
+        assert!(stopped.starts_with("'tuna' stopped "), "{stopped}");
+        assert!(stopped.contains("hcom r tuna"), "{stopped}");
+
+        let typo = describe_missing_agent(&db, "tnua");
+        assert!(typo.starts_with("No agent named 'tnua'"), "{typo}");
+        assert!(typo.contains("Did you mean: tuna?"), "{typo}");
+
+        insert_instance(&db, "vani", None, Some("api"));
+        let tagged = describe_missing_agent(&db, "api-vnai");
+        assert!(tagged.contains("Did you mean: api-vani?"), "{tagged}");
+
+        let unknown = describe_missing_agent(&db, "zzzz");
+        assert!(!unknown.contains("Did you mean"), "{unknown}");
+        assert!(unknown.contains("hcom list --stopped"), "{unknown}");
     }
 }

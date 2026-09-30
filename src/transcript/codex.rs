@@ -31,6 +31,81 @@ fn codex_output_text(value: Option<&Value>) -> String {
     }
 }
 
+/// Forks of forks are followed this deep; a cycle or a runaway chain stops here.
+const MAX_FORK_DEPTH: usize = 16;
+
+/// A rollout's entries, preceded by whatever it inherited as a fork.
+///
+/// Since Codex 0.152 a fork's rollout no longer copies the parent's history: its
+/// `session_meta` names the parent (`forked_from_id`) and the inherited prefix
+/// (every parent entry with `ordinal < forked_from_ordinal_exclusive`). Without
+/// resolving that, a fork's transcript starts at its first own turn.
+fn read_codex_rollout_entries(path: &Path) -> Result<Vec<Value>, String> {
+    let own = read_rollout_lines(path)?;
+    let mut entries = inherited_entries(path, &own, 0);
+    entries.extend(own);
+    Ok(entries)
+}
+
+fn read_rollout_lines(path: &Path) -> Result<Vec<Value>, String> {
+    Ok(read_file_lossy(path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect())
+}
+
+/// What the rollout at `path` (whose parsed lines are `own`) inherited from its
+/// fork parent, recursively. Empty when it is not a fork, or when the parent
+/// rollout is gone — the fork's own turns still render.
+fn inherited_entries(path: &Path, own: &[Value], depth: usize) -> Vec<Value> {
+    let Some((parent_id, bound)) = own.first().and_then(fork_reference) else {
+        return Vec::new();
+    };
+    if depth >= MAX_FORK_DEPTH {
+        return Vec::new();
+    }
+    let Some(parent_path) = find_sibling_rollout(path, &parent_id) else {
+        return Vec::new();
+    };
+    let Ok(parent_own) = read_rollout_lines(&parent_path) else {
+        return Vec::new();
+    };
+    let mut entries = inherited_entries(&parent_path, &parent_own, depth + 1);
+    entries.extend(
+        parent_own
+            .into_iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                let ordinal = entry.get("ordinal").and_then(Value::as_u64);
+                ordinal.unwrap_or(*index as u64) < bound
+            })
+            .map(|(_, entry)| entry),
+    );
+    entries
+}
+
+/// `(parent id, inherited ordinal bound)` when `entry` is a forked rollout's
+/// `session_meta` that references its parent rather than copying it.
+fn fork_reference(entry: &Value) -> Option<(String, u64)> {
+    if entry.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let meta = entry.get("payload")?;
+    let parent_id = meta.get("forked_from_id")?.as_str()?.to_string();
+    let inherited = meta.get("forked_from_ordinal_exclusive")?.as_u64()?;
+    Some((parent_id, inherited))
+}
+
+/// The rollout for session `id` under the same `sessions` root as `path`
+/// (rollouts live in dated subdirectories, so the parent may be days away).
+fn find_sibling_rollout(path: &Path, id: &str) -> Option<std::path::PathBuf> {
+    let sessions = path
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "sessions"))?;
+    let pattern = format!("{}/**/rollout-*-{id}.jsonl", sessions.display());
+    glob::glob(&pattern).ok()?.filter_map(Result::ok).next()
+}
+
 /// Parse Codex JSONL transcript.
 /// Handles both response_item (older) and event_msg (newer) formats.
 pub(crate) fn parse_codex_jsonl(
@@ -38,18 +113,14 @@ pub(crate) fn parse_codex_jsonl(
     last: usize,
     detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
-    let content = read_file_lossy(path)?;
+    let entries = read_codex_rollout_entries(path)?;
 
     // First pass: build call_id → output map for error detection
     let mut call_outputs: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut parsed_lines: Vec<Value> = Vec::new();
 
-    for line in content.lines() {
-        let entry: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for entry in entries {
         let payload = entry.get("payload").cloned().unwrap_or(entry.clone());
         let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if payload_type == "function_call_output" {
@@ -377,6 +448,86 @@ mod tests {
     use super::*;
     use crate::transcript::{ReadOptions, TranscriptBackend, read};
     use std::fs;
+
+    /// One rollout under `sessions/<day>/`, as Codex >= 0.152 writes it: every
+    /// line carries an `ordinal`, and a fork's `session_meta` references its
+    /// parent instead of copying the parent's history.
+    fn write_rollout(
+        sessions: &Path,
+        day: &str,
+        id: &str,
+        fork_of: Option<(&str, u64)>,
+        turns: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let mut meta = json!({"session_id": id, "id": id});
+        if let Some((parent, bound)) = fork_of {
+            meta["forked_from_id"] = json!(parent);
+            meta["forked_from_ordinal_exclusive"] = json!(bound);
+        }
+        let mut lines = vec![json!({"type": "session_meta", "payload": meta})];
+        for (user, assistant) in turns {
+            for (role, kind, text) in [
+                ("user", "input_text", user),
+                ("assistant", "output_text", assistant),
+            ] {
+                lines.push(json!({
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+                }));
+            }
+        }
+        let body: String = lines
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, mut line)| {
+                line["ordinal"] = json!(ordinal);
+                format!("{line}\n")
+            })
+            .collect();
+        let dir = sessions.join(day);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-{day}-{id}.jsonl"));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_parse_codex_fork_includes_inherited_history_through_nested_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        // Ordinals: 0 session_meta, then 2 per turn. The child forks after the
+        // root's first turn (bound 3), so the root's later turn must not leak in.
+        write_rollout(&sessions, "d1", "root", None, &[("r1", "R1"), ("r2", "R2")]);
+        write_rollout(&sessions, "d2", "child", Some(("root", 3)), &[("c1", "C1")]);
+        let grandchild = write_rollout(
+            &sessions,
+            "d3",
+            "grandchild",
+            Some(("child", 3)),
+            &[("g1", "G1")],
+        );
+
+        let exchanges = parse_codex_jsonl(&grandchild, 10, false).unwrap();
+        let users: Vec<&str> = exchanges.iter().map(|e| e.user.as_str()).collect();
+        assert_eq!(users, ["r1", "c1", "g1"]);
+    }
+
+    #[test]
+    fn test_parse_codex_fork_with_missing_parent_keeps_own_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let orphan = write_rollout(
+            &sessions,
+            "d1",
+            "orphan",
+            Some(("gone", 5)),
+            &[("o1", "O1")],
+        );
+
+        let exchanges = parse_codex_jsonl(&orphan, 10, false).unwrap();
+        let users: Vec<&str> = exchanges.iter().map(|e| e.user.as_str()).collect();
+        assert_eq!(users, ["o1"]);
+    }
 
     #[test]
     fn test_parse_codex_prefers_response_items_over_event_msgs() {

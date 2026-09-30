@@ -13,10 +13,46 @@ use crate::instance_lifecycle::{
     RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
     get_instance_status,
 };
-use crate::instances::is_remote_instance;
+use crate::instances::{is_remote_instance, is_subagent_instance};
 use crate::shared::{
     CommandContext, SENDER, ST_LISTENING, shorten_path, shorten_path_max, status_icon,
 };
+
+/// Tool label shown in `hcom list`, e.g. `CLAUDE` or `CODEX*`.
+///
+/// A star means an agent whose delivery depends on local bindings has a
+/// missing one: its hooks haven't bound yet (or never will), or its hcom
+/// process is gone. Subagents use their parent's session and relay mirrors are
+/// bound on their own device, so neither gets a star.
+fn tool_label(db: &HcomDb, data: &InstanceRow) -> String {
+    if data.tool == "adhoc" {
+        return "AD-HOC".to_string();
+    }
+    let tool = data.tool.to_uppercase();
+    if is_remote_instance(data) || is_subagent_instance(data) {
+        return tool;
+    }
+    if db.has_session_binding(&data.name) && db.has_process_binding_for_instance(&data.name) {
+        tool
+    } else {
+        format!("{tool}*")
+    }
+}
+
+/// Binding summary for verbose/detail views: "hooks, process", "hooks", ...
+/// An ad-hoc row's session binding only keys its identity (no hooks run).
+fn bindings_display(db: &HcomDb, data: &InstanceRow) -> &'static str {
+    let session = db.has_session_binding(&data.name);
+    if data.tool == "adhoc" {
+        return if session { "session" } else { "none" };
+    }
+    match (session, db.has_process_binding_for_instance(&data.name)) {
+        (true, true) => "hooks, process",
+        (true, false) => "hooks",
+        (false, true) => "process",
+        (false, false) => "none",
+    }
+}
 
 /// Parsed arguments for `hcom list`.
 #[derive(clap::Parser, Debug)]
@@ -106,7 +142,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     let (sender_identity, current_name) = if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
         (Some(id.clone()), Some(id.name.clone()))
     } else if let Some(name) = explicit_name {
-        match identity::resolve_identity(db, Some(name), None, None, None, None, None) {
+        match identity::resolve_identity(db, Some(name), None, None, None, None) {
             Ok(id) => {
                 let n = id.name.clone();
                 (Some(id), Some(n))
@@ -117,7 +153,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
         }
     } else {
-        identity::resolve_identity(db, None, None, None, None, None, None)
+        identity::resolve_identity(db, None, None, None, None, None)
             .map(|id| {
                 let n = id.name.clone();
                 (Some(id), Some(n))
@@ -194,8 +230,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     }
                     return 0;
                 } else {
-                    eprintln!("Error: Not found: {target}");
-                    eprintln!("Use 'hcom list' to see active agents.");
+                    eprintln!("Error: {}", identity::describe_missing_agent(db, target));
                     return 1;
                 }
             }
@@ -382,23 +417,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         let desc_sep = if !description.is_empty() { ": " } else { "" };
 
-        // Tool prefix — binding state encoding:
-        // UPPER = pty+hooks, lower = hooks only, UPPER* = pty only, lower* = no binding
         let tool_prefix = if show_tool {
-            let hooks_bound = db.has_session_binding(&data.name);
-            let process_bound = db.has_process_binding_for_instance(&data.name);
-            let tool_display = if data.tool == "adhoc" {
-                "ad-hoc".to_string()
-            } else if process_bound && hooks_bound {
-                data.tool.to_uppercase()
-            } else if process_bound {
-                format!("{}*", data.tool.to_uppercase())
-            } else if hooks_bound {
-                data.tool.to_lowercase()
-            } else {
-                format!("{}*", data.tool.to_lowercase())
-            };
-            let padded = format!("[{tool_display}]");
+            let padded = format!("[{}]", tool_label(db, data));
             format!("{padded:<10}")
         } else {
             String::new()
@@ -507,15 +527,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
 
             // Binding status
-            let hooks_bound = db.has_session_binding(&data.name);
-            let process_bound = db.has_process_binding_for_instance(&data.name);
-            let bind_str = match (hooks_bound, process_bound) {
-                (true, true) => "hooks, pty",
-                (true, false) => "hooks",
-                (false, true) => "pty",
-                (false, false) => "none",
-            };
-            println!("    bindings:     {bind_str}");
+            println!("    bindings:     {}", bindings_display(db, data));
 
             let transcript = if data.transcript_path.is_empty() {
                 "(none)".to_string()
@@ -666,15 +678,7 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
     }
 
     // Bindings
-    let hooks_bound = db.has_session_binding(&data.name);
-    let process_bound = db.has_process_binding_for_instance(&data.name);
-    let bind_str = match (hooks_bound, process_bound) {
-        (true, true) => "hooks, pty",
-        (true, false) => "hooks",
-        (false, true) => "pty",
-        (false, false) => "none",
-    };
-    println!("  Bindings:    {bind_str}");
+    println!("  Bindings:    {}", bindings_display(db, data));
 
     if let Some(pid) = data.pid {
         println!("  PID:         {pid}");
@@ -963,4 +967,60 @@ fn get_recently_stopped(
         .filter_map(|r| r.ok())
         .filter(|name| !exclude_active.contains(name))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> HcomDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
+    }
+
+    fn label(db: &HcomDb, name: &str) -> String {
+        tool_label(db, &db.get_instance_full(name).unwrap().unwrap())
+    }
+
+    #[test]
+    fn tool_label_stars_only_local_roots_missing_a_binding() {
+        let db = test_db();
+        for (name, tool, parent, origin) in [
+            ("full", "claude", None, None),
+            ("pend", "codex", None, None),
+            ("hook", "gemini", None, None),
+            ("subx", "claude", Some("full"), None),
+            ("remo", "claude", None, Some("dev-1")),
+            ("adho", "adhoc", None, None),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, parent_name, origin_device_id, created_at)
+                     VALUES (?, ?, ?, ?, 1000.0)",
+                    rusqlite::params![name, tool, parent, origin],
+                )
+                .unwrap();
+        }
+        db.set_session_binding("s-full", "full").unwrap();
+        db.set_process_binding("p-full", "s-full", "full").unwrap();
+        db.set_process_binding("p-pend", "", "pend").unwrap();
+        db.set_session_binding("s-hook", "hook").unwrap();
+        db.set_session_binding("s-adho", "adho").unwrap();
+
+        assert_eq!(label(&db, "full"), "CLAUDE");
+        assert_eq!(label(&db, "pend"), "CODEX*");
+        assert_eq!(label(&db, "hook"), "GEMINI*");
+        assert_eq!(label(&db, "subx"), "CLAUDE");
+        assert_eq!(label(&db, "remo"), "CLAUDE");
+        assert_eq!(label(&db, "adho"), "AD-HOC");
+
+        let bindings = |name| bindings_display(&db, &db.get_instance_full(name).unwrap().unwrap());
+        assert_eq!(bindings("full"), "hooks, process");
+        assert_eq!(bindings("pend"), "process");
+        assert_eq!(bindings("subx"), "none");
+        assert_eq!(bindings("adho"), "session");
+    }
 }

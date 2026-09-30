@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Stdio;
+#[cfg(not(test))]
 use std::sync::OnceLock;
 #[cfg(not(test))]
 use std::sync::mpsc;
@@ -17,10 +18,10 @@ use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
-use toml_edit::{DocumentMut, Item, value};
+use toml_edit::{DocumentMut, Item};
 
 use crate::db::{HcomDb, InstanceRow};
-use crate::hooks::{HookPayload, HookResult, common, family};
+use crate::hooks::{HookPayload, HookResult, common};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
@@ -30,19 +31,529 @@ use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 use super::common::SAFE_HCOM_COMMANDS;
+use super::runtime::{self, LaunchCtx, LegacyFile, PerRunAdapter, RuntimeInjection};
+use anyhow::{Context as _, Result as AnyResult, bail};
 
 const HCOM_TRIGGER: &str = "<hcom>";
+// `fork` is its own SessionStart source since Codex 0.155 (earlier releases
+// reported forks as `startup`); without it a forked session never binds hooks.
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
         "codex-sessionstart",
-        Some("startup|resume|clear"),
+        Some("startup|resume|clear|fork"),
     ),
     ("UserPromptSubmit", "codex-userpromptsubmit", None),
     ("PreToolUse", "codex-pretooluse", Some("Bash")),
     ("PostToolUse", "codex-posttooluse", Some("Bash")),
     ("Stop", "codex-stop", None),
 ];
+
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: Some(ensure_per_run_permissions),
+    managed_value_flags: &[],
+    strip_legacy_args: None,
+};
+
+fn per_run_home(ctx: &LaunchCtx) -> PathBuf {
+    ctx.path_var("CODEX_HOME")
+        .unwrap_or_else(|| crate::runtime_env::tool_config_root().join(".codex"))
+}
+
+fn parse_override(raw: &str) -> AnyResult<(String, toml::Value)> {
+    let (key, value) = raw
+        .split_once('=')
+        .context("Codex -c override must be key=value")?;
+    let key = key.trim();
+    let doc: toml::Value = toml::from_str(&format!("value = {}", value.trim()))
+        .with_context(|| format!("Invalid Codex -c {key} TOML value"))?;
+    Ok((key.to_string(), doc["value"].clone()))
+}
+
+fn override_key_path(key: &str) -> AnyResult<Vec<String>> {
+    let parsed: toml::Value = toml::from_str(&format!("{key} = 0"))
+        .with_context(|| format!("Invalid Codex -c key {key}"))?;
+    let mut path = Vec::new();
+    let mut current = &parsed;
+    while let Some(table) = current.as_table() {
+        if table.len() != 1 {
+            bail!("Invalid Codex -c key {key}");
+        }
+        let (segment, next) = table.iter().next().unwrap();
+        path.push(segment.clone());
+        current = next;
+    }
+    Ok(path)
+}
+
+fn toml_literal(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => serde_json::to_string(s).unwrap(),
+        toml::Value::Integer(n) => n.to_string(),
+        toml::Value::Float(n) => n.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(d) => d.to_string(),
+        toml::Value::Array(a) => format!(
+            "[{}]",
+            a.iter().map(toml_literal).collect::<Vec<_>>().join(", ")
+        ),
+        toml::Value::Table(t) => format!(
+            "{{ {} }}",
+            t.iter()
+                .map(|(k, v)| format!(
+                    "{} = {}",
+                    serde_json::to_string(k).unwrap(),
+                    toml_literal(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn set_override_path(root: &mut toml::Value, path: &[&str], value: toml::Value) -> AnyResult<()> {
+    if path.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    let Some(table) = root.as_table_mut() else {
+        bail!("Codex -c hooks parent is not a table");
+    };
+    if path.len() == 1 {
+        table.insert(path[0].to_string(), value);
+        return Ok(());
+    }
+    let child = table
+        .entry(path[0].to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    set_override_path(child, &path[1..], value)
+}
+
+fn merged_per_run_hooks(ctx: &LaunchCtx) -> AnyResult<(Vec<String>, toml::Value)> {
+    let mut kept = Vec::new();
+    let mut hooks = toml::Value::Table(Default::default());
+    let end = ctx
+        .args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(ctx.args.len());
+    let mut i = 0;
+    while i < ctx.args.len() {
+        if i >= end {
+            kept.extend_from_slice(&ctx.args[i..]);
+            break;
+        }
+        let (raw, consumed) = if ctx.args[i] == "-c" || ctx.args[i] == "--config" {
+            if i + 1 >= end {
+                bail!("Codex -c is missing its value");
+            }
+            (Some(ctx.args[i + 1].as_str()), 2)
+        } else if let Some(raw) = ctx.args[i]
+            .strip_prefix("-c=")
+            .or_else(|| ctx.args[i].strip_prefix("--config="))
+        {
+            (Some(raw), 1)
+        } else {
+            (None, 1)
+        };
+        if let Some(raw) = raw {
+            let key = raw.split_once('=').map(|(key, _)| key.trim());
+            if key == Some("hooks") || key.is_some_and(|key| key.starts_with("hooks.")) {
+                let (key, value) = parse_override(raw)?;
+                let path = override_key_path(&key)?;
+                if path.first().map(String::as_str) != Some("hooks") {
+                    bail!("Invalid Codex -c hooks key {key}");
+                }
+                set_override_path(
+                    &mut hooks,
+                    &path[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+                    value,
+                )?;
+            } else {
+                kept.extend_from_slice(&ctx.args[i..i + consumed]);
+            }
+        } else {
+            kept.push(ctx.args[i].clone());
+        }
+        i += consumed;
+    }
+    let expected = build_expected_hook_json();
+    let table = hooks
+        .as_table_mut()
+        .context("Codex -c hooks must be a TOML table")?;
+    for (event, group) in expected["hooks"].as_object().unwrap() {
+        let entry = table
+            .entry(event.clone())
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let Some(array) = entry.as_array_mut() else {
+            bail!("Codex -c hooks.{event} must be an array");
+        };
+        let hcom_group: toml::Value =
+            toml::from_str(&format!("value = {}", json_to_toml_literal(group)))?;
+        array.extend(hcom_group["value"].as_array().unwrap().iter().cloned());
+    }
+    Ok((kept, hooks))
+}
+
+fn json_to_toml_literal(value: &Value) -> String {
+    match value {
+        Value::String(s) => serde_json::to_string(s).unwrap(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(a) => format!(
+            "[{}]",
+            a.iter()
+                .map(json_to_toml_literal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Object(t) => format!(
+            "{{ {} }}",
+            t.iter()
+                .map(|(k, v)| format!(
+                    "{} = {}",
+                    serde_json::to_string(k).unwrap(),
+                    json_to_toml_literal(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Null => "\"\"".to_string(),
+    }
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
+    let (mut args, mut hooks) = merged_per_run_hooks(ctx)?;
+    // Codex merges hooks.state per key across the user and session-flag layers
+    // (codex-rs/hooks/src/config_rules.rs), so only hcom's entries and the
+    // caller's own -c state belong here. Copying config.toml's state would pin
+    // a launch-time snapshot above any trust the user grants mid-session.
+    let mut state = match hooks.as_table_mut().unwrap().remove("state") {
+        Some(toml::Value::Table(caller_state)) => caller_state,
+        Some(_) => bail!("Codex -c hooks.state must be a table"),
+        None => Default::default(),
+    };
+    let declarations: Vec<String> = hooks
+        .as_table()
+        .unwrap()
+        .iter()
+        .map(|(event, value)| format!("hooks.{event}={}", toml_literal(value)))
+        .collect();
+    let declaration_bytes = serde_json::to_vec(&declarations)?;
+    let version = codex_cli_version_output_for_hook_trust()
+        .map_err(anyhow::Error::msg)
+        .context("Cannot check Codex version for hook trust")?;
+    let cache_key = runtime::content_digest(&[
+        ("version", version.as_bytes()),
+        ("declarations", &declaration_bytes),
+    ]);
+    let cache = runtime::integrations_dir()
+        .join("codex")
+        .join("cache")
+        .join(format!("{cache_key}.json"));
+    let entries: Vec<CodexHookTrustEntry> = if cache.exists() {
+        serde_json::from_slice(&std::fs::read(&cache)?)
+            .with_context(|| format!("Invalid Codex trust cache {}", cache.display()))?
+    } else {
+        let mut preflight = vec!["-c".to_string(), "features.hooks=true".to_string()];
+        for declaration in &declarations {
+            preflight.extend(["-c".to_string(), declaration.clone()]);
+        }
+        let entries =
+            fetch_codex_hook_list_with_overrides(&ctx.cwd, &per_run_home(ctx), &preflight)
+                .map_err(anyhow::Error::msg)
+                .context("Codex hooks/list preflight failed")?;
+        let expected: HashSet<String> = CODEX_HOOK_COMMANDS
+            .iter()
+            .map(|(_, suffix, _)| build_codex_hook_command(suffix))
+            .collect();
+        let owned: Vec<CodexHookTrustEntry> = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.source.as_deref() == Some("sessionFlags")
+                    && entry
+                        .command
+                        .as_ref()
+                        .is_some_and(|command| expected.contains(command))
+            })
+            .map(|entry| {
+                Ok(CodexHookTrustEntry {
+                    key: entry.key.context("Codex hcom session hook lacks key")?,
+                    command: entry.command.unwrap(),
+                    current_hash: entry
+                        .current_hash
+                        .context("Codex hcom session hook lacks currentHash")?,
+                })
+            })
+            .collect::<AnyResult<_>>()?;
+        if owned.len() != CODEX_HOOK_COMMANDS.len() {
+            bail!(
+                "Codex hooks/list found {} of {} hcom session hooks",
+                owned.len(),
+                CODEX_HOOK_COMMANDS.len()
+            );
+        }
+        std::fs::create_dir_all(cache.parent().unwrap())?;
+        paths::atomic_write_io(&cache, &serde_json::to_string(&owned)?)?;
+        owned
+    };
+    for entry in entries {
+        let mut trust = toml::map::Map::new();
+        trust.insert(
+            "trusted_hash".to_string(),
+            toml::Value::String(entry.current_hash),
+        );
+        state.insert(entry.key, toml::Value::Table(trust));
+    }
+    let mut injection = vec!["-c".to_string(), "features.hooks=true".to_string()];
+    for declaration in declarations {
+        injection.extend(["-c".to_string(), declaration]);
+    }
+    injection.extend([
+        "-c".to_string(),
+        format!("hooks.state={}", toml_literal(&toml::Value::Table(state))),
+    ]);
+    runtime::insert_before_separator(&mut args, injection);
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+fn ensure_per_run_permissions(ctx: &LaunchCtx) -> AnyResult<()> {
+    let home = per_run_home(ctx);
+    let ok = if ctx.auto_approve {
+        setup_codex_execpolicy_at(&home)
+    } else {
+        remove_codex_execpolicy_at(&home)
+    };
+    if !ok {
+        bail!(
+            "Cannot sync {}",
+            codex_rules_path_at(&home).join("hcom.rules").display()
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> AnyResult<()> {
+    let home = per_run_home(ctx);
+    cleanup_codex_hooks_in_dir(&home)
+}
+
+/// Remove a legacy install: hcom's handlers in hooks.json, the config.toml
+/// `hooks.state` entries that trusted them, a pre-hooks `codex-notify`
+/// callback, and the trust metadata file.
+/// hcom never declared hooks in config.toml, so its hook tables are left alone.
+/// State keys are removed only when they named an hcom handler position or are
+/// recorded in the metadata; a user's own hooks in the same file keep their trust.
+fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
+    let hooks_path = codex_hooks_path_at(home);
+    let config_path = codex_config_path_at(home);
+    let metadata_path = home.join(HCOM_HOOK_TRUST_METADATA_FILE);
+    let fix_hooks = runtime::FIX_REMOVE_HCOM_HOOKS;
+    // A config.toml failure stops cleanup before hooks.json is rewritten (user
+    // trust keys must move first), so the fix covers hooks.json too.
+    let fix_config = format!(
+        "make it valid, writable TOML, then {fix_hooks} in {}",
+        hooks_path.display()
+    );
+
+    let mut hcom_positions = HashSet::new();
+    // User handlers after an hcom one shift left when it is removed; their
+    // trust keys follow them so the user's hooks stay trusted.
+    let mut moved: HashMap<HandlerPosition, HandlerPosition> = HashMap::new();
+    let mut cleaned_hooks = None;
+    match std::fs::read_to_string(&hooks_path) {
+        Ok(source) => {
+            let mut hooks: Value = serde_json::from_str(&source)
+                .with_context(|| LegacyFile::read(&hooks_path, fix_hooks))?;
+            hcom_positions = handler_positions(&hooks, is_hcom_handler)
+                .into_iter()
+                .collect();
+            if !hcom_positions.is_empty() {
+                let user_before = handler_positions(&hooks, |h| !is_hcom_handler(h));
+                remove_hcom_hooks_from_json(&mut hooks);
+                remove_legacy_hcom_cmd_hooks_from_json(&mut hooks);
+                // Removal keeps the remaining handlers in order.
+                let user_after = handler_positions(&hooks, |_| true);
+                if user_before.len() == user_after.len() {
+                    moved = user_before
+                        .into_iter()
+                        .zip(user_after)
+                        .filter(|(old, new)| old != new)
+                        .collect();
+                }
+                cleaned_hooks = Some(hooks);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| LegacyFile::read(&hooks_path, fix_hooks));
+        }
+    }
+
+    // The metadata only names extra stale keys, and hcom deletes it below, so
+    // an unparseable one is treated as empty rather than blocking the launch.
+    let mut recorded_keys = HashSet::new();
+    match std::fs::read_to_string(&metadata_path) {
+        Ok(source) => {
+            if let Ok(metadata) = source.parse::<DocumentMut>()
+                && let Some(state) = metadata.get("state").and_then(Item::as_table_like)
+            {
+                recorded_keys.extend(state.iter().map(|(key, _)| key.to_string()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| LegacyFile::read(&metadata_path, runtime::FIX_DELETE));
+        }
+    }
+
+    match std::fs::read_to_string(&config_path) {
+        Ok(source) => {
+            let mut config: DocumentMut = source
+                .parse()
+                .with_context(|| LegacyFile::read(&config_path, fix_config.clone()))?;
+            let mut changed = false;
+            if let Some(state) = config
+                .get_mut("hooks")
+                .and_then(|hooks| hooks.get_mut("state"))
+                .and_then(Item::as_table_like_mut)
+            {
+                let mut stale = Vec::new();
+                let mut renames = Vec::new();
+                for (key, _) in state.iter() {
+                    let Some(position) = hcom_hooks_json_state_position(key, &hooks_path) else {
+                        continue;
+                    };
+                    if hcom_positions.contains(&position) {
+                        stale.push(key.to_string());
+                    } else if let Some(new) = moved.get(&position) {
+                        renames.push((key.to_string(), rekey_state_position(key, new)));
+                    } else if recorded_keys.contains(key) {
+                        stale.push(key.to_string());
+                    }
+                }
+                for key in &stale {
+                    state.remove(key);
+                }
+                // Take every moved entry out before reinserting: a new key can
+                // be another handler's old one.
+                let taken: Vec<(String, Item)> = renames
+                    .iter()
+                    .filter_map(|(old, new)| state.remove(old).map(|item| (new.clone(), item)))
+                    .collect();
+                for (key, item) in taken {
+                    state.insert(&key, item);
+                }
+                changed = !stale.is_empty() || !renames.is_empty();
+            }
+            // Pre-hooks hcom installed a `codex-notify` callback; leave unrelated notify alone.
+            if config.get("notify").is_some_and(is_hcom_legacy_notify) {
+                config.remove("notify");
+                changed = true;
+            }
+            if changed {
+                paths::atomic_write_io(&config_path, &config.to_string())
+                    .with_context(|| LegacyFile::write(&config_path, fix_config.clone()))?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| LegacyFile::read(&config_path, fix_config.clone()));
+        }
+    }
+
+    // hooks.json and the metadata go last so a failure above retries next launch.
+    if let Some(hooks) = cleaned_hooks {
+        if hooks.as_object().is_some_and(|o| o.is_empty()) {
+            std::fs::remove_file(&hooks_path)
+        } else {
+            paths::atomic_write_io(&hooks_path, &serde_json::to_string_pretty(&hooks)?)
+        }
+        .with_context(|| LegacyFile::write(&hooks_path, fix_hooks))?;
+    }
+    match std::fs::remove_file(&metadata_path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            // Trust metadata never loads hooks.
+            Err(error).with_context(|| LegacyFile {
+                still_loads: false,
+                ..LegacyFile::write(&metadata_path, runtime::FIX_DELETE)
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// hcom wrote `notify` as its command prefix (`hcom`, `uvx hcom`, or an hcom
+/// executable path) followed by a separate `codex-notify` argument, as an
+/// array or one string. Match that shape, not substrings of a user's path.
+fn is_hcom_legacy_notify(item: &Item) -> bool {
+    let Some(value) = item.as_value() else {
+        return false;
+    };
+    let tokens: Vec<&str> = if let Some(s) = value.as_str() {
+        s.split_whitespace().collect()
+    } else if let Some(arr) = value.as_array() {
+        arr.iter().filter_map(|entry| entry.as_str()).collect()
+    } else {
+        return false;
+    };
+    let Some(notify_at) = tokens.iter().position(|t| *t == "codex-notify") else {
+        return false;
+    };
+    tokens[..notify_at].iter().any(|token| {
+        let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        let stem = name
+            .strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".py"))
+            .unwrap_or(name);
+        stem.eq_ignore_ascii_case("hcom")
+    })
+}
+
+/// `(event_label, group, handler)`: a handler's place in hooks.json, in the
+/// form Codex uses for `hooks.state` keys.
+type HandlerPosition = (String, usize, usize);
+
+fn is_hcom_handler(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_hcom_codex_command)
+        || is_legacy_hcom_codex_cmd_entry(handler)
+}
+
+/// Positions of the handlers `select` accepts, in document order.
+fn handler_positions(hooks: &Value, select: impl Fn(&Value) -> bool) -> Vec<HandlerPosition> {
+    let mut positions = Vec::new();
+    let Some(events) = hooks.get("hooks").and_then(Value::as_object) else {
+        return positions;
+    };
+    for (event, groups) in events {
+        let label = codex_hook_event_state_label(event);
+        for (group_index, group) in groups.as_array().into_iter().flatten().enumerate() {
+            let handlers = group.get("hooks").and_then(Value::as_array);
+            for (handler_index, handler) in handlers.into_iter().flatten().enumerate() {
+                if select(handler) {
+                    positions.push((label.to_string(), group_index, handler_index));
+                }
+            }
+        }
+    }
+    positions
+}
+
+/// `<source>:<label>:<group>:<handler>` with the position replaced.
+fn rekey_state_position(key: &str, (label, group, handler): &HandlerPosition) -> String {
+    let source = key.rsplitn(4, ':').nth(3).unwrap_or_default();
+    format!("{source}:{label}:{group}:{handler}")
+}
+
 const HCOM_TOOL_NAMES: &[&str] = &[
     "claude",
     "gemini",
@@ -51,66 +562,36 @@ const HCOM_TOOL_NAMES: &[&str] = &[
     "antigravity",
     "agy",
 ];
-const CODEX_HOOKS_FEATURE_RENAME_VERSION: (u64, u64, u64) = (0, 129, 0);
-const CODEX_HOOK_TRUST_MIN_VERSION: (u64, u64, u64) = (0, 131, 0);
-const HCOM_CODEX_CLI_VERSION_KEY: &str = "hcom_codex_cli_version";
-const HCOM_HOOK_DEFINITION_HASH_KEY: &str = "hcom_hook_definition_hash";
+const HCOM_HOOK_TRUST_METADATA_FILE: &str = "hcom-hook-trust.toml";
 #[cfg(not(test))]
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CodexHookTrustEntry {
     key: String,
     command: String,
     current_hash: String,
 }
 
+/// One hook from a `codex app-server hooks/list` response.
+///
+/// Field names on the wire are camelCase (`HookMetadata` in
+/// codex-rs/app-server-protocol/src/protocol/v2/plugin.rs:513-542); the
+/// snake_case spellings of the core protocol are accepted too.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CodexHookLocalEntry {
-    key: String,
-    command: String,
-    definition_hash: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CodexHooksFeatureKey {
-    CodexHooks,
-    Hooks,
-}
-
-impl CodexHooksFeatureKey {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::CodexHooks => "codex_hooks",
-            Self::Hooks => "hooks",
-        }
-    }
-
-    fn alternate(self) -> &'static str {
-        match self {
-            Self::CodexHooks => "hooks",
-            Self::Hooks => "codex_hooks",
-        }
-    }
+struct CodexHookListEntry {
+    key: Option<String>,
+    command: Option<String>,
+    source: Option<String>,
+    current_hash: Option<String>,
 }
 
 fn hook_noop() -> HookResult {
     HookResult::Allow {
         additional_context: None,
-        system_message: None,
-        delivery_ack: None,
-    }
-}
-
-fn hcom_available_hint() -> HookResult {
-    HookResult::Allow {
-        additional_context: Some(format!(
-            "[hcom available - run '{} start' to participate]",
-            crate::runtime_env::build_hcom_command()
-        )),
         system_message: None,
         delivery_ack: None,
     }
@@ -192,51 +673,13 @@ fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> O
     )
 }
 
-fn bind_vanilla_instance_codex(
-    db: &HcomDb,
-    session_id: &str,
-    transcript_path: Option<&str>,
-) -> Option<String> {
-    let pending = common::get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
-    }
-
-    let derived_path = if transcript_path.is_none() || transcript_path == Some("") {
-        derive_codex_transcript_path(session_id)
-    } else {
-        None
-    };
-    let effective_path = transcript_path
-        .filter(|s| !s.is_empty())
-        .or(derived_path.as_deref())?;
-    let effective_path = normalize_codex_transcript_path(effective_path);
-
-    let instance_name = common::find_last_bind_marker(&effective_path)?;
-
-    family::bind_vanilla_instance(
-        db,
-        &instance_name,
-        Some(session_id).filter(|s| !s.is_empty()),
-        Some(&effective_path),
-        "codex",
-        "codex-sessionstart",
-    )
-}
-
 fn resolve_codex_instance(
     db: &HcomDb,
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> Option<InstanceRow> {
     let session_id = payload.session_id.as_deref().unwrap_or("");
-    if let Some(instance) = resolve_instance_codex(db, ctx, session_id) {
-        return Some(instance);
-    }
-
-    let bound_name =
-        bind_vanilla_instance_codex(db, session_id, payload.transcript_path.as_deref())?;
-    db.get_instance_full(&bound_name).ok().flatten()
+    resolve_instance_codex(db, ctx, session_id)
 }
 
 fn update_codex_position(
@@ -277,13 +720,13 @@ fn update_codex_position(
 
 /// Prepare pending messages for a Codex instance.
 ///
-/// Only additionalContext — no systemMessage. Codex TUI renders both
-/// as separate visible lines ("warning:" + "hook context:"), causing
-/// double output for every delivered message.
+/// Show the delivery in the TUI while also giving it to the model.
+/// Codex renders systemMessage as hook output and keeps additionalContext
+/// out of the TUI; only additionalContext enters model context.
 fn prepare_codex_delivery(db: &HcomDb, instance_name: &str) -> Option<HookResult> {
     common::prepare_pending_messages(db, instance_name).map(|prepared| HookResult::Allow {
+        system_message: Some(prepared.formatted.clone()),
         additional_context: Some(prepared.formatted),
-        system_message: None,
         delivery_ack: Some(prepared.ack),
     })
 }
@@ -320,7 +763,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     let instance_name = match instance_name {
         Some(name) => name,
-        None => return hcom_available_hint(),
+        None => return hook_noop(),
     };
 
     let _ = db.rebind_instance_session(&instance_name, session_id);
@@ -337,8 +780,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
 
-    // Bootstrap is injected at launch time via developer_instructions flag,
-    // not here — Codex TUI renders hook output visibly ("hook context:").
+    // Bootstrap is injected at launch time via developer_instructions flag.
     hook_noop()
 }
 
@@ -451,7 +893,7 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
             }
             0
         }
-        HookResult::Block { reason } => {
+        HookResult::Block { reason, .. } => {
             // Codex hooks on exit 2 read the reason from stderr, not stdout.
             let _ = std::io::stderr().lock().write_all(reason.as_bytes());
             2
@@ -535,18 +977,93 @@ fn codex_config_dir() -> PathBuf {
 }
 
 /// Get path to Codex config.toml.
-pub fn get_codex_config_path() -> PathBuf {
-    codex_config_dir().join("config.toml")
+#[cfg(test)]
+fn get_codex_config_path() -> PathBuf {
+    codex_config_path_at(&codex_config_dir())
 }
 
 /// Get path to Codex hooks.json.
-pub fn get_codex_hooks_path() -> PathBuf {
-    codex_config_dir().join("hooks.json")
+#[cfg(test)]
+fn get_codex_hooks_path() -> PathBuf {
+    codex_hooks_path_at(&codex_config_dir())
 }
 
-/// Get path to Codex execpolicy rules directory.
-pub fn get_codex_rules_path() -> PathBuf {
-    codex_config_dir().join("rules")
+fn codex_config_path_at(codex_home: &Path) -> PathBuf {
+    codex_home.join("config.toml")
+}
+
+fn codex_hooks_path_at(codex_home: &Path) -> PathBuf {
+    codex_home.join("hooks.json")
+}
+
+fn codex_rules_path_at(codex_home: &Path) -> PathBuf {
+    codex_home.join("rules")
+}
+
+/// Strip a Windows verbatim prefix and collapse `.`/`..` components.
+///
+/// Purely lexical, so it works on paths that do not exist.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let text = path.to_string_lossy();
+    let plain = text
+        .strip_prefix(r"\\?\UNC\")
+        .map(|unc| format!(r"\\{unc}"))
+        .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string));
+    let plain = plain.map(PathBuf::from);
+    let path = plain.as_deref().unwrap_or(path);
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether two paths name the same file, without requiring either to exist.
+///
+/// Codex passes hook source paths through `AbsolutePathBuf::from_absolute_path`
+/// (codex-rs/utils/absolute-path/src/lib.rs:58), which absolutizes lexically but
+/// does not resolve symlinks, so a `sourcePath` from Codex can differ from
+/// hcom's own `codex_hooks_path_at()` by a `.`/`..` component, a verbatim
+/// Windows prefix, or by one side having been canonicalized. Compare lexically
+/// first and only then pay for canonicalization.
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    if a == b || lexically_normalized(a) == lexically_normalized(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The `(event_label, group, handler)` a `hooks.state` key names inside hcom's
+/// hooks.json, or None when the key names another source or event.
+fn hcom_hooks_json_state_position(key: &str, hooks_path: &Path) -> Option<(String, usize, usize)> {
+    let mut parts = key.rsplitn(4, ':');
+    let (Some(handler_index), Some(group_index), Some(event_label), Some(key_source)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let handler_index = handler_index.parse::<usize>().ok()?;
+    let group_index = group_index.parse::<usize>().ok()?;
+    if !CODEX_HOOK_COMMANDS
+        .iter()
+        .any(|(event, _, _)| codex_hook_event_state_label(event) == event_label)
+    {
+        return None;
+    }
+    paths_equivalent(Path::new(key_source), hooks_path)
+        .then(|| (event_label.to_string(), group_index, handler_index))
 }
 
 fn build_codex_hook_command(command: &str) -> String {
@@ -580,89 +1097,17 @@ fn build_expected_hook_json() -> Value {
     )]))
 }
 
+/// hcom's hook commands are `<hcom prefix> codex-<event>`. Matching the last
+/// word alone would also claim a user's own `/usr/local/bin/codex-stop`.
 fn is_hcom_codex_command(command: &str) -> bool {
-    CODEX_HOOK_COMMANDS.iter().any(|(_, suffix, _)| {
-        command == build_codex_hook_command(suffix) || command.ends_with(suffix)
-    })
-}
-
-fn is_hcom_legacy_notify(item: &Item) -> bool {
-    match item {
-        Item::Value(v) => {
-            if let Some(s) = v.as_str() {
-                return s.contains("hcom") && s.contains("codex-notify");
-            }
-            if let Some(arr) = v.as_array() {
-                let values: Vec<&str> = arr.iter().filter_map(|entry| entry.as_str()).collect();
-                return values.iter().any(|s| s.contains("hcom"))
-                    && values.iter().any(|s| s.contains("codex-notify"));
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-fn merge_hcom_hooks(existing: &mut Value) {
-    if !existing.is_object() {
-        *existing = serde_json::json!({ "hooks": {} });
-    }
-
-    // Strip existing hcom hooks first so stale matchers don't accumulate.
-    remove_hcom_hooks_from_json(existing);
-
-    let hooks_obj = existing
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    if !hooks_obj.is_object() {
-        *hooks_obj = serde_json::json!({});
-    }
-
-    let current_hooks = hooks_obj.as_object_mut().unwrap();
-    let expected = build_expected_hook_json();
-    let expected_hooks = expected["hooks"].as_object().unwrap();
-
-    for (event, expected_groups) in expected_hooks {
-        let entry = current_hooks
-            .entry(event.clone())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if !entry.is_array() {
-            *entry = Value::Array(Vec::new());
-        }
-        let groups = entry.as_array_mut().unwrap();
-
-        for expected_group in expected_groups.as_array().unwrap() {
-            let expected_matcher = expected_group.get("matcher").and_then(|v| v.as_str());
-            let new_hooks = expected_group["hooks"].as_array().unwrap();
-
-            let matched = groups
-                .iter_mut()
-                .find(|g| g.get("matcher").and_then(|v| v.as_str()) == expected_matcher);
-
-            if let Some(group) = matched {
-                if !group.get("hooks").is_some_and(|v| v.is_array()) {
-                    group
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("hooks".into(), Value::Array(Vec::new()));
-                }
-                let hooks_arr = group
-                    .get_mut("hooks")
-                    .and_then(|v| v.as_array_mut())
-                    .unwrap();
-                hooks_arr.retain(|h| {
-                    !h.get("command")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(is_hcom_codex_command)
-                });
-                hooks_arr.extend(new_hooks.iter().cloned());
-            } else {
-                groups.push(expected_group.clone());
-            }
-        }
-    }
+    let mut words = command.split_whitespace().rev();
+    let Some(last) = words.next() else {
+        return false;
+    };
+    CODEX_HOOK_COMMANDS
+        .iter()
+        .any(|(_, suffix, _)| last == *suffix)
+        && words.any(|word| word.contains("hcom"))
 }
 
 fn remove_hcom_hooks_from_json(existing: &mut Value) {
@@ -701,11 +1146,10 @@ fn remove_hcom_hooks_from_json(existing: &mut Value) {
 /// `"type":"cmd"` / `"cmd"` format used before Codex 0.129.
 fn is_legacy_hcom_codex_cmd_entry(hook: &Value) -> bool {
     hook.get("type").and_then(|v| v.as_str()) == Some("cmd")
-        && hook.get("cmd").and_then(|v| v.as_str()).is_some_and(|cmd| {
-            CODEX_HOOK_COMMANDS
-                .iter()
-                .any(|(_, suffix, _)| cmd.ends_with(suffix))
-        })
+        && hook
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_hcom_codex_command)
 }
 
 /// Remove recognized legacy `"cmd"`-keyed hcom hook entries.
@@ -751,126 +1195,15 @@ fn codex_hook_event_state_label(event: &str) -> &'static str {
     }
 }
 
-fn hcom_hook_definition_hash(event: &str, group: &Value, hook: &Value) -> String {
-    use sha2::{Digest, Sha256};
-
-    let definition = serde_json::json!({
-        "event": event,
-        "matcher": group.get("matcher").cloned().unwrap_or(Value::Null),
-        "hook": hook,
-    });
-    let encoded = serde_json::to_vec(&definition).unwrap_or_default();
-    let digest = Sha256::digest(&encoded);
-    let hex = digest.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(&mut acc, "{b:02x}");
-        acc
-    });
-    format!("sha256:{hex}")
+/// Read one string field, accepting the camelCase wire spelling and the
+/// snake_case spelling of the core protocol.
+fn hook_list_str_field<'a>(hook: &'a Value, camel: &str, snake: &str) -> Option<&'a str> {
+    hook.get(camel)
+        .or_else(|| hook.get(snake))
+        .and_then(|v| v.as_str())
 }
 
-fn hcom_hook_local_entries_from_hooks_json(
-    json: &Value,
-    hooks_path: &Path,
-) -> Vec<CodexHookLocalEntry> {
-    let source = hooks_path.to_path_buf();
-    let Some(hooks_obj) = json.get("hooks").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
-
-    let mut entries = Vec::new();
-    for (event, _, _) in CODEX_HOOK_COMMANDS {
-        let Some(groups) = hooks_obj.get(*event).and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for (group_index, group) in groups.iter().enumerate() {
-            let Some(hooks) = group.get("hooks").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for (handler_index, hook) in hooks.iter().enumerate() {
-                let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if is_hcom_codex_command(command) {
-                    entries.push(CodexHookLocalEntry {
-                        key: format!(
-                            "{}:{}:{}:{}",
-                            source.display(),
-                            codex_hook_event_state_label(event),
-                            group_index,
-                            handler_index
-                        ),
-                        command: command.to_string(),
-                        definition_hash: hcom_hook_definition_hash(event, group, hook),
-                    });
-                }
-            }
-        }
-    }
-    entries
-}
-
-fn hcom_hook_state_keys_from_hooks_json(json: &Value, hooks_path: &Path) -> HashSet<String> {
-    hcom_hook_local_entries_from_hooks_json(json, hooks_path)
-        .into_iter()
-        .map(|entry| entry.key)
-        .collect()
-}
-
-fn hcom_hook_definition_hashes_from_hooks_json(
-    json: &Value,
-    hooks_path: &Path,
-) -> HashMap<String, String> {
-    hcom_hook_local_entries_from_hooks_json(json, hooks_path)
-        .into_iter()
-        .map(|entry| (entry.key, entry.definition_hash))
-        .collect()
-}
-
-fn hcom_hook_definition_hashes_from_hooks_path(
-    hooks_path: &Path,
-) -> Result<HashMap<String, String>, VerifyFailReason> {
-    let hooks_content = std::fs::read_to_string(hooks_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            VerifyFailReason::HooksPathMissing(hooks_path.to_path_buf())
-        }
-        _ => VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()),
-    })?;
-    let hooks_json: Value = serde_json::from_str(&hooks_content)
-        .map_err(|_| VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()))?;
-    Ok(hcom_hook_definition_hashes_from_hooks_json(
-        &hooks_json,
-        hooks_path,
-    ))
-}
-
-fn hcom_hook_local_entries_from_hooks_path(
-    hooks_path: &Path,
-) -> Result<Vec<CodexHookLocalEntry>, VerifyFailReason> {
-    let hooks_content = std::fs::read_to_string(hooks_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            VerifyFailReason::HooksPathMissing(hooks_path.to_path_buf())
-        }
-        _ => VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()),
-    })?;
-    let hooks_json: Value = serde_json::from_str(&hooks_content)
-        .map_err(|_| VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()))?;
-    Ok(hcom_hook_local_entries_from_hooks_json(
-        &hooks_json,
-        hooks_path,
-    ))
-}
-
-fn expected_hcom_hook_commands() -> HashSet<String> {
-    CODEX_HOOK_COMMANDS
-        .iter()
-        .map(|(_, command, _)| build_codex_hook_command(command))
-        .collect()
-}
-
-fn parse_hcom_hook_entries_from_hooks_list(
-    value: &Value,
-) -> Result<Vec<CodexHookTrustEntry>, String> {
+fn parse_codex_hook_list_entries(value: &Value) -> Result<Vec<CodexHookListEntry>, String> {
     let hooks = value
         .pointer("/result/data/0/hooks")
         .or_else(|| value.pointer("/data/0/hooks"))
@@ -878,95 +1211,59 @@ fn parse_hcom_hook_entries_from_hooks_list(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "codex hooks/list response did not contain hooks".to_string())?;
 
-    let expected = expected_hcom_hook_commands();
-    let mut entries = Vec::new();
-    for hook in hooks {
-        let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !expected.contains(command) {
-            continue;
-        }
-        let key = hook
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("hcom hook {command} missing key"))?;
-        let current_hash = hook
-            .get("currentHash")
-            .or_else(|| hook.get("current_hash"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("hcom hook {command} missing currentHash"))?;
-        entries.push(CodexHookTrustEntry {
-            key: key.to_string(),
-            command: command.to_string(),
-            current_hash: current_hash.to_string(),
-        });
-    }
-
-    let found: HashSet<&str> = entries.iter().map(|entry| entry.command.as_str()).collect();
-    let missing: Vec<String> = expected
+    Ok(hooks
         .iter()
-        .filter(|command| !found.contains(command.as_str()))
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "codex hooks/list missing hcom hooks: {}",
-            missing.join(", ")
-        ));
-    }
-
-    Ok(entries)
-}
-
-#[cfg(test)]
-fn test_hcom_hook_entries_from_hooks_json(
-    hooks_path: &Path,
-) -> Result<Vec<CodexHookTrustEntry>, String> {
-    let content = std::fs::read_to_string(hooks_path).map_err(|e| e.to_string())?;
-    let json: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-    let keys = hcom_hook_state_keys_from_hooks_json(&json, hooks_path);
-    let commands = expected_hcom_hook_commands();
-    if keys.len() != commands.len() {
-        return Err(format!(
-            "test hooks.json contained {} hcom hook keys, expected {}",
-            keys.len(),
-            commands.len()
-        ));
-    }
-    let mut keys: Vec<String> = keys.into_iter().collect();
-    keys.sort();
-    Ok(keys
-        .into_iter()
-        .enumerate()
-        .map(|(index, key)| CodexHookTrustEntry {
-            key,
-            command: format!("test-hcom-hook-{index}"),
-            current_hash: format!("sha256:test-{index}"),
+        .map(|hook| CodexHookListEntry {
+            key: hook_list_str_field(hook, "key", "key").map(str::to_string),
+            command: hook_list_str_field(hook, "command", "command").map(str::to_string),
+            source: hook_list_str_field(hook, "source", "source").map(str::to_string),
+            current_hash: hook_list_str_field(hook, "currentHash", "current_hash")
+                .map(str::to_string),
         })
         .collect())
 }
 
-fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
+/// `codex` for the preflight. On Windows the npm `codex.cmd` shim runs through
+/// cmd.exe, which would split the `startup|resume|…` matcher at each `|`, so
+/// call the Node entrypoint directly like interactive launches do.
+#[cfg(not(test))]
+fn codex_app_server_command() -> std::process::Command {
+    #[cfg(windows)]
+    if let Some(resolved) = crate::terminal::which_bin("codex")
+        && let Some((node, prefix)) =
+            crate::terminal::resolve_windows_tool_launcher("codex", &resolved)
+    {
+        let mut command = std::process::Command::new(node);
+        command.args(prefix);
+        return command;
+    }
+    crate::terminal::executable_command("codex")
+}
+
+fn fetch_codex_hook_list_with_overrides(
+    cwd: &Path,
+    codex_home: &Path,
+    overrides: &[String],
+) -> Result<Vec<CodexHookListEntry>, String> {
     #[cfg(test)]
     {
+        let _ = (cwd, codex_home, overrides);
         if let Ok(value) = std::env::var("HCOM_TEST_CODEX_HOOKS_LIST_JSON") {
             if value == "__fail__" {
                 return Err("test hook list failure".to_string());
             }
             let json: Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
-            return parse_hcom_hook_entries_from_hooks_list(&json);
+            return parse_codex_hook_list_entries(&json);
         }
-        test_hcom_hook_entries_from_hooks_json(&get_codex_hooks_path())
+        Err("test hook list fixture missing".to_string())
     }
 
     #[cfg(not(test))]
     {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // TODO: If Codex changes hooks/list discovery to depend on each launch
-        // cwd, pass the target launch cwd through instead of using hcom's cwd.
-        let mut child = crate::terminal::executable_command("codex")
+        let mut child = codex_app_server_command()
+            .args(overrides)
             .args(["app-server", "--listen", "stdio://"])
+            .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1029,7 +1326,7 @@ fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        parse_hcom_hook_entries_from_hooks_list(&response?)
+        parse_codex_hook_list_entries(&response?)
     }
 }
 
@@ -1109,18 +1406,6 @@ fn read_jsonrpc_response(rx: &mpsc::Receiver<String>, id: i64) -> Result<Value, 
     }
 }
 
-fn parse_codex_cli_version(output: &str) -> Option<(u64, u64, u64)> {
-    output
-        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .find_map(|token| {
-            let mut parts = token.split('.');
-            let major = parts.next()?.parse().ok()?;
-            let minor = parts.next()?.parse().ok()?;
-            let patch = parts.next()?.parse().ok()?;
-            Some((major, minor, patch))
-        })
-}
-
 fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
     #[cfg(test)]
     if let Ok(version) = std::env::var("HCOM_TEST_CODEX_CLI_VERSION") {
@@ -1151,579 +1436,6 @@ fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
     }
 }
 
-fn codex_hook_trust_version() -> Result<Option<String>, String> {
-    let output = codex_cli_version_output_for_hook_trust()?;
-    let version = parse_codex_cli_version(&output).ok_or_else(|| {
-        format!("could not parse version from codex --version output: {output:?}")
-    })?;
-    if version >= CODEX_HOOK_TRUST_MIN_VERSION {
-        Ok(Some(format!("{}.{}.{}", version.0, version.1, version.2)))
-    } else {
-        Ok(None)
-    }
-}
-
-fn codex_hooks_feature_key_for_version(version: (u64, u64, u64)) -> CodexHooksFeatureKey {
-    if version >= CODEX_HOOKS_FEATURE_RENAME_VERSION {
-        CodexHooksFeatureKey::Hooks
-    } else {
-        CodexHooksFeatureKey::CodexHooks
-    }
-}
-
-/// Cached result of `detect_codex_hooks_feature_key`.  Tests bypass the
-/// cache when `HCOM_TEST_CODEX_CLI_VERSION` is set so that changing the
-/// env var mid-process produces the expected value.
-static CODEX_HOOKS_FEATURE_KEY_CACHE: OnceLock<CodexHooksFeatureKey> = OnceLock::new();
-
-fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
-    #[cfg(test)]
-    if let Ok(version) = std::env::var("HCOM_TEST_CODEX_CLI_VERSION") {
-        return parse_codex_cli_version(&version)
-            .map(codex_hooks_feature_key_for_version)
-            .unwrap_or(CodexHooksFeatureKey::Hooks);
-    }
-
-    *CODEX_HOOKS_FEATURE_KEY_CACHE.get_or_init(|| {
-        let output = match crate::terminal::executable_command("codex")
-            .arg("--version")
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                crate::log::log_warn(
-                    "hooks",
-                    "codex.version_failed",
-                    &format!("could not run codex --version: {e}"),
-                );
-                return CodexHooksFeatureKey::Hooks;
-            }
-        };
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        match parse_codex_cli_version(&text) {
-            Some(version) => codex_hooks_feature_key_for_version(version),
-            None => {
-                crate::log::log_warn(
-                    "hooks",
-                    "codex.version_unparseable",
-                    "could not parse version from codex --version output",
-                );
-                CodexHooksFeatureKey::Hooks
-            }
-        }
-    })
-}
-
-fn write_hcom_hook_trust_state(
-    config_path: &Path,
-    entries: &[CodexHookTrustEntry],
-    stale_keys: &HashSet<String>,
-    codex_cli_version: &str,
-    definition_hashes: &HashMap<String, String>,
-) -> Result<(), String> {
-    let mut doc: DocumentMut = if config_path.exists() {
-        std::fs::read_to_string(config_path)
-            .map_err(|e| e.to_string())?
-            .parse::<DocumentMut>()
-            .unwrap_or_default()
-    } else {
-        DocumentMut::new()
-    };
-
-    if !doc.contains_table("hooks") {
-        doc["hooks"] = Item::Table(toml_edit::Table::new());
-    }
-    if doc["hooks"]
-        .get("state")
-        .is_none_or(|item| !item.is_table_like())
-    {
-        doc["hooks"]["state"] = Item::Table(toml_edit::Table::new());
-    }
-    let state = doc["hooks"]["state"]
-        .as_table_like_mut()
-        .ok_or_else(|| "hooks.state config section is not a table".to_string())?;
-
-    for key in stale_keys {
-        state.remove(key);
-    }
-
-    for entry in entries {
-        if state
-            .get(&entry.key)
-            .is_none_or(|item| !item.is_table_like())
-        {
-            state.insert(&entry.key, Item::Table(toml_edit::Table::new()));
-        }
-        let Some(item) = state.get_mut(&entry.key) else {
-            continue;
-        };
-        item["trusted_hash"] = value(entry.current_hash.clone());
-        item["enabled"] = value(true);
-        item[HCOM_CODEX_CLI_VERSION_KEY] = value(codex_cli_version.to_string());
-        if let Some(definition_hash) = definition_hashes.get(&entry.key) {
-            item[HCOM_HOOK_DEFINITION_HASH_KEY] = value(definition_hash.clone());
-        }
-    }
-
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())
-}
-
-pub(crate) fn ensure_codex_hcom_hooks_trusted() -> Result<(), String> {
-    let Some(codex_cli_version) = codex_hook_trust_version()? else {
-        return Ok(());
-    };
-
-    let entries = fetch_codex_hcom_hook_entries()?;
-    let definition_hashes = hcom_hook_definition_hashes_from_hooks_path(&get_codex_hooks_path())
-        .map_err(|e| e.to_string())?;
-    let config_path = get_codex_config_path();
-    write_hcom_hook_trust_state(
-        &config_path,
-        &entries,
-        &HashSet::new(),
-        &codex_cli_version,
-        &definition_hashes,
-    )
-}
-
-pub(crate) fn codex_hcom_hooks_trusted_locally() -> bool {
-    let codex_cli_version = match codex_hook_trust_version() {
-        Ok(Some(version)) => version,
-        Ok(None) => {
-            return true;
-        }
-        Err(_) => {
-            return false;
-        }
-    };
-
-    codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version)
-}
-
-fn codex_hcom_hooks_trusted_locally_for_version(codex_cli_version: &str) -> bool {
-    let hooks_path = get_codex_hooks_path();
-    let hooks_content = match std::fs::read_to_string(&hooks_path) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let hooks_json: Value = match serde_json::from_str(&hooks_content) {
-        Ok(json) => json,
-        Err(_) => return false,
-    };
-    if verify_hooks_json_value(&hooks_json).is_err() {
-        return false;
-    }
-    let entries = hcom_hook_local_entries_from_hooks_json(&hooks_json, &hooks_path);
-    if entries.len() != CODEX_HOOK_COMMANDS.len() {
-        return false;
-    }
-    let definition_hashes: HashMap<String, String> = entries
-        .iter()
-        .map(|entry| (entry.key.clone(), entry.definition_hash.clone()))
-        .collect();
-    let keys: HashSet<String> = entries.into_iter().map(|entry| entry.key).collect();
-
-    codex_hcom_hook_keys_trusted_for_version(
-        &get_codex_config_path(),
-        &keys,
-        codex_cli_version,
-        &definition_hashes,
-    )
-}
-
-fn codex_hcom_hook_keys_trusted_for_version(
-    config_path: &Path,
-    keys: &HashSet<String>,
-    codex_cli_version: &str,
-    definition_hashes: &HashMap<String, String>,
-) -> bool {
-    let config_content = match std::fs::read_to_string(config_path) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let doc = match config_content.parse::<DocumentMut>() {
-        Ok(doc) => doc,
-        Err(_) => return false,
-    };
-    let Some(state) = doc
-        .get("hooks")
-        .and_then(|hooks| hooks.get("state"))
-        .and_then(|state| state.as_table_like())
-    else {
-        return false;
-    };
-
-    keys.iter().all(|key| {
-        let Some(entry) = state.get(key) else {
-            return false;
-        };
-        let Some(trusted_hash) = entry.get("trusted_hash").and_then(|v| v.as_str()) else {
-            return false;
-        };
-        !trusted_hash.is_empty()
-            && entry.get("enabled").and_then(|v| v.as_bool()) != Some(false)
-            && entry
-                .get(HCOM_CODEX_CLI_VERSION_KEY)
-                .and_then(|v| v.as_str())
-                == Some(codex_cli_version)
-            && entry
-                .get(HCOM_HOOK_DEFINITION_HASH_KEY)
-                .and_then(|v| v.as_str())
-                == definition_hashes.get(key).map(String::as_str)
-    })
-}
-
-#[cfg(test)]
-fn hcom_command_for_hook_state_key(key: &str) -> String {
-    let mut parts = key.rsplitn(4, ':');
-    let _handler_index = parts.next();
-    let _group_index = parts.next();
-    let event_label = parts.next();
-    if let Some(event_label) = event_label {
-        for (event, command, _) in CODEX_HOOK_COMMANDS {
-            if codex_hook_event_state_label(event) == event_label {
-                return build_codex_hook_command(command);
-            }
-        }
-    }
-    key.to_string()
-}
-
-fn verify_hcom_hook_keys_trusted_for_version(
-    config_path: &Path,
-    entries: &[CodexHookLocalEntry],
-    codex_cli_version: &str,
-) -> Result<(), VerifyFailReason> {
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| VerifyFailReason::HookTrustUnavailable(e.to_string()))?;
-    let doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| VerifyFailReason::HookTrustUnavailable(e.to_string()))?;
-    let state = doc
-        .get("hooks")
-        .and_then(|hooks| hooks.get("state"))
-        .and_then(|state| state.as_table_like())
-        .ok_or_else(|| VerifyFailReason::HookTrustUnavailable("hooks.state missing".to_string()))?;
-
-    for entry in entries {
-        let command = entry.command.clone();
-        let Some(state_entry) = state.get(&entry.key) else {
-            return Err(VerifyFailReason::HookTrustMissing { command });
-        };
-        if state_entry.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-            return Err(VerifyFailReason::HookDisabled { command });
-        }
-        let trusted_hash = state_entry
-            .get("trusted_hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| VerifyFailReason::HookTrustMissing {
-                command: command.clone(),
-            })?;
-        if trusted_hash.is_empty() {
-            return Err(VerifyFailReason::HookTrustMissing { command });
-        }
-        if state_entry
-            .get(HCOM_CODEX_CLI_VERSION_KEY)
-            .and_then(|v| v.as_str())
-            != Some(codex_cli_version)
-        {
-            return Err(VerifyFailReason::HookTrustStale { command });
-        }
-        if state_entry
-            .get(HCOM_HOOK_DEFINITION_HASH_KEY)
-            .and_then(|v| v.as_str())
-            != Some(entry.definition_hash.as_str())
-        {
-            return Err(VerifyFailReason::HookTrustStale { command });
-        }
-    }
-
-    Ok(())
-}
-
-fn verify_hcom_hook_trust_state(
-    config_path: &Path,
-    hooks_path: &Path,
-) -> Result<(), VerifyFailReason> {
-    let Some(codex_cli_version) =
-        codex_hook_trust_version().map_err(VerifyFailReason::CodexUnavailable)?
-    else {
-        return Ok(());
-    };
-    let entries = hcom_hook_local_entries_from_hooks_path(hooks_path)?;
-    if entries.len() != CODEX_HOOK_COMMANDS.len() {
-        return Err(VerifyFailReason::HookTrustUnavailable(format!(
-            "could not derive all hcom hook trust keys from {}",
-            hooks_path.display()
-        )));
-    }
-
-    verify_hcom_hook_keys_trusted_for_version(config_path, &entries, &codex_cli_version)
-}
-
-fn ensure_codex_feature_enabled(
-    config_path: &Path,
-    feature_key: CodexHooksFeatureKey,
-) -> Result<(), String> {
-    let mut doc: DocumentMut = if config_path.exists() {
-        std::fs::read_to_string(config_path)
-            .map_err(|e| e.to_string())?
-            .parse::<DocumentMut>()
-            .unwrap_or_default()
-    } else {
-        DocumentMut::new()
-    };
-
-    if !doc.contains_table("features") {
-        doc["features"] = Item::Table(toml_edit::Table::new());
-    }
-    // Codex renamed the feature flag from codex_hooks to hooks in 0.129.0.
-    // Always clean the deprecated codex_hooks key if present; never remove
-    // hooks — it's the shared flag for all Codex hooks, not just hcom's.
-    remove_codex_hooks_aliases(&mut doc, feature_key);
-    doc["features"][feature_key.as_str()] = value(true);
-    // Remove the old hcom-owned codex-notify form only; leave unrelated notify untouched.
-    let is_hcom_notify = doc.get("notify").is_some_and(is_hcom_legacy_notify);
-    if is_hcom_notify {
-        doc.remove("notify");
-    }
-
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    if paths::atomic_write(config_path, &doc.to_string()) {
-        Ok(())
-    } else {
-        Err("atomic_write failed".to_string())
-    }
-}
-
-fn remove_codex_hooks_aliases(doc: &mut DocumentMut, feature_key: CodexHooksFeatureKey) {
-    if let Some(features) = doc.get_mut("features")
-        && let Some(table) = features.as_table_like_mut()
-    {
-        table.remove("codex_hooks");
-    }
-
-    if feature_key != CodexHooksFeatureKey::Hooks {
-        return;
-    }
-
-    let Some(profiles) = doc
-        .get_mut("profiles")
-        .and_then(|item| item.as_table_like_mut())
-    else {
-        return;
-    };
-    for (_, profile) in profiles.iter_mut() {
-        let Some(features) = profile
-            .as_table_like_mut()
-            .and_then(|profile| profile.get_mut("features"))
-        else {
-            continue;
-        };
-        if let Some(table) = features.as_table_like_mut() {
-            table.remove("codex_hooks");
-        }
-    }
-}
-
-fn codex_selected_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) -> bool {
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    let Ok(doc) = content.parse::<DocumentMut>() else {
-        return false;
-    };
-    doc.get("features")
-        .and_then(|item| item.get(feature_key.as_str()))
-        .and_then(|item| item.as_bool())
-        .unwrap_or(false)
-}
-
-fn codex_deprecated_feature_present(config_path: &Path, feature_key: CodexHooksFeatureKey) -> bool {
-    if feature_key != CodexHooksFeatureKey::Hooks {
-        return false;
-    }
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    let Ok(doc) = content.parse::<DocumentMut>() else {
-        return false;
-    };
-    if doc
-        .get("features")
-        .and_then(|item| item.get("codex_hooks"))
-        .is_some()
-    {
-        return true;
-    }
-
-    let Some(active_profile) = doc.get("profile").and_then(|item| item.as_str()) else {
-        return false;
-    };
-    doc.get("profiles")
-        .and_then(|item| item.as_table_like())
-        .and_then(|profiles| profiles.get(active_profile))
-        .and_then(|profile| profile.get("features"))
-        .and_then(|features| features.get("codex_hooks"))
-        .is_some()
-}
-
-fn codex_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) -> bool {
-    if codex_selected_feature_enabled(config_path, feature_key) {
-        return true;
-    }
-
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    let Ok(doc) = content.parse::<DocumentMut>() else {
-        return false;
-    };
-    // Check the version-selected key first, fall back to the alternate
-    // so that a config written by an older (or newer) hcom still passes
-    // verification until the next setup call canonicalizes it.
-    doc.get("features")
-        .and_then(|item| item.get(feature_key.alternate()))
-        .and_then(|item| item.as_bool())
-        .unwrap_or(false)
-}
-
-/// Whether Codex config already uses the feature flag key expected by the
-/// installed Codex CLI. Verification accepts either key for compatibility, but
-/// launch setup uses this to self-heal stale `codex_hooks` configs. Modern
-/// Codex warns if the deprecated key is present at all, even when `hooks` is
-/// also enabled, so treat that mixed state as not current.
-pub(crate) fn codex_current_feature_enabled() -> bool {
-    let config_path = get_codex_config_path();
-    let feature_key = detect_codex_hooks_feature_key();
-    codex_selected_feature_enabled(&config_path, feature_key)
-        && !codex_deprecated_feature_present(&config_path, feature_key)
-}
-
-fn verify_hooks_json_at(hooks_path: &Path) -> Result<(), VerifyFailReason> {
-    let content = std::fs::read_to_string(hooks_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            VerifyFailReason::HooksPathMissing(hooks_path.to_path_buf())
-        }
-        _ => VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()),
-    })?;
-    let json: Value = serde_json::from_str(&content)
-        .map_err(|_| VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()))?;
-    verify_hooks_json_value(&json)
-}
-
-fn verify_hooks_json_value(json: &Value) -> Result<(), VerifyFailReason> {
-    let hooks_obj = json
-        .get("hooks")
-        .and_then(|v| v.as_object())
-        .ok_or(VerifyFailReason::HooksKeyMissing)?;
-
-    // Check all expected hooks are present with correct matchers.
-    for (event, command, matcher) in CODEX_HOOK_COMMANDS {
-        let groups = match hooks_obj.get(*event).and_then(|v| v.as_array()) {
-            Some(arr) if !arr.is_empty() => arr,
-            _ => {
-                return Err(VerifyFailReason::HookEventMissing {
-                    event: (*event).to_string(),
-                });
-            }
-        };
-        let expected_command = build_codex_hook_command(command);
-        let expected_hook = serde_json::json!({
-            "type": "command",
-            "command": expected_command,
-        });
-        // Mirror merge_hcom_hooks: for None-matcher events only match groups
-        // with no "matcher" key, not groups with "matcher":"" (which may belong
-        // to other tools such as context-mode).
-        let matching_group = groups.iter().find(|group| match matcher {
-            Some(expected) => group.get("matcher").and_then(|v| v.as_str()) == Some(*expected),
-            None => group.get("matcher").and_then(|v| v.as_str()).is_none(),
-        });
-        let Some(group) = matching_group else {
-            return Err(VerifyFailReason::HookCommandMissing {
-                event: (*event).to_string(),
-                expected_command,
-            });
-        };
-        let hooks = group
-            .get("hooks")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| VerifyFailReason::HookCommandMissing {
-                event: (*event).to_string(),
-                expected_command: expected_command.clone(),
-            })?;
-        let hcom_hooks: Vec<&Value> = hooks
-            .iter()
-            .filter(|hook| {
-                hook.get("command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(is_hcom_codex_command)
-            })
-            .collect();
-        if !hcom_hooks.iter().any(|hook| **hook == expected_hook) {
-            return Err(VerifyFailReason::HookCommandMissing {
-                event: (*event).to_string(),
-                expected_command,
-            });
-        }
-        if hcom_hooks.iter().any(|hook| **hook != expected_hook) {
-            return Err(VerifyFailReason::HookDefinitionChanged {
-                event: (*event).to_string(),
-                expected_command,
-            });
-        }
-    }
-
-    // Check no stale hcom hooks exist in groups with non-matching matchers.
-    for (event, groups) in hooks_obj {
-        let Some(groups) = groups.as_array() else {
-            continue;
-        };
-        for group in groups {
-            let has_hcom_command =
-                group
-                    .get("hooks")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(is_hcom_codex_command)
-                        })
-                    });
-            if !has_hcom_command {
-                continue;
-            }
-            // This group has an hcom command — it must match an expected entry.
-            let group_matcher = group.get("matcher").and_then(|v| v.as_str());
-            let is_expected = CODEX_HOOK_COMMANDS
-                .iter()
-                .any(|(exp_event, _, exp_matcher)| {
-                    *exp_event == event.as_str()
-                        && match exp_matcher {
-                            Some(m) => group_matcher == Some(*m),
-                            None => group_matcher.is_none(),
-                        }
-                });
-            if !is_expected {
-                return Err(VerifyFailReason::StaleHcomHookEntry {
-                    event: event.clone(),
-                    matcher: group_matcher.map(|s| s.to_string()),
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn build_codex_rules() -> String {
     let prefix = crate::runtime_env::get_hcom_prefix();
     let prefix_parts: String = prefix
@@ -1752,9 +1464,8 @@ fn build_codex_rules() -> String {
     rules.join("\n") + "\n"
 }
 
-/// Set up Codex execpolicy rules for auto-approval.
-pub fn setup_codex_execpolicy() -> bool {
-    let rules_dir = get_codex_rules_path();
+fn setup_codex_execpolicy_at(codex_home: &Path) -> bool {
+    let rules_dir = codex_rules_path_at(codex_home);
     let rules_file = rules_dir.join("hcom.rules");
     let rule_content = build_codex_rules();
 
@@ -1768,9 +1479,8 @@ pub fn setup_codex_execpolicy() -> bool {
     paths::atomic_write(&rules_file, &rule_content)
 }
 
-/// Remove hcom execpolicy rule.
-pub fn remove_codex_execpolicy() -> bool {
-    let rules_file = get_codex_rules_path().join("hcom.rules");
+fn remove_codex_execpolicy_at(codex_home: &Path) -> bool {
+    let rules_file = codex_rules_path_at(codex_home).join("hcom.rules");
     if rules_file.exists() {
         std::fs::remove_file(&rules_file).is_ok()
     } else {
@@ -1778,244 +1488,20 @@ pub fn remove_codex_execpolicy() -> bool {
     }
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum VerifyFailReason {
-    #[error("Codex config.toml missing: {}", .0.display())]
-    ConfigPathMissing(PathBuf),
-    #[error("Codex hooks.json missing: {}", .0.display())]
-    HooksPathMissing(PathBuf),
-    #[error("Codex experimental hooks feature not enabled in {}", .0.display())]
-    CodexFeatureDisabled(PathBuf),
-    #[error("Codex hooks.json missing or not parseable as JSON: {}", .0.display())]
-    HooksUnreadable(PathBuf),
-    #[error("'hooks' key missing or not an object")]
-    HooksKeyMissing,
-    #[error("hook event '{event}' missing or empty")]
-    HookEventMissing { event: String },
-    #[error("hcom hook command not found under event '{event}' (expected: {expected_command})")]
-    HookCommandMissing {
-        event: String,
-        expected_command: String,
-    },
-    #[error("hcom hook definition changed under event '{event}' (expected: {expected_command})")]
-    HookDefinitionChanged {
-        event: String,
-        expected_command: String,
-    },
-    #[error("stale hcom hook entry in event '{event}' under unexpected matcher: {matcher:?}")]
-    StaleHcomHookEntry {
-        event: String,
-        matcher: Option<String>,
-    },
-    #[error("Codex CLI unavailable for hook trust check: {0}")]
-    CodexUnavailable(String),
-    #[error("hcom Codex hook trust state unavailable: {0}")]
-    HookTrustUnavailable(String),
-    #[error("hcom Codex hook '{command}' has no trusted_hash in hooks.state")]
-    HookTrustMissing { command: String },
-    #[error("hcom Codex hook '{command}' trusted_hash is stale")]
-    HookTrustStale { command: String },
-    #[error("hcom Codex hook '{command}' is disabled in hooks.state")]
-    HookDisabled { command: String },
-    #[error("hcom.rules file missing: {}", .0.display())]
-    PermissionsRulesMissing(PathBuf),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SetupError {
-    #[error("failed to enable Codex experimental hooks feature in {}: {reason}", path.display())]
-    EnsureFeatureFailed { path: PathBuf, reason: String },
-    #[error("failed to read existing {}: {source}", path.display())]
-    HooksReadFailed {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("JSON serialization failed: {0}")]
-    SerializationFailed(#[from] serde_json::Error),
-    #[error("failed to create parent dir {}: {source}", path.display())]
-    DirCreateFailed {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("atomic write to {} failed: {source}", path.display())]
-    AtomicWriteFailed {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("post-write verify failed for {}: {reason}", path.display())]
-    PostWriteVerifyFailed {
-        path: PathBuf,
-        #[source]
-        reason: VerifyFailReason,
-    },
-    #[error(
-        "failed to trust Codex hooks: {reason}. hcom-wrapped Codex launches may fall back to --dangerously-bypass-hook-trust, but vanilla Codex will not run hcom hooks until trust succeeds"
-    )]
-    HookTrustFailed { reason: String },
-}
-
-pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError> {
-    let config_path = get_codex_config_path();
-    let hooks_path = get_codex_hooks_path();
-    let feature_key = detect_codex_hooks_feature_key();
-
-    ensure_codex_feature_enabled(&config_path, feature_key).map_err(|e| {
-        SetupError::EnsureFeatureFailed {
-            path: config_path.clone(),
-            reason: e,
-        }
-    })?;
-
-    let mut hooks_json = if hooks_path.exists() {
-        let content =
-            std::fs::read_to_string(&hooks_path).map_err(|source| SetupError::HooksReadFailed {
-                path: hooks_path.clone(),
-                source,
-            })?;
-        serde_json::from_str::<Value>(&content)
-            .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }))
-    } else {
-        serde_json::json!({ "hooks": {} })
-    };
-    // Strip legacy "cmd"-keyed hcom entries written by pre-0.129 installs.
-    // Only safe once Codex supports the current "command"-keyed format.
-    if feature_key == CodexHooksFeatureKey::Hooks {
-        remove_legacy_hcom_cmd_hooks_from_json(&mut hooks_json);
-    }
-    let old_hcom_hook_keys = hcom_hook_state_keys_from_hooks_json(&hooks_json, &hooks_path);
-    merge_hcom_hooks(&mut hooks_json);
-
-    if let Some(parent) = hooks_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| SetupError::DirCreateFailed {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let content =
-        serde_json::to_string_pretty(&hooks_json).map_err(SetupError::SerializationFailed)?;
-    paths::atomic_write_io(&hooks_path, &content).map_err(|source| {
-        SetupError::AtomicWriteFailed {
-            path: hooks_path.clone(),
-            source,
-        }
-    })?;
-
-    verify_hooks_json_at(&hooks_path).map_err(|reason| SetupError::PostWriteVerifyFailed {
-        path: hooks_path.clone(),
-        reason,
-    })?;
-
-    match codex_hook_trust_version() {
-        Ok(Some(codex_cli_version)) => {
-            let definition_hashes =
-                hcom_hook_definition_hashes_from_hooks_json(&hooks_json, &hooks_path);
-            match fetch_codex_hcom_hook_entries().and_then(|entries| {
-                let current_keys: HashSet<String> =
-                    entries.iter().map(|entry| entry.key.clone()).collect();
-                let stale_keys: HashSet<String> = old_hcom_hook_keys
-                    .difference(&current_keys)
-                    .cloned()
-                    .collect();
-                write_hcom_hook_trust_state(
-                    &config_path,
-                    &entries,
-                    &stale_keys,
-                    &codex_cli_version,
-                    &definition_hashes,
-                )
-            }) {
-                Ok(()) => {}
-                Err(e) => return Err(SetupError::HookTrustFailed { reason: e }),
-            }
-        }
-        Ok(None) => {}
-        Err(e) => log::log_warn(
-            "hooks",
-            "codex.hook_trust_version_warn",
-            &format!(
-                "hooks installed but Codex version check failed; launch may fall back to Codex hook-trust bypass: {e}"
-            ),
-        ),
-    }
-
-    let ep_ok = if include_permissions {
-        setup_codex_execpolicy()
-    } else {
-        remove_codex_execpolicy()
-    };
-    if !ep_ok {
-        log::log_warn(
-            "hooks",
-            "codex.execpolicy_warn",
-            "hooks installed but execpolicy write failed; auto-approval will not work",
-        );
-    }
-    Ok(())
-}
-
-pub fn setup_codex_hooks(include_permissions: bool) -> bool {
-    try_setup_codex_hooks(include_permissions).is_ok()
-}
-
-pub fn verify_codex_hooks_installed(check_permissions: bool) -> bool {
-    verify_codex_hooks_inner(check_permissions).is_ok()
-}
-
-pub(crate) fn verify_codex_hooks_inner(check_permissions: bool) -> Result<(), VerifyFailReason> {
-    let config_path = get_codex_config_path();
-    let hooks_path = get_codex_hooks_path();
-
-    if !config_path.exists() {
-        return Err(VerifyFailReason::ConfigPathMissing(config_path));
-    }
-    let feature_key = detect_codex_hooks_feature_key();
-    if !codex_feature_enabled(&config_path, feature_key) {
-        return Err(VerifyFailReason::CodexFeatureDisabled(config_path));
-    }
-    // No exists() pre-check: verify_hooks_json_at converts NotFound to
-    // HooksPathMissing, avoiding a stat-then-open race.
-    verify_hooks_json_at(&hooks_path)?;
-    verify_hcom_hook_trust_state(&config_path, &hooks_path)?;
-    if check_permissions {
-        let rules_file = get_codex_rules_path().join("hcom.rules");
-        if !rules_file.exists() {
-            return Err(VerifyFailReason::PermissionsRulesMissing(rules_file));
-        }
-    }
-    Ok(())
-}
-
-/// Remove hcom hooks from a single Codex hooks.json + execpolicy at the given base dir.
 fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
-    let hooks_path = base.join("hooks.json");
     let rules_file = base.join("rules").join("hcom.rules");
-    let mut ok = true;
-
-    if hooks_path.exists() {
-        match std::fs::read_to_string(&hooks_path) {
-            Ok(content) => {
-                let mut json = serde_json::from_str::<Value>(&content)
-                    .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }));
-                remove_hcom_hooks_from_json(&mut json);
-                if json.get("hooks").is_none() && json.as_object().is_some_and(|o| o.is_empty()) {
-                    ok &= std::fs::remove_file(&hooks_path).is_ok();
-                } else {
-                    let content =
-                        serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".into());
-                    ok &= paths::atomic_write(&hooks_path, &content);
-                }
-            }
-            Err(_) => ok = false,
+    // A file that doesn't parse is the user's to fix; cleanup leaves it
+    // untouched and the failure is reported.
+    let mut ok = match cleanup_codex_hooks_in_dir(base) {
+        Ok(()) => true,
+        Err(error) => {
+            crate::log::log_warn("codex", "codex.hooks_cleanup_failed", &format!("{error:#}"));
+            false
         }
-    }
-
+    };
     if rules_file.exists() {
         ok &= std::fs::remove_file(&rules_file).is_ok();
     }
-
     ok
 }
 
@@ -2051,6 +1537,260 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
+    use std::collections::HashMap;
+
+    fn per_run_ctx(args: &[&str], home: &Path) -> LaunchCtx {
+        LaunchCtx {
+            tool: crate::tool::Tool::Codex,
+            env: HashMap::from([(
+                "CODEX_HOME".to_string(),
+                home.to_string_lossy().into_owned(),
+            )]),
+            cwd: home.to_path_buf(),
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            auto_approve: false,
+        }
+    }
+
+    #[test]
+    fn per_run_merges_caller_hooks_in_flag_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = per_run_ctx(
+            &[
+                "-c",
+                "hooks={SessionStart=[{hooks=[{type='command',command='first'}]}]}",
+                "-c",
+                "hooks.SessionStart=[{hooks=[{type='command',command='second'}]}]",
+            ],
+            dir.path(),
+        );
+        let (_, hooks) = merged_per_run_hooks(&first).unwrap();
+        let groups = hooks["SessionStart"].as_array().unwrap();
+        assert_eq!(groups[0]["hooks"][0]["command"].as_str(), Some("second"));
+        assert_eq!(
+            groups[1]["hooks"][0]["command"].as_str(),
+            Some(build_codex_hook_command("codex-sessionstart").as_str())
+        );
+
+        let reversed = per_run_ctx(
+            &[
+                "-c",
+                "hooks.SessionStart=[{hooks=[{type='command',command='first'}]}]",
+                "-c",
+                "hooks={SessionStart=[{hooks=[{type='command',command='second'}]}]}",
+            ],
+            dir.path(),
+        );
+        let (_, hooks) = merged_per_run_hooks(&reversed).unwrap();
+        assert_eq!(
+            hooks["SessionStart"][0]["hooks"][0]["command"].as_str(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn per_run_rejects_malformed_caller_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = per_run_ctx(&["-c", "hooks.SessionStart=[oops"], dir.path());
+        assert!(merged_per_run_hooks(&ctx).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn failed_per_run_preparation_leaves_legacy_hooks_untouched() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let codex_home = tempfile::tempdir().unwrap();
+        let hooks_path = codex_home.path().join("hooks.json");
+        let legacy = serde_json::to_vec(&build_expected_hook_json()).unwrap();
+        std::fs::write(&hooks_path, &legacy).unwrap();
+
+        let ctx = per_run_ctx(&["-c", "hooks.SessionStart=[oops"], codex_home.path());
+        assert!(crate::hooks::runtime::plan(&PER_RUN, &ctx).is_err());
+        assert_eq!(std::fs::read(&hooks_path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn per_run_keeps_other_overrides_and_quoted_state_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = per_run_ctx(
+            &[
+                "-c",
+                "model=gpt-5",
+                "-c",
+                "hooks.state.\"config.toml:stop:0:0\"={trusted_hash='old'}",
+            ],
+            dir.path(),
+        );
+        let (kept, hooks) = merged_per_run_hooks(&ctx).unwrap();
+        assert_eq!(kept, vec!["-c", "model=gpt-5"]);
+        assert_eq!(
+            hooks["state"]["config.toml:stop:0:0"]["trusted_hash"].as_str(),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn per_run_cleanup_preserves_foreign_hooks_and_rejects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(cleanup_codex_hooks_in_dir(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        let mut hooks = build_expected_hook_json();
+        hooks["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "hooks": [{"type":"command","command":"user-stop"}]
+            }));
+        std::fs::write(&path, serde_json::to_string(&hooks).unwrap()).unwrap();
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let cleaned: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            cleaned["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "user-stop"
+        );
+    }
+
+    #[test]
+    fn per_run_cleanup_removes_only_hcom_legacy_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        for (notify, removed) in [
+            (
+                "notify = \"hcom internal codex-notify --name luna\"\n",
+                true,
+            ),
+            (
+                "notify = [\"hcom\", \"internal\", \"codex-notify\"]\n",
+                true,
+            ),
+            ("notify = \"some-other-notify-tool\"\n", false),
+            ("notify = \"other-tool codex-notify\"\n", false),
+            ("notify = [\"uvx\", \"hcom\", \"codex-notify\"]\n", true),
+            ("notify = [\"C:/dev/hcom.exe\", \"codex-notify\"]\n", true),
+            (
+                "notify = [\"/home/alice/hcom-tools/codex-notify.sh\"]\n",
+                false,
+            ),
+            ("notify = [\"my-hcom-wrapper\", \"codex-notify\"]\n", false),
+        ] {
+            std::fs::write(&config_path, format!("model = 'gpt-5'\n{notify}")).unwrap();
+            cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+            let source = std::fs::read_to_string(&config_path).unwrap();
+            assert_eq!(!source.contains("notify"), removed, "{notify}: {source}");
+            assert!(source.contains("model = 'gpt-5'"), "{source}");
+        }
+    }
+
+    #[test]
+    fn per_run_cleanup_discards_malformed_trust_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join(HCOM_HOOK_TRUST_METADATA_FILE);
+        std::fs::write(&metadata_path, "[broken").unwrap();
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        assert!(!metadata_path.exists());
+    }
+
+    #[test]
+    fn per_run_cleanup_removes_only_hcom_trust_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "user-stop"}]},
+                {"hooks": [{"type": "command", "command": "hcom codex-stop"}]},
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        let key = |group: usize| format!("{}:stop:{group}:0", hooks_path.display());
+        std::fs::write(
+            &config_path,
+            format!(
+                "# keep me\nmodel = 'gpt-5'\n\n[hooks.state]\n'foreign:stop:0:0' = {{ trusted_hash = 'keep' }}\n'{}' = {{ trusted_hash = 'user' }}\n'{}' = {{ trusted_hash = 'hcom' }}\n",
+                key(0),
+                key(1)
+            ),
+        )
+        .unwrap();
+
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let source = std::fs::read_to_string(&config_path).unwrap();
+        assert!(source.starts_with("# keep me\n"), "{source}");
+        let config: toml::Value = toml::from_str(&source).unwrap();
+        let state = &config["hooks"]["state"];
+        assert_eq!(
+            state["foreign:stop:0:0"]["trusted_hash"].as_str(),
+            Some("keep")
+        );
+        assert_eq!(state[&key(0)]["trusted_hash"].as_str(), Some("user"));
+        assert!(state.get(key(1)).is_none());
+        let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
+        assert_eq!(hooks["hooks"]["Stop"].as_array().unwrap().len(), 1);
+
+        // Once migrated, later launches leave the user's trust alone.
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["hooks"]["state"][&key(0)]["trusted_hash"].as_str(),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn per_run_cleanup_moves_trust_of_user_hooks_that_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "hcom codex-stop"}]},
+                {"hooks": [
+                    {"type": "command", "command": "user-a"},
+                    {"type": "command", "command": "hcom codex-stop"},
+                    {"type": "command", "command": "user-b"},
+                ]},
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        let key = |group: usize, handler: usize| {
+            format!("{}:stop:{group}:{handler}", hooks_path.display())
+        };
+        std::fs::write(
+            &config_path,
+            format!(
+                "[hooks.state]\n'{}' = {{ trusted_hash = 'hcom0' }}\n'{}' = {{ trusted_hash = 'a' }}\n'{}' = {{ trusted_hash = 'hcom1' }}\n'{}' = {{ trusted_hash = 'b' }}\n",
+                key(0, 0),
+                key(1, 0),
+                key(1, 1),
+                key(1, 2)
+            ),
+        )
+        .unwrap();
+
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let state = config["hooks"]["state"].as_table().unwrap();
+        assert_eq!(state.len(), 2, "{state:?}");
+        assert_eq!(state[&key(0, 0)]["trusted_hash"].as_str(), Some("a"));
+        assert_eq!(state[&key(0, 1)]["trusted_hash"].as_str(), Some("b"));
+    }
+
+    #[test]
+    fn hcom_command_match_requires_hcom_prefix() {
+        assert!(is_hcom_codex_command("hcom codex-stop"));
+        assert!(is_hcom_codex_command("/old/bin/hcom codex-stop"));
+        assert!(is_hcom_codex_command("uvx hcom codex-stop"));
+        assert!(!is_hcom_codex_command("/usr/local/bin/codex-stop"));
+        assert!(!is_hcom_codex_command("hcom codex-stop --extra"));
+    }
 
     #[test]
     fn test_hook_payload_factory_uses_native_fields() {
@@ -2135,228 +1875,19 @@ mod tests {
     // -- settings setup/remove/verify --
 
     #[test]
-    #[serial]
-    fn test_setup_and_remove_codex_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.130.0") };
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-
-        let hooks_path = get_codex_hooks_path();
-        let config_path = get_codex_config_path();
-        let hooks_content = std::fs::read_to_string(hooks_path).unwrap();
-        let config_content = std::fs::read_to_string(config_path).unwrap();
-
-        assert!(hooks_content.contains("codex-sessionstart"));
-        assert!(config_content.contains("hooks = true"));
-        assert!(!config_content.contains("codex-notify"));
-
-        assert!(remove_codex_hooks());
-        assert!(!verify_codex_hooks_installed(false));
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_codex_hooks_trusts_hcom_hooks_for_modern_codex() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-
-        let config_content = std::fs::read_to_string(get_codex_config_path()).unwrap();
-        assert!(config_content.contains("trusted_hash"));
-        assert!(config_content.contains("enabled = true"));
-        assert!(config_content.contains("hcom_codex_cli_version = \"0.131.0\""));
-        assert!(config_content.contains("hcom_hook_definition_hash"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_codex_hooks_repairs_disabled_hcom_hook_state() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
-
-        assert!(setup_codex_hooks(false));
-
-        let config_path = get_codex_config_path();
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let mut doc = content.parse::<DocumentMut>().unwrap();
-        let state = doc["hooks"]["state"].as_table_like_mut().unwrap();
-        let first_key = state.iter().next().unwrap().0.to_string();
-        state.get_mut(&first_key).unwrap()["enabled"] = value(false);
-        paths::atomic_write_io(&config_path, &doc.to_string()).unwrap();
-
-        assert!(!verify_codex_hooks_installed(false));
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-        let repaired = std::fs::read_to_string(&config_path).unwrap();
-        let repaired_doc = repaired.parse::<DocumentMut>().unwrap();
-        assert_eq!(
-            repaired_doc["hooks"]["state"][&first_key]["enabled"].as_bool(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_codex_hooks_repairs_stale_trusted_hash() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-
-        let config_path = get_codex_config_path();
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let mut doc = content.parse::<DocumentMut>().unwrap();
-        let state = doc["hooks"]["state"].as_table_like_mut().unwrap();
-        let first_key = state.iter().next().unwrap().0.to_string();
-        state.get_mut(&first_key).unwrap()["trusted_hash"] = value("sha256:stale");
-        paths::atomic_write_io(&config_path, &doc.to_string()).unwrap();
-
-        // Cheap verify does not spawn Codex app-server to compare currentHash.
-        assert!(verify_codex_hooks_installed(false));
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-        let repaired = std::fs::read_to_string(&config_path).unwrap();
-        let repaired_doc = repaired.parse::<DocumentMut>().unwrap();
-        assert_ne!(
-            repaired_doc["hooks"]["state"][&first_key]["trusted_hash"].as_str(),
-            Some("sha256:stale")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_codex_hooks_repairs_version_stamped_trust_state() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.132.0") };
-        assert!(!verify_codex_hooks_installed(false));
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-        let repaired = std::fs::read_to_string(get_codex_config_path()).unwrap();
-        assert!(repaired.contains("hcom_codex_cli_version = \"0.132.0\""));
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_codex_hooks_repairs_drifted_hcom_hook_definition() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-
-        let hooks_path = get_codex_hooks_path();
-        let content = std::fs::read_to_string(&hooks_path).unwrap();
-        let mut json: Value = serde_json::from_str(&content).unwrap();
-        json["hooks"]["PreToolUse"][0]["hooks"][0]["statusMessage"] =
-            Value::String("running".to_string());
-        paths::atomic_write_io(&hooks_path, &serde_json::to_string_pretty(&json).unwrap()).unwrap();
-
-        assert!(!verify_codex_hooks_installed(false));
-
-        assert!(setup_codex_hooks(false));
-        assert!(verify_codex_hooks_installed(false));
-        let repaired: Value =
-            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
-        assert!(
-            repaired["hooks"]["PreToolUse"][0]["hooks"][0]
-                .get("statusMessage")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_hcom_command_for_hook_state_key() {
-        assert_eq!(
-            hcom_command_for_hook_state_key("/tmp/codex/hooks.json:pre_tool_use:0:0"),
-            build_codex_hook_command("codex-pretooluse")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_preserves_unrelated_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let hooks_path = get_codex_hooks_path();
-        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hooks_path,
-            serde_json::json!({
-                "hooks": {
-                    "PostToolUse": [{
-                        "matcher": "Bash",
-                        "hooks": [{"type": "command", "command": "other-hook"}]
-                    }]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        assert!(setup_codex_hooks(false));
-        let content = std::fs::read_to_string(hooks_path).unwrap();
-        assert!(content.contains("other-hook"));
-        assert!(content.contains("codex-posttooluse"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_mixed_group_merge_preserves_user_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let hooks_path = get_codex_hooks_path();
-        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hooks_path,
-            serde_json::json!({
-                "hooks": {
-                    "PostToolUse": [{
-                        "matcher": "Bash",
-                        "hooks": [
-                            {"type": "command", "command": "user-mixed-hook"},
-                            {"type": "command", "command": "old-path codex-posttooluse"}
-                        ]
-                    }]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        assert!(setup_codex_hooks(false));
-        let content = std::fs::read_to_string(&hooks_path).unwrap();
-        assert!(content.contains("user-mixed-hook"), "user hook was dropped");
-        assert!(content.contains("codex-posttooluse"), "hcom hook missing");
-        let json: Value = serde_json::from_str(&content).unwrap();
-        let posttool_groups = json["hooks"]["PostToolUse"].as_array().unwrap();
-        let bash_group = posttool_groups
-            .iter()
-            .find(|g| g.get("matcher").and_then(|v| v.as_str()) == Some("Bash"))
-            .expect("Bash group missing");
-        let hook_cmds: Vec<&str> = bash_group["hooks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|h| h.get("command").and_then(|v| v.as_str()))
-            .collect();
-        let hcom_count = hook_cmds
-            .iter()
-            .filter(|c| c.contains("codex-posttooluse"))
-            .count();
-        assert_eq!(
-            hcom_count, 1,
-            "expected exactly one hcom hook, got {hcom_count}"
-        );
+    fn test_paths_equivalent_handles_dot_components() {
+        assert!(paths_equivalent(
+            Path::new("/home/u/.codex/./hooks.json"),
+            Path::new("/home/u/.codex/hooks.json")
+        ));
+        assert!(paths_equivalent(
+            Path::new("/home/u/other/../.codex/hooks.json"),
+            Path::new("/home/u/.codex/hooks.json")
+        ));
+        assert!(!paths_equivalent(
+            Path::new("/home/u/.codex/hooks.json"),
+            Path::new("/repo/.codex/hooks.json")
+        ));
     }
 
     #[test]
@@ -2376,7 +1907,7 @@ mod tests {
                         "matcher": "Bash",
                         "hooks": [
                             {"type": "command", "command": "user-remove-hook"},
-                            {"type": "command", "command": "old-path codex-posttooluse"}
+                            {"type": "command", "command": "/old/bin/hcom codex-posttooluse"}
                         ]
                     }]
                 }
@@ -2403,439 +1934,9 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_ensure_feature_enabled_preserves_unrelated_notify() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "notify = \"some-other-notify-tool\"\n").unwrap();
-
-        assert!(setup_codex_hooks(false));
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            content.contains("some-other-notify-tool"),
-            "unrelated notify was removed"
-        );
-        assert!(content.contains("hooks = true"), "feature flag not set");
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_feature_enabled_preserves_notify_with_codex_notify_but_no_hcom_owner() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "notify = \"other-tool codex-notify\"\n").unwrap();
-
-        assert!(setup_codex_hooks(false));
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            content.contains("other-tool codex-notify"),
-            "non-hcom notify mentioning codex-notify was removed"
-        );
-        assert!(content.contains("hooks = true"), "feature flag not set");
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_feature_enabled_removes_hcom_notify() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "notify = \"hcom internal codex-notify --name luna\"\n",
-        )
-        .unwrap();
-
-        assert!(setup_codex_hooks(false));
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            !content.contains("notify"),
-            "hcom notify key was not removed"
-        );
-        assert!(content.contains("hooks = true"), "feature flag not set");
-    }
-
-    #[test]
-    #[serial]
-    fn test_remove_codex_hooks_preserves_feature_flag() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        assert!(setup_codex_hooks(false));
-
-        let config_path = get_codex_config_path();
-        let before = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            before.contains("hooks = true"),
-            "setup did not enable feature flag"
-        );
-
-        assert!(remove_codex_hooks());
-        let after = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            after.contains("hooks = true"),
-            "feature flag should be preserved"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_setup_codex_creates_execpolicy() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        assert!(setup_codex_hooks(true));
-
-        let rules_file = get_codex_rules_path().join("hcom.rules");
-        assert!(rules_file.exists(), "execpolicy rules should be created");
-        let content = std::fs::read_to_string(&rules_file).unwrap();
-        assert!(content.contains("hcom"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_remove_codex_removes_execpolicy() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        assert!(setup_codex_hooks(true));
-        let rules_file = get_codex_rules_path().join("hcom.rules");
-        assert!(rules_file.exists());
-
-        assert!(remove_codex_hooks());
-        assert!(!rules_file.exists(), "execpolicy rules should be removed");
-    }
-
-    #[test]
-    #[serial]
     fn test_remove_codex_noop_when_no_hooks_json() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
         assert!(remove_codex_hooks());
-    }
-
-    #[test]
-    #[serial]
-    fn test_codex_feature_enabled_with_fallback() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
-
-        // Both keys resolve because the selected key is checked first,
-        // then the alternate acts as a fallback.
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::CodexHooks
-        ));
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::Hooks
-        ));
-
-        // Reverse: only hooks key present.
-        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::Hooks
-        ));
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::CodexHooks
-        ));
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_feature_upgrade_cleans_stale_codex_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        // Seed config with the deprecated key, simulating an old hcom install.
-        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
-
-        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("hooks = true"), "upgrade should set hooks");
-        assert!(
-            !content.contains("codex_hooks"),
-            "upgrade should remove stale codex_hooks"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_feature_upgrade_cleans_profile_stale_codex_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "profile = \"work\"\n\n[features]\nhooks = true\n\n[profiles.work.features]\ncodex_hooks = true\n",
-        )
-        .unwrap();
-
-        assert!(!codex_current_feature_enabled());
-
-        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("hooks = true"), "upgrade should set hooks");
-        assert!(
-            !content.contains("codex_hooks"),
-            "upgrade should remove stale profile codex_hooks"
-        );
-        assert!(codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_feature_upgrade_cleans_inline_profile_stale_codex_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "profile = \"work\"\nprofiles = { work = { features = { codex_hooks = true } } }\n\n[features]\nhooks = true\n",
-        )
-        .unwrap();
-
-        assert!(!codex_current_feature_enabled());
-
-        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("hooks = true"), "upgrade should set hooks");
-        assert!(
-            !content.contains("codex_hooks"),
-            "upgrade should remove stale inline profile codex_hooks"
-        );
-        assert!(codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_current_feature_enabled_requires_selected_key() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "[features]\ncodex_hooks = true\n").unwrap();
-
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::Hooks
-        ));
-        assert!(!codex_current_feature_enabled());
-
-        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
-        assert!(codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_current_feature_enabled_rejects_mixed_deprecated_key() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "[features]\nhooks = true\ncodex_hooks = true\n",
-        )
-        .unwrap();
-
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::Hooks
-        ));
-        assert!(!codex_current_feature_enabled());
-
-        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::Hooks).unwrap();
-        assert!(codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_current_feature_enabled_rejects_profile_deprecated_key() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "profile = \"work\"\n\n[features]\nhooks = true\n\n[profiles.work.features]\ncodex_hooks = true\n",
-        )
-        .unwrap();
-
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::Hooks
-        ));
-        assert!(!codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_current_feature_enabled_ignores_inactive_profile_deprecated_key() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "[features]\nhooks = true\n\n[profiles.work.features]\ncodex_hooks = true\n",
-        )
-        .unwrap();
-
-        assert!(codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_current_feature_enabled_rejects_inline_profile_deprecated_key() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            "profile = \"work\"\nprofiles = { work = { features = { codex_hooks = true } } }\n\n[features]\nhooks = true\n",
-        )
-        .unwrap();
-
-        assert!(codex_feature_enabled(
-            &config_path,
-            CodexHooksFeatureKey::Hooks
-        ));
-        assert!(!codex_current_feature_enabled());
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_feature_downgrade_uses_codex_hooks() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let config_path = get_codex_config_path();
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "[features]\nhooks = true\n").unwrap();
-
-        ensure_codex_feature_enabled(&config_path, CodexHooksFeatureKey::CodexHooks).unwrap();
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let doc = content.parse::<DocumentMut>().unwrap();
-        let features = doc.get("features").unwrap();
-        assert!(
-            features.get("codex_hooks").and_then(|v| v.as_bool()) == Some(true),
-            "old Codex should use codex_hooks"
-        );
-        // hooks is the shared flag for all Codex hooks — not just hcom's.
-        // hcom must not delete it even when writing for an older Codex.
-        assert!(
-            features.get("hooks").and_then(|v| v.as_bool()) == Some(true),
-            "shared hooks flag should be preserved"
-        );
-    }
-
-    #[test]
-    fn test_codex_hooks_feature_key_version_gate() {
-        assert_eq!(
-            codex_hooks_feature_key_for_version((0, 128, 0)),
-            CodexHooksFeatureKey::CodexHooks
-        );
-        assert_eq!(
-            codex_hooks_feature_key_for_version((0, 129, 0)),
-            CodexHooksFeatureKey::Hooks
-        );
-        assert_eq!(
-            parse_codex_cli_version("codex-cli 0.129.0"),
-            Some((0, 129, 0))
-        );
-    }
-
-    // ── regression: legacy "cmd"-format cleanup ─────────────────────────────
-
-    /// Old hcom versions wrote hooks as {"type":"cmd","cmd":"hcom codex-..."}.
-    /// On Codex >= 0.129 (CODEX_HOOKS_FEATURE_RENAME_VERSION), try_setup_codex_hooks
-    /// must remove those stale entries and replace them with the current format.
-    ///
-    /// FAILS before the fix: remove_legacy_hcom_cmd_hooks_from_json is defined
-    /// but not yet called from try_setup_codex_hooks.
-    #[test]
-    #[serial]
-    fn test_legacy_cmd_hooks_cleaned_on_new_codex() {
-        // isolated_test_env sets HCOM_TEST_CODEX_CLI_VERSION = "codex-cli 0.129.0"
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let hooks_path = get_codex_hooks_path();
-        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hooks_path,
-            serde_json::json!({
-                "hooks": {
-                    "UserPromptSubmit": [{
-                        "hooks": [{"type": "cmd", "cmd": "hcom codex-userpromptsubmit"}]
-                    }]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        assert!(try_setup_codex_hooks(false).is_ok());
-        let content = std::fs::read_to_string(&hooks_path).unwrap();
-        let hooks_json: Value = serde_json::from_str(&content).unwrap();
-        let user_prompt_hooks = hooks_json["hooks"]["UserPromptSubmit"][0]["hooks"]
-            .as_array()
-            .unwrap();
-        assert!(
-            !user_prompt_hooks
-                .iter()
-                .any(|hook| hook["type"] == "cmd" && hook.get("cmd").is_some()),
-            "legacy cmd-keyed entry must be removed on Codex >= 0.129"
-        );
-        assert!(
-            user_prompt_hooks.iter().any(|hook| {
-                hook["type"] == "command"
-                    && hook["command"] == build_codex_hook_command("codex-userpromptsubmit")
-            }),
-            "current command-keyed entry must be present after cleanup"
-        );
-    }
-
-    // ── regression: context-mode "matcher":"" groups must not block verify ──
-
-    /// context-mode writes groups with "matcher":"" for None-matcher events
-    /// (UserPromptSubmit, Stop).  Those groups appear before hcom's no-matcher
-    /// groups in the file.  verify_hooks_json_value must not pick the wrong
-    /// group and report HookCommandMissing.
-    #[test]
-    #[serial]
-    fn test_context_mode_empty_matcher_does_not_block_verify() {
-        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        let hooks_path = get_codex_hooks_path();
-        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        // Seed with context-mode "matcher":"" groups appearing FIRST for both
-        // None-matcher events, matching the live ~/.codex/hooks.json layout.
-        std::fs::write(
-            &hooks_path,
-            serde_json::json!({
-                "hooks": {
-                    "UserPromptSubmit": [{
-                        "matcher": "",
-                        "hooks": [{"type": "command", "command": "context-mode hook codex userpromptsubmit"}]
-                    }],
-                    "Stop": [{
-                        "matcher": "",
-                        "hooks": [{"type": "command", "command": "context-mode hook codex stop"}]
-                    }]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        assert!(
-            try_setup_codex_hooks(false).is_ok(),
-            "setup must succeed even when another tool owns a \"matcher\":\"\" group for the same event"
-        );
-        let content = std::fs::read_to_string(&hooks_path).unwrap();
-        assert!(
-            content.contains("context-mode hook codex userpromptsubmit"),
-            "third-party hook must be preserved"
-        );
-        assert!(
-            content.contains("codex-userpromptsubmit"),
-            "hcom hook must be present"
-        );
     }
 
     #[test]

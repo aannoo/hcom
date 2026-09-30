@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::net::TcpListener;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,7 +16,7 @@ use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::messages;
-use crate::shared::constants::{BIND_MARKER_RE, MAX_MESSAGES_PER_DELIVERY};
+use crate::shared::constants::MAX_MESSAGES_PER_DELIVERY;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
 
@@ -71,6 +70,45 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "-v",
     "--new-terminal",
 ];
+
+/// Whether a shell command line is exactly one `hcom <safe command> …` (or
+/// `uvx hcom …`), for tools where hcom approves commands at runtime.
+///
+/// Anything the shell could turn into a second command fails: unquoted
+/// `; & | < > ( )`, backticks, newlines, and `$` outside single quotes. A
+/// prefix match alone would approve `hcom send @x -- hi; rm -rf ~`.
+pub(crate) fn is_safe_hcom_command(command: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\n' | '\r' => return false,
+            '\'' if !double => single = !single,
+            _ if single => {}
+            '\\' => escaped = true,
+            '"' => double = !double,
+            '$' | '`' => return false,
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' if !double => return false,
+            _ => {}
+        }
+    }
+    if single || double || escaped {
+        return false;
+    }
+    let Ok(words) = shell_words::split(command) else {
+        return false;
+    };
+    let rest = match words.as_slice() {
+        [hcom, rest @ ..] if hcom == "hcom" => rest,
+        [uvx, hcom, rest @ ..] if uvx == "uvx" && hcom == "hcom" => rest,
+        _ => return false,
+    };
+    rest.first()
+        .is_none_or(|command| SAFE_HCOM_COMMANDS.contains(&command.as_str()))
+}
 
 /// Pre-gate check: should hooks proceed?
 ///
@@ -289,12 +327,12 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 
 /// Commit a deferred delivery ack — advance cursor and set status.
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
-    if ack.mark_announced {
-        updates.insert("name_announced".into(), serde_json::json!(true));
+    // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
+    // Cursor and announcement move together so a partial ack can't re-announce.
+    if let Err(e) = db.ack_hook_delivery(&ack.instance_name, ack.last_event_id, ack.mark_announced)
+    {
+        crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}"));
     }
-    instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
         db,
@@ -383,7 +421,7 @@ pub struct PollResult {
 
 /// Stop hook polling loop — NOT used by main PTY path.
 ///
-/// Runs for: headless instances, vanilla tool instances, subagent polling.
+/// Runs for: headless instances and subagent polling.
 /// Main PTY path bypasses this (HCOM_PTY_MODE=1, PTY wrapper handles injection).
 ///
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
@@ -626,86 +664,6 @@ fn delete_hook_notify_endpoint(db: &HcomDb, instance_name: &str) {
     );
 }
 
-/// Find last [hcom:xxx] marker in transcript.
-///
-/// Reads file backwards in 64MB chunks with 70-byte overlap to find marker.
-pub fn find_last_bind_marker(transcript_path: &str) -> Option<String> {
-    let path = Path::new(transcript_path);
-    let metadata = std::fs::metadata(path).ok()?;
-    let file_size = metadata.len() as usize;
-
-    if file_size == 0 {
-        return None;
-    }
-
-    let chunk_size: usize = 64 * 1024 * 1024; // 64MB
-    let overlap: usize = 70; // max prefix len (12) + max instance name (50) + margin
-    let marker_prefixes: &[&[u8]] = &[b"[hcom:"];
-
-    let mut file = std::fs::File::open(path).ok()?;
-
-    let mut pos = file_size;
-    let mut carry: Vec<u8> = Vec::new();
-
-    while pos > 0 {
-        let read_size = chunk_size.min(pos);
-        pos -= read_size;
-
-        use std::io::{Read as _, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(pos as u64)).ok()?;
-
-        let mut data = vec![0u8; read_size];
-        file.read_exact(&mut data).ok()?;
-
-        // Combine data + carry for overlap handling
-        let mut buf = data.clone();
-        buf.extend_from_slice(&carry);
-
-        // Find the last occurrence of any marker prefix
-        let mut best_idx: Option<usize> = None;
-        for prefix in marker_prefixes {
-            if let Some(idx) = rfind_bytes(&buf, prefix) {
-                match best_idx {
-                    Some(current) if idx > current => best_idx = Some(idx),
-                    None => best_idx = Some(idx),
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(idx) = best_idx {
-            // Find closing bracket
-            if let Some(end_offset) = buf[idx..].iter().position(|&b| b == b']') {
-                let marker_bytes = &buf[idx..idx + end_offset + 1];
-                if let Ok(marker_str) = std::str::from_utf8(marker_bytes)
-                    && let Some(caps) = BIND_MARKER_RE.captures(marker_str)
-                {
-                    return Some(caps[1].to_string());
-                }
-            }
-        }
-
-        // Keep overlap for next chunk
-        carry = if overlap > 0 && data.len() >= overlap {
-            data[..overlap].to_vec()
-        } else {
-            data
-        };
-    }
-
-    None
-}
-
-/// Reverse search for byte pattern in buffer.
-fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    (0..=haystack.len() - needle.len())
-        .rev()
-        .find(|&i| haystack[i..i + needle.len()] == *needle)
-}
-
 /// Inject bootstrap text if not already announced.
 ///
 /// Idempotent — checks name_announced flag and only injects once
@@ -723,22 +681,7 @@ pub fn inject_bootstrap_once(
         return None;
     }
 
-    let tag = instance_data.tag.as_deref().unwrap_or("");
-    let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-    let relay_enabled = crate::relay::is_relay_enabled(&hcom_config);
-
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        instance_name,
-        tool,
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        tag,
-        relay_enabled,
-        ctx.background_name.as_deref(),
-    );
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, instance_name, tool);
 
     // Mark as announced
     let mut updates = serde_json::Map::new();
@@ -872,15 +815,12 @@ pub(crate) struct ClaudeIdentityEvidence {
 /// local to each resolution path.
 pub(crate) fn load_claude_identity_evidence(
     db: &HcomDb,
-    process_id: Option<&str>,
+    process_id: &str,
     session_id: &str,
     transcript_path: &str,
     should_scan_lineage: impl FnOnce(&ClaudeIdentityEvidence) -> bool,
 ) -> Result<ClaudeIdentityEvidence> {
-    let process_binding = match process_id.filter(|value| !value.is_empty()) {
-        Some(process_id) => db.get_process_binding_full(process_id)?,
-        None => None,
-    };
+    let process_binding = db.get_process_binding_full(process_id)?;
     let process_session_id = process_binding
         .as_ref()
         .and_then(|(session_id, _)| session_id.clone());
@@ -925,21 +865,28 @@ pub(crate) fn load_claude_identity_evidence(
 
 /// Initialize instance context from hook data via binding lookup.
 ///
-/// Structured session/transcript identity wins over a conflicting process
+/// Hooks only run in hcom-launched Claude processes, but one process can
+/// switch sessions (`/resume`, `/clear`, `/branch`, `--fork-session`) while
+/// its process binding still names the previous generation's owner. So
+/// structured session/transcript identity wins over a conflicting process
 /// binding. Transcript scanning stays off the common hot path: it runs only
 /// when the session is unbound or its binding has not yet been validated.
 ///
-/// Returns (instance_name, metadata_updates, is_matched_resume).
+/// Returns (instance_name, metadata_updates, is_matched_resume). A hook with
+/// no hcom process id never resolves an identity.
 pub fn init_hook_context(
     db: &HcomDb,
     ctx: &HcomContext,
     session_id: &str,
     transcript_path: &str,
 ) -> (Option<String>, serde_json::Map<String, Value>, bool) {
+    let Some(process_id) = ctx.process_id.as_deref() else {
+        return (None, serde_json::Map::new(), false);
+    };
     let start = Instant::now();
     let evidence = match load_claude_identity_evidence(
         db,
-        ctx.process_id.as_deref(),
+        process_id,
         session_id,
         transcript_path,
         |evidence| {
@@ -968,8 +915,7 @@ pub fn init_hook_context(
         .filter(|bound_session_id| !bound_session_id.is_empty())
         .is_some_and(|bound_session_id| bound_session_id != session_id);
 
-    let mut instance_name = if let Some(validated_owner) = evidence.validated_session_owner.clone()
-    {
+    let instance_name = if let Some(validated_owner) = evidence.validated_session_owner.clone() {
         Some(validated_owner)
     } else if evidence.lineage_scanned {
         match &evidence.lineage {
@@ -1031,13 +977,6 @@ pub fn init_hook_context(
             .or_else(|| evidence.process_owner.clone())
     };
 
-    if instance_name.is_none()
-        && !matches!(&evidence.lineage, TranscriptOwnerResolution::Ambiguous(_))
-        && evidence.session_owner.is_none()
-        && evidence.process_owner.is_none()
-    {
-        instance_name = try_bind_from_transcript(db, session_id, transcript_path);
-    }
     let Some(name) = instance_name else {
         log::log_info(
             "hooks",
@@ -1124,94 +1063,6 @@ pub fn init_hook_context(
     );
 
     (Some(name), updates, is_matched_resume)
-}
-
-/// Transcript marker fallback binding.
-///
-/// Searches transcript for [hcom:name] marker and creates session binding
-/// if instance is pending. Fast path: skips file I/O if no pending instances.
-///
-fn try_bind_from_transcript(
-    db: &HcomDb,
-    session_id: &str,
-    transcript_path: &str,
-) -> Option<String> {
-    if transcript_path.is_empty() || session_id.is_empty() {
-        return None;
-    }
-
-    // Fast path: skip file I/O if no pending instances
-    let pending = get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
-    }
-
-    let instance_name = find_last_bind_marker(transcript_path)?;
-
-    // Only bind if instance is in pending list
-    if !pending.contains(&instance_name) {
-        log::log_info(
-            "hooks",
-            "transcript.bind.skip",
-            &format!("instance={} not in pending={:?}", instance_name, pending),
-        );
-        return None;
-    }
-
-    // Verify instance exists
-    let instance = db.get_instance_full(&instance_name).ok()??;
-    let _ = instance; // just checking existence
-
-    // Create binding
-    if let Err(e) = db.rebind_instance_session(&instance_name, session_id) {
-        log::log_error(
-            "hooks",
-            "transcript.bind.error",
-            &format!("instance={} err={}", instance_name, e),
-        );
-        return None;
-    }
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("session_id".into(), Value::String(session_id.to_string()));
-    instances::update_instance_position(db, &instance_name, &updates);
-    if let Err(error) = db.mark_claude_session_validated(session_id, &instance_name) {
-        log::log_warn(
-            "hooks",
-            "transcript.bind.validation_cache_failed",
-            &format!("instance={} err={}", instance_name, error),
-        );
-    }
-
-    log::log_info(
-        "hooks",
-        "transcript.bind.success",
-        &format!("instance={}", instance_name),
-    );
-
-    Some(instance_name)
-}
-
-/// Get instances pending session binding (session_id IS NULL, non-adhoc).
-///
-/// "Pending" means the instance was created (e.g., by launcher) but hasn't
-/// been bound to a tool session yet. Used as fast-path optimization before
-/// doing expensive transcript marker search.
-///
-pub fn get_pending_instances(db: &HcomDb) -> Vec<String> {
-    // Purge leaked launch placeholders before treating them as bindable.
-    // Otherwise an old transcript marker can silently re-bind a stale row.
-    lifecycle::cleanup_stale_placeholders(db);
-    let mut stmt = match db.conn().prepare(
-        "SELECT name FROM instances WHERE session_id IS NULL AND tool != 'adhoc' ORDER BY created_at DESC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-
-    stmt.query_map([], |row| row.get::<_, String>(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
 }
 
 /// Wake an instance's hook poll loop via TCP connection.
@@ -1723,92 +1574,6 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_find_last_bind_marker_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "some log data").unwrap();
-        writeln!(f, "more data [hcom:luna] more stuff").unwrap();
-        writeln!(f, "trailing data").unwrap();
-
-        let result = find_last_bind_marker(path.to_str().unwrap());
-        assert_eq!(result, Some("luna".to_string()));
-    }
-
-    #[test]
-    fn test_find_last_bind_marker_returns_last() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "[hcom:first]").unwrap();
-        writeln!(f, "[hcom:second]").unwrap();
-        writeln!(f, "[hcom:third]").unwrap();
-
-        let result = find_last_bind_marker(path.to_str().unwrap());
-        assert_eq!(result, Some("third".to_string()));
-    }
-
-    #[test]
-    fn test_find_last_bind_marker_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "no markers here").unwrap();
-
-        let result = find_last_bind_marker(path.to_str().unwrap());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_find_last_bind_marker_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        std::fs::File::create(&path).unwrap();
-
-        let result = find_last_bind_marker(path.to_str().unwrap());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_find_last_bind_marker_missing_file() {
-        let result = find_last_bind_marker("/nonexistent/path.jsonl");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_find_last_bind_marker_large_file_marker_at_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // Write ~1MB of padding + marker at end
-        let padding = "x".repeat(1024);
-        for _ in 0..1024 {
-            writeln!(f, "{}", padding).unwrap();
-        }
-        writeln!(f, "[hcom:bigtarget]").unwrap();
-
-        let result = find_last_bind_marker(path.to_str().unwrap());
-        assert_eq!(result, Some("bigtarget".to_string()));
-    }
-
-    #[test]
-    fn test_rfind_bytes_basic() {
-        let haystack = b"hello [hcom:test] world [hcom:second] end";
-        assert_eq!(rfind_bytes(haystack, b"[hcom:"), Some(24));
-    }
-
-    #[test]
-    fn test_rfind_bytes_not_found() {
-        assert_eq!(rfind_bytes(b"hello world", b"[hcom:"), None);
-    }
-
-    #[test]
-    fn test_rfind_bytes_empty() {
-        assert_eq!(rfind_bytes(b"", b"[hcom:"), None);
-        assert_eq!(rfind_bytes(b"hello", b""), None);
-    }
-
-    #[test]
     fn test_check_stdin_closed_does_not_panic() {
         // Verify the function runs without panicking regardless of stdin state.
         // In test context stdin is typically a pipe — check_stdin_closed should
@@ -2047,13 +1812,16 @@ mod tests {
     }
 
     #[test]
-    fn hook_context_uses_session_owner_with_empty_process_id() {
+    fn hook_context_requires_hcom_process_id() {
+        // Per-run Claude hooks only load in hcom launches, which always set
+        // HCOM_PROCESS_ID; a hook without one is not an hcom participant.
         let (dir, db) = make_test_db();
         insert_bound_claude_instance(&db, "niza", "session-niza", "");
-        let ctx = context_with_process_id(dir.path(), Some(""));
-
-        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
-        assert_eq!(owner.as_deref(), Some("niza"));
+        for process_id in [None, Some("")] {
+            let ctx = context_with_process_id(dir.path(), process_id);
+            let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+            assert_eq!(owner, None);
+        }
     }
 
     #[test]
@@ -2734,21 +2502,20 @@ mod tests {
         let transcript = dir.path().join("transcript.jsonl");
         std::fs::write(&transcript, "assistant output [hcom:luna]\n").unwrap();
 
-        let ctx = crate::shared::context::HcomContext::from_env(
-            &std::collections::HashMap::new(),
-            dir.path().to_path_buf(),
-        );
+        // A launched process with no binding: only structured lineage could
+        // name an owner, and marker text is never lineage.
+        let ctx = context_with_process_id(dir.path(), Some("process-unbound"));
         let (instance_name, _updates, _matched_resume) =
             init_hook_context(&db, &ctx, "sess-fresh", transcript.to_str().unwrap());
 
         assert!(
             instance_name.is_none(),
-            "stale placeholder should be cleaned before transcript binding"
+            "a transcript marker must not establish ownership"
         );
 
         assert!(
-            db.get_instance_full("luna").unwrap().is_none(),
-            "stale placeholder row should be deleted"
+            db.get_instance_full("luna").unwrap().is_some(),
+            "unrelated hook must leave the placeholder untouched"
         );
 
         assert_eq!(

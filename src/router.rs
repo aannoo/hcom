@@ -49,6 +49,42 @@ fn is_launch_tool(name: &str) -> bool {
     matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
+fn released_tool_names() -> Vec<&'static str> {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Error for an unrecognized first token, with typo suggestions.
+///
+/// `hcom 2 claud` is reported as an unknown tool (not "unknown command '2'").
+fn unknown_command_message(cmd: &str, args: &[String]) -> String {
+    use crate::shared::suggest::did_you_mean;
+    let tools = released_tool_names();
+    if cmd.parse::<u32>().is_ok() {
+        // Flags like --go can sit between the count and the tool.
+        let (stripped, _) = extract_global_flags(args);
+        return match stripped.iter().skip(1).find(|a| !a.starts_with('-')) {
+            Some(tool) => format!(
+                "Unknown tool '{tool}'{}\nTools: {}",
+                did_you_mean(tool, tools.iter().copied()),
+                tools.join(", ")
+            ),
+            None => format!(
+                "Missing tool after count: hcom {cmd} <tool>\nTools: {}",
+                tools.join(", ")
+            ),
+        };
+    }
+    let candidates = COMMANDS.iter().chain(tools.iter()).copied();
+    format!(
+        "Unknown command '{cmd}'{}\nRun 'hcom --help' for usage.",
+        did_you_mean(cmd, candidates)
+    )
+}
+
 fn maybe_external_send_name_hint(
     cmd: &str,
     explicit_name: Option<&str>,
@@ -104,7 +140,7 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             crate::hooks::copilot::dispatch_copilot_hook_native(hook),
             String::new(),
         ),
-        Tool::Adhoc => unreachable!("adhoc has no hooks"),
+        Tool::Grok | Tool::Adhoc => unreachable!("{} has no hooks", tool.as_str()),
     }
 }
 
@@ -127,6 +163,9 @@ pub enum Action {
     Version,
     /// Show help
     Help,
+    /// `hcom help <topic...>`: print that topic's help page. Never dispatches
+    /// the target, since not every target (scripts, relay-worker) honors --help.
+    TopicHelp { args: Vec<String> },
     /// Open TUI in new terminal window
     NewTerminal,
     /// Run relay-worker process
@@ -279,6 +318,13 @@ pub fn resolve_action(argv: &[String]) -> Action {
     // Global flags as commands
     match first {
         "--help" | "-h" => return Action::Help,
+        // `hcom help [cmd...]` == `hcom [cmd...] --help`
+        "help" if argv.len() == 1 => return Action::Help,
+        "help" => {
+            return Action::TopicHelp {
+                args: argv[1..].to_vec(),
+            };
+        }
         "--version" | "-v" => return Action::Version,
         "--new-terminal" => return Action::NewTerminal,
         _ => {}
@@ -426,7 +472,35 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
 /// the checkout executable path instead of updating the installed binary.
 fn is_update_invocation(argv: &[String]) -> bool {
     let (positional, _, _) = extract_global_flags_full(argv);
-    positional.first().is_some_and(|arg| arg == "update")
+    match positional.as_slice() {
+        [first, ..] if first == "update" => true,
+        [first, second, ..] => first == "help" && second == "update",
+        _ => false,
+    }
+}
+
+/// Print help for `hcom help <topic...>` without running anything.
+fn print_topic_help(args: &[String]) -> i32 {
+    let (stripped, _, _) = extract_global_flags_full(args);
+    // `hcom help 3 claude` == `hcom help claude`
+    let words: Vec<String> = stripped
+        .into_iter()
+        .skip_while(|a| a.parse::<u32>().is_ok())
+        .collect();
+    let Some(name) = words.first().map(String::as_str) else {
+        crate::commands::help::print_help();
+        return 0;
+    };
+    let topic = if is_command(name) {
+        crate::commands::help::help_topic(name, &words[1..])
+    } else if is_launch_tool(name) || matches!(name, "resume" | "fork") {
+        name.to_string()
+    } else {
+        eprintln!("Error: {}", unknown_command_message(name, &words));
+        return 1;
+    };
+    crate::commands::help::print_command_help(&topic);
+    0
 }
 
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
@@ -514,7 +588,11 @@ pub fn dispatch() -> anyhow::Result<()> {
     if !is_update_cmd
         && matches!(
             action,
-            Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
+            Action::Command { .. }
+                | Action::Launch { .. }
+                | Action::Version
+                | Action::Help
+                | Action::TopicHelp { .. }
         )
         && let Some(notice) = crate::update::get_update_notice()
     {
@@ -615,9 +693,8 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Command { ref cmd, .. } => {
-            eprintln!("Error: Unknown command '{}'", cmd);
-            eprintln!("Run 'hcom --help' for usage.");
+        Action::Command { ref cmd, ref args } => {
+            eprintln!("Error: {}", unknown_command_message(cmd, args));
             std::process::exit(1);
         }
         Action::Version => {
@@ -625,6 +702,12 @@ pub fn dispatch() -> anyhow::Result<()> {
         }
         Action::Help => {
             crate::commands::help::print_help();
+        }
+        Action::TopicHelp { ref args } => {
+            let exit_code = print_topic_help(args);
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Action::NewTerminal => {
             let exit_code = launch_new_terminal();
@@ -706,7 +789,8 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // Per-command --help: native help text
     // ("run" handles --help itself for script-level help)
     if help_requested && cmd != "run" {
-        crate::commands::help::print_command_help(cmd);
+        let topic = crate::commands::help::help_topic(cmd, stripped.get(1..).unwrap_or_default());
+        crate::commands::help::print_command_help(&topic);
         return 0;
     }
 
@@ -738,9 +822,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let process_id = std::env::var("HCOM_PROCESS_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let codex_thread_id = std::env::var("CODEX_THREAD_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let codex_thread_id = crate::shared::context::HcomContext::from_os().codex_thread_id;
     let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
@@ -862,9 +944,28 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
+        "reset" => match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
+            Ok(args) => {
+                if let Some(exit_code) =
+                    crate::commands::reset::try_cmd_reset_preserving_db(&db, &args, Some(&ctx))
+                {
+                    exit_code
+                } else {
+                    return crate::commands::reset::cmd_reset(db, &args, Some(&ctx));
+                }
+            }
+            Err(e) => {
+                e.print().ok();
+                let code = if e.use_stderr() { 1 } else { 0 };
+                if let Err(e) =
+                    crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
+                {
+                    eprintln!("hcom: {e}");
+                    return 1;
+                }
+                return code;
+            }
+        },
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),
@@ -890,12 +991,14 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Deliver pending messages AFTER command.
-    // Deliver pending messages AFTER command for hookless codex/adhoc instances.
+    // Deliver pending messages AFTER command for adhoc instances (no hooks).
     // This appends unread hcom messages to the command's stdout — keep in mind
     // when changing output contracts or adding machine-readable modes.
-    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
-        print!("{output}");
+    // Skipped when the command claimed delivery (send, listen). A failed write
+    // leaves the messages unread and fails the command.
+    if let Err(e) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
+        eprintln!("hcom: {e}");
+        return if result == 0 { 1 } else { result };
     }
 
     result
@@ -915,7 +1018,7 @@ mod tests {
         let actual = crate::commands::hooks::hook_tools();
         let expected: Vec<Tool> = crate::integration_spec::ALL
             .iter()
-            .filter(|spec| spec.released && !spec.hooks.names.is_empty())
+            .filter(|spec| spec.released)
             .map(|spec| spec.tool)
             .collect();
         assert_eq!(actual, expected);
@@ -1001,6 +1104,7 @@ mod tests {
         assert!(is_update_invocation(&sv(&[
             "--name", "lovi", "update", "--check"
         ])));
+        assert!(is_update_invocation(&sv(&["help", "update"])));
         assert!(!is_update_invocation(&sv(&["config", "update"])));
         assert!(!is_update_invocation(&sv(&[
             "send", "@lovi", "--", "update"
@@ -1301,6 +1405,16 @@ mod tests {
     fn help_flag() {
         assert_eq!(resolve_action(&sv(&["--help"])), Action::Help);
         assert_eq!(resolve_action(&sv(&["-h"])), Action::Help);
+        assert_eq!(resolve_action(&sv(&["help"])), Action::Help);
+        assert_eq!(
+            resolve_action(&sv(&["help", "relay-worker"])),
+            Action::TopicHelp {
+                args: sv(&["relay-worker"])
+            }
+        );
+        assert_eq!(print_topic_help(&sv(&["relay-worker"])), 1);
+        assert_eq!(print_topic_help(&sv(&["events", "sub"])), 0);
+        assert_eq!(print_topic_help(&sv(&["3", "claude"])), 0);
     }
 
     #[test]

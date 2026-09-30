@@ -1,36 +1,93 @@
+use anyhow::{Context, Result};
+
+use crate::hooks::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
+
 pub const PLUGIN_SOURCE: &str = include_str!("../../omp_plugin/hcom.ts");
 const PLUGIN_FILENAME: &str = "hcom.ts";
 
-fn current_home_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &["-e", "--extension"],
+    strip_legacy_args: Some(strip_managed_extension_args),
+};
+
+pub fn get_omp_plugin_path() -> std::path::PathBuf {
+    effective_plugin_path(&LaunchCtx::ambient(crate::tool::Tool::Omp, false))
 }
 
-fn omp_plugin_dir() -> std::path::PathBuf {
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root == home {
-        if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
-            && !dir.is_empty()
-        {
-            return std::path::PathBuf::from(dir).join("extensions");
-        }
-        home.join(".omp").join("agent").join("extensions")
+fn raw_ctx_var<'a>(ctx: &'a LaunchCtx, key: &str) -> Option<&'a str> {
+    if cfg!(windows) {
+        ctx.env
+            .iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
     } else {
-        tool_root.join(".omp").join("extensions")
+        ctx.env.get(key).map(String::as_str)
     }
 }
 
-pub fn get_omp_plugin_path() -> std::path::PathBuf {
-    omp_plugin_dir().join(PLUGIN_FILENAME)
+fn active_profile(ctx: &LaunchCtx) -> Option<String> {
+    let value = match raw_ctx_var(ctx, "OMP_PROFILE") {
+        Some(value) => Some(value),
+        None => raw_ctx_var(ctx, "PI_PROFILE"),
+    }?;
+    let normalized = value.trim();
+    (!normalized.is_empty() && normalized != "default").then(|| normalized.to_string())
 }
 
-pub fn extension_inject_args() -> Vec<String> {
-    vec![
-        "-e".to_string(),
-        get_omp_plugin_path().to_string_lossy().to_string(),
-    ]
+fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
+    let home = ctx
+        .var("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let config_name = ctx.var("PI_CONFIG_DIR").unwrap_or(".omp");
+    let profile = active_profile(ctx);
+    let agent_dir = match profile {
+        Some(name) => home
+            .join(config_name)
+            .join("profiles")
+            .join(name)
+            .join("agent"),
+        None => ctx
+            .path_var("PI_CODING_AGENT_DIR")
+            .unwrap_or_else(|| home.join(config_name).join("agent")),
+    };
+    agent_dir.join("extensions").join(PLUGIN_FILENAME)
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    let path = runtime::publish_file("omp", PLUGIN_FILENAME, PLUGIN_SOURCE.as_bytes())
+        .context("Cannot publish OMP runtime extension")?;
+    let mut args = ctx.args.clone();
+    runtime::insert_before_separator(
+        &mut args,
+        ["-e".to_string(), path.to_string_lossy().into_owned()],
+    );
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+/// Under a project-local HCOM_DIR the old installer wrote to
+/// `<tool root>/.omp/extensions/` instead of the agent dir.
+fn project_local_legacy_path() -> Option<std::path::PathBuf> {
+    let root = crate::runtime_env::tool_config_root();
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default());
+    (root != home).then(|| root.join(".omp").join("extensions").join(PLUGIN_FILENAME))
+}
+
+fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<()> {
+    runtime::remove_owned_files(paths, is_hcom_owned)
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    remove_owned(std::iter::once(effective_plugin_path(ctx)).chain(project_local_legacy_path()))
 }
 
 /// Remove hcom's managed OMP extension injection (`-e <hcom.ts>` /
@@ -48,10 +105,12 @@ pub fn strip_managed_extension_args(args: &mut Vec<String>) {
     let current = get_omp_plugin_path();
     let is_managed = |value: &str| -> bool {
         let path = std::path::Path::new(value);
-        if path == current.as_path() {
+        if runtime::is_hcom_runtime_path(value) || path == current.as_path() {
             return true;
         }
-        if is_hcom_owned(path) {
+        if is_hcom_owned(path).unwrap_or(false)
+            || crate::hooks::pi::is_hcom_owned(path).unwrap_or(false)
+        {
             return true;
         }
         // Moved/missing managed file only: basename hcom.ts under an `extensions`
@@ -70,8 +129,13 @@ pub fn strip_managed_extension_args(args: &mut Vec<String>) {
     let mut i = 0;
     while i < args.len() {
         let tok = args[i].as_str();
+        // Everything after `--` is prompt text, not flags.
+        if tok == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
         // Two-token forms: `-e PATH` / `--extension PATH`.
-        if (tok == "-e" || tok == "--extension") && i + 1 < args.len() {
+        if (tok == "-e" || tok == "--extension") && i + 1 < args.len() && args[i + 1] != "--" {
             if is_managed(&args[i + 1]) {
                 i += 2;
                 continue;
@@ -96,53 +160,12 @@ pub fn strip_managed_extension_args(args: &mut Vec<String>) {
     *args = out;
 }
 
-fn plugin_matches_source(path: &std::path::Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(content) => content == PLUGIN_SOURCE,
-        Err(_) => false,
-    }
+pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
+    runtime::file_is_hcom_owned(path, |content| {
+        content == PLUGIN_SOURCE || content.contains("customType: \"hcom-bootstrap\"")
+    })
 }
 
-pub fn verify_omp_plugin_installed() -> bool {
-    plugin_matches_source(&get_omp_plugin_path())
-}
-
-fn is_hcom_owned(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| content.contains("customType: \"hcom-bootstrap\""))
-        .unwrap_or(false)
-}
-
-pub fn install_omp_plugin() -> std::io::Result<bool> {
-    let target_dir = omp_plugin_dir();
-    let target = target_dir.join(PLUGIN_FILENAME);
-    std::fs::create_dir_all(&target_dir)?;
-    if target.is_symlink() || target.exists() {
-        if !plugin_matches_source(&target) && !is_hcom_owned(&target) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "A non-hcom hcom.ts file already exists and will not be overwritten",
-            ));
-        }
-        std::fs::remove_file(&target)?;
-    }
-    std::fs::write(&target, PLUGIN_SOURCE)?;
-    Ok(true)
-}
-
-pub fn ensure_omp_plugin_installed() -> bool {
-    if verify_omp_plugin_installed() {
-        return true;
-    }
-    install_omp_plugin().unwrap_or(false)
-}
-
-pub fn remove_omp_plugin() -> std::io::Result<()> {
-    let path = get_omp_plugin_path();
-    if (path.exists() || path.is_symlink())
-        && (plugin_matches_source(&path) || is_hcom_owned(&path))
-    {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
+pub fn remove_omp_plugin() -> Result<()> {
+    remove_owned(std::iter::once(get_omp_plugin_path()).chain(project_local_legacy_path()))
 }

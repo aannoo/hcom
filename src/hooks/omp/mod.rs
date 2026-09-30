@@ -8,9 +8,7 @@ mod tests;
 
 pub use handlers::dispatch_omp_hook;
 pub use plugin::{
-    PLUGIN_SOURCE, ensure_omp_plugin_installed, extension_inject_args, get_omp_plugin_path,
-    install_omp_plugin, remove_omp_plugin, strip_managed_extension_args,
-    verify_omp_plugin_installed,
+    PER_RUN, PLUGIN_SOURCE, get_omp_plugin_path, remove_omp_plugin, strip_managed_extension_args,
 };
 
 #[cfg(test)]

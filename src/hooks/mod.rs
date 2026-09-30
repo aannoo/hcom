@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot). Grok has none (see `delivery/grok.rs`).
 
 pub mod antigravity;
 pub mod claude;
@@ -12,6 +12,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
+pub mod runtime;
 pub mod utils;
 
 use serde_json::Value;
@@ -178,6 +179,9 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // CODEX_HOME overrides HOME; inheriting it would write test hooks
+            // into the user's real Codex configuration.
+            std::env::remove_var("CODEX_HOME");
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();
@@ -188,10 +192,10 @@ pub mod test_helpers {
 
 // Re-export key types.
 pub use common::{
-    deliver_pending_messages, finalize_session, find_last_bind_marker, get_pending_instances,
-    init_hook_context, inject_bootstrap_once, poll_messages, stop_instance,
+    deliver_pending_messages, finalize_session, init_hook_context, inject_bootstrap_once,
+    poll_messages, stop_instance,
 };
-pub use family::{bind_vanilla_instance, extract_tool_detail};
+pub use family::extract_tool_detail;
 pub use utils::{HOOK_REGISTRY, HookCategory, HookInfo};
 
 /// Delivery cursor/status update to apply after hook output is written.
@@ -220,7 +224,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -519,6 +523,8 @@ pub enum HookResult {
     Block {
         /// Reason text (formatted messages for delivery).
         reason: String,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Update the tool input before execution (exit 0, updatedInput field).
@@ -755,11 +761,16 @@ mod tests {
     fn test_hook_result_block() {
         let result = HookResult::Block {
             reason: "<hcom>message here</hcom>".into(),
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 2);
         match &result {
-            HookResult::Block { reason } => {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
                 assert_eq!(reason, "<hcom>message here</hcom>");
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Block"),
         }

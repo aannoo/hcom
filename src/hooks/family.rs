@@ -2,9 +2,6 @@
 //!
 //! and tool-specific settings module patterns.
 
-use crate::db::HcomDb;
-use crate::instances;
-use crate::log;
 use crate::tool::Tool;
 
 /// Extract human-readable detail from tool input for status display.
@@ -47,62 +44,6 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
     }
 
     String::new()
-}
-
-/// Persist vanilla instance binding (session + transcript + tool).
-///
-/// Called after marker extraction (each tool extracts differently).
-/// Returns instance_name on success or error, None only if nothing to bind.
-///
-pub fn bind_vanilla_instance(
-    db: &HcomDb,
-    instance_name: &str,
-    session_id: Option<&str>,
-    transcript_path: Option<&str>,
-    tool: &str,
-    hook: &str,
-) -> Option<String> {
-    if session_id.is_none() && transcript_path.is_none() {
-        return Some(instance_name.to_string());
-    }
-
-    let result: Result<(), anyhow::Error> = (|| {
-        let mut updates = serde_json::Map::new();
-        updates.insert("tool".into(), serde_json::Value::String(tool.to_string()));
-
-        if let Some(sid) = session_id {
-            updates.insert(
-                "session_id".into(),
-                serde_json::Value::String(sid.to_string()),
-            );
-            db.rebind_instance_session(instance_name, sid)?;
-        }
-
-        if let Some(tp) = transcript_path {
-            updates.insert(
-                "transcript_path".into(),
-                serde_json::Value::String(tp.to_string()),
-            );
-        }
-
-        instances::update_instance_position(db, instance_name, &updates);
-        log::log_info(
-            "hooks",
-            &format!("{}.bind.success", tool),
-            &format!("instance={} session_id={:?}", instance_name, session_id),
-        );
-        Ok(())
-    })();
-
-    if let Err(e) = result {
-        log::log_error(
-            "hooks",
-            "hook.error",
-            &format!("hook={} op=bind_vanilla err={}", hook, e),
-        );
-    }
-
-    Some(instance_name.to_string())
 }
 
 #[cfg(test)]
@@ -343,108 +284,5 @@ mod tests {
     fn test_extract_tool_detail_missing_field() {
         let input = serde_json::json!({});
         assert_eq!(extract_tool_detail("claude", "Bash", &input), "");
-    }
-
-    fn make_test_db() -> (tempfile::TempDir, crate::db::HcomDb) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
-        (dir, db)
-    }
-
-    fn insert_test_instance(db: &crate::db::HcomDb, name: &str) {
-        let now = chrono::Utc::now().timestamp() as f64;
-        db.conn().execute(
-            "INSERT INTO instances (name, status, created_at, tool) VALUES (?1, 'active', ?2, 'claude')",
-            rusqlite::params![name, now],
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_bind_vanilla_instance_with_session() {
-        crate::config::Config::init();
-        let (_dir, db) = make_test_db();
-        insert_test_instance(&db, "luna");
-
-        let result =
-            bind_vanilla_instance(&db, "luna", Some("sess-v1"), None, "claude", "PostToolUse");
-        assert_eq!(result, Some("luna".to_string()));
-
-        // Session binding should be created
-        assert_eq!(
-            db.get_session_binding("sess-v1").unwrap(),
-            Some("luna".to_string())
-        );
-
-        // Instance should have session_id set
-        let inst = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(inst.session_id.as_deref(), Some("sess-v1"));
-    }
-
-    #[test]
-    fn test_bind_vanilla_instance_with_transcript() {
-        crate::config::Config::init();
-        let (_dir, db) = make_test_db();
-        insert_test_instance(&db, "nova");
-
-        let result = bind_vanilla_instance(
-            &db,
-            "nova",
-            None,
-            Some("/tmp/transcript.jsonl"),
-            "gemini",
-            "AfterTool",
-        );
-        assert_eq!(result, Some("nova".to_string()));
-
-        // Instance should have transcript_path and tool updated
-        let inst = db.get_instance_full("nova").unwrap().unwrap();
-        assert_eq!(inst.transcript_path, "/tmp/transcript.jsonl");
-        assert_eq!(inst.tool, "gemini");
-    }
-
-    #[test]
-    fn test_bind_vanilla_instance_no_session_no_transcript() {
-        // Early return — no binding to do
-        crate::config::Config::init();
-        let (_dir, db) = make_test_db();
-        insert_test_instance(&db, "miso");
-
-        let result = bind_vanilla_instance(&db, "miso", None, None, "claude", "PostToolUse");
-        assert_eq!(result, Some("miso".to_string()));
-
-        // No session binding should exist
-        let bindings: i64 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM session_bindings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(bindings, 0);
-    }
-
-    #[test]
-    fn test_bind_vanilla_instance_with_both() {
-        crate::config::Config::init();
-        let (_dir, db) = make_test_db();
-        insert_test_instance(&db, "kira");
-
-        let result = bind_vanilla_instance(
-            &db,
-            "kira",
-            Some("sess-v2"),
-            Some("/tmp/t2.jsonl"),
-            "codex",
-            "PostToolUse",
-        );
-        assert_eq!(result, Some("kira".to_string()));
-
-        assert_eq!(
-            db.get_session_binding("sess-v2").unwrap(),
-            Some("kira".to_string())
-        );
-        let inst = db.get_instance_full("kira").unwrap().unwrap();
-        assert_eq!(inst.session_id.as_deref(), Some("sess-v2"));
-        assert_eq!(inst.transcript_path, "/tmp/t2.jsonl");
-        assert_eq!(inst.tool, "codex");
     }
 }

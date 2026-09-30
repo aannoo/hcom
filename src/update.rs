@@ -186,6 +186,22 @@ pub(crate) fn is_powershell_installer_command(cmd: &str) -> bool {
     cmd == WINDOWS_INSTALL_CMD
 }
 
+/// Prefer `pwsh` over `powershell`: Windows PowerShell 5.1's module load can
+/// fail on a polluted `PSModulePath` (nested shells, OneDrive redirects);
+/// `pwsh` isn't affected. Falls back to `powershell` if pwsh isn't installed.
+pub(crate) fn windows_installer_program() -> &'static str {
+    let pwsh_available = std::process::Command::new("pwsh")
+        .args(["-NoProfile", "-Command", "exit 0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if pwsh_available { "pwsh" } else { "powershell" }
+}
+
 /// Split a plain `program arg1 arg2 ...` command string into program + args.
 /// Only meant for the shell-free update commands `get_update_cmd()` returns
 /// (no quoting to worry about); not a general shell parser.

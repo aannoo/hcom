@@ -293,6 +293,17 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             ),
         ),
         (
+            "ptyxis",
+            p(
+                Some("ptyxis"),
+                None,
+                argv(&["ptyxis", "--new-window", "--", "bash", "{script}"]),
+                NONE_ARGV,
+                None,
+                &["Linux"],
+            ),
+        ),
+        (
             "konsole",
             p(
                 Some("konsole"),
@@ -540,11 +551,17 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 DL,
             ),
         ),
-        // Herdr workspace manager. `agent start <name>` sets both the herdr
-        // agent name AND the manual pane label, so we pass a stable
-        // `{instance_name}` here (e.g. `luna`) — that keeps `herdr agent send
-        // luna ...` working. The styled status label (`◉ luna [claude]`) is
-        // pushed separately via `pane.rename` from the delivery loop.
+        // Herdr workspace manager. Launched natively in two steps (see
+        // `launch_herdr_two_step` in `terminal.rs`): first this `tab create`
+        // opens a pane (its stdout JSON carries the pane id), then
+        // `herdr pane run <pane_id> "bash {script}"` starts hcom's normal
+        // `hcom pty` runner inside it. `agent start` can't be used — current
+        // herdr forces the executable and won't run hcom's wrapper script.
+        // `--label {instance_name}` labels the *tab* (e.g. `luna`) — herdr's
+        // `tab create --label` sets the tab label, not the pane label, which
+        // stays null until the delivery loop's first `pane.rename`. The styled
+        // status label (`◉ luna [claude]`) and the agent state are reported
+        // separately from the delivery loop (`pane.rename` / `pane.report_agent`).
         (
             "herdr",
             p(
@@ -552,15 +569,13 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 None,
                 argv(&[
                     "herdr",
-                    "agent",
-                    "start",
-                    "{instance_name}",
+                    "tab",
+                    "create",
                     "--cwd",
                     "{cwd}",
                     "--no-focus",
-                    "--",
-                    "bash",
-                    "{script}",
+                    "--label",
+                    "{instance_name}",
                 ]),
                 argv(&["herdr", "pane", "close", "{pane_id}"]),
                 Some("HERDR_PANE_ID"),
@@ -613,6 +628,7 @@ pub const TERMINAL_ENV_MAP: &[(&str, &str)] = &[
     ("GHOSTTY_RESOURCES_DIR", "ghostty"),
     ("ITERM_SESSION_ID", "iterm"),
     ("ALACRITTY_WINDOW_ID", "alacritty"),
+    ("PTYXIS_VERSION", "ptyxis"),
     ("GNOME_TERMINAL_SCREEN", "gnome-terminal"),
     ("KONSOLE_DBUS_WINDOW", "konsole"),
     ("TERMINATOR_UUID", "terminator"),
@@ -626,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_terminal_presets_count() {
-        assert_eq!(TERMINAL_PRESETS.len(), 28);
+        assert_eq!(TERMINAL_PRESETS.len(), 29);
     }
 
     #[test]
@@ -678,5 +694,17 @@ mod tests {
         );
         assert!(win.contains(&"powershell"));
         assert_eq!(win.first(), Some(&"mintty"));
+    }
+
+    #[test]
+    fn test_ptyxis_opens_a_new_window() {
+        let preset = get_terminal_preset("ptyxis").unwrap();
+        assert_eq!(preset.binary, Some("ptyxis"));
+        assert_eq!(
+            preset.open.select(false),
+            Some(&["ptyxis", "--new-window", "--", "bash", "{script}"] as ArgvTemplate)
+        );
+        assert!(preset.close.select(false).is_none());
+        assert!(preset.platforms.contains(&"Linux"));
     }
 }

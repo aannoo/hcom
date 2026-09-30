@@ -23,8 +23,7 @@ use super::real_tool::{
 const CODEX_META: ToolMeta = ToolMeta {
     tool: "codex",
     binary: "codex",
-    pinned_version: "0.145.0",
-    install_command: "npm install --global @openai/codex@0.145.0",
+    package: "@openai/codex",
 };
 
 /// Codex adapter for the shared real-tool lifecycle. Codex has no fake-response
@@ -69,9 +68,10 @@ impl ToolCase for CodexCase {
         body.contains("function_call_output") || body.contains("custom_tool_call_output")
     }
 
-    fn is_turn_request(&self, _req: &RecordedRequest) -> bool {
-        // Codex has only the single Responses route; every request is a turn.
-        true
+    fn is_turn_request(&self, req: &RecordedRequest) -> bool {
+        // One Responses route for everything; only title generation shares it
+        // without being a turn of the conversation under test.
+        !is_title_request(&req.body)
     }
 
     fn delivery_envelope_markers(&self) -> &'static [&'static str] {
@@ -80,6 +80,9 @@ impl ToolCase for CodexCase {
 
     fn respond(&self, req: &RecordedRequest, ids: &ScenarioIds) -> Reply {
         let body = &req.body;
+        if is_title_request(body) {
+            return title_reply();
+        }
         let has_output =
             |call_id: &str| body.contains("function_call_output") && body.contains(call_id);
         let has_custom =
@@ -161,7 +164,13 @@ impl MockResponses {
     where
         F: Fn(&str) -> Reply + Send + Sync + 'static,
     {
-        let inner = MockHttp::start(move |request: &RecordedRequest| responder(&request.body))?;
+        let inner = MockHttp::start(move |request: &RecordedRequest| {
+            if is_title_request(&request.body) {
+                title_reply()
+            } else {
+                responder(&request.body)
+            }
+        })?;
         Ok(Self { inner })
     }
 
@@ -191,6 +200,23 @@ impl MockResponses {
 }
 
 /// Frame a list of `(event_type, json)` pairs into a Responses SSE body.
+/// Codex (>= 0.157) asks the model for a thread title after each user message
+/// while the thread is unnamed, as a separate hidden Responses request. It
+/// embeds the user's prompt, so without this check it would be scripted as
+/// whichever turn that prompt's token selects, or rejected when none matches.
+pub fn is_title_request(body: &str) -> bool {
+    body.contains("Generate a concise, single-line task title")
+}
+
+/// Answer a title request with the structured `{"title": ...}` Codex expects.
+pub fn title_reply() -> Reply {
+    Reply::Sse(sse(&[
+        created("RESP_TITLE"),
+        message("ITEM_TITLE", r#"{"title":"Real tool lifecycle"}"#),
+        completed("RESP_TITLE"),
+    ]))
+}
+
 pub fn sse(events: &[(&str, Value)]) -> Vec<u8> {
     let mut out = String::new();
     for (typ, obj) in events {
@@ -245,21 +271,35 @@ pub fn function_call(call_id: &str, name: &str, arguments: &str) -> (&'static st
     )
 }
 
-/// Platform-specific shell function advertised by pinned Codex.
+/// The shell function pinned Codex advertises. Since 0.152 that is
+/// `exec_command` on every platform (openai/codex#39772); Windows no longer
+/// accepts `shell_command` ("unsupported call").
 pub fn shell_call(call_id: &str, command: &str) -> (&'static str, Value) {
-    if cfg!(windows) {
-        function_call(
-            call_id,
-            "shell_command",
-            &serde_json::json!({ "command": command }).to_string(),
-        )
-    } else {
-        function_call(
-            call_id,
-            "exec_command",
-            &serde_json::json!({ "cmd": command }).to_string(),
-        )
-    }
+    function_call(
+        call_id,
+        "exec_command",
+        &serde_json::json!({ "cmd": command }).to_string(),
+    )
+}
+
+/// A shell call that asks to run outside the sandbox. Under Codex's default
+/// `on-request` policy (hcom's `workspace` mode) that request is what makes
+/// Codex stop for the user's approval.
+pub fn escalated_shell_call(
+    call_id: &str,
+    command: &str,
+    justification: &str,
+) -> (&'static str, Value) {
+    function_call(
+        call_id,
+        "exec_command",
+        &serde_json::json!({
+            "cmd": command,
+            "sandbox_permissions": "require_escalated",
+            "justification": justification,
+        })
+        .to_string(),
+    )
 }
 
 /// A freeform custom-tool call, used by Codex for `apply_patch`.

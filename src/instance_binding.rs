@@ -10,6 +10,15 @@ use crate::instances::update_instance_position;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 use crate::shared::{ST_INACTIVE, ST_LISTENING};
 
+/// Result of binding a session when the caller requires every existing owner
+/// to belong to one tool family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCheckedBind {
+    Bound(String),
+    Unbound,
+    Rejected,
+}
+
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
 /// The launcher owns the authoritative preset decision. launch_context is only
@@ -163,6 +172,8 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "KITTY_LISTEN_ON",
         "ALACRITTY_WINDOW_ID",
         "WEZTERM_PANE",
+        "PTYXIS_PROFILE",
+        "PTYXIS_VERSION",
         "GNOME_TERMINAL_SCREEN",
         "KONSOLE_DBUS_WINDOW",
         "TERMINATOR_UUID",
@@ -368,6 +379,33 @@ fn retire_true_placeholder_after_canonical_bind(
     delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data);
 }
 
+/// Retire a live identity whose process switched to another session's identity.
+/// Unlike a launch placeholder it is a real agent row, so it is soft-stopped
+/// (kept, inactive) rather than deleted. The stopped event records its session so
+/// resuming that session later restores this identity instead of the current one.
+/// The process's pid and terminal context move to the new identity so
+/// `hcom kill <new>` still works and `hcom kill <old>` can't reach a process it
+/// no longer owns.
+fn retire_switched_identity(
+    db: &HcomDb,
+    name: &str,
+    new_name: &str,
+    old_data: Option<&InstanceRow>,
+) {
+    migrate_placeholder_runtime_state(db, new_name, old_data);
+    let mut clear_pid = serde_json::Map::new();
+    clear_pid.insert("pid".into(), serde_json::Value::Null);
+    update_instance_position(db, name, &clear_pid);
+    crate::hooks::common::soft_finalize_session(db, name, "session_switch", None, false);
+    if let Err(e) = db.delete_session_bindings_for_instance(name) {
+        crate::log::log_error(
+            "binding",
+            "session_switch.delete_session_bindings",
+            &format!("{e}"),
+        );
+    }
+}
+
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
 fn recreate_instance_from_placeholder(
     db: &HcomDb,
@@ -515,20 +553,7 @@ pub fn bind_session_to_process(
                         &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
                     );
                 }
-                crate::instance_lifecycle::set_status(
-                    db,
-                    ph_name,
-                    ST_INACTIVE,
-                    "exit:session_switch",
-                    Default::default(),
-                );
-                if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.delete_session_bindings",
-                        &format!("{e}"),
-                    );
-                }
+                retire_switched_identity(db, ph_name, canonical_name, placeholder_data.as_ref());
             }
         }
 
@@ -562,6 +587,17 @@ pub fn bind_session_to_process(
             session_id,
             placeholder_data.as_ref(),
         );
+        // Without a live placeholder there is nothing to restore into (e.g. the
+        // instance was stopped while its process kept running). Binding anyway
+        // would point the process at a missing row and report a bogus identity.
+        if db.get_instance_full(&stopped_name).ok().flatten().is_none() {
+            crate::log::log_warn(
+                "binding",
+                "restore_stopped.no_instance",
+                &format!("stopped_name={stopped_name}, session_id={session_id}"),
+            );
+            return None;
+        }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
@@ -588,6 +624,15 @@ pub fn bind_session_to_process(
             &stopped_name,
             placeholder_data.as_ref(),
         );
+        // Session switch into a stopped identity (e.g. Pi /resume): the process now
+        // belongs to stopped_name, so the identity it had must not stay listening.
+        if let Some(ph_name) = placeholder_name.as_ref()
+            && *ph_name != stopped_name
+            && placeholder_data.is_some()
+            && !is_true_launch_placeholder(placeholder_data.as_ref())
+        {
+            retire_switched_identity(db, ph_name, &stopped_name, placeholder_data.as_ref());
+        }
 
         return Some(stopped_name);
     }
@@ -630,6 +675,155 @@ pub fn bind_session_to_process(
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");
     None
+}
+
+/// Bind a session without allowing a hook from one tool to adopt another
+/// tool's process, live session, or stopped-session identity.
+///
+/// The ownership checks and the existing binding operation share one SQLite
+/// transaction. A disagreement therefore rolls back any mutation performed by
+/// `bind_session_to_process`, including placeholder retirement and rebinding.
+pub fn bind_session_to_process_for_tool(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+    expected_tool: &str,
+    create_if_unbound: bool,
+) -> ToolCheckedBind {
+    let transaction = match db.conn().unchecked_transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            crate::log::log_error(
+                "binding",
+                "bind_for_tool.transaction",
+                &format!("session_id={session_id} expected_tool={expected_tool} err={error}"),
+            );
+            return ToolCheckedBind::Rejected;
+        }
+    };
+
+    let owner_matches = |kind: &str, name: &str, tool: Option<&str>| {
+        if tool == Some(expected_tool) {
+            return true;
+        }
+        crate::log::log_warn(
+            "binding",
+            "bind_for_tool.owner_rejected",
+            &format!(
+                "kind={kind} instance={name} actual_tool={tool:?} expected_tool={expected_tool} session_id={session_id} process_id={process_id:?}"
+            ),
+        );
+        false
+    };
+
+    if let Some(pid) = process_id {
+        match db.get_process_binding(pid) {
+            Ok(Some(name)) => {
+                let tool = db
+                    .get_instance_full(&name)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.tool);
+                if !owner_matches("process", &name, tool.as_deref()) {
+                    return ToolCheckedBind::Rejected;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.process_owner",
+                    &format!("process_id={pid} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
+    }
+
+    let session_owner = match db.get_session_binding(session_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            crate::log::log_error(
+                "binding",
+                "bind_for_tool.session_owner",
+                &format!("session_id={session_id} err={error}"),
+            );
+            return ToolCheckedBind::Rejected;
+        }
+    };
+    if let Some(ref name) = session_owner {
+        let tool = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| row.tool);
+        if !owner_matches("session", name, tool.as_deref()) {
+            return ToolCheckedBind::Rejected;
+        }
+    } else {
+        match db.find_stopped_instance_by_session_id(session_id) {
+            Ok(Some(name)) => {
+                let tool = db
+                    .conn()
+                    .query_row(
+                        "SELECT json_extract(data, '$.snapshot.tool') FROM events
+                         WHERE type = 'life'
+                           AND instance = ?1
+                           AND json_extract(data, '$.action') = 'stopped'
+                           AND json_extract(data, '$.snapshot.session_id') = ?2
+                         ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![name, session_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                if !owner_matches("stopped_session", &name, tool.as_deref()) {
+                    return ToolCheckedBind::Rejected;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.stopped_owner",
+                    &format!("session_id={session_id} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
+    }
+
+    let bound = bind_session_to_process(db, session_id, process_id).or_else(|| {
+        if create_if_unbound {
+            create_orphaned_pty_identity(db, session_id, process_id, expected_tool)
+        } else {
+            None
+        }
+    });
+    if let Some(ref name) = bound {
+        let tool = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| row.tool);
+        if !owner_matches("bound", name, tool.as_deref()) {
+            return ToolCheckedBind::Rejected;
+        }
+    }
+
+    if let Err(error) = transaction.commit() {
+        crate::log::log_error(
+            "binding",
+            "bind_for_tool.commit",
+            &format!("session_id={session_id} expected_tool={expected_tool} err={error}"),
+        );
+        return ToolCheckedBind::Rejected;
+    }
+
+    match bound {
+        Some(name) => ToolCheckedBind::Bound(name),
+        None => ToolCheckedBind::Unbound,
+    }
 }
 
 /// Rebind process/session after soft-finalize cleared bindings but left the
@@ -947,7 +1141,7 @@ pub fn resolve_process_binding(db: &HcomDb, process_id: Option<&str>) -> Option<
     db.get_process_binding(pid).ok()?
 }
 
-/// Resolve instance via process binding, session binding, or transcript marker.
+/// Resolve instance via process or session binding.
 pub fn resolve_instance_from_binding(
     db: &HcomDb,
     session_id: Option<&str>,
@@ -1571,6 +1765,92 @@ mod tests {
         cleanup(path);
     }
 
+    /// A stopped instance whose process lost its binding has no row to restore
+    /// into: binding must fail rather than point the process at a missing row.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_without_placeholder_does_not_bind() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let snapshot = serde_json::json!({"session_id": "ses-pi-1", "tool": "pi"});
+        db.log_life_event("miro", "stopped", "session", "exit:reload", Some(snapshot))
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-pi-1", Some("pid-pi"));
+        assert_eq!(result, None);
+        assert!(db.get_instance_full("miro").unwrap().is_none());
+        assert_eq!(db.get_session_binding("ses-pi-1").unwrap(), None);
+        assert_eq!(db.get_process_binding("pid-pi").unwrap(), None);
+
+        cleanup(path);
+    }
+
+    /// A live process resuming another agent's stopped session takes that identity;
+    /// its previous identity is retired instead of left listening without a process.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_retires_switched_live_identity() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut nene = serde_json::Map::new();
+        nene.insert("name".into(), serde_json::json!("nene"));
+        nene.insert("tool".into(), serde_json::json!("pi"));
+        nene.insert("session_id".into(), serde_json::json!("ses-nene"));
+        nene.insert("created_at".into(), serde_json::json!(now));
+        nene.insert("status".into(), serde_json::json!("listening"));
+        nene.insert("pid".into(), serde_json::json!(4242));
+        db.save_instance_named("nene", &nene).unwrap();
+        db.rebind_session("ses-nene", "nene").unwrap();
+        db.set_process_binding("pid-pi", "ses-nene", "nene")
+            .unwrap();
+
+        let snapshot = serde_json::json!({"session_id": "ses-zumi", "tool": "pi"});
+        db.log_life_event("zumi", "stopped", "session", "exit:closed", Some(snapshot))
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-zumi", Some("pid-pi"));
+        assert_eq!(result, Some("zumi".to_string()));
+        assert_eq!(
+            db.get_process_binding("pid-pi").unwrap(),
+            Some("zumi".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-zumi").unwrap(),
+            Some("zumi".to_string())
+        );
+
+        let nene = db.get_instance_full("nene").unwrap().unwrap();
+        assert_eq!(nene.status, ST_INACTIVE);
+        assert_eq!(nene.status_context, "exit:session_switch");
+        assert_eq!(db.get_session_binding("ses-nene").unwrap(), None);
+        assert_eq!(nene.pid, None, "retired identity must not keep the process");
+        let zumi = db.get_instance_full("zumi").unwrap().unwrap();
+        assert_eq!(zumi.pid, Some(4242), "new identity must stay killable");
+
+        // Resuming the previous session switches back to its original identity.
+        let result = bind_session_to_process(&db, "ses-nene", Some("pid-pi"));
+        assert_eq!(result, Some("nene".to_string()));
+        assert_eq!(
+            db.get_process_binding("pid-pi").unwrap(),
+            Some("nene".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-nene").unwrap(),
+            Some("nene".to_string())
+        );
+        assert_eq!(db.get_session_binding("ses-zumi").unwrap(), None);
+        let nene = db.get_instance_full("nene").unwrap().unwrap();
+        assert_eq!(nene.pid, Some(4242));
+        let zumi = db.get_instance_full("zumi").unwrap().unwrap();
+        assert_eq!(zumi.status_context, "exit:session_switch");
+        assert_eq!(zumi.pid, None);
+
+        cleanup(path);
+    }
+
     #[test]
     #[serial]
     fn test_restore_stopped_migrates_pid_and_launch_context_to_canonical() {
@@ -1954,7 +2234,7 @@ mod tests {
     #[serial]
     fn new_row_honors_configured_hcom_timeout() {
         // Regression test for issue #71: a brand-new instance row (the path
-        // used by vanilla `hcom start`, launched, and resumed sessions) must
+        // used by adhoc `hcom start`, launched, and resumed sessions) must
         // carry the effective HCOM_TIMEOUT rather than silently falling back
         // to the old always-86400 schema default.
         let _env = EnvVarGuard::set("HCOM_TIMEOUT", "30");

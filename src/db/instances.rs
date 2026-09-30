@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
-use crate::shared::constants::ST_LISTENING;
+use crate::shared::constants::{ST_INACTIVE, ST_LISTENING};
 use crate::shared::time::now_epoch_i64;
 
 /// Instance status info
@@ -183,6 +183,20 @@ impl HcomDb {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Record an explicit kill before signalling the process.
+    ///
+    /// The PTY exit cleanup may finalize the stop before `hcom kill` does; it
+    /// reads `status_detail` back so the stopped event names the real initiator
+    /// instead of "pty".
+    pub fn mark_killed(&self, name: &str, initiator: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET status = ?, status_context = 'exit:killed', status_detail = ?, status_time = ?
+             WHERE name = ?",
+            params![ST_INACTIVE, initiator, now_epoch_i64(), name],
+        )?;
         Ok(())
     }
 
@@ -407,11 +421,12 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
-        let timestamp = chrono_now_iso();
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
+            // Stamp after taking the write lock so timestamp order matches id order.
+            let timestamp = chrono_now_iso();
             let deleted = tx.execute(
                 "DELETE FROM instances
                  WHERE name = ? AND created_at = ?
@@ -786,6 +801,28 @@ impl HcomDb {
         let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         let rows = self.conn.execute(&sql, refs.as_slice())?;
         Ok(rows > 0)
+    }
+
+    /// Acknowledge an emitted batch without rewinding a concurrent delivery.
+    /// The comparison and update are one SQLite operation, not a read/modify/write.
+    pub fn advance_instance_cursor(&self, name: &str, event_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?) WHERE name = ?",
+            params![event_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Forward-only cursor advance, optionally marking the name announced, in
+    /// one statement.
+    pub fn ack_hook_delivery(&self, name: &str, event_id: i64, announce: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
+             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
+             WHERE name = ?",
+            params![event_id, announce, name],
+        )?;
+        Ok(())
     }
 
     /// Update specific fields on an instance row.

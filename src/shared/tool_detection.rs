@@ -64,6 +64,10 @@ const CODEX_NATIVE: &[EnvPredicate] = &[
         var: "CODEX_THREAD_ID",
         condition: EnvMatch::Set,
     },
+    EnvPredicate {
+        var: "CODEX_SESSION_ID",
+        condition: EnvMatch::Set,
+    },
 ];
 const OPENCODE_NATIVE: &[EnvPredicate] = &[EnvPredicate {
     var: "OPENCODE",
@@ -90,6 +94,16 @@ const KIMI_NATIVE: &[EnvPredicate] = &[
     },
     EnvPredicate {
         var: "KIMI_SESSION_ID",
+        condition: EnvMatch::Set,
+    },
+];
+const GROK_NATIVE: &[EnvPredicate] = &[
+    EnvPredicate {
+        var: "GROK_SESSION_ID",
+        condition: EnvMatch::Set,
+    },
+    EnvPredicate {
+        var: "GROK_HOOK_EVENT",
         condition: EnvMatch::Set,
     },
 ];
@@ -120,6 +134,7 @@ hcom_tool_predicate!("kilo", HCOM_TOOL_KILO);
 hcom_tool_predicate!("cursor", HCOM_TOOL_CURSOR);
 hcom_tool_predicate!("kimi", HCOM_TOOL_KIMI);
 hcom_tool_predicate!("copilot", HCOM_TOOL_COPILOT);
+hcom_tool_predicate!("grok", HCOM_TOOL_GROK);
 hcom_tool_predicate!("pi", HCOM_TOOL_PI);
 hcom_tool_predicate!("omp", HCOM_TOOL_OMP);
 
@@ -138,7 +153,7 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Gemini,
         predicates: GEMINI_NATIVE,
-        clear_for_child: &["GEMINI_CLI", "GEMINI_SYSTEM_MD"],
+        clear_for_child: &["GEMINI_CLI", "GEMINI_SYSTEM_MD", "GEMINI_CLI_NO_RELAUNCH"],
     },
     ToolDetectionRule {
         tool: Tool::Codex,
@@ -149,12 +164,13 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
             "CODEX_MANAGED_BY_NPM",
             "CODEX_MANAGED_BY_BUN",
             "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
         ],
     },
     ToolDetectionRule {
         tool: Tool::OpenCode,
         predicates: OPENCODE_NATIVE,
-        clear_for_child: &["OPENCODE"],
+        clear_for_child: &["OPENCODE", "OPENCODE_PID"],
     },
     ToolDetectionRule {
         tool: Tool::Kilo,
@@ -170,6 +186,17 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
         tool: Tool::Kimi,
         predicates: KIMI_NATIVE,
         clear_for_child: &["KIMI_CODE_CLI", "KIMI_SESSION_ID"],
+    },
+    ToolDetectionRule {
+        tool: Tool::Grok,
+        predicates: GROK_NATIVE,
+        clear_for_child: &[
+            "GROK_SESSION_ID",
+            "GROK_HOOK_EVENT",
+            "GROK_HOOK_NAME",
+            "GROK_AGENT",
+            "GROK_LEADER_SOCKET",
+        ],
     },
     ToolDetectionRule {
         tool: Tool::Pi,
@@ -224,6 +251,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Copilot,
         predicates: HCOM_TOOL_COPILOT,
+        clear_for_child: &["HCOM_TOOL"],
+    },
+    ToolDetectionRule {
+        tool: Tool::Grok,
+        predicates: HCOM_TOOL_GROK,
         clear_for_child: &["HCOM_TOOL"],
     },
     ToolDetectionRule {

@@ -88,6 +88,9 @@ pub(super) fn update_delivery_state(
         state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
             && (screen.is_claude_subagent_nav_visible()
                 || screen.is_claude_session_switcher_visible());
+        state.startup_loading = matches!(target.known_tool(), Some(Tool::Codex))
+            && launch_phase_active.load(Ordering::Acquire)
+            && screen.is_codex_startup_loading();
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {
@@ -320,6 +323,7 @@ pub(super) fn start_delivery_thread(
     current_name: Arc<RwLock<String>>,
     current_status: Arc<RwLock<String>>,
     title_wake: Option<crate::delivery::TitleWake>,
+    grok_acp: Option<crate::delivery::grok::Launch>,
 ) -> Result<DeliveryStart> {
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
@@ -412,6 +416,7 @@ pub(super) fn start_delivery_thread(
         // Create delivery state wrapper
         let state = DeliveryState {
             screen: delivery_state,
+            grok_acp,
             launch_phase_active,
             inject_port,
             user_activity_cooldown_ms: USER_ACTIVITY_COOLDOWN_MS,

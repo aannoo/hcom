@@ -139,15 +139,19 @@ pub(crate) const TERMINAL_CONTEXT_VARS: &[&str] = &[
     "GHOSTTY_RESOURCES_DIR",
     "ITERM_SESSION_ID",
     "ALACRITTY_WINDOW_ID",
+    "PTYXIS_PROFILE",
+    "PTYXIS_VERSION",
     "GNOME_TERMINAL_SCREEN",
     "KONSOLE_DBUS_WINDOW",
     "TERMINATOR_UUID",
     "TILIX_ID",
     "WT_SESSION",
-    // HERDR_* not stripped: the herdr preset's CLI (`herdr agent start ...`)
-    // resolves its server socket from $HERDR_SOCKET_PATH; other presets pass
-    // the socket via CLI flag (e.g. `kitty @ --to {kitty_listen}`) and don't
-    // need their identity vars to survive in the launcher env.
+    // HERDR_* not stripped: the herdr preset's CLI (`herdr tab create` /
+    // `herdr pane run ...`) resolves its server socket from $HERDR_SOCKET_PATH;
+    // the delivery loop also reuses it for `pane.rename` / `pane.report_agent`.
+    // Other presets pass the socket via CLI flag (e.g. `kitty @ --to
+    // {kitty_listen}`) and don't need their identity vars to survive in the
+    // launcher env.
     // Generic terminal identity
     "TERM_PROGRAM",
     "TERM_SESSION_ID",
@@ -366,6 +370,16 @@ fn normalize_terminal_mode_for_launch(
     if opens_new_window {
         if terminal_mode == "default"
             && let Some(detected) = detect_terminal_from_env()
+            // Ptyxis is commonly installed as a Flatpak. Such shells export
+            // PTYXIS_VERSION even when no host-side `ptyxis` launcher exists,
+            // so environment detection alone is not enough to launch a new
+            // window. Keep `default` in that case and use the normal Linux
+            // fallback selection below. A configured `ptyxis.binary` override
+            // (for example, a wrapper around `flatpak run`) is honored.
+            && (detected != "ptyxis"
+                || crate::config::get_merged_preset("ptyxis")
+                    .and_then(|preset| preset.binary)
+                    .is_some_and(|binary| which_bin(&binary).is_some()))
         {
             terminal_mode = detected;
         }
@@ -1052,6 +1066,18 @@ pub fn create_bash_script(
     Ok(())
 }
 
+/// Flags for every PowerShell process hcom starts to run a generated script.
+///
+/// `-NoProfile` is the Windows counterpart of running the Unix launcher with
+/// plain `bash script.sh` — a non-interactive, non-login shell that reads no
+/// `.bashrc`/`.profile`. Without it, a user's PowerShell profile runs inside
+/// each agent launch: its banner output lands in the PTY stream the screen
+/// scraper reads, its PATH/location edits override what the generated script
+/// just set, and anything in it that waits on input blocks forever, because
+/// background launches attach stdin to NUL. It also skips profile and module
+/// analysis work on every launch.
+pub const POWERSHELL_SCRIPT_FLAGS: &[&str] = &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"];
+
 /// Quote a string as a PowerShell single-quoted literal (embedded `'` doubled).
 pub fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -1497,6 +1523,8 @@ pub fn get_default_fallback_terminal_name() -> &'static str {
                 }
             } else if which_bin("gnome-terminal").is_some() {
                 "gnome-terminal"
+            } else if which_bin("ptyxis").is_some() {
+                "ptyxis"
             } else if which_bin("konsole").is_some() {
                 "konsole"
             } else if which_bin("xterm").is_some() {
@@ -1516,6 +1544,10 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
         (
             "gnome-terminal",
             &["gnome-terminal", "--", "bash", "{script}"] as &[&str],
+        ),
+        (
+            "ptyxis",
+            &["ptyxis", "--new-window", "--", "bash", "{script}"],
         ),
         ("konsole", &["konsole", "-e", "bash", "{script}"]),
         ("xterm", &["xterm", "-e", "bash", "{script}"]),
@@ -1610,6 +1642,7 @@ fn is_external_terminal_launcher(argv: &[String]) -> bool {
             | "ttab"
             | "wttab"
             | "gnome-terminal"
+            | "ptyxis"
             | "konsole"
             | "xterm"
             | "tilix"
@@ -1827,25 +1860,120 @@ fn normalize_captured_terminal_id(captured_id: &str) -> String {
     }
 }
 
-/// Parse herdr `agent start` JSON output and extract `result.agent.pane_id`.
+/// Parse a herdr CLI JSON response and extract the launched pane's id.
 ///
-/// Gated on the response `id` field (`cli:agent:start`) so non-herdr terminal
-/// outputs that happen to be JSON don't accidentally match this shape.
+/// Handles the envelopes hcom launches through:
+/// - `cli:tab:create` (the default herdr preset) → `result.root_pane.pane_id`
+/// - `cli:pane:split` → `result.root_pane.pane_id`
+/// - `cli:agent:start` (legacy) → `result.agent.pane_id`
+///
+/// Gated on the response `id` field so non-herdr terminal outputs that happen
+/// to be JSON don't accidentally match this shape.
 fn parse_herdr_pane_id(captured: &str) -> Option<String> {
     let trimmed = captured.trim_start();
     if !trimmed.starts_with('{') {
         return None;
     }
     let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    if val.get("id").and_then(|v| v.as_str()) != Some("cli:agent:start") {
-        return None;
-    }
-    val.get("result")?
-        .get("agent")?
-        .get("pane_id")?
+    let result = val.get("result")?;
+    let pane_id = match val.get("id").and_then(|v| v.as_str())? {
+        "cli:tab:create" | "cli:pane:split" => result.get("root_pane")?.get("pane_id")?,
+        "cli:agent:start" => result.get("agent")?.get("pane_id")?,
+        _ => return None,
+    };
+    pane_id
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Launch a herdr pane in two steps: `tab create` (whose stdout JSON carries
+/// the new pane id) then `pane run <pane_id> "bash <script>"` to start hcom's
+/// normal runner inside it. Returns `(success, captured_stdout)` where the
+/// captured stdout is the `tab create` envelope — `write_terminal_id` re-parses
+/// the pane id out of it exactly like every other terminal's captured id.
+fn launch_herdr_two_step(
+    create_template: &[String],
+    ctx: TerminalCommandContext<'_>,
+    inside_ai_tool: bool,
+) -> Result<(bool, String)> {
+    // Step 1: open the pane. `tab create` takes no script, so substitute
+    // placeholders directly — the generic `substitute_open_argv` requires a
+    // `{script}` slot this command intentionally lacks.
+    let create_argv = substitute_herdr_create_argv(create_template, &ctx);
+    let (created, captured) = spawn_terminal_process(&create_argv, inside_ai_tool)?;
+    let Some(pane_id) = parse_herdr_pane_id(captured.trim()) else {
+        // Couldn't open/parse a pane. Either `tab create` failed outright (no
+        // pane exists) or returned something unparseable; without a pane id
+        // there's nothing to close. Surface failure but keep the raw stdout so
+        // callers/logs can see what herdr returned.
+        return Ok((false, captured));
+    };
+
+    // Step 2: run hcom's generated runner script in the new pane. `pane run`
+    // sends the text and presses Enter, so `bash <script>` is the whole line.
+    // The script path is shell-quoted: herdr types it into the pane's shell,
+    // and hcom's launch dir lives under $HOME, which can contain spaces.
+    let run_argv = vec![
+        "herdr".to_string(),
+        "pane".to_string(),
+        "run".to_string(),
+        pane_id.clone(),
+        format!("bash {}", shell_quote(ctx.script)),
+    ];
+    // Don't `?`-propagate a step-2 failure directly: step 1 already opened the
+    // pane, so bailing here would orphan an empty pane that looks like a live
+    // agent in herdr's sidebar (issue #102, F3). Unlike the old single-command
+    // `agent start` preset — where a spawn failure left nothing behind — the
+    // two-step split has to clean up the half it created. Close it best-effort,
+    // then surface the original error.
+    let ran = match spawn_terminal_process(&run_argv, inside_ai_tool) {
+        Ok((ran, _)) => ran,
+        Err(run_err) => {
+            let close_argv = vec![
+                "herdr".to_string(),
+                "pane".to_string(),
+                "close".to_string(),
+                pane_id,
+            ];
+            let _ = spawn_terminal_process(&close_argv, inside_ai_tool);
+            return Err(run_err);
+        }
+    };
+
+    // Return the `tab create` stdout so `write_terminal_id` records the pane id.
+    Ok((created && ran, captured))
+}
+
+/// Substitute placeholders into herdr's `tab create` argv. Mirrors
+/// `substitute_open_argv` but without the mandatory `{script}` slot (herdr's
+/// `tab create` takes no script; the runner is sent separately via `pane run`).
+fn substitute_herdr_create_argv(
+    template: &[String],
+    ctx: &TerminalCommandContext<'_>,
+) -> Vec<String> {
+    let pane_title = ctx
+        .pane_title
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ctx.instance_name);
+    template
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            for (placeholder, value) in [
+                ("{process_id}", ctx.process_id),
+                ("{cwd}", ctx.cwd),
+                ("{instance_name}", ctx.instance_name),
+                ("{tool}", ctx.tool),
+                ("{pane_title}", pane_title),
+            ] {
+                if part.contains(placeholder) {
+                    part = part.replace(placeholder, value);
+                }
+            }
+            part
+        })
+        .collect()
 }
 
 /// Launch terminal with command.
@@ -1944,7 +2072,7 @@ pub fn launch_terminal(
 
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("powershell");
-            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c.args(POWERSHELL_SCRIPT_FLAGS);
             c
         } else {
             Command::new(resolve_bash_command())
@@ -1989,7 +2117,7 @@ pub fn launch_terminal(
         // Replace this process entirely with the script's shell.
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("powershell");
-            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c.args(POWERSHELL_SCRIPT_FLAGS);
             c
         } else {
             Command::new(resolve_bash_command())
@@ -2118,10 +2246,18 @@ pub fn launch_terminal(
                 .map(|s| s.as_str())
                 .filter(|s| !s.is_empty()),
         };
-        // The Windows `.ps1`-via-PowerShell variant is already selected by the
-        // preset's `open_argv(cfg!(windows))`; no text rewrite needed.
-        let final_argv = substitute_open_argv(&cmd_template, ctx)?;
-        let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
+        // Herdr launches in two steps: `tab create` (stdout carries the pane
+        // id) then `pane run <pane_id> "bash {script}"`. This doesn't fit the
+        // single-argv preset model, so handle it natively. Everything else is a
+        // single spawn.
+        let (success, captured_id) = if terminal_mode == "herdr" {
+            launch_herdr_two_step(&cmd_template, ctx, inside_ai_tool)?
+        } else {
+            // The Windows `.ps1`-via-PowerShell variant is already selected by
+            // the preset's `open_argv(cfg!(windows))`; no text rewrite needed.
+            let final_argv = substitute_open_argv(&cmd_template, ctx)?;
+            spawn_terminal_process(&final_argv, inside_ai_tool)?
+        };
         write_terminal_id(env, &captured_id);
         if success {
             Ok((LaunchResult::Success, terminal_mode))
@@ -3065,6 +3201,49 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_detect_terminal_from_ptyxis_version() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        unsafe {
+            std::env::set_var("PTYXIS_VERSION", "50.1");
+        }
+
+        assert_eq!(detect_terminal_from_env().as_deref(), Some("ptyxis"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_auto_detected_ptyxis_requires_host_launcher_for_new_window() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        let _path = EnvGuard::clear(&["PATH"]);
+        let empty_path = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PTYXIS_VERSION", "50.1");
+            std::env::set_var("PATH", empty_path.path());
+        }
+
+        let (mode, socket) = normalize_terminal_mode_for_launch("default".to_string(), true, false);
+
+        assert_eq!(mode, "default");
+        assert!(socket.is_empty());
+    }
+
+    #[test]
+    fn test_launcher_env_strips_ptyxis_identity() {
+        let env = get_launcher_env_from(vec![
+            ("PTYXIS_PROFILE".into(), "profile-id".into()),
+            ("PTYXIS_VERSION".into(), "50.1".into()),
+            ("PATH".into(), "/bin".into()),
+        ]);
+
+        assert!(!env.contains_key("PTYXIS_PROFILE"));
+        assert!(!env.contains_key("PTYXIS_VERSION"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
     fn test_splice_kitten_to_socket_matches_absolute_app_bundle_path() {
         // Regression: when `kitten` isn't on PATH, resolve_terminal_open_argv
         // rewrites argv[0] to kitten's absolute macOS app-bundle path before
@@ -3375,18 +3554,78 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_herdr_tab_create_json() {
+        // The default herdr preset launches via `tab create`; the pane id lives
+        // at result.root_pane.pane_id.
+        let json = r#"{"id":"cli:tab:create","result":{"type":"tab_created","tab":{"tab_id":"w1:2"},"root_pane":{"pane_id":"p_7","terminal_id":"term_x","workspace_id":"w1","tab_id":"w1:2","focused":false}}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), "p_7");
+    }
+
+    #[test]
+    fn test_normalize_herdr_pane_split_json() {
+        let json = r#"{"id":"cli:pane:split","result":{"root_pane":{"pane_id":"p_9"}}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), "p_9");
+    }
+
+    #[test]
+    fn test_substitute_herdr_create_argv_uses_instance_name_and_cwd() {
+        let template = argv(&[
+            "herdr",
+            "tab",
+            "create",
+            "--cwd",
+            "{cwd}",
+            "--no-focus",
+            "--label",
+            "{instance_name}",
+        ]);
+        let out = substitute_herdr_create_argv(
+            &template,
+            &TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                cwd: "/home/user/project",
+                instance_name: "luna",
+                tool: "claude",
+                pane_title: Some("\u{25c9} luna [claude]"),
+            },
+        );
+        assert_eq!(
+            out,
+            vec![
+                "herdr",
+                "tab",
+                "create",
+                "--cwd",
+                "/home/user/project",
+                "--no-focus",
+                "--label",
+                "luna",
+            ]
+        );
+    }
+
+    #[test]
     fn test_herdr_preset_template_uses_stable_instance_name() {
-        // The herdr preset must launch with a stable agent name so
-        // `herdr agent send <name>` keeps working — the styled status label
-        // (`◉ luna [claude]`) is pushed separately via `pane.rename` from the
-        // delivery loop, not baked into the agent name.
+        // The herdr preset opens the pane with `tab create` and a stable
+        // `--label {instance_name}` (e.g. `luna`). The runner script is sent
+        // separately via `pane run` (handled natively in `launch_terminal`), so
+        // the open argv carries no `{script}` slot. The styled status label
+        // (`◉ luna [claude]`) is pushed via `pane.rename` from the delivery
+        // loop, not baked into the pane label.
         let preset = crate::shared::terminal_presets::get_terminal_preset("herdr").unwrap();
         let open = preset.open.select(false).unwrap();
-        assert!(open.contains(&"{script}"));
+        assert!(open.contains(&"tab"));
+        assert!(open.contains(&"create"));
+        assert!(
+            !open.contains(&"{script}"),
+            "herdr's `tab create` open argv must not carry {{script}} — the \
+             runner is sent separately via `pane run`"
+        );
         assert!(open.contains(&"{instance_name}"));
         assert!(
             !open.contains(&"{pane_title}"),
-            "herdr preset must not use {{pane_title}} as agent name"
+            "herdr preset must not use {{pane_title}} as the pane label"
         );
         assert!(open.contains(&"{cwd}"));
         assert!(!open.contains(&"{process_id}"));
@@ -3700,9 +3939,7 @@ mod tests {
     #[test]
     fn test_resolve_termux_tool_launcher_codex_wrapper() {
         let resolved = resolve_termux_tool_launcher("codex", TERMUX_CODEX_WRAPPER_PATH);
-        if crate::shared::platform::is_termux()
-            && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
-        {
+        if is_native_termux_runtime() && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists() {
             let (command, args) = resolved.expect("expected termux codex wrapper override");
             assert!(command.ends_with("/sh") || command == "sh");
             assert_eq!(args, vec![TERMUX_CODEX_INNER_WRAPPER_PATH.to_string()]);
@@ -3718,7 +3955,7 @@ mod tests {
         std::fs::write(&path, "#!/usr/bin/env node\nconsole.log('ok');\n").unwrap();
 
         let resolved = resolve_termux_tool_launcher("tool", path.to_str().unwrap());
-        if crate::shared::platform::is_termux() {
+        if is_native_termux_runtime() {
             let (command, args) = resolved.expect("expected node wrapper on termux");
             assert!(command.ends_with("/node") || command == "node");
             assert_eq!(args, vec![path.to_string_lossy().to_string()]);
@@ -3809,6 +4046,8 @@ mod tests {
         assert!(terminal_preset_supported_on("wttab", "Windows"));
         assert!(!terminal_preset_supported_on("wttab", "Darwin"));
         assert!(terminal_preset_supported_on("wezterm", "Windows"));
+        assert!(terminal_preset_supported_on("ptyxis", "Linux"));
+        assert!(!terminal_preset_supported_on("ptyxis", "Darwin"));
         assert!(!terminal_preset_supported_on("nope", "Darwin"));
     }
 }

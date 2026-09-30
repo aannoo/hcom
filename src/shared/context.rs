@@ -99,7 +99,10 @@ impl HcomContext {
             tool,
             claude_env_file: get_nonempty("CLAUDE_ENV_FILE"),
             is_fork: is_eq("HCOM_IS_FORK", "1"),
-            codex_thread_id: get_nonempty("CODEX_THREAD_ID"),
+            // Current Codex hooks report the shared root session ID; older
+            // builds expose only the thread ID. Keep this legacy field name.
+            codex_thread_id: get_nonempty("CODEX_SESSION_ID")
+                .or_else(|| get_nonempty("CODEX_THREAD_ID")),
             launched_by: get_nonempty("HCOM_LAUNCHED_BY"),
             launch_batch_id: get_nonempty("HCOM_LAUNCH_BATCH_ID"),
             launch_event_id: get_nonempty("HCOM_LAUNCH_EVENT_ID"),
@@ -156,17 +159,6 @@ impl HcomContext {
     /// Detect current tool name, or "adhoc".
     pub fn detect_current_tool(&self) -> &'static str {
         self.tool.as_str()
-    }
-
-    /// Detect vanilla (non-hcom-launched) tool, or None.
-    pub fn detect_vanilla_tool(&self) -> Option<&'static str> {
-        if self.is_launched {
-            return None;
-        }
-        match self.tool {
-            Tool::Adhoc => None,
-            _ => Some(self.tool.as_str()),
-        }
     }
 }
 
@@ -248,7 +240,6 @@ mod tests {
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
 
         assert_eq!(ctx.tool, Tool::Kilo);
-        assert_eq!(ctx.detect_vanilla_tool(), Some("kilo"));
     }
 
     #[test]
@@ -381,32 +372,6 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(launched.is_inside_ai_tool());
-    }
-
-    #[test]
-    fn test_detect_vanilla_tool() {
-        // Claude not launched by hcom = vanilla
-        let ctx = HcomContext::from_env(
-            &make_env(&[("CLAUDECODE", "1"), ("HOME", "/home/test")]),
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(ctx.detect_vanilla_tool(), Some("claude"));
-
-        // Claude launched by hcom = not vanilla
-        let ctx = HcomContext::from_env(
-            &make_env(&[
-                ("CLAUDECODE", "1"),
-                ("HCOM_LAUNCHED", "1"),
-                ("HOME", "/home/test"),
-            ]),
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(ctx.detect_vanilla_tool(), None);
-
-        // Adhoc = not vanilla
-        let ctx =
-            HcomContext::from_env(&make_env(&[("HOME", "/home/test")]), PathBuf::from("/tmp"));
-        assert_eq!(ctx.detect_vanilla_tool(), None);
     }
 
     #[test]

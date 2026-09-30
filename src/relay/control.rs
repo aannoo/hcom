@@ -987,9 +987,28 @@ fn handle_remote_transcript(
     let json_mode = bool_param(params, "json", false);
     let full_mode = bool_param(params, "full", false);
     let detailed = bool_param(params, "detailed", false);
-    let content = crate::commands::transcript::render_instance_transcript_with_options_no_retry(
-        db, target, range, last_n, json_mode, full_mode, detailed,
-    )?;
+    let display_target = optional_param(params, "display_target").unwrap_or(target);
+    let content = match optional_param(params, "origin_device") {
+        Some(device) => {
+            crate::commands::transcript::render_remote_instance_transcript_with_options_no_retry(
+                db,
+                target,
+                display_target,
+                device,
+                &crate::commands::transcript::TranscriptRenderOpts {
+                    range,
+                    last_n,
+                    json_mode,
+                    full_mode,
+                    detailed,
+                    retry_codex: false,
+                },
+            )?
+        }
+        None => crate::commands::transcript::render_instance_transcript_with_options_no_retry(
+            db, target, range, last_n, json_mode, full_mode, detailed,
+        )?,
+    };
     Ok(json!({"target": target, "content": content}))
 }
 
