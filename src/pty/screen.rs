@@ -124,6 +124,28 @@ fn trim_with_nbsp(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || c == '\u{00A0}')
 }
 
+/// Prompt glyph to inspect in PTY debug dumps for a rendered input row.
+///
+/// Codex can use either glyph depending on the active reasoning tier, so the
+/// dump must inspect the glyph actually present on the row rather than assuming
+/// the normal-effort prompt.
+fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
+    use crate::tool::Tool;
+    use std::str::FromStr;
+
+    let line = line.trim_start();
+    match Tool::from_str(tool).ok()? {
+        Tool::Claude if line.contains('❯') => Some("❯"),
+        Tool::Codex if line == "»" || line.starts_with("» ") => Some("»"),
+        Tool::Codex if line == "›" || line.starts_with("› ") => Some("›"),
+        Tool::Gemini if line.contains("│ >") => Some(">"),
+        Tool::Antigravity if line.starts_with("> ") || line == ">" => Some(">"),
+        Tool::Cursor if line.contains('→') => Some("→"),
+        Tool::Copilot if line.contains('❯') => Some("❯"),
+        _ => None,
+    }
+}
+
 /// Check if a line is a Gemini dash border (all ─ chars, at least 20 wide)
 fn is_dash_border(line: &str) -> bool {
     let trimmed = line.trim();
@@ -610,6 +632,37 @@ impl ScreenTracker {
         }
 
         Some(!(non_dim_count > 0 && non_dim_count > dim_count))
+    }
+
+    /// Render the non-whitespace cells after a prompt as char:style pairs for
+    /// debug logs. D means dim and - means normal intensity.
+    fn debug_cell_attrs_after_prompt(&self, row: u16, prompt_char: &str) -> Option<String> {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let mut found_prompt = false;
+        let mut attrs = String::new();
+
+        for col in 0..cols {
+            let cell = screen.cell(row, col)?;
+            let contents = cell.contents();
+            if !found_prompt {
+                if contents == prompt_char {
+                    found_prompt = true;
+                }
+                continue;
+            }
+            if contents.is_empty() || contents.chars().all(char::is_whitespace) {
+                continue;
+            }
+            let dim_marker = if cell.dim() { "D" } else { "-" };
+            attrs.push_str(&format!(
+                "{}:{} ",
+                contents.chars().next().unwrap_or('?'),
+                dim_marker
+            ));
+        }
+
+        found_prompt.then_some(attrs)
     }
 
     /// Check if prompt is empty (tool-specific)
@@ -1105,57 +1158,12 @@ impl ScreenTracker {
             if !trimmed.is_empty() {
                 output.push_str(&format!("  {:3}: {}\n", i, trimmed));
 
-                // For Claude prompt lines, show cell attributes to verify dim detection
-                use crate::tool::Tool;
-                use std::str::FromStr;
-
-                let prompt_char = match Tool::from_str(tool) {
-                    Ok(Tool::Claude) => Some("❯"),
-                    Ok(Tool::Codex) => Some("›"),
-                    Ok(Tool::Gemini) => Some(">"),
-                    Ok(Tool::Antigravity) => Some(">"),
-                    Ok(Tool::Cursor) => Some("→"),
-                    Ok(Tool::Copilot) => Some("❯"),
-                    _ => None,
-                };
-                if let Some(pc) = prompt_char {
-                    let should_dump = match (Tool::from_str(tool), pc) {
-                        (Ok(Tool::Gemini), ">") => trimmed.contains("│ >"),
-                        (Ok(Tool::Antigravity), ">") => trimmed.starts_with("> "),
-                        _ => trimmed.contains(pc),
-                    };
-                    if should_dump {
-                        let row = i as u16;
-                        let prompt_marker = if matches!(Tool::from_str(tool), Ok(Tool::Antigravity))
-                        {
-                            "> "
-                        } else {
-                            pc
-                        };
-                        let mut attrs_info = format!("       Cell attrs: [{}] ", prompt_marker);
-                        let mut found_prompt = false;
-                        for col in 0..cols {
-                            if let Some(cell) = screen.cell(row, col) {
-                                let contents = cell.contents();
-                                if contents == pc || (prompt_marker == "> " && contents == ">") {
-                                    found_prompt = true;
-                                    continue;
-                                }
-                                if found_prompt
-                                    && !contents.is_empty()
-                                    && !contents.chars().all(|c| c.is_whitespace())
-                                {
-                                    let dim_marker = if cell.dim() { "D" } else { "-" };
-                                    attrs_info.push_str(&format!(
-                                        "{}:{} ",
-                                        contents.chars().next().unwrap_or('?'),
-                                        dim_marker
-                                    ));
-                                }
-                            }
-                        }
-                        output.push_str(&format!("{}\n", attrs_info));
-                    }
+                // Show the parser's cell attributes for input rows so styling
+                // loss can be distinguished from a display-only terminal bug.
+                if let Some(pc) = debug_prompt_glyph(tool, trimmed)
+                    && let Some(attrs) = self.debug_cell_attrs_after_prompt(i as u16, pc)
+                {
+                    output.push_str(&format!("       Cell attrs: [{}] {}\n", pc, attrs));
                 }
             }
         }
@@ -1745,6 +1753,37 @@ mod tests {
             t.get_codex_input_text(),
             Some("<hcom>test message</hcom>".to_string())
         );
+    }
+
+    #[test]
+    fn codex_debug_attrs_cover_both_prompt_glyphs() {
+        let mut normal = make_tracker(24, 80, "? for shortcuts");
+        normal.process("› compare A » B\r\n".as_bytes());
+        let normal_line = normal.get_screen_lines()[0].clone();
+        assert_eq!(debug_prompt_glyph("codex", &normal_line), Some("›"));
+        let normal_attrs = normal.debug_cell_attrs_after_prompt(0, "›").unwrap();
+        assert!(normal_attrs.contains("c:-"));
+
+        let mut ultra = make_tracker(24, 80, "? for shortcuts");
+        ultra.process("» \x1b[2mcompare A › B\x1b[0m\r\n".as_bytes());
+        let ultra_line = ultra.get_screen_lines()[0].clone();
+        assert_eq!(debug_prompt_glyph("codex", &ultra_line), Some("»"));
+        let ultra_attrs = ultra.debug_cell_attrs_after_prompt(0, "»").unwrap();
+        assert!(ultra_attrs.contains("c:D"));
+    }
+
+    #[test]
+    fn codex_debug_dump_writes_ultra_prompt_attrs() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.debug_enabled = true;
+        t.debug_file = Some(log.reopen().unwrap());
+        t.process("» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
+
+        t.dump_screen("codex", 0, "test");
+
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        assert!(output.contains("Cell attrs: [»] A:D"));
     }
 
     // ---- Cursor input extraction ----
