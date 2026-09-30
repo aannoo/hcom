@@ -150,7 +150,7 @@ pub(crate) fn shrink_event(event: &mut Value) {
             "rpc result too large to relay ({original_bytes} bytes); the relayed copy was cut"
         );
         // Callers and backfill read the reason from `result.error`; a top-level `error`
-        // alone left them reporting "unknown remote error" (upstream review of #144).
+        // alone left them reporting "unknown remote error".
         data.insert("result".to_string(), json!({ "error": error }));
         match data.get_mut("error") {
             Some(Value::String(existing)) if existing.contains(&error) => {}
@@ -166,7 +166,7 @@ pub(crate) fn shrink_event(event: &mut Value) {
     // Bounded: a level-3 shrink of an event with thousands of small fields would otherwise
     // copy every name into the marker, which could overflow the budget the shrink exists to
     // meet. The count stays exact; `result` is listed first so a cut RPC answer is always
-    // named (upstream review of #144, round 3).
+    // named.
     let mut total_dropped = already_count.max(already_dropped.len());
     let mut all_dropped = already_dropped;
     for key in dropped {
@@ -382,7 +382,7 @@ fn new_event_count(events: &[Value], last_push_id: i64) -> usize {
 /// Whether another drain iteration has work. Only NEW events count: a retained-tail event
 /// dropped to fit the budget was already sent, and counting it as "more" made the drain loop
 /// republish the same state for its whole time budget after every oversized event, then the
-/// periodic timer started another drain (upstream review of PR #144).
+/// periodic timer started another drain.
 fn more_to_send(
     source_has_more: bool,
     source_new_events: usize,

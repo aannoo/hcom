@@ -1136,8 +1136,7 @@ fn handle_remote_events(
             // carry it whole: send a cut copy with the same marker a push uses rather than
             // an empty answer that makes a catch-up backfill abandon the gap. Below the
             // widest budget the empty, truncated answer is still returned, because that is
-            // what sends backfill to the wide request that recovers the event intact
-            // (upstream review of #144: cutting at 32 KiB lost events a wide ask would get).
+            // what sends backfill to the wide request that recovers the event intact.
             super::push::shrink_event(&mut events[0]);
         } else {
             events.pop();

@@ -66,7 +66,7 @@ pub(crate) struct Gap {
     /// Answers that came back cut to fit the peer's publish. Each one halves the next normal
     /// request's byte budget, down to `BACKFILL_MIN_BYTES`, so a large peer state leaves room
     /// for a smaller answer instead of every retry failing the same way until the gap is
-    /// abandoned (upstream review of #144, round 4).
+    /// abandoned.
     #[serde(default)]
     pub shrink: u32,
 }
@@ -207,9 +207,9 @@ pub(crate) fn apply_answer(
 ) -> Result<AnswerOutcome, String> {
     // An answer the publishing peer had to shrink to fit its sealed payload (answer + its
     // state) has had strings inside `result.events` cut while `ok` stayed true. Importing it
-    // would store partial events as if whole, and the gap would close. Refuse it (round 3),
+    // would store partial events as if whole, and the gap would close. Refuse it,
     // and ask for less next time: the peer's state does not shrink between retries, so the
-    // same budget would be cut the same way every time (upstream review of #144, round 4).
+    // same budget would be cut the same way every time.
     if response.get("_relay_truncated").is_some() {
         gap.shrink = gap.shrink.saturating_add(1);
         return Err(format!(

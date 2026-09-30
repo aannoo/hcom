@@ -552,8 +552,7 @@ pub fn handle_state_message(
     // relay liveness traffic into a permanent TCP fan-out storm on large
     // registries. Wake only when the snapshot actually changed local work. A join or
     // reconnect logged above counts as local work, and waking for it HERE, after the peer's
-    // state is applied, means a waiter that acts on it finds the peer synced (upstream review
-    // of #144, round 4).
+    // state is applied, means a waiter that acts on it finds the peer synced.
     if should_push || imported_new_events || lifecycle_logged {
         crate::notify::wake_all(db);
     }
@@ -842,10 +841,10 @@ fn emit_device_event(
     if reconnect {
         data["reconnect"] = serde_json::json!(true);
     }
-    // A lifecycle event is new local work that `hcom events --wait` may be waiting for
-    // (upstream review of #144, round 3), but waking here was too early for a join or
+    // A lifecycle event is new local work that `hcom events --wait` may be waiting for,
+    // but waking here was too early for a join or
     // reconnect: the snapshot handler logs those before it applies the peer's state, so a
-    // waiter could act on the event and still be told the peer is unsynced (round 4).
+    // waiter could act on the event and still be told the peer is unsynced.
     db.log_event("life", "", &data).is_ok()
 }
 
