@@ -165,11 +165,6 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
-        "HCOM_RELAY_BACKUP",
-        "Backup relay MQTT broker URL, used when the primary does not answer (config file only)",
-        "string",
-    ),
-    (
         "HCOM_RELAY_ID",
         "Relay group identifier (config file only)",
         "string",
@@ -203,43 +198,11 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
 
 /// Maps HCOM_ field name (lowercase, no prefix) to nested TOML dotted path.
 fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "terminal" => Some("terminal.active"),
-        "title_mode" => Some("terminal.title_mode"),
-        "tag" => Some("launch.tag"),
-        "hints" => Some("launch.hints"),
-        "notes" => Some("launch.notes"),
-        "subagent_timeout" => Some("launch.subagent_timeout"),
-        "auto_subscribe" => Some("launch.auto_subscribe"),
-        "auto_trust_workspace" => Some("launch.auto_trust_workspace"),
-        "claude_args" => Some("launch.claude.args"),
-        "gemini_args" => Some("launch.gemini.args"),
-        "gemini_system_prompt" => Some("launch.gemini.system_prompt"),
-        "codex_args" => Some("launch.codex.args"),
-        "codex_sandbox_mode" => Some("launch.codex.sandbox_mode"),
-        "codex_system_prompt" => Some("launch.codex.system_prompt"),
-        "opencode_args" => Some("launch.opencode.args"),
-        "kilo_args" => Some("launch.kilo.args"),
-        "pi_args" => Some("launch.pi.args"),
-        "omp_args" => Some("launch.omp.args"),
-        "cursor_args" => Some("launch.cursor.args"),
-        "kimi_args" => Some("launch.kimi.args"),
-        "copilot_args" => Some("launch.copilot.args"),
-        "grok_args" => Some("launch.grok.args"),
-        "relay" => Some("relay.url"),
-        "relay_id" => Some("relay.id"),
-        "relay_token" => Some("relay.token"),
-        "relay_enabled" => Some("relay.enabled"),
-        "timeout" => Some("preferences.timeout"),
-        "auto_approve" => Some("preferences.auto_approve"),
-        "name_export" => Some("preferences.name_export"),
-        // Any other mapped field lands where the loader reads it. Without this a
-        // field added to TOML_KEY_MAP but not here (relay_backup did) was written
-        // as a flat top-level key the loader never reads. relay_psk keeps its
-        // existing behaviour: it is set through `hcom relay`, not `hcom config`.
-        other if other != "relay_psk" => crate::config::toml_path_for_field(other),
-        _ => None,
+    // relay_psk is set through `hcom relay`, not `hcom config`.
+    if field_name == "relay_psk" {
+        return None;
     }
+    crate::config::toml_path_for_field(field_name)
 }
 
 // ── Config File Operations ───────────────────────────────────────────────
@@ -1506,20 +1469,6 @@ Stored in [relay] in config.toml. Environment overrides are ignored for relay fi
 Private broker: hcom relay new --broker mqtts://host:port",
         ),
 
-        "HCOM_RELAY_BACKUP" => Some(
-            "\
-HCOM_RELAY_BACKUP - Backup MQTT broker URL
-
-Empty = no backup. When the primary broker (HCOM_RELAY) does not accept a login,
-the relay worker connects here instead, and moves back once the primary answers.
-Every device in the relay group should name the same backup, or peers can split
-across the two brokers. Stored in [relay] in config.toml. Environment overrides
-are ignored for relay fields. A running worker picks up a change on its next probe.
-
-Usage:
-  hcom config relay_backup mqtt://host:1883",
-        ),
-
         "HCOM_RELAY_ID" => Some(
             "\
 HCOM_RELAY_ID - Shared UUID for relay group
@@ -2317,24 +2266,6 @@ mod tests {
                 "`hcom config {field}` must write {path}"
             );
         }
-    }
-
-    #[test]
-    fn relay_backup_is_written_under_the_relay_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[relay]\nurl = \"mqtt://primary.example:1883\"\n").unwrap();
-        config_set_at_path(&path, "HCOM_RELAY_BACKUP", "mqtt://backup.example:1883").unwrap();
-        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            doc["relay"]["backup"].as_str(),
-            Some("mqtt://backup.example:1883")
-        );
-        assert_eq!(
-            doc["relay"]["url"].as_str(),
-            Some("mqtt://primary.example:1883")
-        );
-        assert!(doc.get("relay_backup").is_none(), "no flat top-level key");
     }
 
     #[test]

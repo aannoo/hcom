@@ -242,7 +242,7 @@ pub fn handle_state_message(
     // (equal timestamps must, so a broker can re-deliver that same snapshot). If it also ends
     // below the events already imported and announces no newer reset than the one already
     // applied, it is an earlier snapshot arriving out of order, for example a stale retained
-    // copy after a broker failover. Skip it before the peer's state or events are applied, so
+    // copy after a broker restart. Skip it before the peer's state or events are applied, so
     // it can neither roll that state back nor trip the id-regression reset in
     // import_remote_events. A snapshot announcing a newer reset is a new database generation
     // and always reaches the reset handling below, whatever second it was sealed in.

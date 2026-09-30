@@ -142,7 +142,6 @@ pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("copilot_args", "launch.copilot.args"),
     ("grok_args", "launch.grok.args"),
     ("relay", "relay.url"),
-    ("relay_backup", "relay.backup"),
     ("relay_id", "relay.id"),
     ("relay_token", "relay.token"),
     ("relay_psk", "relay.psk"),
@@ -185,7 +184,6 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("copilot_args", "HCOM_COPILOT_ARGS"),
     ("grok_args", "HCOM_GROK_ARGS"),
     ("relay", "HCOM_RELAY"),
-    ("relay_backup", "HCOM_RELAY_BACKUP"),
     ("relay_id", "HCOM_RELAY_ID"),
     ("relay_token", "HCOM_RELAY_TOKEN"),
     // NOTE: `relay_psk` is deliberately NOT in FIELD_TO_ENV. `to_env_dict` feeds
@@ -205,7 +203,6 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
 /// Relay fields — file-only, no env var override.
 const RELAY_FIELDS: &[&str] = &[
     "relay",
-    "relay_backup",
     "relay_id",
     "relay_token",
     "relay_psk",
@@ -305,10 +302,6 @@ pub struct HcomConfig {
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
     pub relay: String,
-    /// Optional second broker URL. The relay worker uses it only while the
-    /// primary (`relay`) is unreachable, and returns to the primary as soon as
-    /// it answers again (see relay::choose_broker).
-    pub relay_backup: String,
     pub relay_id: String,
     pub relay_token: String,
     pub relay_psk: String,
@@ -348,7 +341,6 @@ impl Default for HcomConfig {
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
             relay: String::new(),
-            relay_backup: String::new(),
             relay_id: String::new(),
             relay_token: String::new(),
             relay_psk: String::new(),
@@ -535,7 +527,6 @@ impl HcomConfig {
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
             "relay" => Some(self.relay.clone()),
-            "relay_backup" => Some(self.relay_backup.clone()),
             "relay_id" => Some(self.relay_id.clone()),
             "relay_token" => Some(self.relay_token.clone()),
             "relay_psk" => Some(self.relay_psk.clone()),
@@ -592,7 +583,6 @@ impl HcomConfig {
             "gemini_system_prompt" => self.gemini_system_prompt = value.to_string(),
             "codex_system_prompt" => self.codex_system_prompt = value.to_string(),
             "relay" => self.relay = value.to_string(),
-            "relay_backup" => self.relay_backup = value.to_string(),
             "relay_id" => self.relay_id = value.to_string(),
             "relay_token" => self.relay_token = value.to_string(),
             "relay_psk" => self.relay_psk = value.to_string(),
@@ -751,13 +741,7 @@ impl HcomConfig {
         }
 
         // Load relay string fields (file-only, already handled by get_var)
-        for relay_field in &[
-            "relay",
-            "relay_backup",
-            "relay_id",
-            "relay_token",
-            "relay_psk",
-        ] {
+        for relay_field in &["relay", "relay_id", "relay_token", "relay_psk"] {
             if let Some(val) = get_var(relay_field) {
                 let _ = config.set_field(relay_field, &val.as_string());
             }
@@ -2193,31 +2177,6 @@ mod tests {
 
         // Relay fields should come from file, not env
         assert_eq!(config.relay, "mqtt://file.example.com");
-    }
-
-    #[test]
-    fn test_relay_backup_loads_from_file_only_and_round_trips() {
-        let mut file_config = HashMap::new();
-        file_config.insert(
-            "relay_backup".to_string(),
-            TomlFieldValue::Str("mqtts://backup.example:8883".to_string()),
-        );
-        let mut env = HashMap::new();
-        env.insert(
-            "HCOM_RELAY_BACKUP".to_string(),
-            "mqtt://env.example.com".to_string(),
-        );
-
-        let mut config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
-        assert_eq!(config.relay_backup, "mqtts://backup.example:8883");
-
-        config
-            .set_field("relay_backup", "mqtt://other.example:1883")
-            .unwrap();
-        assert_eq!(
-            config.get_field("relay_backup").as_deref(),
-            Some("mqtt://other.example:1883")
-        );
     }
 
     #[test]

@@ -18,17 +18,16 @@ use crate::db::HcomDb;
 use crate::log;
 use crate::relay::client::RelayCommand;
 
-/// Set by a deliberate self-exit (new build installed, failback, broker switch): the exiting
-/// worker spawns its successor after its pidfile is gone. Leaving the restart to the next hook
-/// left an idle device (no active local instance, so `ensure_worker(true)` never spawns) without
-/// a relay worker at all (upstream review of PR #144).
+/// Set when the worker exits because a new build was installed: the exiting worker spawns its
+/// successor after its pidfile is gone. Leaving the restart to the next hook left an idle device
+/// (no active local instance, so `ensure_worker(true)` never spawns) without a relay worker.
 static HANDOFF_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// The executable path this worker was started from, captured ONCE at start. The upgrade
 /// watchdog fingerprints it and the hand-off spawns it. Asking the OS again at exit is wrong
 /// after an upgrade: a rename-then-install swap leaves the running image under its new
 /// (old-build) name, and on Linux an atomic replace makes /proc/self/exe read "... (deleted)",
-/// so the successor could run the old build or fail to start (upstream review of #144).
+/// so the successor could run the old build or fail to start.
 static INSTALL_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 fn install_path() -> Option<PathBuf> {
@@ -38,7 +37,7 @@ fn install_path() -> Option<PathBuf> {
 }
 
 /// Ask the worker to start a successor when it exits.
-pub(crate) fn request_handoff() {
+fn request_handoff() {
     HANDOFF_ON_EXIT.store(true, Ordering::SeqCst);
 }
 
@@ -294,19 +293,6 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             db = HcomDb::open().ok();
         }
 
-        // On the backup broker and the primary answers again: go back, so the
-        // peers do not stay split across two brokers longer than needed.
-        if db.as_ref().is_some_and(primary_is_back) {
-            log::log_info(
-                "relay",
-                "relay_worker.failback",
-                "primary broker answers again; exiting so the next worker connects to it",
-            );
-            request_handoff();
-            let _ = cmd_tx.send(RelayCommand::Shutdown);
-            return;
-        }
-
         let count = match &db {
             Some(d) => local_instance_count(d),
             None => {
@@ -337,21 +323,6 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             consecutive_empty = 0;
         }
     }
-}
-
-/// True when this worker failed over to the backup broker and the primary
-/// accepts a login again.
-fn primary_is_back(db: &HcomDb) -> bool {
-    if super::safe_kv_get(db, super::ACTIVE_BROKER_KEY).as_deref() != Some("backup") {
-        return false;
-    }
-    let Ok(config) = HcomConfig::load(None) else {
-        return false;
-    };
-    let Some((host, port, tls)) = super::get_broker_from_config(&config) else {
-        return false;
-    };
-    super::client::broker_answers(&config.relay_token, &host, port, tls)
 }
 
 type ExeFingerprint = (u64, std::time::SystemTime);

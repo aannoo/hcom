@@ -21,7 +21,8 @@ use serde_json::json;
 
 use super::replay::ReplayGuard;
 use super::{
-    is_relay_enabled, load_psk, read_device_uuid, set_relay_status, state_topic, wildcard_topic,
+    get_broker_from_config, is_relay_enabled, load_psk, read_device_uuid, set_relay_status,
+    state_topic, wildcard_topic,
 };
 
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
@@ -105,12 +106,6 @@ pub struct MqttRelay {
     cmd_rx: mpsc::Receiver<RelayCommand>,
     /// Push interval (seconds between automatic push cycles).
     push_interval: Duration,
-    /// The configured broker this worker is NOT on, if any (primary or backup).
-    alternate_broker: Option<(String, u16, bool)>,
-    /// Connected to the backup broker, so the alternate is the primary.
-    on_backup: bool,
-    /// Broker login, for probing the alternate broker.
-    relay_token: String,
 }
 
 impl MqttRelay {
@@ -122,34 +117,8 @@ impl MqttRelay {
     /// events flow.
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
 
-    /// Disconnected this long with another broker configured: probe it, and
-    /// exit if it answers so the respawned worker connects there. Connection
-    /// errors count as activity for LIVENESS_TIMEOUT, so without this a worker
-    /// on a dead broker would retry it forever.
-    const SWITCH_BROKER_AFTER: Duration = Duration::from_secs(60);
-
     /// How often the worker advances catch-up backfill for skipped event ranges.
     const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
-
-    /// The broker this worker did NOT connect to, read from the config NOW, so a backup set
-    /// with `hcom config relay_backup` after the worker started is still probed (upstream
-    /// review of PR #144). Falls back to the one captured at connect if the config cannot load.
-    fn current_alternate(&self) -> Option<(String, u16, bool, String)> {
-        match HcomConfig::load(None) {
-            Ok(config) => {
-                let alternate = if self.on_backup {
-                    super::get_broker_from_config(&config)
-                } else {
-                    super::get_backup_broker_from_config(&config)
-                };
-                alternate.map(|(host, port, tls)| (host, port, tls, config.relay_token.clone()))
-            }
-            Err(_) => self
-                .alternate_broker
-                .clone()
-                .map(|(host, port, tls)| (host, port, tls, self.relay_token.clone())),
-        }
-    }
 
     /// Create and connect the MQTT relay client.
     ///
@@ -163,36 +132,7 @@ impl MqttRelay {
             return Err("relay not configured or disabled".into());
         }
 
-        let choice = super::choose_broker(config, &|host, port, tls| {
-            broker_answers(&config.relay_token, host, port, tls)
-        })
-        .ok_or("no broker configured")?;
-        // The broker NOT chosen: probed after a long disconnect, so a worker whose
-        // broker died moves to the other one instead of retrying it forever.
-        let alternate = if choice.backup {
-            super::get_broker_from_config(config)
-        } else {
-            super::get_backup_broker_from_config(config)
-        };
-        let (host, port, use_tls) = (choice.host.clone(), choice.port, choice.tls);
-        if let Ok(db) = HcomDb::open() {
-            let which = if choice.backup { "backup" } else { "primary" };
-            let previous = super::safe_kv_get(&db, super::ACTIVE_BROKER_KEY);
-            super::safe_kv_set(&db, super::ACTIVE_BROKER_KEY, Some(which));
-            if choice.backup {
-                log::log_warn(
-                    "relay",
-                    "relay.failover",
-                    &format!("primary broker not answering; using backup {host}:{port}"),
-                );
-            } else if previous.as_deref() == Some("backup") {
-                log::log_info(
-                    "relay",
-                    "relay.failback",
-                    &format!("primary broker answering again; back on {host}:{port}"),
-                );
-            }
-        }
+        let (host, port, use_tls) = get_broker_from_config(config).ok_or("no broker configured")?;
 
         let psk = load_psk(config)?;
 
@@ -242,9 +182,6 @@ impl MqttRelay {
             replay_guard: Mutex::new(ReplayGuard::default()),
             cmd_rx,
             push_interval: Duration::from_secs(5),
-            alternate_broker: alternate,
-            on_backup: choice.backup,
-            relay_token: config.relay_token.clone(),
         };
 
         log::log_info(
@@ -302,8 +239,6 @@ impl MqttRelay {
         let mut backoff_until = Instant::now();
         let mut last_push = Instant::now();
         let mut last_backfill = Instant::now();
-        let mut disconnected_since: Option<Instant> = Some(Instant::now());
-        let mut last_switch_probe: Option<Instant> = None;
         let mut pending_push_at: Option<Instant> = None;
         let mut connected = false;
         // Track last time we received ANY event (success or error) from the
@@ -383,36 +318,6 @@ impl MqttRelay {
                 self.do_push_cycle(connected);
                 last_push = Instant::now();
                 pending_push_at = None;
-            }
-
-            if connected {
-                disconnected_since = None;
-            } else if disconnected_since.is_none() {
-                disconnected_since = Some(Instant::now());
-            }
-            if let Some(since) = disconnected_since
-                && since.elapsed() >= Self::SWITCH_BROKER_AFTER
-                && last_switch_probe.is_none_or(|t| t.elapsed() >= Self::SWITCH_BROKER_AFTER)
-                && let Some((host, port, tls, token)) = self.current_alternate()
-            {
-                last_switch_probe = Some(Instant::now());
-                let answers = broker_answers(&token, &host, port, tls);
-                // The probe can wait seconds for a CONNACK; write a heartbeat at once
-                // after it so a slow probe is never read as a stale worker.
-                last_heartbeat = None;
-                if answers {
-                    log::log_warn(
-                        "relay",
-                        "relay.switch_broker",
-                        &format!(
-                            "disconnected {}s; {host}:{port} answers - exiting so the next worker connects there",
-                            since.elapsed().as_secs()
-                        ),
-                    );
-                    super::worker::request_handoff();
-                    self.shutdown_graceful(&event_rx);
-                    return;
-                }
             }
 
             // Catch-up backfill runs here, never in the inbound handler: its
@@ -935,8 +840,7 @@ impl EphemeralClient {
         payload: Vec<u8>,
         timeout: Duration,
     ) -> bool {
-        if self.client.publish(topic, qos, retain, payload).is_err()
-        {
+        if self.client.publish(topic, qos, retain, payload).is_err() {
             return false;
         }
 
@@ -970,34 +874,9 @@ impl EphemeralClient {
 /// Connects, waits for CONNACK (up to 5s), disconnects on failure. Returns None on failure.
 /// The returned EphemeralClient tracks PUBACK so callers can wait for delivery confirmation.
 pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
-    // Reach the peers where the worker is: on the backup while it has failed over.
-    let (host, port, use_tls) = match HcomDb::open() {
-        Ok(db) => super::active_broker(config, &db)?,
-        Err(_) => super::get_broker_from_config(config)?,
-    };
-    ephemeral_client_to(&config.relay_token, &host, port, use_tls)
-}
-
-/// True when an MQTT broker accepts our login (CONNACK) within the ephemeral
-/// client's connect timeout. Used to choose between primary and backup.
-pub fn broker_answers(relay_token: &str, host: &str, port: u16, use_tls: bool) -> bool {
-    match ephemeral_client_to(relay_token, host, port, use_tls) {
-        Some(client) => {
-            client.disconnect();
-            true
-        }
-        None => false,
-    }
-}
-
-fn ephemeral_client_to(
-    relay_token: &str,
-    host: &str,
-    port: u16,
-    use_tls: bool,
-) -> Option<EphemeralClient> {
+    let (host, port, use_tls) = super::get_broker_from_config(config)?;
     let client_id = format!("hcom-ephemeral-{}", std::process::id());
-    let mut mqttoptions = MqttOptions::new(&client_id, host, port);
+    let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
     mqttoptions.set_clean_start(true);
 
@@ -1005,8 +884,8 @@ fn ephemeral_client_to(
         mqttoptions.set_transport(rumqttc::Transport::tls_with_config(relay_tls_config()));
     }
 
-    if !relay_token.is_empty() {
-        mqttoptions.set_credentials("hcom", relay_token);
+    if !config.relay_token.is_empty() {
+        mqttoptions.set_credentials("hcom", &config.relay_token);
     }
 
     let (client, connection) = Client::new(mqttoptions, 10);
@@ -1159,9 +1038,6 @@ mod tests {
             replay_guard: Mutex::new(ReplayGuard::default()),
             cmd_rx,
             push_interval: Duration::from_secs(5),
-            alternate_broker: None,
-            on_backup: false,
-            relay_token: String::new(),
         };
         let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
             "other-relay/device-b",
