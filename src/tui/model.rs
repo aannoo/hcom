@@ -88,6 +88,7 @@ pub enum Tool {
     Cursor,
     Kimi,
     Copilot,
+    Grok,
     Adhoc,
     /// Persisted value written by a newer or third-party integration.
     Unknown(String),
@@ -108,6 +109,7 @@ impl Tool {
             Self::Cursor => Some(crate::tool::Tool::Cursor),
             Self::Kimi => Some(crate::tool::Tool::Kimi),
             Self::Copilot => Some(crate::tool::Tool::Copilot),
+            Self::Grok => Some(crate::tool::Tool::Grok),
             Self::Adhoc => Some(crate::tool::Tool::Adhoc),
             Self::Unknown(_) => None,
         }
@@ -142,7 +144,8 @@ impl Tool {
             Self::Antigravity => Self::Cursor,
             Self::Cursor => Self::Kimi,
             Self::Kimi => Self::Copilot,
-            Self::Copilot => Self::Claude,
+            Self::Copilot => Self::Grok,
+            Self::Grok => Self::Claude,
             Self::Adhoc => Self::Adhoc,
             Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
@@ -151,7 +154,7 @@ impl Tool {
     /// Cycle backward (for launch panel). Adhoc is not launchable.
     pub fn prev(&self) -> Self {
         match self {
-            Self::Claude => Self::Copilot,
+            Self::Claude => Self::Grok,
             Self::Gemini => Self::Claude,
             Self::Codex => Self::Gemini,
             Self::OpenCode => Self::Codex,
@@ -162,6 +165,7 @@ impl Tool {
             Self::Cursor => Self::Antigravity,
             Self::Kimi => Self::Cursor,
             Self::Copilot => Self::Kimi,
+            Self::Grok => Self::Copilot,
             Self::Adhoc => Self::Adhoc,
             Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
@@ -1271,12 +1275,14 @@ mod tests {
         assert_eq!(Tool::Antigravity.next(), Tool::Cursor);
         assert_eq!(Tool::Cursor.next(), Tool::Kimi);
         assert_eq!(Tool::Kimi.next(), Tool::Copilot);
-        assert_eq!(Tool::Copilot.next(), Tool::Claude);
+        assert_eq!(Tool::Copilot.next(), Tool::Grok);
+        assert_eq!(Tool::Grok.next(), Tool::Claude);
     }
 
     #[test]
     fn tool_prev_cycles_backward() {
-        assert_eq!(Tool::Claude.prev(), Tool::Copilot);
+        assert_eq!(Tool::Claude.prev(), Tool::Grok);
+        assert_eq!(Tool::Grok.prev(), Tool::Copilot);
         assert_eq!(Tool::Copilot.prev(), Tool::Kimi);
         assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
         assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);

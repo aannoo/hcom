@@ -1,7 +1,7 @@
-//! Batch launch tracking and wait_for_launch polling.
+//! Batch launch tracking and notification-driven launch confirmation.
 //!
 //! batch is ready, times out, or errors. Used by `hcom events --wait` and
-//! the launcher to poll for readiness after `hcom N claude`.
+//! the launcher to wait for readiness after `hcom N claude`.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -584,6 +584,40 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
     })
 }
 
+/// Each waiter gets its own endpoint, including anonymous and concurrent waits.
+/// Drop removes it on every return path; missed notifications still use polling.
+struct LaunchWaiter<'a> {
+    db: &'a HcomDb,
+    name: String,
+    server: crate::notify::NotifyServer,
+}
+
+impl<'a> LaunchWaiter<'a> {
+    fn new(db: &'a HcomDb, batch_id: Option<&str>) -> Option<Self> {
+        let server = crate::notify::NotifyServer::new().ok()?;
+        // LIKE wildcards are accepted by the existing batch query; keep those
+        // waits aggregate rather than treating a wildcard as a literal prefix.
+        let scope = batch_id.filter(|id| !id.contains(['%', '_'])).unwrap_or("");
+        let pid = std::process::id();
+        let owner = serde_json::json!({
+            "token": uuid::Uuid::new_v4().to_string(),
+            "pid": pid,
+            "process_identity": crate::sys::process::identity(pid),
+            "batch_prefix": scope,
+        });
+        let name = format!("launch-wait:{owner}");
+        db.upsert_notify_endpoint(&name, "launch_wait", server.port())
+            .ok()?;
+        Some(Self { db, name, server })
+    }
+}
+
+impl Drop for LaunchWaiter<'_> {
+    fn drop(&mut self) {
+        let _ = self.db.delete_notify_endpoint(&self.name, "launch_wait");
+    }
+}
+
 /// Block until launch batch is ready, times out, or errors.
 ///
 /// Args:
@@ -611,6 +645,9 @@ pub fn wait_for_launch(
         }
     };
 
+    // Register before reading status so a change between the read and wait
+    // remains queued on the socket rather than being lost.
+    let waiter = LaunchWaiter::new(db, batch_id);
     let mut status_data = match fetch(db) {
         Some(data) => data,
         None => {
@@ -647,7 +684,13 @@ pub fn wait_for_launch(
         && status_data.ready < status_data.expected
         && start.elapsed() < timeout
     {
-        thread::sleep(Duration::from_millis(500));
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let wait_time = remaining.min(Duration::from_millis(500));
+        if let Some(waiter) = &waiter {
+            waiter.server.wait(wait_time);
+        } else {
+            thread::sleep(wait_time);
+        }
 
         match fetch(db) {
             Some(data) => status_data = data,
@@ -819,6 +862,181 @@ mod tests {
         let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
         db.init_db().unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn concurrent_launch_waiters_receive_queued_events_and_clean_up() {
+        let (db, _dir) = make_test_db();
+        {
+            let first = LaunchWaiter::new(&db, None).unwrap();
+            let second = LaunchWaiter::new(&db, None).unwrap();
+            assert_ne!(first.name, second.name);
+            for action in [
+                "ready",
+                "launch_failed",
+                "launch_blocked",
+                "launch_blocked_cleared",
+                "stopped",
+            ] {
+                db.log_event("life", "mari", &serde_json::json!({"action": action}))
+                    .unwrap();
+                assert!(first.server.wait(Duration::from_secs(2)));
+                assert!(second.server.wait(Duration::from_secs(2)));
+            }
+            db.log_event(
+                "status",
+                "mari",
+                &serde_json::json!({"context": "launch_failed"}),
+            )
+            .unwrap();
+            assert!(first.server.wait(Duration::from_secs(2)));
+            assert!(second.server.wait(Duration::from_secs(2)));
+            db.log_event("status", "mari", &serde_json::json!({"status": "active"}))
+                .unwrap();
+            assert!(!first.server.wait(Duration::ZERO));
+            assert!(!second.server.wait(Duration::ZERO));
+        }
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'launch_wait'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn launch_notifications_route_to_batch_prefixes_and_aggregate_waiters() {
+        let (db, _dir) = make_test_db();
+        let aggregate = LaunchWaiter::new(&db, None).unwrap();
+        let matching = LaunchWaiter::new(&db, Some("BATCH-a")).unwrap();
+        let unrelated = LaunchWaiter::new(&db, Some("batch-b")).unwrap();
+        let wildcard = LaunchWaiter::new(&db, Some("batch-%")).unwrap();
+        for action in ["ready", "launch_failed", "launch_blocked"] {
+            db.log_event(
+                "life",
+                "mari",
+                &serde_json::json!({"action": action, "batch_id": "batch-a123"}),
+            )
+            .unwrap();
+            assert!(aggregate.server.wait(Duration::from_secs(2)));
+            assert!(matching.server.wait(Duration::from_secs(2)));
+            assert!(wildcard.server.wait(Duration::from_secs(2)));
+            assert!(!unrelated.server.wait(Duration::ZERO));
+        }
+        // Stopped/failure fallback events may lack batch metadata. They must
+        // still wake scoped waiters so launch failures are observed promptly.
+        db.log_event("life", "mari", &serde_json::json!({"action": "stopped"}))
+            .unwrap();
+        for waiter in [&aggregate, &matching, &unrelated, &wildcard] {
+            assert!(waiter.server.wait(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn launch_wait_observes_ready_and_cleans_up() {
+        let (db, _dir) = make_test_db();
+        db.log_event("life", "leku", &serde_json::json!({
+            "action": "batch_launched", "batch_id": "wake-test", "launched": 1, "instances": ["mari"]
+        })).unwrap();
+        let path = db.path().to_owned();
+        let writer = std::thread::spawn(move || {
+            let db = HcomDb::open_at(&path).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let count: i64 = db
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'launch_wait'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if count > 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "waiter never registered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Let the waiter enter its wait after registration.
+            std::thread::sleep(Duration::from_millis(40));
+            db.log_event(
+                "life",
+                "mari",
+                &serde_json::json!({"action": "ready", "batch_id": "wake-test"}),
+            )
+            .unwrap();
+        });
+        let result = wait_for_launch(&db, None, Some("wake-test"), 5);
+        writer.join().unwrap();
+        assert_eq!(result.status, LaunchStatus::Ready);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'launch_wait'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn launch_wait_falls_back_when_writer_does_not_notify() {
+        let (db, _dir) = make_test_db();
+        db.log_event("life", "leku", &serde_json::json!({"action": "batch_launched", "batch_id": "fallback-test", "launched": 1})).unwrap();
+        let path = db.path().to_owned();
+        let writer = std::thread::spawn(move || {
+            let db = HcomDb::open_at(&path).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let count: i64 = db
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'launch_wait'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if count > 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            db.conn().execute("INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', 'mari', ?)",
+                rusqlite::params![crate::db::chrono_now_iso(), r#"{"action":"ready","batch_id":"fallback-test"}"#]).unwrap();
+        });
+        assert_eq!(
+            wait_for_launch(&db, None, Some("fallback-test"), 3).status,
+            LaunchStatus::Ready
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn launch_wait_cleans_up_no_launches_and_zero_timeout() {
+        let (db, _dir) = make_test_db();
+        assert_eq!(
+            wait_for_launch(&db, None, None, 0).status,
+            LaunchStatus::NoLaunches
+        );
+        db.log_event("life", "leku", &serde_json::json!({"action": "batch_launched", "batch_id": "zero-test", "launched": 1})).unwrap();
+        assert_eq!(
+            wait_for_launch(&db, None, Some("zero-test"), 0).status,
+            LaunchStatus::Timeout
+        );
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'launch_wait'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -1128,7 +1346,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = wait_for_launch(&db, None, Some("batch-fresh-placeholder"), 1);
+        // This checks timeout finalization, not polling elapsed time. An
+        // immediate deadline exercises the same finalization path.
+        let result = wait_for_launch(&db, None, Some("batch-fresh-placeholder"), 0);
         assert_eq!(result.status, LaunchStatus::Timeout);
         assert_eq!(result.ready, Some(0));
         assert_eq!(result.failed, Some(0));

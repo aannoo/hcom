@@ -124,6 +124,28 @@ fn trim_with_nbsp(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || c == '\u{00A0}')
 }
 
+/// Prompt glyph to inspect in PTY debug dumps for a rendered input row.
+///
+/// Codex can use either glyph depending on the active reasoning tier, so the
+/// dump must inspect the glyph actually present on the row rather than assuming
+/// the normal-effort prompt.
+fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
+    use crate::tool::Tool;
+    use std::str::FromStr;
+
+    let line = line.trim_start();
+    match Tool::from_str(tool).ok()? {
+        Tool::Claude if line.contains('❯') => Some("❯"),
+        Tool::Codex if line == "»" || line.starts_with("» ") => Some("»"),
+        Tool::Codex if line == "›" || line.starts_with("› ") => Some("›"),
+        Tool::Gemini if line.contains("│ >") => Some(">"),
+        Tool::Antigravity if line.starts_with("> ") || line == ">" => Some(">"),
+        Tool::Cursor if line.contains('→') => Some("→"),
+        Tool::Copilot if line.contains('❯') => Some("❯"),
+        _ => None,
+    }
+}
+
 /// Check if a line is a Gemini dash border (all ─ chars, at least 20 wide)
 fn is_dash_border(line: &str) -> bool {
     let trimmed = line.trim();
@@ -146,7 +168,7 @@ pub struct ScreenTracker {
     // `process`/`resize`).
     rows: u16,
     cols: u16,
-    ready_pattern: String,
+    ready_patterns: Vec<String>,
     waiting_approval: bool,
     // Last complete, sanitized OSC 0/2 title the wrapped tool set, cached for the
     // Combined title passthrough. Only ever holds a fully-terminated title (see
@@ -189,7 +211,7 @@ impl ScreenTracker {
     pub fn new_with_instance(
         rows: u16,
         cols: u16,
-        ready_pattern: &[u8],
+        ready_patterns: &[String],
         instance_name: Option<&str>,
     ) -> Self {
         let config = Config::get();
@@ -206,7 +228,7 @@ impl ScreenTracker {
             parser: vt100::Parser::new(rows, cols, 0),
             rows,
             cols,
-            ready_pattern: String::from_utf8_lossy(ready_pattern).into_owned(),
+            ready_patterns: ready_patterns.to_vec(),
             waiting_approval: false,
             last_child_title: None,
             last_output: Instant::now(),
@@ -223,9 +245,9 @@ impl ScreenTracker {
 
         if tracker.debug_enabled {
             tracker.debug_log(&format!(
-                "PTY Debug log started for {}\nReady pattern: {:?}\nWill dump screen state every 5 seconds",
+                "PTY Debug log started for {}\nReady patterns: {:?}\nWill dump screen state every 5 seconds",
                 instance_name.unwrap_or("unknown"),
-                String::from_utf8_lossy(ready_pattern)
+                ready_patterns
             ));
         }
 
@@ -354,10 +376,10 @@ impl ScreenTracker {
     /// - Slash menu or other overlay is shown
     /// - Claude is in accept-edits mode (pattern hidden entirely)
     ///
-    /// Returns `true` if ready_pattern is currently visible on screen.
-    /// Always returns `true` if no ready_pattern configured (no gating by pattern).
+    /// Returns `true` if any ready pattern is currently visible on screen.
+    /// Always returns `true` if none are configured (no gating by pattern).
     pub fn is_ready(&self) -> bool {
-        if self.ready_pattern.is_empty() {
+        if self.ready_patterns.is_empty() {
             return true;
         }
 
@@ -369,8 +391,10 @@ impl ScreenTracker {
             if is_codex_startup_line(&line) {
                 return false;
             }
-            pattern_visible |= line.contains(&self.ready_pattern)
-                || (self.ready_pattern == "› " && line.contains("» "));
+            pattern_visible |= self
+                .ready_patterns
+                .iter()
+                .any(|p| line.contains(p.as_str()));
         }
         pattern_visible
     }
@@ -612,6 +636,37 @@ impl ScreenTracker {
         Some(!(non_dim_count > 0 && non_dim_count > dim_count))
     }
 
+    /// Render the non-whitespace cells after a prompt as char:style pairs for
+    /// debug logs. D means dim and - means normal intensity.
+    fn debug_cell_attrs_after_prompt(&self, row: u16, prompt_char: &str) -> Option<String> {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let mut found_prompt = false;
+        let mut attrs = String::new();
+
+        for col in 0..cols {
+            let cell = screen.cell(row, col)?;
+            let contents = cell.contents();
+            if !found_prompt {
+                if contents == prompt_char {
+                    found_prompt = true;
+                }
+                continue;
+            }
+            if contents.is_empty() || contents.chars().all(char::is_whitespace) {
+                continue;
+            }
+            let dim_marker = if cell.dim() { "D" } else { "-" };
+            attrs.push_str(&format!(
+                "{}:{} ",
+                contents.chars().next().unwrap_or('?'),
+                dim_marker
+            ));
+        }
+
+        found_prompt.then_some(attrs)
+    }
+
     /// Check if prompt is empty (tool-specific)
     pub fn is_prompt_empty(&self, tool: &str) -> bool {
         match self.get_input_box_text(tool) {
@@ -637,6 +692,9 @@ impl ScreenTracker {
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
+            // Grok: prompt-empty gate uses generic scrape when available; no
+            // tool-specific VT100 input parser yet.
+            Ok(Tool::Grok) => None,
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -1084,7 +1142,7 @@ impl ScreenTracker {
             self.debug_counter, label
         ));
         output.push_str(&format!("Tool: {}\n", tool));
-        output.push_str(&format!("Ready pattern: {:?}\n", self.ready_pattern));
+        output.push_str(&format!("Ready patterns: {:?}\n", self.ready_patterns));
         output.push_str(&format!("Inject port: {}\n", inject_port));
         output.push_str(&format!("Screen size: {}x{}\n", rows, cols));
         output.push_str(&format!("Cursor: ({}, {})\n", cursor.0, cursor.1));
@@ -1102,57 +1160,12 @@ impl ScreenTracker {
             if !trimmed.is_empty() {
                 output.push_str(&format!("  {:3}: {}\n", i, trimmed));
 
-                // For Claude prompt lines, show cell attributes to verify dim detection
-                use crate::tool::Tool;
-                use std::str::FromStr;
-
-                let prompt_char = match Tool::from_str(tool) {
-                    Ok(Tool::Claude) => Some("❯"),
-                    Ok(Tool::Codex) => Some("›"),
-                    Ok(Tool::Gemini) => Some(">"),
-                    Ok(Tool::Antigravity) => Some(">"),
-                    Ok(Tool::Cursor) => Some("→"),
-                    Ok(Tool::Copilot) => Some("❯"),
-                    _ => None,
-                };
-                if let Some(pc) = prompt_char {
-                    let should_dump = match (Tool::from_str(tool), pc) {
-                        (Ok(Tool::Gemini), ">") => trimmed.contains("│ >"),
-                        (Ok(Tool::Antigravity), ">") => trimmed.starts_with("> "),
-                        _ => trimmed.contains(pc),
-                    };
-                    if should_dump {
-                        let row = i as u16;
-                        let prompt_marker = if matches!(Tool::from_str(tool), Ok(Tool::Antigravity))
-                        {
-                            "> "
-                        } else {
-                            pc
-                        };
-                        let mut attrs_info = format!("       Cell attrs: [{}] ", prompt_marker);
-                        let mut found_prompt = false;
-                        for col in 0..cols {
-                            if let Some(cell) = screen.cell(row, col) {
-                                let contents = cell.contents();
-                                if contents == pc || (prompt_marker == "> " && contents == ">") {
-                                    found_prompt = true;
-                                    continue;
-                                }
-                                if found_prompt
-                                    && !contents.is_empty()
-                                    && !contents.chars().all(|c| c.is_whitespace())
-                                {
-                                    let dim_marker = if cell.dim() { "D" } else { "-" };
-                                    attrs_info.push_str(&format!(
-                                        "{}:{} ",
-                                        contents.chars().next().unwrap_or('?'),
-                                        dim_marker
-                                    ));
-                                }
-                            }
-                        }
-                        output.push_str(&format!("{}\n", attrs_info));
-                    }
+                // Show the parser's cell attributes for input rows so styling
+                // loss can be distinguished from a display-only terminal bug.
+                if let Some(pc) = debug_prompt_glyph(tool, trimmed)
+                    && let Some(attrs) = self.debug_cell_attrs_after_prompt(i as u16, pc)
+                {
+                    output.push_str(&format!("       Cell attrs: [{}] {}\n", pc, attrs));
                 }
             }
         }
@@ -1225,11 +1238,25 @@ mod tests {
 
     /// Helper: create tracker without debug/config dependencies
     fn make_tracker(rows: u16, cols: u16, ready_pattern: &str) -> ScreenTracker {
+        let patterns: &[&str] = if ready_pattern.is_empty() {
+            &[]
+        } else {
+            &[ready_pattern]
+        };
+        make_tracker_with(rows, cols, patterns)
+    }
+
+    /// Tracker using a tool's real `ready_patterns` from its IntegrationSpec.
+    fn make_tool_tracker(rows: u16, cols: u16, tool: crate::tool::Tool) -> ScreenTracker {
+        make_tracker_with(rows, cols, tool.ready_patterns())
+    }
+
+    fn make_tracker_with(rows: u16, cols: u16, ready_patterns: &[&str]) -> ScreenTracker {
         ScreenTracker {
             parser: vt100::Parser::new(rows, cols, 0),
             rows,
             cols,
-            ready_pattern: ready_pattern.to_string(),
+            ready_patterns: ready_patterns.iter().map(|p| p.to_string()).collect(),
             waiting_approval: false,
             last_child_title: None,
             last_output: Instant::now(),
@@ -1322,6 +1349,35 @@ mod tests {
         let mut t = make_tracker(24, 80, "? for shortcuts");
         t.process(b"Some output\r\n? for shortcuts\r\n");
         assert!(t.is_ready());
+    }
+
+    #[test]
+    fn claude_is_ready_in_every_permission_mode_footer() {
+        for footer in [
+            "  \u{23F8} manual mode on \u{00B7} ? for shortcuts \u{00B7} \u{2190} for agents",
+            "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle) \u{00B7} \u{2190} for agents",
+            "  \u{23F8} plan mode on (shift+tab to cycle)",
+            "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)",
+            "  \u{23F5}\u{23F5} don't ask on (shift+tab to cycle)",
+            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)",
+            "  \u{23F5}\u{23F5} accept edits on (meta+m to cycle)",
+        ] {
+            let mut t = make_tool_tracker(24, 80, crate::tool::Tool::Claude);
+            t.process(format!("\u{276F} \r\n{footer}\r\n").as_bytes());
+            assert!(t.is_ready(), "footer not ready: {footer}");
+        }
+    }
+
+    #[test]
+    fn claude_trust_dialog_is_not_ready() {
+        let mut t = make_tool_tracker(24, 80, crate::tool::Tool::Claude);
+        t.process(
+            "Quick safety check: Is this a project you created or one you trust?\r\n\
+             \u{276F} 1. Yes, I trust this folder\r\n  2. No, exit\r\n\
+             Enter to confirm \u{00B7} Esc to cancel\r\n"
+                .as_bytes(),
+        );
+        assert!(!t.is_ready());
     }
 
     #[test]
@@ -1652,7 +1708,7 @@ mod tests {
 
     #[test]
     fn codex_ultra_prompt_satisfies_ready_pattern() {
-        let mut t = make_tracker(24, 80, "› ");
+        let mut t = make_tool_tracker(24, 80, crate::tool::Tool::Codex);
         t.process("» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
 
         assert!(t.is_ready());
@@ -1742,6 +1798,37 @@ mod tests {
             t.get_codex_input_text(),
             Some("<hcom>test message</hcom>".to_string())
         );
+    }
+
+    #[test]
+    fn codex_debug_attrs_cover_both_prompt_glyphs() {
+        let mut normal = make_tracker(24, 80, "? for shortcuts");
+        normal.process("› compare A » B\r\n".as_bytes());
+        let normal_line = normal.get_screen_lines()[0].clone();
+        assert_eq!(debug_prompt_glyph("codex", &normal_line), Some("›"));
+        let normal_attrs = normal.debug_cell_attrs_after_prompt(0, "›").unwrap();
+        assert!(normal_attrs.contains("c:-"));
+
+        let mut ultra = make_tracker(24, 80, "? for shortcuts");
+        ultra.process("» \x1b[2mcompare A › B\x1b[0m\r\n".as_bytes());
+        let ultra_line = ultra.get_screen_lines()[0].clone();
+        assert_eq!(debug_prompt_glyph("codex", &ultra_line), Some("»"));
+        let ultra_attrs = ultra.debug_cell_attrs_after_prompt(0, "»").unwrap();
+        assert!(ultra_attrs.contains("c:D"));
+    }
+
+    #[test]
+    fn codex_debug_dump_writes_ultra_prompt_attrs() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.debug_enabled = true;
+        t.debug_file = Some(log.reopen().unwrap());
+        t.process("» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
+
+        t.dump_screen("codex", 0, "test");
+
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        assert!(output.contains("Cell attrs: [»] A:D"));
     }
 
     // ---- Cursor input extraction ----

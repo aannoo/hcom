@@ -28,7 +28,7 @@ use rusqlite::params;
 use serde_json::json;
 
 use super::HcomDb;
-use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags};
+use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags, collision_window_sql};
 use crate::messages::{InstanceInfo, MessageScope, ScopeResult, compute_scope, resolve_targets};
 use crate::shared::constants::extract_mentions;
 
@@ -548,12 +548,29 @@ pub(crate) fn process_logged_event(
     }
 
     for (key, value) in &rows {
-        let sub: serde_json::Value = match serde_json::from_str(value) {
+        let mut sub: serde_json::Value = match serde_json::from_str(value) {
             Ok(v) => v,
             Err(_) => continue,
         };
         if subscription_is_delivery_only(&sub) {
             continue;
+        }
+        if let Some(sql) = sub
+            .get("filters")
+            .and_then(|f| f.get("collision"))
+            .and(sub.get("sql"))
+            .and_then(|v| v.as_str())
+            .and_then(upgrade_collision_sql)
+        {
+            // Only the sql field, and only if no other process rewrote the
+            // record since it was read (it may have advanced last_id).
+            if let Err(e) = db.conn.execute(
+                "UPDATE kv SET value = json_set(value, '$.sql', ?1) WHERE key = ?2 AND value = ?3",
+                params![sql, key, value],
+            ) {
+                crate::log::log_error("db", "collision_sql_upgrade", &format!("{e}"));
+            }
+            sub["sql"] = json!(sql);
         }
         let sub_id = sub
             .get("id")
@@ -912,11 +929,33 @@ fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
     if exists { "instance" } else { "external" }
 }
 
+/// Rewrite collision SQL stored before the time-window index fix. Its
+/// correlated scans walked every status event (~0.3s per subscription on each
+/// file-write event), inside the writing agent's tool hook.
+fn upgrade_collision_sql(sql: &str) -> Option<String> {
+    if !sql.contains("WHERE e.type = 'status'") && !sql.contains("WHERE e2.type = 'status'") {
+        return None;
+    }
+    let mut sql = sql
+        .replace("WHERE e.type = 'status'", "WHERE +e.type = 'status'")
+        .replace("WHERE e2.type = 'status'", "WHERE +e2.type = 'status'");
+    for inner in ["e", "e2"] {
+        sql = sql.replace(
+            &format!(
+                "AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', {inner}.timestamp)) < 30"
+            ),
+            &format!("AND {}", collision_window_sql("events_v", inner)),
+        );
+    }
+    Some(sql)
+}
+
 fn collision_self_relevance_sql(caller: &str) -> String {
     let caller_escaped = caller.replace('\'', "''");
     format!(
-        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30))",
-        ctx = FILE_WRITE_CONTEXTS
+        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE +e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND {window}))",
+        ctx = FILE_WRITE_CONTEXTS,
+        window = collision_window_sql("events_v", "e2"),
     )
 }
 
@@ -1051,18 +1090,17 @@ fn find_collision_partner(
     db.conn
         .query_row(
             &format!(
-                "SELECT e.instance FROM events_v e
-                 WHERE e.type = 'status' AND e.status_context IN {}
+                "SELECT e.instance FROM events_v ev, events_v e
+                 WHERE ev.id = ?
+                 AND +e.type = 'status' AND e.status_context IN {}
                  AND e.status_detail = ?
                  AND e.instance != ?
-                 AND EXISTS (
-                     SELECT 1 FROM events_v ev WHERE ev.id = ?
-                     AND ABS(strftime('%s', ev.timestamp) - strftime('%s', e.timestamp)) < 30
-                 )
+                 AND {}
                  ORDER BY e.id DESC LIMIT 1",
-                FILE_WRITE_CONTEXTS
+                FILE_WRITE_CONTEXTS,
+                collision_window_sql("ev", "e"),
             ),
-            params![file_path, instance, event_id],
+            params![event_id, file_path, instance],
             |row| row.get::<_, String>(0),
         )
         .ok()
@@ -1493,6 +1531,84 @@ mod tests {
         assert_ne!(h1, h3);
         assert_eq!(h1.len(), 64);
         assert_eq!(&h1[..8], "9dfe6f15");
+    }
+
+    #[test]
+    fn test_upgrade_collision_sql_matches_current_builder() {
+        let mut filters = crate::core::filters::FilterMap::new();
+        filters.insert("collision".into(), vec!["true".into()]);
+        let current = format!(
+            "({}) AND {}",
+            build_sql_from_flags(&filters).unwrap(),
+            collision_self_relevance_sql("luna")
+        );
+        let legacy = current
+            .replace("+e.type", "e.type")
+            .replace("+e2.type", "e2.type")
+            .replace(
+                &collision_window_sql("events_v", "e"),
+                "ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30",
+            )
+            .replace(
+                &collision_window_sql("events_v", "e2"),
+                "ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30",
+            );
+        assert_ne!(legacy, current);
+        assert_eq!(
+            upgrade_collision_sql(&legacy).as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(upgrade_collision_sql(&current), None);
+    }
+
+    #[test]
+    fn test_process_logged_event_upgrades_stored_collision_sql() {
+        let (db, path) = setup_full_test_db();
+        let legacy = "(type = 'status' AND EXISTS (SELECT 1 FROM events_v e WHERE e.type = 'status' \
+             AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30))";
+        let sub = json!({"id": "sub-legacy", "caller": "luna", "sql": legacy, "last_id": 0,
+            "filters": {"collision": ["true"]}});
+        db.kv_set("events_sub:sub-legacy", Some(&sub.to_string()))
+            .unwrap();
+        db.log_status_event("nova", "active", "tool:Bash", Some("ls"), None)
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&db.kv_get("events_sub:sub-legacy").unwrap().unwrap()).unwrap();
+        let sql = stored["sql"].as_str().unwrap();
+        assert!(sql.contains("WHERE +e.type = 'status'"));
+        assert!(sql.contains(&collision_window_sql("events_v", "e")));
+        assert_eq!(stored["caller"], "luna");
+
+        let raw = json!({"id": "sub-raw", "caller": "luna", "sql": legacy, "last_id": 0,
+            "filters": {}});
+        db.kv_set("events_sub:sub-raw", Some(&raw.to_string()))
+            .unwrap();
+        db.log_status_event("nova", "active", "tool:Bash", Some("pwd"), None)
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&db.kv_get("events_sub:sub-raw").unwrap().unwrap()).unwrap();
+        assert_eq!(stored["sql"], legacy);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn test_find_collision_partner_respects_window() {
+        let (db, path) = setup_full_test_db();
+        let edit = |instance: &str, ts: &str| {
+            db.log_status_event(instance, "active", "tool:Edit", Some("/r/a.rs"), Some(ts))
+                .unwrap();
+            db.get_last_event_id()
+        };
+        edit("luna", "2026-09-30T02:00:00.100000+00:00");
+        edit("nova", "2026-09-30T02:01:00.000000+00:00");
+        let near = edit("mira", "2026-09-30T02:01:29.900000+00:00");
+        assert_eq!(
+            find_collision_partner(&db, near, "mira", "/r/a.rs").as_deref(),
+            Some("nova")
+        );
+        let far = edit("mira", "2026-09-30T02:05:00Z");
+        assert_eq!(find_collision_partner(&db, far, "mira", "/r/a.rs"), None);
+        cleanup_test_db(path);
     }
 
     #[test]

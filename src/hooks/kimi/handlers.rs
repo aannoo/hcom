@@ -80,15 +80,9 @@ pub(crate) fn handle_sessionstart(
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> HookResult {
+    // Persistent hooks also fire in plain runs; stay out of those.
     if ctx.process_id.is_none() {
-        return HookResult::Allow {
-            additional_context: Some(format!(
-                "[hcom available - run '{} start' to participate]",
-                crate::runtime_env::build_hcom_command()
-            )),
-            system_message: None,
-            delivery_ack: None,
-        };
+        return hook_noop();
     }
 
     let session_id = match payload.session_id.as_deref() {

@@ -579,23 +579,29 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 
 /// Configuration for the PTY proxy
 pub struct ProxyConfig {
-    /// Pattern to detect when tool is ready (e.g., b"? for shortcuts")
-    pub ready_pattern: Vec<u8>,
+    /// Markers that the tool is ready (e.g. "? for shortcuts"); any one matches
+    pub ready_patterns: Vec<String>,
     /// Instance name for logging and database tracking
     pub instance_name: Option<String>,
     /// Known integration or explicit ad-hoc command.
     pub target: PtyTarget,
     /// Extra environment variables to set in the child process
     pub env_vars: Vec<(String, String)>,
+    pub grok_acp: Option<crate::delivery::grok::Launch>,
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            ready_pattern: b"? for shortcuts".to_vec(),
+            ready_patterns: Tool::Claude
+                .ready_patterns()
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
             instance_name: None,
             target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
+            grok_acp: None,
         }
     }
 }
@@ -632,6 +638,8 @@ pub struct Proxy {
     title_notify_read: OwnedFd,
     /// Write side shared with the delivery thread's title wake callback.
     title_notify_write: Arc<OwnedFd>,
+    /// Startup timeline, measured from the child's spawn.
+    startup_trace: shared::StartupTrace,
 }
 
 #[cfg(unix)]
@@ -646,13 +654,14 @@ impl Proxy {
         terminal::setup_signal_handlers()?;
 
         // Spawn child process
+        let spawn_started = Instant::now();
         let slave_fd = pty.slave.as_raw_fd();
         let master_fd = pty.master.as_raw_fd();
 
         // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
         // All operations are async-signal-safe (setsid, ioctl, dup2, close).
         // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
-        let child = unsafe {
+        let mut child = unsafe {
             Command::new(command)
                 .args(args)
                 .envs(
@@ -699,16 +708,43 @@ impl Proxy {
                 .spawn()
                 .context("spawn failed")?
         };
+        let child_pid = child.id();
+        let child_identity = crate::sys::process::identity(child_pid);
+        let spawned_at = Instant::now();
+        shared::log_spawned(
+            config.instance_name.as_deref(),
+            Some(child_pid),
+            spawned_at.duration_since(spawn_started),
+            command,
+        );
+        let startup_trace = shared::StartupTrace::new(spawned_at, config.instance_name.as_deref());
 
         // Write PID and launch context to database for hcom kill
-        if let Some(ref instance_name) = config.instance_name
-            && let Ok(db) = crate::db::HcomDb::open()
-        {
-            let _ = db.update_instance_pid(instance_name, child.id());
+        if let Some(ref instance_name) = config.instance_name {
+            let persist_result = (|| -> Result<()> {
+                let db = crate::db::HcomDb::open()?;
+                // Our unreaped child can't have been recycled, so a missing identity
+                // (unobservable on this platform) just means no reuse protection.
+                db.update_instance_pid_with_identity(
+                    instance_name,
+                    child_pid,
+                    child_identity.as_deref(),
+                )?;
 
-            // Capture minimal launch context early so kill can close the terminal pane.
-            // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                // Capture minimal launch context early so kill can close the terminal pane.
+                // The start hook may later overwrite with richer context (git_branch, tty, env).
+                let _ =
+                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                Ok(())
+            })();
+            if let Err(error) = persist_result {
+                // The child is still unreaped, so its PID (and the process group it
+                // leads after setsid) can't have been reused yet.
+                let _ = crate::sys::process::kill_group(child_pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to persist PTY process"));
+            }
         }
 
         // Close slave in parent
@@ -721,7 +757,7 @@ impl Proxy {
         let screen = ScreenTracker::new_with_instance(
             winsize.ws_row,
             winsize.ws_col,
-            &config.ready_pattern,
+            &config.ready_patterns,
             config.instance_name.as_deref(),
         );
 
@@ -767,6 +803,7 @@ impl Proxy {
             current_status,
             title_notify_read,
             title_notify_write: Arc::new(title_notify_write),
+            startup_trace,
         })
     }
 
@@ -906,8 +943,20 @@ impl Proxy {
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
             }
+            // A tool that draws a screen without its ready pattern and then goes
+            // quiet (a trust dialog, a footer variant) would otherwise only reach
+            // the delivery-start fallback on the next 10s poll timeout.
+            if !delivery_started {
+                poll_timeout = poll_timeout.min(delivery_start_poll_ms(
+                    delivery_start_timeout,
+                    startup_time.elapsed(),
+                ));
+            }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
+                    if !ready_signaled {
+                        self.startup_trace.check_not_ready();
+                    }
                     // Timeout - still update delivery state for time-based checks
                     if ready_signaled {
                         shared::update_delivery_state(
@@ -938,6 +987,7 @@ impl Proxy {
                             self.current_name.clone(),
                             self.current_status.clone(),
                             Some(title_wake_callback(self.title_notify_write.clone())),
+                            self.config.grok_acp.clone(),
                         )? {
                             shared::DeliveryStart::Started(h) => {
                                 self.delivery_handle = Some(h);
@@ -1069,6 +1119,7 @@ impl Proxy {
 
                     // Process raw chunks for screen tracking
                     for raw in &raw_chunks {
+                        self.startup_trace.on_output(raw);
                         self.screen.process(raw);
                     }
                     if !raw_chunks.is_empty() {
@@ -1086,6 +1137,9 @@ impl Proxy {
                                 self.inject_server.port(),
                                 "Ready pattern detected",
                             );
+                        }
+                        if !ready_signaled {
+                            self.startup_trace.check_not_ready();
                         }
                         if !delivery_started {
                             let should_start =
@@ -1107,6 +1161,7 @@ impl Proxy {
                                     self.current_name.clone(),
                                     self.current_status.clone(),
                                     Some(title_wake_callback(self.title_notify_write.clone())),
+                                    self.config.grok_acp.clone(),
                                 )? {
                                     shared::DeliveryStart::Started(h) => {
                                         self.delivery_handle = Some(h);
@@ -1595,6 +1650,15 @@ fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
 
+/// Poll timeout (ms) that wakes the loop just past the delivery-start
+/// fallback. The start check is strict (`elapsed > timeout`), so wake 1ms late;
+/// never 0, which would make poll() busy-spin once the deadline has passed.
+#[cfg(unix)]
+fn delivery_start_poll_ms(timeout: Duration, elapsed: Duration) -> u16 {
+    let left = timeout.saturating_sub(elapsed).as_millis() + 1;
+    left.min(u16::MAX as u128) as u16
+}
+
 /// Initialize delivery components with dependency injection for testing
 ///
 /// Returns (db, notify) on success, Err on failure
@@ -1625,7 +1689,8 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+        PtyTarget, delivery_start_poll_ms, initialize_delivery_components, prompt_submit_observed,
+        strip_focus_events,
     };
     use anyhow::anyhow;
     use rusqlite::Connection;
@@ -1662,6 +1727,23 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delivery_start_poll_wakes_just_past_the_fallback() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(5);
+        assert_eq!(delivery_start_poll_ms(timeout, Duration::ZERO), 5001);
+        assert_eq!(
+            delivery_start_poll_ms(timeout, Duration::from_millis(4200)),
+            801
+        );
+        // Past the deadline: short but nonzero, so poll() never spins.
+        assert_eq!(delivery_start_poll_ms(timeout, Duration::from_secs(9)), 1);
+        assert_eq!(
+            delivery_start_poll_ms(Duration::from_secs(600), Duration::ZERO),
+            u16::MAX
+        );
     }
 
     #[test]

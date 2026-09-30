@@ -499,6 +499,30 @@ impl HcomDb {
         )?;
         let event_id = self.conn.last_insert_rowid();
 
+        // Wake launch confirmations only for changes they can observe. The
+        // usual autocommit INSERT is visible before the listener re-queries.
+        // Writes inside an outer transaction remain covered by fallback polling.
+        let action = data.get("action").and_then(serde_json::Value::as_str);
+        let context = data.get("context").and_then(serde_json::Value::as_str);
+        if (event_type == "life"
+            && matches!(
+                action,
+                Some(
+                    "ready"
+                        | "launch_failed"
+                        | "launch_blocked"
+                        | "launch_blocked_cleared"
+                        | "stopped"
+                )
+            ))
+            || (event_type == "status" && context == Some("launch_failed"))
+        {
+            crate::notify::wake::wake_launch_waiters(
+                self,
+                data.get("batch_id").and_then(serde_json::Value::as_str),
+            );
+        }
+
         // Check event subscriptions inline.
         subscriptions::process_logged_event(self, event_id, event_type, instance, data);
 
@@ -582,9 +606,8 @@ impl HcomDb {
             .unwrap_or(0)
     }
 
-    /// Log a status event to the events table
-    ///
-    /// Used by TranscriptWatcher to log tool:apply_patch, tool:shell, and prompt events.
+    /// Log a bare status event (test fixture for status-driven subscriptions).
+    #[cfg(test)]
     pub fn log_status_event(
         &self,
         instance: &str,

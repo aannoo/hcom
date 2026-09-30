@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
-use crate::shared::constants::ST_LISTENING;
+use crate::shared::constants::{ST_INACTIVE, ST_LISTENING};
 use crate::shared::time::now_epoch_i64;
 
 /// Instance status info
@@ -138,6 +138,54 @@ pub(super) const INSTANCE_COLUMNS: &str =
      terminal_preset_requested, terminal_preset_effective,
      idle_since, pid, launch_context";
 
+impl InstanceRow {
+    /// Process identity recorded with this snapshot's PID, if any.
+    pub fn pid_identity(&self) -> Option<String> {
+        let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;
+        ctx.get("pid_identity")?.as_str().map(str::to_string)
+    }
+
+    /// Whether a *different* live process now holds `pid` (the identity in
+    /// this snapshot no longer matches), so it must not be signalled on this
+    /// instance's behalf. Checked against the snapshot, not a fresh read, so
+    /// a concurrent delete of the row can't turn a reused PID into "unknown".
+    /// A PID that is simply gone is not "reused": its process group can
+    /// outlive the leader, and a PID isn't recycled while that group exists,
+    /// so group signals and pane cleanup stay safe there. Rows without a
+    /// stored identity can't tell and report `false`, as before identities.
+    pub fn pid_reused(&self, pid: u32) -> bool {
+        self.pid_identity().is_some_and(|expected| {
+            crate::sys::process::identity(pid).is_some_and(|current| current != expected)
+        })
+    }
+}
+
+/// Observe a live PID's process incarnation for storage.
+///
+/// Returns `Ok(None)` when the process is running but the platform can't report
+/// an identity (e.g. a sandbox hiding `/proc/sys/kernel/random/boot_id`): the
+/// PID is still tracked, just without PID-reuse protection, and cleanup falls
+/// back to plain liveness for that row. Only a PID that is already gone errors.
+pub fn observe_pid_identity(pid: u32) -> Result<Option<String>> {
+    // 0 and values that wrap negative as pid_t address process groups (or
+    // every process) in kill(), so liveness would be meaningless.
+    if pid == 0 || i32::try_from(pid).is_err() {
+        anyhow::bail!("invalid pid {pid}");
+    }
+    if let Some(identity) = crate::sys::process::identity(pid) {
+        return Ok(Some(identity));
+    }
+    if !crate::sys::process::is_alive(pid) {
+        anyhow::bail!("process {pid} is not running");
+    }
+    crate::log::log_warn(
+        "db",
+        "pid_identity.unavailable",
+        &format!("pid={pid} tracked without process identity"),
+    );
+    Ok(None)
+}
+
 impl HcomDb {
     /// Get instance status by name
     ///
@@ -186,6 +234,20 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Record an explicit kill before signalling the process.
+    ///
+    /// The PTY exit cleanup may finalize the stop before `hcom kill` does; it
+    /// reads `status_detail` back so the stopped event names the real initiator
+    /// instead of "pty".
+    pub fn mark_killed(&self, name: &str, initiator: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET status = ?, status_context = 'exit:killed', status_detail = ?, status_time = ?
+             WHERE name = ?",
+            params![ST_INACTIVE, initiator, now_epoch_i64(), name],
+        )?;
+        Ok(())
+    }
+
     /// Update gate blocking status WITHOUT logging a status event.
     ///
     /// Used for transient PTY gate states (tui:*) that shouldn't pollute the events table.
@@ -206,11 +268,105 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance PID after spawn
+    /// Update instance PID after spawn, recording the exact process incarnation
+    /// when the platform can observe it (see [`observe_pid_identity`]).
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
+        let pid_identity = observe_pid_identity(pid)?;
+        self.update_instance_pid_with_identity(name, pid, pid_identity.as_deref())
+    }
+
+    /// Update an instance PID with an already-observed process incarnation.
+    /// `None` stores the PID without reuse protection and drops any stale
+    /// identity so it can't be mistaken for this process.
+    pub fn update_instance_pid_with_identity(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: Option<&str>,
+    ) -> Result<()> {
+        match pid_identity {
+            Some(pid_identity) => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = json_set(
+                         CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                         '$.pid_identity', ?
+                     )
+                 WHERE name = ?",
+                params![pid as i64, pid_identity, name],
+            )?,
+            None => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = CASE
+                         WHEN json_valid(launch_context)
+                         THEN json_remove(launch_context, '$.pid_identity')
+                         ELSE launch_context
+                     END
+                 WHERE name = ?",
+                params![pid as i64, name],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Atomically persist PID ownership together with related instance fields.
+    pub fn update_instance_pid_with_fields(
+        &self,
+        name: &str,
+        pid: u32,
+        updates: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        let pid_identity = observe_pid_identity(pid)?;
+        self.update_instance_pid_with_identity_and_fields(
+            name,
+            pid,
+            pid_identity.as_deref(),
+            updates,
+        )
+    }
+
+    /// Atomically persist an already-observed PID incarnation with related fields.
+    pub fn update_instance_pid_with_identity_and_fields(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: Option<&str>,
+        updates: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.with_write_scope(|| {
+            self.update_instance_fields(name, updates)?;
+            self.update_instance_pid_with_identity(name, pid, pid_identity)
+        })
+    }
+
+    /// Stored process incarnation for an instance PID.
+    pub fn get_instance_pid_identity(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(launch_context)
+                        THEN json_extract(launch_context, '$.pid_identity') END
+                 FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Clear a PID and its stored process identity.
+    pub fn clear_instance_pid(&self, name: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET pid = ? WHERE name = ?",
-            params![pid as i64, name],
+            "UPDATE instances
+             SET pid = NULL,
+                 launch_context = CASE
+                     WHEN json_valid(launch_context)
+                     THEN json_remove(launch_context, '$.pid_identity')
+                     ELSE launch_context
+                 END
+             WHERE name = ?",
+            params![name],
         )?;
         Ok(())
     }
@@ -220,8 +376,9 @@ impl HcomDb {
     /// currently missing or empty so late-bound PTY metadata can be persisted
     /// without clobbering richer hook-captured context.
     pub fn store_launch_context(&self, name: &str, context_json: &str) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
+        // A write scope rather than BEGIN IMMEDIATE so this also works inside a
+        // caller's transaction (e.g. placeholder migration during a tool bind).
+        self.with_write_scope(|| {
             let existing_json: Option<String> = self
                 .conn
                 .query_row(
@@ -275,18 +432,7 @@ impl HcomDb {
                 )?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Get instance tag (for display name computation).
@@ -407,17 +553,69 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
-        let timestamp = chrono_now_iso();
+        self.finalize_instance_stop_inner(name, created_at, session_id, agent_id, None, event_data)
+    }
+
+    /// Finalize a stop only while the row still owns the inspected PID incarnation.
+    pub fn finalize_instance_stop_if_pid_identity(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid_guard: (u32, &str),
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
+        self.finalize_instance_stop_inner(
+            name,
+            created_at,
+            session_id,
+            agent_id,
+            Some(pid_guard),
+            event_data,
+        )
+    }
+
+    fn finalize_instance_stop_inner(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid_guard: Option<(u32, &str)>,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
-            let deleted = tx.execute(
-                "DELETE FROM instances
-                 WHERE name = ? AND created_at = ?
-                   AND session_id IS ? AND agent_id IS ?",
-                params![name, created_at, session_id, agent_id],
-            )?;
+            // Stamp after taking the write lock so timestamp order matches id order.
+            let timestamp = chrono_now_iso();
+            let deleted = if let Some((pid, pid_identity)) = pid_guard {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?
+                       AND pid = ?
+                       AND json_valid(launch_context)
+                       AND json_extract(launch_context, '$.pid_identity') = ?",
+                    params![
+                        name,
+                        created_at,
+                        session_id,
+                        agent_id,
+                        pid as i64,
+                        pid_identity
+                    ],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?",
+                    params![name, created_at, session_id, agent_id],
+                )?
+            };
             if deleted == 0 {
                 return Ok(false);
             }
@@ -788,6 +986,28 @@ impl HcomDb {
         Ok(rows > 0)
     }
 
+    /// Acknowledge an emitted batch without rewinding a concurrent delivery.
+    /// The comparison and update are one SQLite operation, not a read/modify/write.
+    pub fn advance_instance_cursor(&self, name: &str, event_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?) WHERE name = ?",
+            params![event_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Forward-only cursor advance, optionally marking the name announced, in
+    /// one statement.
+    pub fn ack_hook_delivery(&self, name: &str, event_id: i64, announce: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
+             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
+             WHERE name = ?",
+            params![event_id, announce, name],
+        )?;
+        Ok(())
+    }
+
     /// Update specific fields on an instance row.
     /// Uses a JSON Value map for flexible field specification.
     pub fn update_instance_fields(
@@ -1045,6 +1265,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ready_count, 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_pid_identity_lives_in_launch_context_and_clears_with_pid() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\"}')",
+                [],
+            )
+            .unwrap();
+
+        let pid = std::process::id();
+        let expected = crate::sys::process::identity(pid).expect("current process has identity");
+        db.update_instance_pid("luna", pid).unwrap();
+
+        assert_eq!(
+            db.get_instance_pid_identity("luna").unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+        let launch_context: String = db
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+        assert_eq!(launch_context["pane_id"], "42");
+        assert_eq!(launch_context["pid_identity"], expected);
+
+        db.clear_instance_pid("luna").unwrap();
+        let (pid, launch_context): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, launch_context FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, None);
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+        assert_eq!(launch_context["pane_id"], "42");
+        assert!(launch_context.get("pid_identity").is_none());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_update_instance_pid_rejects_process_that_is_gone() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.update_instance_pid("luna", u32::MAX).is_err());
+        let pid: Option<i64> = db
+            .conn
+            .query_row("SELECT pid FROM instances WHERE name = 'luna'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pid, None);
+        assert_eq!(db.get_instance_pid_identity("luna").unwrap(), None);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_pid_without_observable_identity_is_tracked_and_drops_stale_identity() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\",\"pid_identity\":\"old\"}')",
+                [],
+            )
+            .unwrap();
+
+        // Platforms that can't report an identity must still record the PID
+        // (so launches don't fail), and must not keep a previous identity.
+        db.update_instance_pid_with_identity("luna", 4242, None)
+            .unwrap();
+
+        let (pid, launch_context): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, launch_context FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, Some(4242));
+        assert_eq!(db.get_instance_pid_identity("luna").unwrap(), None);
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+        assert_eq!(launch_context["pane_id"], "42");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_update_instance_pid_with_fields_can_join_outer_transaction() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        let pid = std::process::id();
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "background_log_file".into(),
+            serde_json::json!("runner.log"),
+        );
+
+        let outer = db.conn.unchecked_transaction().unwrap();
+        db.update_instance_pid_with_fields("luna", pid, &updates)
+            .unwrap();
+        outer.commit().unwrap();
+
+        let (stored_pid, log_file): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, background_log_file FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_pid, Some(pid as i64));
+        assert_eq!(log_file, "runner.log");
+        assert!(db.get_instance_pid_identity("luna").unwrap().is_some());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_update_instance_pid_with_fields_is_atomic_on_identity_failure() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, background_log_file)
+                 VALUES ('luna', 1.0, 'before.log')",
+                [],
+            )
+            .unwrap();
+
+        let mut updates = serde_json::Map::new();
+        updates.insert("background_log_file".into(), serde_json::json!("after.log"));
+        assert!(
+            db.update_instance_pid_with_fields("luna", u32::MAX, &updates)
+                .is_err()
+        );
+
+        let (pid, log_file): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, background_log_file FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, None);
+        assert_eq!(log_file, "before.log");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_finalize_instance_stop_pid_identity_guard_rejects_rebind() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+        let pid = std::process::id();
+        db.update_instance_pid("luna", pid).unwrap();
+        let original_identity = db
+            .get_instance_pid_identity("luna")
+            .unwrap()
+            .expect("current process identity");
+
+        db.update_instance_pid_with_identity("luna", pid, Some("replacement-incarnation"))
+            .unwrap();
+        let event = serde_json::json!({"action": "stopped", "reason": "process_exit"});
+        assert!(
+            !db.finalize_instance_stop_if_pid_identity(
+                "luna",
+                1.0,
+                None,
+                None,
+                (pid, &original_identity),
+                &event,
+            )
+            .unwrap()
+        );
+        assert!(db.get_instance_full("luna").unwrap().is_some());
 
         cleanup_test_db(db_path);
     }

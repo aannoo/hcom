@@ -36,14 +36,27 @@ pub enum WakeKind {
     ListenFilter,
     /// `hcom events --wait` blocking poll.
     EventsWait,
+    /// Temporary launch-confirmation waiter.
+    LaunchWait,
     /// OpenCode plugin runtime.
     Plugin,
 }
 
 impl WakeKind {
-    /// All wake kinds — used for "wake everything for this instance" and for
-    /// the kind filter in `wake_all`.
+    /// All wake kinds, including temporary launch confirmations.
     pub const ALL: &'static [WakeKind] = &[
+        WakeKind::Pty,
+        WakeKind::Hook,
+        WakeKind::Listen,
+        WakeKind::ListenFilter,
+        WakeKind::EventsWait,
+        WakeKind::LaunchWait,
+        WakeKind::Plugin,
+    ];
+
+    /// Instance loops woken by sends, relay imports, and configuration changes.
+    /// Launch confirmations use their own batch-scoped lifecycle wake path.
+    pub const INSTANCE_LOOPS: &'static [WakeKind] = &[
         WakeKind::Pty,
         WakeKind::Hook,
         WakeKind::Listen,
@@ -65,6 +78,7 @@ impl WakeKind {
             WakeKind::Listen => "listen",
             WakeKind::ListenFilter => "listen_filter",
             WakeKind::EventsWait => "events_wait",
+            WakeKind::LaunchWait => "launch_wait",
             WakeKind::Plugin => "plugin",
         }
     }

@@ -1,9 +1,8 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot). Grok has none (see `delivery/grok.rs`).
 
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
-pub mod codex_file_edits;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
@@ -12,6 +11,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
+pub mod runtime;
 pub mod utils;
 
 use serde_json::Value;
@@ -223,7 +223,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,

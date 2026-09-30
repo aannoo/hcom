@@ -1,23 +1,39 @@
-//! Broker discovery — parallel TLS handshake to find working MQTT broker.
+//! Broker discovery — parallel TLS handshake to find a working MQTT broker.
 //!
-//! Uses std::thread::scope for parallel connections (no async runtime needed).
-//! Used by `hcom relay new` to find and pin the fastest public broker.
+//! Used by `hcom relay new` to pick the highest-priority reachable public broker.
 
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-/// Result of testing a single broker: (host, port, ping_ms or None on failure).
-pub type BrokerTestResult = (String, u16, Option<u64>);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of probing one broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerProbe {
+    /// TCP (+TLS) handshake completed in this many ms.
+    Reachable(u64),
+    Failed,
+    /// Not waited for: a higher-priority broker already answered.
+    Skipped,
+}
+
+/// Result of testing a single broker: (host, port, outcome).
+pub type BrokerTestResult = (String, u16, BrokerProbe);
+
+/// Connect to the first resolved address that accepts. Resolution often lists
+/// IPv6 first, and on an IPv4-only network that address can never connect.
+fn connect_any(addrs: &[SocketAddr]) -> Option<TcpStream> {
+    addrs
+        .iter()
+        .find_map(|addr| TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).ok())
+}
 
 /// Test a single broker via TCP+TLS handshake. Returns round-trip ms or None.
 pub fn ping_broker(host: &str, port: u16, use_tls: bool) -> Option<u64> {
     let t0 = Instant::now();
-    let socket_addr = format!("{}:{}", host, port)
-        .to_socket_addrs()
-        .ok()?
-        .next()?;
-    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)).ok()?;
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs().ok()?.collect();
+    let mut stream = connect_any(&addrs)?;
 
     if use_tls {
         // TCP+TLS handshake only. Verify the broker is reachable and accepts TLS.
@@ -54,48 +70,57 @@ pub fn ping_broker(host: &str, port: u16, use_tls: bool) -> Option<u64> {
     Some(t0.elapsed().as_millis() as u64)
 }
 
-/// Test all brokers in parallel. Returns results in input order.
-/// Uses std::thread::scope for scoped threads (no Arc needed for shared refs).
+/// Probe brokers in parallel, returning results in input (priority) order.
+///
+/// Returns as soon as the pick is settled — every broker ahead of the first
+/// reachable one has failed — rather than waiting out slower lower-priority
+/// probes, which can each take up to 10s to fail. Those report `Skipped`.
 pub fn test_brokers_parallel(brokers: &[(&str, u16)]) -> Vec<BrokerTestResult> {
-    let mut results: Vec<BrokerTestResult> = brokers
-        .iter()
-        .map(|(h, p)| (h.to_string(), *p, None))
-        .collect();
-
-    std::thread::scope(|s| {
-        let handles: Vec<_> = brokers
-            .iter()
-            .enumerate()
-            .map(|(i, (host, port))| {
-                let host = host.to_string();
-                let port = *port;
-                s.spawn(move || {
-                    let use_tls = port == 8883 || port == 8886;
-                    let ping_ms = ping_broker(&host, port, use_tls);
-                    (i, ping_ms)
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            if let Ok((i, ping_ms)) = handle.join() {
-                results[i].2 = ping_ms;
-            }
-        }
-    });
-
-    results
+    test_brokers_with(brokers, ping_broker)
 }
 
-/// Find the first working broker from DEFAULT_BROKERS.
-/// Returns (host, port, ping_ms) or None if all unreachable.
-pub fn find_working_broker() -> Option<(String, u16, u64)> {
-    let results = test_brokers_parallel(super::DEFAULT_BROKERS);
-    // Return first reachable broker (preserves priority order)
-    results
-        .into_iter()
-        .find(|(_, _, ping)| ping.is_some())
-        .map(|(h, p, ping)| (h, p, ping.unwrap()))
+fn test_brokers_with(
+    brokers: &[(&str, u16)],
+    ping: fn(&str, u16, bool) -> Option<u64>,
+) -> Vec<BrokerTestResult> {
+    let mut outcomes: Vec<Option<BrokerProbe>> = vec![None; brokers.len()];
+    let (tx, rx) = mpsc::channel();
+    for (i, (host, port)) in brokers.iter().enumerate() {
+        let (tx, host, port) = (tx.clone(), host.to_string(), *port);
+        // Detached: an abandoned probe finishes (or times out) on its own.
+        std::thread::spawn(move || {
+            let use_tls = port == 8883 || port == 8886;
+            let _ = tx.send((i, ping(&host, port, use_tls)));
+        });
+    }
+    drop(tx);
+
+    let settled = |outcomes: &[Option<BrokerProbe>]| {
+        for outcome in outcomes {
+            match outcome {
+                Some(BrokerProbe::Reachable(_)) => return true,
+                Some(_) => {}
+                None => return false,
+            }
+        }
+        true
+    };
+    while !settled(&outcomes) {
+        let Ok((i, ping_ms)) = rx.recv() else { break };
+        outcomes[i] = Some(ping_ms.map_or(BrokerProbe::Failed, BrokerProbe::Reachable));
+    }
+
+    brokers
+        .iter()
+        .zip(outcomes)
+        .map(|((host, port), outcome)| {
+            (
+                host.to_string(),
+                *port,
+                outcome.unwrap_or(BrokerProbe::Skipped),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -145,15 +170,58 @@ mod tests {
         let brokers = &[("127.0.0.1", p1), ("127.0.0.1", p2)];
         // Pretend these are TLS broker ports so ping_broker drives the full
         // TLS handshake path against our closing listeners.
-        let results: Vec<BrokerTestResult> = brokers
+        let results: Vec<_> = brokers
             .iter()
-            .map(|(h, p)| {
-                let ping = ping_broker(h, *p, true);
-                (h.to_string(), *p, ping)
-            })
+            .map(|(h, p)| ping_broker(h, *p, true))
             .collect();
-        assert_eq!(results.len(), 2);
-        assert!(results[0].2.is_none());
-        assert!(results[1].2.is_none());
+        assert_eq!(results, [None, None]);
+    }
+
+    fn fake_ping(host: &str, _port: u16, _tls: bool) -> Option<u64> {
+        // host encodes "<delay_ms>:<ok|fail>"
+        let (delay, ok) = host.split_once(':').unwrap();
+        std::thread::sleep(Duration::from_millis(delay.parse().unwrap()));
+        (ok == "ok").then_some(1)
+    }
+
+    #[test]
+    fn brokers_return_once_top_priority_answers() {
+        let t0 = Instant::now();
+        let results = test_brokers_with(&[("10:ok", 1), ("3000:fail", 2)], fake_ping);
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "waited for slow probe"
+        );
+        assert_eq!(results[0].2, BrokerProbe::Reachable(1));
+        assert_eq!(results[1].2, BrokerProbe::Skipped);
+    }
+
+    #[test]
+    fn brokers_wait_for_higher_priority_before_picking_lower() {
+        let results =
+            test_brokers_with(&[("200:fail", 1), ("10:ok", 2), ("3000:ok", 3)], fake_ping);
+        assert_eq!(results[0].2, BrokerProbe::Failed);
+        assert_eq!(results[1].2, BrokerProbe::Reachable(1));
+        assert_eq!(results[2].2, BrokerProbe::Skipped);
+    }
+
+    #[test]
+    fn brokers_all_failed() {
+        let results = test_brokers_with(&[("10:fail", 1), ("20:fail", 2)], fake_ping);
+        assert!(results.iter().all(|r| r.2 == BrokerProbe::Failed));
+    }
+
+    #[test]
+    fn connect_any_skips_unconnectable_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        // A just-closed port refuses immediately, standing in for an
+        // unreachable IPv6 address listed first.
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let stream = connect_any(&[dead, good]).expect("falls through to the live address");
+        assert_eq!(stream.peer_addr().unwrap(), good);
     }
 }

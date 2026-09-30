@@ -19,7 +19,9 @@ use serial_test::serial;
 use std::fs;
 use std::time::Duration;
 use support::Hcom;
-use support::claude_mock::{ClaudeCase, MODEL, claude_text, claude_tool_use, latest_user_turn};
+use support::claude_mock::{
+    ClaudeCase, MODEL, claude_text, claude_tool_use, latest_user_turn, seed_claude_state,
+};
 use support::mock_http::{MockHttp, Reply};
 use support::real_tool::{ToolCase, require_pinned};
 use support::{parse_launch_names, unique_suffix};
@@ -108,6 +110,9 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
 
     let base_url = case.provider_base_url(mock.port());
     case.prepare(&h, &base_url);
+    // prepare() pre-trusts the workspace; drop that here so this test still
+    // drives Claude's real trust dialog (required before hooks register).
+    seed_claude_state(&h.claude_home, &[]);
 
     // Manual permission mode so a non-allowlisted Bash call is gated by
     // Claude's permission UI and PermissionRequest hook. Explicit because a

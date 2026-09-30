@@ -86,11 +86,15 @@ pub struct Proxy {
     /// runs. `None` if the child couldn't be assigned (falls back to the
     /// snapshot-based kill in `Drop`).
     _job: Option<job::KillOnDropJob>,
+    /// When the ConPTY child was spawned; the reader's startup trace measures
+    /// from here.
+    spawned_at: Instant,
 }
 
 impl Proxy {
     /// Spawn `command` under a ConPTY and prepare the proxy.
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
+        let spawn_started = Instant::now();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
         let pty_system = native_pty_system();
@@ -135,30 +139,58 @@ impl Proxy {
             cmd.cwd(crate::shared::platform::child_process_path(&cwd));
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("ConPTY spawn failed")?;
+        let spawned_at = Instant::now();
+        shared::log_spawned(
+            config.instance_name.as_deref(),
+            child.process_id(),
+            spawned_at.duration_since(spawn_started),
+            command,
+        );
+        // Install descendant cleanup immediately. Any later setup failure must
+        // still reap the spawned process tree.
+        let job = child.process_id().and_then(job::KillOnDropJob::assign);
         // The parent does not need the slave handle once the child holds it.
         drop(pair.slave);
 
         let writer = pair.master.take_writer().context("take_writer failed")?;
 
         // Persist PID so `hcom kill` can target the agent.
-        if let Some(ref instance_name) = config.instance_name
-            && let Ok(db) = HcomDb::open()
-            && let Some(pid) = child.process_id()
-        {
-            let _ = db.update_instance_pid(instance_name, pid);
+        if let Some(ref instance_name) = config.instance_name {
+            let persist_result = (|| -> Result<()> {
+                let pid = child
+                    .process_id()
+                    .context("ConPTY child has no process id")?;
+                let db = HcomDb::open()?;
+                // The child handle keeps this PID from being reused, so a missing
+                // identity only means no reuse protection for later cleanup.
+                db.update_instance_pid_with_identity(
+                    instance_name,
+                    pid,
+                    crate::sys::process::identity(pid).as_deref(),
+                )?;
 
-            // Capture minimal launch context early so kill can close the terminal pane.
-            // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                // Capture minimal launch context early so kill can close the terminal pane.
+                // The start hook may later overwrite with richer context (git_branch, tty, env).
+                let _ =
+                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                Ok(())
+            })();
+            if let Err(error) = persist_result {
+                // We still hold the child's handle, so its PID can't have been
+                // reused. Kill the tree, then the child itself, and reap it so
+                // nothing outlives the failed launch (matches the Unix path).
+                if let Some(pid) = child.process_id() {
+                    let _ = crate::sys::process::kill_group(pid);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to persist ConPTY process"));
+            }
         }
-
-        // Tie the child to a kill-on-close job so its whole tree is reaped if we
-        // die abnormally (the explicit snapshot-kill in Drop covers clean exit).
-        let job = child.process_id().and_then(job::KillOnDropJob::assign);
 
         let initial_name = config.instance_name.clone().unwrap_or_default();
 
@@ -183,6 +215,7 @@ impl Proxy {
             last_tail: Arc::new(RwLock::new(None)),
             launch_failed: Arc::new(AtomicBool::new(false)),
             _job: job,
+            spawned_at,
         })
     }
 
@@ -328,6 +361,7 @@ impl Proxy {
         let launch_phase = self.launch_phase_active.clone();
         let target = self.config.target.clone();
         let instance = self.config.instance_name.clone();
+        let grok_acp = self.config.grok_acp.clone();
         let current_name = self.current_name.clone();
         let current_status = self.current_status.clone();
         let notify_port = self.notify_port.clone();
@@ -356,6 +390,7 @@ impl Proxy {
                         current_name.clone(),
                         current_status.clone(),
                         None,
+                        grok_acp.clone(),
                     ) {
                         Ok(shared::DeliveryStart::Started(h)) => {
                             *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
@@ -468,7 +503,7 @@ impl Proxy {
         let screen_state = self.screen_state.clone();
         let launch_phase = self.launch_phase_active.clone();
         let target = self.config.target.clone();
-        let ready_pattern = self.config.ready_pattern.clone();
+        let ready_patterns = self.config.ready_patterns.clone();
         let instance = self.config.instance_name.clone();
         let current_name = self.current_name.clone();
         let current_status = self.current_status.clone();
@@ -479,6 +514,7 @@ impl Proxy {
         let screen_snapshot = self.screen_snapshot.clone();
         let writer = self.writer.clone();
         let (rows, cols) = (self.rows, self.cols);
+        let mut trace = shared::StartupTrace::new(self.spawned_at, instance.as_deref());
 
         // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
         // chunks over a channel. This exists so the consumer loop below can wait
@@ -517,7 +553,7 @@ impl Proxy {
 
         Ok(thread::spawn(move || {
             let mut screen =
-                ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
+                ScreenTracker::new_with_instance(rows, cols, &ready_patterns, instance.as_deref());
             let mut stdout = std::io::stdout();
             let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
@@ -586,6 +622,9 @@ impl Proxy {
                                 &publish,
                             );
                         }
+                        if !ready_signaled.load(Ordering::Acquire) {
+                            trace.check_not_ready();
+                        }
                         screen.check_debug_flag();
                         screen.check_periodic_dump(
                             target.name(),
@@ -606,6 +645,7 @@ impl Proxy {
                     }
                     Ok(data) => {
                         let data = data.as_slice();
+                        trace.on_output(data);
                         // A genuine keystroke / injected answer flagged a pending
                         // approval for clearing; the reader owns the tracker.
                         if approval_clear_requested.swap(false, Ordering::AcqRel) {
@@ -639,6 +679,7 @@ impl Proxy {
                         {
                             let _ = w.write_all(b"\x1b[1;1R");
                             let _ = w.flush();
+                            trace.on_dsr_answered();
                         }
 
                         screen.process(data);

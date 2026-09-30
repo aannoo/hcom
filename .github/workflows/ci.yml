@@ -175,6 +175,8 @@ jobs:
       # took the runner out from under it".
       - shell: bash
         if: runner.os != 'Windows'
+        env:
+          HCOM_TEST_KEEP_DIR: ${{ runner.temp }}/hcom-real-tool
         run: |
           for i in $(seq 1 "${{ inputs.repeat || 1 }}"); do
             echo "::group::${{ matrix.test }} attempt $i"
@@ -194,6 +196,8 @@ jobs:
           done
       - shell: pwsh
         if: runner.os == 'Windows'
+        env:
+          HCOM_TEST_KEEP_DIR: ${{ runner.temp }}/hcom-real-tool
         run: |
           foreach ($i in 1..${{ inputs.repeat || 1 }}) {
             Write-Host "::group::${{ matrix.test }} attempt $i"
@@ -208,3 +212,15 @@ jobs:
               exit $code
             }
           }
+      # Only failed tests leave a directory behind (hcom state + logs, Claude
+      # debug log, workspace, launch scripts). The log dump alone could not
+      # tell a slow Windows Bash tool from a hung one.
+      - name: Upload failed test directories
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failed-${{ matrix.test }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/hcom-real-tool
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14

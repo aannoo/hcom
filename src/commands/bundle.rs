@@ -352,10 +352,7 @@ fn cmd_bundle_show(db: &HcomDb, args: &BundleShowArgs) -> i32 {
     };
 
     if json_mode {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&bundle).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&bundle).unwrap_or_default());
     } else {
         let title = bundle.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let desc = bundle
@@ -736,10 +733,7 @@ fn cmd_bundle_chain(db: &HcomDb, args: &BundleChainArgs) -> i32 {
     }
 
     if json_mode {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&chain).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&chain).unwrap_or_default());
         return 0;
     }
 
@@ -953,10 +947,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
             "template_command": template_command,
             "note": format!("Last {} transcript entries, {} events per category", last_transcript, last_events),
         });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&result).unwrap_or_default());
         return 0;
     }
 

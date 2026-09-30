@@ -13,7 +13,7 @@ use support::{Hcom, parse_hcom_marker};
 fn fixture_drop_terminates_registered_process_group() {
     #[cfg(unix)]
     let mut child = Command::new("sh")
-        .args(["-c", "sleep 60"])
+        .args(["-c", "exec sleep 60"])
         .process_group(0)
         .spawn()
         .expect("spawn cleanup test process group");
@@ -47,6 +47,70 @@ fn fixture_drop_terminates_registered_process_group() {
         !support::process_group_alive(pid),
         "fixture drop left process group {pid} alive"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_drop_terminates_orphan_without_instance_row() {
+    let h = Hcom::new();
+    // Only the pidfile owns this process; neither instance rows nor explicit
+    // fixture cleanup registration can discover it.
+    // Reap the descendant on group termination so zombie lifetime does not
+    // depend on the host init process. Killing only the shell still leaves it
+    // waiting for its live child, which the bounded exit check detects.
+    let ready_path = h.root_path().join("orphan-ready");
+    let mut child = Command::new("sh")
+        .args([
+            "-c",
+            r#"sleep 60 & descendant=$!; trap 'wait "$descendant"; exit 143' TERM; printf ready > "$1"; wait "$descendant""#,
+            "orphan-fixture",
+        ])
+        .arg(&ready_path)
+        .process_group(0)
+        .spawn()
+        .expect("spawn orphan process group");
+    let pid = i64::from(child.id());
+    let tmp = h.hcom_dir.join(".tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        tmp.join("launched_pids.json"),
+        serde_json::json!({pid.to_string(): {
+            "tool": "claude", "names": ["orphan"], "launched_at": 1.0
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    // Confirm the descendant exists without an unbounded pipe read. Register
+    // its group first so fixture cleanup also runs if readiness times out.
+    h.eventually("orphan descendant started", Duration::from_secs(3), || {
+        Ok(ready_path.exists().then_some(()))
+    });
+    drop(h);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll orphan") {
+            assert!(
+                !status.success(),
+                "orphan must be terminated by fixture teardown"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            support::terminate_process_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture teardown left orphan {pid} alive");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while support::process_group_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if support::process_group_alive(pid) {
+        support::terminate_process_group(pid);
+        panic!("fixture teardown left orphan descendants in group {pid}");
+    }
 }
 
 #[test]
@@ -611,9 +675,25 @@ fn bigboss_send_bypasses_identity_gate() {
 }
 
 #[test]
-fn config_unknown_key_is_not_set() {
+fn config_unknown_key_is_rejected() {
     let h = Hcom::new();
-    let (code, stdout, _stderr) = h.run(["config", "no_such_key"]);
+    let (code, _stdout, stderr) = h.run(["config", "no_such_key"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Unknown config key 'no_such_key'"),
+        "stderr={stderr}"
+    );
+
+    // Setting a typo must not write it to config.toml either.
+    let (code, _stdout, stderr) = h.run(["config", "timout", "60"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Did you mean: timeout?"), "stderr={stderr}");
+}
+
+#[test]
+fn config_known_unset_key_reports_not_set() {
+    let h = Hcom::new();
+    let (code, stdout, _stderr) = h.run(["config", "hints"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("(not set)"), "stdout={stdout}");
 }
@@ -691,7 +771,7 @@ fn antigravity_e2e_hook_dispatch() {
         .as_str()
         .expect("initial Antigravity bootstrap");
     assert!(first_context.contains("[HCOM SESSION]"));
-    assert!(first_context.contains(&format!("[hcom:{me}]")));
+    assert!(first_context.contains(&format!("--name {me}")));
 
     // Verify session_id binding matches in the DB via hcom list --json
     let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
@@ -736,7 +816,7 @@ fn antigravity_e2e_hook_dispatch() {
         .as_str()
         .expect("recurring Antigravity bootstrap");
     assert!(repeated_context.contains("[HCOM SESSION]"));
-    assert!(repeated_context.contains(&format!("[hcom:{me}]")));
+    assert!(repeated_context.contains(&format!("--name {me}")));
 
     // 2. Now pipe PreToolUse to gemini-beforetool.
     // Since the session is bound, it should resolve the instance and execute successfully.
@@ -780,11 +860,11 @@ fn antigravity_e2e_hook_dispatch() {
     assert_eq!(parsed, serde_json::json!({ "decision": "allow" }));
 
     // 3. AfterTool cannot inject context for Antigravity, so it must not ack delivery.
+    // Send from bigboss: self-sends are never delivered, so they'd leave nothing pending.
     let (send_code, _, send_stderr) = h.run([
         "send",
         &format!("@{me}"),
-        "--name",
-        &me,
+        "-b",
         "--intent",
         "request",
         "--",
@@ -1174,8 +1254,8 @@ fn pi_e2e_hook_dispatch() {
     assert!(
         start["bootstrap"]
             .as_str()
-            .is_some_and(|text| text.contains(&format!("[hcom:{me}]"))),
-        "pi-start should return bootstrap with the hcom marker: {start}"
+            .is_some_and(|text| text.contains(&format!("--name {me}"))),
+        "pi-start should return bootstrap with the agent identity: {start}"
     );
 
     let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
@@ -1465,12 +1545,13 @@ fn run_events_wait_cli_oracle(timing: UnreadTiming, wait_secs: u64, expected_cod
 
     let send_ok = send_code.is_none_or(|c| c == 0);
     let pending = premature_exit.is_none();
-    // Composite oracle: first establish send_ok and pending mid-wait.
-    // In GREEN, pending=true implies cursor unchanged, preview_count <= 1 (no duplicate preview),
-    // and expected final code. Endpoint registration is diagnostic-only and not required.
-    // In RED, premature_exit is Some(ExitStatus(0)), failing immediately on pending=false.
+    // A timeout may legitimately finish before the mid-wait probe on a busy
+    // runner. Its final exit code and unchanged cursor still reject a false
+    // match. Success scenarios must remain pending until we insert the match.
+    let wait_state_ok = pending
+        || (expected_code == 1 && premature_exit.is_some_and(|status| status.code() == Some(1)));
     let oracle_passed = send_ok
-        && pending
+        && wait_state_ok
         && mid_wait_cursor == initial_cursor
         && preview_count <= 1
         && code == expected_code;
@@ -1489,4 +1570,107 @@ fn events_wait_cli_preexisting_unread_times_out_with_one() {
 #[test]
 fn events_wait_cli_arriving_unread_then_matching_status_exits_zero() {
     run_events_wait_cli_oracle(UnreadTiming::ArrivingAfterReadiness, 4, 0);
+}
+
+#[test]
+fn commands_on_stopped_agent_explain_when_and_how_to_resume() {
+    let h = Hcom::new();
+    let me = h.start();
+    let gone = h.start();
+    let (cs, _, es) = h.run(["stop", &gone]);
+    assert_eq!(cs, 0, "stop failed: {es}");
+
+    // kill/stop of an already-stopped agent is a no-op success, not "not found".
+    for cmd in ["kill", "stop"] {
+        let (code, stdout, stderr) = h.run([cmd, &gone]);
+        assert_eq!(code, 0, "{cmd}: stdout={stdout} stderr={stderr}");
+        assert!(
+            stdout.contains(&format!("'{gone}' stopped ")),
+            "{cmd}: stdout={stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("hcom r {gone}")),
+            "{cmd}: stdout={stdout}"
+        );
+    }
+
+    for args in [vec!["list", gone.as_str()], vec!["term", gone.as_str()]] {
+        let (code, _stdout, stderr) = h.run(args.clone());
+        assert_eq!(code, 1, "{args:?}");
+        assert!(
+            stderr.contains(&format!("'{gone}' stopped ")),
+            "{args:?}: stderr={stderr}"
+        );
+    }
+
+    let (code, _stdout, stderr) = h.run(["send", &format!("@{gone}"), "--name", &me, "--", "hi"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("@{gone} stopped")) && stderr.contains(&format!("hcom r {gone}")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn unknown_agent_gets_typo_suggestion() {
+    let h = Hcom::new();
+    let me = h.start();
+    let typo: String = {
+        let mut c: Vec<char> = me.chars().collect();
+        c.swap(1, 2);
+        c.into_iter().collect()
+    };
+    if typo == me {
+        return; // name with repeated letters; swap is a no-op
+    }
+    let (code, _stdout, stderr) = h.run(["kill", &typo]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("No agent named '{typo}'"))
+            && stderr.contains(&format!("Did you mean: {me}?")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn send_rejects_ambiguous_bare_word_and_self_target() {
+    let h = Hcom::new();
+    let me = h.start();
+    let other = h.start();
+
+    // A lone word without '@' or '--' must not silently broadcast.
+    let (code, _stdout, stderr) = h.run(["send", &other, "--name", &me]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("Did you mean @{other}?")),
+        "stderr={stderr}"
+    );
+
+    let (code, _stdout, stderr) = h.run(["send", "hello", "--name", &me]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("hcom send -- hello"), "stderr={stderr}");
+
+    let (code, _stdout, stderr) = h.run(["send", &format!("@{me}"), "--name", &me, "--", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is you"), "stderr={stderr}");
+
+    // bigboss:DEVICE routes to bigboss, so it is also a self-only target.
+    let (code, _stdout, stderr) = h.run(["send", "-b", "@bigboss:ABCD", "--", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is you"), "stderr={stderr}");
+}
+
+#[test]
+fn unknown_command_and_tool_suggest_corrections() {
+    let h = Hcom::new();
+    let (code, _stdout, stderr) = h.run(["lst"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Did you mean: list?"), "stderr={stderr}");
+
+    let (code, _stdout, stderr) = h.run(["1", "claud"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Unknown tool 'claud'") && stderr.contains("Did you mean: claude?"),
+        "stderr={stderr}"
+    );
 }

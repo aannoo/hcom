@@ -45,8 +45,26 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    // Hooks of an agent nested under an hcom-launched one must not act as it.
+    // Runs first: every later env reader should see only the child's view.
+    let nested = std::env::args()
+        .nth(1)
+        .and_then(|arg| tool::Tool::from_hook_name(&arg))
+        .and_then(shared::nested::scrub_inherited_identity);
+
     // Initialize global config from environment variables
     config::Config::init();
+
+    if let Some(nested) = nested {
+        log::log_info(
+            "identity",
+            "nested_agent.scrubbed",
+            &format!(
+                "child={} parent={}: ignoring inherited hcom identity",
+                nested.child, nested.parent
+            ),
+        );
+    }
 
     // Set custom panic hook to log to file instead of stderr (prevents TUI corruption)
     panic::set_hook(Box::new(|panic_info| {
@@ -141,8 +159,14 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
-    let (ready_pattern, target) = match tool::Tool::from_str(tool_str) {
-        Ok(tool) => (tool.ready_pattern().to_vec(), pty::PtyTarget::Known(tool)),
+    let (ready_patterns, target) = match tool::Tool::from_str(tool_str) {
+        Ok(tool) => (
+            tool.ready_patterns()
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+            pty::PtyTarget::Known(tool),
+        ),
         Err(_) => (vec![], pty::PtyTarget::AdhocCommand(tool_str.to_string())),
     };
 
@@ -176,9 +200,20 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         command = resolved;
         extra_args = vec![];
     }
+    let mut child_env = pty_child_env();
+    let grok_acp = if target.known_tool() == Some(tool::Tool::Grok) && instance_name.is_some() {
+        let launch = delivery::grok::Launch::new(&command, &extra_args, &tool_args)?;
+        child_env.extend(launch.child_env());
+        Some(launch)
+    } else {
+        None
+    };
+    let leader_args = grok_acp.as_ref().map(|l| l.tui_args()).unwrap_or_default();
+    let grok_leader = grok_acp.clone();
     let full_args: Vec<&str> = extra_args
         .iter()
         .map(|s| s.as_str())
+        .chain(leader_args.iter().map(String::as_str))
         .chain(tool_args.iter().copied())
         .collect();
 
@@ -188,10 +223,11 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         &command,
         &full_args,
         pty::ProxyConfig {
-            ready_pattern,
+            ready_patterns,
             instance_name,
             target,
-            env_vars: pty_child_env(),
+            env_vars: child_env,
+            grok_acp,
         },
     ) {
         Ok(proxy) => proxy,
@@ -206,6 +242,10 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             // agent that ran `hcom N <tool>`) is notified immediately instead
             // of waiting on the generic stale-placeholder timeout.
             log::log_error("pty", "spawn_failed", &format!("{err:#}"));
+            // Grok may have started its persistent leader before the failure.
+            if let Some(launch) = grok_leader.as_ref() {
+                launch.stop_leader();
+            }
             if let Some(name) = instance_name_for_failure.as_deref()
                 && let Ok(db) = db::HcomDb::open()
                 && let Ok(Some(instance)) = db.get_instance_full(name)
@@ -229,10 +269,15 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         }
     };
 
-    let exit_code = proxy.run().context("PTY run failed")?;
+    let exit_code = proxy.run().context("PTY run failed");
 
     // Drop proxy to run cleanup (join delivery thread, which does DB cleanup)
     drop(proxy);
+    // Only once the TUI is gone: a live TUI would respawn its leader.
+    if let Some(launch) = grok_leader {
+        launch.stop_leader();
+    }
+    let exit_code = exit_code?;
 
     std::process::exit(exit_code);
 }

@@ -65,32 +65,35 @@ macro_rules! logln {
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-/// Ready patterns — must match `IntegrationSpec.ready_pattern`. This test is
+/// Ready patterns — each must be one of `IntegrationSpec.ready_patterns` (the
+/// one visible under the args these tests launch with). This test is
 /// an integration test against the hcom binary so it can't import the crate;
 /// the patterns are short and rarely change, drift is caught by the test
 /// itself when the expected pattern fails to appear on screen.
-fn ready_pattern(tool: &str) -> &'static str {
+fn ready_patterns(tool: &str) -> &'static [&'static str] {
     match tool {
-        "claude" => "? for shortcuts",
-        "codex" => "\u{203a} ",
-        "gemini" => "Type your message",
-        "opencode" => "ctrl+p commands",
+        // Default mode shows "? for shortcuts"; other permission modes show
+        // "<mode> on (<binding> to cycle)" instead.
+        "claude" => &["? for shortcuts", "to cycle)"],
+        "codex" => &["\u{203a} ", "\u{bb} "],
+        "gemini" => &["Type your message"],
+        "opencode" => &["ctrl+p commands"],
         // Kilo is an OpenCode-family fork: same TUI footer.
-        "kilo" => "ctrl+p commands",
-        "pi" => "/ commands",
+        "kilo" => &["ctrl+p commands"],
+        "pi" => &["/ commands"],
         // OMP (Oh My Pi) has no reliable on-screen ready marker: its only chrome
         // candidates live in the preset/theme-configurable status line. Launch
         // readiness is proven by the hcom extension bind instead
-        // (`launch_ready_on_plugin_bind`), so the spec ready_pattern is empty and
+        // (`launch_ready_on_plugin_bind`), so the spec ready_patterns is empty and
         // is_ready() is always true — same handling as cursor here. See OMP spec.
-        "omp" => "",
-        "antigravity" => "? for shortcuts",
-        // Cursor has no stable ASCII ready footer (spec ready_pattern is empty,
+        "omp" => &[],
+        "antigravity" => &["? for shortcuts"],
+        // Cursor has no stable ASCII ready footer (spec ready_patterns is empty,
         // so is_ready() is always true); readiness is asserted via ready/
         // prompt_empty directly. has_ready_pattern() gates the pattern check off
         // for cursor so it isn't run vacuously against an empty needle.
-        "cursor" => "",
-        "copilot" => "/ commands",
+        "cursor" => &[],
+        "copilot" => &["/ commands"],
         _ => panic!("Unknown tool: {tool}"),
     }
 }
@@ -453,17 +456,17 @@ fn validate_screen_schema(screen: &serde_json::Value) {
 }
 
 /// Returns true if this tool has an ASCII ready-pattern footer to match.
-/// Cursor signals readiness via prompt-empty instead (spec ready_pattern is
+/// Cursor signals readiness via prompt-empty instead (spec ready_patterns is
 /// empty), so there is no pattern to assert — callers check `ready`/`prompt_empty`
 /// directly rather than running a pattern match that would pass on `contains("")`.
 fn has_ready_pattern(tool: &str) -> bool {
-    !ready_pattern(tool).is_empty()
+    !ready_patterns(tool).is_empty()
 }
 
 fn validate_ready_pattern(screen: &serde_json::Value, tool: &str) {
-    let pattern = ready_pattern(tool);
+    let patterns = ready_patterns(tool);
     assert!(
-        !pattern.is_empty(),
+        !patterns.is_empty(),
         "validate_ready_pattern called for {tool}, which has no ready pattern; \
          guard the call with has_ready_pattern() so the check isn't vacuous"
     );
@@ -474,13 +477,13 @@ fn validate_ready_pattern(screen: &serde_json::Value, tool: &str) {
         .filter_map(|l| l.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let present = screen_text.contains(pattern);
+    let present = patterns.iter().any(|p| screen_text.contains(p));
 
     if screen["ready"].as_bool().unwrap() && !present {
-        panic!("ready=true but ready pattern '{pattern}' not found in screen lines");
+        panic!("ready=true but no ready pattern of {patterns:?} found in screen lines");
     }
     if !screen["ready"].as_bool().unwrap() && present {
-        eprintln!("  WARN: ready=false but pattern '{pattern}' found in screen (transient?)");
+        eprintln!("  WARN: ready=false but a pattern of {patterns:?} is on screen (transient?)");
     }
 }
 
@@ -800,8 +803,8 @@ fn run_pty_test(tool: &str) {
         validate_ready_pattern(&screen, tool);
         logln!(
             log,
-            "  OK: Ready pattern '{}' consistent",
-            ready_pattern(tool)
+            "  OK: Ready patterns {:?} consistent",
+            ready_patterns(tool)
         );
     } else {
         logln!(
@@ -1233,8 +1236,8 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
                 validate_ready_pattern(&screen, tool);
                 logln!(
                     log,
-                    "  OK: Ready pattern '{}' consistent",
-                    ready_pattern(tool)
+                    "  OK: Ready patterns {:?} consistent",
+                    ready_patterns(tool)
                 );
             } else {
                 logln!(
@@ -1258,8 +1261,8 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
         validate_ready_pattern(&screen, tool);
         logln!(
             log,
-            "  OK: Ready pattern '{}' consistent",
-            ready_pattern(tool)
+            "  OK: Ready patterns {:?} consistent",
+            ready_patterns(tool)
         );
     }
     assert!(

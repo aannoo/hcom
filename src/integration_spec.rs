@@ -45,8 +45,8 @@ pub struct HooksSpec {
     /// should resolve those names to the owner, not the borrowing tool.
     ///
     /// Antigravity borrows Gemini hook names and is identified out-of-band by
-    /// `ANTIGRAVITY_AGENT`, so `Tool::Antigravity.owns_hook("gemini-*")` must
-    /// stay false even though this spec lists Gemini's hook names.
+    /// `ANTIGRAVITY_AGENT`, so `Tool::from_hook_name("gemini-*")` must resolve
+    /// to Gemini even though this spec lists Gemini's hook names.
     pub shared_hooks_with: Option<Tool>,
     pub invocation: HookInvocation,
 }
@@ -61,10 +61,10 @@ pub struct GatesSpec {
     pub block_on_approval: bool,
     pub launch_requires_ready: bool,
     /// Treat the plugin's extension bind (a `kind='plugin'` notify endpoint) as
-    /// launch readiness, in addition to the on-screen `ready_pattern`. For
-    /// plugin-driven tools whose visible chrome is theme/preset configurable
-    /// (OMP: status-line presets omit the pi glyph), the bind is the only
-    /// rendering-independent proof the interactive TUI is up.
+    /// launch readiness, in addition to the on-screen `ready_patterns`. For
+    /// plugin-driven tools whose visible chrome is configurable (Pi: quiet or
+    /// expanded header; OMP: status-line presets omit the pi glyph), the bind
+    /// is the only rendering-independent proof the interactive TUI is up.
     pub launch_ready_on_plugin_bind: bool,
 }
 
@@ -188,8 +188,9 @@ pub struct IntegrationSpec {
     pub adhoc_icon: Option<&'static str>,
     /// True if this tool is in the public `RELEASED_TOOLS` set.
     pub released: bool,
-    /// PTY ready-pattern bytes (empty for Adhoc).
-    pub ready_pattern: &'static [u8],
+    /// On-screen markers of an idle, input-ready TUI; any one visible means
+    /// ready. Empty disables pattern gating (Adhoc, plugin-bound tools).
+    pub ready_patterns: &'static [&'static str],
     pub pty: PtySpec,
     /// Environment variables specific to this tool's instance state that
     /// will corrupt a same-tool child if leaked (session IDs, sandbox modes,
@@ -250,8 +251,10 @@ const CODEX_HOOKS: &[&str] = &[
     "codex-sessionstart",
     "codex-userpromptsubmit",
     "codex-pretooluse",
+    "codex-permissionrequest",
     "codex-posttooluse",
     "codex-stop",
+    "codex-interrupt",
 ];
 
 const OPENCODE_HOOKS: &[&str] = &[
@@ -315,15 +318,15 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-sessionend",
 ];
 
+/// Grok has no hooks: status and delivery come over its ACP (`delivery/grok.rs`).
+const GROK_HOOKS: &[&str] = &[];
+
 // ── Help examples / extra-env tables ────────────────────────────────────
 
-const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
-    (
-        "hcom claude --model sonnet|opus|haiku",
-        "Use a specific model",
-    ),
-];
+const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom claude --model fable|opus|sonnet|haiku",
+    "Flags forwarded to claude",
+)];
 const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
     "HCOM_SUBAGENT_TIMEOUT",
     "Seconds subagents keep-alive after task",
@@ -332,23 +335,17 @@ const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
 const GEMINI_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom N gemini --yolo", "Flags forwarded to gemini"),
     (
-        "hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash",
+        "hcom gemini --model pro|flash|flash-lite",
         "Use a specific model",
     ),
 ];
 const GEMINI_HELP_EXTRA_ENV: &[HelpEntry] =
     &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")];
 
-const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[
-    (
-        "hcom codex --sandbox danger-full-access",
-        "Flags forwarded to codex",
-    ),
-    (
-        "hcom codex --model gpt-5.4|gpt-5.4-mini",
-        "Use a specific model",
-    ),
-];
+const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom codex --sandbox danger-full-access",
+    "Flags forwarded to codex",
+)];
 const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     (
         "HCOM_CODEX_SYSTEM_PROMPT",
@@ -360,21 +357,17 @@ const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     ),
 ];
 
-const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[(
-    "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
-    "Use a specific model",
-)];
+const OPENCODE_HELP_EXAMPLES: &[HelpEntry] =
+    &[("hcom opencode --agent plan", "Flags forwarded to opencode")];
 
 const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
     "hcom kilo --model kilo/kilo-auto/free",
-    "Use Kilo's free auto model",
+    "Flags forwarded to kilo",
 )];
 
-const PI_HELP_EXAMPLES: &[HelpEntry] =
-    &[("hcom pi --model claude-3-5-sonnet", "Use a specific model")];
+const PI_HELP_EXAMPLES: &[HelpEntry] = &[("hcom pi --thinking high", "Flags forwarded to pi")];
 
-const OMP_HELP_EXAMPLES: &[HelpEntry] =
-    &[("hcom omp --model claude-3-5-sonnet", "Use a specific model")];
+const OMP_HELP_EXAMPLES: &[HelpEntry] = &[("hcom omp --thinking high", "Flags forwarded to omp")];
 
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
@@ -383,23 +376,36 @@ const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
 ];
 
 const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom cursor-agent --model sonnet-4", "Use a specific model"),
+    ("hcom cursor-agent --model auto", "Use a specific model"),
     (
         "hcom cursor-agent --force",
         "Allow commands unless explicitly denied",
     ),
+    (
+        "hcom cursor-agent --plan",
+        "Flags forwarded to cursor-agent",
+    ),
 ];
 
 const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom kimi --model kimi-k2.6", "Use a specific model"),
-    ("hcom kimi --yolo", "Bypass permission prompts"),
+    (
+        "hcom kimi --yolo",
+        "Auto-run routine actions; risky ones still ask",
+    ),
+    ("hcom kimi --auto", "Never ask for approval"),
+    ("hcom kimi --plan", "Flags forwarded to kimi"),
+];
+
+const GROK_HELP_EXAMPLES: &[HelpEntry] = &[
+    (
+        "hcom grok --reasoning-effort high",
+        "Flags forwarded to grok",
+    ),
+    ("hcom grok --always-approve", "Auto-approve tool executions"),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
-    (
-        "hcom copilot --model claude-haiku-4.5",
-        "Use a specific model",
-    ),
+    ("hcom copilot --model auto", "Use a specific model"),
     (
         "hcom copilot --allow-tool 'shell(hcom:*)'",
         "Flags forwarded to copilot",
@@ -417,7 +423,11 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     tui_prefix: "cla ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"? for shortcuts",
+    // Default mode shows "? for shortcuts"; every other permission mode
+    // (acceptEdits, plan, auto, dontAsk, bypassPermissions) replaces it with
+    // "<mode> on (<binding> to cycle)". The binding is configurable (shift+tab
+    // by default, meta+m on Windows without VT), so match only its tail.
+    ready_patterns: &["? for shortcuts", "to cycle)"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -471,7 +481,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "gem ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"Type your message",
+    ready_patterns: &["Type your message"],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
@@ -511,7 +521,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     status_detail: StatusDetailSpec {
         bash: &["run_shell_command"],
         file: &["write_file", "replace"],
-        delegate: &["delegate_to_agent"],
+        delegate: &["invoke_agent"],
     },
 };
 
@@ -524,7 +534,8 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     tui_prefix: "cod ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: "\u{203A} ".as_bytes(),
+    // "» " is the Ultra composer prompt.
+    ready_patterns: &["\u{203A} ", "\u{BB} "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -561,10 +572,11 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         unique_examples: CODEX_HELP_EXAMPLES,
         extra_env: CODEX_HELP_EXTRA_ENV,
     },
+    // Codex hooks report every shell/exec tool as `Bash` (HookToolName::bash).
     status_detail: StatusDetailSpec {
-        bash: &["Bash", "execute_command", "shell", "shell_command"],
+        bash: &["Bash"],
         file: &["apply_patch"],
-        delegate: &[],
+        delegate: &["spawn_agent"],
     },
 };
 
@@ -577,7 +589,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     tui_prefix: "opc ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"ctrl+p commands",
+    ready_patterns: &["ctrl+p commands"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -619,10 +631,12 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         unique_examples: OPENCODE_HELP_EXAMPLES,
         extra_env: &[],
     },
+    // Tool IDs from the plugin's execute.before hook: OpenCode 1 names first,
+    // then OpenCode 2's (shell/patch/subagent). Kilo shares the plugin.
     status_detail: StatusDetailSpec {
-        bash: &[],
-        file: &[],
-        delegate: &[],
+        bash: &["bash", "shell"],
+        file: &["edit", "write", "apply_patch", "patch"],
+        delegate: &["task", "subagent"],
     },
 };
 
@@ -635,7 +649,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     tui_prefix: "kil ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"ctrl+p commands",
+    ready_patterns: &["ctrl+p commands"],
     // Kilo namespaces OpenCode's run/role state under its own vars (see
     // kilocode packages/core/src/util/opencode-process.ts: KILO_RUN_ID /
     // KILO_PROCESS_ROLE are `??=`-assigned, so an inherited value is reused
@@ -679,9 +693,9 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
         extra_env: &[],
     },
     status_detail: StatusDetailSpec {
-        bash: &[],
-        file: &[],
-        delegate: &[],
+        bash: &["bash", "shell"],
+        file: &["edit", "write", "apply_patch", "patch"],
+        delegate: &["task", "subagent"],
     },
 };
 
@@ -694,7 +708,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     tui_prefix: "agy ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"? for shortcuts",
+    ready_patterns: &["? for shortcuts"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -756,7 +770,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     released: true,
     // Cursor's input placeholder is styled rather than a stable ASCII footer.
     // Prompt-empty detection is the readiness signal for the MVP.
-    ready_pattern: b"",
+    ready_patterns: &[],
     // Closed-source; unknown instance-state vars are a documented gap.
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
@@ -816,7 +830,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "kim ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"> ",
+    ready_patterns: &["> "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -862,13 +876,13 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         // advertising it here was a ghost.
         extra_env: &[],
     },
-    // Tool names verified against kimi-code 0.9.0 built-in tools
+    // Tool names from kimi-code's built-in tools
     // (docs/reference/tools.md): shell is `Bash`, file writes are `Write`/`Edit`,
-    // and the subagent tool is `Agent`.
+    // and the subagent tools are `Agent` and `AgentSwarm`.
     status_detail: StatusDetailSpec {
         bash: &["Bash"],
         file: &["Write", "Edit"],
-        delegate: &["Agent"],
+        delegate: &["Agent", "AgentSwarm"],
     },
 };
 
@@ -881,7 +895,13 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "pi  ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"/ commands",
+    // Readiness comes from the hcom extension's bind, not on-screen text.
+    // Pi's header hint differs between the compact ("/ commands"), expanded
+    // ("/ for commands") and quiet-startup (none) headers, and it is drawn
+    // before Pi enables its key/submit handlers. Pi fires session_start (our
+    // bind) from rebindCurrentSession() after those handlers are set up, so
+    // the bind is the earliest point at which the TUI reliably accepts input.
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -899,7 +919,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: true,
         launch_requires_ready: true,
-        launch_ready_on_plugin_bind: false,
+        launch_ready_on_plugin_bind: true,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_PI_ARGS"),
@@ -950,7 +970,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     // the hcom extension's bind (`launch_ready_on_plugin_bind`), which is
     // rendering-independent. Empty pattern => is_ready() is always true, so it
     // never gates launch on scraped chrome; the plugin bind is authoritative.
-    ready_pattern: b"",
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -971,7 +991,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         // preset/theme-configurable status line), so launch readiness is proven
         // by the hcom extension's bind (kind='plugin' notify endpoint) instead —
         // rendering-independent, and a dead extension correctly fails to bind and
-        // blocks. `ready_pattern` is empty; this is the authoritative signal.
+        // blocks. `ready_patterns` is empty; this is the authoritative signal.
         launch_ready_on_plugin_bind: true,
     },
     launch: LaunchSpec {
@@ -998,10 +1018,12 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         unique_examples: OMP_HELP_EXAMPLES,
         extra_env: &[],
     },
+    // `ast_edit` is left out: it takes glob `paths`, not a file, which would
+    // make `--file` filters match patterns instead of paths.
     status_detail: StatusDetailSpec {
         bash: &["bash"],
         file: &["edit", "write"],
-        delegate: &[],
+        delegate: &["task"],
     },
 };
 
@@ -1017,7 +1039,7 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     // Copilot fires SessionStart twice: once at boot and again after it loads
     // hooks/instructions. Gate on "/ commands" footer text so delivery doesn't
     // inject during the loading window.
-    ready_pattern: b"/ commands",
+    ready_patterns: &["/ commands"],
     // Closed-source; unknown instance-state vars are a documented gap.
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
@@ -1060,6 +1082,61 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static GROK: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Grok,
+    name: "grok",
+    label: "Grok Build",
+    aliases: &["grok-build"],
+    cli_binary: "grok",
+    tui_prefix: "grk ",
+    adhoc_icon: None,
+    released: true,
+    // Delivery goes through Grok's prompt queue (delivery/grok.rs), never the
+    // PTY, so there is no composer to parse and no ready footer to wait for.
+    ready_patterns: &[],
+    pty: PtySpec {
+        delivery_start_timeout_secs: 10,
+    },
+    // Session id is instance-specific and would corrupt a same-tool child launch.
+    instance_state_env: &["GROK_SESSION_ID"],
+    hooks: HooksSpec {
+        names: GROK_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        // Launch readiness falls back to the settle timeout.
+        launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_GROK_ARGS"),
+        config_dir_env: Some("GROK_HOME"),
+        initial_prompt: InitialPromptShape::DashDashPositional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: Some(ForkArgs::AppendFlag("--fork-session")),
+    }),
+    help: HelpSpec {
+        unique_examples: GROK_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["run_terminal_command", "Bash"],
+        file: &["search_replace", "write", "Edit", "Write", "MultiEdit"],
+        delegate: &["spawn_subagent", "Task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -1069,7 +1146,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tui_prefix: "ah  ",
     adhoc_icon: Some("\u{25e6}"), // ◦ neutral dot
     released: false,
-    ready_pattern: b"",
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
@@ -1124,6 +1201,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &CURSOR,
     &KIMI,
     &COPILOT,
+    &GROK,
     &ADHOC,
 ];
 
@@ -1142,6 +1220,7 @@ impl Tool {
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
+            Tool::Grok => &GROK,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -1189,6 +1268,7 @@ mod tests {
             Tool::Cursor,
             Tool::Kimi,
             Tool::Copilot,
+            Tool::Grok,
             Tool::Pi,
             Tool::Omp,
             Tool::Adhoc,
@@ -1256,8 +1336,9 @@ mod tests {
         assert!(names.contains(&"cursor"));
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
+        assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     #[test]
@@ -1460,14 +1541,18 @@ mod tests {
 
     #[test]
     fn drift_released_tools_have_hook_dispatch() {
-        // Every released hook-bearing tool must round-trip through Tool's
-        // hook-ops adapter: settings_path resolves to a non-empty path and
-        // verify_hooks_installed() can be called without panicking.
+        // Every released hook-bearing tool is either per-run (it has a
+        // runtime adapter) or persistent, in which case it must round-trip
+        // through Tool's install ops: settings_path resolves to a non-empty
+        // path and verify_hooks_installed() can be called without panicking.
         // Borrowed-hooks specs (Antigravity → Gemini) are checked via their
         // owning Tool — Antigravity has its own hook module but borrows the
         // hook command names.
         for spec in ALL {
             if !spec.released || spec.hooks.names.is_empty() {
+                continue;
+            }
+            if crate::hooks::runtime::is_per_run(spec.tool) {
                 continue;
             }
             let path = spec.tool.hooks_settings_path();

@@ -3,20 +3,18 @@
 //! - `CommandContext` builder (`_build_ctx_for_command`)
 //! - Identity gating (`REQUIRE_IDENTITY`)
 //! - `set_hookless_command_status` — status for non-hook CLI commands
-//! - `maybe_deliver_pending_messages` — append unread for codex/adhoc
+//! - `maybe_deliver_pending_messages` — append unread to adhoc command output
 //! - `format_messages_human` — human-readable message formatting
 
 use crate::claude_actor;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle as lifecycle;
-use crate::instances;
-#[cfg(test)]
-use crate::shared::SenderIdentity;
 use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
 use crate::shared::{
     CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind, status_fg, status_icon,
 };
+use crate::shared::{MAX_MESSAGES_PER_DELIVERY, SenderIdentity};
 
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
@@ -176,88 +174,161 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
     lifecycle::set_status(db, &identity.name, status, &context, Default::default());
 }
 
-/// For hookless instances (codex/adhoc): append unread messages after command output.
+/// Set when the running command has taken over inline delivery for this
+/// invocation (send after persisting its message, listen once it reads the
+/// inbox), so the router's after-command delivery must not run.
+static COMMAND_OWNS_INLINE_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn claim_inline_delivery() {
+    COMMAND_OWNS_INLINE_DELIVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The invoking instance, if the router delivers its messages inline after
+/// every hcom command.
 ///
-/// Codex and adhoc instances have no delivery hooks, so messages are delivered
-/// via CLI command output. Skips for --json output to preserve machine-readable format.
+/// Only adhoc instances: they have no hooks, so command output is their only
+/// delivery path while working. Hooked tools (including codex, via
+/// UserPromptSubmit/PostToolUse) get messages from their hooks instead.
+/// Exception: `hcom send` shows the sending instance's own unread messages
+/// inline for every tool.
+pub fn inline_receiver(ctx: &CommandContext) -> Option<&SenderIdentity> {
+    let identity = ctx.identity.as_ref()?;
+    let tool = identity.instance_data.as_ref()?.get("tool")?.as_str()?;
+    (matches!(identity.kind, SenderKind::Instance) && tool == "adhoc").then_some(identity)
+}
+
+/// One chronological prefix of an instance's unread messages, capped per delivery.
 ///
-/// Not display-only: also advances the instance cursor and updates delivery status.
-/// This is the hookless counterpart to hook-based delivery.
+/// A single cursor acknowledges everything up to the batch's last event, so the
+/// batch must be a prefix: capping per sender or per group would skip messages.
+pub struct InlineBatch {
+    pub messages: Vec<crate::db::Message>,
+    /// Unread messages left after this batch.
+    pub remaining: usize,
+    /// Event id of the last unread message when the batch was taken.
+    pub backlog_end: Option<i64>,
+}
+
+impl InlineBatch {
+    pub fn take(db: &HcomDb, name: &str) -> Option<Self> {
+        let mut messages = db.get_unread_messages(name);
+        if messages.is_empty() {
+            return None;
+        }
+        let remaining = messages.len().saturating_sub(MAX_MESSAGES_PER_DELIVERY);
+        let backlog_end = messages.last().and_then(|m| m.event_id);
+        messages.truncate(MAX_MESSAGES_PER_DELIVERY);
+        Some(Self {
+            messages,
+            remaining,
+            backlog_end,
+        })
+    }
+
+    /// Text line telling the reader more unread messages are waiting (empty if none).
+    pub fn remaining_note(&self, name: &str) -> String {
+        if self.remaining == 0 {
+            return String::new();
+        }
+        format!(
+            "[+{} more unread — run: hcom listen --name {name}]\n",
+            self.remaining
+        )
+    }
+
+    /// Note for messages that arrived after this batch was taken (empty if none,
+    /// or if the remaining note already covers them).
+    pub fn arrived_since_note(&self, db: &HcomDb, name: &str) -> String {
+        if self.remaining > 0 || db.get_unread_messages(name).is_empty() {
+            return String::new();
+        }
+        format!("[hcom] new message(s) arrived — run: hcom listen --name {name}\n")
+    }
+
+    /// Write `output` to stdout, then acknowledge the batch.
+    ///
+    /// Nothing is acknowledged if the write fails, so a retry after partial
+    /// output may duplicate messages but never skips them. The cursor only moves
+    /// forward, so a slow writer cannot rewind a newer concurrent delivery.
+    ///
+    /// `set_status` records the delivery in the receiver's status. Used when the
+    /// command's own status would not reflect it (router delivery, send --from).
+    pub fn emit(
+        &self,
+        db: &HcomDb,
+        name: &str,
+        output: &str,
+        set_status: bool,
+    ) -> Result<(), String> {
+        use std::io::Write;
+
+        let written = {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(output.as_bytes())
+                .and_then(|_| stdout.flush())
+        };
+        if let Err(e) = written {
+            return Err(format!(
+                "incoming message output failed; unread messages retained: {e}"
+            ));
+        }
+
+        let last = self.messages.last();
+        if let Some(id) = last.and_then(|m| m.event_id) {
+            db.advance_instance_cursor(name, id)
+                .map_err(|e| format!("receive acknowledgment failed: {e}"))?;
+        }
+
+        if set_status {
+            let sender_display = identity::get_display_name(db, &self.messages[0].from);
+            lifecycle::set_status(
+                db,
+                name,
+                ST_INACTIVE,
+                &format!("deliver:{sender_display}"),
+                lifecycle::StatusUpdate {
+                    msg_ts: last.and_then(|m| m.timestamp.as_deref()).unwrap_or(""),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// For adhoc instances: append unread messages after command output.
 ///
-/// Returns formatted output string if messages were delivered, None otherwise.
+/// Skips for --json output to preserve machine-readable format, and when the
+/// command claimed delivery itself. Not display-only: advances the cursor
+/// (after a successful write) and updates delivery status.
+///
+/// Returns Ok(true) if messages were delivered, Err if writing them failed
+/// (they stay unread).
 pub fn maybe_deliver_pending_messages(
     db: &HcomDb,
     ctx: &CommandContext,
     has_json_flag: bool,
-) -> Option<String> {
-    if has_json_flag {
-        return None;
+) -> Result<bool, String> {
+    if has_json_flag || COMMAND_OWNS_INLINE_DELIVERY.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(false);
     }
-
-    let identity = ctx.identity.as_ref()?;
-    if !matches!(identity.kind, SenderKind::Instance) {
-        return None;
-    }
-
-    let instance_data = identity.instance_data.as_ref()?;
-    let tool = instance_data
-        .get("tool")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if tool != "codex" && tool != "adhoc" {
-        return None;
-    }
-
-    // Get unread messages
-    let messages = db.get_unread_messages(&identity.name);
-    if messages.is_empty() {
-        return None;
-    }
-
-    // Advance cursor — update last_event_id on the instance
-    if let Some(last) = messages.last()
-        && let Some(id) = last.event_id
-    {
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(id));
-        instances::update_instance_position(db, &identity.name, &updates);
-    }
-
-    // Format with divider
-    let formatted = format_hook_messages_simple_from_msgs(db, &messages, &identity.name);
+    let Some(identity) = inline_receiver(ctx) else {
+        return Ok(false);
+    };
+    let Some(batch) = InlineBatch::take(db, &identity.name) else {
+        return Ok(false);
+    };
+    let formatted = format_hook_messages_simple_from_msgs(db, &batch.messages, &identity.name);
     let output = format!(
-        "\n{}\n[hcom]\n{}\n{}",
+        "\n{}\n[hcom]\n{}\n{}\n",
         "─".repeat(40),
         "─".repeat(40),
         formatted,
-    );
-
-    // Update status after delivery
-    let msg_ts = messages
-        .last()
-        .and_then(|m| m.timestamp.as_deref())
-        .unwrap_or("");
-    let sender_display = identity::get_display_name(db, &messages[0].from);
-    let context = format!("deliver:{sender_display}");
-
-    let status = if tool == "codex" {
-        ST_ACTIVE
-    } else {
-        ST_INACTIVE
-    };
-    lifecycle::set_status(
-        db,
-        &identity.name,
-        status,
-        &context,
-        lifecycle::StatusUpdate {
-            msg_ts,
-            ..Default::default()
-        },
-    );
-
-    Some(output)
+    ) + &batch.remaining_note(&identity.name);
+    batch.emit(db, &identity.name, &output, true)?;
+    Ok(true)
 }
 
 /// Format messages for human terminal display.
@@ -934,7 +1005,7 @@ mod tests {
             }),
             go: false,
         };
-        assert!(maybe_deliver_pending_messages(&db, &ctx, true).is_none());
+        assert_eq!(maybe_deliver_pending_messages(&db, &ctx, true), Ok(false));
     }
 
     #[test]
@@ -950,7 +1021,7 @@ mod tests {
             }),
             go: false,
         };
-        assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_none());
+        assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
     }
 
     #[test]
@@ -961,6 +1032,6 @@ mod tests {
             identity: None,
             go: false,
         };
-        assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_none());
+        assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
     }
 }

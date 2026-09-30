@@ -6,19 +6,31 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that coding agents use to message, watch, and spawn each other across terminals.
+**`hcom`** is a CLI that agents use to message, watch, and spawn each other across terminals.
 
-Works with Claude Code, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi and Copilot - in any combination, without changing how you use them.
+Start an agent with `hcom` in front, then prompt normally.
 
-Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
+Use it to:
 
-Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.
+- coordinate multi-agent pipelines
+- run different AI CLIs as each other's subagents
+- avoid copy-pasting
+
+Works with: `claude`, `codex`, `opencode`, `pi`, `omp`, `agy`, `cursor`, `kimi`, `kilo`, `copilot`, `gemini`
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
 ---
 
 ## Install
+
+**python -** macOS, Linux, Windows:
+
+```bash
+uv tool install hcom
+```
+
+**homebrew -** macOS, Linux:
 
 ```bash
 brew install aannoo/hcom/hcom
@@ -27,22 +39,17 @@ brew install aannoo/hcom/hcom
 <details><summary>Other install options</summary>
 
 ```bash
-# With Python
-uv tool install hcom  # or: pip install hcom
-```
-
-```bash
-# macOS, Linux, Android (Termux), and WSL
+# macOS, Linux, Android
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
 ```powershell
-# Windows (native, PowerShell)
+# Windows
 irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
 ```
 
 ```bash
-# Update any existing install to latest hcom version
+# Update any existing install
 hcom update
 ```
 
@@ -55,7 +62,7 @@ hcom update
 Terminal 1:
 
 ```bash
-hcom claude   # codex / opencode / kilo / pi / omp / agy / cursor-agent / kimi / copilot / gemini
+hcom claude
 ```
 
 Terminal 2:
@@ -82,13 +89,13 @@ hcom
 
 ## What agents can do
 
-**Message** each other in real time: requests, updates, replies, threads, and bundled context for handoffs.
+**Message** each other in real time: mid-turn or wake immediately when idle
 
-**Observe** each other: transcripts, file edits, terminal screens, command history.
+**Observe** each other: status, transcripts, file edits, live terminal screens, command history.
 
-**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
+**Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
 
-**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator or headless.
+**Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
 
 ---
 
@@ -96,22 +103,11 @@ hcom
 
 Hooks record activity to a local SQLite database and deliver messages from it.
 
-```bash
+```text
 agent → hooks → db → hooks → other agent
 ```
 
-Messages arrive mid-turn (injected between tool calls) or wake idle agents immediately.
-
-Each agent has a name. You and other agents can inspect its:
-
-- status and inbox
-- live terminal screen
-- transcript
-- event log, including file edits and tool calls
-
-Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
-
-Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
+Hooks activate only when an agent is launched with `hcom` in front. Normal usage is unaffected.
 
 Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
@@ -210,9 +206,18 @@ hcom reset all               # clear and archive: database + hooks + config
 
 ## Uninstall
 
+Safely remove all hcom hooks:
+
 ```bash
-hcom hooks remove            # safely remove all hcom hooks
-brew uninstall hcom          # or: rm $(which hcom)
+hcom hooks remove
+```
+
+Then remove binary:
+
+```bash
+brew uninstall hcom
+# or: uv tool uninstall hcom
+# or: rm "$(which hcom)"
 ```
 
 ---
@@ -237,6 +242,7 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Cursor CLI | automatic | `hcom cursor-agent` |
 | Kimi | automatic | `hcom kimi` |
 | Copilot CLI | automatic | `hcom copilot` |
+| Grok Build | automatic | `hcom grok` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -270,7 +276,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot   # launch N agents
+hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot|grok   # launch N agents
 hcom r <name|session_id>     # resume agent
 hcom f <name|session_id>     # fork session
 hcom kill <name|tag:T|all>   # kill + close terminal pane
@@ -332,9 +338,9 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `name_export` | Export instance name to a custom env var |
 | `title_mode` | Terminal/tab title behavior: `combined` (default), `label`, or `off` |
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
-| `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
+| `timeout` | Idle timeout for headless Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `grok_args` | Default args passed to the tool |
 
 ### Scope
 
@@ -380,6 +386,8 @@ Tell agent to run them:
 
 **`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
+**`hcom run onidle`** — waits for an agent to go idle, then types text into another agent (`hcom run onidle luna nova 'luna is done, review it'`) or launches a new one with it as the prompt (`hcom run onidle luna codex 'review what luna just did'`).
+
 Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
 
 </details>
@@ -423,7 +431,6 @@ HCOM_DIR=$PWD/.hcom HCOM_DEV_ROOT=$PWD hcom claude
 ```
 
 </details>
-
 
 ---
 

@@ -225,6 +225,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
         "copilot_args" => Some("launch.copilot.args"),
+        "grok_args" => Some("launch.grok.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -579,12 +580,12 @@ fn config_instance(
                 Ok(matched) => match db.get_instance_full(&matched) {
                     Ok(Some(inst)) => inst,
                     _ => {
-                        eprintln!("Error: Agent '{name}' not found");
+                        eprintln!("Error: {}", identity::describe_missing_agent(db, &name));
                         return 1;
                     }
                 },
                 Err(_) => {
-                    eprintln!("Error: Agent '{name}' not found");
+                    eprintln!("Error: {}", identity::describe_missing_agent(db, &name));
                     return 1;
                 }
             }
@@ -874,7 +875,7 @@ pub fn config_instance_get(
     let instance = db
         .get_instance_full(&name)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+        .ok_or_else(|| identity::describe_missing_agent(db, instance_arg))?;
 
     Ok(match key {
         None => {
@@ -903,7 +904,7 @@ pub fn config_instance_set(
     let instance = db
         .get_instance_full(&name)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+        .ok_or_else(|| identity::describe_missing_agent(db, instance_arg))?;
     let inst_name = &instance.name;
 
     match key {
@@ -1104,7 +1105,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     let key_arg = &argv[0];
 
-    if key_arg == "dev_root" {
+    if normalize_key(key_arg) == "HCOM_DEV_ROOT" {
         return config_dev_root(
             db,
             argv.get(1).map(|s| s.as_str()),
@@ -1138,6 +1139,29 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     if wants_info {
         return show_key_info(&key);
+    }
+
+    // Unknown keys would silently read as "(not set)" or be written to
+    // config.toml where nothing reads them. Reading an env-only setting that
+    // is actually set (e.g. HCOM_DIR) stays allowed.
+    let is_set_mode = argv.len() >= 2;
+    let env_readable = !is_set_mode && std::env::var(&key).is_ok();
+    if !CONFIG_KEYS.iter().any(|(k, _, _)| *k == key) && !env_readable {
+        let typed = key_arg.to_lowercase();
+        let short: Vec<String> = CONFIG_KEYS
+            .iter()
+            .map(|(k, _, _)| k.trim_start_matches("HCOM_").to_lowercase())
+            .chain(["dev_root".to_string()])
+            .collect();
+        eprintln!(
+            "Error: Unknown config key '{key_arg}'{}\nValid keys: {}",
+            crate::shared::suggest::did_you_mean(
+                typed.trim_start_matches("hcom_"),
+                short.iter().map(String::as_str)
+            ),
+            short.join(", ")
+        );
+        return 1;
     }
 
     // Set mode: config KEY VALUE
@@ -1276,7 +1300,7 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
         }
         println!(
             "{}",
-            serde_json::to_string_pretty(&Value::Object(result)).unwrap_or_default()
+            serde_json::to_string(&Value::Object(result)).unwrap_or_default()
         );
     } else {
         println!("hcom configuration ({})\n", config_path().display());
@@ -1378,13 +1402,12 @@ Usage:
 
         "HCOM_TIMEOUT" => Some(
             "\
-HCOM_TIMEOUT - Advanced: idle timeout for headless/vanilla Claude (seconds)
+HCOM_TIMEOUT - Advanced: idle timeout for headless Claude (seconds)
 
 Default: 86400 (24 hours)
 
 This setting only applies to:
   - Headless Claude: hcom N claude -p
-  - Vanilla Claude: claude + hcom start
 
 Does NOT apply to:
   - Interactive PTY mode: hcom N claude (main path)
@@ -1434,7 +1457,7 @@ Merged with launch-time cli args (launch args win on conflict).",
             "\
 HCOM_GEMINI_ARGS - Default args passed to gemini on launch
 
-Example: hcom config gemini_args \"--model gemini-2.5-flash\"
+Example: hcom config gemini_args \"--model flash\"
 Clear:   hcom config gemini_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
@@ -1520,7 +1543,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Grok auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1625,7 +1648,7 @@ Notes:
             "\
 HCOM_OPENCODE_ARGS - Default args passed to opencode on launch
 
-Example: hcom config opencode_args \"--model o3\"
+Example: hcom config opencode_args \"--agent plan\"
 Clear:   hcom config opencode_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
@@ -1645,7 +1668,7 @@ Prepended to launch-time cli args.",
             "\
 HCOM_COPILOT_ARGS - Default args passed to copilot on launch
 
-Example: hcom config copilot_args \"--model claude-haiku-4.5\"
+Example: hcom config copilot_args \"--model auto\"
 Clear:   hcom config copilot_args \"\"
 
 Prepended to launch-time cli args.",
@@ -1661,11 +1684,21 @@ Clear:   hcom config cursor_args \"\"
 Prepended to launch-time cli args.",
         ),
 
+        "HCOM_GROK_ARGS" => Some(
+            "\
+HCOM_GROK_ARGS - Default args passed to grok on launch
+
+Example: hcom config grok_args \"--always-approve\"
+Clear:   hcom config grok_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
         "HCOM_KIMI_ARGS" => Some(
             "\
 HCOM_KIMI_ARGS - Default args passed to kimi on launch
 
-Example: hcom config kimi_args \"--model kimi-k2.6\"
+Example: hcom config kimi_args \"--yolo\"
 Clear:   hcom config kimi_args \"\"
 
 Prepended to launch-time cli args.",
@@ -2255,7 +2288,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Grok"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");

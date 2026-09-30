@@ -27,10 +27,10 @@ pub const WAKE_TARGETED_MS: u64 = 100;
 /// from serially consuming the full timeout for every other endpoint.
 const MAX_WAKE_FANOUT_WORKERS: usize = 32;
 
-/// SQL fragment listing the wake kinds — used to filter `notify_endpoints`
-/// queries so inject ports are never pinged with connect-drop.
+/// SQL fragment listing instance loops. Inject ports speak RPC, and launch
+/// confirmations have a separate batch-scoped wake path.
 fn wake_kinds_sql_list() -> String {
-    WakeKind::ALL
+    WakeKind::INSTANCE_LOOPS
         .iter()
         .map(|k| format!("'{}'", k.as_str()))
         .collect::<Vec<_>>()
@@ -39,7 +39,7 @@ fn wake_kinds_sql_list() -> String {
 
 /// Wake a specific instance's wake endpoints.
 ///
-/// If `kinds` is empty, wakes all wake kinds registered for the instance.
+/// If `kinds` is empty, wakes the instance loops registered for the instance.
 /// `inject` is never woken regardless.
 pub fn wake(db: &HcomDb, instance: &str, kinds: &[WakeKind]) {
     let ports = lookup_ports(db, instance, kinds);
@@ -73,13 +73,91 @@ pub fn wake_all(db: &HcomDb) {
     wake_ports(&ports, WAKE_FANOUT_MS);
 }
 
+/// Wake launch confirmations for this batch, including aggregate waiters.
+/// Events without batch metadata still wake all launch waiters; their status
+/// query may discover a stopped or failed child, so skipping them is unsafe.
+pub fn wake_launch_waiters(db: &HcomDb, batch_id: Option<&str>) {
+    let kind = WakeKind::LaunchWait;
+    let Ok(mut stmt) = db
+        .conn()
+        .prepare("SELECT instance, port FROM notify_endpoints WHERE kind = ? AND port > 0")
+    else {
+        return;
+    };
+    let endpoints: Vec<(String, u16)> = stmt
+        .query_map(params![kind.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|(name, port)| u16::try_from(port).ok().map(|port| (name, port)))
+        .collect();
+    drop(stmt);
+    for (name, port) in endpoints {
+        let remove = || {
+            let _ = db.conn().execute(
+                "DELETE FROM notify_endpoints WHERE instance = ? AND kind = ? AND port = ?",
+                params![name, kind.as_str(), port],
+            );
+        };
+        let owner = name
+            .strip_prefix("launch-wait:")
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        if let Some(pid) = owner
+            .as_ref()
+            .and_then(|owner| owner.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+        {
+            let expected_identity = owner
+                .as_ref()
+                .and_then(|owner| owner.get("process_identity"))
+                .and_then(serde_json::Value::as_str);
+            let stale = if let (Some(expected), Some(actual)) =
+                (expected_identity, crate::sys::process::identity(pid))
+            {
+                expected != actual
+            } else {
+                !crate::sys::process::is_alive(pid)
+            };
+            if stale {
+                // Reap dead or reused PIDs before filtering by batch, without
+                // opening unrelated listeners just to probe their liveness.
+                remove();
+                continue;
+            }
+        }
+        let scope = owner
+            .as_ref()
+            .and_then(|owner| owner.get("batch_prefix"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if let Some(batch_id) = batch_id
+            && !scope.is_empty()
+            && !batch_id
+                .get(..scope.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scope))
+        {
+            continue;
+        }
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(WAKE_FANOUT_MS)).is_err() {
+            // An abruptly killed temporary waiter cannot run its Drop cleanup.
+            // Reap only the endpoint we tried, in case a registration changed.
+            remove();
+        }
+    }
+}
+
 /// Snapshot wake-endpoint ports for an instance.
 ///
 /// Used by the stop pattern in `hooks::common::finalize_instance_inner`,
 /// which must capture ports BEFORE `delete_notify_endpoints` removes the rows
 /// and wake them AFTER `delete_instance` so listeners see the row gone.
 pub fn snapshot_wake_ports(db: &HcomDb, instance: &str) -> Vec<u16> {
-    lookup_ports(db, instance, &[])
+    lookup_ports(db, instance, WakeKind::ALL)
 }
 
 /// Connect-and-close on each port to fire a wake. Best-effort; errors ignored.
@@ -190,6 +268,109 @@ mod tests {
         .unwrap();
         drop(conn);
         HcomDb::open_raw(path).unwrap()
+    }
+
+    #[test]
+    fn wake_launch_waiters_reaps_abandoned_waiters_and_keeps_other_kinds() {
+        let db_path = temp_db_path("abandoned_waiter");
+        let db = open_db_with_endpoints(&db_path);
+        let probe = bind_probe();
+        let dead_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let live = bind_probe();
+        let unrelated = bind_probe();
+        db.upsert_notify_endpoint("dead", "launch_wait", dead_port)
+            .unwrap();
+        db.upsert_notify_endpoint("live", "launch_wait", live.local_addr().unwrap().port())
+            .unwrap();
+        db.upsert_notify_endpoint("other", "pty", unrelated.local_addr().unwrap().port())
+            .unwrap();
+        wake_launch_waiters(&db, None);
+        assert!(!db.has_notify_endpoint_kind("dead", "launch_wait"));
+        assert!(db.has_notify_endpoint_kind("live", "launch_wait"));
+        assert!(await_connect(&live, Duration::from_millis(500)));
+        assert!(!await_connect(&unrelated, Duration::from_millis(50)));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn launch_waiters_reap_dead_owners_from_unrelated_batches() {
+        let db_path = temp_db_path("unrelated_dead_owner");
+        let db = open_db_with_endpoints(&db_path);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let dead_probe = bind_probe();
+        let live_probe = bind_probe();
+        let dead = format!(
+            "launch-wait:{}",
+            serde_json::json!({"pid": pid, "batch_prefix": "old-batch"})
+        );
+        let current_pid = std::process::id();
+        let live = format!(
+            "launch-wait:{}",
+            serde_json::json!({
+                "pid": current_pid, "process_identity": crate::sys::process::identity(current_pid),
+                "batch_prefix": "different-live-batch"
+            })
+        );
+        db.upsert_notify_endpoint(
+            &dead,
+            "launch_wait",
+            dead_probe.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        db.upsert_notify_endpoint(
+            &live,
+            "launch_wait",
+            live_probe.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        wake_launch_waiters(&db, Some("new-batch"));
+        assert!(!db.has_notify_endpoint_kind(&dead, "launch_wait"));
+        assert!(db.has_notify_endpoint_kind(&live, "launch_wait"));
+        assert!(!crate::sys::net::wait_readable(&live_probe, Duration::ZERO));
+        assert!(!crate::sys::net::wait_readable(&dead_probe, Duration::ZERO));
+        // Model PID reuse: a live PID with a different recorded creation time
+        // must not keep an abandoned endpoint alive.
+        if crate::sys::process::identity(current_pid).is_some() {
+            let reused = format!(
+                "launch-wait:{}",
+                serde_json::json!({
+                    "pid": current_pid, "process_identity": "previous-incarnation", "batch_prefix": "old-batch"
+                })
+            );
+            db.upsert_notify_endpoint(
+                &reused,
+                "launch_wait",
+                dead_probe.local_addr().unwrap().port(),
+            )
+            .unwrap();
+            wake_launch_waiters(&db, Some("new-batch"));
+            assert!(!db.has_notify_endpoint_kind(&reused, "launch_wait"));
+        }
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn ordinary_broadcasts_skip_launch_waiters() {
+        let db_path = temp_db_path("skip_launch_waiters");
+        let db = open_db_with_endpoints(&db_path);
+        let launch = bind_probe();
+        let delivery = bind_probe();
+        db.upsert_notify_endpoint("waiter", "launch_wait", launch.local_addr().unwrap().port())
+            .unwrap();
+        db.upsert_notify_endpoint("agent", "pty", delivery.local_addr().unwrap().port())
+            .unwrap();
+        wake_all(&db);
+        assert!(await_connect(&delivery, Duration::from_millis(500)));
+        assert!(!crate::sys::net::wait_readable(&launch, Duration::ZERO));
+        assert!(db.has_notify_endpoint_kind("waiter", "launch_wait"));
+        let _ = std::fs::remove_file(db_path);
     }
 
     /// Bug fix: `wake_all` must NOT connect to inject ports — they speak a

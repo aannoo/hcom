@@ -2,6 +2,7 @@
 
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
+pub(crate) mod grok;
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -715,8 +716,8 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
 
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
-/// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
-/// print the full message in the TUI. Gemini, Antigravity, and OpenCode bootstrap
+/// Claude and Codex inject the plain `<hcom>` trigger because their hooks show
+/// the full message in the TUI. Gemini, Antigravity, and OpenCode bootstrap
 /// need a human-visible prompt line, but it must stay prompt-safe: metadata only,
 /// no message body, no `@` autocomplete triggers, and no wrapping. If the compact
 /// preview will not fit the current input width, use the same minimal trigger.
@@ -904,6 +905,8 @@ pub struct GateResult {
 /// Shared state for delivery thread
 pub struct DeliveryState {
     pub screen: Arc<std::sync::RwLock<ScreenState>>,
+    /// Grok's native ACP transport; set for every hcom-launched Grok.
+    pub grok_acp: Option<grok::Launch>,
     /// True while the launch outcome is still Pending. Cleared once any
     /// terminal outcome (ready/failed/blocked) fires, so the PTY proxy can
     /// stop computing launch-only signals (e.g. `visible_tail`).
@@ -1222,11 +1225,11 @@ fn launch_ready_observed(
         return true;
     }
     if config.launch_ready_on_plugin_bind {
-        // Authoritative readiness for plugin-driven tools (OMP): the extension's
+        // Authoritative readiness for plugin-driven tools (Pi, OMP): the extension's
         // bind (a kind='plugin' notify endpoint) proves both TUI construction
         // and extension load. It deliberately REPLACES on-screen scraping rather
-        // than OR-ing with it — OMP's visible chrome is theme/preset dependent
-        // (status-line presets omit the pi glyph), and a syntactically broken /
+        // than OR-ing with it — their visible chrome is configurable (Pi's
+        // header, OMP's status-line presets), and a syntactically broken /
         // non-running extension could still render default chrome and be falsely
         // declared ready. Requiring the bind makes a dead extension block.
         return db.has_notify_endpoint_kind(name, "plugin");
@@ -1674,7 +1677,23 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(
+    if let Some(launch) = state.grok_acp.as_ref() {
+        grok::run(
+            launch,
+            &running,
+            db,
+            notify,
+            state,
+            &process_id,
+            &mut current_name,
+            config,
+            &shared_name,
+            &shared_status,
+            &title_wake,
+            &mut host_label,
+            &mut launch_outcome,
+        );
+    } else if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
     ) {
@@ -1925,7 +1944,7 @@ pub fn run_delivery_loop(
                             continue;
                         }
 
-                        // Claude/Codex hooks show full delivery in the TUI, so
+                        // Claude/Codex hooks show the full delivery in the TUI, so
                         // they only need a trigger. Gemini-style paths use a
                         // compact, prompt-safe preview for human visibility.
                         use crate::tool::Tool;
@@ -2535,7 +2554,11 @@ pub fn run_delivery_loop(
 }
 
 /// True when this delivery thread's process_id still owns `current_name`.
-fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &str) -> bool {
+pub(crate) fn instance_owns_process_binding(
+    db: &HcomDb,
+    process_id: &str,
+    current_name: &str,
+) -> bool {
     if process_id.is_empty() {
         return true;
     }
@@ -2547,38 +2570,45 @@ fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &s
 }
 
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
+///
+/// Publishes through the same atomic delete gate as `stop_instance`, so a
+/// concurrent `hcom kill` and this cleanup produce exactly one stopped event.
 pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
-    let snapshot = match db.get_instance_snapshot(current_name) {
-        Ok(Some(snap)) => Some(snap),
-        Ok(None) => {
-            log_info(
-                "native",
-                "delivery.cleanup_skipped",
-                &format!(
-                    "Skipping PTY stop event for {} because the instance row is already gone",
-                    current_name
-                ),
-            );
-            return;
-        }
+    let skip = |why: &str| {
+        log_info(
+            "native",
+            "delivery.cleanup_skipped",
+            &format!("Skipping PTY stop event for {current_name} because {why}"),
+        );
+    };
+    let inst = match db.get_instance_full(current_name) {
+        Ok(Some(inst)) => inst,
+        Ok(None) => return skip("the instance row is already gone"),
         Err(e) => {
             log_error(
                 "native",
                 "delivery.cleanup",
-                &format!("DB error getting instance snapshot: {}", e),
+                &format!("DB error loading instance {current_name}: {e}"),
             );
-            None
+            return;
         }
     };
+    let snapshot = db.get_instance_snapshot(current_name).ok().flatten();
 
-    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire)
-        || matches!(db.get_status(current_name), Ok(Some((_, context))) if context == "exit:killed");
+    // `hcom kill` records exit:killed + its initiator before signalling.
+    let kill_recorded = inst.status_context == "exit:killed";
+    let was_killed = kill_recorded || EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
         ("exit:killed", "killed")
     } else {
         ("exit:closed", "closed")
     };
-    if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
+    let by = if kill_recorded && !inst.status_detail.is_empty() {
+        inst.status_detail.clone()
+    } else {
+        "pty".to_string()
+    };
+    if !kill_recorded && let Err(e) = db.set_status(current_name, "inactive", exit_context) {
         log_warn(
             "native",
             "delivery.set_status_fail",
@@ -2586,25 +2616,31 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         );
     }
 
-    if let Err(e) = db.delete_notify_endpoints(current_name) {
-        log_warn(
-            "native",
-            "delivery.cleanup_endpoints_fail",
-            &format!("{}", e),
-        );
-    }
     if let Err(e) = db.cleanup_subscriptions(current_name) {
         log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
     }
-    if let Err(e) = db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot) {
-        log_warn(
+    let mut event_data = serde_json::json!({
+        "action": "stopped",
+        "by": by,
+        "reason": exit_reason,
+    });
+    if let Some(snapshot) = snapshot {
+        event_data["snapshot"] = snapshot;
+    }
+    match db.finalize_instance_stop(
+        current_name,
+        inst.created_at,
+        inst.session_id.as_deref(),
+        inst.agent_id.as_deref(),
+        &event_data,
+    ) {
+        Ok(true) => {}
+        Ok(false) => skip("another stop finalized it first"),
+        Err(e) => log_warn(
             "native",
             "delivery.life_event_fail",
-            &format!("Failed to log life event: {}", e),
-        );
-    }
-    if let Err(e) = db.delete_instance(current_name) {
-        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+            &format!("Failed to finalize stop for {current_name}: {e}"),
+        ),
     }
 }
 
@@ -2653,6 +2689,7 @@ mod tests {
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
         DeliveryState {
+            grok_acp: None,
             screen: Arc::new(std::sync::RwLock::new(screen)),
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             inject_port: 0,
@@ -2769,7 +2806,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_cleanup_keeps_killed_reason_recorded_by_kill() {
+    fn pty_cleanup_keeps_kill_reason_and_initiator_with_single_stop_event() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let mut db = HcomDb::open_raw(&db_path).unwrap();
@@ -2783,21 +2820,26 @@ mod tests {
             .unwrap();
         // `hcom kill` records the reason before signalling; the PTY cleanup
         // can then win the race without having seen the signal itself.
-        db.set_status("kiro", ST_INACTIVE, "exit:killed").unwrap();
+        db.mark_killed("kiro", "samu").unwrap();
 
         cleanup_deleted_instance(&mut db, "kiro");
+        // The kill path's own finalize loses the gate and logs nothing.
+        crate::hooks::common::stop_instance(&db, "kiro", "samu", "killed");
 
-        let reason: String = db
+        let stops: Vec<(String, String)> = db
             .conn()
-            .query_row(
-                "SELECT json_extract(data, '$.reason') FROM events
+            .prepare(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
                  WHERE type = 'life' AND instance = 'kiro'
                    AND json_extract(data, '$.action') = 'stopped'",
-                [],
-                |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(reason, "killed");
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(stops, vec![("samu".to_string(), "killed".to_string())]);
+        assert!(db.get_instance_full("kiro").unwrap().is_none());
     }
 
     #[test]
@@ -3137,13 +3179,20 @@ mod tests {
     }
 
     #[test]
-    fn omp_launch_ready_requires_plugin_bind_not_screen() {
-        // OMP readiness is bind-driven: a rendered/ready screen must NOT be
+    fn pi_family_launch_ready_requires_plugin_bind_not_screen() {
+        // Pi/OMP readiness is bind-driven: a rendered/ready screen must NOT be
         // enough, and a kind='plugin' notify endpoint must flip it ready even
         // with no on-screen marker.
+        for tool in [crate::tool::Tool::Pi, crate::tool::Tool::Omp] {
+            assert_plugin_bind_readiness(tool);
+        }
+    }
+
+    fn assert_plugin_bind_readiness(tool: crate::tool::Tool) {
         let (_dir, db) = open_ready_test_db();
-        let config = ToolConfig::for_tool(crate::tool::Tool::Omp);
-        assert!(config.launch_ready_on_plugin_bind);
+        let config = ToolConfig::for_tool(tool);
+        assert!(config.launch_ready_on_plugin_bind, "{tool:?}");
+        assert!(tool.ready_patterns().is_empty(), "{tool:?}");
 
         let mut screen = safe_screen();
         screen.ready = true; // empty pattern => is_ready() always true

@@ -27,9 +27,10 @@ pub struct ArchiveArgs {
     /// SQL WHERE clause for filtering
     #[arg(long)]
     pub sql: Option<String>,
-    /// Limit results
-    #[arg(long, default_value = "20")]
-    pub last: usize,
+    /// Limit archives listed (default: all), or events queried from a
+    /// selected archive (default: 20)
+    #[arg(long)]
+    pub last: Option<usize>,
 }
 
 /// Get list of archive sessions with metadata.
@@ -118,6 +119,10 @@ fn list_archives(here_filter: bool) -> Vec<serde_json::Value> {
     }
 
     archives
+}
+
+fn limit_archives(archives: &[serde_json::Value], last: Option<usize>) -> &[serde_json::Value] {
+    &archives[..archives.len().min(last.unwrap_or(usize::MAX))]
 }
 
 /// Query event/instance counts from an archive DB. Returns None if filtered out.
@@ -277,19 +282,25 @@ pub fn cmd_archive(_db: &HcomDb, args: &ArchiveArgs, _ctx: Option<&CommandContex
     if args.selector.is_none() {
         if archives.is_empty() {
             if json_output {
-                println!("{}", serde_json::json!({"archives": [], "count": 0}));
+                println!(
+                    "{}",
+                    serde_json::json!({"archives": [], "count": 0, "total": 0})
+                );
             } else {
                 println!("No archives found");
             }
             return 0;
         }
 
+        let visible_archives = limit_archives(&archives, last_count);
+
         if json_output {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "archives": archives,
-                    "count": archives.len(),
+                serde_json::to_string(&serde_json::json!({
+                    "archives": visible_archives,
+                    "count": visible_archives.len(),
+                    "total": archives.len(),
                 }))
                 .unwrap_or_default()
             );
@@ -298,7 +309,7 @@ pub fn cmd_archive(_db: &HcomDb, args: &ArchiveArgs, _ctx: Option<&CommandContex
 
         // Human-readable list
         println!("Archives:");
-        for archive in &archives {
+        for archive in visible_archives {
             let idx = archive["index"].as_i64().unwrap_or(0);
             let name = archive["name"].as_str().unwrap_or("?");
             let events = archive["events"]
@@ -310,6 +321,13 @@ pub fn cmd_archive(_db: &HcomDb, args: &ArchiveArgs, _ctx: Option<&CommandContex
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
             println!("  {idx:>2}. {name}  {events} events  {instances} agents");
+        }
+        if visible_archives.len() < archives.len() {
+            println!(
+                "  ... showing {} of {} (--last N for more)",
+                visible_archives.len(),
+                archives.len()
+            );
         }
         return 0;
     }
@@ -330,10 +348,7 @@ pub fn cmd_archive(_db: &HcomDb, args: &ArchiveArgs, _ctx: Option<&CommandContex
         match query_archive_instances(resolved, sql_filter.as_deref()) {
             Ok(instances) => {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&instances).unwrap_or_default()
-                    );
+                    println!("{}", serde_json::to_string(&instances).unwrap_or_default());
                 } else if instances.is_empty() {
                     println!("Archive is empty");
                 } else {
@@ -363,13 +378,10 @@ pub fn cmd_archive(_db: &HcomDb, args: &ArchiveArgs, _ctx: Option<&CommandContex
         }
     } else {
         // Default: query events
-        match query_archive_events(resolved, sql_filter.as_deref(), last_count) {
+        match query_archive_events(resolved, sql_filter.as_deref(), last_count.unwrap_or(20)) {
             Ok(events) => {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&events).unwrap_or_default()
-                    );
+                    println!("{}", serde_json::to_string(&events).unwrap_or_default());
                 } else if events.is_empty() {
                     println!("No events in archive");
                 } else {
@@ -437,7 +449,7 @@ mod tests {
     fn test_archive_args_last_flag() {
         use clap::Parser;
         let args = ArchiveArgs::try_parse_from(["archive", "--last", "50", "1"]).unwrap();
-        assert_eq!(args.last, 50);
+        assert_eq!(args.last, Some(50));
         assert_eq!(args.selector.as_deref(), Some("1"));
     }
 
@@ -445,7 +457,7 @@ mod tests {
     fn test_archive_args_last_default() {
         use clap::Parser;
         let args = ArchiveArgs::try_parse_from(["archive", "1"]).unwrap();
-        assert_eq!(args.last, 20);
+        assert_eq!(args.last, None);
         assert_eq!(args.selector.as_deref(), Some("1"));
     }
 
@@ -464,6 +476,19 @@ mod tests {
         let args = ArchiveArgs::try_parse_from(["archive", "--json", "1"]).unwrap();
         assert!(args.json);
         assert_eq!(args.selector.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn test_archive_list_limit() {
+        let archives = vec![
+            serde_json::json!({"index": 1}),
+            serde_json::json!({"index": 2}),
+            serde_json::json!({"index": 3}),
+        ];
+        assert_eq!(limit_archives(&archives, Some(2)).len(), 2);
+        assert_eq!(limit_archives(&archives, Some(20)).len(), 3);
+        assert!(limit_archives(&archives, Some(0)).is_empty());
+        assert_eq!(limit_archives(&archives, None).len(), 3);
     }
 
     #[test]

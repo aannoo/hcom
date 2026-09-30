@@ -8,6 +8,7 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::db::HcomDb;
+use crate::hooks::runtime::HookMode;
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom status`.
@@ -45,7 +46,7 @@ fn is_in_path(name: &str) -> bool {
 }
 
 fn is_antigravity_installed() -> bool {
-    is_in_path("agy")
+    crate::terminal::which_bin("agy").is_some()
         || is_in_path("antigravity")
         || std::env::var_os("HOME").is_some_and(|home| {
             let bin_dir = Path::new(&home).join(".antigravity/antigravity/bin");
@@ -60,13 +61,9 @@ fn is_antigravity_installed() -> bool {
 fn is_tool_installed(tool: crate::tool::Tool) -> bool {
     match tool {
         crate::tool::Tool::Antigravity => is_antigravity_installed(),
-        crate::tool::Tool::Kilo => crate::terminal::which_bin("kilo").is_some(),
-        crate::tool::Tool::Pi => crate::terminal::which_bin("pi").is_some(),
-        crate::tool::Tool::Omp => crate::terminal::which_bin("omp").is_some(),
-        crate::tool::Tool::Cursor => crate::terminal::which_bin("cursor-agent").is_some(),
-        crate::tool::Tool::Copilot => crate::terminal::which_bin("copilot").is_some(),
         crate::tool::Tool::Adhoc => false,
-        _ => is_in_path(tool.spec().cli_binary),
+        // Same lookup the launcher uses (PATH, then per-user install dirs).
+        _ => crate::terminal::which_bin(tool.spec().cli_binary).is_some(),
     }
 }
 
@@ -76,7 +73,10 @@ struct ToolStatus {
     key: &'static str,
     name: &'static str,
     installed: bool,
+    /// hcom launches get hooks with no further setup: always for per-run
+    /// tools, when the global install is present for persistent ones.
     hooks: bool,
+    hook_mode: HookMode,
     settings_path: String,
 }
 
@@ -96,12 +96,21 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
     crate::integration_spec::ALL
         .iter()
         .filter(|spec| spec.released)
-        .map(|spec| ToolStatus {
-            key: spec.name,
-            name: spec.label,
-            installed: is_tool_installed(spec.tool),
-            hooks: spec.tool.verify_hooks_installed(false),
-            settings_path: spec.tool.hooks_settings_path(),
+        .map(|spec| {
+            let hook_mode = HookMode::of(spec.tool);
+            let persistent = hook_mode == HookMode::Persistent;
+            ToolStatus {
+                key: spec.name,
+                name: spec.label,
+                installed: is_tool_installed(spec.tool),
+                hooks: !persistent || spec.tool.verify_hooks_installed(false),
+                hook_mode,
+                settings_path: if persistent {
+                    spec.tool.hooks_settings_path()
+                } else {
+                    String::new()
+                },
+            }
         })
         .collect()
 }
@@ -111,6 +120,7 @@ fn tool_statuses_json(tools: &[ToolStatus]) -> serde_json::Value {
         let mut status = serde_json::Map::from_iter([
             ("installed".to_string(), json!(tool.installed)),
             ("hooks".to_string(), json!(tool.hooks)),
+            ("hook_mode".to_string(), json!(tool.hook_mode.as_str())),
         ]);
         if !tool.settings_path.is_empty() {
             status.insert("settings_path".to_string(), json!(tool.settings_path));
@@ -323,10 +333,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     .map(|p| p.to_string_lossy().into_owned()),
             });
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&result).unwrap_or_default());
         return 0;
     }
 
@@ -564,6 +571,7 @@ mod tests {
             name: "Claude",
             installed: true,
             hooks: true,
+            hook_mode: HookMode::Persistent,
             settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "✓");
@@ -573,6 +581,7 @@ mod tests {
             name: "Claude",
             installed: true,
             hooks: false,
+            hook_mode: HookMode::Persistent,
             settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "~");
@@ -582,6 +591,7 @@ mod tests {
             name: "Claude",
             installed: false,
             hooks: false,
+            hook_mode: HookMode::Persistent,
             settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "✗");
@@ -640,13 +650,15 @@ mod tests {
                 name: "Kimi",
                 installed: true,
                 hooks: false,
+                hook_mode: HookMode::Persistent,
                 settings_path: "/tmp/kimi.json".to_string(),
             },
             ToolStatus {
                 key: "claude",
                 name: "Claude",
                 installed: false,
-                hooks: false,
+                hooks: true,
+                hook_mode: HookMode::PerRun,
                 settings_path: String::new(),
             },
         ];
@@ -654,6 +666,10 @@ mod tests {
         assert_eq!(value["kimi"]["installed"], true);
         assert_eq!(value["kimi"]["settings_path"], "/tmp/kimi.json");
         assert_eq!(value["claude"]["installed"], false);
+        assert_eq!(value["kimi"]["hook_mode"], "persistent");
+        assert_eq!(value["claude"]["hook_mode"], "per_run");
+        assert_eq!(value["claude"]["hooks"], true);
+        assert!(value["claude"].get("settings_path").is_none());
         assert!(value.get("0").is_none());
     }
 

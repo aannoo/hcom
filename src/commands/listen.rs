@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::cli_context::InlineBatch;
 use crate::cli_context::format_envelope_prefix;
 use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::db::HcomDb;
@@ -359,15 +360,34 @@ fn listen_loop(
         }
 
         // Check for unread messages
-        let messages = db.get_unread_messages(instance_name);
-        if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last()
-                && let Some(id) = last.event_id
-            {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, instance_name, &updates);
+        if let Some(batch) = InlineBatch::take(db, instance_name) {
+            // listen delivers this batch itself (or leaves it unread on a failed
+            // write); the router must not deliver another one after it.
+            crate::cli_context::claim_inline_delivery();
+            let output = if json_output {
+                batch
+                    .messages
+                    .iter()
+                    .map(|msg| message_json(msg) + "\n")
+                    .collect()
+            } else {
+                format!(
+                    "\n{}\n{}",
+                    format_messages_text(db, &batch.messages, instance_name),
+                    batch.remaining_note(instance_name)
+                )
+            };
+            if let Err(e) = batch.emit(db, instance_name, &output, false) {
+                eprintln!("hcom: {e}");
+                set_listen_done_status(db, instance_name, instance_data, "delivery failed");
+                return 1;
+            }
+            let late = batch.arrived_since_note(db, instance_name);
+            if json_output {
+                // Keep stdout pure JSON; notes go to stderr.
+                eprint!("{}{late}", batch.remaining_note(instance_name));
+            } else {
+                print!("{late}");
             }
 
             let context = if is_adhoc(instance_data) {
@@ -376,15 +396,6 @@ fn listen_loop(
                 "finished listening"
             };
             set_listen_done_status(db, instance_name, instance_data, context);
-
-            if json_output {
-                for msg in &messages {
-                    println!("{}", message_json(msg));
-                }
-            } else {
-                let formatted = format_messages_text(db, &messages, instance_name);
-                println!("\n{formatted}");
-            }
             return 0;
         }
 
@@ -553,6 +564,7 @@ fn filter_listen_loop(
     notify_server: Option<&NotifyServer>,
     shutdown: &AtomicBool,
 ) -> i32 {
+    let mut backlog_end: Option<Option<i64>> = None;
     loop {
         // Check for SIGTERM
         if shutdown.load(Ordering::Relaxed) {
@@ -581,50 +593,88 @@ fn filter_listen_loop(
             return 0;
         }
 
-        // Check for messages (subscription notification or regular)
-        let messages = db.get_unread_messages(instance_name);
-        if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last()
-                && let Some(id) = last.event_id
-            {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, instance_name, &updates);
-            }
-
-            // Check for subscription notification
-            for msg in &messages {
-                if msg.from == "[hcom-events]" && msg.text.contains(&format!("[sub:{sub_id}]")) {
-                    if json_output {
-                        let j = serde_json::json!({
-                            "matched": true,
-                            "notification": msg.text,
-                        });
-                        println!("{}", serde_json::to_string(&j).unwrap_or_default());
-                    } else {
-                        println!("\n{}", msg.text);
-                    }
-                    set_listen_done_status(db, instance_name, instance_data, "filter matched");
-                    return 0;
-                }
-            }
-
-            // Other non-system messages
-            let real_messages: Vec<&crate::db::Message> = messages
+        // Check for messages (subscription notification or regular). Everything
+        // in the batch is shown before it is acknowledged; only the match or a
+        // real message ends the listen.
+        if let Some(batch) = InlineBatch::take(db, instance_name) {
+            // listen delivers this batch itself (or leaves it unread on a failed
+            // write); the router must not deliver another one after it.
+            crate::cli_context::claim_inline_delivery();
+            let sub_tag = format!("[sub:{sub_id}]");
+            let is_match =
+                |m: &crate::db::Message| m.from == "[hcom-events]" && m.text.contains(&sub_tag);
+            let matched = batch.messages.iter().find(|m| is_match(m));
+            let others: Vec<crate::db::Message> = batch
+                .messages
                 .iter()
-                .filter(|m| !m.from.starts_with('['))
+                .filter(|m| !is_match(m))
+                .cloned()
                 .collect();
-            if !real_messages.is_empty() {
+
+            // Event order, with the match in its place among the other messages.
+            let mut output = String::new();
+            let mut run: Vec<crate::db::Message> = Vec::new();
+            let flush = |run: &mut Vec<crate::db::Message>, output: &mut String| {
+                if run.is_empty() {
+                    return;
+                }
                 if json_output {
-                    for msg in &real_messages {
-                        println!("{}", message_json(msg));
+                    for msg in run.iter() {
+                        output.push_str(&(message_json(msg) + "\n"));
                     }
                 } else {
-                    let owned: Vec<crate::db::Message> =
-                        real_messages.iter().map(|m| (*m).clone()).collect();
-                    let formatted = format_messages_text(db, &owned, instance_name);
-                    println!("\n{formatted}");
+                    output.push_str(&format!(
+                        "\n{}\n",
+                        format_messages_text(db, run, instance_name)
+                    ));
+                }
+                run.clear();
+            };
+            for msg in &batch.messages {
+                if !is_match(msg) {
+                    run.push(msg.clone());
+                    continue;
+                }
+                flush(&mut run, &mut output);
+                if json_output {
+                    let j = serde_json::json!({"matched": true, "notification": msg.text});
+                    output.push_str(&format!("{j}\n"));
+                } else {
+                    output.push_str(&format!("\n{}\n", msg.text));
+                }
+            }
+            flush(&mut run, &mut output);
+            if let Err(e) = batch.emit(db, instance_name, &output, false) {
+                eprintln!("hcom: {e}");
+                set_listen_done_status(db, instance_name, instance_data, "delivery failed");
+                return 1;
+            }
+            if matched.is_some() {
+                let note = batch.remaining_note(instance_name)
+                    + &batch.arrived_since_note(db, instance_name);
+                if json_output {
+                    eprint!("{note}");
+                } else {
+                    print!("{note}");
+                }
+                set_listen_done_status(db, instance_name, instance_data, "filter matched");
+                return 0;
+            }
+            // The match may sit beyond this capped batch: keep reading through the
+            // backlog that existed at the first batch, but not newer arrivals, so
+            // sustained traffic can't keep the listen draining.
+            let end = *backlog_end.get_or_insert(batch.backlog_end);
+            let batch_end = batch.messages.last().and_then(|m| m.event_id);
+            if batch.remaining > 0 && batch_end < end {
+                continue;
+            }
+            if others.iter().any(|m| !m.from.starts_with('[')) {
+                let late = batch.remaining_note(instance_name)
+                    + &batch.arrived_since_note(db, instance_name);
+                if json_output {
+                    eprint!("{late}");
+                } else {
+                    print!("{late}");
                 }
                 set_listen_done_status(db, instance_name, instance_data, "message received");
                 return 0;

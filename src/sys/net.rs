@@ -12,7 +12,9 @@ pub fn wait_readable(listener: &TcpListener, timeout: Duration) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // poll uses whole milliseconds: round positive fractions up so the
+        // final fraction of a deadline cannot turn into a busy poll.
+        let timeout_ms = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
         let mut pfd = libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,

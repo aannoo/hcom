@@ -481,6 +481,42 @@ pub(crate) fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf
     }
 }
 
+/// Per-user bin dirs searched after PATH, in order.
+///
+/// Tool-specific dirs are where each official installer puts its binary.
+/// `~/.local/bin` is the default for Codex, Copilot, agy, OMP, Cursor, Pi and
+/// Claude's native installer; `~/.bun/bin` is where `bun install -g` links
+/// npm-published CLIs (pi, omp, opencode, gemini, ...).
+fn fallback_bin_dirs(home: &Path, name: &str) -> Vec<std::path::PathBuf> {
+    const LOCAL: &[&str] = &[".local", "bin"];
+    const BUN: &[&str] = &[".bun", "bin"];
+    let dirs: &[&[&str]] = match name {
+        // Native installer (~/.local/bin) before the legacy ~/.claude/bin copy.
+        "claude" => &[&[".claude", "local"], LOCAL, &[".claude", "bin"], BUN],
+        "opencode" => &[&[".opencode", "bin"], LOCAL, BUN],
+        "kilo" => &[&[".kilo", "bin"], LOCAL, BUN],
+        "grok" => &[&[".grok", "bin"], LOCAL, BUN],
+        "kimi" => &[&[".kimi-code", "bin"], LOCAL, BUN],
+        "pi" => &[&[".pi", "agent", "bin"], LOCAL, BUN],
+        _ => &[LOCAL, BUN],
+    };
+    dirs.iter()
+        .map(|parts| {
+            parts
+                .iter()
+                .fold(home.to_path_buf(), |p, part| p.join(part))
+        })
+        .collect()
+}
+
+fn which_in_fallback_dirs(home: &Path, name: &str) -> Option<String> {
+    fallback_bin_dirs(home, name)
+        .iter()
+        .flat_map(|dir| which_candidates(dir, name))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().to_string())
+}
+
 /// Simple `which` implementation — find binary in PATH.
 pub fn which_bin(name: &str) -> Option<String> {
     // `split_paths` uses the platform separator (`;` on Windows, `:` elsewhere),
@@ -497,25 +533,10 @@ pub fn which_bin(name: &str) -> Option<String> {
         }
     }
 
-    // Fallback: well-known install locations not always in PATH
-    if let Ok(home) = std::env::var("HOME") {
-        let home = Path::new(&home);
-        let fallbacks: &[std::path::PathBuf] = match name {
-            "claude" => &[
-                home.join(".claude").join("local").join("claude"),
-                home.join(".local").join("bin").join("claude"),
-                home.join(".claude").join("bin").join("claude"),
-            ],
-            "opencode" => &[home.join(".opencode").join("bin").join("opencode")],
-            "kilo" => &[home.join(".kilo").join("bin").join("kilo")],
-            "cursor-agent" => &[home.join(".local").join("bin").join("cursor-agent")],
-            _ => &[],
-        };
-        for fallback in fallbacks {
-            if fallback.exists() && fallback.is_file() {
-                return Some(fallback.to_string_lossy().to_string());
-            }
-        }
+    // Fallback: install locations that are often missing from PATH (GUI or
+    // hook-spawned shells, or the user never added them).
+    if let Some(found) = dirs::home_dir().and_then(|home| which_in_fallback_dirs(&home, name)) {
+        return Some(found);
     }
 
     #[cfg(windows)]
@@ -1042,6 +1063,14 @@ pub fn create_bash_script(
         }
     }
 
+    if background {
+        // Startup timeline marker for the background log; hcom.log carries the
+        // rest (startup.* events). macOS date has no sub-second format.
+        writeln!(
+            f,
+            "echo \"[hcom runner] starting PTY wrapper $(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+        )?;
+    }
     writeln!(f, "{}", final_command)?;
 
     if opens_new_window {
@@ -4034,6 +4063,46 @@ mod tests {
             Some(p) => assert_eq!(r, p),
             None => assert_eq!(r, "/bin/bash"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_fallback_finds_user_bin_installs() {
+        let home = tempfile::tempdir().unwrap();
+        let install = |parts: &[&str], name: &str| {
+            let dir = parts
+                .iter()
+                .fold(home.path().to_path_buf(), |p, part| p.join(part));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), "").unwrap();
+            dir.join(name).to_string_lossy().to_string()
+        };
+        assert_eq!(which_in_fallback_dirs(home.path(), "omp"), None);
+
+        // `bun install -g` links into ~/.bun/bin.
+        let bun_omp = install(&[".bun", "bin"], "omp");
+        assert_eq!(which_in_fallback_dirs(home.path(), "omp"), Some(bun_omp));
+        // ~/.local/bin (native installer) wins over the bun link.
+        let local_omp = install(&[".local", "bin"], "omp");
+        assert_eq!(which_in_fallback_dirs(home.path(), "omp"), Some(local_omp));
+
+        // A tool's own installer dir comes before the shared ones.
+        install(&[".local", "bin"], "grok");
+        let grok = install(&[".grok", "bin"], "grok");
+        assert_eq!(which_in_fallback_dirs(home.path(), "grok"), Some(grok));
+        let kimi = install(&[".kimi-code", "bin"], "kimi");
+        assert_eq!(which_in_fallback_dirs(home.path(), "kimi"), Some(kimi));
+        let pi = install(&[".pi", "agent", "bin"], "pi");
+        assert_eq!(which_in_fallback_dirs(home.path(), "pi"), Some(pi));
+
+        // Claude: ~/.local/bin (native installer) wins over legacy ~/.claude/bin.
+        install(&[".claude", "bin"], "claude");
+        let claude = install(&[".local", "bin"], "claude");
+        assert_eq!(which_in_fallback_dirs(home.path(), "claude"), Some(claude));
+
+        // Directories are not binaries.
+        std::fs::create_dir_all(home.path().join(".bun").join("bin").join("gemini")).unwrap();
+        assert_eq!(which_in_fallback_dirs(home.path(), "gemini"), None);
     }
 
     // Finding 17: built-in preset platform capability, checked against the

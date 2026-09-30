@@ -23,8 +23,9 @@ use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
-    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
-    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
+    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, GROK_REJECTED_ARGS, KILO_REJECTED_ARGS,
+    KIMI_REJECTED_ARGS, OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS,
+    validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -44,6 +45,7 @@ pub enum LaunchTool {
     Cursor,
     Kimi,
     Copilot,
+    Grok,
     Omp,
 }
 
@@ -63,6 +65,7 @@ impl LaunchTool {
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
             "copilot" => Ok(LaunchTool::Copilot),
+            "grok" | "grok-build" => Ok(LaunchTool::Grok),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -81,6 +84,7 @@ impl LaunchTool {
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
             LaunchTool::Copilot => "copilot",
+            LaunchTool::Grok => "grok",
         }
     }
 
@@ -101,6 +105,7 @@ impl LaunchTool {
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
+            LaunchTool::Grok => crate::tool::Tool::Grok,
         }
     }
 
@@ -170,7 +175,8 @@ impl LaunchBackend {
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
             | LaunchTool::Kimi
-            | LaunchTool::Copilot => LaunchBackend::HeadlessPty,
+            | LaunchTool::Copilot
+            | LaunchTool::Grok => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -330,31 +336,104 @@ fn apply_inherited_notes(instance_env: &mut HashMap<String, String>, inherited: 
     }
 }
 
+/// Start a new Grok conversation under an explicit session id.
+///
+/// Without one the TUI opens on its welcome screen over a hidden "home"
+/// session, and never draws turns another client (hcom's queue) runs there.
+/// `--session-id` opens the conversation view directly. Resume/continue
+/// already open a conversation.
+fn ensure_grok_session_id(args: &mut Vec<String>) {
+    let opens_conversation = args.iter().take_while(|arg| *arg != "--").any(|arg| {
+        let flag = arg.split('=').next().unwrap_or(arg);
+        matches!(
+            flag,
+            "-r" | "--resume" | "-c" | "--continue" | "-s" | "--session-id"
+        )
+    });
+    if !opens_conversation {
+        args.insert(0, "--session-id".to_string());
+        args.insert(1, uuid::Uuid::new_v4().to_string());
+    }
+}
+
+/// Prepend `extra` to Grok's `--rules` (text appended to its system prompt).
+fn inject_grok_rules(args: &mut Vec<String>, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    // Flags only: after `--` it is the prompt, whatever it looks like.
+    while i < args.len() && args[i] != "--" {
+        let token = &args[i];
+        if token == "--rules" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                args[i + 1] = format!("{}\n\n{}", extra, args[i + 1]);
+            } else {
+                args.insert(i + 1, extra.to_string());
+            }
+            return;
+        }
+        if let Some(rest) = token.strip_prefix("--rules=") {
+            args[i] = format!("--rules={}\n\n{}", extra, rest);
+            return;
+        }
+        i += 1;
+    }
+    args.insert(0, "--rules".to_string());
+    args.insert(1, extra.to_string());
+}
+
 fn build_codex_bootstrap(
     db: &HcomDb,
     hcom_dir: &Path,
     instance_name: &str,
     background: bool,
     instance_env: &HashMap<String, String>,
-    tag: &str,
-    relay_enabled: bool,
 ) -> String {
-    let notes = instance_env
-        .get("HCOM_NOTES")
-        .map(String::as_str)
-        .unwrap_or("");
-    crate::bootstrap::get_bootstrap(
+    build_launch_bootstrap(
         db,
         hcom_dir,
         instance_name,
         "codex",
         background,
-        true,
-        notes,
-        tag,
-        relay_enabled,
-        None,
+        instance_env,
     )
+}
+
+fn build_grok_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+) -> String {
+    build_launch_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "grok",
+        background,
+        instance_env,
+    )
+}
+
+fn build_launch_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    tool: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+) -> String {
+    // Codex and Grok take their bootstrap at launch, so render it from the env
+    // the instance will run with. HCOM_BACKGROUND is only added to the runner
+    // env later, hence the explicit override.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut ctx = crate::shared::HcomContext::from_env(instance_env, cwd);
+    ctx.hcom_dir = hcom_dir.to_path_buf();
+    ctx.is_launched = true;
+    ctx.is_background = background;
+    crate::bootstrap::get_bootstrap(db, &ctx, instance_name, tool)
 }
 
 fn build_launch_env_with_resolver<F>(
@@ -429,6 +508,9 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
         strip.insert((*v).to_string());
     }
     strip.insert("HCOM_LAUNCHED_PRESET".to_string());
+    // A new plugin host must claim ownership itself; an inherited marker would
+    // make hcom's OpenCode/Kilo plugin stay inert in the process hcom launched.
+    strip.insert(crate::hooks::runtime::PLUGIN_HOST_PID_ENV.to_string());
 
     strip
 }
@@ -448,6 +530,7 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::Cursor => ".cursor",
         crate::tool::Tool::Kimi => ".kimi",
         crate::tool::Tool::Copilot => ".copilot",
+        crate::tool::Tool::Grok => ".grok",
         crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
     };
     Some(root.join(dirname))
@@ -580,61 +663,13 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
     out
 }
 
-fn format_plugin_install_error(
-    label: &str,
-    tool: &str,
-    target: &std::path::Path,
-    error: &std::io::Error,
-    diag: &str,
-) -> String {
-    use std::io::ErrorKind;
-
-    let mut message = format!(
-        "Failed to install {label} plugin at {}: {error}",
-        target.display()
-    );
-    if matches!(
-        error.kind(),
-        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
-    ) {
-        message.push_str(
-            "\nThe current process cannot write to the tool's config directory. If an AI agent ran this command inside a sandbox, retry the original hcom launch with approval or elevated permission to write this path.",
-        );
-    }
-    message.push_str(&format!("\nManual retry: hcom hooks add {tool}\n{diag}"));
-    message
-}
-
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(
-    tool: &LaunchTool,
-    include_permissions: bool,
-    codex_home: Option<&std::path::Path>,
-) -> Result<()> {
+fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
     match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => {
-            if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::claude::try_setup_claude_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "settings_path",
-                        crate::hooks::claude::get_claude_settings_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Claude hooks: {e}\n\
-                     Run: hcom hooks add claude\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Claude | LaunchTool::ClaudePty => unreachable!("Claude uses per-run hooks"),
         LaunchTool::Gemini => {
             if !crate::hooks::gemini::is_gemini_version_supported() {
                 if let Some(ver) = crate::hooks::gemini::get_gemini_version() {
@@ -667,99 +702,11 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Codex => {
-            let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
-            if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
-                && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
-            {
-                return Ok(());
-            }
-            if let Err(e) =
-                crate::hooks::codex::try_setup_codex_hooks_at(include_permissions, codex_home)
-            {
-                if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
-                    crate::log::log_warn(
-                        "codex",
-                        "codex.hook_trust_setup_warn",
-                        &format!(
-                            "Codex hook setup could not write trust state; launch preprocessing may fall back to hook-trust bypass: {e}"
-                        ),
-                    );
-                } else {
-                    let diag = install_diag_context(
-                        tool,
-                        &[
-                            ("config_path", codex_home.join("config.toml")),
-                            ("hooks_path", codex_home.join("hooks.json")),
-                        ],
-                    );
-                    bail!(
-                        "Failed to setup Codex hooks: {e}\n\
-                         Run: hcom hooks add codex\n\
-                         {diag}"
-                    );
-                }
-            }
-            Ok(())
-        }
-        LaunchTool::OpenCode => {
-            match crate::hooks::opencode::ensure_plugin_installed("opencode") {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(error) => {
-                    let target = crate::hooks::opencode::get_opencode_plugin_path();
-                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
-                    bail!(
-                        "{}",
-                        format_plugin_install_error("OpenCode", "opencode", &target, &error, &diag,)
-                    );
-                }
-            }
-            let diag = install_diag_context(
-                tool,
-                &[(
-                    "plugin_path",
-                    crate::hooks::opencode::get_opencode_plugin_path(),
-                )],
-            );
-            bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
-        }
-        LaunchTool::Kilo => {
-            match crate::hooks::opencode::ensure_plugin_installed("kilo") {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(error) => {
-                    let target = crate::hooks::opencode::get_kilo_plugin_path();
-                    let diag = install_diag_context(tool, &[("plugin_path", target.clone())]);
-                    bail!(
-                        "{}",
-                        format_plugin_install_error("Kilo Code", "kilo", &target, &error, &diag,)
-                    );
-                }
-            }
-            let diag = install_diag_context(
-                tool,
-                &[(
-                    "plugin_path",
-                    crate::hooks::opencode::get_kilo_plugin_path(),
-                )],
-            );
-            bail!("Failed to setup Kilo Code plugin. Run: hcom hooks add kilo\n{diag}");
-        }
-        LaunchTool::Pi => {
-            if crate::hooks::pi::ensure_pi_plugin_installed() {
-                return Ok(());
-            }
-            let diag = install_diag_context(tool, &[]);
-            bail!("Failed to setup Pi plugin. Run: hcom hooks add pi\n{diag}");
-        }
-        LaunchTool::Omp => {
-            if crate::hooks::omp::ensure_omp_plugin_installed() {
-                return Ok(());
-            }
-            let diag = install_diag_context(tool, &[]);
-            bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
-        }
+        LaunchTool::Codex => unreachable!("Codex uses per-run hooks"),
+        LaunchTool::OpenCode => unreachable!("OpenCode uses per-run hooks"),
+        LaunchTool::Kilo => unreachable!("Kilo uses per-run hooks"),
+        LaunchTool::Pi => unreachable!("Pi uses per-run hooks"),
+        LaunchTool::Omp => unreachable!("OMP uses per-run hooks"),
         LaunchTool::Antigravity => {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
                 return Ok(());
@@ -816,26 +763,8 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Copilot => {
-            if crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::copilot::try_setup_copilot_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "hooks_path",
-                        crate::hooks::copilot::get_copilot_hooks_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Copilot hooks: {e}\n\
-                     Run: hcom hooks add copilot\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
+        LaunchTool::Grok => unreachable!("Grok has no hooks"),
     }
 }
 
@@ -1150,10 +1079,10 @@ fn create_runner_script_windows(
          Set-Location {cwd}\n\
          {unset_line}\n\
          {env_block}\n\
-         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] environment ready' }}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host \"[hcom runner] environment ready $((Get-Date).ToString('o'))\" }}\n\
          {sidecar_source}\n\
          {path_line}\n\
-         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] starting PTY wrapper' }}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host \"[hcom runner] starting PTY wrapper $((Get-Date).ToString('o'))\" }}\n\
          \n\
          {run_line}\n",
         cwd = terminal::ps_quote(cwd),
@@ -1458,7 +1387,7 @@ fn finalize_background_launch(
     log_file: String,
     pid: u32,
     effective_preset: String,
-) {
+) -> Result<()> {
     instance_binding::persist_terminal_launch_context(
         ctx.db,
         ctx.instance_name,
@@ -1466,14 +1395,46 @@ fn finalize_background_launch(
         &effective_preset,
         Some(ctx.process_id),
     );
-    instances::update_instance_position(
-        ctx.db,
-        ctx.instance_name,
-        &serde_json::Map::from_iter([
-            ("pid".to_string(), json!(pid)),
-            ("background_log_file".to_string(), json!(&log_file)),
-        ]),
-    );
+    let updates =
+        serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
+    let pid_identity = crate::db::observe_pid_identity(pid);
+    let persist_result = pid_identity
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|identity| {
+            ctx.db.update_instance_pid_with_identity_and_fields(
+                ctx.instance_name,
+                pid,
+                identity.as_deref(),
+                &updates,
+            )
+        });
+    if let Err(e) = persist_result {
+        // Keep the log path as diagnostics even though PID ownership was not
+        // established, and stop the untracked runner. Never kill by an
+        // unverified PID: it may already have exited and been reused. A runner
+        // that was alive but had no observable identity is still our unreaped
+        // child, so its PID can't have been recycled yet.
+        let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
+        let still_ours = match pid_identity.as_ref() {
+            Ok(Some(expected)) => crate::sys::process::identity(pid).as_ref() == Some(expected),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if still_ours {
+            let _ = crate::sys::process::kill_group(pid);
+        }
+        crate::log::log_error(
+            "launcher",
+            "background.persist_pid",
+            &format!("instance={} pid={} err={}", ctx.instance_name, pid, e),
+        );
+        bail!(
+            "failed to persist background process for '{}': {}",
+            ctx.instance_name,
+            e
+        );
+    }
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
         process_id: ctx.process_id,
         terminal_preset: &effective_preset,
@@ -1493,6 +1454,7 @@ fn finalize_background_launch(
         "log_file": log_file,
         "pid": pid,
     }));
+    Ok(())
 }
 
 fn launch_background_runner(
@@ -1559,7 +1521,7 @@ fn launch_pty_or_background(
             ctx.terminal_mode,
             inside_ai_tool,
         )?;
-        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        finalize_background_launch(ctx, log_file, pid, effective_preset)?;
         Ok(true)
     } else {
         let effective_run_here = will_run_in_current_terminal(
@@ -1709,23 +1671,6 @@ fn validate_launch_count(tool: &LaunchTool, count: usize) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn inject_omp_extension_args(tool: &LaunchTool, args: &mut Vec<String>) {
-    if !matches!(tool, LaunchTool::Omp) {
-        return;
-    }
-    let extension_args = crate::hooks::omp::extension_inject_args();
-    let plugin_path = extension_args
-        .get(1)
-        .map(String::as_str)
-        .unwrap_or_default();
-    let already_present = args
-        .windows(2)
-        .any(|window| matches!(window, [flag, path] if flag == "-e" && path == plugin_path));
-    if !already_present {
-        args.extend(extension_args);
-    }
 }
 
 fn append_initial_prompt_args(
@@ -1878,12 +1823,36 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
-    // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(
-        &normalized,
-        hcom_config.auto_approve,
-        codex_home.as_ref().map(|(path, _)| path.as_path()),
-    )?;
+    // Hooks: per-run tools get a fresh injection built from the effective env,
+    // cwd and args (applied to args after the persisted snapshot below);
+    // persistent tools must have their global install (strict: refuse to launch
+    // without hooks).
+    let runtime_injection = match crate::hooks::runtime::adapter(normalized.tool()) {
+        Some(adapter) => {
+            // Replayed args (resume/fork) may carry hcom-injected values from a
+            // previous launch; drop them so the injection is rebuilt, not doubled.
+            crate::hooks::runtime::strip_replayed_args(adapter, &mut params.args);
+            if let Some(persisted) = params.persisted_args.as_mut() {
+                crate::hooks::runtime::strip_replayed_args(adapter, persisted);
+            }
+            let ctx = crate::hooks::runtime::LaunchCtx {
+                tool: normalized.tool(),
+                env: base_env.clone(),
+                cwd: canonical_dir.clone(),
+                args: params.args.clone(),
+                auto_approve: hcom_config.auto_approve,
+            };
+            let injection = crate::hooks::runtime::plan(adapter, &ctx)?;
+            for (key, value) in &injection.env {
+                insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
+            }
+            Some(injection)
+        }
+        None => {
+            ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
+            None
+        }
+    };
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1931,58 +1900,28 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
 
-    // Scrub any hcom-managed OMP extension arg a previous hcom version may have
-    // baked into the stored args, from BOTH the live and the persisted vectors
-    // (the snapshot below prefers persisted_args, and resume supplies that
-    // historical vector separately). Without this, replaying an old session can
-    // pass a stale `-e <old hcom.ts>` alongside the freshly injected current
-    // path — failing startup or loading hcom twice. User extensions are kept.
-    if matches!(normalized, LaunchTool::Omp) {
-        crate::hooks::omp::strip_managed_extension_args(&mut params.args);
-        if let Some(persisted) = params.persisted_args.as_mut() {
-            crate::hooks::omp::strip_managed_extension_args(persisted);
-        }
-    }
-
     // Capture the persistable args BEFORE any hcom launch injection below.
     // Resume replays only user/config args; workspace-trust injection
-    // (gemini `--skip-trust`, codex `-c projects=…trust_level`), the OMP
-    // delivery-extension path (`-e <abs hcom.ts>`), and the `--hcom-prompt`
+    // (gemini `--skip-trust`, codex `-c projects=…trust_level`) and the `--hcom-prompt`
     // translation are session/path-specific and must not be baked into
-    // launch_args, or they would replay stale state on resume/fork (e.g. a
-    // stale plugin path if PI_CODING_AGENT_DIR or the install location moves).
+    // launch_args, or they would replay stale state on resume/fork.
     let stored_launch_args = params
         .persisted_args
         .clone()
         .unwrap_or_else(|| params.args.clone());
 
-    // Injected after the snapshot so the internal plugin path is never persisted;
-    // resume re-injects the current path via the same call.
-    inject_omp_extension_args(&normalized, &mut params.args);
-
-    // Resolved here, before any trust injection, and threaded to
-    // preprocess_codex_args below. Codex's hook-trust bypass is invocation-wide,
-    // so a bypass hcom grants on the strength of a local hook scan must not be
-    // paired with a project layer that hcom itself just marked trusted — that
-    // layer could contribute a hook source the scan never saw.
-    let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
-        codex_preprocessing::resolve_codex_hook_trust_at(
-            &params.args,
-            &canonical_dir,
-            codex_home
-                .as_ref()
-                .map(|(path, _)| path.as_path())
-                .expect("Codex launch must resolve CODEX_HOME"),
-        )
-    } else {
-        codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
-    };
+    // Same for per-run hook injection: `injection.args` is the complete argv
+    // (caller args + hcom's merged flags), built from `params.args` above.
+    // Every instance of `hcom N <tool>` shares it; it holds no per-instance state.
+    if let Some(injection) = runtime_injection {
+        params.args = injection.args;
+    }
 
     inject_workspace_trust_args(
         &normalized,
         &canonical_dir,
         &mut params.args,
-        hcom_config.auto_trust_workspace && !codex_hook_trust.suppresses_workspace_trust(),
+        hcom_config.auto_trust_workspace,
     );
     let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
@@ -2074,6 +2013,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         let tool_type = base_tool;
         instance_env.insert("HCOM_TOOL".to_string(), tool_type.to_string());
+        // A resumed OpenCode session emits no session event until the first
+        // prompt, so the plugin binds at startup from this instead. Always set
+        // (empty unless resuming) so a launch from inside a resumed agent does
+        // not inherit it.
+        if matches!(tool_type, "opencode" | "kilo") {
+            instance_env.insert(
+                "HCOM_RESUME_SESSION_ID".to_string(),
+                params.prior_session_id.clone().unwrap_or_default(),
+            );
+        }
 
         // Pre-format the pane title for templates that substitute
         // `{pane_title}` (custom user templates only — the built-in herdr
@@ -2181,7 +2130,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                     log_file,
                                     pid,
                                     effective_preset,
-                                );
+                                )?;
                                 Ok(true)
                             }
                             _ => Ok(false),
@@ -2309,8 +2258,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         params.background,
                         &instance_env,
-                        &effective_tag,
-                        hcom_config.relay_enabled,
                     );
 
                     let sandbox_mode = instance_env
@@ -2322,7 +2269,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &effective_args,
                         &bootstrap,
                         &sandbox_mode,
-                        codex_hook_trust,
                     );
 
                     instances::update_instance_position(
@@ -2512,6 +2458,49 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Grok => {
+                    // Grok hook output never reaches the model, so the bootstrap
+                    // goes in at launch through `--rules` (appended to the
+                    // system prompt).
+                    let bootstrap = build_grok_bootstrap(
+                        db,
+                        &paths::hcom_dir(),
+                        &instance_name,
+                        params.background,
+                        &instance_env,
+                    );
+                    let mut grok_args = params.args.clone();
+                    inject_grok_rules(&mut grok_args, &bootstrap);
+                    ensure_grok_session_id(&mut grok_args);
+                    if let Some(ref sp) = params.system_prompt {
+                        inject_grok_rules(&mut grok_args, sp);
+                    }
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([
+                            ("launch_args".to_string(), json!(&stored_launch_args)),
+                            ("name_announced".to_string(), json!(true)),
+                        ]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "grok",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &grok_args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -2610,6 +2599,14 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             ANTIGRAVITY_REJECTED_ARGS,
         ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
+        LaunchTool::Grok => {
+            let mut errors = validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS);
+            let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
+            if let Err(error) = crate::delivery::grok::Launch::validate_args(&borrowed) {
+                errors.push(error.to_string());
+            }
+            errors
+        }
     }
 }
 
@@ -2721,40 +2718,12 @@ mod tests {
             LaunchTool::from_str("copilot").unwrap(),
             LaunchTool::Copilot
         );
+        assert_eq!(LaunchTool::from_str("grok").unwrap(), LaunchTool::Grok);
+        assert_eq!(
+            LaunchTool::from_str("grok-build").unwrap(),
+            LaunchTool::Grok
+        );
         assert!(LaunchTool::from_str("unknown").is_err());
-    }
-
-    #[test]
-    fn plugin_permission_error_tells_sandboxed_agents_how_to_retry() {
-        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sandbox denied");
-        let message = format_plugin_install_error(
-            "OpenCode",
-            "opencode",
-            std::path::Path::new("/home/test/.config/opencode/plugins/hcom.ts"),
-            &error,
-            "Diagnostic context:\n",
-        );
-
-        assert!(message.contains("sandbox denied"));
-        assert!(
-            message.contains("retry the original hcom launch with approval or elevated permission")
-        );
-        assert!(message.contains("Manual retry: hcom hooks add opencode"));
-    }
-
-    #[test]
-    fn plugin_non_permission_error_preserves_cause_without_sandbox_advice() {
-        let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad plugin data");
-        let message = format_plugin_install_error(
-            "OpenCode",
-            "opencode",
-            std::path::Path::new("/tmp/hcom.ts"),
-            &error,
-            "Diagnostic context:\n",
-        );
-
-        assert!(message.contains("bad plugin data"));
-        assert!(!message.contains("run outside the sandbox"));
     }
 
     #[test]
@@ -2834,6 +2803,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_grok_rejects_one_shot() {
+        let errors = validate_tool_args(&LaunchTool::Grok, &["-p".to_string(), "task".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("-p") || errors[0].contains("single"));
+        assert!(
+            validate_tool_args(&LaunchTool::Grok, &["--always-approve".to_string()]).is_empty()
+        );
+        assert_eq!(
+            validate_tool_args(&LaunchTool::Grok, &["--no-leader".into()]).len(),
+            1
+        );
+        for flag in ["--deny=bash", "--disable-web-search", "--allow"] {
+            assert_eq!(
+                validate_tool_args(&LaunchTool::Grok, &[flag.to_string()]).len(),
+                1
+            );
+        }
+        assert!(validate_tool_args(&LaunchTool::Grok, &["--no-subagents".to_string()]).is_empty());
+    }
+
+    #[test]
     fn validate_cursor_print_mode_fails_fast() {
         let errors = validate_tool_args(&LaunchTool::Cursor, &["--print".to_string()]);
         assert_eq!(errors.len(), 1);
@@ -2871,18 +2861,6 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--print"));
         assert!(validate_tool_args(&LaunchTool::Pi, &["--fork".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn omp_extension_args_are_injected_once() {
-        let mut args = vec!["--model".to_string(), "opus".to_string()];
-        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
-        assert!(args.iter().any(|arg| arg == "-e"));
-        assert!(args.iter().any(|arg| arg.ends_with("hcom.ts")));
-
-        let once = args.clone();
-        inject_omp_extension_args(&LaunchTool::Omp, &mut args);
-        assert_eq!(args, once);
     }
 
     #[test]
@@ -3306,6 +3284,73 @@ mod tests {
     }
 
     #[test]
+    fn test_inject_grok_rules_prepends_when_absent() {
+        let mut args = vec!["--always-approve".to_string()];
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(
+            args,
+            vec![
+                "--rules".to_string(),
+                "BOOT".to_string(),
+                "--always-approve".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_new_launch_gets_session_id_unless_it_opens_one() {
+        let mut args = vec!["--always-approve".to_string()];
+        ensure_grok_session_id(&mut args);
+        assert_eq!(args[0], "--session-id");
+        assert!(uuid::Uuid::parse_str(&args[1]).is_ok());
+        for existing in [
+            vec!["--resume", "abc"],
+            vec!["-c"],
+            vec!["--session-id=abc"],
+            vec!["--resume", "abc", "--fork-session"],
+        ] {
+            let mut args: Vec<String> = existing.iter().map(|s| s.to_string()).collect();
+            let before = args.clone();
+            ensure_grok_session_id(&mut args);
+            assert_eq!(args, before);
+        }
+        let mut literal = vec!["--".to_string(), "--resume".to_string()];
+        ensure_grok_session_id(&mut literal);
+        assert_eq!(literal[0], "--session-id");
+    }
+
+    #[test]
+    fn grok_prompt_that_looks_like_a_flag_stays_a_prompt() {
+        let mut args = Vec::new();
+        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--rules=x".into()).unwrap();
+        assert_eq!(args, ["--", "--rules=x"]);
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(args, ["--rules", "BOOT", "--", "--rules=x"]);
+        let mut args = Vec::new();
+        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--continue".into()).unwrap();
+        ensure_grok_session_id(&mut args);
+        assert_eq!(args[0], "--session-id");
+    }
+
+    #[test]
+    fn test_inject_grok_rules_prefixes_existing_value() {
+        let mut args = vec!["--rules".to_string(), "user-rules".to_string()];
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(args[0], "--rules");
+        assert!(args[1].starts_with("BOOT"));
+        assert!(args[1].contains("user-rules"));
+    }
+
+    #[test]
+    fn test_grok_bootstrap_uses_automatic_delivery() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let bootstrap = build_grok_bootstrap(&db, hcom_dir.path(), "kumo", true, &HashMap::new());
+        assert!(bootstrap.contains("Your name: kumo"));
+        assert!(bootstrap.contains("Messages instantly and automatically arrive"));
+    }
+
+    #[test]
     fn test_codex_bootstrap_includes_notes_from_effective_instance_env() {
         let db = launcher_test_db();
         let hcom_dir = tempfile::tempdir().unwrap();
@@ -3314,15 +3359,7 @@ mod tests {
             "instance-specific notes".to_string(),
         )]);
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &instance_env,
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
         assert!(bootstrap.contains("## NOTES"));
         assert!(bootstrap.contains("instance-specific notes"));
@@ -3333,15 +3370,7 @@ mod tests {
         let db = launcher_test_db();
         let hcom_dir = tempfile::tempdir().unwrap();
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &HashMap::new(),
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &HashMap::new());
 
         assert!(!bootstrap.contains("## NOTES"));
     }
@@ -3355,15 +3384,7 @@ mod tests {
         let hcom_dir = tempfile::tempdir().unwrap();
         let instance_env = HashMap::from([("HCOM_NOTES".to_string(), String::new())]);
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &instance_env,
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
         assert!(!bootstrap.contains("## NOTES"));
     }
@@ -3418,22 +3439,10 @@ mod tests {
             "Use \"review mode\".\nWindows path: C:\\work\\repo\n{literal braces}\nSecond line";
         let instance_env = HashMap::from([("HCOM_NOTES".to_string(), notes.to_string())]);
 
-        let bootstrap = build_codex_bootstrap(
-            &db,
-            hcom_dir.path(),
-            "luna",
-            false,
-            &instance_env,
-            "",
-            false,
-        );
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
-        let args = crate::tools::codex_preprocessing::preprocess_codex_args(
-            &[],
-            &bootstrap,
-            "workspace",
-            crate::tools::codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded,
-        );
+        let args =
+            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
 
         // Locate the `-c developer_instructions=<TOML>` value and decode it.
         // preprocess also injects sandbox `-c` args, so match by prefix rather

@@ -183,10 +183,10 @@ pub fn inject_prompt_until(
     while prompt_attempts < 5 && Instant::now() < inject_deadline {
         let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter"]);
         if code != 0 {
-            let retryable = stdout.contains("No inject port")
-                || stdout.contains("No response from")
-                || stderr.contains("No inject port")
-                || stderr.contains("No response from");
+            // The PTY registers its inject port shortly after the row appears.
+            let retryable = ["no terminal registered yet", "No response from"]
+                .iter()
+                .any(|m| stdout.contains(m) || stderr.contains(m));
             if retryable {
                 std::thread::sleep(Duration::from_millis(250));
                 continue;
@@ -505,8 +505,8 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         .find(|body| body.contains(&ids.initial) && !case.is_followup_turn(body))
         .expect("mock did not receive the initial turn");
     assert!(
-        initial_request.contains(&format!("[hcom:{name}]")),
-        "fresh request did not contain the hcom bootstrap identity marker"
+        initial_request.contains(&format!("--name {name}")),
+        "fresh request did not contain the hcom bootstrap identity"
     );
     assert_eq!(
         h.instances_for_tool(tool).expect("list after bind").len(),
@@ -1041,7 +1041,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         "resumed request must inherit parent history without fork-only history"
     );
     assert!(
-        resume_request.contains(&format!("[hcom:{name}]")),
+        resume_request.contains(&format!("--name {name}")),
         "resume request did not retain the original hcom identity bootstrap"
     );
     let rebound_parent = h

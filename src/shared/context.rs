@@ -160,17 +160,6 @@ impl HcomContext {
     pub fn detect_current_tool(&self) -> &'static str {
         self.tool.as_str()
     }
-
-    /// Detect vanilla (non-hcom-launched) tool, or None.
-    pub fn detect_vanilla_tool(&self) -> Option<&'static str> {
-        if self.is_launched {
-            return None;
-        }
-        match self.tool {
-            Tool::Adhoc => None,
-            _ => Some(self.tool.as_str()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -251,7 +240,6 @@ mod tests {
         let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
 
         assert_eq!(ctx.tool, Tool::Kilo);
-        assert_eq!(ctx.detect_vanilla_tool(), Some("kilo"));
     }
 
     #[test]
@@ -384,32 +372,6 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(launched.is_inside_ai_tool());
-    }
-
-    #[test]
-    fn test_detect_vanilla_tool() {
-        // Claude not launched by hcom = vanilla
-        let ctx = HcomContext::from_env(
-            &make_env(&[("CLAUDECODE", "1"), ("HOME", "/home/test")]),
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(ctx.detect_vanilla_tool(), Some("claude"));
-
-        // Claude launched by hcom = not vanilla
-        let ctx = HcomContext::from_env(
-            &make_env(&[
-                ("CLAUDECODE", "1"),
-                ("HCOM_LAUNCHED", "1"),
-                ("HOME", "/home/test"),
-            ]),
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(ctx.detect_vanilla_tool(), None);
-
-        // Adhoc = not vanilla
-        let ctx =
-            HcomContext::from_env(&make_env(&[("HOME", "/home/test")]), PathBuf::from("/tmp"));
-        assert_eq!(ctx.detect_vanilla_tool(), None);
     }
 
     #[test]

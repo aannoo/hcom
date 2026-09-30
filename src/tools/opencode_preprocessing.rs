@@ -70,16 +70,13 @@ pub fn preprocess_opencode_args(
     if let Some(ref model) = model {
         validate_model_arg(model)?;
     }
-    let remote = chosen_server(&args).is_some_and(|server| server[0] != STANDALONE_FLAG);
-    if remote && (agent.is_some() || model.is_some()) {
-        bail!("--agent/--model cannot reach a server chosen with --server on OpenCode 2");
-    }
+    reject_foreign_server(&args)?;
     for (key, value) in [(AGENT_ENV, agent), (MODEL_ENV, model)] {
         if let Some(value) = value {
             env.insert(key.to_string(), value);
         }
     }
-    let server = chosen_server(&args).unwrap_or_else(|| vec![STANDALONE_FLAG.to_string()]);
+    let server = [STANDALONE_FLAG.to_string()];
     let args = fork_session_server_side(&args, |id| fork_session(id, &server, cwd))?;
     Ok(add_standalone(&args))
 }
@@ -132,23 +129,24 @@ fn validate_model_arg(model: &str) -> Result<()> {
     Ok(())
 }
 
-/// The server flags the user chose (`--standalone`, `--server <url>`), if any.
-fn chosen_server(args: &[String]) -> Option<Vec<String>> {
-    args.iter().enumerate().find_map(|(at, arg)| {
-        if arg == STANDALONE_FLAG || arg.starts_with("--server=") {
-            Some(vec![arg.clone()])
-        } else if arg == "--server" {
-            Some(args[at..].iter().take(2).cloned().collect())
-        } else {
-            None
-        }
-    })
+/// hcom's plugin comes from this launch's env (per-run), which only a server
+/// hcom starts itself can see, so `--server <url>` would run without hooks.
+fn reject_foreign_server(args: &[String]) -> Result<()> {
+    if args
+        .iter()
+        .any(|arg| arg == "--server" || arg.starts_with("--server="))
+    {
+        bail!(
+            "--server is not supported with hcom on OpenCode 2: an existing server never \
+             loads hcom's plugin. Drop --server; hcom runs a private --standalone server."
+        );
+    }
+    Ok(())
 }
 
-/// Leaves the args alone when the user already chose a server.
 fn add_standalone(args: &[String]) -> Vec<String> {
     let mut result = args.to_vec();
-    if chosen_server(args).is_none() {
+    if !args.iter().any(|arg| arg == STANDALONE_FLAG) {
         result.insert(0, STANDALONE_FLAG.to_string());
     }
     result
@@ -294,14 +292,17 @@ mod tests {
     }
 
     #[test]
-    fn test_add_standalone_respects_chosen_server() {
-        for args in [
-            strings(&["--standalone"]),
-            strings(&["--server", "http://x"]),
-            strings(&["--server=http://x"]),
-        ] {
-            assert_eq!(add_standalone(&args), args);
-        }
+    fn test_reject_foreign_server() {
+        assert!(reject_foreign_server(&strings(&["--server", "http://x"])).is_err());
+        assert!(reject_foreign_server(&strings(&["--server=http://x"])).is_err());
+        assert!(reject_foreign_server(&strings(&["--standalone"])).is_ok());
+        assert!(reject_foreign_server(&strings(&["--model", "a/b"])).is_ok());
+    }
+
+    #[test]
+    fn test_add_standalone_keeps_existing_flag() {
+        let args = strings(&["--standalone", "--model", "a/b"]);
+        assert_eq!(add_standalone(&args), args);
     }
 
     #[test]
@@ -353,23 +354,6 @@ mod tests {
         ] {
             assert!(validate_model_arg(model).is_err());
         }
-    }
-
-    #[test]
-    fn test_chosen_server() {
-        assert_eq!(chosen_server(&strings(&["--model", "a/b"])), None);
-        assert_eq!(
-            chosen_server(&strings(&["--session", "s", "--server", "http://x"])),
-            Some(strings(&["--server", "http://x"]))
-        );
-        assert_eq!(
-            chosen_server(&strings(&["--server=http://x"])),
-            Some(strings(&["--server=http://x"]))
-        );
-        assert_eq!(
-            chosen_server(&strings(&["--standalone"])),
-            Some(strings(&["--standalone"]))
-        );
     }
 
     #[test]

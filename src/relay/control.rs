@@ -1710,7 +1710,7 @@ mod tests {
     fn test_handle_control_events_relay_off_disables_local_relay() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let config = HcomConfig {
-            relay: "mqtts://broker.emqx.io:8883".to_string(),
+            relay: "mqtt://127.0.0.1:1".to_string(),
             relay_id: "relay-1".to_string(),
             relay_psk: super::super::encode_psk(&[0x22; 32]),
             relay_enabled: true,

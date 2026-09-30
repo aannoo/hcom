@@ -1,3 +1,4 @@
+// hcom-managed-plugin: installed by hcom; removed automatically. Do not add this line to your own plugins.
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
 import { appendFileSync } from "fs"
@@ -5,6 +6,14 @@ import { homedir } from "os"
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
+
+function claimPluginHost(): boolean {
+  const owner = process.env.HCOM_PLUGIN_HOST_PID
+  const current = String(process.pid)
+  if (owner && owner !== current) return false
+  process.env.HCOM_PLUGIN_HOST_PID = current
+  return true
+}
 
 type PromptModel = {
   providerID: string
@@ -106,6 +115,8 @@ function log(
 }
 
 export const HcomPlugin: Plugin = async ({ client, $ }) => {
+  if (!claimPluginHost()) return {}
+
   let hcomChecked = false
   let hcomAvailable = false
   let instanceName: string | null = null      // IDEN-03: bound instance name
@@ -412,6 +423,22 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     await bindingPromise
   }
 
+  // Resumed session (`hcom r`): OpenCode emits no session.created, and no
+  // session.status until the first prompt, so bind now and deliver anything
+  // already pending. Without this, messages waited for the user to type.
+  // Not awaited: plugin load must not wait on hcom.
+  const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID
+  if (resumeSessionId && checkHcom()) {
+    void (async () => {
+      await bindIdentity(resumeSessionId)
+      if (disposed || !instanceName || sessionId !== resumeSessionId) return
+      log("INFO", "plugin.resume_bound", instanceName, { session_id: sessionId })
+      lastReportedStatus = "listening"
+      startReconcileTimer()
+      await deliverPendingToIdle(resumeSessionId)
+    })().catch((e) => log("ERROR", "plugin.resume_bind_error", instanceName, { error: String(e) }))
+  }
+
   return {
     event: async ({ event }: { event: HcomEvent }) => {
       try {
@@ -512,13 +539,6 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             currentAgent = launchedAgent
             currentModel = launchedModel
             break
-          case "file.edited": {
-            const filePath = event.properties.file
-            if (instanceName) {
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --context ${"tool:write"} --detail ${String(filePath ?? "")}`.quiet()
-            }
-            break
-          }
         }
       } catch (e) {
         log("ERROR", "plugin.event_error", instanceName, { error: String(e) })
@@ -550,6 +570,24 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         })
       } catch (e) {
         log("ERROR", "plugin.chat_message_error", instanceName, { error: String(e) })
+      }
+    },
+
+    // Tool activity for status/`events --cmd`/`--file`. hcom derives the detail
+    // from the tool's status_detail mapping; long strings (write content, patch
+    // bodies) are capped so argv stays small; the fields hcom reads come first.
+    "tool.execute.before": async (input, output) => {
+      try {
+        if (!checkHcom() || !instanceName || !isBoundSession(input.sessionID)) return
+        const args: Record<string, unknown> = {}
+        for (const [key, value] of Object.entries(output.args ?? {})) {
+          args[key] = typeof value === "string" && value.length > 2000 ? value.slice(0, 2000) : value
+        }
+        // Recorded so the next idle edge is not skipped as "unchanged".
+        lastReportedStatus = "active"
+        await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --tool ${input.tool} --input-json ${JSON.stringify(args)}`.quiet()
+      } catch (e) {
+        log("ERROR", "plugin.tool_status_error", instanceName, { error: String(e) })
       }
     },
 
@@ -675,10 +713,16 @@ type V2Context = {
     switchModel: (input: { sessionID: string; model: V2Model }) => Promise<unknown>
     hook: (name: string, callback: (draft: any) => Promise<void> | void) => Promise<V2Registration>
   }
+  tool: {
+    hook: (
+      name: "execute.before",
+      callback: (event: { tool: string; sessionID: string; id: string; input: unknown }) => Promise<void> | void,
+    ) => Promise<V2Registration>
+  }
 }
 
 // Reshapes v2 events into the v1 events HcomPlugin handles. Execution events
-// carry the busy/idle edge; v2 has no `file.edited`.
+// carry the busy/idle edge.
 function v1Event({ type, data }: V2Event): HcomEvent | null {
   switch (type) {
     case "session.created":
@@ -709,6 +753,8 @@ function parseLaunchModel(raw: string | undefined): V2Model | undefined {
 }
 
 async function setupOpenCode2(ctx: V2Context) {
+  if (!claimPluginHost()) return async () => {}
+
   const statusBySession: Record<string, { type: string }> = {}
   const client = {
     session: {
@@ -773,6 +819,9 @@ async function setupOpenCode2(ctx: V2Context) {
     if (launchAgent) registrations.push(await ctx.agent.transform((editor) => editor.default(launchAgent)))
     registrations.push(await ctx.session.hook("prompt", onPrompt))
     registrations.push(await ctx.session.hook("context", transform))
+    registrations.push(await ctx.tool.hook("execute.before", (event) =>
+      hooks["tool.execute.before"]({ tool: event.tool, sessionID: event.sessionID, callID: event.id }, { args: event.input }),
+    ))
     registrations.push(await ctx.session.hook("compaction", async (draft: V2Draft) => {
       const output = { context: [] as string[] }
       await hooks["experimental.session.compacting"]({ sessionID: draft.sessionID }, output)

@@ -1,4 +1,6 @@
 use crate::db::HcomDb;
+use crate::paths::{ARCHIVE_DIR, hcom_path};
+use crate::shared::platform::shorten_path;
 
 use super::reset::ResetTarget;
 
@@ -56,11 +58,15 @@ fn hook_tool_specs() -> impl Iterator<Item = &'static crate::integration_spec::I
 fn hook_preview_lines() -> String {
     hook_tool_specs()
         .map(|spec| {
-            format!(
-                "  \u{2022} Remove hooks from {} ({})",
-                spec.label,
-                spec.tool.hooks_settings_path()
-            )
+            if crate::hooks::runtime::is_per_run(spec.tool) {
+                format!("  \u{2022} Remove legacy {} hooks", spec.label)
+            } else {
+                format!(
+                    "  \u{2022} Remove hooks from {} ({})",
+                    spec.label,
+                    spec.tool.hooks_settings_path()
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -78,9 +84,10 @@ fn render_hooks_preview() -> String {
     let actions = hook_preview_lines();
     format!(
         "\n== RESET HOOKS PREVIEW ==\n\
-         This will remove hcom hooks from tool configs.\n\n\
+         This will remove persistent hcom hooks and legacy installs left by older hcom.\n\n\
          Actions:\n{actions}\n\n\
-         To reinstall: hcom hooks add\n\n\
+         Persistent hooks can be reinstalled with: hcom hooks add\n\
+         Per-run tools load hooks automatically on their next hcom launch.\n\n\
          Add --go flag and run again to proceed:\n  \
          {hcom_cmd} --go reset hooks\n"
     )
@@ -90,17 +97,18 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
     let hcom_cmd = "hcom";
     format!(
         "\n== RESET ALL PREVIEW ==\n\
-         This will stop all instances, archive the database, remove hooks, and reset config.\n\n\
+         This will stop all instances, archive the database, remove hooks and legacy installs, and reset config.\n\n\
          Current state:\n  \
          \u{2022} {instance_count} local instance{plural}: {names_display}\n  \
          \u{2022} {event_count} events in database\n\n\
          Actions:\n  \
          1. Stop all {instance_count} local instances (kills processes, logs snapshots)\n  \
-         2. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
+         2. Archive database to {archive}/session-<timestamp>/\n  \
          3. Delete database (hcom.db)\n  \
-         4. Remove hooks from {hook_labels} configs\n  \
+         4. Remove hooks and legacy installs ({hook_labels})\n  \
          5. Archive and delete config.toml + env\n  \
-         6. Clear device identity (new UUID on next relay)\n\n\
+         6. Clear device identity (new UUID on next relay)\n  \
+         7. Delete per-run hook files ({integrations}/)\n\n\
          Add --go flag and run again to proceed:\n  \
          {hcom_cmd} --go reset all\n",
         instance_count = state.instance_count,
@@ -108,6 +116,8 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
         names_display = state.names_display,
         event_count = state.event_count,
         hook_labels = hook_tool_labels("/"),
+        archive = archive_display(),
+        integrations = shorten_path(&crate::hooks::runtime::integrations_dir().to_string_lossy()),
     )
 }
 
@@ -120,7 +130,7 @@ fn render_reset_preview(state: &ResetPreviewState) -> String {
          \u{2022} {instance_count} instance{plural}: {names_display}\n  \
          \u{2022} {event_count} events in database\n\n\
          Actions:\n  \
-         1. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
+         1. Archive database to {archive}/session-<timestamp>/\n  \
          2. Delete database (hcom.db, hcom.db-wal, hcom.db-shm)\n  \
          3. Log reset event to fresh database\n  \
          4. Sync with relay (push reset, pull fresh state)\n\n\
@@ -132,7 +142,12 @@ fn render_reset_preview(state: &ResetPreviewState) -> String {
         plural = state.plural,
         names_display = state.names_display,
         event_count = state.event_count,
+        archive = archive_display(),
     )
+}
+
+fn archive_display() -> String {
+    shorten_path(&hcom_path(&[ARCHIVE_DIR]).to_string_lossy())
 }
 
 /// Print reset preview for AI tools (shows what will be destroyed).

@@ -71,6 +71,45 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "--new-terminal",
 ];
 
+/// Whether a shell command line is exactly one `hcom <safe command> …` (or
+/// `uvx hcom …`), for tools where hcom approves commands at runtime.
+///
+/// Anything the shell could turn into a second command fails: unquoted
+/// `; & | < > ( )`, backticks, newlines, and `$` outside single quotes. A
+/// prefix match alone would approve `hcom send @x -- hi; rm -rf ~`.
+pub(crate) fn is_safe_hcom_command(command: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\n' | '\r' => return false,
+            '\'' if !double => single = !single,
+            _ if single => {}
+            '\\' => escaped = true,
+            '"' => double = !double,
+            '$' | '`' => return false,
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' if !double => return false,
+            _ => {}
+        }
+    }
+    if single || double || escaped {
+        return false;
+    }
+    let Ok(words) = shell_words::split(command) else {
+        return false;
+    };
+    let rest = match words.as_slice() {
+        [hcom, rest @ ..] if hcom == "hcom" => rest,
+        [uvx, hcom, rest @ ..] if uvx == "uvx" && hcom == "hcom" => rest,
+        _ => return false,
+    };
+    rest.first()
+        .is_none_or(|command| SAFE_HCOM_COMMANDS.contains(&command.as_str()))
+}
+
 /// Pre-gate check: should hooks proceed?
 ///
 ///
@@ -288,12 +327,12 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 
 /// Commit a deferred delivery ack — advance cursor and set status.
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
-    if ack.mark_announced {
-        updates.insert("name_announced".into(), serde_json::json!(true));
+    // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
+    // Cursor and announcement move together so a partial ack can't re-announce.
+    if let Err(e) = db.ack_hook_delivery(&ack.instance_name, ack.last_event_id, ack.mark_announced)
+    {
+        crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}"));
     }
-    instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
         db,
@@ -382,7 +421,7 @@ pub struct PollResult {
 
 /// Stop hook polling loop — NOT used by main PTY path.
 ///
-/// Runs for: headless instances, vanilla tool instances, subagent polling.
+/// Runs for: headless instances and subagent polling.
 /// Main PTY path bypasses this (HCOM_PTY_MODE=1, PTY wrapper handles injection).
 ///
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
@@ -535,9 +574,9 @@ fn poll_loop(
         // TCP wake fires as soon as remote events land — no separate relay
         // polling needed.
         let wait_time = if notify_server.is_some() {
-            Duration::from_secs(remaining.as_secs().min(30))
+            remaining.min(Duration::from_secs(30))
         } else {
-            Duration::from_millis(remaining.as_millis().min(100) as u64)
+            remaining.min(Duration::from_millis(100))
         };
 
         if let Some(server) = notify_server {
@@ -642,22 +681,7 @@ pub fn inject_bootstrap_once(
         return None;
     }
 
-    let tag = instance_data.tag.as_deref().unwrap_or("");
-    let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-    let relay_enabled = crate::relay::is_relay_enabled(&hcom_config);
-
-    let bootstrap_text = bootstrap::get_bootstrap(
-        db,
-        &ctx.hcom_dir,
-        instance_name,
-        tool,
-        ctx.is_background,
-        ctx.is_launched,
-        &ctx.notes,
-        tag,
-        relay_enabled,
-        ctx.background_name.as_deref(),
-    );
+    let bootstrap_text = bootstrap::get_bootstrap(db, ctx, instance_name, tool);
 
     // Mark as announced
     let mut updates = serde_json::Map::new();
@@ -791,15 +815,12 @@ pub(crate) struct ClaudeIdentityEvidence {
 /// local to each resolution path.
 pub(crate) fn load_claude_identity_evidence(
     db: &HcomDb,
-    process_id: Option<&str>,
+    process_id: &str,
     session_id: &str,
     transcript_path: &str,
     should_scan_lineage: impl FnOnce(&ClaudeIdentityEvidence) -> bool,
 ) -> Result<ClaudeIdentityEvidence> {
-    let process_binding = match process_id.filter(|value| !value.is_empty()) {
-        Some(process_id) => db.get_process_binding_full(process_id)?,
-        None => None,
-    };
+    let process_binding = db.get_process_binding_full(process_id)?;
     let process_session_id = process_binding
         .as_ref()
         .and_then(|(session_id, _)| session_id.clone());
@@ -844,21 +865,28 @@ pub(crate) fn load_claude_identity_evidence(
 
 /// Initialize instance context from hook data via binding lookup.
 ///
-/// Structured session/transcript identity wins over a conflicting process
+/// Hooks only run in hcom-launched Claude processes, but one process can
+/// switch sessions (`/resume`, `/clear`, `/branch`, `--fork-session`) while
+/// its process binding still names the previous generation's owner. So
+/// structured session/transcript identity wins over a conflicting process
 /// binding. Transcript scanning stays off the common hot path: it runs only
 /// when the session is unbound or its binding has not yet been validated.
 ///
-/// Returns (instance_name, metadata_updates, is_matched_resume).
+/// Returns (instance_name, metadata_updates, is_matched_resume). A hook with
+/// no hcom process id never resolves an identity.
 pub fn init_hook_context(
     db: &HcomDb,
     ctx: &HcomContext,
     session_id: &str,
     transcript_path: &str,
 ) -> (Option<String>, serde_json::Map<String, Value>, bool) {
+    let Some(process_id) = ctx.process_id.as_deref() else {
+        return (None, serde_json::Map::new(), false);
+    };
     let start = Instant::now();
     let evidence = match load_claude_identity_evidence(
         db,
-        ctx.process_id.as_deref(),
+        process_id,
         session_id,
         transcript_path,
         |evidence| {
@@ -1064,7 +1092,27 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, None)
+}
+
+/// Stop a row only while it still owns the inspected dead process incarnation.
+pub(crate) fn stop_instance_if_pid_identity(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    pid: u32,
+    pid_identity: &str,
+) -> StopOutcome {
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        Some((pid, pid_identity)),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1080,7 +1128,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, None)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1105,6 +1153,7 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
+    pid_guard: Option<(u32, &str)>,
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1130,10 +1179,32 @@ fn stop_instance_inner(
         }
     };
 
+    if let Some((expected_pid, expected_identity)) = pid_guard {
+        if instance_data.pid != Some(expected_pid as i64) {
+            return StopOutcome::AlreadyStopped;
+        }
+        match db.get_instance_pid_identity(instance_name) {
+            Ok(Some(identity)) if identity == expected_identity => {}
+            Ok(_) => return StopOutcome::AlreadyStopped,
+            Err(e) => {
+                return StopOutcome::RetryableError(format!(
+                    "could not verify process identity for {instance_name}: {e}"
+                ));
+            }
+        }
+    }
+
     // Kill headless processes (background=true)
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
-    if let Some(pid_val) = pid {
+    // After a reboot or crash the PID may belong to an unrelated process now
+    // (stored identity mismatch): never signal it or track it as an orphan.
+    // A merely dead leader still gets its group signalled, which reaches any
+    // children it left behind.
+    if pid_guard.is_none()
+        && let Some(pid_val) = pid
+        && !instance_data.pid_reused(pid_val as u32)
+    {
         let pid_u32 = pid_val as u32;
         if is_headless {
             // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
@@ -1282,42 +1353,58 @@ fn stop_instance_inner(
         }
     };
 
-    // Finish children first while the parent row keeps the teardown retryable.
-    // Concurrent callers may repeat this work; every child has its own atomic
-    // event/delete gate.
-    for sub_name in session_subagents {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner(
-            db,
-            &sub_name,
-            initiated_by,
-            "parent_stopped",
-            false,
-            depth + 1,
-        ) {
-            log::log_warn(
-                "hooks",
-                "finalize.child_stop_incomplete",
-                &format!("parent={instance_name} child={sub_name} err={error}"),
-            );
-            return StopOutcome::RetryableError(format!(
-                "could not stop child {sub_name}: {error}"
-            ));
-        }
+    // A guarded stale-stop must not mutate children before winning its
+    // PID-incarnation CAS, and deleting the parent first would make a failed
+    // child stop non-retryable. Leave the parent in place while it still has
+    // children; their own cleanup can retire them independently, after which a
+    // later pass can safely finalize the parent.
+    if pid_guard.is_some() && (!session_subagents.is_empty() || !native_children.is_empty()) {
+        return StopOutcome::RetryableError(format!(
+            "guarded stop deferred while {instance_name} still has child instances"
+        ));
     }
 
-    // Native subagent rows carry session_id=NULL and inherit the root session
-    // as parent_session_id, so only parent_name links nested children. A row
-    // already stopped via the session set is a no-op here.
-    for child in native_children {
-        if let StopOutcome::RetryableError(error) =
-            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
-        {
-            log::log_warn(
-                "hooks",
-                "finalize.child_stop_incomplete",
-                &format!("parent={instance_name} child={child} err={error}"),
-            );
-            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
+    if pid_guard.is_none() {
+        for sub_name in &session_subagents {
+            if let StopOutcome::RetryableError(error) = stop_instance_inner(
+                db,
+                sub_name,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+                None,
+            ) {
+                log::log_warn(
+                    "hooks",
+                    "finalize.child_stop_incomplete",
+                    &format!("parent={instance_name} child={sub_name} err={error}"),
+                );
+                return StopOutcome::RetryableError(format!(
+                    "could not stop child {sub_name}: {error}"
+                ));
+            }
+        }
+
+        for child in &native_children {
+            if let StopOutcome::RetryableError(error) = stop_instance_inner(
+                db,
+                child,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+                None,
+            ) {
+                log::log_warn(
+                    "hooks",
+                    "finalize.child_stop_incomplete",
+                    &format!("parent={instance_name} child={child} err={error}"),
+                );
+                return StopOutcome::RetryableError(format!(
+                    "could not stop child {child}: {error}"
+                ));
+            }
         }
     }
 
@@ -1333,13 +1420,25 @@ fn stop_instance_inner(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    match db.finalize_instance_stop(
-        instance_name,
-        instance_data.created_at,
-        instance_data.session_id.as_deref(),
-        instance_data.agent_id.as_deref(),
-        &event_data,
-    ) {
+    let finalize_result = if let Some((expected_pid, expected_identity)) = pid_guard {
+        db.finalize_instance_stop_if_pid_identity(
+            instance_name,
+            instance_data.created_at,
+            instance_data.session_id.as_deref(),
+            instance_data.agent_id.as_deref(),
+            (expected_pid, expected_identity),
+            &event_data,
+        )
+    } else {
+        db.finalize_instance_stop(
+            instance_name,
+            instance_data.created_at,
+            instance_data.session_id.as_deref(),
+            instance_data.agent_id.as_deref(),
+            &event_data,
+        )
+    };
+    match finalize_result {
         Ok(true) => {}
         Ok(false) => return StopOutcome::AlreadyStopped,
         Err(e) => {
@@ -1495,14 +1594,26 @@ pub fn finalize_session(
         &format!("instance={} reason={}", instance_name, reason),
     );
 
-    // Set inactive status
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_INACTIVE,
-        &format!("exit:{}", reason),
-        Default::default(),
-    );
+    // `hcom kill` records exit:killed + its initiator before signalling, and the
+    // tool's SessionEnd fires in response to that signal. Keep the kill as the
+    // stop reason: overwriting it here would make whichever finalizer wins (this
+    // hook, the PTY cleanup, or the kill command) record a plain session exit.
+    let killed_by = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .filter(|inst| inst.status_context == "exit:killed")
+        .map(|inst| inst.status_detail);
+
+    if killed_by.is_none() {
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
+        );
+    }
 
     // Persist metadata updates
     if let Some(updates) = updates {
@@ -1510,7 +1621,29 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    match killed_by {
+        Some(initiator) if !initiator.is_empty() => {
+            stop_instance(db, instance_name, &initiator, "killed")
+        }
+        Some(_) => stop_instance(db, instance_name, "session", "killed"),
+        None => stop_instance(db, instance_name, "session", &format!("exit:{}", reason)),
+    };
+}
+
+/// Whether launch `batch_id` has emitted `ready` for `instance_name`.
+pub fn launch_reached_ready(db: &HcomDb, instance_name: &str, batch_id: &str) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events
+                WHERE type = 'life' AND instance = ?1
+                  AND json_extract(data, '$.action') = 'ready'
+                  AND json_extract(data, '$.batch_id') = ?2
+            )",
+            rusqlite::params![instance_name, batch_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(true)
 }
 
 /// Update instance status for tool execution.
@@ -1608,6 +1741,36 @@ mod tests {
             .unwrap();
         db.set_session_binding(session_id, name).unwrap();
         db.mark_claude_session_validated(session_id, name).unwrap();
+    }
+
+    #[test]
+    fn fractional_notification_timeout_does_not_spin_heartbeat_writes() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('polltest', 'claude', 0)",
+                [],
+            )
+            .unwrap();
+        db.conn().execute_batch(
+            "CREATE TABLE heartbeat_writes (n INTEGER); INSERT INTO heartbeat_writes VALUES (0);
+             CREATE TRIGGER count_heartbeat AFTER UPDATE OF last_stop ON instances
+             BEGIN UPDATE heartbeat_writes SET n = n + 1; END;").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        let timeout = Duration::from_millis(180);
+        let result = poll_loop(&db, "polltest", timeout, start, true, Some(&listener)).unwrap();
+        assert!(result.timed_out);
+        assert!(start.elapsed() >= timeout);
+        let writes: i64 = db
+            .conn()
+            .query_row("SELECT n FROM heartbeat_writes", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            writes <= 3,
+            "fractional wait spun {writes} heartbeat writes"
+        );
     }
 
     fn context_with_process_id(
@@ -1784,13 +1947,16 @@ mod tests {
     }
 
     #[test]
-    fn hook_context_uses_session_owner_with_empty_process_id() {
+    fn hook_context_requires_hcom_process_id() {
+        // Per-run Claude hooks only load in hcom launches, which always set
+        // HCOM_PROCESS_ID; a hook without one is not an hcom participant.
         let (dir, db) = make_test_db();
         insert_bound_claude_instance(&db, "niza", "session-niza", "");
-        let ctx = context_with_process_id(dir.path(), Some(""));
-
-        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
-        assert_eq!(owner.as_deref(), Some("niza"));
+        for process_id in [None, Some("")] {
+            let ctx = context_with_process_id(dir.path(), process_id);
+            let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+            assert_eq!(owner, None);
+        }
     }
 
     #[test]
@@ -2455,6 +2621,57 @@ mod tests {
     }
 
     #[test]
+    fn test_launch_reached_ready_is_scoped_to_batch() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        // An earlier launch of the same name was ready; the current one is not.
+        db.log_event(
+            "life",
+            "inst",
+            &serde_json::json!({"action": "ready", "batch_id": "old"}),
+        )
+        .unwrap();
+        assert!(launch_reached_ready(&db, "inst", "old"));
+        assert!(!launch_reached_ready(&db, "inst", "new"));
+    }
+
+    #[test]
+    fn test_finalize_session_keeps_recorded_kill() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let _ = db.conn().execute(
+            "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at)
+             VALUES ('inst', 'claude', 'sess-1', 'active', 'running', 0, 0)",
+            [],
+        );
+        db.mark_killed("inst", "boss").unwrap();
+
+        // The tool's SessionEnd fires in response to the kill's SIGTERM.
+        finalize_session(&db, "inst", "other", None);
+
+        let (by, reason): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = 'inst' AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((by.as_str(), reason.as_str()), ("boss", "killed"));
+        let exit_statuses: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'inst'
+                 AND json_extract(data, '$.context') = 'exit:other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exit_statuses, 0, "SessionEnd must not overwrite the kill");
+    }
+
+    #[test]
     fn test_stale_placeholder_marker_does_not_rebind() {
         crate::config::Config::init();
         let (dir, db) = make_test_db();
@@ -2471,10 +2688,9 @@ mod tests {
         let transcript = dir.path().join("transcript.jsonl");
         std::fs::write(&transcript, "assistant output [hcom:luna]\n").unwrap();
 
-        let ctx = crate::shared::context::HcomContext::from_env(
-            &std::collections::HashMap::new(),
-            dir.path().to_path_buf(),
-        );
+        // A launched process with no binding: only structured lineage could
+        // name an owner, and marker text is never lineage.
+        let ctx = context_with_process_id(dir.path(), Some("process-unbound"));
         let (instance_name, _updates, _matched_resume) =
             init_hook_context(&db, &ctx, "sess-fresh", transcript.to_str().unwrap());
 
