@@ -849,10 +849,11 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Surface an identity that drifted away from this shell. This is a warning,
-    // not a refusal: an explicit --name stays authoritative, because a human or
-    // a relay may legitimately act for another instance.
-    if let Some(ref warning) = ctx.identity_warning {
+    // --name disagrees with this shell's binding. Warn, don't refuse: --name is
+    // what the agent knows itself to be. With --from, --name isn't the sender.
+    if let Some(ref warning) = ctx.identity_warning
+        && !has_from_flag
+    {
         eprintln!("{warning}");
     }
 

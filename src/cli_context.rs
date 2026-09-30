@@ -43,7 +43,6 @@ pub fn build_ctx_for_command(
     }
 
     let had_verified_actor = verified_actor.is_some();
-
     let identity = if let Some(actor) = verified_actor {
         Some(actor)
     } else if let Some(name) = explicit_name {
@@ -65,15 +64,14 @@ pub fn build_ctx_for_command(
         identity::resolve_identity(db, None, None, None, process_id, codex_thread_id).ok()
     };
 
-    let identity_warning = identity.as_ref().and_then(|resolved| {
-        drift_warning(
-            db,
-            resolved,
-            had_verified_actor,
-            process_id,
-            codex_thread_id,
-        )
-    });
+    // Only an explicit --name can disagree with the shell's binding. A verified
+    // Claude actor is already the exact acting agent (and ensure_explicit_matches
+    // above hard-errors on conflict), so its process binding naming the parent
+    // row is not drift.
+    let identity_warning = match (&identity, explicit_name, had_verified_actor) {
+        (Some(resolved), Some(_), false) => drift_warning(db, resolved, process_id),
+        _ => None,
+    };
 
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
@@ -83,48 +81,43 @@ pub fn build_ctx_for_command(
     })
 }
 
-/// Warn when an explicit `--name` resolves to one instance while this shell's own
-/// process or session binding resolves to another.
+/// Warn when an explicit `--name` names a different instance than the one this
+/// shell's process binding points at.
 ///
-/// An explicit `--name` overrides whatever the shell is bound to. That is
-/// intentional, but it is also how an identity drifts unnoticed: a session keeps
-/// sending under the name it was told at start while its row has since been
-/// rebound or recovered under another one. Saying so beats silently accepting it.
+/// `--name` is what the agent knows itself to be, so on disagreement the binding
+/// is the stale side (session switch, resume, recovery). Hooks deliver by
+/// binding, so messages to the agent's name silently stop arriving until it
+/// reclaims the name.
 ///
-/// Returns `None` when there is nothing to report:
-/// - the shell has no identity of its own to disagree with;
-/// - the two agree;
-/// - the sender is a subagent, which shares the parent's shell and so always
-///   resolves to the parent row.
+/// Read-only: a plain binding lookup, never `resolve_identity`, whose Codex
+/// recovery path can rebind or retire rows.
+///
+/// Returns `None` when the shell is unbound, the two agree, or the named
+/// instance is a subagent of the bound row (subagents share the parent's shell).
 fn drift_warning(
     db: &HcomDb,
     resolved: &SenderIdentity,
-    had_verified_actor: bool,
     process_id: Option<&str>,
-    codex_thread_id: Option<&str>,
 ) -> Option<String> {
-    // A verified Claude actor is the exact acting agent for this shell call, so
-    // the shell's own binding is not a second opinion to weigh against it. A
-    // subagent acting through the actor env resolves to a name other than the
-    // parent row that binding names, and comparing the two only manufactures a
-    // warning on every call.
-    if had_verified_actor {
+    if !matches!(resolved.kind, SenderKind::Instance) {
         return None;
     }
-    let ambient =
-        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id).ok()?;
-    if !matches!(ambient.kind, SenderKind::Instance) || ambient.name == resolved.name {
+    let bound = db.get_process_binding(process_id?).ok()??;
+    if bound == resolved.name {
         return None;
     }
-    if db.was_subagent_name(&resolved.name) {
+    let parent = resolved
+        .instance_data
+        .as_ref()
+        .and_then(|d| d.get("parent_name"))
+        .and_then(|v| v.as_str());
+    if parent == Some(bound.as_str()) {
         return None;
     }
+    let name = &resolved.name;
     Some(format!(
-        concat!(
-            "[hcom] warning: sending as '{}', but this shell resolves to '{}'. ",
-            "If '{}' is stale, run 'hcom start --as {}' to reclaim it."
-        ),
-        resolved.name, ambient.name, resolved.name, resolved.name
+        "[hcom] warning: --name '{name}' but this shell is bound to '{bound}'. \
+         If you are '{name}', run 'hcom start --as {name}'."
     ))
 }
 
@@ -1186,34 +1179,44 @@ mod tests {
     }
 
     #[test]
-    fn drift_warning_is_quiet_for_a_verified_claude_actor() {
-        // A verified actor is the exact acting agent for this shell call. A Claude
-        // subagent acting through the actor env legitimately resolves to a name
-        // other than the parent row its process binding names, so comparing the
-        // two is meaningless here.
+    fn build_ctx_warns_for_a_subagent_of_another_parent() {
         let (db, _dir) = make_test_db();
-        insert_instance(&db, "riko", "claude");
         insert_instance(&db, "voni", "claude");
+        insert_instance(&db, "riko", "claude");
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, parent_name, agent_id, status, created_at, tool)
+                 VALUES ('riko_task_1', 'riko', 'a6d9caf', 'active', ?1, 'claude')",
+                rusqlite::params![now],
+            )
+            .unwrap();
         insert_process_binding(&db, "pid-1", "voni");
 
-        let resolved = identity::resolve_from_name(&db, "riko").unwrap();
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("riko_task_1"),
+            false,
+            Some("pid-1"),
+            None,
+        )
+        .unwrap();
         assert!(
-            drift_warning(&db, &resolved, true, Some("pid-1"), None).is_none(),
-            "a verified actor must not be compared against the shell's process binding"
+            ctx.identity_warning.is_some(),
+            "only the bound row's own subagents are exempt"
         );
     }
 
     #[test]
-    fn drift_warning_still_fires_without_a_verified_actor() {
+    fn build_ctx_skips_drift_check_without_explicit_name() {
         let (db, _dir) = make_test_db();
-        insert_instance(&db, "riko", "claude");
         insert_instance(&db, "voni", "claude");
         insert_process_binding(&db, "pid-1", "voni");
 
-        let resolved = identity::resolve_from_name(&db, "riko").unwrap();
-        let warning = drift_warning(&db, &resolved, false, Some("pid-1"), None)
-            .expect("an explicit --name that disagrees with this shell must still warn");
-        assert!(warning.contains("riko") && warning.contains("voni"));
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), None, false, Some("pid-1"), None).unwrap();
+        assert!(ctx.identity_warning.is_none());
     }
 
     #[test]
@@ -1224,7 +1227,8 @@ mod tests {
         insert_process_binding(&db, "pid-1", "voni");
 
         let resolved = identity::resolve_from_name(&db, "riko").unwrap();
-        let warning = drift_warning(&db, &resolved, false, Some("pid-1"), None).unwrap();
+        let warning = drift_warning(&db, &resolved, Some("pid-1")).unwrap();
+        assert!(warning.contains("hcom start --as riko"), "{warning}");
         assert!(
             !warning.contains("  "),
             "the warning is printed to a terminal; it must not carry a run of spaces: {warning:?}"

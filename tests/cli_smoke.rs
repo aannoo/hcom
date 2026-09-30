@@ -1640,3 +1640,22 @@ fn send_is_quiet_when_name_matches_the_shell_identity() {
         "a matching --name must not warn, got stderr={stderr}"
     );
 }
+
+#[test]
+fn send_with_from_skips_the_name_drift_warning() {
+    let h = Hcom::new();
+    let _sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    // With --from the sender is the external name, so --name disagreeing with
+    // the shell's binding says nothing about who is sending.
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--name", &other, "--from", "bigboss", "--", "hi"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("warning"),
+        "--from must suppress the drift warning, got stderr={stderr}"
+    );
+}
