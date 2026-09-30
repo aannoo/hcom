@@ -1676,3 +1676,20 @@ fn from_in_message_text_does_not_suppress_the_name_drift_warning() {
         "--from after -- is message text, got stderr={stderr}"
     );
 }
+
+#[test]
+fn send_with_attached_from_skips_the_name_drift_warning() {
+    let h = Hcom::new();
+    let _sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--name", &other, "--from=bigboss", "--", "hi"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("warning"),
+        "--from=NAME must suppress the drift warning, got stderr={stderr}"
+    );
+}

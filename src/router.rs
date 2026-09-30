@@ -827,7 +827,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let has_from_flag = cmd_argv
         .iter()
         .take_while(|a| a.as_str() != "--")
-        .any(|a| a == "--from" || a == "-b");
+        .any(|a| a == "--from" || a.starts_with("--from=") || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
         &db,
