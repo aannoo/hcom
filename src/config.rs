@@ -132,6 +132,7 @@ pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("gemini_system_prompt", "launch.gemini.system_prompt"),
     ("codex_args", "launch.codex.args"),
     ("codex_system_prompt", "launch.codex.system_prompt"),
+    ("codex_native_delivery", "launch.codex.native_delivery"),
     ("opencode_args", "launch.opencode.args"),
     ("kilo_args", "launch.kilo.args"),
     ("pi_args", "launch.pi.args"),
@@ -174,6 +175,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("codex_args", "HCOM_CODEX_ARGS"),
     ("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT"),
     ("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT"),
+    ("codex_native_delivery", "HCOM_CODEX_NATIVE_DELIVERY"),
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
     ("kilo_args", "HCOM_KILO_ARGS"),
     ("pi_args", "HCOM_PI_ARGS"),
@@ -298,6 +300,9 @@ pub struct HcomConfig {
     pub grok_args: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
+    /// Opt-in: deliver Codex idle messages through a private app-server queue
+    /// instead of typing into the composer. See `delivery::codex`.
+    pub codex_native_delivery: bool,
     pub relay: String,
     pub relay_id: String,
     pub relay_token: String,
@@ -337,6 +342,7 @@ impl Default for HcomConfig {
             grok_args: String::new(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
+            codex_native_delivery: false,
             relay: String::new(),
             relay_id: String::new(),
             relay_token: String::new(),
@@ -524,6 +530,9 @@ impl HcomConfig {
             "auto_trust_workspace" => {
                 Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
             }
+            "codex_native_delivery" => {
+                Some(if self.codex_native_delivery { "1" } else { "0" }.into())
+            }
             "title_mode" => Some(self.title_mode.clone()),
             _ => None,
         }
@@ -569,6 +578,7 @@ impl HcomConfig {
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
             "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
+            "codex_native_delivery" => self.codex_native_delivery = !is_falsy(value),
             // Stored leniently; `TitleMode::from_config` maps unknown → default.
             // The CLI set path (`config_set_at_path`) validates against
             // `VALID_TITLE_MODES` before this is ever written to the file.
@@ -701,7 +711,12 @@ impl HcomConfig {
         }
 
         // Load boolean fields
-        for bool_field in &["relay_enabled", "auto_approve", "auto_trust_workspace"] {
+        for bool_field in &[
+            "relay_enabled",
+            "auto_approve",
+            "auto_trust_workspace",
+            "codex_native_delivery",
+        ] {
             if let Some(val) = get_var(bool_field) {
                 match val {
                     TomlFieldValue::Bool(b) => {
@@ -1027,6 +1042,7 @@ system_prompt = ""
 args = ""
 sandbox_mode = "workspace"
 system_prompt = ""
+native_delivery = false
 
 [launch.opencode]
 args = ""

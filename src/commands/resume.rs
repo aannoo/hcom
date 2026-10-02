@@ -1107,20 +1107,6 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
     }
 }
 
-fn codex_permission_override(raw: &str) -> bool {
-    let key = raw.split('=').next().unwrap_or(raw).trim();
-    matches!(
-        key.split('.').next().unwrap_or(key),
-        "approval_policy"
-            | "approvals_reviewer"
-            | "sandbox_mode"
-            | "default_permissions"
-            | "permissions"
-            | "network"
-            | "sandbox_workspace_write"
-    )
-}
-
 /// Keep ordinary flags at the root, but replay config overrides after the
 /// session selector. Extra resume overrides follow saved overrides so Codex
 /// resolves precedence itself. Moving all flags would put saved and new
@@ -1135,34 +1121,7 @@ fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String
             root.extend_from_slice(&original[i..]);
             break;
         }
-        // Codex restores the destination thread's saved permissions. Replaying
-        // those launch choices makes its remote TUI reject resume/fork.
-        let flag = token.split('=').next().unwrap_or(token);
-        if matches!(
-            flag,
-            "--yolo"
-                | "--dangerously-bypass-approvals-and-sandbox"
-                | "--approve-for-me"
-                | "--not-so-yolo"
-        ) {
-            i += 1;
-            continue;
-        }
-        if matches!(
-            flag,
-            "-a" | "--ask-for-approval" | "-s" | "--sandbox" | "--add-dir"
-        ) {
-            i += if token.contains('=') { 1 } else { 2 };
-            continue;
-        }
         if matches!(token.as_str(), "-c" | "--config") {
-            if original
-                .get(i + 1)
-                .is_some_and(|value| codex_permission_override(value))
-            {
-                i += 2;
-                continue;
-            }
             config.push(token.clone());
             i += 1;
             if let Some(value) = original.get(i) {
@@ -1171,14 +1130,7 @@ fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String
             }
         } else {
             if (token.starts_with("-c") && token.len() > 2) || token.starts_with("--config=") {
-                let raw = token
-                    .strip_prefix("--config=")
-                    .or_else(|| token.strip_prefix("-c="))
-                    .or_else(|| token.strip_prefix("-c"))
-                    .unwrap();
-                if !codex_permission_override(raw) {
-                    config.push(token.clone());
-                }
+                config.push(token.clone());
             } else {
                 root.push(token.clone());
             }
@@ -2859,6 +2811,7 @@ mod tests {
                 s(&[
                     "--model",
                     "gpt-6-luna",
+                    "--yolo",
                     if fork { "fork" } else { "resume" },
                     "session-id",
                     "-c",

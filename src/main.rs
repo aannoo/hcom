@@ -208,17 +208,13 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let (codex_native, codex_server, codex_args) =
-        if target.known_tool() == Some(tool::Tool::Codex) && instance_name.is_some() {
-            let (launch, server, args) =
-                delivery::codex::Launch::start(&command, &extra_args, &tool_args, &child_env)
-                    .inspect_err(|error| {
-                        report_pty_launch_failure(instance_name.as_deref(), error);
-                    })?;
-            (Some(launch), Some(server), Some(args))
-        } else {
-            (None, None, None)
-        };
+    let codex = (target.known_tool() == Some(tool::Tool::Codex) && instance_name.is_some())
+        .then(|| delivery::codex::start(&command, &extra_args, &tool_args, &child_env))
+        .flatten();
+    let (codex_native, codex_server, codex_args) = match codex {
+        Some((launch, server, args)) => (Some(launch), Some(server), Some(args)),
+        None => (None, None, None),
+    };
     let codex_arg_refs: Vec<&str> = codex_args
         .as_ref()
         .map(|args| args.iter().map(String::as_str).collect())
@@ -262,10 +258,29 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             // through the launch-failure event so the launcher (human or the
             // agent that ran `hcom N <tool>`) is notified immediately instead
             // of waiting on the generic stale-placeholder timeout.
-            report_pty_launch_failure(instance_name_for_failure.as_deref(), &err);
+            log::log_error("pty", "spawn_failed", &format!("{err:#}"));
             // Grok may have started its persistent leader before the failure.
             if let Some(launch) = grok_leader.as_ref() {
                 launch.stop_leader();
+            }
+            if let Some(name) = instance_name_for_failure.as_deref()
+                && let Ok(db) = db::HcomDb::open()
+                && let Ok(Some(instance)) = db.get_instance_full(name)
+            {
+                let fallback = format!("{err:#}");
+                if let Some(detail) = instance_lifecycle::finalize_launch_failure_detail(
+                    &db,
+                    &instance,
+                    Some(&fallback),
+                ) {
+                    let _ = db.emit_launch_failed_event(
+                        name,
+                        shared::ST_INACTIVE,
+                        "launch_failed",
+                        "spawn_failed",
+                        &detail,
+                    );
+                }
             }
             return Err(err);
         }
@@ -283,27 +298,6 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     let exit_code = exit_code?;
 
     std::process::exit(exit_code);
-}
-
-fn report_pty_launch_failure(instance_name: Option<&str>, error: &anyhow::Error) {
-    log::log_error("pty", "spawn_failed", &format!("{error:#}"));
-    if let Some(name) = instance_name
-        && let Ok(db) = db::HcomDb::open()
-        && let Ok(Some(instance)) = db.get_instance_full(name)
-    {
-        let fallback = format!("{error:#}");
-        if let Some(detail) =
-            instance_lifecycle::finalize_launch_failure_detail(&db, &instance, Some(&fallback))
-        {
-            let _ = db.emit_launch_failed_event(
-                name,
-                shared::ST_INACTIVE,
-                "launch_failed",
-                "spawn_failed",
-                &detail,
-            );
-        }
-    }
 }
 
 fn pty_child_env() -> Vec<(String, String)> {

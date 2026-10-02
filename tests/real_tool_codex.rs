@@ -35,6 +35,13 @@ fn real_codex_full_lifecycle_send_fork_kill_resume_and_cleanup() {
     support::real_tool::run_full_lifecycle(CodexCase);
 }
 
+#[test]
+#[ignore = "requires the pinned real @openai/codex binary"]
+#[serial]
+fn real_codex_native_delivery_lifecycle_preserves_draft() {
+    support::real_tool::run_full_lifecycle_native(CodexCase);
+}
+
 /// Codex's approval gate is hcom's only PTY-driven block path, and
 /// `blocked(pty:approval)` only latches when a message is pending behind a
 /// visible approval prompt. This drives that exact race: with Codex configured

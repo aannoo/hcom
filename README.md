@@ -237,11 +237,15 @@ hcom r <session_id>   # Resume a session started outside hcom
 hcom f <session_id>   # Fork a session in hcom
 ```
 
-#### Codex delivery
+#### Codex native delivery (opt-in)
 
-hcom starts a private Codex app-server for each agent and connects its terminal to that server. Idle messages use Codex's native queue, so delivery preserves a draft in the composer. The existing hooks fetch and acknowledge messages; a successful queue request only wakes Codex.
+```bash
+hcom config codex_native_delivery 1
+```
 
-hcom manages the connection, so `--remote` and `--no-daemon` cannot be passed through. `--profile` is also unavailable because app-server cannot select the CLI's profile; use `-c` overrides instead. Resume and fork restore the thread's saved permissions. Codex's remote terminal rejects new explicit permission overrides on resume or fork.
+By default hcom wakes an idle Codex by typing into its terminal. With this on, each Codex agent gets a private `codex app-server` and the terminal UI attaches to it with `--remote`; hcom wakes the agent through Codex's own queue on whichever thread the UI is showing. Drafts in the composer are never touched and the first message can arrive before the first prompt. Costs one extra Codex process per agent and relies on experimental Codex APIs. Unix only.
+
+Launches the private server can't serve fall back to terminal delivery: `--profile`, `--remote`, `--no-daemon`, `--add-dir`, `--worktree`, and resume/fork with explicit permission flags (a remote Codex resumes with the thread's saved permissions).
 
 #### Claude Code headless and subagents
 

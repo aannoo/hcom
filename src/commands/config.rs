@@ -130,6 +130,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_CODEX_NATIVE_DELIVERY",
+        "Deliver idle codex messages via its native queue (true/false)",
+        "boolean",
+    ),
+    (
         "HCOM_TERMINAL",
         "Terminal preset for spawning agent panes",
         "string",
@@ -409,6 +414,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_SUBAGENT_TIMEOUT" => "30",
         "HCOM_AUTO_APPROVE" => "true",
         "HCOM_AUTO_TRUST_WORKSPACE" => "true",
+        "HCOM_CODEX_NATIVE_DELIVERY" => "false",
         "HCOM_TITLE_MODE" => "combined",
         _ => "",
     };
@@ -1473,6 +1479,29 @@ Always require approval:
   - hcom <N> claude     (launches new instances)
 
 Values: 1, true, yes, on (enabled) | 0, false, no, off, \"\" (disabled)",
+        ),
+
+        "HCOM_CODEX_NATIVE_DELIVERY" => Some(
+            "\
+HCOM_CODEX_NATIVE_DELIVERY - Wake idle Codex agents through Codex's own queue
+
+Default: false (hcom types the wake prompt into the Codex terminal)
+
+When enabled, hcom starts a private Codex app-server for each Codex agent and
+attaches the terminal UI to it with --remote. Idle messages are queued on the
+thread the terminal is showing, so a half-typed draft is never touched and an
+agent can receive messages before its first prompt.
+
+Usage:
+  hcom config codex_native_delivery 1
+  HCOM_CODEX_NATIVE_DELIVERY=1 hcom codex    # one launch
+
+Notes:
+  - Applies to new launches, resumes and forks (Unix only)
+  - Uses experimental Codex APIs; one extra codex process per agent
+  - Falls back to terminal delivery for launches that pass --profile,
+    --remote, --no-daemon, --add-dir or --worktree, or if the server fails
+    to start (see hcom.log: codex.native.*)",
         ),
 
         "HCOM_AUTO_SUBSCRIBE" => Some(

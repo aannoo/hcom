@@ -314,9 +314,24 @@ fn wait_pty_ready(h: &Hcom, name: &str, what: &str) {
 /// needs a live parent and resume needs a prior kill, so the phases share live
 /// process state and cannot be split without re-launching the tool per phase.
 pub fn run_full_lifecycle<C: ToolCase>(case: C) {
+    run_lifecycle(case, false);
+}
+
+/// The same lifecycle with opt-in Codex native delivery, which additionally
+/// must leave a human's composer draft untouched.
+#[allow(dead_code)]
+pub fn run_full_lifecycle_native<C: ToolCase>(case: C) {
+    run_lifecycle(case, true);
+}
+
+fn run_lifecycle<C: ToolCase>(case: C, native: bool) {
     let h = Hcom::new();
     require_pinned(&h, &case);
     let tool = case.meta().tool;
+    if native {
+        let (code, stdout, stderr) = h.run(["config", "codex_native_delivery", "1"]);
+        assert_eq!(code, 0, "enable native delivery: {stdout} {stderr}");
+    }
 
     let suffix = unique_suffix();
     let recipient_process_id = format!("hcom-{tool}-recipient-{suffix}");
@@ -688,7 +703,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     );
     // Native Codex waking must not type into or submit the human's draft.
     let idle_draft = "human draft stays here";
-    if tool == "codex" {
+    if native {
         let (code, stdout, stderr) = h.run(["term", "inject", &name, idle_draft]);
         assert_eq!(code, 0, "draft injection failed: {stdout} {stderr}");
         h.eventually("Codex draft rendered", Duration::from_secs(10), || {
@@ -782,7 +797,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         "delivered inbound must advance the cursor exactly once"
     );
 
-    if tool == "codex" {
+    if native {
         h.eventually(
             "Codex draft preserved after native delivery",
             Duration::from_secs(10),

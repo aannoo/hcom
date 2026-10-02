@@ -592,6 +592,10 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "  gemini_system_prompt / codex_system_prompt",
         "Default system prompt",
     ),
+    (
+        "  codex_native_delivery",
+        "Wake idle codex via its native queue (opt-in)",
+    ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
     ("  auto_subscribe", "Event auto-subscribe presets"),
     (
