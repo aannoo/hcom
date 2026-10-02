@@ -459,6 +459,7 @@ pub(super) fn start_delivery_thread(
     current_status: Arc<RwLock<String>>,
     title_wake: Option<crate::delivery::TitleWake>,
     grok_acp: Option<crate::delivery::grok::Launch>,
+    codex_native: Option<crate::delivery::codex::Launch>,
 ) -> Result<DeliveryStart> {
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
@@ -536,6 +537,7 @@ pub(super) fn start_delivery_thread(
         let state = DeliveryState {
             screen: delivery_state,
             grok_acp,
+            codex_native,
             launch_phase_active,
             inject_port,
             user_activity_cooldown_ms: USER_ACTIVITY_COOLDOWN_MS,

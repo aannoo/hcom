@@ -825,8 +825,13 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
     if let Some(result) = prepare_codex_delivery(db, &instance.name) {
         result
     } else {
-        set_prompt_active(db, &instance.name);
-        hook_noop()
+        // A PostToolUse hook or another prompt can drain the inbox while a
+        // native wake is queued. Reject the empty trigger without starting an
+        // inference turn or claiming that the agent became active.
+        HookResult::Block {
+            reason: "No pending hcom messages.".to_string(),
+            delivery_ack: None,
+        }
     }
 }
 
@@ -1601,6 +1606,35 @@ mod tests {
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
     use std::collections::HashMap;
+
+    #[test]
+    #[serial]
+    fn empty_wake_is_rejected_without_turn_or_cursor_change() {
+        let (_dir, _hcom, home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn().execute(
+            "INSERT INTO instances (name, tool, session_id, status, status_context, created_at, last_event_id) VALUES ('luna', 'codex', 'thread', 'listening', '', 0, 0)",
+            [],
+        ).unwrap();
+        db.rebind_session("thread", "luna").unwrap();
+        let ctx = HcomContext::from_env(&HashMap::new(), home);
+        let payload = HookPayload::from_codex_native(
+            "UserPromptSubmit",
+            serde_json::json!({"session_id":"thread", "prompt":"<hcom>"}),
+        );
+        assert!(matches!(
+            handle_userpromptsubmit(&db, &ctx, &payload),
+            HookResult::Block {
+                delivery_ack: None,
+                ..
+            }
+        ));
+        assert_eq!(db.get_cursor("luna"), 0);
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().status,
+            ST_LISTENING
+        );
+    }
 
     fn per_run_ctx(args: &[&str], home: &Path) -> LaunchCtx {
         LaunchCtx {

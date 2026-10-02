@@ -593,6 +593,7 @@ pub struct ProxyConfig {
     /// Extra environment variables to set in the child process
     pub env_vars: Vec<(String, String)>,
     pub grok_acp: Option<crate::delivery::grok::Launch>,
+    pub codex_native: Option<crate::delivery::codex::Launch>,
 }
 
 impl Default for ProxyConfig {
@@ -607,6 +608,7 @@ impl Default for ProxyConfig {
             target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
             grok_acp: None,
+            codex_native: None,
         }
     }
 }
@@ -1033,6 +1035,7 @@ impl Proxy {
                             self.current_status.clone(),
                             Some(title_wake_callback(self.title_notify_write.clone())),
                             self.config.grok_acp.clone(),
+                            self.config.codex_native.clone(),
                         )? {
                             shared::DeliveryStart::Started(h) => {
                                 self.delivery_handle = Some(h);
@@ -1246,6 +1249,7 @@ impl Proxy {
                                     self.current_status.clone(),
                                     Some(title_wake_callback(self.title_notify_write.clone())),
                                     self.config.grok_acp.clone(),
+                                    self.config.codex_native.clone(),
                                 )? {
                                     shared::DeliveryStart::Started(h) => {
                                         self.delivery_handle = Some(h);

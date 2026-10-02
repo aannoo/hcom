@@ -2,6 +2,7 @@
 
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
+pub(crate) mod codex;
 pub(crate) mod grok;
 
 use std::io::Write;
@@ -911,6 +912,7 @@ pub struct DeliveryState {
     pub screen: Arc<std::sync::RwLock<ScreenState>>,
     /// Grok's native ACP transport; set for every hcom-launched Grok.
     pub grok_acp: Option<grok::Launch>,
+    pub codex_native: Option<codex::Launch>,
     /// True while the launch outcome is still Pending. Cleared once any
     /// terminal outcome (ready/failed/blocked) fires, so the PTY proxy can
     /// stop computing launch-only signals (e.g. `visible_tail`).
@@ -1692,6 +1694,22 @@ pub fn run_delivery_loop(
     use std::str::FromStr;
     if let Some(launch) = state.grok_acp.as_ref() {
         grok::run(
+            launch,
+            &running,
+            db,
+            notify,
+            state,
+            &process_id,
+            &mut current_name,
+            config,
+            &shared_name,
+            &shared_status,
+            &title_wake,
+            &mut host_label,
+            &mut launch_outcome,
+        );
+    } else if let Some(launch) = state.codex_native.as_ref() {
+        codex::run(
             launch,
             &running,
             db,
@@ -2739,6 +2757,7 @@ mod tests {
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
         DeliveryState {
             grok_acp: None,
+            codex_native: None,
             screen: Arc::new(std::sync::RwLock::new(screen)),
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             inject_port: 0,

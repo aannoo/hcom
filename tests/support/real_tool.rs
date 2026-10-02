@@ -686,6 +686,17 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
             Ok((instance["status"].as_str() == Some("listening")).then_some(()))
         },
     );
+    // Native Codex waking must not type into or submit the human's draft.
+    let idle_draft = "human draft stays here";
+    if tool == "codex" {
+        let (code, stdout, stderr) = h.run(["term", "inject", &name, idle_draft]);
+        assert_eq!(code, 0, "draft injection failed: {stdout} {stderr}");
+        h.eventually("Codex draft rendered", Duration::from_secs(10), || {
+            let (code, stdout, _) = h.run(["term", &name, "--json"]);
+            let screen: Value = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+            Ok((code == 0 && screen["input_text"].as_str() == Some(idle_draft)).then_some(()))
+        });
+    }
     let (inbound_send_code, inbound_send_stdout, inbound_send_stderr) = h.run_as_process(
         &recipient_process_id,
         [
@@ -770,6 +781,18 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         Some(0),
         "delivered inbound must advance the cursor exactly once"
     );
+
+    if tool == "codex" {
+        h.eventually(
+            "Codex draft preserved after native delivery",
+            Duration::from_secs(10),
+            || {
+                let (code, stdout, _) = h.run(["term", &name, "--json"]);
+                let screen: Value = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+                Ok((code == 0 && screen["input_text"].as_str() == Some(idle_draft)).then_some(()))
+            },
+        );
+    }
 
     // --- Phase 6: live fork ----------------------------------------------------
     assert!(

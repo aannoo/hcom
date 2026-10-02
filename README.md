@@ -237,6 +237,12 @@ hcom r <session_id>   # Resume a session started outside hcom
 hcom f <session_id>   # Fork a session in hcom
 ```
 
+#### Codex delivery
+
+hcom starts a private Codex app-server for each agent and connects its terminal to that server. Idle messages use Codex's native queue, so delivery preserves a draft in the composer. The existing hooks fetch and acknowledge messages; a successful queue request only wakes Codex.
+
+hcom manages the connection, so `--remote` and `--no-daemon` cannot be passed through. `--profile` is also unavailable because app-server cannot select the CLI's profile; use `-c` overrides instead. Resume and fork restore the thread's saved permissions. Codex's remote terminal rejects new explicit permission overrides on resume or fork.
+
 #### Claude Code headless and subagents
 
 Detached background processes in print mode stay alive. Manage through the TUI.
