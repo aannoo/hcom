@@ -2759,6 +2759,57 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     })
 }
 
+/// Claude's shared background daemon keeps the environment of whichever
+/// session started it, so a session moved there by /background or the agent
+/// view would run hooks and `hcom` as that other launch. Settings `env` is
+/// re-applied per session, so pin this launch's hcom identity there.
+pub(crate) fn pin_launch_environment(
+    args: &mut Vec<String>,
+    env: &std::collections::HashMap<String, String>,
+    pty: bool,
+) -> Result<()> {
+    let values = runtime::take_flag_values(args, &["--settings"]);
+    let path = values.last().context("Claude runtime settings missing")?;
+    let mut settings: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let settings_env = object_field(&mut settings, "env")?;
+    for key in [
+        "HCOM_DIR",
+        "HCOM_PROCESS_ID",
+        "HCOM_INSTANCE_NAME",
+        "HCOM_LAUNCHED",
+        "HCOM_LAUNCHED_BY",
+        "HCOM_LAUNCH_BATCH_ID",
+        "HCOM_DEV_ROOT",
+    ] {
+        // Clear values inherited from whichever launch started the supervisor.
+        settings_env.insert(
+            key.to_string(),
+            Value::String(env.get(key).cloned().unwrap_or_default()),
+        );
+    }
+    settings_env.insert(
+        "HCOM_PTY_MODE".to_string(),
+        Value::String(if pty { "1" } else { "0" }.to_string()),
+    );
+    settings_env.insert(
+        "HCOM_IS_FORK".to_string(),
+        Value::String(
+            env.get("HCOM_IS_FORK")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string()),
+        ),
+    );
+    let path = runtime::publish_file("claude", "settings.json", &serde_json::to_vec(&settings)?)?;
+    runtime::insert_before_separator(
+        args,
+        [
+            "--settings".to_string(),
+            path.to_string_lossy().into_owned(),
+        ],
+    );
+    Ok(())
+}
+
 /// Older hcom wrote hooks into the effective settings.json, or into
 /// `<HCOM_DIR parent>/.claude/settings.json` under a project-local HCOM_DIR.
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
@@ -3120,6 +3171,45 @@ mod tests {
         assert!(settings["env"]["HCOM"].is_string());
         assert_eq!(settings["permissions"]["allow"][0], "Bash(caller:*)");
         assert_eq!(settings["custom"], 42);
+    }
+
+    #[test]
+    fn each_claude_launch_pins_its_own_supervisor_environment() {
+        // Publishing settings reads HCOM_DIR, which parallel tests also change.
+        let (dir, _hcom_dir, _test_home, _guard) = isolated_test_env();
+        let source = dir.path().join("settings.json");
+        std::fs::write(
+            &source,
+            serde_json::json!({
+                "env": {"CALLER": "kept", "HCOM_PROCESS_ID": "stale"},
+                "hooks": {"Stop": [{"hooks": [{"command": "caller-hook"}]}]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for process in ["process-one", "process-two"] {
+            let mut args = vec![
+                "--settings".to_string(),
+                source.to_string_lossy().into_owned(),
+            ];
+            let env = std::collections::HashMap::from([
+                ("HCOM_PROCESS_ID".to_string(), process.to_string()),
+                ("HCOM_DIR".to_string(), "/tmp/launch-db".to_string()),
+            ]);
+            pin_launch_environment(&mut args, &env, true).unwrap();
+            let settings: Value =
+                serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
+            assert_eq!(settings["env"]["HCOM_PROCESS_ID"], process);
+            assert_eq!(settings["env"]["HCOM_DIR"], "/tmp/launch-db");
+            assert_eq!(settings["env"]["HCOM_PTY_MODE"], "1");
+            assert_eq!(settings["env"]["HCOM_IS_FORK"], "0");
+            assert_eq!(settings["env"]["HCOM_DEV_ROOT"], "");
+            assert_eq!(settings["env"]["CALLER"], "kept");
+            assert_eq!(
+                settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+                "caller-hook"
+            );
+        }
     }
 
     #[test]

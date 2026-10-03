@@ -2,7 +2,7 @@
 
 /// Cached hcom invocation prefix (computed once per process lifetime).
 static HCOM_PREFIX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-    if std::env::var("HCOM_DEV_ROOT").is_ok() {
+    if std::env::var("HCOM_DEV_ROOT").is_ok_and(|root| !root.is_empty()) {
         #[cfg(windows)]
         if let Ok(exe) = std::env::current_exe()
             && let Ok(resolved) = exe.canonicalize()

@@ -2037,6 +2037,20 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             ),
         );
 
+        // Claude's background daemon keeps settings but not launch env; see
+        // `pin_launch_environment`.
+        let mut params = params.clone();
+        if matches!(normalized, LaunchTool::Claude | LaunchTool::ClaudePty)
+            && let Err(error) = crate::hooks::claude::pin_launch_environment(
+                &mut params.args,
+                &instance_env,
+                matches!(normalized, LaunchTool::ClaudePty),
+            )
+        {
+            errors.push(json!({"tool": base_tool, "error": error.to_string()}));
+            continue;
+        }
+
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {
             instance_binding::initialize_instance_in_position_file(
