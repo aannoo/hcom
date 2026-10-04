@@ -894,6 +894,10 @@ impl ToolConfig {
     pub fn copilot() -> Self {
         Self::for_tool(crate::tool::Tool::Copilot)
     }
+    #[cfg(test)]
+    pub fn qoder() -> Self {
+        Self::for_tool(crate::tool::Tool::Qoder)
+    }
 }
 
 /// Gate evaluation result
@@ -1038,6 +1042,15 @@ impl Default for ScreenState {
 /// hook's `status=active` update. Tuned from PTY test traces where the gap was
 /// about 1s; round up for headroom.
 pub(crate) const SUBMIT_SETTLE_COOLDOWN_MS: u64 = 1500;
+
+/// Pause between seeing the injected text in the composer and pressing Enter.
+///
+/// Qoder (1.1.65) submits the text twice (`<hcom><hcom>`) when Enter follows it
+/// within a few tens of milliseconds as a separate write. A 100ms gap is enough
+/// (measured); this leaves a margin. Other tools take Enter at once.
+pub(crate) fn pre_enter_settle(tool: &str) -> Option<Duration> {
+    (tool == "qoder").then(|| Duration::from_millis(250))
+}
 
 /// How long screen output must be quiet before a negative approval scrape is
 /// trusted to clear the latched signal. Redraw bursts (cursor's approval prompt
@@ -1981,8 +1994,8 @@ pub fn run_delivery_loop(
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
-                            | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Pi)
-                            | Some(Tool::Omp) => "<hcom>".to_string(),
+                            | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Qoder)
+                            | Some(Tool::Pi) | Some(Tool::Omp) => "<hcom>".to_string(),
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
@@ -2199,6 +2212,10 @@ pub fn run_delivery_loop(
                                 "delivery.text_rendered",
                                 "Injected text exclusively owns the input box",
                             );
+
+                            if let Some(settle) = pre_enter_settle(&config.tool) {
+                                std::thread::sleep(settle);
+                            }
 
                             // Re-check all submit hazards from one fresh snapshot.
                             // The prompt can change between render detection and Enter.
@@ -3079,6 +3096,14 @@ mod tests {
     }
 
     #[test]
+    fn only_qoder_waits_before_enter() {
+        assert_eq!(pre_enter_settle("qoder"), Some(Duration::from_millis(250)));
+        for tool in ["claude", "codex", "copilot", "kimi", "adhoc"] {
+            assert_eq!(pre_enter_settle(tool), None, "{tool}");
+        }
+    }
+
+    #[test]
     fn gate_blocks_during_submit_settle_window() {
         let config = ToolConfig::codex();
         let mut screen = safe_screen();
@@ -3371,6 +3396,16 @@ mod tests {
         assert!(copilot.require_prompt_empty);
         assert!(copilot.block_on_user_activity);
         assert!(copilot.block_on_approval);
+
+        // Qoder: same gates as Copilot. Its composer stays on screen while busy,
+        // so the ready markers only prove the TUI is up; idle comes from hooks.
+        let qoder = ToolConfig::qoder();
+        assert!(qoder.require_idle);
+        assert!(qoder.require_ready_prompt);
+        assert!(qoder.require_prompt_empty);
+        assert!(qoder.block_on_user_activity);
+        assert!(qoder.block_on_approval);
+        assert!(qoder.launch_requires_ready);
     }
 
     #[test]

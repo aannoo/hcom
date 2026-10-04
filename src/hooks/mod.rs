@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot). Grok has none (see `delivery/grok.rs`).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Qoder). Grok has none (see `delivery/grok.rs`).
 
 pub mod antigravity;
 pub mod claude;
@@ -11,6 +11,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
+pub mod qoder;
 pub mod runtime;
 pub mod utils;
 
@@ -48,6 +49,7 @@ pub mod test_helpers {
         saved_kilo_config_dir: Option<String>,
         saved_kimi_code_home: Option<String>,
         saved_copilot_home: Option<String>,
+        saved_qoder_config_dir: Option<String>,
         saved_test_codex_cli_version: Option<String>,
         saved_pi_coding_agent_dir: Option<String>,
         saved_pi_coding_agent_session_dir: Option<String>,
@@ -79,6 +81,7 @@ pub mod test_helpers {
                 saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
                 saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
                 saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
+                saved_qoder_config_dir: std::env::var("QODER_CONFIG_DIR").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
                 saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
                 saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
@@ -133,6 +136,10 @@ pub mod test_helpers {
                 match &self.saved_copilot_home {
                     Some(v) => std::env::set_var("COPILOT_HOME", v),
                     None => std::env::remove_var("COPILOT_HOME"),
+                }
+                match &self.saved_qoder_config_dir {
+                    Some(v) => std::env::set_var("QODER_CONFIG_DIR", v),
+                    None => std::env::remove_var("QODER_CONFIG_DIR"),
                 }
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
@@ -223,7 +230,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot", "grok").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot", "qoder", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -484,6 +491,35 @@ impl HookPayload {
         }
     }
 
+    /// Build from Qoder CLI hook JSON.
+    ///
+    /// Qoder mirrors Claude Code's hook payload (snake_case, all keys at the
+    /// root): `session_id`, `transcript_path`, `cwd`, `hook_event_name`, plus
+    /// `prompt`, `tool_name`, `tool_input`, `tool_response`, `notification_type`,
+    /// `reason` depending on the event.
+    pub fn from_qoder(hook_type: &str, raw: Value) -> Self {
+        let tool_result = match raw.get("tool_response") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(v) => v.to_string(),
+        };
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcript_path"]),
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "qoder".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result,
+            notification_type: Self::opt_str_field(&raw, &["notification_type"]),
+            raw,
+        }
+    }
+
     /// Build from OpenCode hook JSON.
     ///
     /// OpenCode hooks: session_id from env, minimal tool info.
@@ -646,6 +682,33 @@ mod tests {
         assert_eq!(payload.session_id.as_deref(), Some("oc-111"));
         assert_eq!(payload.tool, "opencode");
         assert_eq!(payload.tool_name, "bash");
+    }
+
+    #[test]
+    fn test_hook_payload_from_qoder() {
+        let raw = serde_json::json!({
+            "session_id": "s1",
+            "transcript_path": "/h/.qoder/projects/p/s1.jsonl",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": "ok",
+            "notification_type": "permission_prompt",
+        });
+        let payload = HookPayload::from_qoder("PostToolUse", raw);
+        assert_eq!(payload.tool, "qoder");
+        assert_eq!(payload.session_id.as_deref(), Some("s1"));
+        assert_eq!(
+            payload.transcript_path.as_deref(),
+            Some("/h/.qoder/projects/p/s1.jsonl")
+        );
+        assert_eq!(payload.tool_name, "Bash");
+        assert_eq!(payload.tool_input["command"], "ls");
+        assert_eq!(payload.tool_result, "ok");
+        assert_eq!(
+            payload.notification_type.as_deref(),
+            Some("permission_prompt")
+        );
     }
 
     #[test]

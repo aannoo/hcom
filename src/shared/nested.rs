@@ -15,7 +15,7 @@
 //! startup, so they run as a plain unlaunched session.
 //!
 //! Supported: any cross-tool child, and same-tool Codex, Gemini and Grok children.
-//! Per-run tools (Claude, Codex, Copilot, Pi, Omp, OpenCode, Kilo; see
+//! Per-run tools (Claude, Codex, Copilot, Qoder, Pi, Omp, OpenCode, Kilo; see
 //! `hooks::runtime`) load hcom only through launch args or env, so a plain
 //! same-tool child doesn't load hcom at all (OpenCode's inherited env var is
 //! made inert by the plugin's owner-PID guard). Persistent Cursor, Kimi and

@@ -139,6 +139,7 @@ pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("cursor_args", "launch.cursor.args"),
     ("kimi_args", "launch.kimi.args"),
     ("copilot_args", "launch.copilot.args"),
+    ("qoder_args", "launch.qoder.args"),
     ("grok_args", "launch.grok.args"),
     ("relay", "relay.url"),
     ("relay_id", "relay.id"),
@@ -180,6 +181,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("cursor_args", "HCOM_CURSOR_ARGS"),
     ("kimi_args", "HCOM_KIMI_ARGS"),
     ("copilot_args", "HCOM_COPILOT_ARGS"),
+    ("qoder_args", "HCOM_QODER_ARGS"),
     ("grok_args", "HCOM_GROK_ARGS"),
     ("relay", "HCOM_RELAY"),
     ("relay_id", "HCOM_RELAY_ID"),
@@ -292,6 +294,7 @@ pub struct HcomConfig {
     pub cursor_args: String,
     pub kimi_args: String,
     pub copilot_args: String,
+    pub qoder_args: String,
     pub grok_args: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
@@ -330,6 +333,7 @@ impl Default for HcomConfig {
             cursor_args: String::new(),
             kimi_args: String::new(),
             copilot_args: String::new(),
+            qoder_args: String::new(),
             grok_args: String::new(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
@@ -450,6 +454,7 @@ impl HcomConfig {
             ("cursor_args", &self.cursor_args),
             ("kimi_args", &self.kimi_args),
             ("copilot_args", &self.copilot_args),
+            ("qoder_args", &self.qoder_args),
             ("grok_args", &self.grok_args),
         ] {
             if !value.is_empty()
@@ -504,6 +509,7 @@ impl HcomConfig {
             "cursor_args" => Some(self.cursor_args.clone()),
             "kimi_args" => Some(self.kimi_args.clone()),
             "copilot_args" => Some(self.copilot_args.clone()),
+            "qoder_args" => Some(self.qoder_args.clone()),
             "grok_args" => Some(self.grok_args.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
@@ -550,6 +556,7 @@ impl HcomConfig {
             "cursor_args" => self.cursor_args = value.to_string(),
             "kimi_args" => self.kimi_args = value.to_string(),
             "copilot_args" => self.copilot_args = value.to_string(),
+            "qoder_args" => self.qoder_args = value.to_string(),
             "grok_args" => self.grok_args = value.to_string(),
             "gemini_system_prompt" => self.gemini_system_prompt = value.to_string(),
             "codex_system_prompt" => self.codex_system_prompt = value.to_string(),
@@ -674,6 +681,7 @@ impl HcomConfig {
             "pi_args",
             "cursor_args",
             "copilot_args",
+            "qoder_args",
             "grok_args",
             "gemini_system_prompt",
             "codex_system_prompt",
@@ -1036,6 +1044,9 @@ args = ""
 args = ""
 
 [launch.copilot]
+args = ""
+
+[launch.qoder]
 args = ""
 
 [preferences]

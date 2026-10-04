@@ -189,6 +189,7 @@ mod tests {
             Tool::Codex,
             Tool::Cursor,
             Tool::Copilot,
+            Tool::Qoder,
             Tool::OpenCode,
         ] {
             let argv = build_launch_argv(tool.clone(), 1, "", false, false, "kitty", "fix the bug");

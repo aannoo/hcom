@@ -1,4 +1,4 @@
-# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code + Pi + OMP + Antigravity + Cursor + Kimi + Copilot + Grok
+# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code + Pi + OMP + Antigravity + Cursor + Kimi + Copilot + Qoder + Grok
 
 Verified behavior when mixing different AI coding tools via hcom.
 
@@ -65,6 +65,20 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Status detail**: edit tool is `StrReplace` (not `Edit`); file/edit tools key the path off `path` (not `file_path`); shell has the `run_terminal_cmd` variant; delegates are `Task`/`Subagent`.
 - **Fork**: not supported (cursor-agent has no native branch primitive — only `--resume`/`--continue`); resume preserved.
 - **Transcript**: cursor-agent writes JSONL under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Parser support is limited: no timestamps, `cwd`, or tool-result blocks; user prompts require wrapper removal.
+
+### Qoder CLI
+- **Hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, Notification, Stop, SessionEnd. Loaded per run through `--settings` (merged with a caller's `--settings`); no hooks are installed in `~/.qoder/settings.json`.
+- **Payload**: JSON via stdin, same shape as Claude Code
+- **Session binding**: On SessionStart; on the first prompt when SessionStart was skipped (Qoder runs no hooks in a folder until it is trusted).
+- **Workspace trust**: with `auto_trust_workspace`, hcom adds the workspace to `permissions.trustDirectories` in Qoder's `settings.json` unless it or a parent is already listed. This is the one persistent change a launch makes to Qoder's config.
+- **Message delivery**: Idle agent → `<hcom>` wake prompt with the body in UserPromptSubmit `additionalContext`. Active turn → PostToolUse `additionalContext`. Turn end → Stop `decision: block`.
+- **Auto-approval**: with `auto_approve`, a PermissionRequest hook allows a single safe `hcom …` Bash command; no permission rules are written.
+- **Status**: `blocked: approval` from the `permission_prompt` notification, cleared when the tool call finishes.
+- **Resume/Fork**: `--resume <id>` / `--resume <id> --fork-session`
+- **Transcript**: Claude-format JSONL at `$QODER_CONFIG_DIR/projects/<slug>/<session-id>.jsonl` (default `~/.qoder`).
+- **System prompt**: `--hcom-system-prompt` maps to Qoder’s `--system-prompt` and is preserved on resume/fork.
+- **Rejected flags**: `-p`/`--print` (one-shot), `--acp`, `--remote`, `--remote-control`, `--list-sessions`, `--delete-session`, and `--list-models` (non-interactive modes).
+- **Not covered**: Qoder subagent events (SubagentStart/SubagentStop).
 
 ### Grok Build
 - **Hooks**: none. hcom installs nothing for Grok; binding, status and delivery all come over the ACP client on hcom's private leader.

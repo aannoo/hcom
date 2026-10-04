@@ -243,7 +243,7 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT] [GROK]  hcom-launched, automatic delivery",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT] [QODER] [GROK]  hcom-launched, automatic delivery",
     ),
     (
         "",
@@ -585,7 +585,7 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / grok_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args",
         "Default launch args per tool",
     ),
     (
@@ -887,7 +887,7 @@ fn expand_hook_tools(text: &str) -> String {
         .replace("{hookless_list}", &names(&|m| m == HookMode::None, ", "))
 }
 
-// ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot) ─────────────────────
+// ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder) ─────────────────────
 
 /// Resolve the launch-help spec for a CLI name (`claude`, `agy`, …).
 fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::IntegrationSpec> {
@@ -1113,6 +1113,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "cursor-agent",
     "kimi",
     "copilot",
+    "qoder",
+    "qodercli",
     "grok",
     "grok-build",
 ];
@@ -1607,12 +1609,12 @@ mod tests {
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
         assert!(help.contains(
-            "hcom f <target>                       Fork agent session (claude/codex/opencode/kilo/pi/omp/grok)"
+            "hcom f <target>                       Fork agent session (claude/codex/opencode/kilo/pi/omp/qoder/grok)"
         ));
         assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
         assert_eq!(
             forkable_tool_names(),
-            "claude/codex/opencode/kilo/pi/omp/grok"
+            "claude/codex/opencode/kilo/pi/omp/qoder/grok"
         );
     }
 }

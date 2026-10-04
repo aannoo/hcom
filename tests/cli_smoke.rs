@@ -1200,6 +1200,220 @@ fn copilot_e2e_hook_dispatch() {
     );
 }
 
+/// Pipe a Qoder hook payload to `qoder-*` and return its stdout as JSON
+/// (`{}` when the hook wrote nothing, as no-op Qoder hooks do).
+fn run_qoder_hook(
+    h: &Hcom,
+    hook: &str,
+    process_id: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = h.cmd();
+    cmd.arg(hook);
+    cmd.env("HCOM_PROCESS_ID", process_id);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {hook}: {e}"));
+    {
+        let mut stdin = child.stdin.take().expect("open stdin");
+        stdin
+            .write_all(serde_json::to_string(payload).unwrap().as_bytes())
+            .unwrap();
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait {hook}: {e}"));
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "{hook} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.trim().is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("{hook} json: {e}\nstdout={stdout}"))
+}
+
+/// End-to-end Qoder CLI hook lifecycle over JSON-on-stdin, with Qoder's
+/// Claude-shaped payloads and `hookSpecificOutput` replies.
+#[test]
+fn qoder_e2e_hook_dispatch() {
+    let h = Hcom::new();
+    let pid = "pid-qod-123";
+    let session_id = "sess-qod-1";
+    let transcript_path = "/home/u/.qoder/projects/p/sess-qod-1.jsonl";
+
+    let mut start_cmd = h.cmd();
+    start_cmd.arg("start");
+    start_cmd.env("HCOM_PROCESS_ID", pid);
+    start_cmd.env("QODER_CLI", "1");
+    let start_out = start_cmd.output().expect("failed to run hcom start");
+    let me = support::parse_hcom_marker(&String::from_utf8_lossy(&start_out.stdout))
+        .expect("no [hcom:NAME] marker");
+
+    // 1. UserPromptSubmit with no prior SessionStart (untrusted folder): binds
+    //    lazily and carries the bootstrap.
+    let first = run_qoder_hook(
+        &h,
+        "qoder-userpromptsubmit",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": "/tmp",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "do a thing",
+        }),
+    );
+    assert_eq!(
+        first["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
+        "{first}"
+    );
+    let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
+    assert_eq!(v["session_id"].as_str(), Some(session_id));
+    assert_eq!(v["status"].as_str(), Some("active"));
+
+    // 2. PreToolUse records tool status and writes nothing.
+    let pre = run_qoder_hook(
+        &h,
+        "qoder-pretooluse",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_input": { "command": "echo hello" },
+        }),
+    );
+    assert_eq!(pre, serde_json::json!({}));
+
+    // 3. A queued message is delivered by PostToolUse via additionalContext.
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "--from",
+        "bigboss",
+        &format!("@{me}"),
+        "--intent",
+        "request",
+        "--",
+        "ping",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+    let post = run_qoder_hook(
+        &h,
+        "qoder-posttooluse",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_input": { "command": "echo hello" },
+            "tool_response": "hello",
+        }),
+    );
+    let injected = post["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PostToolUse should inject additionalContext: {post}"));
+    assert!(injected.contains("ping"), "{injected:?}");
+    assert_eq!(post["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+
+    // 3b. A failed tool call delivers too, answering under its own event name.
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "--from",
+        "bigboss",
+        &format!("@{me}"),
+        "--intent",
+        "inform",
+        "--",
+        "after-failure",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+    let failed = run_qoder_hook(
+        &h,
+        "qoder-posttoolusefailure",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_input": { "command": "false" },
+            "error": "Command exited with non-zero status code 1",
+        }),
+    );
+    assert_eq!(
+        failed["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure",
+        "{failed}"
+    );
+    assert!(
+        failed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("")
+            .contains("after-failure"),
+        "{failed}"
+    );
+
+    // 4. A message queued during the turn blocks Stop with it as the reason.
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "--from",
+        "bigboss",
+        &format!("@{me}"),
+        "--intent",
+        "request",
+        "--",
+        "pong",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+    let stop = run_qoder_hook(
+        &h,
+        "qoder-stop",
+        pid,
+        &serde_json::json!({ "session_id": session_id, "stop_hook_active": false }),
+    );
+    assert_eq!(stop["decision"], "block", "{stop}");
+    assert!(stop["reason"].as_str().unwrap_or("").contains("pong"));
+
+    // 5. With nothing pending, Stop goes listening and writes nothing.
+    let stop = run_qoder_hook(
+        &h,
+        "qoder-stop",
+        pid,
+        &serde_json::json!({ "session_id": session_id, "stop_hook_active": true }),
+    );
+    assert_eq!(stop, serde_json::json!({}));
+    let (_, stdout, _) = h.run(["list", &me, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
+    assert_eq!(v["status"].as_str(), Some("listening"));
+
+    // 6. SessionEnd for the bound session removes the instance; `clear` does not.
+    let _ = run_qoder_hook(
+        &h,
+        "qoder-sessionend",
+        pid,
+        &serde_json::json!({ "session_id": session_id, "reason": "clear" }),
+    );
+    let (code, _, _) = h.run(["list", &me, "--json"]);
+    assert_eq!(code, 0, "clear must not end the instance");
+    let _ = run_qoder_hook(
+        &h,
+        "qoder-sessionend",
+        pid,
+        &serde_json::json!({ "session_id": session_id, "reason": "other" }),
+    );
+    let (code, _, _) = h.run(["list", &me, "--json"]);
+    assert_ne!(
+        code, 0,
+        "SessionEnd for the bound session ends the instance"
+    );
+}
+
 /// Pipe argv to a native argv-style hook and return its parsed stdout.
 fn run_argv_hook(
     h: &Hcom,

@@ -115,6 +115,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_QODER_ARGS",
+        "Default args for qodercli on launch",
+        "string",
+    ),
+    (
         "HCOM_GEMINI_SYSTEM_PROMPT",
         "System prompt for gemini on launch",
         "string",
@@ -141,7 +146,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     ),
     (
         "HCOM_AUTO_TRUST_WORKSPACE",
-        "Auto-inject ephemeral workspace trust for gemini/codex/cursor at launch (true/false)",
+        "Auto-approve workspace trust at launch; may persist in tool config (true/false)",
         "boolean",
     ),
     (
@@ -1451,7 +1456,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Grok auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Qoder/Grok auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1547,7 +1552,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot/qoder)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -1578,6 +1583,16 @@ HCOM_COPILOT_ARGS - Default args passed to copilot on launch
 
 Example: hcom config copilot_args \"--model auto\"
 Clear:   hcom config copilot_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_QODER_ARGS" => Some(
+            "\
+HCOM_QODER_ARGS - Default args passed to qodercli on launch
+
+Example: hcom config qoder_args \"--model Qwen3.8-Flash\"
+Clear:   hcom config qoder_args \"\"
 
 Prepended to launch-time cli args.",
         ),
@@ -2196,7 +2211,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Grok"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Qoder/Grok"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");

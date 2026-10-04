@@ -5,7 +5,7 @@
 //!
 //! Requires:
 //! - tmux installed and available by default, or another terminal preset via HCOM_TEST_TERMINAL
-//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot)
+//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder)
 //!
 //! Phases (claude/gemini/codex/antigravity/cursor/copilot):
 //! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=<terminal>
@@ -94,6 +94,7 @@ fn ready_patterns(tool: &str) -> &'static [&'static str] {
         // for cursor so it isn't run vacuously against an empty needle.
         "cursor" => &[],
         "copilot" => &["/ commands"],
+        "qoder" => &["Type your message", "? for shortcuts"],
         _ => panic!("Unknown tool: {tool}"),
     }
 }
@@ -107,6 +108,7 @@ fn prompt_marker(tool: &str) -> &'static str {
         "antigravity" => ">",
         "cursor" => "→",
         "copilot" => "❯",
+        "qoder" => ">",
         _ => panic!("No prompt marker for {tool}"),
     }
 }
@@ -120,6 +122,7 @@ fn frame_marker(tool: &str) -> Option<&'static str> {
         "antigravity" => Some("─"),
         "cursor" => None,
         "copilot" => None,
+        "qoder" => Some("─"),
         _ => None,
     }
 }
@@ -136,6 +139,7 @@ fn gate_block_context(tool: &str) -> &'static str {
         // only warns on mismatch).
         "cursor" => "tui:prompt-has-text",
         "copilot" => "tui:prompt-has-text",
+        "qoder" => "tui:prompt-has-text",
         _ => panic!("No gate block context for {tool}"),
     }
 }
@@ -160,7 +164,7 @@ fn require_ready(tool: &str) -> bool {
 fn clean_prompt_delivery_timeout(tool: &str) -> Duration {
     match tool {
         // Turn-bounded delivery: agentStop/followup_message fires at end of a full model turn
-        "cursor" | "copilot" => Duration::from_secs(60),
+        "cursor" | "copilot" | "qoder" => Duration::from_secs(60),
         _ => Duration::from_secs(20),
     }
 }
@@ -720,6 +724,8 @@ fn run_pty_test(tool: &str) {
         // `auto` is the only model guaranteed to launch across cursor plan tiers
         // (named models error on free plans).
         "cursor" => " --model auto",
+        // qoder: Qwen3.8-Flash is the free model; the default one is paid.
+        "qoder" => " --model Qwen3.8-Flash",
         // copilot: no flag — its default model is probably cheap.
         _ => "",
     };
@@ -1526,4 +1532,10 @@ fn test_pty_cursor() {
 #[ignore]
 fn test_pty_copilot() {
     run_pty_test("copilot");
+}
+
+#[test]
+#[ignore]
+fn test_pty_qoder() {
+    run_pty_test("qoder");
 }

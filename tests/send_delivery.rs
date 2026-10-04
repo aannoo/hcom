@@ -500,6 +500,7 @@ fn automatic_delivery_tools_preserve_inbox_on_send() {
         "gemini",
         "cursor",
         "copilot",
+        "qoder",
         "antigravity",
         "grok",
         "kimi",

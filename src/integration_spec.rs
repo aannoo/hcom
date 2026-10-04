@@ -305,6 +305,18 @@ const KIMI_HOOKS: &[&str] = &[
     "kimi-notification",
 ];
 
+const QODER_HOOKS: &[&str] = &[
+    "qoder-sessionstart",
+    "qoder-userpromptsubmit",
+    "qoder-pretooluse",
+    "qoder-posttooluse",
+    "qoder-posttoolusefailure",
+    "qoder-permissionrequest",
+    "qoder-notification",
+    "qoder-stop",
+    "qoder-sessionend",
+];
+
 const COPILOT_HOOKS: &[&str] = &[
     "copilot-sessionstart",
     "copilot-userpromptsubmit",
@@ -405,6 +417,14 @@ const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
     (
         "hcom copilot --allow-tool 'shell(hcom:*)'",
         "Flags forwarded to copilot",
+    ),
+];
+
+const QODER_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom qoder --model Qwen3.8-Flash", "Use a specific model"),
+    (
+        "hcom qoder --permission-mode accept_edits",
+        "Flags forwarded to qodercli",
     ),
 ];
 
@@ -1075,6 +1095,67 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static QODER: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Qoder,
+    name: "qoder",
+    label: "Qoder",
+    aliases: &["qodercli"],
+    cli_binary: "qodercli",
+    tui_prefix: "qod ",
+    adhoc_icon: None,
+    released: true,
+    // Idle composer placeholder, or the `? for shortcuts` footer hint. The
+    // hint is sometimes replaced by a banner (e.g. credits exhausted), so
+    // neither marker can stand alone.
+    ready_patterns: &["Type your message", "? for shortcuts"],
+    pty: PtySpec {
+        delivery_start_timeout_secs: 60,
+    },
+    // Qoder's own session env vars are read as input on a fresh start and are
+    // instance-specific. `QODER_CONFIG_DIR` is deliberately not here: it is a
+    // user config toggle (see `config_dir_env`).
+    instance_state_env: &[
+        "QODER_SESSION_ID",
+        "QODER_SESSION_NAME",
+        "QODER_WORKING_DIR",
+    ],
+    hooks: HooksSpec {
+        names: QODER_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: true,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_QODER_ARGS"),
+        config_dir_env: Some("QODER_CONFIG_DIR"),
+        initial_prompt: InitialPromptShape::Flag("--prompt-interactive"),
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: Some(ForkArgs::AppendFlag("--fork-session")),
+    }),
+    help: HelpSpec {
+        unique_examples: QODER_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["Bash"],
+        file: &["Write", "Edit"],
+        delegate: &["Agent"],
+    },
+};
+
 pub static GROK: IntegrationSpec = IntegrationSpec {
     tool: Tool::Grok,
     name: "grok",
@@ -1194,6 +1275,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &CURSOR,
     &KIMI,
     &COPILOT,
+    &QODER,
     &GROK,
     &ADHOC,
 ];
@@ -1213,6 +1295,7 @@ impl Tool {
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
+            Tool::Qoder => &QODER,
             Tool::Grok => &GROK,
             Tool::Adhoc => &ADHOC,
         }
@@ -1261,6 +1344,7 @@ mod tests {
             Tool::Cursor,
             Tool::Kimi,
             Tool::Copilot,
+            Tool::Qoder,
             Tool::Grok,
             Tool::Pi,
             Tool::Omp,
@@ -1329,9 +1413,10 @@ mod tests {
         assert!(names.contains(&"cursor"));
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
+        assert!(names.contains(&"qoder"));
         assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
     }
 
     #[test]

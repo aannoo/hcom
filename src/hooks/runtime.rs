@@ -130,6 +130,7 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         Tool::Claude => Some(&crate::hooks::claude::PER_RUN),
         Tool::Codex => Some(&crate::hooks::codex::PER_RUN),
         Tool::Copilot => Some(&crate::hooks::copilot::PER_RUN),
+        Tool::Qoder => Some(&crate::hooks::qoder::PER_RUN),
         Tool::Pi => Some(&crate::hooks::pi::PER_RUN),
         Tool::Omp => Some(&crate::hooks::omp::PER_RUN),
         Tool::OpenCode => Some(&crate::hooks::opencode::OPENCODE_PER_RUN),

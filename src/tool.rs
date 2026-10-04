@@ -20,6 +20,7 @@ pub enum Tool {
     Cursor,
     Kimi,
     Copilot,
+    Qoder,
     Grok,
     Pi,
     Omp,
@@ -83,6 +84,7 @@ impl Tool {
             Tool::Claude
             | Tool::Codex
             | Tool::Copilot
+            | Tool::Qoder
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
@@ -109,6 +111,7 @@ impl Tool {
             Tool::Claude
             | Tool::Codex
             | Tool::Copilot
+            | Tool::Qoder
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
@@ -144,6 +147,7 @@ impl Tool {
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
+            Tool::Qoder => Ok(crate::hooks::qoder::remove_qoder_hooks()),
             Tool::Grok => Ok(true),
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
                 .map(|_| true)
@@ -163,6 +167,7 @@ impl Tool {
             Tool::Claude
             | Tool::Codex
             | Tool::Copilot
+            | Tool::Qoder
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
@@ -275,6 +280,16 @@ mod tests {
     #[test]
     fn copilot_from_alias() {
         assert_eq!("copilot".parse::<Tool>(), Ok(Tool::Copilot));
+    }
+
+    #[test]
+    fn qoder_from_name_and_alias() {
+        assert_eq!("qoder".parse::<Tool>(), Ok(Tool::Qoder));
+        assert_eq!("qodercli".parse::<Tool>(), Ok(Tool::Qoder));
+        assert_eq!(
+            Tool::from_hook_name("qoder-sessionstart"),
+            Some(Tool::Qoder)
+        );
     }
 
     #[test]

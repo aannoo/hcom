@@ -358,6 +358,22 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_detail_qoder() {
+        // Qoder uses Claude-style tool names and input keys.
+        let shell = serde_json::json!({"command": "cargo build", "description": "build"});
+        assert_eq!(extract_tool_detail("qoder", "Bash", &shell), "cargo build");
+        let write = serde_json::json!({"file_path": "/src/lib.rs", "content": "x"});
+        assert_eq!(extract_tool_detail("qoder", "Write", &write), "/src/lib.rs");
+        assert_eq!(extract_tool_detail("qoder", "Edit", &write), "/src/lib.rs");
+        let agent = serde_json::json!({"prompt": "explore the codebase"});
+        assert_eq!(
+            extract_tool_detail("qoder", "Agent", &agent),
+            "explore the codebase"
+        );
+        assert_eq!(extract_tool_detail("qoder", "Read", &write), "");
+    }
+
+    #[test]
     fn test_extract_tool_detail_unknown() {
         let input = serde_json::json!({"command": "ls"});
         assert_eq!(extract_tool_detail("claude", "UnknownTool", &input), "");

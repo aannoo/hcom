@@ -745,6 +745,7 @@ mod tests {
             "gemini",
             "cursor",
             "copilot",
+            "qoder",
             "antigravity",
             "grok",
             "kimi",
@@ -793,6 +794,10 @@ mod tests {
         assert!(cursor.contains("CURSOR DELIVERY"));
         let copilot = render(&db, tmp.path(), "copilot");
         assert!(copilot.contains("COPILOT DELIVERY"));
+        // Qoder's hooks attach the message to the wake prompt itself, so it
+        // must not be told to ignore a bare `<hcom>` prompt.
+        let qoder = render(&db, tmp.path(), "qoder");
+        assert!(!qoder.contains("wake trigger"));
     }
 
     #[test]

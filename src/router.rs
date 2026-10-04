@@ -140,6 +140,10 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             crate::hooks::copilot::dispatch_copilot_hook_native(hook),
             String::new(),
         ),
+        Tool::Qoder => (
+            crate::hooks::qoder::dispatch_qoder_hook_native(hook),
+            String::new(),
+        ),
         Tool::Grok | Tool::Adhoc => unreachable!("{} has no hooks", tool.as_str()),
     }
 }
@@ -1509,6 +1513,9 @@ mod tests {
         assert!(is_hook("opencode-start"));
         assert!(is_hook("pi-start"));
         assert!(is_hook("copilot-sessionstart"));
+        assert!(is_hook("qoder-sessionstart"));
+        assert!(is_launch_tool("qoder"));
+        assert!(is_launch_tool("qodercli"));
         assert!(!is_hook("send"));
         assert!(!is_hook("unknown"));
     }
@@ -1521,6 +1528,7 @@ mod tests {
             Tool::Codex,
             Tool::OpenCode,
             Tool::Copilot,
+            Tool::Qoder,
             Tool::Pi,
             Tool::Omp,
         ] {

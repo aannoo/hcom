@@ -14,7 +14,7 @@ immediately. What fires depends on <target>:
 
 Tool keywords are whatever `hcom <kw> --help` documents as a launcher —
 claude, codex, gemini, opencode, kilo, pi, omp, antigravity/agy, cursor-agent,
-kimi, copilot. Tool keywords win over same-named agents.
+kimi, copilot, qoder. Tool keywords win over same-named agents.
 
 Options:
   --timeout SEC   Give up if watch-agent never goes idle (default: 3600)

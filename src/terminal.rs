@@ -484,7 +484,7 @@ pub(crate) fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf
 /// Per-user bin dirs searched after PATH, in order.
 ///
 /// Tool-specific dirs are where each official installer puts its binary.
-/// `~/.local/bin` is the default for Codex, Copilot, agy, OMP, Cursor, Pi and
+/// `~/.local/bin` is the default for Codex, Copilot, Qoder, agy, OMP, Cursor, Pi and
 /// Claude's native installer; `~/.bun/bin` is where `bun install -g` links
 /// npm-published CLIs (pi, omp, opencode, gemini, ...).
 fn fallback_bin_dirs(home: &Path, name: &str) -> Vec<std::path::PathBuf> {

@@ -2662,7 +2662,7 @@ fn effective_settings_path(ctx: &LaunchCtx) -> PathBuf {
         .join("settings.json")
 }
 
-fn caller_settings(value: &str, cwd: &Path) -> Result<Value> {
+pub(crate) fn caller_settings(value: &str, cwd: &Path) -> Result<Value> {
     let source = if value.trim_start().starts_with('{') {
         value.to_string()
     } else {
@@ -2677,7 +2677,7 @@ fn caller_settings(value: &str, cwd: &Path) -> Result<Value> {
     Ok(settings)
 }
 
-fn object_field<'a>(
+pub(crate) fn object_field<'a>(
     settings: &'a mut Value,
     field: &str,
 ) -> Result<&'a mut serde_json::Map<String, Value>> {

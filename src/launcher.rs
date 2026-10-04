@@ -25,10 +25,11 @@ use crate::terminal;
 use crate::tools::launch_arg_validation::{
     ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, GROK_REJECTED_ARGS, KILO_REJECTED_ARGS,
     KIMI_REJECTED_ARGS, OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS,
-    validate_rejected_args,
+    QODER_REJECTED_ARGS, validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
+    qoder_preprocessing,
 };
 
 /// Canonical tool types for launch.
@@ -45,6 +46,7 @@ pub enum LaunchTool {
     Cursor,
     Kimi,
     Copilot,
+    Qoder,
     Grok,
     Omp,
 }
@@ -65,6 +67,7 @@ impl LaunchTool {
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
             "copilot" => Ok(LaunchTool::Copilot),
+            "qoder" | "qodercli" => Ok(LaunchTool::Qoder),
             "grok" | "grok-build" => Ok(LaunchTool::Grok),
             _ => bail!("Unknown tool: {}", s),
         }
@@ -84,6 +87,7 @@ impl LaunchTool {
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
             LaunchTool::Copilot => "copilot",
+            LaunchTool::Qoder => "qoder",
             LaunchTool::Grok => "grok",
         }
     }
@@ -105,6 +109,7 @@ impl LaunchTool {
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
+            LaunchTool::Qoder => crate::tool::Tool::Qoder,
             LaunchTool::Grok => crate::tool::Tool::Grok,
         }
     }
@@ -140,7 +145,7 @@ impl LaunchTool {
 ///
 /// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
 /// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot and for default claude `--headless`.
+///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder and for default claude `--headless`.
 /// - `NativePrint`:       background, direct claude spawn in print mode
 ///   (`-p --output-format stream-json --verbose`). Claude only, opt-in via an
 ///   explicit `-p`/`--print`; kept alive across turns by hcom's stop-hook loop.
@@ -176,6 +181,7 @@ impl LaunchBackend {
             | LaunchTool::Cursor
             | LaunchTool::Kimi
             | LaunchTool::Copilot
+            | LaunchTool::Qoder
             | LaunchTool::Grok => LaunchBackend::HeadlessPty,
         }
     }
@@ -736,6 +742,7 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
+        LaunchTool::Qoder => unreachable!("Qoder uses per-run hooks"),
         LaunchTool::Grok => unreachable!("Grok has no hooks"),
     }
 }
@@ -1795,6 +1802,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
+    if matches!(normalized, LaunchTool::Qoder) {
+        qoder_preprocessing::apply_system_prompt(&mut params.args, params.system_prompt.as_deref());
+        if let Some(args) = params.persisted_args.as_mut() {
+            qoder_preprocessing::apply_system_prompt(args, params.system_prompt.as_deref());
+        }
+    }
+
     // Hooks: per-run tools get a fresh injection built from the effective env,
     // cwd and args (applied to args after the persisted snapshot below);
     // persistent tools must have their global install (strict: refuse to launch
@@ -1870,6 +1884,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
     if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Copilot) {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
+    }
+    if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Qoder) {
+        qoder_preprocessing::ensure_qoder_workspace_trusted(
+            &canonical_dir,
+            &params.args,
+            &base_env,
+        )?;
     }
 
     // Capture the persistable args BEFORE any hcom launch injection below.
@@ -2423,6 +2444,33 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Qoder => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(&stored_launch_args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "qoder",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
                 LaunchTool::Grok => {
                     // Grok hook output never reaches the model, so the bootstrap
                     // goes in at launch through `--rules` (appended to the
@@ -2564,6 +2612,9 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             ANTIGRAVITY_REJECTED_ARGS,
         ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
+        LaunchTool::Qoder => {
+            validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS)
+        }
         LaunchTool::Grok => {
             let mut errors = validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS);
             let borrowed: Vec<_> = args.iter().map(String::as_str).collect();

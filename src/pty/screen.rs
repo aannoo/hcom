@@ -142,8 +142,15 @@ fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
         Tool::Antigravity if line.starts_with("> ") || line == ">" => Some(">"),
         Tool::Cursor if line.contains('→') => Some("→"),
         Tool::Copilot if line.contains('❯') => Some("❯"),
+        Tool::Qoder if line.starts_with("> ") || line == ">" => Some(">"),
         _ => None,
     }
+}
+
+/// A full-width `─` rule (Qoder's composer frame).
+fn is_dash_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
 }
 
 /// Check if a line is a Gemini dash border (all ─ chars, at least 20 wide)
@@ -709,6 +716,7 @@ impl ScreenTracker {
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
+            Ok(Tool::Qoder) => self.get_qoder_input_text(),
             // Grok: prompt-empty gate uses generic scrape when available; no
             // tool-specific VT100 input parser yet.
             Ok(Tool::Grok) => None,
@@ -1123,6 +1131,51 @@ impl ScreenTracker {
             }
         }
         None
+    }
+
+    /// Extract Qoder CLI input text.
+    ///
+    /// Qoder draws the composer between two `─` rules with a one-line status
+    /// footer (`<model> Model · ctx … · <cwd>`) directly below the bottom rule:
+    ///
+    /// ```text
+    ///  Shift+Tab to Accept Edits                 1 MCP server · 21 skills
+    /// ────────────────────────────────────────────────────────────────────
+    ///  >   Type your message or @path/to/file
+    /// ────────────────────────────────────────────────────────────────────
+    ///  Qwen3.8-Flash Model · ctx ░░░░░░░░░░ 0% · /path/to/cwd
+    /// ```
+    ///
+    /// A submitted prompt is echoed in the scrollback with the same ` > ` prefix,
+    /// so anchor to the last non-empty row (the status footer), require the rule
+    /// directly above it, and read the rows between that rule and the one above.
+    /// No framed composer (an approval or trust prompt, a menu) is `None`, which
+    /// callers treat as "not safe to inject".
+    fn get_qoder_input_text(&self) -> Option<String> {
+        const PLACEHOLDER: &str = "Type your message or @path/to/file";
+        let lines = self.get_screen_lines();
+        let status = lines.iter().rposition(|line| !line.trim().is_empty())?;
+        let bottom = status.checked_sub(1)?;
+        if !is_dash_rule(&lines[bottom]) || is_dash_rule(&lines[status]) {
+            return None;
+        }
+        let top = (bottom.saturating_sub(12)..bottom)
+            .rev()
+            .find(|&row| is_dash_rule(&lines[row]))?;
+        let first = lines.get(top + 1)?.trim_start().strip_prefix('>')?;
+        if top + 1 >= bottom {
+            return None;
+        }
+        let mut text = vec![trim_with_nbsp(first).to_string()];
+        for line in &lines[top + 2..bottom] {
+            text.push(trim_with_nbsp(line).to_string());
+        }
+        let text = text.join("\n").trim().to_string();
+        Some(if text == PLACEHOLDER {
+            String::new()
+        } else {
+            text
+        })
     }
 
     /// Check and perform periodic dump if 5 seconds elapsed
@@ -2064,6 +2117,149 @@ mod tests {
         t.process(format!("{}\r\n", bottom).as_bytes());
         // Ready pattern visible in prompt text → empty
         assert_eq!(t.get_gemini_input_text(), Some(String::new()));
+    }
+
+    // ---- Qoder input extraction ----
+    // Fixtures are bottom-of-screen captures from qodercli 1.1.65 (140 columns,
+    // narrowed to 80 here).
+
+    const QODER_RULE: &str =
+        "────────────────────────────────────────────────────────────────────────────────";
+
+    fn qoder_screen(rows: &[&str]) -> ScreenTracker {
+        let mut t = make_tool_tracker(30, 80, crate::tool::Tool::Qoder);
+        let mut lines = vec![""; 30 - rows.len()];
+        lines.extend_from_slice(rows);
+        render_rows(&mut t, &lines);
+        t
+    }
+
+    const QODER_STATUS: &str = " Qwen3.8-Flash Model · ctx ░░░░░░░░░░ 0% · /work/dir";
+
+    #[test]
+    fn qoder_idle_placeholder_is_empty_and_ready() {
+        let t = qoder_screen(&[
+            "                                                              ? for shortcuts",
+            QODER_RULE,
+            " Shift+Tab to Accept Edits                       1 MCP server · 21 skills",
+            QODER_RULE,
+            " >   Type your message or @path/to/file",
+            QODER_RULE,
+            QODER_STATUS,
+        ]);
+        assert_eq!(t.get_qoder_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("qoder"));
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn qoder_banner_in_place_of_hint_is_still_ready_and_empty() {
+        let t = qoder_screen(&[
+            "                    Credits exhausted. Use /usage for details or /upgrade for more.",
+            QODER_RULE,
+            " Shift+Tab to Accept Edits                       1 MCP server · 21 skills",
+            QODER_RULE,
+            " >   Type your message or @path/to/file",
+            QODER_RULE,
+            QODER_STATUS,
+        ]);
+        assert!(t.is_prompt_empty("qoder"));
+        // The composer placeholder is the second ready marker.
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn qoder_extracts_typed_text() {
+        let t = qoder_screen(&[
+            QODER_RULE,
+            " > Run the shell command: sleep 4 && echo done   then reply with the word ok",
+            QODER_RULE,
+            QODER_STATUS,
+        ]);
+        assert_eq!(
+            t.get_qoder_input_text().as_deref(),
+            Some("Run the shell command: sleep 4 && echo done   then reply with the word ok")
+        );
+        assert!(!t.is_prompt_empty("qoder"));
+    }
+
+    #[test]
+    fn qoder_extracts_wrapped_multiline_input() {
+        let t = qoder_screen(&[
+            QODER_RULE,
+            " > first line of a long draft",
+            "   second line",
+            QODER_RULE,
+            QODER_STATUS,
+        ]);
+        assert_eq!(
+            t.get_qoder_input_text().as_deref(),
+            Some("first line of a long draft\nsecond line")
+        );
+    }
+
+    #[test]
+    fn qoder_ignores_submitted_prompt_echo_in_scrollback() {
+        // The submitted prompt stays in the scrollback with the same ` > `
+        // prefix; the live composer below it is empty.
+        let t = qoder_screen(&[
+            " > Reply with the single word ok and nothing else",
+            " Thinking",
+            " ▪ ok",
+            "                                                              ? for shortcuts",
+            QODER_RULE,
+            " Shift+Tab to Accept Edits                       1 MCP server · 21 skills",
+            QODER_RULE,
+            " >   Type your message or @path/to/file",
+            QODER_RULE,
+            QODER_STATUS,
+        ]);
+        assert_eq!(t.get_qoder_input_text().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn qoder_busy_screen_keeps_the_composer_visible_and_empty() {
+        let t = qoder_screen(&[
+            " ▪ Bash(sleep 4 && echo done)",
+            "   └ Running…",
+            " ⠼ Generating... (esc to cancel, 13s)                         ? for shortcuts",
+            QODER_RULE,
+            " Shift+Tab to Accept Edits                       1 MCP server · 21 skills",
+            QODER_RULE,
+            " >   Type your message or @path/to/file",
+            QODER_RULE,
+            QODER_STATUS,
+        ]);
+        assert!(t.is_prompt_empty("qoder"));
+    }
+
+    #[test]
+    fn qoder_approval_prompt_is_not_an_empty_composer() {
+        let t = qoder_screen(&[
+            " Permission Required",
+            QODER_RULE,
+            " Tool: Bash",
+            " Sleep 4 seconds then print done",
+            " Command: sleep 4 && echo done",
+            " Allow this command to run?",
+            "  ❯ 1. Allow once",
+            "    2. Always allow this exact command for future sessions [local]",
+            "    3. Reject and type something",
+            "    4. No",
+        ]);
+        assert_eq!(t.get_qoder_input_text(), None);
+        assert!(!t.is_prompt_empty("qoder"));
+    }
+
+    #[test]
+    fn qoder_trust_prompt_is_not_an_empty_composer() {
+        let t = qoder_screen(&[
+            " Do you trust the files in this folder?",
+            "  ❯ 1. Trust folder",
+            "    2. Exit",
+        ]);
+        assert_eq!(t.get_qoder_input_text(), None);
+        assert!(!t.is_prompt_empty("qoder"));
     }
 
     // ---- Kimi input extraction ----

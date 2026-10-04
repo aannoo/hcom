@@ -88,6 +88,7 @@ pub enum Tool {
     Cursor,
     Kimi,
     Copilot,
+    Qoder,
     Grok,
     Adhoc,
     /// Persisted value written by a newer or third-party integration.
@@ -109,6 +110,7 @@ impl Tool {
             Self::Cursor => Some(crate::tool::Tool::Cursor),
             Self::Kimi => Some(crate::tool::Tool::Kimi),
             Self::Copilot => Some(crate::tool::Tool::Copilot),
+            Self::Qoder => Some(crate::tool::Tool::Qoder),
             Self::Grok => Some(crate::tool::Tool::Grok),
             Self::Adhoc => Some(crate::tool::Tool::Adhoc),
             Self::Unknown(_) => None,
@@ -144,7 +146,8 @@ impl Tool {
             Self::Antigravity => Self::Cursor,
             Self::Cursor => Self::Kimi,
             Self::Kimi => Self::Copilot,
-            Self::Copilot => Self::Grok,
+            Self::Copilot => Self::Qoder,
+            Self::Qoder => Self::Grok,
             Self::Grok => Self::Claude,
             Self::Adhoc => Self::Adhoc,
             Self::Unknown(raw) => Self::Unknown(raw.clone()),
@@ -165,7 +168,8 @@ impl Tool {
             Self::Cursor => Self::Antigravity,
             Self::Kimi => Self::Cursor,
             Self::Copilot => Self::Kimi,
-            Self::Grok => Self::Copilot,
+            Self::Qoder => Self::Copilot,
+            Self::Grok => Self::Qoder,
             Self::Adhoc => Self::Adhoc,
             Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
@@ -1275,14 +1279,16 @@ mod tests {
         assert_eq!(Tool::Antigravity.next(), Tool::Cursor);
         assert_eq!(Tool::Cursor.next(), Tool::Kimi);
         assert_eq!(Tool::Kimi.next(), Tool::Copilot);
-        assert_eq!(Tool::Copilot.next(), Tool::Grok);
+        assert_eq!(Tool::Copilot.next(), Tool::Qoder);
+        assert_eq!(Tool::Qoder.next(), Tool::Grok);
         assert_eq!(Tool::Grok.next(), Tool::Claude);
     }
 
     #[test]
     fn tool_prev_cycles_backward() {
         assert_eq!(Tool::Claude.prev(), Tool::Grok);
-        assert_eq!(Tool::Grok.prev(), Tool::Copilot);
+        assert_eq!(Tool::Grok.prev(), Tool::Qoder);
+        assert_eq!(Tool::Qoder.prev(), Tool::Copilot);
         assert_eq!(Tool::Copilot.prev(), Tool::Kimi);
         assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
         assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);
