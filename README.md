@@ -1,24 +1,24 @@
-# hcom
+<center>
+
+# `hcom`
+
+*Hook your coding agents together*
 
 [![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
 
-CLI tool that coding agents use to message, watch, and spawn each other across terminals.
+</center>
+
+**CLI tool that agents use to message, watch, and spawn each other across terminals.**
 
 Start an agent with `hcom` in front, then prompt normally.
 
-Use it to:
-
-- coordinate multi-agent pipelines
-- run different AI CLIs as each other's subagents
-- avoid copy-pasting
+Use it to coordinate multi-agent pipelines, run different AI CLIs as each other's subagents, or just to avoid copy-pasting.
 
 Works with: `claude`, `codex`, `opencode`, `copilot`, `qoder`, `grok`, `pi`, `omp`, `agy`, `cursor`, `kimi`, `kilo`, `gemini`
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
-
----
 
 ## Install
 
@@ -34,7 +34,8 @@ uv tool install hcom
 brew install aannoo/hcom/hcom
 ```
 
-<details><summary>Other install options</summary>
+<details>
+<summary>Other install options</summary>
 
 ```bash
 # macOS, Linux, Android
@@ -53,49 +54,61 @@ hcom update
 
 </details>
 
----
-
 ## Quickstart
 
-Terminal 1:
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**Terminal 1:**
 
 ```bash
 hcom claude
 ```
 
-Terminal 2:
+</td>
+<td width="50%" valign="top">
+
+**Terminal 2:**
 
 ```bash
 hcom codex
 ```
 
-Prompt:
+</td>
+</tr>
+</table>
 
-- `ask the other agent their favorite cake`
+<b>Prompt:</b>
+
+<details>
+<summary><code>ask the other agent their favorite cake</code></summary>
+
 - `review what claude did and send it fixes`
+
 - `spawn 3x opencode, split work, collect results`
+
 - `fork yourself to investigate the bug and report back`
+
 - `when codex goes idle, send it the next task`
 
-Open the TUI dashboard:
+</details>
+
+**Open the TUI dashboard:**
 
 ```bash
 hcom
 ```
 
----
-
 ## What agents can do
 
-**Message** each other in real time: mid-turn or wake immediately when idle
+- **Message** each other in real time: mid-turn or wake immediately when idle
 
-**Observe** each other: status, transcripts, file edits, live terminal screens, command history.
+- **Observe** each other: status, transcripts, file edits, live terminal screens, command history.
 
-**Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
+- **Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
 
-**Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
-
----
+- **Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
 
 ## How it works
 
@@ -141,8 +154,6 @@ hcom events --idle luna --wait 600 && hcom send -b @nova -- "luna is done, revie
 
 </details>
 
----
-
 ## Terminal
 
 Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning. **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
@@ -152,8 +163,6 @@ To configure a custom terminal open/close setup, tell an agent to run:
 ```bash
 hcom config terminal --info
 ```
-
----
 
 ## Cross-device
 
@@ -165,25 +174,21 @@ hcom relay connect <token>   # on each device
 ```
 
 ```bash
-hcom relay status            # check connection
-hcom relay off|on            # toggle
+hcom relay status   # check connection
+hcom relay off|on   # toggle
 ```
 
 > Treat the token like an API/SSH key. See [SECURITY.md](SECURITY.md)
 
----
-
 ## Troubleshoot
 
 ```bash
-hcom status                  # diagnostics
+hcom status   # diagnostics
 ```
 
 ```bash
-hcom reset all               # clear and archive: database + hooks + config
+hcom reset all   # clear and archive: database + hooks + config
 ```
-
----
 
 ## Uninstall
 
@@ -206,7 +211,7 @@ brew uninstall hcom
 ## Reference
 
 <details>
-<summary>Tools</summary>
+<summary><strong>Tools</strong></summary>
 
 ### Supported tools
 
@@ -228,8 +233,8 @@ brew uninstall hcom
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
-hcom r <session_id>           # Resume a session started outside hcom
-hcom f <session_id>           # Fork a session in hcom
+hcom r <session_id>   # Resume a session started outside hcom
+hcom f <session_id>   # Fork a session in hcom
 ```
 
 #### Claude Code headless and subagents
@@ -247,15 +252,14 @@ For subagents, run `hcom claude`, then prompt:
 
 </details>
 
-
 <details>
-<summary>CLI</summary>
+<summary><strong>CLI</strong></summary>
 
 ### CLI commands
 
 What you might type from a shell. Agents run their own commands that they learn from the hcom CLI primer (~700 tokens) at launch. `hcom <command> --help` for full flags.
 
-### Spawn
+#### Spawn
 
 ```bash
 hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot|qoder|grok   # launch N agents
@@ -278,7 +282,7 @@ hcom launch flags:
 
 Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 
-### Other commands
+#### Other commands
 
 ```bash
 hcom                           # TUI dashboard
@@ -294,7 +298,7 @@ hcom update                    # update hcom version
 </details>
 
 <details>
-<summary>Config</summary>
+<summary><strong>Config</strong></summary>
 
 ### Configuration
 
@@ -308,7 +312,7 @@ hcom config <key> --info              # detailed help for a key
 hcom config -i <name> <key> <value>   # per-agent override at runtime
 ```
 
-### Keys
+#### Keys
 
 | Key | Purpose |
 |---|---|
@@ -324,7 +328,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
 | `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `qoder_args` / `grok_args` | Default args passed to the tool |
 
-### Scope
+#### Scope
 
 ```bash
 hcom config tag mycrew                        # global
@@ -332,11 +336,11 @@ hcom config -i luna hints "respond in JSON"   # per-agent
 HCOM_TAG=dev hcom 3 claude                    # per-launch env
 ```
 
-### Per-project isolation
+#### Per-project isolation
 
 ```bash
-export HCOM_DIR="$PWD/.hcom"    # isolate hcom state (db, logs) to this folder
-rm -rf "$HCOM_DIR"              # clean up
+export HCOM_DIR="$PWD/.hcom"   # isolate hcom state (db, logs) to this folder
+rm -rf "$HCOM_DIR"             # clean up
 ```
 
 Run `hcom config <key> --info` or `hcom run docs --config` for the full per-key reference.
@@ -346,41 +350,37 @@ Edit `~/.hcom/env` to set external env vars passed to every launched agent.
 </details>
 
 <details>
-<summary>Workflow Scripts</summary>
+<summary><strong>Workflow Scripts</strong></summary>
 
 ### Multi-agent workflows
 
 Bundled and user scripts (`~/.hcom/scripts/`) for multi-agent patterns:
 
 ```bash
-hcom run                   # list available scripts
-hcom run debate "topic"    # run one
-hcom run docs              # tell agent to run this to create any new workflow
+hcom run                  # list available scripts
+hcom run debate "topic"   # run one
+hcom run docs             # tell agent to run this to create any new workflow
 ```
 
-### Included scripts
+#### Included scripts
 
 Tell agent to run them:
 
-**`hcom run confess`** — An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
+- **`hcom run confess`** — An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
 
-**`hcom run debate`** — A judge spawns and sets up a debate with existing agents. It coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
+- **`hcom run debate`** — A judge spawns and sets up a debate with existing agents. It coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
 
-**`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
+- **`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
-**`hcom run onidle`** — waits for an agent to go idle, then types text into another agent (`hcom run onidle luna nova 'luna is done, review it'`) or launches a new one with it as the prompt (`hcom run onidle luna codex 'review what luna just did'`).
+- **`hcom run onidle`** — waits for an agent to go idle, then types text into another agent (`hcom run onidle luna nova 'luna is done, review it'`) or launches a new one with it as the prompt (`hcom run onidle luna codex 'review what luna just did'`).
 
 Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
 
 </details>
 
----
-
 ## Contributing
 
 Issues and PRs welcome. Build from source and dev setup: [CONTRIBUTING.md](CONTRIBUTING.md)
-
----
 
 ## License
 
