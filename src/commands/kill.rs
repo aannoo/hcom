@@ -142,7 +142,9 @@ pub fn kill_tracked_instance(
     let is_headless = inst.background != 0;
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless, initiator);
-    stop_instance(db, name, initiator, "killed");
+    if result != terminal::KillResult::PermissionDenied {
+        stop_instance(db, name, initiator, "killed");
+    }
 
     Ok(KillTrackedResult {
         target: name.to_string(),
@@ -389,9 +391,10 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            // Clean up instance
-            stop_instance(db, &inst.name, initiator, "killed");
-            println!("  To resume: hcom r {}", inst.name);
+            if result != terminal::KillResult::PermissionDenied {
+                stop_instance(db, &inst.name, initiator, "killed");
+                println!("  To resume: hcom r {}", inst.name);
+            }
         } else {
             // No PID tracked — just clean up
             stop_instance(db, &inst.name, initiator, "killed");
@@ -433,7 +436,9 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        pidtrack::remove_pid(hcom_dir, orphan.pid);
+        if result != terminal::KillResult::PermissionDenied {
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+        }
     }
 
     if killed == 0 && failed == 0 {
@@ -488,7 +493,9 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            stop_instance(db, &inst.name, initiator, "killed");
+            if result != terminal::KillResult::PermissionDenied {
+                stop_instance(db, &inst.name, initiator, "killed");
+            }
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
@@ -534,7 +541,9 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        pidtrack::remove_pid(hcom_dir, orphan.pid);
+        if result != terminal::KillResult::PermissionDenied {
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+        }
     }
 
     if tagged.is_empty() && tagged_orphans.is_empty() {
@@ -701,6 +710,39 @@ fn kill_single(
     )
 }
 
+fn restore_failed_kill_status(
+    db: &HcomDb,
+    instance: &crate::db::InstanceRow,
+    initiator: &str,
+    result: terminal::KillResult,
+) {
+    if result != terminal::KillResult::PermissionDenied {
+        return;
+    }
+    // Restore only our pending kill marker; hooks may have updated the row
+    // while we were signalling or trying to close its pane.
+    if let Err(e) = db.conn().execute(
+        "UPDATE instances SET status = ?, status_context = ?, status_detail = ?, status_time = ?
+         WHERE name = ? AND pid = ? AND status = 'inactive'
+           AND status_context = 'exit:killed' AND status_detail = ?",
+        rusqlite::params![
+            instance.status,
+            instance.status_context,
+            instance.status_detail,
+            instance.status_time,
+            instance.name,
+            instance.pid,
+            initiator,
+        ],
+    ) {
+        log_info(
+            "kill",
+            "lifecycle.kill_status_restore",
+            &format!("name={} err={e}", instance.name),
+        );
+    }
+}
+
 /// Kill a process and close its terminal pane.
 /// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
 fn kill_instance(
@@ -743,6 +785,7 @@ fn kill_instance(
         let (result, pane_closed, pane_retry_command) =
             terminal::kill_process(pid, "", "", "", "", "", "");
         let result = normalize_kill_result(name, pid, result, pane_closed);
+        restore_failed_kill_status(db, instance, initiator, result);
         log_info(
             "kill",
             "lifecycle.kill",
@@ -775,6 +818,7 @@ fn kill_instance(
         &ti.zellij_session_name,
     );
     let result = normalize_kill_result(name, pid, result, pane_closed);
+    restore_failed_kill_status(db, instance, initiator, result);
 
     log_info(
         "kill",
@@ -797,6 +841,52 @@ fn kill_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_kill_restores_status_and_preserves_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn().execute(
+            "INSERT INTO instances (name, created_at, pid, status, status_context, status_detail, status_time)
+             VALUES ('luna', 1.0, 4242, 'listening', 'ready', 'original', 123)",
+            [],
+        ).unwrap();
+        let original = db.get_instance_full("luna").unwrap().unwrap();
+        db.mark_killed("luna", "boss").unwrap();
+        restore_failed_kill_status(
+            &db,
+            &original,
+            "boss",
+            terminal::KillResult::PermissionDenied,
+        );
+        let restored = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(restored.pid, original.pid);
+        assert_eq!(restored.status, original.status);
+        assert_eq!(restored.status_context, original.status_context);
+        assert_eq!(restored.status_detail, original.status_detail);
+        assert_eq!(restored.status_time, original.status_time);
+
+        db.mark_killed("luna", "boss").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status_context = 'new-hook' WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
+        restore_failed_kill_status(
+            &db,
+            &original,
+            "boss",
+            terminal::KillResult::PermissionDenied,
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "new-hook"
+        );
+    }
 
     fn orphan(name: &str, tag: &str) -> pidtrack::OrphanProcess {
         pidtrack::OrphanProcess {
