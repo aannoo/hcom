@@ -18,14 +18,14 @@ cleanup() {
   if [[ ${#LAUNCHED_NAMES[@]} -gt 0 ]]; then
     echo "Cleaning up ${#LAUNCHED_NAMES[@]} launched agents..." >&2
     for name in "${LAUNCHED_NAMES[@]}"; do
-      hcom stop "$name" --go 2>/dev/null || true
+      hcom kill "$name" --go ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null || true
     done
   fi
 }
 track_launch() {
   local output="$1"
   local names
-  names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs)
+  names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs) || { echo "Error: launch returned no agent names: $output" >&2; return 1; }
   for n in $names; do
     LAUNCHED_NAMES+=("$n")
   done
@@ -76,6 +76,12 @@ interactive=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -w|--workers|--tool|-r|--rounds|-t|--timeout|-c|--context|--name)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "Error: $1 requires a value" >&2; exit 1
+      fi ;;
+  esac
+  case "$1" in
     -h|--help) usage ;;
     -s|--spawn) spawn=true; shift ;;
     -w|--workers) workers="$2"; shift 2 ;;
@@ -105,9 +111,13 @@ if [[ "$spawn" == "true" && -n "$workers" ]]; then
   exit 1
 fi
 
-thread="debate-$(date +%s)"
-name_arg=""
-[[ -n "$name_flag" ]] && name_arg="--name $name_flag"
+if ! [[ "$rounds" =~ ^[0-9]+$ && "$timeout" =~ ^[0-9]+$ ]] || (( timeout < 1 )); then
+  echo "Error: rounds must be nonnegative and timeout must be positive whole seconds" >&2; exit 1
+fi
+thread="debate-$(date +%s)-$$"
+name_arg=()
+[[ -n "$name_flag" ]] && name_arg=(--name "$name_flag")
+caller=$(hcom list self name ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null) || caller="bigboss"
 
 # System prompts
 PRO_SYSTEM='You are an expert debater arguing IN FAVOR of propositions.
@@ -168,15 +178,17 @@ Debaters: Review this context first."
 fi
 
 # Set trap
-trap cleanup ERR INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-bg_flag=""
+bg_flag=()
 if [[ "$interactive" == "false" ]]; then
   # claude: explicit -p so --headless goes through print mode
   if [[ "$tool" == "claude" ]]; then
-    bg_flag="--headless -p"
+    bg_flag=(--headless -p)
   else
-    bg_flag="--headless"
+    bg_flag=(--headless)
   fi
 fi
 
@@ -193,16 +205,17 @@ if [[ "$spawn" == "true" ]]; then
   pro_prompt="You are the PRO debater in thread '${thread}'.
 Topic: ${topic}
 
-Argue IN FAVOR of this proposition. A judge will coordinate the debate.
+Argue IN FAVOR of this proposition. A judge will coordinate the debate. Send a ready confirmation to @judge.${thread}- when it exists, then end your turn to receive messages. Only answer judge requests for your own role; observe opponent messages without sending unsolicited rebuttals.
+${context_section}
 All messages use --thread ${thread}. You can see your opponent's arguments directly.
 
 Wait for the judge to start, then present your opening argument when prompted.
-Use: hcom send \"@judge- @con- [your argument]\" --thread ${thread} --intent inform"
+Use: hcom send \"@judge.${thread}- @con.${thread}- [your argument]\" --thread ${thread} --intent inform"
 
-  launch_out=$(hcom 1 "$tool" --tag pro --go \
+  launch_out=$(hcom 1 "$tool" --tag "pro.${thread}" --go \
     --hcom-system-prompt "$PRO_SYSTEM" \
     --hcom-prompt "$pro_prompt" \
-    ${bg_flag} 2>&1)
+    ${bg_flag[@]+"${bg_flag[@]}"} ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }
   track_launch "$launch_out"
 
   echo "PRO debater launched ($tool)"
@@ -211,16 +224,17 @@ Use: hcom send \"@judge- @con- [your argument]\" --thread ${thread} --intent inf
   con_prompt="You are the CON debater in thread '${thread}'.
 Topic: ${topic}
 
-Argue AGAINST this proposition. A judge will coordinate the debate.
+Argue AGAINST this proposition. A judge will coordinate the debate. Send a ready confirmation to @judge.${thread}- when it exists, then end your turn to receive messages. Only answer judge requests for your own role; observe opponent messages without sending unsolicited rebuttals.
+${context_section}
 All messages use --thread ${thread}. You can see your opponent's arguments directly.
 
 Wait for the judge to start, then present your argument when prompted.
-Use: hcom send \"@judge- @pro- [your argument]\" --thread ${thread} --intent inform"
+Use: hcom send \"@judge.${thread}- @pro.${thread}- [your argument]\" --thread ${thread} --intent inform"
 
-  launch_out=$(hcom 1 "$tool" --tag con --go \
+  launch_out=$(hcom 1 "$tool" --tag "con.${thread}" --go \
     --hcom-system-prompt "$CON_SYSTEM" \
     --hcom-prompt "$con_prompt" \
-    ${bg_flag} 2>&1)
+    ${bg_flag[@]+"${bg_flag[@]}"} ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }
   track_launch "$launch_out"
 
   echo "CON debater launched ($tool)"
@@ -234,8 +248,8 @@ ROUNDS: ${rounds}
 TIMEOUT: ${timeout}s per response
 
 DEBATERS:
-  PRO: use @pro- to address
-  CON: use @con- to address
+  PRO: use @pro.${thread}- to address
+  CON: use @con.${thread}- to address
 
 Positions are pre-assigned. PRO argues first in each round.
 ${context_section}
@@ -245,17 +259,17 @@ ${JUDGE_SYSTEM}
 PROCEDURE:
 
 1. WAIT FOR READY
-   Check for ready confirmations:
+   Confirm both debaters exist using hcom list. Do not block waiting for ready messages:
    hcom events --last 10 --sql \"msg_thread='${thread}'\"
 
 2. OPENING STATEMENTS
    Ask PRO for opening argument (CC both debaters):
-   hcom send \"@pro- @con- PRO: Present your opening argument IN FAVOR of: ${topic}\" --thread ${thread} --intent request
-   Wait: hcom events --wait ${timeout} --sql \"msg_thread='${thread}'\"
+   hcom send \"@pro.${thread}- @con.${thread}- PRO: Present your opening argument IN FAVOR of: ${topic}\" --thread ${thread} --intent request
+   End your turn to receive PRO's response. Check responses with hcom events --thread ${thread} --agent pro.${thread}- --type message --last 1; do not count your own request as a response.
 
    Then ask CON:
-   hcom send \"@pro- @con- CON: Present your opening argument AGAINST: ${topic}. You can see PRO's argument above.\" --thread ${thread} --intent request
-   Wait: hcom events --wait ${timeout} --sql \"msg_thread='${thread}'\"
+   hcom send \"@pro.${thread}- @con.${thread}- CON: Present your opening argument AGAINST: ${topic}. You can see PRO's argument above.\" --thread ${thread} --intent request
+   End your turn to receive CON's response. Check responses with hcom events --thread ${thread} --agent con.${thread}- --type message --last 1; do not count your own request as a response.
 
 3. REBUTTALS (${rounds} rounds)
    For each round:
@@ -264,7 +278,7 @@ PROCEDURE:
    - Provide brief feedback
 
 4. FINAL JUDGMENT
-   hcom send \"@pro- @con- VERDICT: [WINNER or TIE]
+   hcom send \"@${caller} @pro.${thread}- @con.${thread}- VERDICT: [WINNER or TIE]
 
    PRO strengths: ...
    PRO weaknesses: ...
@@ -279,7 +293,7 @@ RULES:
 - Always use --thread ${thread}
 - Stay neutral until final judgment
 
-Begin now."
+End your turn between requests to receive hcom messages. Begin now."
 
 else
   # --- WORKERS MODE ---
@@ -293,7 +307,7 @@ else
   # Validate workers exist
   for w in "${worker_arr[@]}"; do
     w=$(echo "$w" | xargs)  # trim
-    hcom list "$w" --json $name_arg >/dev/null 2>&1 || {
+    hcom list "$w" --json ${name_arg[@]+"${name_arg[@]}"} >/dev/null 2>&1 || {
       echo "Error: instance '$w' not found" >&2
       exit 1
     }
@@ -319,7 +333,7 @@ else
 
   for w in "${worker_arr[@]}"; do
     w=$(echo "$w" | xargs)
-    hcom send "@${w}" --thread "${thread}" --intent request $name_arg -- \
+    hcom send "@${w}" --thread "${thread}" --intent request ${name_arg[@]+"${name_arg[@]}"} -- \
       "You will debate: '${topic}'. Thread: '${thread}'. When the judge asks for positions, decide if you're FOR or AGAINST. Say 'ready' to confirm." 2>/dev/null
   done
   echo "Sent prep to ${#worker_arr[@]} debaters"
@@ -343,7 +357,7 @@ ${JUDGE_SYSTEM}
 PROCEDURE:
 
 1. WAIT FOR READY
-   Check for ready confirmations:
+   Confirm both debaters exist using hcom list. Do not block waiting for ready messages:
    hcom events --last 10 --sql \"msg_thread='${thread}'\"
 
 2. OPENING STATEMENTS
@@ -357,26 +371,26 @@ PROCEDURE:
    For each round, prompt each debater to respond to opponents.
 
 4. FINAL JUDGMENT
-   Announce winner with scores, send to all debaters via --thread ${thread}.
+   Announce winner with scores, send to @${caller} and all debaters via --thread ${thread}.
 
 RULES:
 - Always use --thread ${thread}
 - Stay neutral until final judgment
 
-Begin now."
+End your turn between requests to receive hcom messages. Begin now."
 fi
 
 # Launch judge
-launch_out=$(hcom 1 "$tool" --tag judge --go \
+launch_out=$(hcom 1 "$tool" --tag "judge.${thread}" --go \
   --hcom-system-prompt "$JUDGE_SYSTEM" \
   --hcom-prompt "$judge_prompt" \
-  ${bg_flag} 2>&1)
+  ${bg_flag[@]+"${bg_flag[@]}"} ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }
 track_launch "$launch_out"
 
 echo "Judge launched ($tool)"
 
 # Clear trap
-trap - ERR INT TERM
+trap - EXIT INT TERM
 
 echo
 echo "Watch debate:"

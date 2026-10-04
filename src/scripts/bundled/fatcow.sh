@@ -14,7 +14,7 @@
 #   hcom run fatcow --path src/tools --dead                   # dead fatcow
 #   hcom run fatcow --ask fatcow.tools-luna "what does db.py export?"  # query
 #   hcom run fatcow --path src/ --focus "auth, middleware"           # with focus
-#   hcom stop @fatcow.tools                                         # kill by tag
+#   hcom kill tag:fatcow.tools                                         # kill by tag
 
 set -euo pipefail
 
@@ -53,7 +53,7 @@ Examples:
   hcom run fatcow --path src/ --focus "auth, middleware"
   hcom run fatcow --path src/tools --dead
   hcom run fatcow --ask fatcow.tools-luna "what does db.py export?"
-  hcom stop @fatcow.tools
+  hcom kill tag:fatcow.tools
 EOF
   exit 0
 }
@@ -74,6 +74,14 @@ args=("$@")
 i=0
 while [[ $i -lt ${#args[@]} ]]; do
   case "${args[$i]}" in
+    --path|-f|--focus|--tool|--timeout|--name|--ask)
+      needed=1
+      [[ "${args[$i]}" == "--ask" ]] && needed=2
+      if (( i + needed >= ${#args[@]} )); then
+        echo "Error: ${args[$i]} requires $needed value(s)" >&2; exit 1
+      fi ;;
+  esac
+  case "${args[$i]}" in
     -h|--help) usage ;;
     --path) i=$(( i + 1 )); path="${args[$i]}"; i=$(( i + 1 )) ;;
     -f|--focus) i=$(( i + 1 )); focus="${args[$i]}"; i=$(( i + 1 )) ;;
@@ -88,37 +96,47 @@ while [[ $i -lt ${#args[@]} ]]; do
   esac
 done
 
-name_arg=""
-[[ -n "$name_flag" ]] && name_arg="--name $name_flag"
+if ! [[ "$timeout" =~ ^[0-9]+$ ]] || (( timeout < 1 )); then
+  echo "Error: --timeout must be positive whole seconds" >&2; exit 1
+fi
+name_arg=()
+[[ -n "$name_flag" ]] && name_arg=(--name "$name_flag")
 
 # --- Helper: resolve caller name ---
 resolve_caller() {
   local caller
-  caller=$(hcom list self --json $name_arg 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])" 2>/dev/null) || caller="fatcow-q"
+  caller=$(hcom list self --json ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])" 2>/dev/null) || caller="fatcow-q"
   echo "$caller"
 }
 
 # --- Helper: check if instance is active ---
 is_active() {
-  hcom list "$1" --json $name_arg >/dev/null 2>&1
+  hcom list "$1" status ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null | python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() in ("active", "listening", "blocked") else 1)'
 }
 
 # --- ASK MODE ---
 if [[ -n "$ask_name" ]]; then
+  ask_name="${ask_name#@}"
+  if ! [[ "$ask_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "Error: invalid fatcow name '$ask_name'" >&2; exit 1
+  fi
   caller_name=$(resolve_caller)
   has_identity=true
   [[ "$caller_name" == "fatcow-q" ]] && has_identity=false
+  send_identity=()
+  [[ "$has_identity" == "false" ]] && send_identity=(--from "$caller_name")
+  query_started=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')
 
   # Live fatcow — just send the question
   if is_active "$ask_name"; then
-    hcom send "@${ask_name}" $name_arg -- "$ask_question" 2>/dev/null
+    hcom send "@${ask_name}" ${name_arg[@]+"${name_arg[@]}"} ${send_identity[@]+"${send_identity[@]}"} --intent request -- "$ask_question"
     if [[ "$has_identity" == "true" ]]; then
       echo "Asked ${ask_name} — answer will arrive via hcom"
       exit 0
     fi
     echo "Sent to live fatcow ${ask_name}, waiting for reply..."
     # Wait for reply
-    event=$(hcom events --wait "$timeout" --sql "type='message' AND msg_from='${ask_name}'" --json $name_arg 2>/dev/null) || true
+    event=$(hcom events --wait "$timeout" --from "${ask_name##*-}" --mention "$caller_name" --after "$query_started" --last 1 ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null) || true
     if [[ -n "$event" ]]; then
       echo "$event" | python3 -c "import sys,json; data=json.load(sys.stdin); print(data.get('data',{}).get('text',''))" 2>/dev/null
       exit 0
@@ -130,7 +148,7 @@ if [[ -n "$ask_name" ]]; then
 
   # Dead fatcow — resume it
   # Get stopped snapshot
-  stopped_json=$(hcom events --sql "type='life' AND instance='${ask_name}' AND json_extract(data, '$.action')='stopped'" --last 1 --json $name_arg 2>/dev/null) || true
+  stopped_json=$(hcom events --sql "type='life' AND instance='${ask_name##*-}' AND life_action='stopped'" --last 1 ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null) || true
   if [[ -z "$stopped_json" ]]; then
     echo "Error: '${ask_name}' not found (no stopped snapshot)" >&2
     exit 1
@@ -144,13 +162,17 @@ ${ask_question}
 ## INSTRUCTIONS
 
 1. Answer with file:line precision.
-2. Send your answer: hcom send @${caller_name} -- <your answer>
-3. Stop yourself: run hcom stop"
+2. Send your answer: hcom send @${caller_name} --intent inform -- <your answer>
+3. Exit your process after sending: resolve your own name with hcom list self name, then run hcom kill <your-name> --go"
+
+  # A stopped agent can still hold its CLI session open. Close its process
+  # before resuming to avoid Codex session locks.
+  hcom kill "$ask_name" --go ${name_arg[@]+"${name_arg[@]}"} || true
 
   # Resume headless (claude reuses its saved -p launch args)
   hcom r "$ask_name" --go \
     --hcom-prompt "$resume_prompt" \
-    --headless >/dev/null 2>&1 || {
+    --headless ${name_arg[@]+"${name_arg[@]}"} || {
     echo "Error: Resume failed" >&2
     exit 1
   }
@@ -161,7 +183,7 @@ ${ask_question}
   fi
 
   echo "Resumed ${ask_name}, waiting for answer..."
-  event=$(hcom events --wait "$timeout" --sql "type='message' AND msg_from='${ask_name}'" --json $name_arg 2>/dev/null) || true
+  event=$(hcom events --wait "$timeout" --from "${ask_name##*-}" --mention "$caller_name" --after "$query_started" --last 1 ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null) || true
   if [[ -n "$event" ]]; then
     echo "$event" | python3 -c "import sys,json; data=json.load(sys.stdin); print(data.get('data',{}).get('text',''))" 2>/dev/null
     exit 0
@@ -177,11 +199,11 @@ if [[ -z "$path" ]]; then
   exit 1
 fi
 
-target_path=$(cd "$(dirname "$path")" && pwd)/$(basename "$path")
-if [[ ! -e "$target_path" ]]; then
+if [[ ! -e "$path" ]]; then
   echo "Error: path '$path' does not exist" >&2
   exit 1
 fi
+target_path=$(cd "$(dirname "$path")" && pwd)/$(basename "$path")
 
 if [[ -f "$target_path" ]]; then
   cwd=$(dirname "$target_path")
@@ -189,7 +211,7 @@ else
   cwd="$target_path"
 fi
 
-display_path="$path"
+display_path="$target_path"
 
 # Build tag from path
 basename_clean=$(basename "${target_path%/}")
@@ -263,15 +285,17 @@ ${ingest_section}
 
 4. Summarize what you indexed: file count, key modules, major exports/functions.
 
-5. Stop yourself: run \`hcom stop\`
+5. Send your indexing summary to @${notify} using hcom send --intent inform. Then exit your process: resolve your own name with \`hcom list self name\`, then run \`hcom kill <your-name> --go\`
 
 Do NOT subscribe to events. Do NOT wait for questions. Summarize, then stop."
 
   # claude: explicit -p so --headless goes through print mode
-  if [[ "$tool" == "claude" ]]; then
-    bg_flag="--headless -p"
+  if [[ "$interactive" == "true" ]]; then
+    bg_flag=()
+  elif [[ "$tool" == "claude" ]]; then
+    bg_flag=(--headless -p)
   else
-    bg_flag="--headless"
+    bg_flag=(--headless)
   fi
 
 else
@@ -315,7 +339,7 @@ ${ingest_section}
 
 ## PHASE 3: ANSWER
 
-6. Wait for questions. When a message arrives:
+6. End your turn to receive hcom questions. When a message arrives:
    - Parse what they're asking about
    - Answer with file:line references
    - Reply via: \`hcom send \"@<asker> <answer>\"\`
@@ -326,22 +350,22 @@ ${ingest_section}
 You are a fat, lazy, knowledge-stuffed oracle. Eat all the files. Sit there. Answer questions. Stay current."
 
   if [[ "$interactive" == "true" ]]; then
-    bg_flag=""
+    bg_flag=()
   else
     # claude: explicit -p so --headless goes through print mode
     if [[ "$tool" == "claude" ]]; then
-      bg_flag="--headless -p"
+      bg_flag=(--headless -p)
     else
-      bg_flag="--headless"
+      bg_flag=(--headless)
     fi
   fi
 fi
 
-hcom 1 "$tool" --tag "$tag" --go \
+hcom 1 "$tool" --tag "$tag" --go ${name_arg[@]+"${name_arg[@]}"} \
   --hcom-system-prompt "$system_prompt" \
   --hcom-prompt "$launch_prompt" \
   --dir "$cwd" \
-  ${bg_flag} >/dev/null 2>&1 || {
+  ${bg_flag[@]+"${bg_flag[@]}"} || {
   echo "Error: Launch failed" >&2
   exit 1
 }
@@ -360,8 +384,8 @@ if [[ "$dead" == "true" ]]; then
   echo "  hcom run fatcow --ask ${tag}-<name> \"what does ${display_path} export?\""
 else
   echo "Ask it anything:"
-  echo "  hcom send \"@${tag} what functions does ${display_path} export?\""
-  echo "  hcom send \"@${tag} where is error handling done?\""
+  echo "  hcom send \"@${tag}- what functions does ${display_path} export?\""
+  echo "  hcom send \"@${tag}- where is error handling done?\""
   echo
-  echo "Stop: hcom stop @${tag}"
+  echo "Stop: hcom kill tag:${tag}"
 fi

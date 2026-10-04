@@ -39,6 +39,12 @@ positional=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --name|--timeout)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "Error: $1 requires a value" >&2; exit 1
+      fi ;;
+  esac
+  case "$1" in
     -h|--help) usage; exit 0 ;;
     --name) name_flag="${2:-}"; shift 2 ;;
     --timeout) timeout="${2:-}"; shift 2 ;;
@@ -92,13 +98,13 @@ fi
 check=("$watch")
 [[ "$mode" == "inject" ]] && check+=("$target")
 for agent in "${check[@]}"; do
-  if ! hcom list "$agent" status "${name_arg[@]}" >/dev/null 2>&1; then
+  if ! hcom list "$agent" status ${name_arg[@]+"${name_arg[@]}"} >/dev/null 2>&1; then
     echo "Not an agent or tool keyword: $agent (see \`hcom list\`)" >&2
     exit 1
   fi
 done
 
-status_of() { hcom list "$1" status "${name_arg[@]}" 2>/dev/null || echo gone; }
+status_of() { hcom list "$1" status ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null || echo gone; }
 
 # Per-agent detail line. status_detail is last in the template because it holds
 # raw shell commands that themselves contain `|`.
@@ -106,7 +112,7 @@ status_of() { hcom list "$1" status "${name_arg[@]}" 2>/dev/null || echo gone; }
 # SIGPIPE, which under `set -o pipefail` takes the whole script down.
 info_of() {
   hcom list --format '{name}|{base_name}|{tool}|{status}|{status_context}|{status_age_seconds}|{status_detail}' \
-    "${name_arg[@]}" 2>/dev/null |
+    ${name_arg[@]+"${name_arg[@]}"} 2>/dev/null |
     awk -F'|' -v want="$1" '($1==want || $2==want) && !seen {print; seen=1}'
 }
 
@@ -217,7 +223,7 @@ while :; do
   # The status re-check at the top of the loop is what actually decides —
   # --wait has a 10s lookback that can replay an already-stale idle event, so
   # debounce a matched wake to avoid spinning through that window.
-  if hcom events --idle "$watch" --wait "$remaining" "${name_arg[@]}" >/dev/null 2>&1; then
+  if hcom events --idle "$watch" --wait "$remaining" ${name_arg[@]+"${name_arg[@]}"} >/dev/null 2>&1; then
     sleep 1
   fi
 done
@@ -225,12 +231,12 @@ done
 waited=$(( $(date +%s) - started ))
 if [[ "$mode" == "launch" ]]; then
   say "fired   $watch idle after ${waited}s — launching $target"
-  hcom "$target" --hcom-prompt "$text" "${name_arg[@]}"
+  hcom "$target" --go --hcom-prompt "$text" ${name_arg[@]+"${name_arg[@]}"}
 else
   say "fired   $watch idle after ${waited}s — injecting into $target"
   if [[ -n "$enter" ]]; then
-    hcom term inject "$target" "$text" --enter
+    hcom term inject "$target" "$text" --enter ${name_arg[@]+"${name_arg[@]}"}
   else
-    hcom term inject "$target" "$text"
+    hcom term inject "$target" "$text" ${name_arg[@]+"${name_arg[@]}"}
   fi
 fi
