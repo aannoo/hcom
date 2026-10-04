@@ -1985,3 +1985,36 @@ fn send_with_attached_from_skips_the_name_drift_warning() {
         "--from=NAME must suppress the drift warning, got stderr={stderr}"
     );
 }
+
+#[test]
+fn run_help_and_docs_flags_preserve_script_help() {
+    let h = Hcom::new();
+    let caller = h.start();
+    for args in [
+        vec!["run", "--help"],
+        vec!["run", "-h", "--name", &caller],
+        vec!["run", "docs", "--help", "--name", &caller],
+    ] {
+        let (code, stdout, stderr) = h.run(&args);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        assert!(stdout.contains("hcom run <name>"), "{stdout}");
+        assert!(!stdout.contains("# Creating Custom Scripts"), "{stdout}");
+    }
+    let (code, stdout, stderr) = h.run(["run", "debate", "--help", "--name", &caller]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("Usage: hcom run debate [OPTIONS] TOPIC"),
+        "{stdout}"
+    );
+    let (code, stdout, stderr) = h.run(["run", "docs", "--scripts", "--name", &caller]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("# Creating Custom Scripts"), "{stdout}");
+    assert!(!stdout.contains("# CLI Reference"), "{stdout}");
+    let (code, stdout, stderr) = h.run(["run", "docs", "--scrpits", "--name", &caller]);
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("Unknown docs option: --scrpits"),
+        "{stderr}"
+    );
+}

@@ -2,19 +2,39 @@
 name: hcom-agent-messaging
 description: >
   Multi-agent communication for AI coding tools. Agents message, watch,
-  and spawn each other across terminals. Use when setting up hcom,
-  troubleshooting delivery, or writing multi-agent scripts.
+  and spawn each other across terminals. Use when setting up hcom or
+  troubleshooting.
 ---
 
 # hcom — multi-agent communication for AI coding tools
 
 AI agents running in separate terminals are isolated. hcom connects them via hooks and a shared database so they can message, watch, and spawn each other in real-time.
 
+Start an agent with `hcom` in front, then prompt normally.
+
+Use hcom to:
+
+- coordinate multi-agent pipelines
+- run different AI CLIs as each other's subagents
+- avoid copy-pasting
+
 ```bash
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot, hcom qoder, hcom grok
+uv tool install hcom
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor, hcom kimi, hcom copilot, hcom qoder, hcom grok
 hcom              # TUI dashboard
 ```
+
+Quickstart:
+
+```bash
+# terminal 1
+hcom claude
+
+# terminal 2
+hcom codex
+```
+
+Prompt normally — e.g. `review what claude did and send it fixes`
 
 ---
 
@@ -36,55 +56,47 @@ tell any agent:
 
 ## what agents can do
 
-**Message** each other in real-time, bundle context for handoffs.
+**Message** each other in real time: mid-turn or wake immediately when idle
 
-**Observe** each other: transcripts, file edits, terminal screens, command history.
+**Observe** each other: status, transcripts, file edits, live terminal screens, command history.
 
-**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
+**Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
 
-**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator.
+**Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
 
 run `hcom --help` for full command syntax and flags.
 
 ---
 
-## tool support
-
-| tool | delivery | connect |
-|------|----------|---------|
-| claude code (incl. subagents) | automatic | `hcom claude` |
-| gemini cli (>= 0.26.0) | automatic | `hcom gemini` |
-| codex | automatic | `hcom codex` |
-| opencode | automatic | `hcom opencode` |
-| kilo code | automatic | `hcom kilo` |
-| antigravity | automatic | `hcom agy` |
-| cursor | automatic | `hcom cursor-agent` |
-| copilot | automatic | `hcom copilot` |
-| qoder cli | automatic | `hcom qoder` |
-| grok build | automatic | `hcom grok` |
-| any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
-
-session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
+Works with Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Qoder CLI, Grok Build, and other tools
 
 ---
 
 ## setup
 
-if the user invokes this skill without arguments:
+When this skill is invoked, first run:
 
-1. run `hcom status` — if "command not found", install first:
-   ```bash
-   curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-   ```
-2. run `hcom hooks add` to install hooks for all detected tools
-3. restart the AI tool for hooks to activate
+```bash
+hcom status
+```
 
-| status output | meaning | action |
-|---------------|---------|--------|
-| command not found | not installed | install via `brew install aannoo/hcom/hcom`, the curl installer above, or `pip install hcom` |
-| `[~] claude` | tool exists, hooks not installed | `hcom hooks add` then restart |
-| `[✓] claude` | hooks installed | ready |
-| `[✗] claude` | tool not found | install the AI tool first |
+If hcom status works: run `hcom list`
+
+If hcom list shows "Your name: <name>" where `<name>` is not "(not participating)": congratulations!
+
+If running `hcom status` returns "command not found", install first:
+```bash
+uv tool install hcom
+```
+
+See the [hcom README](https://github.com/aannoo/hcom#install) for other install options.
+
+If hcom status shows a list of CLI tools and you are not any of them, run `hcom start` to connect to hcom.
+
+If you've just installed hcom now or if hcom list shows "Your name: (not participating)" and you are a tool in the hcom status list of CLI tools:
+
+Relaunch into hcom properly for automatic message delivery and full hcom functionality. User should exit and run `hcom <tool>`.
+Or if you know your sessionID/ses_/thread_name: user can exit and run `hcom r <session-id>` to resume you inside hcom. See `hcom r --help`.
 
 ---
 
@@ -98,65 +110,27 @@ hcom hooks status    # check hooks specifically
 hcom relay status    # check cross-device relay
 ```
 
-hooks missing? `hcom hooks add` then restart tool.
-
 still broken?
 ```bash
-hcom reset all && hcom hooks add
-# close all ai tool windows
+hcom reset all # backup config/db + reset it
 hcom claude          # fresh start
 ```
 
-### "messages not arriving"
+still broken after that?
+```bash
+git clone https://github.com/aannoo/hcom.git
+cd hcom
+```
+Read code and figure out what is going on.
 
-| symptom | diagnosis | fix |
-|---------|-----------|-----|
-| agent not in `hcom list` | agent stopped or never bound | relaunch or wait for binding |
-| message sent but not delivered | check `hcom events --last 5` | verify @mention matches agent name/tag |
-| message reaches more than one agent | duplicate base name across tags | target the full `@tag-name` to hit exactly one |
-| messages leaking between workflows | no thread isolation | always use `--thread` |
-
-### intent system
-
-agents follow these rules from their bootstrap:
-- `--intent request` -> agent always responds
-- `--intent inform` -> agent responds only if useful
-- `--intent ack` -> agent does not respond
 
 ### sandbox / permission issues
 
+Use project-local hcom state when the normal hcom directory is unavailable:
+
 ```bash
-export HCOM_DIR="$PWD/.hcom"     # project-local mode
-hcom hooks add                   # installs to project dir
+HCOM_DIR=$PWD/.hcom hcom <tool>
 ```
-
----
-
-## workflow scripting
-
-place scripts in `~/.hcom/scripts/` as `.sh` or `.py`. run with `hcom run <name> "task"`. see `references/script-template.md` for the full annotated template, or run `hcom run docs --scripts` inside an agent.
-
-### key rules
-
-- **never use `sleep`** — use `hcom events --wait` or `hcom listen`
-- **never hardcode agent names** — parse from `grep '^Names: '` in launch output
-- **always use `--thread`** — without it, messages leak across workflows
-- **always use `trap cleanup ERR INT TERM`** — orphan headless agents run indefinitely
-- **always use `hcom kill` for cleanup** (not `stop`) — kill also closes the terminal pane
-- **always forward `--name`** — hcom injects it, scripts must propagate it
-- **always use `--go`** on launch commands — without it, scripts hang on confirmation prompt (`hcom kill` never prompts, so `--go` is optional there)
-
-### agent topologies
-
-| topology | agents | pattern |
-|----------|--------|---------|
-| worker-reviewer | 2 | worker sends result, reviewer reads transcript, sends APPROVED/FIX |
-| pipeline | N sequential | each stage reads previous via `hcom transcript`, signals via thread |
-| ensemble | N+1 (judge) | N agents answer independently, judge reads all via `hcom events --sql` |
-| hub-spoke | 1+N | coordinator broadcasts to `@tag-`, workers report back |
-| reactive | N | `hcom events sub` triggers agent actions on file edits/status changes |
-
----
 
 ## files
 
@@ -164,30 +138,18 @@ place scripts in `~/.hcom/scripts/` as `.sh` or `.py`. run with `hcom run <name>
 |------|----------|
 | database | `~/.hcom/hcom.db` |
 | config | `~/.hcom/config.toml` |
+| env | `~/.hcom/env` |
 | logs | `~/.hcom/.tmp/logs/` |
 | user scripts | `~/.hcom/scripts/` |
-
-with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
-
----
-
-## reference files
-
-| file | when to read |
-|------|-------------|
-| `references/patterns.md` | writing multi-agent scripts — 6 tested patterns with full code and real event JSON |
-| `references/cross-tool.md` | claude + codex + gemini + opencode + kilo + pi + omp + antigravity + cursor + kimi + copilot + qoder + grok collaboration details and per-tool quirks |
-| `references/gotchas.md` | debugging scripts — timing, message delivery, intent system, cleanup |
-| `references/script-template.md` | writing a new script from scratch — full template with commentary |
-| `references/scripts/` | 6 tested, working example scripts |
 
 ---
 
 ## more info
 
 ```bash
-hcom --help              # all commands
-hcom <command> --help    # command details
+hcom --help
+hcom <command> --help
+hcom run docs --scripts   # script authoring info
 ```
 
-github: https://github.com/aannoo/hcom
+Github: https://github.com/aannoo/hcom
