@@ -1,4 +1,4 @@
-<center>
+<div align="center">
 
 # `hcom`
 
@@ -8,7 +8,7 @@
 [![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
 
-</center>
+</div>
 
 **CLI tool that agents use to message, watch, and spawn each other across terminals.**
 
