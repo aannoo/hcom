@@ -5,7 +5,7 @@
 # Without that, a failing pre-commit run buries the one relevant assertion under
 # a full --nocapture real-tool transcript.
 #
-# Lives here rather than inline in the Justfile because just writes shebang
+# Lives here rather than inline in the justfile because just writes shebang
 # recipe bodies to an extension-less temp file, which powershell -File refuses.
 param(
     [string[]] $Only

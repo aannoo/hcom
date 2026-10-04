@@ -79,7 +79,7 @@ struct DiagContext {
 
 thread_local! {
     // Thread-local, not a process-wide `Mutex`: `cli_smoke.rs` runs ~20
-    // non-`#[ignore]` tests that each call `Hcom::new()`, and the Justfile's
+    // non-`#[ignore]` tests that each call `Hcom::new()`, and the justfile's
     // `step test` (unlike the three real-tool/relay steps) runs plain `cargo
     // test --locked` with the default multi-threaded runner — a shared slot
     // there would dump whichever fixture happened to be active on some other
