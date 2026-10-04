@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.22.2 <23"
   },
-  "packageManager": "npm@10.9.8",
+  "packageManager": "npm@10.9.9",
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
