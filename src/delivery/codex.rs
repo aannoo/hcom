@@ -242,6 +242,60 @@ mod unix {
     /// killed before it could drop its [`Server`].
     const OWNER_FILE: &str = "owner";
 
+    /// The native binary an npm-style `codex.js` launcher would spawn, so the
+    /// private server runs without a Node process in front of it. The launcher
+    /// only adds `CODEX_MANAGED_BY_*`, which just picks the TUI's update hint.
+    /// Wrappers and unrecognized layouts keep the original command.
+    fn native_server_binary(command: &str, prefix: &[String]) -> Option<std::path::PathBuf> {
+        if !prefix.is_empty() {
+            return None;
+        }
+        let launcher = std::fs::canonicalize(command).ok()?;
+        if !launcher.ends_with("node_modules/@openai/codex/bin/codex.js") {
+            return None;
+        }
+        let root = launcher.parent()?.parent()?;
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join("package.json")).ok()?).ok()?;
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            _ => return None,
+        };
+        // Take whichever platform package the installer picked rather than
+        // hcom's own arch: Node may run under Rosetta. Resolve it like Node
+        // (nested, then hoisted), falling back to the package's own vendor.
+        let platform = format!("@openai/codex-{os}-");
+        let mut installed = manifest["optionalDependencies"]
+            .as_object()?
+            .keys()
+            .filter(|name| name.starts_with(&platform))
+            .filter_map(|name| {
+                root.ancestors()
+                    .map(|dir| dir.join("node_modules").join(name))
+                    .find(|dir| dir.join("package.json").is_file())
+            });
+        let vendor = match (installed.next(), installed.next()) {
+            (Some(package), None) => package.join("vendor"),
+            (None, _) => root.join("vendor"),
+            (Some(_), Some(_)) => return None,
+        };
+        // vendor/<target triple>/bin/codex; one target, or it's ambiguous.
+        let mut binaries = std::fs::read_dir(vendor)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("bin/codex"))
+            .filter(|path| {
+                use std::os::unix::fs::PermissionsExt;
+                path.metadata()
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            });
+        match (binaries.next(), binaries.next()) {
+            (Some(binary), None) => Some(binary),
+            _ => None,
+        }
+    }
+
     #[derive(Clone)]
     pub(crate) struct Launch {
         endpoint: String,
@@ -279,8 +333,20 @@ mod unix {
                 early: Arc::default(),
             };
             let log_path = directory.path().join("server.log");
-            let mut command = Command::new(command);
-            command
+            let native = native_server_binary(command, prefix);
+            if let Some(binary) = &native {
+                log_info(
+                    "native",
+                    "codex.native.binary",
+                    &binary.display().to_string(),
+                );
+            }
+            let mut server_command = Command::new(
+                native
+                    .as_deref()
+                    .map_or(std::ffi::OsStr::new(command), std::path::Path::as_os_str),
+            );
+            server_command
                 .args(prefix)
                 .args(&server_args)
                 .args(["app-server", "--listen", &launch.endpoint])
@@ -289,7 +355,7 @@ mod unix {
                 .stdout(Stdio::null())
                 .stderr(std::fs::File::create(&log_path)?)
                 .process_group(0);
-            let child = command
+            let child = server_command
                 .spawn()
                 .context("starting private Codex app-server")?;
             let _ = std::fs::write(
@@ -751,6 +817,58 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn native_server_binary_follows_npm_layouts() {
+            let os = match std::env::consts::OS {
+                "macos" => "darwin",
+                "linux" => "linux",
+                _ => return,
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let modules = temp.path().join("node_modules");
+            let root = modules.join("@openai/codex");
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            let launcher = root.join("bin/codex.js");
+            std::fs::write(&launcher, "#!/usr/bin/env node\n").unwrap();
+            let launcher = launcher.to_str().unwrap();
+            // Deliberately not hcom's arch: Node may run under Rosetta.
+            let package = format!("@openai/codex-{os}-other");
+            let manifest = json!({"name": "@openai/codex", "optionalDependencies": {
+                format!("@openai/codex-{os}-x64"): "", format!("@openai/codex-{os}-arm64"): "",
+                package.clone(): "", "@openai/codex-plan9-x64": "",
+            }});
+            std::fs::write(root.join("package.json"), manifest.to_string()).unwrap();
+            let install = |dir: &std::path::Path, target: &str| {
+                let binary = dir.join("vendor").join(target).join("bin/codex");
+                std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+                std::fs::write(&binary, "").unwrap();
+                crate::sys::fs::set_executable(&binary).unwrap();
+                if !dir.join("package.json").exists() {
+                    std::fs::write(dir.join("package.json"), "{}").unwrap();
+                }
+                binary.canonicalize().unwrap()
+            };
+
+            // Neither platform package nor bundled vendor: keep the launcher.
+            assert_eq!(native_server_binary(launcher, &[]), None);
+            // Bundled vendor in the main package.
+            let bundled = install(&root, "bundled-triple");
+            assert_eq!(native_server_binary(launcher, &[]), Some(bundled));
+            // Hoisted platform package wins over the bundled fallback.
+            let hoisted = install(&modules.join(&package), "triple");
+            assert_eq!(native_server_binary(launcher, &[]), Some(hoisted));
+            // A custom wrapper owns its own launch.
+            assert_eq!(native_server_binary(launcher, &["wrapper".into()]), None);
+            // Two installed platform packages: Node would pick by its arch.
+            install(
+                &root
+                    .join("node_modules")
+                    .join(format!("@openai/codex-{os}-x64")),
+                "x",
+            );
+            assert_eq!(native_server_binary(launcher, &[]), None);
+        }
 
         /// Scripted peer: answers each expected request in order, sending
         /// `notes` notifications just before the response.
