@@ -752,12 +752,47 @@ fn prepare_codex_delivery(db: &HcomDb, instance_name: &str) -> Option<HookResult
     })
 }
 
+/// Codex runs hooks for its internal threads inside the agent's process:
+/// spawned subagents (payload carries `agent_id`) and memory consolidation
+/// (ephemeral, so no transcript, under its own thread id). They must not
+/// rebind the session or drive status: memory consolidation fires
+/// SessionStart, UserPromptSubmit and tool hooks, but Codex filters
+/// session-flag Stop hooks for it, so nothing would return the agent to
+/// listening.
+fn is_internal_thread(instance: &InstanceRow, payload: &HookPayload) -> bool {
+    if payload
+        .raw
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.is_empty())
+    {
+        return true;
+    }
+    if payload.transcript_path.is_some() {
+        return false;
+    }
+    // Memory work starts alongside the first turn, so it can reach
+    // SessionStart before the main thread binds: recognize its workspace.
+    let in_memory_root = payload
+        .raw
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|cwd| Path::new(cwd).file_name())
+        .is_some_and(|name| name == "memories" || name == "memories_v2");
+    let bound = instance.session_id.as_deref().unwrap_or("");
+    let session_id = payload.session_id.as_deref().unwrap_or("");
+    in_memory_root || (!bound.is_empty() && !session_id.is_empty() && session_id != bound)
+}
+
 fn resolve_and_update_codex_instance(
     db: &HcomDb,
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> Option<InstanceRow> {
     let instance = resolve_codex_instance(db, ctx, payload)?;
+    if is_internal_thread(&instance, payload) {
+        return None;
+    }
     update_codex_position(db, ctx, payload, &instance.name);
     Some(instance)
 }
@@ -771,6 +806,12 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         Some(sid) if !sid.is_empty() => sid,
         _ => return hook_noop(),
     };
+
+    if resolve_codex_instance(db, ctx, payload)
+        .is_some_and(|instance| is_internal_thread(&instance, payload))
+    {
+        return hook_noop();
+    }
 
     let mut instance_name = if let Some(pid) = ctx.process_id.as_deref() {
         instance_binding::bind_session_to_process(db, session_id, Some(pid))
@@ -1878,6 +1919,149 @@ mod tests {
         );
         assert_eq!(payload.session_id.as_deref(), Some("sess-1"));
         assert_eq!(payload.hook_name, "UserPromptSubmit");
+    }
+
+    fn db_with_listening_codex() -> (tempfile::TempDir, HcomDb, HcomContext) {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id, directory, transcript_path)
+                 VALUES ('luna', 'codex', 'listening', '', 0, 0, 'main-sid', '/work', '/rollout-main.jsonl')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-1", "main-sid", "luna")
+            .unwrap();
+        let env = [("HCOM_PROCESS_ID".to_string(), "proc-1".to_string())]
+            .into_iter()
+            .collect();
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+        (dir, db, ctx)
+    }
+
+    fn assert_main_thread_untouched(db: &HcomDb, label: &str) {
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING, "{label}");
+        assert_eq!(row.session_id.as_deref(), Some("main-sid"), "{label}");
+        assert_eq!(row.directory, "/work", "{label}");
+        assert_eq!(db.get_session_binding("mem-sid").unwrap(), None, "{label}");
+    }
+
+    #[test]
+    fn internal_thread_hooks_leave_main_thread_alone() {
+        // Memory consolidation: ephemeral (null transcript), own thread id,
+        // and Codex never runs our Stop for it (#151).
+        let (_dir, db, ctx) = db_with_listening_codex();
+        let memory = |event: &str| {
+            HookPayload::from_codex_native(
+                event,
+                serde_json::json!({
+                    "session_id": "mem-sid", "transcript_path": null,
+                    "cwd": "/home/.codex/memories", "source": "startup",
+                    "prompt": "consolidate", "tool_name": "Bash",
+                    "tool_input": {"command": "ls"},
+                }),
+            )
+        };
+        handle_sessionstart(&db, &ctx, &memory("SessionStart"));
+        assert_main_thread_untouched(&db, "SessionStart");
+        handle_userpromptsubmit(&db, &ctx, &memory("UserPromptSubmit"));
+        assert_main_thread_untouched(&db, "UserPromptSubmit");
+        handle_pretooluse(&db, &ctx, &memory("PreToolUse"));
+        assert_main_thread_untouched(&db, "PreToolUse");
+        handle_posttooluse(&db, &ctx, &memory("PostToolUse"));
+        assert_main_thread_untouched(&db, "PostToolUse");
+
+        // Spawned subagent tool hooks carry agent_id.
+        let subagent = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "sub-sid", "agent_id": "sub-sid", "agent_type": "default",
+                "transcript_path": "/rollout-sub.jsonl", "cwd": "/work",
+                "tool_name": "Bash", "tool_input": {"command": "ls"},
+            }),
+        );
+        handle_pretooluse(&db, &ctx, &subagent);
+        assert_main_thread_untouched(&db, "subagent PreToolUse");
+    }
+
+    #[test]
+    fn memory_thread_cannot_claim_unbound_launch() {
+        // Codex starts memory work right after submitting the first turn;
+        // its SessionStart can beat the main thread's to a fresh row.
+        let (_dir, db, ctx) = db_with_listening_codex();
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = NULL WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
+        let memory = |event: &str| {
+            HookPayload::from_codex_native(
+                event,
+                serde_json::json!({
+                    "session_id": "mem-sid", "transcript_path": null,
+                    "cwd": "/home/.codex/memories", "source": "startup",
+                    "prompt": "consolidate", "tool_name": "Bash",
+                    "tool_input": {"command": "ls"},
+                }),
+            )
+        };
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse"] {
+            let payload = memory(event);
+            match event {
+                "SessionStart" => handle_sessionstart(&db, &ctx, &payload),
+                "UserPromptSubmit" => handle_userpromptsubmit(&db, &ctx, &payload),
+                _ => handle_pretooluse(&db, &ctx, &payload),
+            };
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(row.status, ST_LISTENING, "{event}");
+            assert_eq!(row.session_id, None, "{event}");
+            assert_eq!(row.directory, "/work", "{event}");
+            assert_eq!(db.get_session_binding("mem-sid").unwrap(), None, "{event}");
+        }
+
+        // The main thread still binds afterwards.
+        let main = HookPayload::from_codex_native(
+            "SessionStart",
+            serde_json::json!({
+                "session_id": "main-sid", "transcript_path": "/rollout-main.jsonl",
+                "cwd": "/work", "source": "startup",
+            }),
+        );
+        handle_sessionstart(&db, &ctx, &main);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("main-sid"));
+    }
+
+    #[test]
+    fn new_main_thread_still_rebinds() {
+        // /new and resume start a thread with a transcript: SessionStart rebinds.
+        let (_dir, db, ctx) = db_with_listening_codex();
+        let payload = HookPayload::from_codex_native(
+            "SessionStart",
+            serde_json::json!({
+                "session_id": "new-sid", "transcript_path": "/rollout-new.jsonl",
+                "cwd": "/work", "source": "clear",
+            }),
+        );
+        handle_sessionstart(&db, &ctx, &payload);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("new-sid"));
+
+        let tool = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "new-sid", "transcript_path": "/rollout-new.jsonl",
+                "cwd": "/work", "tool_name": "Bash", "tool_input": {"command": "ls"},
+            }),
+        );
+        handle_pretooluse(&db, &ctx, &tool);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
     }
 
     #[test]
