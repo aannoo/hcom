@@ -173,8 +173,12 @@ pub fn check_identity_gate(
 /// Claude/Gemini main instances have PreToolUse hooks that set active:tool:*.
 /// These instance types need explicit status updates here:
 /// - Subagent: status is also updated directly for manual/non-hook invocations
-/// - Codex: has notify hook (turn-end) but no pre-tool hook
 /// - Adhoc: no hooks at all
+///
+/// Codex is not hookless: its PreToolUse hook already marks the shell call
+/// active, and an hcom call from a process that outlives the turn (a
+/// backgrounded command, memory consolidation) would mark it active with no
+/// Stop to follow.
 ///
 /// Status model:
 /// - Adhoc: inactive:tool:* (no hooks to reset, just records "this happened")
@@ -209,9 +213,8 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
 
     // Only set status for hookless instances:
     // - subagent (has parent_name)
-    // - codex
     // - adhoc
-    let is_hookless = has_parent || tool == "codex" || tool == "adhoc";
+    let is_hookless = has_parent || tool == "adhoc";
     if !is_hookless {
         return;
     }
@@ -842,9 +845,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hookless_status_codex() {
+    fn test_hookless_status_codex_skipped() {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", "codex");
+        db.set_status("luna", crate::shared::ST_LISTENING, "")
+            .unwrap();
         let ctx = CommandContext {
             explicit_name: None,
             identity: Some(SenderIdentity {
@@ -856,10 +861,11 @@ mod tests {
             go: false,
             identity_warning: None,
         };
+        // A backgrounded `hcom send` after Stop must not mark it active:
+        // no later Stop would return it to listening (#151).
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(data.status, ST_ACTIVE);
-        assert_eq!(data.status_context, "tool:send");
+        assert_eq!(data.status, crate::shared::ST_LISTENING);
     }
 
     #[test]
