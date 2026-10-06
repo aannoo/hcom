@@ -309,6 +309,9 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
 /// something and only `version` and empty `hooks` remain, the file is deleted;
 /// a file hcom had no entries in is never touched.
 fn remove_hooks_at(path: &Path) -> Result<()> {
+    if !crate::runtime_env::hook_cleanup_allowed(path) {
+        return Ok(());
+    }
     if !path.exists() {
         return Ok(());
     }

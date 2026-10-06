@@ -356,9 +356,14 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> AnyResult<()> {
     let legacy = crate::runtime_env::legacy_tool_config_root()
         .map(|root| root.join(".codex"))
         .filter(|path| *path != home);
+    let old_home = Some(crate::runtime_env::tool_home().join(".codex"));
+    #[cfg(test)]
+    let old_home = old_home.filter(|path| crate::paths::test_roots::is_registered(path));
     runtime::collect_errors(
         std::iter::once(home)
             .chain(legacy)
+            .chain(old_home)
+            .filter(|path| crate::runtime_env::hook_cleanup_allowed(path))
             .filter_map(|path| cleanup_codex_hooks_in_dir(&path).err())
             .collect(),
     )
@@ -1630,7 +1635,12 @@ pub fn remove_codex_hooks() -> bool {
     if !dirs.contains(&default_dir) {
         dirs.push(default_dir);
     }
+    // Unit tests must never sweep the platform profile, even when a test
+    // intentionally unsets CODEX_HOME to exercise legacy path discovery.
+    #[cfg(test)]
+    dirs.retain(|dir| crate::paths::test_roots::is_registered(dir));
     dirs.iter()
+        .filter(|dir| crate::runtime_env::hook_cleanup_allowed(dir))
         .filter(|dir| !remove_codex_hooks_from_dir(dir))
         .count()
         == 0
@@ -2228,6 +2238,7 @@ mod tests {
     fn remove_codex_hooks_cleans_active_hcom_dir_local_path() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
+        crate::paths::test_roots::register(dir.path());
         let home = dir.path().join("home");
         let workspace = dir.path().join("workspace");
         let local_dir = workspace.join(".codex");

@@ -37,6 +37,22 @@ pub(crate) fn tool_home() -> std::path::PathBuf {
     user_home().unwrap_or_default()
 }
 
+/// Fixtures explicitly scope cleanup so Windows platform-profile discovery
+/// cannot touch the developer's configuration despite HOME/CODEX_HOME overrides.
+pub(crate) fn hook_cleanup_allowed(path: &std::path::Path) -> bool {
+    let root = std::env::var_os("HCOM_TEST_ROOT").map(std::path::PathBuf::from);
+    let Some(root) = root else {
+        return true;
+    };
+    match (
+        crate::paths::resolve_deepest_existing(path),
+        crate::paths::resolve_deepest_existing(&root),
+    ) {
+        (Some(path), Some(root)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
 /// Parent of a non-default HCOM_DIR. Older hcom versions installed tool hooks,
 /// plugins and config under `<this>/.<tool>/`; only legacy cleanup looks here.
 pub(crate) fn legacy_tool_config_root() -> Option<std::path::PathBuf> {
@@ -66,7 +82,7 @@ pub(crate) fn tool_config_cleanup_dirs(dirname: &str, env_var: &str) -> Vec<std:
     ];
     let mut dirs = Vec::new();
     for dir in candidates.into_iter().flatten() {
-        if !dirs.contains(&dir) {
+        if hook_cleanup_allowed(&dir) && !dirs.contains(&dir) {
             dirs.push(dir);
         }
     }
@@ -103,7 +119,9 @@ pub(crate) fn gemini_family_cleanup_dirs() -> Vec<std::path::PathBuf> {
             dirs.push(dir);
         }
     }
-    dirs
+    dirs.into_iter()
+        .filter(|dir| hook_cleanup_allowed(dir))
+        .collect()
 }
 
 /// User home directory, honoring an explicit `HOME` override before falling back

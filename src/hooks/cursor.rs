@@ -97,11 +97,13 @@ fn build_cursor_hook_command(command: &str) -> String {
 }
 
 fn is_hcom_cursor_command(command: &str) -> bool {
-    ["hcom", "uvx hcom"].iter().any(|prefix| {
-        CURSOR_HOOK_COMMANDS
+    crate::hooks::runtime::is_hcom_command(
+        command,
+        &CURSOR_HOOK_COMMANDS
             .iter()
-            .any(|(_, suffix)| command == format!("{prefix} {suffix}"))
-    })
+            .map(|(_, suffix)| *suffix)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn expected_hook(event: &str, command: &str) -> Value {
@@ -360,6 +362,7 @@ fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn cursor_hooks_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    push_unique(&mut paths, default_cursor_config_dir().join("hooks.json"));
     push_unique(&mut paths, get_cursor_hooks_path());
     if let Some(root) = crate::runtime_env::legacy_tool_config_root() {
         push_unique(&mut paths, root.join(".cursor").join("hooks.json"));
@@ -402,9 +405,11 @@ fn cursor_permissions_cleanup_paths() -> Vec<PathBuf> {
 pub fn remove_cursor_hooks() -> bool {
     let hooks_ok = cursor_hooks_cleanup_paths()
         .iter()
+        .filter(|path| crate::runtime_env::hook_cleanup_allowed(path))
         .all(|path| remove_cursor_hooks_at(path));
     let permissions_ok = cursor_permissions_cleanup_paths()
         .iter()
+        .filter(|path| crate::runtime_env::hook_cleanup_allowed(path))
         .all(|path| update_cursor_permissions_at(path, false).is_ok());
     hooks_ok && permissions_ok
 }
@@ -680,6 +685,20 @@ mod tests {
     use crate::hooks::test_helpers::EnvGuard;
     use serial_test::serial;
 
+    #[test]
+    fn windows_executable_hooks_are_owned() {
+        assert!(is_hcom_cursor_command(
+            r#"& 'C:\Program Files\hcom.exe' cursor-stop"#
+        ));
+        assert!(is_hcom_cursor_command(
+            "C:/dev/hcom.exe cursor-sessionstart"
+        ));
+        assert!(!is_hcom_cursor_command("other-hcom.exe cursor-stop"));
+        assert!(!is_hcom_cursor_command("user cursor-stop"));
+        assert!(!is_hcom_cursor_command(r#"echo "hcom cursor-stop""#));
+        assert!(!is_hcom_cursor_command("hcom cursor-stop-extra"));
+    }
+
     fn cursor_test_env() -> (tempfile::TempDir, PathBuf, EnvGuard) {
         let guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -839,10 +858,6 @@ mod tests {
         );
     }
 
-    // Unix-only: relies on redirecting the home dir via $HOME, but on Windows
-    // `dirs::home_dir()` reads USERPROFILE and ignores the test's temp HOME, so
-    // the normal-vs-isolated mode check never sees the override.
-    #[cfg(unix)]
     #[test]
     #[serial]
     fn normal_mode_permissions_honor_cursor_config_dir() {

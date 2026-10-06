@@ -10,6 +10,69 @@ use std::time::{Duration, Instant};
 use support::{Hcom, parse_hcom_marker};
 
 #[test]
+fn windows_hook_cleanup_preserves_foreign_hooks_and_stays_in_fixture() {
+    let h = Hcom::new();
+    for (tool, event, suffix, filename) in [
+        (
+            "claude",
+            "SessionStart",
+            "claude-sessionstart",
+            "settings.json",
+        ),
+        (
+            "cursor",
+            "sessionStart",
+            "cursor-sessionstart",
+            "hooks.json",
+        ),
+        ("codex", "SessionStart", "codex-sessionstart", "hooks.json"),
+    ] {
+        let dir = h.home.join(format!(".{tool}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handlers = serde_json::json!([
+            {"type": "command", "command": format!("C:/dev/hcom.exe {suffix}")},
+            {"type": "command", "command": "user-hook"},
+            {"type": "command", "command": "echo \"hcom cursor-stop\""}
+        ]);
+        let hooks = if tool == "cursor" {
+            serde_json::json!({"hooks": {event: handlers}})
+        } else {
+            serde_json::json!({"hooks": {event: [{"hooks": handlers}]}})
+        };
+        let path = dir.join(filename);
+        std::fs::write(&path, hooks.to_string()).unwrap();
+        let mut command = h.cmd();
+        if tool == "codex" {
+            command.env("CODEX_HOME", &dir);
+        }
+        let output = command.args(["hooks", "remove", tool]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{tool}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let remaining = std::fs::read_to_string(path).unwrap();
+        assert!(!remaining.contains("hcom.exe"), "{tool}: {remaining}");
+        assert!(remaining.contains("user-hook"), "{tool}: {remaining}");
+        assert!(remaining.contains("echo"), "{tool}: {remaining}");
+    }
+
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("hooks.json");
+    let original =
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"command":"hcom codex-sessionstart"}]}]}}"#;
+    std::fs::write(&sentinel, original).unwrap();
+    let output = h
+        .cmd()
+        .env("CODEX_HOME", outside.path())
+        .args(["hooks", "remove", "codex"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), original);
+}
+
+#[test]
 fn fixture_drop_terminates_registered_process_group() {
     #[cfg(unix)]
     let mut child = Command::new("sh")

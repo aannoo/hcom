@@ -2962,6 +2962,16 @@ fn build_all_claude_permission_patterns() -> Vec<String> {
 
 /// Check if a hook command string matches any hcom hook pattern.
 fn is_hcom_hook_command(command: &str) -> bool {
+    let prefixed: Vec<String> = CLAUDE_HOOK_COMMANDS
+        .iter()
+        .map(|suffix| format!("claude-{suffix}"))
+        .collect();
+    let prefixed: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+    if crate::hooks::runtime::is_hcom_command(command, CLAUDE_HOOK_COMMANDS)
+        || crate::hooks::runtime::is_hcom_command(command, &prefixed)
+    {
+        return true;
+    }
     // Env var patterns: ${HCOM} or %HCOM%
     if command.contains("${HCOM}")
         || command.contains("$HCOM")
@@ -3131,6 +3141,9 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
 /// A missing file is fine; an unreadable or malformed one is an error (left
 /// untouched), and the file is only rewritten when something was removed.
 fn remove_hooks_at(path: &Path) -> Result<()> {
+    if !crate::runtime_env::hook_cleanup_allowed(path) {
+        return Ok(());
+    }
     let unreadable = || runtime::LegacyFile::read(path, runtime::FIX_REMOVE_HCOM_HOOKS);
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
@@ -4114,6 +4127,14 @@ mod tests {
 
     #[test]
     fn test_is_hcom_hook_command() {
+        assert!(is_hcom_hook_command(
+            r#"& 'C:\Program Files\hcom.exe' claude-sessionstart"#
+        ));
+        assert!(is_hcom_hook_command(r#""C:/dev/hcom.exe" post"#));
+        assert!(!is_hcom_hook_command("other-hcom.exe post"));
+        assert!(!is_hcom_hook_command(
+            r#"echo "hcom.exe claude-sessionstart""#
+        ));
         assert!(is_hcom_hook_command("${HCOM} sessionstart"));
         assert!(is_hcom_hook_command("${HCOM} post"));
         assert!(is_hcom_hook_command("hcom sessionstart"));

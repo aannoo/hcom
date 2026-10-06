@@ -147,6 +147,26 @@ pub fn is_per_run(tool: Tool) -> bool {
     adapter(tool).is_some()
 }
 
+/// Recognize direct and shell-quoted hcom executable paths without claiming
+/// another program that happens to use the same hook argument.
+pub fn is_hcom_command(command: &str, suffixes: &[&str]) -> bool {
+    static COMMAND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^\s*(?:&\s+)?(?:uvx\s+)?(?:"([^"]+)"|'([^']+)'|([^\s]+))\s+([^\s]+)\s*$"#,
+        )
+        .unwrap()
+    });
+    let Some(parts) = COMMAND.captures(command) else {
+        return false;
+    };
+    let executable = (1..=3).find_map(|index| parts.get(index)).unwrap().as_str();
+    let basename = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    ["hcom", "hcom.exe", "hcom.py"]
+        .iter()
+        .any(|name| basename.eq_ignore_ascii_case(name))
+        && suffixes.contains(&parts.get(4).unwrap().as_str())
+}
+
 /// How a tool gets hcom's hooks. Static per tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookMode {
@@ -319,6 +339,7 @@ pub fn remove_owned_files(
 ) -> Result<()> {
     let errors = paths
         .into_iter()
+        .filter(|path| crate::runtime_env::hook_cleanup_allowed(path))
         .filter_map(|path| remove_owned_file(&path, &owned).err())
         .collect();
     collect_errors(errors)

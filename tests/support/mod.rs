@@ -182,6 +182,7 @@ fn apply_isolated_env_ctx(
         command.env("TMP", ctx.root_path.join("tmp"));
     }
     command.env("HCOM_DIR", &ctx.hcom_dir);
+    command.env("HCOM_TEST_ROOT", &ctx.root_path);
     command.env("TMPDIR", ctx.root_path.join("tmp"));
     command.env("XDG_CONFIG_HOME", ctx.root_path.join("xdg/config"));
     command.env("XDG_CACHE_HOME", ctx.root_path.join("xdg/cache"));
@@ -467,6 +468,7 @@ impl Hcom {
     pub fn cmd(&self) -> Command {
         let mut command = Command::new(&self.bin);
         self.apply_isolated_env(&mut command);
+        command.current_dir(&self.workspace);
         command
     }
 

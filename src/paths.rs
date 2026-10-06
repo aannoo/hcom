@@ -59,8 +59,7 @@ pub fn resolve_hcom_dir_from_env(env: &HashMap<String, String>, cwd: &Path) -> (
 /// suffix cannot be resolved on the filesystem here, so it is rejected outright
 /// rather than folded lexically — otherwise `<tmp>/nope/../../etc` would
 /// spuriously appear to sit under the temp prefix.
-#[cfg(test)]
-fn resolve_deepest_existing(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_deepest_existing(path: &Path) -> Option<PathBuf> {
     let mut current = path;
     loop {
         if let Ok(existing) = current.canonicalize() {
