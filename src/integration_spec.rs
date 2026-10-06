@@ -447,7 +447,13 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &[],
+    // Set in Claude's Bash tool for the parent session. CHILD_SESSION turns
+    // off transcript saving, which would break resume, fork and lineage.
+    instance_state_env: &[
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+    ],
     hooks: HooksSpec {
         names: CLAUDE_HOOKS,
         shared_hooks_with: None,

@@ -997,6 +997,12 @@ pub fn create_bash_script(
     // Unset tool markers and identity vars to prevent inheritance
     writeln!(f, "unset {}", tool_marker_vars().join(" "))?;
     writeln!(f, "unset {}", HCOM_IDENTITY_VARS.join(" "))?;
+    if let Some(tool) = tool_id.and_then(|id| id.parse::<crate::tool::Tool>().ok()) {
+        let vars = tool.spec().instance_state_env;
+        if !vars.is_empty() {
+            writeln!(f, "unset {}", vars.join(" "))?;
+        }
+    }
 
     // Discover paths for minimal environments (kitty splits, etc.)
     let mut paths_to_add: Vec<String> = Vec::new();
@@ -1163,9 +1169,14 @@ pub fn create_powershell_script(
 
     // Scrub inherited tool markers and identity vars so the child can't inherit
     // them (PowerShell ignores Env: entries that don't exist).
+    let instance_state_env = tool_id
+        .and_then(|id| id.parse::<crate::tool::Tool>().ok())
+        .map(|tool| tool.spec().instance_state_env)
+        .unwrap_or(&[]);
     let scrub: Vec<String> = tool_marker_vars()
         .iter()
         .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(instance_state_env.iter())
         .map(|v| format!("Env:{v}"))
         .collect();
     writeln!(
@@ -3006,6 +3017,28 @@ mod tests {
                 "$env:ZED = 'z'".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn native_claude_scripts_strip_parent_session_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let bash = tmp.path().join("launch.sh");
+        create_bash_script(&bash, &env, None, "true", true, Some("claude"), false).unwrap();
+        let ps = tmp.path().join("launch.ps1");
+        create_powershell_script(&ps, &env, None, "true", true, Some("claude"), false).unwrap();
+        for var in crate::integration_spec::CLAUDE.instance_state_env {
+            assert!(
+                std::fs::read_to_string(&bash)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line.starts_with("unset ")
+                        && line.split_whitespace().any(|word| word == *var))
+            );
+            assert!(std::fs::read_to_string(&ps).unwrap().lines().any(|line| {
+                line.starts_with("Remove-Item ") && line.contains(&format!("Env:{var}"))
+            }));
+        }
     }
 
     #[test]
