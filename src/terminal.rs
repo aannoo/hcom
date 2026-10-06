@@ -863,6 +863,93 @@ fn splice_kitten_to_socket(argv: &mut Vec<String>, kitty_socket: &str) {
     }
 }
 
+/// Target the launcher's WezTerm tab and, for splits, choose placement.
+///
+/// The launcher env strips `$WEZTERM_PANE`, and without it `wezterm cli`
+/// falls back to whichever pane is focused, so agents would land in an
+/// unrelated tab. Pin `--pane-id` explicitly.
+///
+/// WezTerm has no layout engine (unlike kitty's `--type=window`), so for
+/// `split-pane` split the largest pane in the launcher's tab along its longer
+/// axis. Repeated launches then tile into an even grid instead of each new
+/// pane halving the same space. User-supplied target/direction flags win.
+fn splice_wezterm_target(
+    argv: &mut Vec<String>,
+    launcher_pane: &str,
+    list_panes: impl FnOnce() -> Option<String>,
+) {
+    let is_wezterm = argv
+        .first()
+        .and_then(|a| Path::new(a).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("wezterm"));
+    if !is_wezterm || argv.get(1).map(String::as_str) != Some("cli") {
+        return;
+    }
+    let sep = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let has_flag = |flags: &[&str]| argv[..sep].iter().any(|a| flags.contains(&a.as_str()));
+    match argv.get(2).map(String::as_str) {
+        Some("spawn") if !has_flag(&["--pane-id", "--window-id", "--new-window"]) => {
+            argv.splice(3..3, ["--pane-id".to_string(), launcher_pane.to_string()]);
+        }
+        Some("split-pane") if !has_flag(&["--pane-id"]) => {
+            let directed = has_flag(&[
+                "--top-level",
+                "--left",
+                "--right",
+                "--top",
+                "--bottom",
+                "--horizontal",
+            ]);
+            let (pane, dir) = if directed {
+                (launcher_pane.to_string(), None)
+            } else {
+                list_panes()
+                    .and_then(|json| pick_wezterm_split(&json, launcher_pane))
+                    .map(|(pane, dir)| (pane, Some(dir)))
+                    .unwrap_or_else(|| (launcher_pane.to_string(), Some("--right")))
+            };
+            let mut args = vec!["--pane-id".to_string(), pane];
+            args.extend(dir.map(String::from));
+            argv.splice(3..3, args);
+        }
+        _ => {}
+    }
+}
+
+fn wezterm_list_panes() -> Option<String> {
+    let out = Command::new("wezterm")
+        .args(["cli", "list", "--format", "json"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// From `wezterm cli list --format json`, pick the largest pane in the
+/// launcher's tab and the split direction along its longer side.
+fn pick_wezterm_split(json: &str, launcher_pane: &str) -> Option<(String, &'static str)> {
+    let panes: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let pane_id = |p: &serde_json::Value| p["pane_id"].as_u64().map(|id| id.to_string());
+    let tab = panes
+        .iter()
+        .find(|p| pane_id(p).as_deref() == Some(launcher_pane))?["tab_id"]
+        .as_u64()?;
+    let dim = |p: &serde_json::Value, k: &str| p["size"][k].as_u64().unwrap_or(0);
+    let target = panes
+        .iter()
+        .filter(|p| p["tab_id"].as_u64() == Some(tab))
+        .max_by_key(|p| dim(p, "cols") * dim(p, "rows"))?;
+    let (pw, ph) = (dim(target, "pixel_width"), dim(target, "pixel_height"));
+    // Cells are roughly twice as tall as wide when pixel size is unknown.
+    let wide = if pw > 0 && ph > 0 {
+        pw >= ph
+    } else {
+        dim(target, "cols") >= dim(target, "rows") * 2
+    };
+    Some((pane_id(target)?, if wide { "--right" } else { "--bottom" }))
+}
+
 /// Get terminal presets for current platform with availability status.
 pub fn get_available_presets() -> Vec<(String, bool)> {
     let mut result = vec![("default".to_string(), true)];
@@ -2218,6 +2305,12 @@ pub fn launch_terminal(
                 ["--match".to_string(), format!("window_id:{wid}")],
             );
         }
+        if (terminal_mode == "wezterm-tab" || terminal_mode == "wezterm-split")
+            && let Ok(pane) = std::env::var("WEZTERM_PANE")
+            && !pane.is_empty()
+        {
+            splice_wezterm_target(&mut argv, &pane, wezterm_list_panes);
+        }
         Some(argv)
     } else {
         // Custom command template string (HCOM_TERMINAL / config custom command).
@@ -3348,6 +3441,67 @@ mod tests {
                 "ls".to_string(),
             ]
         );
+    }
+
+    fn wez_pane(pane: u64, tab: u64, cols: u64, rows: u64) -> String {
+        format!(
+            r#"{{"pane_id":{pane},"tab_id":{tab},"size":{{"cols":{cols},"rows":{rows},"pixel_width":0,"pixel_height":0}}}}"#
+        )
+    }
+
+    #[test]
+    fn test_pick_wezterm_split_largest_pane_in_launcher_tab() {
+        let json = format!(
+            "[{},{},{},{}]",
+            wez_pane(1, 0, 400, 100), // other tab, biggest overall
+            wez_pane(5, 7, 90, 50),
+            wez_pane(6, 7, 100, 25),
+            wez_pane(8, 7, 100, 25),
+        );
+        // 90x50 cells is taller than wide in pixels → split below.
+        assert_eq!(
+            pick_wezterm_split(&json, "6"),
+            Some(("5".to_string(), "--bottom"))
+        );
+        let json = format!("[{}]", wez_pane(5, 7, 200, 50));
+        assert_eq!(
+            pick_wezterm_split(&json, "5"),
+            Some(("5".to_string(), "--right"))
+        );
+        assert_eq!(pick_wezterm_split(&json, "99"), None);
+    }
+
+    #[test]
+    fn test_splice_wezterm_target() {
+        let base = |sub: &str, extra: &[&str]| -> Vec<String> {
+            let mut v = vec!["wezterm", "cli", sub];
+            v.extend(extra);
+            v.extend(["--", "bash", "s.sh"]);
+            v.into_iter().map(String::from).collect()
+        };
+        let json = format!("[{},{}]", wez_pane(3, 1, 200, 50), wez_pane(4, 1, 50, 50));
+
+        let mut argv = base("split-pane", &[]);
+        splice_wezterm_target(&mut argv, "4", || Some(json.clone()));
+        assert_eq!(argv, base("split-pane", &["--pane-id", "3", "--right"]));
+
+        // List failure: split the launcher pane.
+        let mut argv = base("split-pane", &[]);
+        splice_wezterm_target(&mut argv, "4", || None);
+        assert_eq!(argv, base("split-pane", &["--pane-id", "4", "--right"]));
+
+        // User direction kept, launcher pinned, no listing.
+        let mut argv = base("split-pane", &["--bottom"]);
+        splice_wezterm_target(&mut argv, "4", || panic!("should not list"));
+        assert_eq!(argv, base("split-pane", &["--pane-id", "4", "--bottom"]));
+
+        let mut argv = base("spawn", &[]);
+        splice_wezterm_target(&mut argv, "4", || panic!("should not list"));
+        assert_eq!(argv, base("spawn", &["--pane-id", "4"]));
+
+        let mut argv = base("spawn", &["--new-window"]);
+        splice_wezterm_target(&mut argv, "4", || None);
+        assert_eq!(argv, base("spawn", &["--new-window"]));
     }
 
     #[test]

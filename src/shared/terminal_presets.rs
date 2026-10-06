@@ -479,22 +479,11 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 Some("wezterm"),
                 Some("WezTerm"),
                 argv_win(
+                    &["wezterm", "cli", "split-pane", "--", "bash", "{script}"],
                     &[
                         "wezterm",
                         "cli",
                         "split-pane",
-                        "--top-level",
-                        "--right",
-                        "--",
-                        "bash",
-                        "{script}",
-                    ],
-                    &[
-                        "wezterm",
-                        "cli",
-                        "split-pane",
-                        "--top-level",
-                        "--right",
                         "--",
                         "powershell",
                         "-ExecutionPolicy",
