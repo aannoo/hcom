@@ -279,10 +279,10 @@ impl Proxy {
         // the ordering below still matches the Unix proxy). The reader breaks
         // its loop on PTY EOF (Ok(0)), not on `running`, so the child having
         // exited is enough for it to wind down — no stop signal is needed first.
-        // It writes last_tail only at that EOF, and on Windows the ConPTY pipe
-        // can signal EOF after `child.wait()` already returned; without the join
-        // we could read last_tail while it is still None and emit a launch
-        // failure with an empty PTY tail. Joining first closes that race.
+        // It refreshes last_tail when launch output goes quiet and again at that
+        // EOF; the ConPTY pipe can signal EOF after `child.wait()` returned (or
+        // not until the pseudoconsole closes), so joining first lets a final
+        // EOF capture land before we read it.
         //
         // Bounded join: the ConPTY pipe only reaches EOF once *every* process
         // holding the slave handle exits. If the child spawned a grandchild that
@@ -486,9 +486,10 @@ impl Proxy {
     /// changes.
     ///
     /// Returns the thread's `JoinHandle` so `run()` can join it after the child
-    /// exits and before reading `last_tail` — the reader writes `last_tail` only
-    /// at PTY EOF (`Ok(0)`), which on Windows can lag the child's exit, so the
-    /// join is what guarantees the launch-failure tail is populated.
+    /// exits and before reading `last_tail`. During the launch phase the reader
+    /// writes `last_tail` whenever output goes quiet, and again at PTY EOF;
+    /// ConPTY may not reach EOF until the pseudoconsole closes, so the quiet-
+    /// period capture is what usually supplies the launch-failure tail.
     ///
     /// Returns `Err` if the ConPTY reader can't be cloned (or the master mutex is
     /// poisoned): without a reader there is no screen tracking, no delivery
@@ -593,6 +594,11 @@ impl Proxy {
             const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(120);
             let mut last_snapshot = Instant::now();
             let mut dirty = false;
+            // Launch-failure tail, captured once output goes quiet. ConPTY keeps
+            // the output pipe open after the child exits (until the pseudoconsole
+            // is closed), so waiting for EOF to capture it loses the race with
+            // run()'s bounded reader join — and with it the tool's error text.
+            let mut tail_stale = false;
             let refresh = |screen: &ScreenTracker| {
                 if let Ok(mut s) = screen_snapshot.write() {
                     *s = screen.get_screen_dump(target.name(), inject_port);
@@ -611,6 +617,12 @@ impl Proxy {
                             refresh(&screen);
                             last_snapshot = Instant::now();
                             dirty = false;
+                        }
+                        if tail_stale && launch_phase.load(Ordering::Acquire) {
+                            if let Ok(mut g) = last_tail.write() {
+                                *g = screen.visible_tail(8, 1000);
+                            }
+                            tail_stale = false;
                         }
                         // Mirror the Unix poll loop's idle-path hooks (src/pty/mod.rs):
                         // without this, `update_delivery_state` on Windows only ever
@@ -723,6 +735,7 @@ impl Proxy {
                         } else {
                             dirty = true;
                         }
+                        tail_stale = true;
 
                         shared::update_delivery_state(
                             &screen_state,

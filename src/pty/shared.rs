@@ -687,9 +687,12 @@ fn finalize_launch_failure_with_db(
     // In that case EXIT_WAS_KILLED stays false, and kill may already have
     // deleted the row. Use the launch's event cursor to recognize its stop
     // without confusing a previous incarnation's kill with a resume failure.
-    let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok());
+    // HCOM_LAUNCH_EVENT_ID is a resume's inherited message cursor, older than
+    // that kill, so it only serves as a fallback for launchers predating
+    // HCOM_LAUNCH_START_EVENT_ID.
+    let launch_event_id = ["HCOM_LAUNCH_START_EVENT_ID", "HCOM_LAUNCH_EVENT_ID"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok()?.parse::<i64>().ok());
     if instance
         .as_ref()
         .is_some_and(|instance| instance.status_context == "exit:killed")
@@ -1298,6 +1301,72 @@ mod tests {
         ));
         assert!(!launch_was_killed(&db, "nova", Some(cursor)));
         assert!(!launch_was_killed(&db, "luna", None));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_after_kill_still_reports_its_own_failure() {
+        // `hcom kill luna` then `hcom r luna`: the resume inherits luna's
+        // message cursor, which predates the kill. That old kill must not
+        // swallow the resumed tool's missing-session error.
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let mut db = HcomDb::open_at(&hcom_dir.join("test.db")).unwrap();
+        let resume_cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "luna",
+            &serde_json::json!({"action": "stopped", "by": "cli", "reason": "killed"}),
+        )
+        .unwrap();
+        let launch_start = db.get_last_event_id();
+        db.save_instance_named(
+            "luna",
+            &serde_json::Map::from_iter([
+                ("tool".into(), serde_json::json!("pi")),
+                ("session_id".into(), serde_json::json!("never-saved")),
+                ("status".into(), serde_json::json!("inactive")),
+                ("status_context".into(), serde_json::json!("new")),
+                ("created_at".into(), serde_json::json!(1.0)),
+            ]),
+        )
+        .unwrap();
+
+        const KEYS: [&str; 2] = ["HCOM_LAUNCH_EVENT_ID", "HCOM_LAUNCH_START_EVENT_ID"];
+        let saved: Vec<_> = KEYS.iter().map(std::env::var_os).collect();
+        unsafe {
+            std::env::set_var(KEYS[0], resume_cursor.to_string());
+            std::env::set_var(KEYS[1], launch_start.to_string());
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        finalize_launch_failure_with_db(
+            &mut db,
+            "luna",
+            Some("No session found matching 'never-saved'"),
+            &active,
+            Duration::from_secs(1),
+            1,
+            true,
+        );
+        for (key, value) in KEYS.iter().zip(saved) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+
+        let detail: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.detail') FROM events
+                 WHERE instance = 'luna' AND json_extract(data, '$.action') = 'launch_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(detail.contains(
+            "PTY output:
+No session found matching 'never-saved'"
+        ));
     }
 
     #[test]

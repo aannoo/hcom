@@ -1995,13 +1995,19 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     for _ in 0..params.count {
         let mut instance_env = base_env.clone();
-        let initial_event_id = params
-            .resume_cursor
-            .unwrap_or_else(|| db.get_last_event_id());
+        // A resume's message cursor predates its previous incarnation's
+        // events (e.g. the kill that stopped it), so "did this launch get
+        // killed" needs its own marker for where this launch began.
+        let launch_start_event_id = db.get_last_event_id();
+        let initial_event_id = params.resume_cursor.unwrap_or(launch_start_event_id);
         instance_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
         instance_env.insert(
             "HCOM_LAUNCH_EVENT_ID".to_string(),
             initial_event_id.to_string(),
+        );
+        instance_env.insert(
+            "HCOM_LAUNCH_START_EVENT_ID".to_string(),
+            launch_start_event_id.to_string(),
         );
         instance_env.insert("HCOM_LAUNCHED_BY".to_string(), launcher_name.to_string());
         instance_env.insert("HCOM_LAUNCH_BATCH_ID".to_string(), batch_id.clone());

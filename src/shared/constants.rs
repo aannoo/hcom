@@ -56,6 +56,7 @@ pub const HCOM_IDENTITY_VARS: &[&str] = &[
     "HCOM_LAUNCHED_BY",
     "HCOM_LAUNCH_BATCH_ID",
     "HCOM_LAUNCH_EVENT_ID",
+    "HCOM_LAUNCH_START_EVENT_ID",
 ];
 
 pub const ST_ACTIVE: &str = "active";
