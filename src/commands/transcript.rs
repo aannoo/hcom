@@ -302,7 +302,7 @@ fn resolve_remote_instance_name(db: &HcomDb, base_name: &str) -> Option<String> 
 }
 
 /// Get exchanges from a transcript file using the shared transcript module.
-fn get_exchanges(
+pub(crate) fn get_exchanges(
     path: &str,
     agent: &str,
     last: usize,
@@ -1196,8 +1196,10 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
     );
 
     let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
-    let formatted = format_exchanges(&owned, &instance_name, full_mode, detailed);
-    println!("{formatted}");
+    println!("{}", format_exchanges(&owned, full_mode, detailed));
+    if let Some(hint) = transcript::flag_hint(full_mode, detailed) {
+        println!("{hint}");
+    }
 
     0
 }
@@ -1397,7 +1399,11 @@ fn render_instance_transcript_impl(
     let first_pos = filtered.first().map(|e| e.position).unwrap_or(1);
     let last_pos = filtered.last().map(|e| e.position).unwrap_or(1);
     let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
-    let formatted = format_exchanges(&owned, &instance_name, opts.full_mode, opts.detailed);
+    let mut formatted = format_exchanges(&owned, opts.full_mode, opts.detailed);
+    if let Some(hint) = transcript::flag_hint(opts.full_mode, opts.detailed) {
+        formatted.push('\n');
+        formatted.push_str(hint);
+    }
     Ok(format!(
         "Recent conversation ({} exchanges, {}-{} of {}) - @{}:\n\n{}",
         owned.len(),
@@ -1409,6 +1415,39 @@ fn render_instance_transcript_impl(
     ))
 }
 
+/// Transcript `(path, tool, session_id)` for an exact agent name: the live row,
+/// else the agent's last stopped snapshot. A live row without a transcript is
+/// authoritative (None) rather than falling back to an older session.
+pub(crate) fn exact_instance_transcript(
+    db: &HcomDb,
+    name: &str,
+) -> Option<(String, String, Option<String>)> {
+    match db.get_instance_full(name) {
+        Ok(Some(instance)) if !instance.transcript_path.is_empty() => {
+            return Some((instance.transcript_path, instance.tool, instance.session_id));
+        }
+        Ok(Some(_)) | Err(_) => return None,
+        Ok(None) => {}
+    }
+
+    let (path, tool, sid) = db
+        .conn()
+        .query_row(
+            "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()?;
+    let tool = tool.unwrap_or_else(|| detect_agent_type(&path).to_string());
+    Some((path, tool, sid))
+}
+
 /// Resolve instance name to (name, transcript_path, agent_type, session_id).
 fn resolve_instance_transcript(
     db: &HcomDb,
@@ -1418,29 +1457,8 @@ fn resolve_instance_transcript(
     // transcript. Only infer a prefix when no exact identity exists; otherwise
     // a transcript-bearing longer name can disclose the wrong conversation.
     if let Some(exact_name) = crate::identity::resolve_display_name_or_stopped(db, name) {
-        match db.get_instance_full(&exact_name) {
-            Ok(Some(instance)) if !instance.transcript_path.is_empty() => {
-                return Some((
-                    exact_name,
-                    instance.transcript_path,
-                    instance.tool,
-                    instance.session_id,
-                ));
-            }
-            Ok(Some(_)) | Err(_) => return None,
-            Ok(None) => {}
-        }
-
-        if let Ok((path, sid)) = db.conn().query_row(
-            "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
-            rusqlite::params![&exact_name],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        ) {
-            let agent = detect_agent_type(&path).to_string();
-            return Some((exact_name, path, agent, sid));
-        }
-
-        return None;
+        return exact_instance_transcript(db, &exact_name)
+            .map(|(path, tool, sid)| (exact_name, path, tool, sid));
     }
 
     // Prefix match (literal matching; only an unambiguous single match returns immediately)

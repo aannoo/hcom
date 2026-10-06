@@ -432,12 +432,7 @@ pub(crate) fn read_file_lossy(path: &Path) -> Result<String, String> {
 // ── Formatting (Exchange → String) ───────────────────────────────────────
 
 /// Format exchanges for display.
-pub fn format_exchanges(
-    exchanges: &[Exchange],
-    _instance: &str,
-    full: bool,
-    detailed: bool,
-) -> String {
+pub fn format_exchanges(exchanges: &[Exchange], full: bool, detailed: bool) -> String {
     let mut lines = Vec::new();
 
     for ex in exchanges {
@@ -530,25 +525,21 @@ pub fn format_exchanges(
         lines.push(String::new()); // blank line between exchanges
     }
 
-    // Trailing hint
-    if !exchanges.is_empty() {
-        match (full, detailed) {
-            (false, false) => lines.push(
-                "Note: Conversation text truncated. Use --full for full text; use --detailed for tool outputs, file edits, and errors."
-                    .to_string(),
-            ),
-            (false, true) => lines.push(
-                "Note: Conversation text truncated. Use --full for full text.".to_string(),
-            ),
-            (true, false) => lines.push(
-                "Note: Tool outputs, file edits, and errors hidden. Use --detailed to show them."
-                    .to_string(),
-            ),
-            (true, true) => {}
-        }
-    }
-
     lines.join("\n")
+}
+
+/// `hcom transcript` footer pointing at the flags that reveal what was elided.
+pub fn flag_hint(full: bool, detailed: bool) -> Option<&'static str> {
+    match (full, detailed) {
+        (false, false) => Some(
+            "Note: Conversation text truncated. Use --full for full text; use --detailed for tool outputs, file edits, and errors.",
+        ),
+        (false, true) => Some("Note: Conversation text truncated. Use --full for full text."),
+        (true, false) => {
+            Some("Note: Tool outputs, file edits, and errors hidden. Use --detailed to show them.")
+        }
+        (true, true) => None,
+    }
 }
 
 fn single_line_ellipsized(text: &str, max: usize) -> String {
@@ -619,19 +610,21 @@ mod tests {
     }
 
     #[test]
-    fn detailed_renders_outputs_edits_errors_and_no_active_flag_hint() {
-        let rendered = format_exchanges(&[exchange()], "agent", true, true);
+    fn detailed_renders_outputs_edits_errors() {
+        let rendered = format_exchanges(&[exchange()], true, true);
         assert!(rendered.contains("OUTPUT: line one line two"));
         assert!(rendered.contains("Δ EDIT a.rs: -old +new"));
         assert!(rendered.contains("✗ ERROR Bash: exit 1"));
-        assert!(!rendered.contains("Use --detailed"));
+        assert!(!rendered.contains("Note:"));
     }
 
     #[test]
-    fn detailed_without_full_only_hints_about_conversation_text() {
-        let rendered = format_exchanges(&[exchange()], "agent", false, true);
-        assert!(rendered.contains("Use --full for full text"));
-        assert!(!rendered.contains("Use --detailed"));
+    fn flag_hint_names_only_flags_not_already_active() {
+        assert_eq!(flag_hint(true, true), None);
+        let detailed_only = flag_hint(false, true).unwrap();
+        assert!(detailed_only.contains("Use --full"));
+        assert!(!detailed_only.contains("--detailed"));
+        assert!(!flag_hint(true, false).unwrap().contains("--full"));
     }
 
     #[test]
@@ -645,7 +638,7 @@ mod tests {
             command: None,
             output: Some(String::new()),
         });
-        let rendered = format_exchanges(&[ex], "agent", true, true);
+        let rendered = format_exchanges(&[ex], true, true);
         assert!(!rendered.contains("OUTPUT: (empty)"));
         assert!(!rendered.contains("OUTPUT: exit 1"));
         assert_eq!(rendered.matches("ERROR Bash: exit 1").count(), 1);

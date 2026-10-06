@@ -13,70 +13,14 @@ use crate::core::filters::FILE_WRITE_CONTEXTS;
 use crate::db::HcomDb;
 use crate::shared::{CommandContext, SenderKind};
 
-// Re-use transcript parsing for bundle prepare/cat (C5 fix)
-use crate::transcript::{TranscriptQuery, format_exchanges_pub, get_exchanges_pub};
+use crate::commands::transcript::{exact_instance_transcript, get_exchanges};
+use crate::transcript::{Exchange, format_exchanges};
 
 fn file_operations_query() -> String {
     format!(
         "SELECT id, timestamp, instance, data FROM events WHERE type = 'status' AND instance = ?1 AND (status_context IN {ctx} OR status_context LIKE 'tool:%' AND status_detail LIKE '/%') ORDER BY id DESC LIMIT ?2",
         ctx = FILE_WRITE_CONTEXTS
     )
-}
-
-/// `(transcript_path, tool, session_id)` for a bundle target.
-type BundleTranscriptSource = (Option<String>, String, Option<String>);
-
-fn lookup_bundle_transcript_source(
-    db: &HcomDb,
-    agent: &str,
-) -> Result<Option<BundleTranscriptSource>, String> {
-    match db.conn().query_row(
-        "SELECT transcript_path, tool, session_id FROM instances WHERE name = ?",
-        rusqlite::params![agent],
-        |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        },
-    ) {
-        Ok(source) => return Ok(Some(source)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => {}
-        Err(e) => {
-            return Err(format!(
-                "Failed to read transcript metadata for active agent '{agent}': {e}"
-            ));
-        }
-    }
-
-    match db.conn().query_row(
-        "SELECT
-            json_extract(data, '$.snapshot.transcript_path'),
-            json_extract(data, '$.snapshot.tool'),
-            json_extract(data, '$.snapshot.session_id')
-         FROM events
-         WHERE type = 'life'
-           AND instance = ?
-           AND json_extract(data, '$.action') = 'stopped'
-           AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL
-         ORDER BY id DESC
-         LIMIT 1",
-        rusqlite::params![agent],
-        |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        },
-    ) {
-        Ok(source) => Ok(Some(source)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(format!(
-            "Failed to read transcript metadata for stopped agent '{agent}': {e}"
-        )),
-    }
 }
 
 /// Parsed arguments for `hcom bundle`.
@@ -542,138 +486,94 @@ fn cmd_bundle_cat(db: &HcomDb, args: &BundleCatArgs) -> i32 {
             }
         }
 
-        // Transcript section (C5 fix: actually display transcript content)
         if let Some(transcript) = refs.get("transcript").and_then(|v| v.as_array()) {
             let sep = "━".repeat(80);
             println!("\n{sep}");
             println!("TRANSCRIPT ({} entries)", transcript.len());
             println!("{sep}\n");
-
-            // Get transcript path from instance data
-            let transcript_path: Option<String> = db
-                .conn()
-                .query_row(
-                    "SELECT transcript_path FROM instances WHERE name = ?",
-                    rusqlite::params![created_by],
-                    |row| row.get(0),
-                )
-                .ok();
-            let (tool, session_id): (String, Option<String>) = db
-                .conn()
-                .query_row(
-                    "SELECT tool, session_id FROM instances WHERE name = ?",
-                    rusqlite::params![created_by],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                )
-                .unwrap_or_else(|_| ("claude".into(), None));
-
-            if let Some(ref tpath) = transcript_path {
-                if Path::new(tpath).exists() {
-                    for tref in transcript {
-                        let parsed = bundles::parse_transcript_ref(tref);
-                        match parsed {
-                            Ok(ref_data) => {
-                                let range =
-                                    ref_data.get("range").and_then(|v| v.as_str()).unwrap_or("");
-                                let detail = ref_data
-                                    .get("detail")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("normal");
-                                let full = detail == "full" || detail == "detailed";
-                                let detailed = detail == "detailed";
-
-                                println!("--- Transcript [{range}] ({detail}) ---\n");
-
-                                // Parse range and get exchanges
-                                let (start, end) = if range.contains('-') {
-                                    let parts: Vec<&str> = range.splitn(2, '-').collect();
-                                    let s = parts[0].parse::<usize>().unwrap_or(1);
-                                    let e = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(s);
-                                    (s, e)
-                                } else {
-                                    let pos = range.parse::<usize>().unwrap_or(1);
-                                    (pos, pos)
-                                };
-
-                                // Get exchanges and filter to requested range
-                                match get_exchanges_pub(&TranscriptQuery {
-                                    path: tpath,
-                                    agent: &tool,
-                                    last: usize::MAX,
-                                    detailed,
-                                    session_id: session_id.as_deref(),
-                                }) {
-                                    Ok(exchanges) => {
-                                        let filtered: Vec<&Value> = exchanges
-                                            .iter()
-                                            .filter(|e| {
-                                                let pos = e
-                                                    .get("position")
-                                                    .and_then(|v| v.as_u64())
-                                                    .unwrap_or(0)
-                                                    as usize;
-                                                pos >= start && pos <= end
-                                            })
-                                            .collect();
-                                        for ex in &filtered {
-                                            let pos = ex
-                                                .get("position")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0);
-                                            let user = ex
-                                                .get("user")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            let action = ex
-                                                .get("action")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            let user_disp = if full || user.len() <= 300 {
-                                                user.to_string()
-                                            } else {
-                                                let trunc_end = (0..=297)
-                                                    .rev()
-                                                    .find(|&i| user.is_char_boundary(i))
-                                                    .unwrap_or(0);
-                                                format!("{}...", &user[..trunc_end])
-                                            };
-                                            let action_disp = if full {
-                                                action.to_string()
-                                            } else if action.len() > 200 {
-                                                let trunc_end = (0..=197)
-                                                    .rev()
-                                                    .find(|&i| action.is_char_boundary(i))
-                                                    .unwrap_or(0);
-                                                format!("{}...", &action[..trunc_end])
-                                            } else {
-                                                action.to_string()
-                                            };
-                                            println!(
-                                                "#{pos}\n  User: {user_disp}\n  Action: {action_disp}\n"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => println!("Error reading transcript: {e}"),
-                                }
-                            }
-                            Err(e) => {
-                                println!("  (invalid ref: {e})");
-                            }
-                        }
-                    }
-                } else {
-                    println!("Transcript unavailable: file not found");
-                }
-            } else {
-                println!(
-                    "Transcript unavailable: agent '{}' not found or has no transcript",
-                    created_by
-                );
-            }
+            print_bundle_transcript(db, created_by, transcript);
         }
     }
 
     0
+}
+
+/// Render each `range:detail` transcript ref against the creator's transcript.
+fn print_bundle_transcript(db: &HcomDb, created_by: &str, refs: &[Value]) {
+    let Some((path, tool, session_id)) = exact_instance_transcript(db, created_by) else {
+        println!("Transcript unavailable: agent '{created_by}' not found or has no transcript");
+        return;
+    };
+    if !Path::new(&path).exists() {
+        println!("Transcript unavailable: {path} not found");
+        return;
+    }
+
+    // Parsed once per detail mode: [normal/full, detailed].
+    let mut cache: [Option<Result<Vec<Exchange>, String>>; 2] = [None, None];
+    for tref in refs {
+        let ref_data = match bundles::parse_transcript_ref(tref) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  (invalid ref: {e})");
+                continue;
+            }
+        };
+        let range = ref_data.get("range").and_then(|v| v.as_str()).unwrap_or("");
+        let detail = ref_data
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("normal");
+        let full = detail == "full" || detail == "detailed";
+        let detailed = detail == "detailed";
+
+        println!("--- Transcript [{range}] ({detail}) ---\n");
+
+        let Some((start, end)) = parse_exchange_range(range) else {
+            println!("  (invalid range: {range})\n");
+            continue;
+        };
+        let exchanges = cache[detailed as usize].get_or_insert_with(|| {
+            get_exchanges(
+                &path,
+                &tool,
+                usize::MAX,
+                detailed,
+                session_id.as_deref(),
+                true,
+            )
+        });
+        match exchanges {
+            Ok(all) => {
+                let selected: Vec<Exchange> = all
+                    .iter()
+                    .filter(|e| e.position >= start && e.position <= end)
+                    .cloned()
+                    .collect();
+                if selected.is_empty() {
+                    println!(
+                        "  (no exchanges in range; transcript has {} exchanges)\n",
+                        all.len()
+                    );
+                } else {
+                    println!("{}", format_exchanges(&selected, full, detailed));
+                }
+            }
+            Err(e) => println!("Error reading transcript: {e}\n"),
+        }
+    }
+}
+
+/// Parse `N` or `N-M` (1-based, inclusive).
+fn parse_exchange_range(range: &str) -> Option<(usize, usize)> {
+    let (start, end) = match range.split_once('-') {
+        Some((s, e)) => (s.trim().parse().ok()?, e.trim().parse().ok()?),
+        None => {
+            let pos = range.trim().parse().ok()?;
+            (pos, pos)
+        }
+    };
+    (start >= 1 && start <= end).then_some((start, end))
 }
 
 /// Chain: `hcom bundle chain <id> [--json]`
@@ -755,25 +655,85 @@ fn cmd_bundle_chain(db: &HcomDb, args: &BundleChainArgs) -> i32 {
     0
 }
 
+/// One prepare event category: (display label, JSON key, rows `(id, timestamp, instance, data)`).
+type EventCategory = (
+    &'static str,
+    &'static str,
+    Vec<(i64, String, String, Value)>,
+);
+
+/// Recent events touching `agent`, newest first, `limit` per category.
+fn bundle_event_categories(db: &HcomDb, agent: &str, limit: usize) -> Vec<EventCategory> {
+    let queries: [(&str, &str, String); 4] = [
+        (
+            "Messages to",
+            "messages_to",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
+        ),
+        (
+            "Messages from",
+            "messages_from",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2".to_string(),
+        ),
+        ("File operations", "file_operations", file_operations_query()),
+        (
+            "Lifecycle",
+            "lifecycle",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
+        ),
+    ];
+
+    queries
+        .into_iter()
+        .map(|(label, key, query)| {
+            let rows = db
+                .conn()
+                .prepare(&query)
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![agent, limit as i64], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, ts, inst, data)| {
+                    (
+                        id,
+                        ts,
+                        inst,
+                        serde_json::from_str(&data).unwrap_or(json!({})),
+                    )
+                })
+                .collect();
+            (label, key, rows)
+        })
+        .collect()
+}
+
 /// Prepare: `hcom bundle prepare [--for AGENT] [--last-transcript N] [--last-events N] [--compact] [--json]`
-#[allow(clippy::type_complexity)]
 fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&CommandContext>) -> i32 {
-    let json_mode = args.json;
-    let compact = args.compact;
-    let for_agent = args.for_agent.as_deref().map(|name| {
-        crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
-    });
     let last_transcript = args.last_transcript;
     let last_events = args.last_events;
 
-    // Resolve target agent
-    let agent_name = for_agent.or_else(|| {
-        ctx.and_then(|c| c.identity.as_ref())
-            .filter(|id| matches!(id.kind, SenderKind::Instance))
-            .map(|id| id.name.clone())
-    });
-
-    let agent = match agent_name {
+    // The caller creates the bundle, whichever agent's context it covers.
+    let caller = ctx
+        .and_then(|c| c.identity.as_ref())
+        .filter(|id| matches!(id.kind, SenderKind::Instance))
+        .map(|id| id.name.clone());
+    let agent = match args
+        .for_agent
+        .as_deref()
+        .map(|name| {
+            crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+        })
+        .or_else(|| caller.clone())
+    {
         Some(name) => name,
         None => {
             eprintln!("Error: No agent context. Use --for <agent> to specify.");
@@ -781,262 +741,158 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
         }
     };
 
-    // C5 fix: get transcript text
-    let transcript_source = match lookup_bundle_transcript_source(db, &agent) {
-        Ok(source) => source,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return 1;
-        }
-    };
-
     let mut transcript_text: Option<String> = None;
     let mut transcript_range: Option<String> = None;
-
-    if let Some((Some(tpath), tool, bundle_session_id)) = transcript_source.as_ref()
-        && Path::new(tpath).exists()
-    {
-        let tq = TranscriptQuery {
-            path: tpath,
-            agent: tool,
-            last: last_transcript,
-            detailed: false,
-            session_id: bundle_session_id.as_deref(),
-        };
-        match get_exchanges_pub(&tq) {
-            Ok(exchanges) if !exchanges.is_empty() => {
-                let first_pos = exchanges
-                    .first()
-                    .and_then(|e| e.get("position").and_then(|v| v.as_u64()))
-                    .unwrap_or(1);
-                let last_pos = exchanges
-                    .last()
-                    .and_then(|e| e.get("position").and_then(|v| v.as_u64()))
-                    .unwrap_or(first_pos);
-                transcript_range = Some(format!("{first_pos}-{last_pos}"));
-
-                match format_exchanges_pub(&tq, &agent, false) {
-                    Ok(text) => transcript_text = Some(text),
-                    Err(e) => transcript_text = Some(format!("Error reading transcript: {e}")),
+    if let Some((path, tool, session_id)) = exact_instance_transcript(db, &agent) {
+        match get_exchanges(
+            &path,
+            &tool,
+            last_transcript,
+            false,
+            session_id.as_deref(),
+            true,
+        ) {
+            Ok(exchanges) => {
+                if let (Some(first), Some(last)) = (exchanges.first(), exchanges.last()) {
+                    transcript_range = Some(if first.position == last.position {
+                        first.position.to_string()
+                    } else {
+                        format!("{}-{}", first.position, last.position)
+                    });
+                    transcript_text = Some(format_exchanges(&exchanges, false, false));
                 }
             }
             Err(e) => transcript_text = Some(format!("Error reading transcript: {e}")),
-            _ => {}
         }
     }
 
-    // Events by category (parameterized queries to prevent SQL injection)
-    let categories: Vec<(&str, String, Vec<Box<dyn rusqlite::ToSql>>)> = vec![
-        (
-            "Messages to",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-        (
-            "Messages from",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2".to_string(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-        (
-            "File operations",
-            file_operations_query(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-        (
-            "Lifecycle",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-    ];
+    let categories = bundle_event_categories(db, &agent, last_events);
 
-    let mut all_event_ids = Vec::new();
-    let mut all_files = Vec::new();
+    let mut event_ids: Vec<i64> = categories
+        .iter()
+        .flat_map(|(_, _, rows)| rows.iter().map(|(id, ..)| *id))
+        .collect();
+    event_ids.sort_unstable_by(|a, b| b.cmp(a));
+    event_ids.dedup();
 
-    for (_label, query, params) in &categories {
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        if let Ok(mut stmt) = db.conn().prepare(query) {
-            let rows: Vec<(i64, String, String, String)> = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.ok())
-                .collect();
+    let mut files: Vec<String> = categories
+        .iter()
+        .flat_map(|(_, _, rows)| rows.iter())
+        .filter_map(|(.., data)| data.get("detail").and_then(|v| v.as_str()))
+        .filter(|detail| {
+            detail.contains('/')
+                || [".py", ".ts", ".js", ".md", ".json", ".rs"]
+                    .iter()
+                    .any(|ext| detail.ends_with(ext))
+        })
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files.dedup();
 
-            for (id, _ts, _inst, data_str) in &rows {
-                all_event_ids.push(*id);
-                let data: Value = serde_json::from_str(data_str).unwrap_or(json!({}));
-
-                // Extract file paths from status events ("/" in path or common extensions)
-                if let Some(detail) = data.get("detail").and_then(|v| v.as_str())
-                    && (detail.starts_with('/')
-                        || detail.contains("/")
-                        || detail.ends_with(".py")
-                        || detail.ends_with(".ts")
-                        || detail.ends_with(".js")
-                        || detail.ends_with(".md")
-                        || detail.ends_with(".json")
-                        || detail.ends_with(".rs"))
-                {
-                    all_files.push(detail.to_string());
-                }
-            }
-        }
+    // Template command (events capped at 20, files at 10)
+    let mut template_parts = vec![match caller {
+        Some(ref name) => format!("hcom bundle create \"Bundle Title Here\" --name {name}"),
+        None => "hcom bundle create \"Bundle Title Here\"".to_string(),
+    }];
+    template_parts.push("--description \"detailed description text here\"".to_string());
+    if let Some(ref range) = transcript_range {
+        template_parts.push(format!("--transcript \"{range}:normal\""));
     }
+    if !event_ids.is_empty() {
+        let ids: Vec<String> = event_ids.iter().take(20).map(i64::to_string).collect();
+        template_parts.push(format!("--events \"{}\"", ids.join(",")));
+    }
+    if !files.is_empty() {
+        let sample: Vec<&str> = files.iter().take(10).map(String::as_str).collect();
+        template_parts.push(format!("--files \"{}\"", sample.join(",")));
+    }
+    let template_command = template_parts.join(" \\\n  ");
 
-    // Deduplicate and sort files
-    all_files.sort();
-    all_files.dedup();
-
-    if json_mode {
-        // JSON output with transcript, files, and note
-        let categories_json = query_bundle_event_categories(db, &agent, last_events);
-
-        // Build template command (cap events at 20)
-        let mut template_parts = vec![
-            format!("hcom bundle create \"Bundle Title Here\" --name {agent}"),
-            "--description \"detailed description text here\"".to_string(),
-        ];
-        if let Some(ref range) = transcript_range {
-            template_parts.push(format!("--transcript \"{range}:normal\""));
-        }
-        if !all_event_ids.is_empty() {
-            let mut latest: Vec<i64> = all_event_ids.clone();
-            latest.sort_unstable_by(|a, b| b.cmp(a));
-            latest.truncate(20);
-            let ids_str = latest
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            template_parts.push(format!("--events \"{ids_str}\""));
-        }
-        if !all_files.is_empty() {
-            let files_sample: Vec<&str> = all_files.iter().take(10).map(|s| s.as_str()).collect();
-            template_parts.push(format!("--files \"{}\"", files_sample.join(",")));
-        }
-        let template_command = template_parts.join(" \\\n  ");
-
+    if args.json {
+        let events_json: serde_json::Map<String, Value> = categories
+            .iter()
+            .map(|(_, key, rows)| {
+                let events: Vec<Value> = rows
+                    .iter()
+                    .map(|(id, ts, inst, data)| {
+                        json!({"id": id, "timestamp": ts, "instance": inst, "data": data})
+                    })
+                    .collect();
+                (key.to_string(), json!(events))
+            })
+            .collect();
         let result = json!({
             "agent": agent,
             "transcript": {
                 "text": transcript_text,
                 "range": transcript_range,
             },
-            "events": categories_json,
-            "files": all_files,
+            "events": events_json,
+            "files": files,
             "template_command": template_command,
-            "note": format!("Last {} transcript entries, {} events per category", last_transcript, last_events),
+            "note": format!("Last {last_transcript} transcript exchanges, {last_events} events per category"),
         });
         println!("{}", serde_json::to_string(&result).unwrap_or_default());
         return 0;
     }
 
+    let sep = "─".repeat(40);
     println!("[Bundle Context: {agent}]\n");
 
-    // HOW-TO-USE guidance section
-    if !compact {
-        let sep = "─".repeat(40);
+    if !args.compact {
         println!("{sep}");
         println!("HOW TO USE THIS CONTEXT:\n");
-        println!("Use 'hcom send' with these bundle flags to create and send directly");
         println!(
-            "Transcript detail: normal (truncated) | full (complete text) | detailed (tool I/O, edits, errors)\n"
-        );
-        println!("Use this bundle context as a template for your specific bundle");
-        println!("- Pick relevant events/files/transcript ranges from the bundle context");
-        println!(
-            "- Use the hcom events and hcom transcript commands to find all everything relevant to include"
+            "Edit the CREATE command below into your bundle, or pass the same flags to \
+'hcom send' (with --title) to create and send in one step."
         );
         println!(
-            "- Specify the correct transcript detail for each transcript range \
-(ie full when all relevant, normal only when the above is sufficient)"
+            "Transcript refs: range:detail, comma-separated (e.g. 3-14:normal,6:full,22-30:detailed)"
         );
         println!(
-            "- For description: give comprehensive detail and prescision. explain what is in this bundle, \
-summerise specific transcript ranges and events. give deep insight so another agent can understand \
-everything you know about this. what happened, decisions, current state, issues, plans, etc.\n"
+            "  normal = truncated | full = complete text | detailed = full + tool I/O, edits, errors\n"
+        );
+        println!("- Pick the relevant transcript ranges, events, and files from the context below");
+        println!("- Use hcom transcript and hcom events to find anything else relevant");
+        println!(
+            "- Give each transcript range the detail it needs \
+(full when the whole text matters, normal only when the summary below is enough)"
+        );
+        println!(
+            "- Description: be comprehensive and precise. Explain what the bundle contains, \
+summarise the referenced transcript ranges and events, and give enough insight for another agent \
+to understand everything you know: what happened, decisions, current state, issues, plans.\n"
         );
         println!("A good bundle includes everything relevant and nothing irrelevant.\n");
-        println!("View: hcom transcript {agent} [--range N-N] [--full|--detailed]");
-        println!("View: hcom events {agent} [--last N]\n");
-        println!("Use hcom bundle prepare --compact to hide this how to section\n");
+        println!("View: hcom transcript {agent} [N-M] [--full|--detailed]");
+        println!("View: hcom events --agent {agent} [--last N]\n");
+        println!("Use hcom bundle prepare --compact to hide this section\n");
     }
 
-    // Transcript
-    {
-        let sep = "─".repeat(40);
-        println!("{sep}");
-        println!("TRANSCRIPT");
-        if let Some(ref text) = transcript_text {
-            println!("{text}");
-        } else {
-            println!("(none)");
+    println!("{sep}");
+    println!("TRANSCRIPT");
+    println!("{}\n", transcript_text.as_deref().unwrap_or("(none)"));
+
+    for (label, _, rows) in &categories {
+        if rows.is_empty() {
+            continue;
+        }
+        println!("--- {label} ({} events) ---", rows.len());
+        for (id, ts, inst, data) in rows {
+            let ts_short = ts.get(..19).unwrap_or(ts);
+            println!(
+                "  #{id} | {inst} @ {ts_short} | {}",
+                format_event_summary(data)
+            );
         }
         println!();
     }
 
-    // Events display
-    for (label, query, params) in &categories {
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        if let Ok(mut stmt) = db.conn().prepare(query) {
-            let rows: Vec<(i64, String, String, String)> = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if !rows.is_empty() {
-                println!("--- {label} ({} events) ---", rows.len());
-                for (id, ts, inst, data_str) in &rows {
-                    let ts_short = if ts.len() > 19 {
-                        &ts[..19]
-                    } else {
-                        ts.as_str()
-                    };
-                    let data: Value = serde_json::from_str(data_str).unwrap_or(json!({}));
-                    let summary = format_event_summary(&data);
-                    println!("  #{id} | {inst} @ {ts_short} | {summary}");
-                }
-                println!();
-            }
-        }
-    }
-
-    // Files
-    if !all_files.is_empty() {
-        let sep = "─".repeat(40);
+    if !files.is_empty() {
         println!("{sep}");
-        println!("FILES ({})", all_files.len());
-        for f in all_files.iter().take(20) {
+        println!("FILES ({})", files.len());
+        for f in files.iter().take(20) {
             // Show relative-ish path (last 3 components)
             let parts: Vec<&str> = f.split('/').collect();
             let short = if parts.len() > 3 {
@@ -1046,41 +902,15 @@ everything you know about this. what happened, decisions, current state, issues,
             };
             println!("  {short}");
         }
-        if all_files.len() > 20 {
-            println!("  +{} more", all_files.len() - 20);
+        if files.len() > 20 {
+            println!("  +{} more", files.len() - 20);
         }
         println!();
     }
 
-    // Template command (cap events at 20)
-    {
-        let sep = "─".repeat(40);
-        println!("{sep}");
-        println!("CREATE:");
-        let mut template_parts = vec![
-            format!("hcom bundle create \"Bundle Title Here\" --name {agent}"),
-            "--description \"detailed description text here\"".to_string(),
-        ];
-        if let Some(ref range) = transcript_range {
-            template_parts.push(format!("--transcript \"{range}:normal    //can be multiple: 3-14:normal,6:full,22-30:detailed\""));
-        }
-        if !all_event_ids.is_empty() {
-            let mut latest: Vec<i64> = all_event_ids.clone();
-            latest.sort_unstable_by(|a, b| b.cmp(a));
-            latest.truncate(20);
-            let ids_str = latest
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            template_parts.push(format!("--events \"{ids_str}\""));
-        }
-        if !all_files.is_empty() {
-            let files_sample: Vec<&str> = all_files.iter().take(10).map(|s| s.as_str()).collect();
-            template_parts.push(format!("--files \"{}\"", files_sample.join(",")));
-        }
-        println!("{}", template_parts.join(" \\\n  "));
-    }
+    println!("{sep}");
+    println!("CREATE:");
+    println!("{template_command}");
 
     0
 }
@@ -1202,73 +1032,6 @@ fn create_and_log_bundle(
             1
         }
     }
-}
-
-/// Query bundle events by category for JSON output (C5 fix).
-#[allow(clippy::type_complexity)]
-fn query_bundle_event_categories(db: &HcomDb, agent: &str, last_events: usize) -> Value {
-    let categories: Vec<(&str, String, Vec<Box<dyn rusqlite::ToSql>>)> = vec![
-        (
-            "messages_to",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-        (
-            "messages_from",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2".to_string(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-        (
-            "file_operations",
-            file_operations_query(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(last_events as i64),
-            ],
-        ),
-        (
-            "lifecycle",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
-            vec![
-                Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new(5i64),
-            ],
-        ),
-    ];
-
-    let mut result = serde_json::Map::new();
-    for (label, query, params) in &categories {
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let mut events = Vec::new();
-        if let Ok(mut stmt) = db.conn().prepare(query)
-            && let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-        {
-            for (id, ts, inst, data_str) in rows.flatten() {
-                let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
-                events.push(json!({
-                    "id": id,
-                    "timestamp": ts,
-                    "instance": inst,
-                    "data": data,
-                }));
-            }
-        }
-        result.insert(label.to_string(), json!(events));
-    }
-    Value::Object(result)
 }
 
 /// Format a short summary for an event data object.
@@ -1500,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_bundle_transcript_source_falls_back_to_stopped_snapshot() {
+    fn test_bundle_transcript_source_falls_back_to_stopped_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let transcript_path = dir.path().join("claude.jsonl");
         let db = test_db();
@@ -1541,34 +1304,28 @@ mod tests {
         db.log_life_event("huno", "stopped", "cli", "killed", Some(snapshot))
             .unwrap();
 
-        let (path, tool, sid) = lookup_bundle_transcript_source(&db, "huno")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            path.as_deref(),
-            Some(transcript_path.to_string_lossy().as_ref())
-        );
+        let (path, tool, sid) = exact_instance_transcript(&db, "huno").unwrap();
+        assert_eq!(path, transcript_path.to_string_lossy());
         assert_eq!(tool, "claude");
         assert_eq!(sid.as_deref(), Some("sess-123"));
 
-        let tq = TranscriptQuery {
-            path: path.as_deref().unwrap(),
-            agent: &tool,
-            last: 10,
-            detailed: false,
-            session_id: sid.as_deref(),
-        };
-        let exchanges = get_exchanges_pub(&tq).unwrap();
+        let exchanges = get_exchanges(&path, &tool, 10, false, sid.as_deref(), true).unwrap();
         assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0]["position"], 1);
+        assert_eq!(exchanges[0].position, 1);
     }
 
     #[test]
-    fn test_lookup_bundle_transcript_source_does_not_invent_claude_metadata() {
+    fn test_bundle_transcript_source_does_not_invent_claude_metadata() {
         let db = test_db();
-        assert_eq!(
-            lookup_bundle_transcript_source(&db, "missing").unwrap(),
-            None
-        );
+        assert_eq!(exact_instance_transcript(&db, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_exchange_range() {
+        assert_eq!(parse_exchange_range("7"), Some((7, 7)));
+        assert_eq!(parse_exchange_range("3-14"), Some((3, 14)));
+        assert_eq!(parse_exchange_range("0"), None);
+        assert_eq!(parse_exchange_range("9-3"), None);
+        assert_eq!(parse_exchange_range("x-3"), None);
     }
 }

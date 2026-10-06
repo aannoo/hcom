@@ -18,11 +18,9 @@ pub mod shared;
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
-
 use crate::tool::Tool;
 
-pub use shared::{Exchange, ToolUse, format_exchanges, summarize_action};
+pub use shared::{Exchange, ToolUse, flag_hint, format_exchanges, summarize_action};
 
 pub(crate) use opencode::TranscriptSearchMatch;
 
@@ -623,61 +621,6 @@ pub(crate) fn search_database_sessions(
         }
         _ => Err(format!("Tool '{}' is not database-backed", tool)),
     }
-}
-
-// ── Public API for other commands (bundle) ──────────────────────────────
-
-/// Options for querying and formatting transcript exchanges.
-pub struct TranscriptQuery<'a> {
-    pub path: &'a str,
-    pub agent: &'a str,
-    pub last: usize,
-    pub detailed: bool,
-    pub session_id: Option<&'a str>,
-}
-
-/// Public wrapper for read (used by bundle prepare/cat).
-///
-/// Returns a JSON projection that intentionally drops tools/edits/errors/
-/// ended_on_error — bundle consumers only read user/action/files/timestamp.
-pub fn get_exchanges_pub(q: &TranscriptQuery) -> Result<Vec<Value>, String> {
-    let backend = backend_from_agent_or_path(q.agent, q.path)?;
-    let opts = ReadOptions {
-        last: q.last,
-        detailed: q.detailed,
-        session_id: q.session_id.map(|s| s.to_string()),
-        allow_codex_retry: true,
-    };
-    let exchanges = read(Path::new(q.path), backend, &opts)?;
-    Ok(exchanges
-        .iter()
-        .map(|ex| {
-            json!({
-                "position": ex.position,
-                "user": ex.user,
-                "action": ex.action,
-                "files": ex.files,
-                "timestamp": ex.timestamp,
-            })
-        })
-        .collect())
-}
-
-/// Public wrapper for format_exchanges (used by bundle cat).
-pub fn format_exchanges_pub(
-    q: &TranscriptQuery,
-    instance: &str,
-    full: bool,
-) -> Result<String, String> {
-    let backend = backend_from_agent_or_path(q.agent, q.path)?;
-    let opts = ReadOptions {
-        last: q.last,
-        detailed: q.detailed,
-        session_id: q.session_id.map(|s| s.to_string()),
-        allow_codex_retry: true,
-    };
-    let exchanges = read(Path::new(q.path), backend, &opts)?;
-    Ok(format_exchanges(&exchanges, instance, full, q.detailed))
 }
 
 #[cfg(test)]
