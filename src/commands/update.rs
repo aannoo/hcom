@@ -56,15 +56,21 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>
             println!(
                 "Running: {program} -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex\""
             );
-            std::process::Command::new(program)
-                .args([
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    "irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex",
-                ])
-                .status()
+            let mut cmd = std::process::Command::new(program);
+            if program == "powershell" {
+                // A PSModulePath inherited from pwsh lists PowerShell 7 module dirs first;
+                // Windows PowerShell 5.1 then fails loading Microsoft.PowerShell.Security.
+                // Unset, 5.1 rebuilds its own default module path.
+                cmd.env_remove("PSModulePath");
+            }
+            cmd.args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex",
+            ])
+            .status()
         } else if crate::update::is_shell_pipe_command(info.cmd) {
             Err(std::io::Error::other(
                 "POSIX shell update command selected on Windows",
