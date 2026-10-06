@@ -803,6 +803,7 @@ fn handle_remote_launch(
             args: prepared.args,
             persisted_args: None,
             prior_session_id: None,
+            resume_cursor: None,
             tag: request.tag,
             system_prompt: request.system_prompt,
             initial_prompt: request.initial_prompt,

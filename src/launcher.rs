@@ -198,6 +198,8 @@ pub struct LaunchParams {
     /// Session id being resumed, inherited by the recreated instance row so a
     /// kill before the tool's first turn (no hook re-bind yet) stays resumable.
     pub prior_session_id: Option<String>,
+    /// Saved unread position for a tracked resume; zero is a valid cursor.
+    pub resume_cursor: Option<i64>,
     pub tag: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
@@ -221,6 +223,7 @@ impl Default for LaunchParams {
             args: Vec::new(),
             persisted_args: None,
             prior_session_id: None,
+            resume_cursor: None,
             tag: None,
             system_prompt: None,
             initial_prompt: None,
@@ -1672,6 +1675,48 @@ fn append_initial_prompt_args(
     Ok(())
 }
 
+fn initialize_launch_instance(
+    db: &HcomDb,
+    params: &LaunchParams,
+    instance_name: &str,
+    tool: &str,
+    tag: &str,
+    working_dir: &str,
+    initial_event_id: i64,
+) -> Result<()> {
+    db.with_write_scope(|| {
+        if !instance_binding::initialize_instance_in_position_file(
+            db,
+            instance_name,
+            params.prior_session_id.as_deref(),
+            None, // parent_session_id
+            None, // parent_name
+            None, // agent_id
+            None, // transcript_path
+            Some(tool),
+            params.background,
+            (!tag.is_empty()).then_some(tag),
+            None, // wait_timeout
+            None, // subagent_timeout
+            None, // hints
+            Some(working_dir),
+        ) {
+            bail!("Failed to initialize instance '{instance_name}'");
+        }
+        // The initializer can read the caller's inherited launch cursor or promote
+        // a fork reservation. Set this launch's authoritative position before any
+        // process binding or child spawn makes the instance available for delivery.
+        db.update_instance_fields(
+            instance_name,
+            &serde_json::Map::from_iter([("last_event_id".to_string(), json!(initial_event_id))]),
+        )?;
+        if db.get_instance_full(instance_name)?.is_none() {
+            bail!("Failed to initialize instance '{instance_name}'");
+        }
+        Ok(())
+    })
+}
+
 /// Launch one or more AI tool instances with consistent tracking.
 ///
 /// This is the unified entry point for launching Claude, Gemini, Codex,
@@ -1950,10 +1995,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     for _ in 0..params.count {
         let mut instance_env = base_env.clone();
+        let initial_event_id = params
+            .resume_cursor
+            .unwrap_or_else(|| db.get_last_event_id());
         instance_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
         instance_env.insert(
             "HCOM_LAUNCH_EVENT_ID".to_string(),
-            db.get_last_event_id().to_string(),
+            initial_event_id.to_string(),
         );
         instance_env.insert("HCOM_LAUNCHED_BY".to_string(), launcher_name.to_string());
         instance_env.insert("HCOM_LAUNCH_BATCH_ID".to_string(), batch_id.clone());
@@ -2053,26 +2101,15 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {
-            instance_binding::initialize_instance_in_position_file(
+            initialize_launch_instance(
                 db,
+                &params,
                 &instance_name,
-                params.prior_session_id.as_deref(),
-                None,            // parent_session_id
-                None,            // parent_name
-                None,            // agent_id
-                None,            // transcript_path
-                Some(tool_type), // tool
-                params.background,
-                if effective_tag.is_empty() {
-                    None
-                } else {
-                    Some(effective_tag.as_str())
-                },
-                None,              // wait_timeout
-                None,              // subagent_timeout
-                None,              // hints
-                Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
-            );
+                tool_type,
+                &effective_tag,
+                working_dir,
+                initial_event_id,
+            )?;
             db.set_process_binding(&process_id, "", &instance_name)?;
             Ok(())
         })() {
@@ -3836,6 +3873,81 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
         db
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_preserves_resume_backlog_including_zero() {
+        // A nested launcher inherits its parent's cursor. It must initialize
+        // the resumed identity from the stopped snapshot instead.
+        let _env = EnvVarGuard::remove(["HCOM_LAUNCH_EVENT_ID".to_string()]);
+        unsafe { std::env::set_var("HCOM_LAUNCH_EVENT_ID", "1") };
+        for saved_cursor in [0, 1] {
+            let db = launcher_test_db();
+            db.log_event("life", "luna", &json!({"action": "stopped"}))
+                .unwrap();
+            let queued_id = db
+                .log_event(
+                    "message",
+                    "user",
+                    &json!({"from": "user", "text": "queued", "scope": "mentions", "mentions": ["luna"]}),
+                )
+                .unwrap();
+            let params = LaunchParams {
+                prior_session_id: Some("resumed-session".into()),
+                resume_cursor: Some(saved_cursor),
+                ..Default::default()
+            };
+            initialize_launch_instance(&db, &params, "luna", "codex", "", "/tmp", saved_cursor)
+                .unwrap();
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(row.last_event_id, saved_cursor);
+            assert_eq!(row.session_id.as_deref(), Some("resumed-session"));
+            let unread = db.get_unread_messages("luna");
+            assert_eq!(unread.len(), 1);
+            assert_eq!(unread[0].event_id, Some(queued_id));
+
+            db.ack_hook_delivery("luna", queued_id, false).unwrap();
+            assert!(db.get_unread_messages("luna").is_empty());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_uses_fresh_cursor_and_keeps_startup_messages() {
+        let _env = EnvVarGuard::remove(["HCOM_LAUNCH_EVENT_ID".to_string()]);
+        unsafe { std::env::set_var("HCOM_LAUNCH_EVENT_ID", "0") };
+        for reserved in [false, true] {
+            let db = launcher_test_db();
+            if reserved {
+                let mut row = serde_json::Map::new();
+                row.insert("status".into(), json!(instance_names::PLACEHOLDER_STATUS));
+                row.insert(
+                    "status_context".into(),
+                    json!(instance_names::PLACEHOLDER_CONTEXT),
+                );
+                row.insert("created_at".into(), json!(1.0));
+                db.save_instance_named("luna", &row).unwrap();
+            }
+            let message =
+                json!({"from": "user", "text": "old", "scope": "mentions", "mentions": ["luna"]});
+            let initial_cursor = db.log_event("message", "user", &message).unwrap();
+            initialize_launch_instance(
+                &db,
+                &LaunchParams::default(),
+                "luna",
+                "codex",
+                "",
+                "/tmp",
+                initial_cursor,
+            )
+            .unwrap();
+            assert!(db.get_unread_messages("luna").is_empty());
+            let startup_message = db.log_event("message", "user", &message).unwrap();
+            let unread = db.get_unread_messages("luna");
+            assert_eq!(unread.len(), 1);
+            assert_eq!(unread[0].event_id, Some(startup_message));
+        }
     }
 
     fn insert_test_instance(db: &crate::db::HcomDb, name: &str, status: &str) {

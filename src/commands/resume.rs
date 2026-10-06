@@ -37,7 +37,6 @@ enum ResumeSource<'a> {
 struct PreparedResume {
     output: ResumeOutputContext,
     launch: LaunchParams,
-    last_event_id: i64,
     session_id: String,
     tracked_fork_identity: Option<TrackedForkIdentity>,
 }
@@ -219,8 +218,8 @@ pub fn run_local_resume_result(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<LaunchResult> {
-    let (resolved, plan) = resolve_name_to_plan(db, name, fork, extra_args, flags)?;
-    execute_prepared_resume_result(db, &resolved, fork, &plan)
+    let (_, plan) = resolve_name_to_plan(db, name, fork, extra_args, flags)?;
+    execute_prepared_resume_result(db, &plan)
 }
 
 /// Walk the resume/fork resolution chain once, in a single place:
@@ -555,6 +554,7 @@ fn prepare_resume_plan_from_source(
             // Forks start a new session on first turn; only plain resume
             // inherits the prior id so kill-before-bind stays resumable.
             prior_session_id: (!fork).then(|| session_id.clone()),
+            resume_cursor: (!fork && !is_adoption).then_some(last_event_id),
             tag: launch_tag,
             system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
@@ -572,7 +572,6 @@ fn prepare_resume_plan_from_source(
             // has no identity-reset prompt, so normal handoff rules apply.
             append_reply_handoff,
         },
-        last_event_id,
         session_id,
         tracked_fork_identity,
     })
@@ -622,7 +621,7 @@ fn execute_prepared_resume(
     print_feedback_now: bool,
     inline_readiness_wait_secs: Option<u64>,
 ) -> Result<i32> {
-    let result = execute_prepared_resume_result(db, name, fork, plan)?;
+    let result = execute_prepared_resume_result(db, plan)?;
 
     if print_feedback_now {
         let output = LaunchOutputContext {
@@ -661,44 +660,9 @@ fn execute_prepared_resume(
     Ok(if result.launched > 0 { 0 } else { 1 })
 }
 
-fn execute_prepared_resume_result(
-    db: &HcomDb,
-    name: &str,
-    fork: bool,
-    plan: &PreparedResume,
-) -> Result<LaunchResult> {
+fn execute_prepared_resume_result(db: &HcomDb, plan: &PreparedResume) -> Result<LaunchResult> {
     let launch = prepare_launch_for_execution(db, plan)?;
-    let result = launcher::launch(db, launch.clone())?;
-
-    if !fork && plan.last_event_id > 0 {
-        crate::instances::update_instance_position(
-            db,
-            name,
-            &serde_json::Map::from_iter([("last_event_id".to_string(), json!(plan.last_event_id))]),
-        );
-    }
-    if fork {
-        // Named-fork belt-and-suspenders: the pre-registered instance row
-        // was created with last_event_id=0 and may inherit a stale
-        // HCOM_LAUNCH_EVENT_ID from the parent's env if the tool doesn't
-        // propagate our override cleanly. Stamp the current position
-        // directly on the DB so there's no replay window.
-        //
-        // Adoption-fork (plan.launch.name=None) doesn't need the belt:
-        // there's no pre-reg row, so the SessionStart hook creates the
-        // instance fresh using HCOM_LAUNCH_EVENT_ID (always set by
-        // launcher::launch to current max) — no zero-cursor window to
-        // protect against.
-        let current_max = db.get_last_event_id();
-        if let Some(ref child_name) = launch.name {
-            crate::instances::update_instance_position(
-                db,
-                child_name,
-                &serde_json::Map::from_iter([("last_event_id".to_string(), json!(current_max))]),
-            );
-        }
-    }
-    Ok(result)
+    launcher::launch(db, launch)
 }
 
 fn prepare_launch_for_execution(db: &HcomDb, plan: &PreparedResume) -> Result<LaunchParams> {
@@ -2671,6 +2635,46 @@ mod tests {
         db.init_db().unwrap();
         std::mem::forget(dir);
         db
+    }
+
+    #[test]
+    fn resume_cursor_is_only_inherited_by_tracked_resumes() {
+        for cursor in [0, 1] {
+            let db = test_db();
+            db.log_event(
+                "life",
+                "luna",
+                &json!({"action": "stopped", "snapshot": {
+                    "tool": "codex", "session_id": "test-session",
+                    "last_event_id": cursor, "directory": "/tmp", "launch_args": "[]"
+                }}),
+            )
+            .unwrap();
+            for fork in [false, true] {
+                let tracked = prepare_resume_plan_from_source(
+                    &db,
+                    ResumeSource::Instance { name: "luna" },
+                    fork,
+                    &[],
+                    &GlobalFlags::default(),
+                )
+                .unwrap();
+                assert_eq!(tracked.launch.resume_cursor, (!fork).then_some(cursor));
+                let adopted = prepare_resume_plan_from_source(
+                    &db,
+                    ResumeSource::Disk {
+                        session_id: "untracked-session".into(),
+                        tool: "codex".into(),
+                        cwd_hint: Some("/tmp".into()),
+                    },
+                    fork,
+                    &[],
+                    &GlobalFlags::default(),
+                )
+                .unwrap();
+                assert_eq!(adopted.launch.resume_cursor, None);
+            }
+        }
     }
 
     #[test]
