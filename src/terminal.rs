@@ -2693,6 +2693,10 @@ pub fn kill_process(
     terminal_id: &str,
     zellij_session_name: &str,
 ) -> (KillResult, bool, Option<String>) {
+    // Closing the pane can take the whole process tree with it (wezterm and
+    // ConPTY on Windows do this synchronously), so liveness must be sampled
+    // before the close to tell "we killed it" apart from "it was already gone".
+    let was_alive = crate::sys::process::is_alive(pid);
     let pane_close = if !preset_name.is_empty() {
         close_terminal_pane(
             pid,
@@ -2720,8 +2724,19 @@ pub fn kill_process(
         #[cfg(unix)]
         GroupSignal::Other => KillResult::AlreadyDead,
     };
+    let kill_result = attribute_pane_close_kill(kill_result, was_alive, pane_close.closed);
 
     (kill_result, pane_close.closed, pane_close.retry_command)
+}
+
+/// A process that was alive until we closed its pane was killed by us, even
+/// though the follow-up group signal then finds nothing left to signal.
+fn attribute_pane_close_kill(result: KillResult, was_alive: bool, pane_closed: bool) -> KillResult {
+    if result == KillResult::AlreadyDead && was_alive && pane_closed {
+        KillResult::Sent
+    } else {
+        result
+    }
 }
 
 /// Resolve terminal info from the canonical preset fields plus launch_context metadata.
@@ -3447,6 +3462,28 @@ mod tests {
         format!(
             r#"{{"pane_id":{pane},"tab_id":{tab},"size":{{"cols":{cols},"rows":{rows},"pixel_width":0,"pixel_height":0}}}}"#
         )
+    }
+
+    #[test]
+    fn test_attribute_pane_close_kill() {
+        use KillResult::*;
+        // Pane close took a live process down before the group signal.
+        assert_eq!(attribute_pane_close_kill(AlreadyDead, true, true), Sent);
+        // Genuinely dead before kill started, pane still lingering.
+        assert_eq!(
+            attribute_pane_close_kill(AlreadyDead, false, true),
+            AlreadyDead
+        );
+        // No pane closed: nothing to attribute the death to.
+        assert_eq!(
+            attribute_pane_close_kill(AlreadyDead, true, false),
+            AlreadyDead
+        );
+        assert_eq!(attribute_pane_close_kill(Sent, true, true), Sent);
+        assert_eq!(
+            attribute_pane_close_kill(PermissionDenied, true, true),
+            PermissionDenied
+        );
     }
 
     #[test]
