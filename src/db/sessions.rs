@@ -396,6 +396,17 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Detach an ended session from its instance without stopping it, so the
+    /// next session the same process starts can bind.
+    pub fn release_instance_session(&self, instance_name: &str, session_id: &str) -> Result<()> {
+        self.delete_session_binding(session_id)?;
+        self.conn.execute(
+            "UPDATE instances SET session_id = NULL WHERE name = ? AND session_id = ?",
+            params![instance_name, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Delete session binding.
     pub fn delete_session_binding(&self, session_id: &str) -> Result<()> {
         if session_id.is_empty() {

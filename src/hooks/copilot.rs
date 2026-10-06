@@ -398,13 +398,18 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         return json!({});
     };
     update_position(db, ctx, payload, &instance_name);
-    lifecycle::set_status(
-        db,
-        &instance_name,
-        ST_LISTENING,
-        "start",
-        Default::default(),
-    );
+    // Copilot creates the session lazily: SessionStart arrives right after the
+    // first UserPromptSubmit, inside that turn. Marking it listening there would
+    // invite idle delivery into a busy agent.
+    if instance.status != ST_ACTIVE {
+        lifecycle::set_status(
+            db,
+            &instance_name,
+            ST_LISTENING,
+            "start",
+            Default::default(),
+        );
+    }
     crate::runtime_env::set_terminal_title(&instance_name);
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
@@ -417,14 +422,20 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     }
 }
 
+/// The hook's instance, with its position updated from the hook unless the
+/// hook comes from a subagent's session, which must not rebind it.
 fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
     let instance = resolve_instance(db, ctx, payload)?;
-    update_position(db, ctx, payload, &instance.name);
+    if !from_subagent_session(payload, &instance) {
+        update_position(db, ctx, payload, &instance.name);
+    }
     Some(instance)
 }
 
 fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
-    if let Some(instance) = resolved_instance(db, ctx, payload) {
+    if let Some(instance) = resolved_instance(db, ctx, payload)
+        && !from_subagent_session(payload, &instance)
+    {
         let prompt = payload
             .raw
             .get("prompt")
@@ -475,6 +486,21 @@ fn handle_posttooluse(
     pending_additional_context(db, &instance.name)
 }
 
+/// A hook from a session other than the instance's own: a Copilot subagent
+/// (`task`, `explore`, ...) runs in a session of its own and fires its own
+/// UserPromptSubmit and Stop, which must not drive the agent's status.
+fn from_subagent_session(payload: &HookPayload, instance: &InstanceRow) -> bool {
+    matches!(
+        (payload.session_id.as_deref(), instance.session_id.as_deref()),
+        (Some(incoming), Some(bound)) if !incoming.is_empty() && incoming != bound
+    )
+}
+
+/// Stop. Pending messages continue the turn; the instance is only marked
+/// listening when nothing is handed over, so idle delivery never sees
+/// "listening" with the same unread batch this hook is about to deliver.
+/// A subagent's Stop neither idles the agent nor takes its messages, which
+/// the agent's own hooks deliver once the subagent returns.
 fn handle_agentstop(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -483,15 +509,21 @@ fn handle_agentstop(
     let Some(instance) = resolved_instance(db, ctx, payload) else {
         return (json!({ "decision": "allow" }), None);
     };
-    lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
-    common::notify_hook_instance_with_db(db, &instance.name);
-    match common::prepare_pending_messages(db, &instance.name) {
-        Some(prepared) => (
+    if from_subagent_session(payload, &instance) {
+        return (json!({ "decision": "allow" }), None);
+    }
+    if let Some(prepared) = common::prepare_pending_messages(db, &instance.name) {
+        return (
             json!({ "decision": "block", "reason": prepared.formatted }),
             Some(prepared.ack),
-        ),
-        None => (json!({ "decision": "allow" }), None),
+        );
     }
+    lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
+    // Every endpoint, not just hook waiters: a message that arrived after the
+    // pending check found the instance active, and its wake was declined;
+    // idle delivery must look again now.
+    crate::notify::wake(db, &instance.name, &[]);
+    (json!({ "decision": "allow" }), None)
 }
 
 fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
@@ -610,6 +642,39 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> V
         );
         return json!({});
     }
+    // `/clear` ends the session with `user_exit` while the CLI keeps running
+    // (hooks reference, SessionEnd). Copilot always runs under hcom's PTY,
+    // which finalizes the instance when the CLI really exits, so here only the
+    // session is released for the replacement one to bind.
+    if reason == "user_exit"
+        && instance.tcp_mode != 0
+        && let Some(session_id) = incoming
+    {
+        if let Err(e) = db.release_instance_session(&instance.name, session_id) {
+            log::log_warn("hooks", "copilot.session_release_failed", &format!("{e}"));
+        }
+        // The replacement session starts without hcom's context; its
+        // SessionStart (first turn) injects the bootstrap again.
+        let mut updates = serde_json::Map::new();
+        updates.insert("name_announced".into(), json!(false));
+        instances::update_instance_position(db, &instance.name, &updates);
+        lifecycle::set_status(
+            db,
+            &instance.name,
+            ST_LISTENING,
+            "clear",
+            Default::default(),
+        );
+        log::log_info(
+            "hooks",
+            "copilot.sessionend_clear",
+            &format!(
+                "instance={} session_id={session_id}: released (/clear or quit; PTY exit stops the instance)",
+                instance.name
+            ),
+        );
+        return json!({});
+    }
     update_position(db, ctx, payload, &instance.name);
     common::finalize_session(db, &instance.name, reason, None);
     json!({})
@@ -663,9 +728,10 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
                 "copilot-posttooluse" | "copilot-posttoolusefailure" => {
                     handle_posttooluse(&db, &ctx, &payload)
                 }
-                "copilot-agentstop" | "copilot-subagentstop" => {
-                    handle_agentstop(&db, &ctx, &payload)
-                }
+                "copilot-agentstop" => handle_agentstop(&db, &ctx, &payload),
+                // The subagent's own Stop (its session) already ran; the agent
+                // continues, so there is nothing to change or deliver here.
+                "copilot-subagentstop" => (json!({ "decision": "allow" }), None),
                 "copilot-notification" => (handle_notification(&db, &ctx, &payload), None),
                 "copilot-erroroccurred" => (handle_erroroccurred(&db, &ctx, &payload), None),
                 "copilot-subagentstart" => (handle_subagentstart(&db, &ctx, &payload), None),
@@ -702,6 +768,120 @@ mod tests {
             std::env::remove_var("COPILOT_HOME");
         }
         (dir, workspace, guard)
+    }
+
+    /// Active instance `memo` bound to session `sid-fg` / process `proc-1`,
+    /// with one unread message from luna.
+    fn stop_test_db() -> (tempfile::TempDir, HcomDb, HcomContext) {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, session_id)
+                 VALUES ('memo', 'copilot', 'active', 'tool:bash', 0, 0, 0, 'sid-fg')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-1", "sid-fg", "memo").unwrap();
+        let data = json!({"from": "luna", "text": "hello", "scope": "broadcast"}).to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:01Z', 'luna', ?1)",
+                [data],
+            )
+            .unwrap();
+        let env = [("HCOM_PROCESS_ID".to_string(), "proc-1".to_string())]
+            .into_iter()
+            .collect();
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+        (dir, db, ctx)
+    }
+
+    #[test]
+    fn agentstop_with_pending_keeps_instance_active() {
+        let (_dir, db, ctx) = stop_test_db();
+        let stop = |session: &str| {
+            handle_agentstop(
+                &db,
+                &ctx,
+                &HookPayload::from_copilot_native("Stop", json!({"sessionId": session})),
+            )
+        };
+
+        // A subagent's session stopping: no delivery, agent stays active.
+        let (out, ack) = stop("sid-subagent");
+        assert_eq!(out["decision"], "allow");
+        assert!(ack.is_none());
+        assert!(
+            !db.is_idle("memo"),
+            "a subagent stopping does not idle the agent"
+        );
+        assert_eq!(
+            db.get_instance_full("memo")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sid-fg"),
+            "a subagent's hooks do not rebind the instance"
+        );
+
+        let (out, ack) = stop("sid-fg");
+        assert_eq!(out["decision"], "block");
+        assert!(ack.is_some());
+        assert!(
+            !db.is_idle("memo"),
+            "listening would invite a second delivery"
+        );
+
+        db.conn()
+            .execute("UPDATE instances SET last_event_id = 999", [])
+            .unwrap();
+        let (out, _) = stop("sid-fg");
+        assert_eq!(out["decision"], "allow");
+        assert!(db.is_idle("memo"));
+    }
+
+    #[test]
+    #[serial]
+    fn sessionstart_inside_first_turn_keeps_it_active() {
+        let (_env_dir, _workspace, _guard) = copilot_test_env();
+        let (_dir, db, ctx) = stop_test_db();
+        db.set_status("memo", ST_ACTIVE, "prompt").unwrap();
+        handle_sessionstart(
+            &db,
+            &ctx,
+            &HookPayload::from_copilot_native("SessionStart", json!({"sessionId": "sid-fg"})),
+        );
+        assert_eq!(
+            db.get_instance_full("memo").unwrap().unwrap().status,
+            ST_ACTIVE
+        );
+    }
+
+    #[test]
+    fn sessionend_from_clear_keeps_pty_instance_and_frees_session() {
+        let (_dir, db, ctx) = stop_test_db();
+        db.conn()
+            .execute("UPDATE instances SET tcp_mode = 1", [])
+            .unwrap();
+        let raw = json!({"sessionId": "sid-fg", "reason": "user_exit"});
+        handle_sessionend(
+            &db,
+            &ctx,
+            &HookPayload::from_copilot_native("SessionEnd", raw),
+        );
+        let inst = db.get_instance_full("memo").unwrap().unwrap();
+        assert_eq!(inst.session_id, None);
+        assert_eq!(inst.status, ST_LISTENING);
+        assert!(db.get_session_binding("sid-fg").unwrap().is_none());
+        assert_eq!(
+            inst.name_announced, 0,
+            "new session needs the bootstrap again"
+        );
     }
 
     #[test]
