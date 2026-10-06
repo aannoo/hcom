@@ -588,7 +588,8 @@ impl HcomDb {
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
 
-        let won = self.with_immediate_transaction(|tx| {
+        let won = self.with_write_scope(|| {
+            let tx = self.conn();
             // Stamp after taking the write lock so timestamp order matches id order.
             let timestamp = chrono_now_iso();
             let deleted = if let Some((pid, pid_identity)) = pid_guard {

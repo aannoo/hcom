@@ -1104,15 +1104,35 @@ pub(crate) fn stop_instance_if_pid_identity(
     pid: u32,
     pid_identity: &str,
 ) -> StopOutcome {
-    stop_instance_inner(
-        db,
-        instance_name,
-        initiated_by,
-        reason,
-        false,
-        0,
-        Some((pid, pid_identity)),
-    )
+    // Hold the write lock from identity verification through child teardown
+    // and parent deletion. A rebind must not leave a live parent's children
+    // deleted by a stale cleanup pass.
+    let mut outcome = None;
+    let result = db.with_write_scope(|| {
+        let stopped = stop_instance_inner(
+            db,
+            instance_name,
+            initiated_by,
+            reason,
+            false,
+            0,
+            Some((pid, pid_identity)),
+        );
+        let complete = stopped == StopOutcome::Stopped;
+        outcome = Some(stopped);
+        if !complete {
+            anyhow::bail!("guarded stop did not complete");
+        }
+        Ok(())
+    });
+    match (result, outcome) {
+        (_, Some(outcome @ (StopOutcome::AlreadyStopped | StopOutcome::RetryableError(_)))) => {
+            outcome
+        }
+        (Ok(()), Some(outcome)) => outcome,
+        (Ok(()), None) => unreachable!("write scope did not run"),
+        (Err(error), _) => StopOutcome::RetryableError(error.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1353,58 +1373,67 @@ fn stop_instance_inner(
         }
     };
 
-    // A guarded stale-stop must not mutate children before winning its
-    // PID-incarnation CAS, and deleting the parent first would make a failed
-    // child stop non-retryable. Leave the parent in place while it still has
-    // children; their own cleanup can retire them independently, after which a
-    // later pass can safely finalize the parent.
-    if pid_guard.is_some() && (!session_subagents.is_empty() || !native_children.is_empty()) {
-        return StopOutcome::RetryableError(format!(
-            "guarded stop deferred while {instance_name} still has child instances"
-        ));
-    }
-
-    if pid_guard.is_none() {
-        for sub_name in &session_subagents {
-            if let StopOutcome::RetryableError(error) = stop_instance_inner(
-                db,
-                sub_name,
-                initiated_by,
-                "parent_stopped",
-                false,
-                depth + 1,
-                None,
-            ) {
-                log::log_warn(
-                    "hooks",
-                    "finalize.child_stop_incomplete",
-                    &format!("parent={instance_name} child={sub_name} err={error}"),
-                );
-                return StopOutcome::RetryableError(format!(
-                    "could not stop child {sub_name}: {error}"
-                ));
+    // A guarded stop only knows the parent's process incarnation is gone.
+    // Children without a process of their own (native subagents) ran inside
+    // it, so they are gone too and are retired with it. A child that has its
+    // own tracked process may outlive the parent: defer to its own cleanup,
+    // after which a later pass can finalize the parent. Children are stopped
+    // before the parent is deleted so a failed child stop stays retryable.
+    if pid_guard.is_some() {
+        for child in session_subagents.iter().chain(&native_children) {
+            match db.get_instance_full(child) {
+                Ok(Some(row)) if row.pid.is_some() => {
+                    return StopOutcome::RetryableError(format!(
+                        "guarded stop deferred while {instance_name} has child {child} with its own process"
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return StopOutcome::RetryableError(format!(
+                        "could not read child {child} of {instance_name}: {e}"
+                    ));
+                }
             }
         }
+    }
 
-        for child in &native_children {
-            if let StopOutcome::RetryableError(error) = stop_instance_inner(
-                db,
-                child,
-                initiated_by,
-                "parent_stopped",
-                false,
-                depth + 1,
-                None,
-            ) {
-                log::log_warn(
-                    "hooks",
-                    "finalize.child_stop_incomplete",
-                    &format!("parent={instance_name} child={child} err={error}"),
-                );
-                return StopOutcome::RetryableError(format!(
-                    "could not stop child {child}: {error}"
-                ));
-            }
+    for sub_name in &session_subagents {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+            db,
+            sub_name,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+            None,
+        ) {
+            log::log_warn(
+                "hooks",
+                "finalize.child_stop_incomplete",
+                &format!("parent={instance_name} child={sub_name} err={error}"),
+            );
+            return StopOutcome::RetryableError(format!(
+                "could not stop child {sub_name}: {error}"
+            ));
+        }
+    }
+
+    for child in &native_children {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+            db,
+            child,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+            None,
+        ) {
+            log::log_warn(
+                "hooks",
+                "finalize.child_stop_incomplete",
+                &format!("parent={instance_name} child={child} err={error}"),
+            );
+            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
         }
     }
 
@@ -2475,6 +2504,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped, 0, "a stale stopper must publish no event");
+    }
+
+    #[test]
+    fn guarded_stop_rolls_back_children_when_parent_delete_loses() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "parent");
+        insert_test_instance(&db, "child");
+        db.update_instance_pid_with_identity("parent", 999999, Some("dead"))
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET parent_name = 'parent' WHERE name = 'child'",
+                [],
+            )
+            .unwrap();
+        // Force the final ownership CAS to lose after the child teardown.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER lose_parent_delete BEFORE DELETE ON instances
+            WHEN OLD.name = 'parent' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        let outcome =
+            stop_instance_if_pid_identity(&db, "parent", "test", "process_exit", 999999, "dead");
+        assert_eq!(outcome, StopOutcome::AlreadyStopped);
+        assert!(db.get_instance_full("child").unwrap().is_some());
+        let events: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events WHERE type = 'life'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(events, 0);
+        db.conn()
+            .execute_batch("DROP TRIGGER lose_parent_delete")
+            .unwrap();
+        assert_eq!(
+            stop_instance_if_pid_identity(&db, "parent", "test", "process_exit", 999999, "dead"),
+            StopOutcome::Stopped
+        );
+        assert!(db.get_instance_full("parent").unwrap().is_none());
+        assert!(db.get_instance_full("child").unwrap().is_none());
     }
 
     #[test]

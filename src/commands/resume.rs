@@ -317,6 +317,30 @@ fn prepare_resume_plan(
     prepare_resume_plan_from_source(db, ResumeSource::Instance { name }, fork, extra_args, flags)
 }
 
+/// Refuse to resume an agent whose process is still running; a verifiably
+/// dead one is stopped here (writing its snapshot) instead of waiting for a
+/// sweep. The process identity decides when there is one, because a live
+/// process can sit at `inactive` (soft-finalize, StopFailure) and a dead one
+/// at `listening`; the stored status is only the fallback.
+fn ensure_not_running(db: &HcomDb, name: &str) -> Result<()> {
+    use crate::instance_lifecycle::{TrackedProcess, reap_if_process_gone};
+    let Ok(Some(inst)) = db.get_instance_full(name) else {
+        return Ok(());
+    };
+    let running = match reap_if_process_gone(db, &inst) {
+        TrackedProcess::Alive => true,
+        TrackedProcess::Reaped => false,
+        TrackedProcess::ReapFailed(e) => bail!("'{name}' exited but could not be stopped: {e}"),
+        TrackedProcess::Unverifiable => inst.status != ST_INACTIVE,
+    };
+    if running {
+        bail!(
+            "'{name}' is still running.\n  Branch a copy instead: hcom f {name}\n  Or stop it first:     hcom kill {name}"
+        );
+    }
+    Ok(())
+}
+
 fn prepare_resume_plan_from_source(
     db: &HcomDb,
     source: ResumeSource<'_>,
@@ -339,13 +363,8 @@ fn prepare_resume_plan_from_source(
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
-            if !fork
-                && let Ok(Some(inst)) = db.get_instance_full(name)
-                && inst.status != ST_INACTIVE
-            {
-                bail!(
-                    "'{name}' is still running.\n  Branch a copy instead: hcom f {name}\n  Or stop it first:     hcom kill {name}"
-                );
+            if !fork {
+                ensure_not_running(db, name)?;
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
                 load_instance_data(db, name)?
@@ -3371,6 +3390,94 @@ mod tests {
             "expected inactive agy row to be resumable, got: {:?}",
             result.err()
         );
+    }
+
+    /// An agy row with a recorded process and a stopped snapshot, as left by
+    /// soft-finalize. `identity` None records the live identity of `pid`.
+    fn insert_tracked_agy_row(db: &HcomDb, name: &str, status: &str, identity: Option<&str>) {
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("agy-session-002"));
+        data.insert("tool".into(), json!("antigravity"));
+        data.insert("status".into(), json!(status));
+        data.insert("directory".into(), json!("/tmp"));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named(name, &data).unwrap();
+        let pid = std::process::id();
+        match identity {
+            Some(identity) => db
+                .update_instance_pid_with_identity(name, pid, Some(identity))
+                .unwrap(),
+            None => db.update_instance_pid(name, pid).unwrap(),
+        }
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "antigravity",
+                "session_id": "agy-session-002",
+                "launch_args": "[]",
+                "directory": "/tmp"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", name, snapshot.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_resume_reaps_dead_process_reported_as_running() {
+        let db = test_db();
+        // Crash: the row still says listening, but its process incarnation is gone.
+        insert_tracked_agy_row(
+            &db,
+            "dead",
+            crate::shared::ST_LISTENING,
+            Some("previous-boot-process"),
+        );
+
+        let result = prepare_resume_plan(&db, "dead", false, &[], &GlobalFlags::default());
+
+        assert!(
+            result.is_ok(),
+            "dead process must be resumable: {:?}",
+            result.err()
+        );
+        assert!(
+            db.get_instance_full("dead").unwrap().is_none(),
+            "row reaped"
+        );
+    }
+
+    #[test]
+    fn test_resume_refuses_live_process_marked_inactive() {
+        let db = test_db();
+        // Soft-finalize / StopFailure: inactive with a snapshot, process still running.
+        insert_tracked_agy_row(&db, "live", ST_INACTIVE, None);
+
+        let err = prepare_resume_plan(&db, "live", false, &[], &GlobalFlags::default())
+            .err()
+            .expect("a live process must not get a second copy");
+
+        assert!(err.to_string().contains("still running"), "{err}");
+        assert!(db.get_instance_full("live").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_resume_without_identity_falls_back_to_status() {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("tool".into(), json!("antigravity"));
+        data.insert("status".into(), json!(crate::shared::ST_LISTENING));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("legacy", &data).unwrap();
+
+        let err = prepare_resume_plan(&db, "legacy", false, &[], &GlobalFlags::default())
+            .err()
+            .expect("unverifiable row trusts its status");
+
+        assert!(err.to_string().contains("still running"), "{err}");
     }
 
     #[test]

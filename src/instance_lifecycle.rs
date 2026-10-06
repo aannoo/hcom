@@ -785,28 +785,45 @@ const DEAD_PROCESS_SWEEP_INTERVAL_SECS: f64 = 30.0;
 const DEAD_PROCESS_SWEEP_KV: &str = "_dead_process_sweep_at";
 const ORPHAN_ENDPOINT_GRACE_SECS: f64 = 60.0;
 
-/// If `data`'s tracked process is verifiably gone (its PID is dead or now
-/// belongs to a different process incarnation), stop the row and return
-/// `Some(stopped)`. Returns `None` when the row isn't eligible or its process
-/// is still the one it launched. Rows without a stored identity are left to
-/// the clock-based cleanup: plain liveness can't rule out PID reuse.
-fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bool> {
-    if data.status == ST_INACTIVE
-        || data.status == ST_LAUNCHING
+/// What a row's stored process identity says about its process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackedProcess {
+    /// The recorded process incarnation is still running.
+    Alive,
+    /// It was gone and the row has been stopped (snapshot written, row deleted).
+    Reaped,
+    /// It was gone but the row couldn't be stopped.
+    ReapFailed(String),
+    /// Nothing to verify: remote, launching, or no stored identity.
+    Unverifiable,
+}
+
+/// Check `data`'s tracked process and stop the row if that process is
+/// verifiably gone (its PID is dead or now belongs to a different process
+/// incarnation). The stored status is deliberately ignored: several paths
+/// mark a live process `inactive` (soft-finalize, StopFailure), so only the
+/// identity can tell. Rows without a stored identity are left to the
+/// clock-based cleanup: plain liveness can't rule out PID reuse.
+pub fn reap_if_process_gone(db: &HcomDb, data: &InstanceRow) -> TrackedProcess {
+    if data.status == ST_LAUNCHING
         || crate::instances::is_launching_placeholder(data)
         || data.origin_device_id.is_some()
     {
-        return None;
+        return TrackedProcess::Unverifiable;
     }
-    let pid = data.pid.and_then(|pid| u32::try_from(pid).ok())?;
-    let expected_identity = data.pid_identity()?;
+    let (Some(pid), Some(expected_identity)) = (
+        data.pid.and_then(|pid| u32::try_from(pid).ok()),
+        data.pid_identity(),
+    ) else {
+        return TrackedProcess::Unverifiable;
+    };
     let current_identity = crate::sys::process::identity(pid);
     let original_process_gone = match current_identity.as_deref() {
         Some(current) => current != expected_identity,
         None => !crate::sys::process::is_alive(pid),
     };
     if !original_process_gone {
-        return None;
+        return TrackedProcess::Alive;
     }
 
     crate::log::log_info(
@@ -822,16 +839,24 @@ fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bo
     );
     // Guarded by the inspected incarnation: never signals, and loses to any
     // concurrent rebind of the row to a new process.
-    Some(
-        crate::hooks::common::stop_instance_if_pid_identity(
-            db,
-            &data.name,
-            "system",
-            "process_exit",
-            pid,
-            &expected_identity,
-        ) == crate::hooks::common::StopOutcome::Stopped,
-    )
+    use crate::hooks::common::StopOutcome;
+    match crate::hooks::common::stop_instance_if_pid_identity(
+        db,
+        &data.name,
+        "system",
+        "process_exit",
+        pid,
+        &expected_identity,
+    ) {
+        StopOutcome::Stopped => TrackedProcess::Reaped,
+        // Someone else stopped it, or a new process claimed the row meanwhile.
+        StopOutcome::AlreadyStopped => match db.get_instance_full(&data.name) {
+            Ok(None) => TrackedProcess::Reaped,
+            Ok(Some(current)) => reap_if_process_gone(db, &current),
+            Err(e) => TrackedProcess::ReapFailed(e.to_string()),
+        },
+        StopOutcome::RetryableError(e) => TrackedProcess::ReapFailed(e),
+    }
 }
 
 /// Stop every local instance whose tracked process is verifiably gone.
@@ -842,8 +867,7 @@ fn reap_dead_processes(db: &HcomDb) -> Option<i32> {
     Some(
         instances
             .iter()
-            .filter_map(|data| reap_if_process_gone(db, data))
-            .filter(|stopped| *stopped)
+            .filter(|data| reap_if_process_gone(db, data) == TrackedProcess::Reaped)
             .count() as i32,
     )
 }
@@ -895,9 +919,13 @@ pub fn cleanup_stale_instances(
     if let Ok(instances) = db.iter_instances_full() {
         for data in &instances {
             // Direct evidence beats clock inference, even inside wake grace.
-            if let Some(stopped) = reap_if_process_gone(db, data) {
-                deleted += stopped as i32;
-                continue;
+            match reap_if_process_gone(db, data) {
+                TrackedProcess::Reaped => {
+                    deleted += 1;
+                    continue;
+                }
+                TrackedProcess::ReapFailed(_) => continue,
+                TrackedProcess::Alive | TrackedProcess::Unverifiable => {}
             }
 
             if in_wake_grace {
@@ -1220,6 +1248,78 @@ mod tests {
         .unwrap();
         assert_eq!(reap_dead_processes_throttled(&db), 1);
         assert!(!instance_exists(&db, "second"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_sweep_reaps_dead_process_marked_inactive() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let pid = std::process::id();
+        // StopFailure and soft-finalize mark a row inactive without stopping it.
+        insert_with_identity(&db, "failed", pid, "previous-boot-process");
+        db.set_status("failed", ST_INACTIVE, "failure:model_not_found")
+            .unwrap();
+        insert_stale_active(&db, "live", 0, 0, pid as i64);
+        db.update_instance_pid("live", pid).unwrap();
+        db.set_status("live", ST_INACTIVE, "exit:turn_end").unwrap();
+
+        assert_eq!(reap_dead_processes(&db), Some(1));
+        assert!(!instance_exists(&db, "failed"));
+        assert!(instance_exists(&db, "live"), "a live process is kept");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_sweep_retires_virtual_children_with_dead_parent() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let pid = std::process::id();
+        let set_parent = |child: &str, column: &str, value: &str| {
+            db.conn()
+                .execute(
+                    &format!("UPDATE instances SET {column} = ? WHERE name = ?"),
+                    rusqlite::params![value, child],
+                )
+                .unwrap();
+        };
+
+        // Crashed root with a native subagent (no process of its own) and a
+        // session subagent: both ran inside the dead process.
+        insert_with_identity(&db, "root", pid, "previous-boot-process");
+        set_parent("root", "session_id", "root-session");
+        insert_stale_active(&db, "root_task_1", 0, 0, 0);
+        db.conn()
+            .execute(
+                "UPDATE instances SET pid = NULL WHERE name = 'root_task_1'",
+                [],
+            )
+            .unwrap();
+        set_parent("root_task_1", "parent_name", "root");
+        insert_stale_active(&db, "root_task_2", 0, 0, 0);
+        db.conn()
+            .execute(
+                "UPDATE instances SET pid = NULL WHERE name = 'root_task_2'",
+                [],
+            )
+            .unwrap();
+        set_parent("root_task_2", "parent_session_id", "root-session");
+
+        // A child with its own live process may outlive its parent.
+        insert_with_identity(&db, "other", pid, "previous-boot-process");
+        insert_stale_active(&db, "spawned", 0, 0, pid as i64);
+        db.update_instance_pid("spawned", pid).unwrap();
+        set_parent("spawned", "parent_name", "other");
+
+        assert_eq!(reap_dead_processes(&db), Some(1));
+        assert!(!instance_exists(&db, "root"));
+        assert!(!instance_exists(&db, "root_task_1"));
+        assert!(!instance_exists(&db, "root_task_2"));
+        assert!(
+            instance_exists(&db, "other"),
+            "deferred behind a live child"
+        );
+        assert!(instance_exists(&db, "spawned"));
         cleanup(path);
     }
 
