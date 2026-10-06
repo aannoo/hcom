@@ -308,7 +308,7 @@ mod app_server {
             let (server_args, mut tui_args) = split_args(args)?;
             let directory = tempfile::Builder::new().prefix(DIR_PREFIX).tempdir()?;
             let launch = Self {
-                endpoint: format!("unix://{}", directory.path().join("server.sock").display()),
+                endpoint: format!("unix://{}", socket_path(directory.path()).display()),
                 early: Arc::default(),
             };
             let log_path = directory.path().join("server.log");
@@ -375,6 +375,12 @@ mod app_server {
         }
     }
 
+    /// Codex creates the socket's directory itself: on Windows it accepts only
+    /// a directory with its exact user-only ACL, which a pre-made one lacks.
+    fn socket_path(directory: &std::path::Path) -> std::path::PathBuf {
+        directory.join("socket").join("server.sock")
+    }
+
     /// Stop servers left by wrappers that died without cleanup (SIGKILL, OOM).
     /// Only a socket that still accepts proves the recorded group is ours.
     fn sweep_orphans() {
@@ -398,7 +404,7 @@ mod app_server {
             if crate::sys::process::is_alive(owner) {
                 continue;
             }
-            if UnixStream::connect(path.join("server.sock")).is_ok() {
+            if UnixStream::connect(socket_path(&path)).is_ok() {
                 let _ = crate::sys::process::kill_group(server);
                 log_info(
                     "native",
