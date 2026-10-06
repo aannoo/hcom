@@ -7,6 +7,9 @@
 //! - Inject: TCP injection server
 //! - Delivery: Notify-driven message delivery (integrated)
 
+#[cfg(windows)]
+mod conpty;
+mod console_input;
 #[cfg(unix)]
 mod forward;
 mod inject;
@@ -100,6 +103,11 @@ impl PtyTarget {
 
     pub(super) fn delivery_start_timeout(&self) -> Duration {
         Duration::from_secs(self.delivery_tool().spec().pty.delivery_start_timeout_secs)
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(super) fn console_input(&self) -> crate::integration_spec::ConsoleInput {
+        self.delivery_tool().spec().pty.console_input
     }
 }
 

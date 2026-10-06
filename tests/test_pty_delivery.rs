@@ -719,7 +719,7 @@ fn run_pty_test(tool: &str) {
 
     let model_flag = match tool {
         "claude" => " --model haiku",
-        "codex" => " --model gpt-5.4-mini",
+        "codex" => " --model gpt-6-luna",
         "gemini" => " --model gemini-2.5-flash-lite",
         // `auto` is the only model guaranteed to launch across cursor plan tiers
         // (named models error on free plans).

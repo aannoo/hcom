@@ -113,6 +113,21 @@ pub struct PtySpec {
     /// starting delivery anyway. Every known integration declares this
     /// explicitly; ad-hoc commands use the Adhoc profile.
     pub delivery_start_timeout_secs: u64,
+    /// How the tool reads its console on Windows; the PTY relay reads the
+    /// real console the same way, so keys reach it as they would directly.
+    pub console_input: ConsoleInput,
+}
+
+/// How a Windows TUI reads keyboard input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleInput {
+    /// VT text (`ENABLE_VIRTUAL_TERMINAL_INPUT`): Node/Bun TUIs. Modifiers VT
+    /// can't express are lost even when run directly, but terminal replies and
+    /// bracketed-paste markers arrive intact.
+    Vt,
+    /// Input records (`ReadConsoleInputW`): crossterm. Keys keep their
+    /// virtual-key code and modifiers, so Shift+Enter differs from Enter.
+    Records,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -446,6 +461,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["? for shortcuts", "to cycle)"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     // Set in Claude's Bash tool for the parent session. CHILD_SESSION turns
     // off transcript saving, which would break resume, fork and lineage.
@@ -506,6 +522,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["Type your message"],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &["GEMINI_PTY_INFO"],
     hooks: HooksSpec {
@@ -560,6 +577,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["\u{203A} ", "\u{BB} "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Records,
     },
     instance_state_env: &["CODEX_EXEC_SERVER_URL"],
     hooks: HooksSpec {
@@ -614,6 +632,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["ctrl+p commands"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &["OPENCODE_RUN_ID", "OPENCODE_PROCESS_ROLE"],
     hooks: HooksSpec {
@@ -677,6 +696,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     // KILO_DB is the on-disk session store; all three are instance-state.
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &["KILO_DB", "KILO_RUN_ID", "KILO_PROCESS_ROLE"],
     hooks: HooksSpec {
@@ -730,6 +750,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["? for shortcuts"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &["ANTIGRAVITY_EXECUTABLE_DATA_DIR", "GEMINI_PTY_INFO"],
     hooks: HooksSpec {
@@ -793,6 +814,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     // Closed-source; unknown instance-state vars are a documented gap.
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &[],
     hooks: HooksSpec {
@@ -852,6 +874,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["> "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &[],
     hooks: HooksSpec {
@@ -923,6 +946,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &[],
     hooks: HooksSpec {
@@ -992,6 +1016,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &[],
     hooks: HooksSpec {
@@ -1062,6 +1087,7 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     // Closed-source; unknown instance-state vars are a documented gap.
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &[],
     hooks: HooksSpec {
@@ -1116,6 +1142,7 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
     ready_patterns: &["Type your message", "? for shortcuts"],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
+        console_input: ConsoleInput::Vt,
     },
     // Qoder's own session env vars are read as input on a fresh start and are
     // instance-specific. `QODER_CONFIG_DIR` is deliberately not here: it is a
@@ -1176,6 +1203,7 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 10,
+        console_input: ConsoleInput::Vt,
     },
     // Session id is instance-specific and would corrupt a same-tool child launch.
     instance_state_env: &["GROK_SESSION_ID"],
@@ -1229,6 +1257,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
+        console_input: ConsoleInput::Vt,
     },
     instance_state_env: &[],
     hooks: HooksSpec {

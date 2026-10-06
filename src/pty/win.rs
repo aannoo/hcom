@@ -26,6 +26,7 @@ use super::shared;
 
 use crate::db::HcomDb;
 use crate::delivery::{EXIT_WAS_KILLED, ScreenState};
+use crate::integration_spec::ConsoleInput;
 use crate::log::log_error;
 
 /// True if `path` is a `.cmd`/`.bat` script (case-insensitive), which
@@ -97,6 +98,7 @@ impl Proxy {
         let spawn_started = Instant::now();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
+        super::conpty::select();
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -223,7 +225,7 @@ impl Proxy {
     pub fn run(&mut self) -> Result<i32> {
         // Put our console into raw + VT passthrough so the tool's TUI renders
         // and keystrokes flow through unbuffered. Restored on drop.
-        let _console = console::RawConsoleGuard::enable();
+        let _console = console::RawConsoleGuard::enable(self.config.target.console_input());
 
         let startup_time = Instant::now();
 
@@ -514,6 +516,7 @@ impl Proxy {
         let screen_snapshot = self.screen_snapshot.clone();
         let writer = self.writer.clone();
         let (rows, cols) = (self.rows, self.cols);
+        let console_input = self.config.target.console_input();
         let mut trace = shared::StartupTrace::new(self.spawned_at, instance.as_deref());
 
         // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
@@ -573,6 +576,10 @@ impl Proxy {
                 .unwrap_or(crate::shared::TitleMode::Combined);
             let title_enabled = title_mode != crate::shared::TitleMode::Off;
             filter.set_passthrough_titles(!title_enabled);
+            // A relay reading input records can't receive the terminal's
+            // cursor reports (see set_local_cursor_reports).
+            let local_cursor_reports = !headless && console_input == ConsoleInput::Records;
+            filter.set_local_cursor_reports(local_cursor_reports);
             let mut last_child = String::new();
 
             // `hcom term` snapshot refresh (see should_refresh_snapshot). Under
@@ -665,22 +672,39 @@ impl Proxy {
                         // which the child can't parse, and startup hangs.
                         scratch.clear();
                         filter.filter(data, &mut scratch);
-                        let _ = stdout.write_all(&scratch);
-                        let _ = stdout.flush();
-
-                        // Headless: no outer terminal saw the DSR query, so answer
-                        // it here (a canned cursor-at-1;1 report) to unblock the
-                        // child's console initialization. Interactive: the real
-                        // terminal already answered, so we never synthesize a
-                        // reply — the latch is simply left set and unread.
-                        if headless
-                            && filter.take_dsr()
-                            && let Ok(mut w) = writer.lock()
-                        {
-                            let _ = w.write_all(b"\x1b[1;1R");
-                            let _ = w.flush();
-                            trace.on_dsr_answered();
+                        let queries = filter.take_queries();
+                        let mut written = 0;
+                        for &(query, at) in &queries {
+                            let reply = if headless {
+                                // No outer terminal saw the ConPTY's startup
+                                // queries; answer them to unblock its console
+                                // initialization.
+                                Some(query.headless_reply().to_vec())
+                            } else if local_cursor_reports
+                                && query == shared::TerminalQuery::CursorPosition
+                            {
+                                // Answer once everything before the query is on
+                                // the console, so the cursor is where it asked.
+                                let _ = stdout.write_all(&scratch[written..at]);
+                                let _ = stdout.flush();
+                                written = at;
+                                console::cursor_position_report()
+                            } else {
+                                // The real terminal answers.
+                                None
+                            };
+                            if let Some(reply) = reply
+                                && let Ok(mut w) = writer.lock()
+                            {
+                                let _ = w.write_all(&reply);
+                                let _ = w.flush();
+                                if query == shared::TerminalQuery::CursorPosition {
+                                    trace.on_dsr_answered();
+                                }
+                            }
                         }
+                        let _ = stdout.write_all(&scratch[written..]);
+                        let _ = stdout.flush();
 
                         screen.process(data);
 
@@ -767,9 +791,15 @@ impl Proxy {
 
     /// Our stdin → PTY input. Intentionally detached and never joined.
     ///
-    /// The `running` check at the loop top only catches shutdown *between*
-    /// reads; a `stdin.read()` already blocked when the child exits cannot be
-    /// interrupted and outlives the child. This does not leak: `main` calls
+    /// A console stdin is read as input records and re-encoded (see
+    /// `console_input`); `std::io::stdin()` can't be used there, since on a
+    /// console it reports end-of-file for a read that ends in Ctrl+Z, which
+    /// used to stop all input for the rest of the session. A redirected stdin
+    /// is forwarded byte for byte.
+    ///
+    /// The `running` check only catches shutdown *between* reads; a pipe
+    /// `read()` already blocked when the child exits cannot be interrupted and
+    /// outlives the child. This does not leak: `main` calls
     /// `std::process::exit` immediately after `run` returns (and `Proxy::drop`),
     /// which terminates the process and reaps this thread even mid-read. The
     /// thread holds no lock across the blocking read, so it cannot wedge
@@ -784,43 +814,63 @@ impl Proxy {
         let current_status = self.current_status.clone();
         let instance = self.config.instance_name.clone();
         let approval_clear_requested = self.approval_clear_requested.clone();
+        let console_input = self.config.target.console_input();
         thread::spawn(move || {
+            let forward = |bytes: &[u8]| {
+                if let Ok(mut w) = writer.lock() {
+                    let _ = w.write_all(bytes);
+                    let _ = w.flush();
+                }
+                // A genuine keystroke answering a title-detected approval
+                // clears it immediately. Record the cleared edge against shared
+                // state; the reader thread owns the tracker, so request a
+                // tracker-clear via the atomic it consumes — but ONLY when an
+                // approval was actually standing. `clear_approval()` wipes the
+                // OSC scrape buffer, so requesting it on every keystroke would
+                // let a routine keypress race out an approval edge arriving in
+                // the same window.
+                let publish = |a: bool| {
+                    shared::publish_approval_status(a, instance.as_deref(), &current_status)
+                };
+                if shared::note_user_keystroke(&target, &screen_state, &publish) {
+                    approval_clear_requested.store(true, Ordering::Release);
+                }
+            };
+
+            if let Some(mut input) = console::InputReader::open(console_input) {
+                let mut out = Vec::new();
+                while running.load(Ordering::Acquire) {
+                    out.clear();
+                    // Bounded wait so the loop sees shutdown.
+                    if let Err(error) = input.read(100, &mut out) {
+                        log_error(
+                            "native",
+                            "win.stdin",
+                            &format!("console input read failed: {error}"),
+                        );
+                        break;
+                    }
+                    if !out.is_empty() {
+                        forward(&out);
+                    }
+                }
+                return;
+            }
+
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 4096];
-            loop {
-                if !running.load(Ordering::Acquire) {
-                    break;
-                }
+            while running.load(Ordering::Acquire) {
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(mut w) = writer.lock() {
-                            let _ = w.write_all(&buf[..n]);
-                            let _ = w.flush();
-                        }
-                        if n > 0 {
-                            // A genuine keystroke answering a title-detected
-                            // approval clears it immediately. Record the cleared
-                            // edge against shared state; the reader thread owns
-                            // the tracker, so request a tracker-clear via the
-                            // atomic it consumes — but ONLY when an approval was
-                            // actually standing. `clear_approval()` wipes the OSC
-                            // scrape buffer, so requesting it on every keystroke
-                            // would let a routine keypress race out an approval
-                            // edge arriving in the same window.
-                            let publish = |a: bool| {
-                                shared::publish_approval_status(
-                                    a,
-                                    instance.as_deref(),
-                                    &current_status,
-                                )
-                            };
-                            if shared::note_user_keystroke(&target, &screen_state, &publish) {
-                                approval_clear_requested.store(true, Ordering::Release);
-                            }
-                        }
+                    Err(error) => {
+                        log_error(
+                            "native",
+                            "win.stdin",
+                            &format!("stdin read failed: {error}"),
+                        );
+                        break;
                     }
-                    Err(_) => break,
+                    Ok(n) => forward(&buf[..n]),
                 }
             }
         });
@@ -1202,13 +1252,134 @@ mod job {
     }
 }
 
-/// Windows console raw-mode + VT passthrough, restored on drop.
+/// Windows console raw mode + VT output, restored on drop, and the console
+/// input reader.
 mod console {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Console::{
-        CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
-        GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, KEY_EVENT,
+        MOUSE_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
     };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    use super::super::console_input::{InputEncoder, KeyRecord, MouseRecord};
+    use crate::integration_spec::ConsoleInput;
+
+    fn screen_info() -> Option<CONSOLE_SCREEN_BUFFER_INFO> {
+        // SAFETY: CONSOLE_SCREEN_BUFFER_INFO is plain data; the call fills it
+        // for our own stdout handle.
+        unsafe {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+            (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) != 0)
+                .then_some(info)
+        }
+    }
+
+    /// `\x1b[<row>;<col>R` for our console's cursor, relative to the visible
+    /// window — what the terminal would reply to `\x1b[6n`.
+    pub fn cursor_position_report() -> Option<Vec<u8>> {
+        let info = screen_info()?;
+        let row = i32::from(info.dwCursorPosition.Y) - i32::from(info.srWindow.Top) + 1;
+        let col = i32::from(info.dwCursorPosition.X) - i32::from(info.srWindow.Left) + 1;
+        Some(format!("\x1b[{};{}R", row.max(1), col.max(1)).into_bytes())
+    }
+
+    /// Reads the console's input records and encodes them for the ConPTY (see
+    /// `console_input`).
+    pub struct InputReader {
+        handle: isize,
+        records: Vec<INPUT_RECORD>,
+        encoder: InputEncoder,
+    }
+
+    impl InputReader {
+        /// `None` when stdin isn't a console.
+        pub fn open(input: ConsoleInput) -> Option<Self> {
+            // SAFETY: querying the mode of our own std handle.
+            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as isize;
+            let mut mode: CONSOLE_MODE = 0;
+            // SAFETY: as above; `mode` is a valid out-pointer.
+            if unsafe { GetConsoleMode(handle as _, &mut mode) } == 0 {
+                return None;
+            }
+            Some(Self {
+                handle,
+                // SAFETY: INPUT_RECORD is plain data; all-zero is valid.
+                records: vec![unsafe { std::mem::zeroed() }; 128],
+                encoder: InputEncoder::new(input),
+            })
+        }
+
+        /// Wait up to `timeout_ms` for input and append its encoding to `out`.
+        pub fn read(&mut self, timeout_ms: u32, out: &mut Vec<u8>) -> std::io::Result<()> {
+            // SAFETY: waiting on our own console input handle.
+            match unsafe { WaitForSingleObject(self.handle as _, timeout_ms) } {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => return Ok(()),
+                _ => return Err(std::io::Error::last_os_error()),
+            }
+            let mut n = 0u32;
+            // SAFETY: `records` holds `len` writable records; `n` receives the
+            // count actually read.
+            let ok = unsafe {
+                ReadConsoleInputW(
+                    self.handle as _,
+                    self.records.as_mut_ptr(),
+                    self.records.len() as u32,
+                    &mut n,
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Mouse positions are buffer coordinates; SGR reports are relative
+            // to the visible window. Looked up once per batch, if needed.
+            let mut window_origin = None;
+            for record in &self.records[..n as usize] {
+                // SAFETY: the union member read matches `EventType`.
+                unsafe {
+                    match u32::from(record.EventType) {
+                        KEY_EVENT => {
+                            let k = record.Event.KeyEvent;
+                            self.encoder.key(
+                                KeyRecord {
+                                    down: k.bKeyDown != 0,
+                                    repeat: k.wRepeatCount,
+                                    vk: k.wVirtualKeyCode,
+                                    scan: k.wVirtualScanCode,
+                                    ch: k.uChar.UnicodeChar,
+                                    ctrl: k.dwControlKeyState,
+                                },
+                                out,
+                            );
+                        }
+                        MOUSE_EVENT => {
+                            let m = record.Event.MouseEvent;
+                            let (left, top) = *window_origin.get_or_insert_with(|| {
+                                screen_info().map_or((0, 0), |i| (i.srWindow.Left, i.srWindow.Top))
+                            });
+                            self.encoder.mouse(
+                                MouseRecord {
+                                    x: m.dwMousePosition.X.saturating_sub(left),
+                                    y: m.dwMousePosition.Y.saturating_sub(top),
+                                    buttons: m.dwButtonState,
+                                    ctrl: m.dwControlKeyState,
+                                    flags: m.dwEventFlags,
+                                },
+                                out,
+                            );
+                        }
+                        // Focus and buffer-size records: focus reporting is
+                        // kept off the outer terminal, and resizes are polled.
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 
     pub struct RawConsoleGuard {
         stdin_handle: isize,
@@ -1219,10 +1390,12 @@ mod console {
     }
 
     impl RawConsoleGuard {
-        /// Best-effort: disable line input/echo on stdin, enable VT input, and
-        /// enable VT processing on stdout so the child's escape sequences render.
-        /// If the handles aren't consoles (piped), this is a no-op.
-        pub fn enable() -> Self {
+        /// Best-effort: disable line input, echo and Ctrl+C processing on
+        /// stdin, with VT input on only when the child reads VT (see
+        /// `console_input`), and enable VT processing on stdout so the child's
+        /// escape sequences render. If the handles aren't consoles (piped),
+        /// this is a no-op.
+        pub fn enable(input: ConsoleInput) -> Self {
             // SAFETY: GetStdHandle returns process-owned console handles; the
             // mode getters/setters only touch those handles.
             unsafe {
@@ -1233,9 +1406,14 @@ mod console {
                 let ok_in = GetConsoleMode(stdin_handle as _, &mut prev_in) != 0;
                 let ok_out = GetConsoleMode(stdout_handle as _, &mut prev_out) != 0;
                 if ok_in {
-                    let raw_in = (prev_in
-                        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
-                        | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                    let mut raw_in = prev_in
+                        & !(ENABLE_LINE_INPUT
+                            | ENABLE_ECHO_INPUT
+                            | ENABLE_PROCESSED_INPUT
+                            | ENABLE_VIRTUAL_TERMINAL_INPUT);
+                    if input == ConsoleInput::Vt {
+                        raw_in |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+                    }
                     SetConsoleMode(stdin_handle as _, raw_in);
                 }
                 if ok_out {

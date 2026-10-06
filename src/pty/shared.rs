@@ -912,16 +912,41 @@ pub(super) fn build_early_launch_context() -> String {
     Value::Object(ctx).to_string()
 }
 
-/// True when `seq` is the terminal's cursor-position query (`ESC[6n`, a DSR
-/// with parameter 6). In headless mode there is no outer terminal to answer it,
-/// so the reader must reply on the child's behalf or startup hangs (#1).
-///
-/// Deliberately narrow: only the bare `ESC[6n` query matches. A CPR *reply*
-/// (`ESC[<r>;<c>R`), a private DSR (`ESC[?6n`), and a parameterless `ESC[n`
-/// must not match — we only synthesize a reply to the child's own query.
+/// A query the ConPTY sends its terminal at startup. In headless mode there is
+/// no outer terminal to answer, so the reader replies on the child's behalf:
+/// an unanswered cursor-position query hangs startup (#1), and an unanswered
+/// DA1 stalls the bundled ConPTY for seconds.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn csi_is_dsr_cpr(seq: &[u8]) -> bool {
-    seq == b"\x1b[6n"
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum TerminalQuery {
+    /// `ESC[6n`
+    CursorPosition,
+    /// `ESC[c` / `ESC[0c`
+    PrimaryDeviceAttributes,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl TerminalQuery {
+    /// Deliberately narrow: only the bare queries match. A CPR *reply*
+    /// (`ESC[<r>;<c>R`), a private DSR (`ESC[?6n`), a parameterless `ESC[n`,
+    /// and secondary/tertiary DA (`ESC[>c`, `ESC[=c`) must not — we only
+    /// answer what we can answer correctly.
+    fn parse(seq: &[u8]) -> Option<Self> {
+        match seq {
+            b"\x1b[6n" => Some(Self::CursorPosition),
+            b"\x1b[c" | b"\x1b[0c" => Some(Self::PrimaryDeviceAttributes),
+            _ => None,
+        }
+    }
+
+    /// The reply a headless reader sends: cursor at the origin, and the
+    /// device attributes the inbox ConPTY reports for itself.
+    pub(super) fn headless_reply(self) -> &'static [u8] {
+        match self {
+            Self::CursorPosition => b"\x1b[1;1R",
+            Self::PrimaryDeviceAttributes => b"\x1b[?61;6;7;22;23;24;28;32;42c",
+        }
+    }
 }
 
 /// Rebuild a DEC private mode-set (`ESC[? … h|l`), dropping only the Win32-input
@@ -957,8 +982,7 @@ pub(super) fn filter_dec_private_modes(seq: &[u8]) -> Vec<u8> {
 
 /// Rewrites the child's DEC private-mode **sets** so the *outer* terminal is
 /// never switched into Win32 input mode (`?9001`) or focus reporting (`?1004`),
-/// and notices the child's cursor-position query (`ESC[6n`) so a headless reader
-/// can answer it.
+/// and notices the [`TerminalQuery`]s a headless reader must answer.
 ///
 /// A ConPTY wrapper sits between the child and the real terminal. If the child's
 /// `ESC[?9001h` reaches the outer terminal, that terminal starts encoding its
@@ -969,7 +993,7 @@ pub(super) fn filter_dec_private_modes(seq: &[u8]) -> Vec<u8> {
 ///
 /// The parser is stateful so sequences split across reads are handled, and every
 /// other byte (including all other escape sequences) passes through unchanged.
-/// DSR queries are still passed through: in interactive mode the real terminal
+/// Queries are still passed through: in interactive mode the real terminal
 /// must see them to answer; the headless reply is gated separately in win.rs.
 ///
 /// Lives here (rather than in `win.rs`) so its correctness-critical parsing runs
@@ -979,12 +1003,17 @@ pub(super) fn filter_dec_private_modes(seq: &[u8]) -> Vec<u8> {
 pub(super) struct OutputModeFilter {
     state: FilterState,
     buf: Vec<u8>,
-    dsr_seen: bool,
+    /// Queries seen, each with its offset in the `out` buffer of the `filter`
+    /// call that completed it.
+    queries: Vec<(TerminalQuery, usize)>,
     pending_utf8: u8,
     /// When true (title_mode `off`), the tool's own OSC 0/1/2 titles are passed
     /// through to the terminal instead of stripped. DSR/ground-state tracking is
     /// unaffected. Default false preserves the strip-and-override behavior.
     passthrough_titles: bool,
+    /// When true, cursor-position queries are held back from the terminal for
+    /// the reader to answer from the console (see `set_local_cursor_reports`).
+    local_cursor_reports: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -1010,6 +1039,14 @@ impl OutputModeFilter {
     /// (title_mode `off`). DSR/ground-state tracking is unaffected.
     pub(super) fn set_passthrough_titles(&mut self, passthrough: bool) {
         self.passthrough_titles = passthrough;
+    }
+
+    /// Hold cursor-position queries back from the terminal; the reader answers
+    /// them at the offset `take_queries` reports. Needed when the relay reads
+    /// its console as input records: the console host decodes a terminal's
+    /// `ESC[<r>;<c>R` reply as an F3 keypress there.
+    pub(super) fn set_local_cursor_reports(&mut self, local: bool) {
+        self.local_cursor_reports = local;
     }
 
     pub(super) fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
@@ -1060,14 +1097,18 @@ impl OutputModeFilter {
                 FilterState::Csi => {
                     self.buf.push(b);
                     if (0x40..=0x7e).contains(&b) {
-                        // Completed CSI. Notice the child's cursor-position query
-                        // (still pass it through — interactive needs the real
-                        // terminal to answer), and filter DEC private mode-sets
-                        // per-parameter.
-                        if csi_is_dsr_cpr(&self.buf) {
-                            self.dsr_seen = true;
+                        // Completed CSI. Notice terminal queries (passed through
+                        // so the real terminal answers, unless cursor reports
+                        // are answered locally), and filter DEC private
+                        // mode-sets per-parameter.
+                        let query = TerminalQuery::parse(&self.buf);
+                        if let Some(query) = query {
+                            self.queries.push((query, out.len()));
                         }
-                        if self.buf.starts_with(b"\x1b[?") && matches!(b, b'h' | b'l') {
+                        if query == Some(TerminalQuery::CursorPosition) && self.local_cursor_reports
+                        {
+                            // Held back; the reader answers it at this offset.
+                        } else if self.buf.starts_with(b"\x1b[?") && matches!(b, b'h' | b'l') {
                             out.extend_from_slice(&filter_dec_private_modes(&self.buf));
                         } else {
                             out.extend_from_slice(&self.buf);
@@ -1174,11 +1215,11 @@ impl OutputModeFilter {
         }
     }
 
-    /// One-shot: returns `true` once after a cursor-position query (`ESC[6n`)
-    /// was seen, then resets. The reader uses it to reply on the child's behalf
-    /// when running headless.
-    pub(super) fn take_dsr(&mut self) -> bool {
-        std::mem::take(&mut self.dsr_seen)
+    /// The queries seen since the last call, in order, each with its offset in
+    /// the `out` buffer passed to `filter`. The reader uses them to reply on
+    /// the child's behalf when headless or answering cursor reports locally.
+    pub(super) fn take_queries(&mut self) -> Vec<(TerminalQuery, usize)> {
+        std::mem::take(&mut self.queries)
     }
 
     /// True when an hcom title OSC can be appended without splitting a control
@@ -1440,12 +1481,28 @@ mod tests {
     }
 
     #[test]
-    fn csi_is_dsr_cpr_matches_only_the_cursor_position_query() {
-        assert!(csi_is_dsr_cpr(b"\x1b[6n"));
-        // A CPR reply, a private DSR, and a bare DSR must not match.
-        assert!(!csi_is_dsr_cpr(b"\x1b[6;1R"));
-        assert!(!csi_is_dsr_cpr(b"\x1b[?6n"));
-        assert!(!csi_is_dsr_cpr(b"\x1b[n"));
+    fn terminal_query_matches_only_bare_queries() {
+        use TerminalQuery::*;
+        assert_eq!(TerminalQuery::parse(b"\x1b[6n"), Some(CursorPosition));
+        assert_eq!(
+            TerminalQuery::parse(b"\x1b[c"),
+            Some(PrimaryDeviceAttributes)
+        );
+        assert_eq!(
+            TerminalQuery::parse(b"\x1b[0c"),
+            Some(PrimaryDeviceAttributes)
+        );
+        // Replies, private/bare DSR, and secondary/tertiary DA must not match.
+        for seq in [
+            &b"\x1b[6;1R"[..],
+            b"\x1b[?6n",
+            b"\x1b[n",
+            b"\x1b[?62;22c",
+            b"\x1b[>c",
+            b"\x1b[=c",
+        ] {
+            assert_eq!(TerminalQuery::parse(seq), None);
+        }
     }
 
     fn filter_modes(chunks: &[&[u8]]) -> Vec<u8> {
@@ -1511,15 +1568,39 @@ mod tests {
     }
 
     #[test]
-    fn output_mode_filter_take_dsr_is_one_shot() {
+    fn output_mode_filter_take_queries_is_one_shot_and_ordered() {
         let mut f = OutputModeFilter::default();
         let mut out = Vec::new();
-        f.filter(b"\x1b[6n", &mut out);
-        // DSR passes through to the outer terminal...
-        assert_eq!(out, b"\x1b[6n");
-        // ...and is latched exactly once.
-        assert!(f.take_dsr());
-        assert!(!f.take_dsr());
+        f.filter(b"\x1b[6n\x1b[", &mut out);
+        f.filter(b"c", &mut out);
+        // Queries pass through to the outer terminal...
+        assert_eq!(out, b"\x1b[6n\x1b[c");
+        // ...and are handed out once, in order, with their output offsets.
+        assert_eq!(
+            f.take_queries(),
+            [
+                (TerminalQuery::CursorPosition, 0),
+                (TerminalQuery::PrimaryDeviceAttributes, 4)
+            ]
+        );
+        assert!(f.take_queries().is_empty());
+    }
+
+    #[test]
+    fn output_mode_filter_holds_back_cursor_queries_when_answering_locally() {
+        let mut f = OutputModeFilter::default();
+        f.set_local_cursor_reports(true);
+        let mut out = Vec::new();
+        f.filter(b"ab\x1b[6ncd\x1b[c", &mut out);
+        // The cursor query is withheld at offset 2; DA1 still goes out.
+        assert_eq!(out, b"abcd\x1b[c");
+        assert_eq!(
+            f.take_queries(),
+            [
+                (TerminalQuery::CursorPosition, 2),
+                (TerminalQuery::PrimaryDeviceAttributes, 4)
+            ]
+        );
     }
 
     #[test]

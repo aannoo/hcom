@@ -64,11 +64,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Console",
+    "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
     "Win32_Networking_WinSock",
 ] }
 # ConPTY-backed pseudoterminal for the Windows PTY wrapper.
 portable-pty = "0.9"
+conpty-assets = "=0.1.1"
 
 [dev-dependencies]
 serial_test = "3"
