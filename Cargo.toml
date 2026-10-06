@@ -71,6 +71,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 # ConPTY-backed pseudoterminal for the Windows PTY wrapper.
 portable-pty = "0.9"
+# AF_UNIX client for the private Codex app-server socket.
+uds_windows = "1"
 
 [dev-dependencies]
 serial_test = "3"

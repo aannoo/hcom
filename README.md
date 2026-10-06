@@ -243,7 +243,7 @@ hcom f <session_id>   # Fork a session in hcom
 hcom config codex_native_delivery 1
 ```
 
-By default hcom wakes an idle Codex by typing into its terminal. With this on, each Codex agent gets a private `codex app-server` and the terminal UI attaches to it with `--remote`; hcom wakes the agent through Codex's own queue on whichever thread the UI is showing. Drafts in the composer are never touched and the first message can arrive before the first prompt. Costs one extra Codex process per agent and relies on experimental Codex APIs. Unix only.
+By default hcom wakes an idle Codex by typing into its terminal. With this on, each Codex agent gets a private `codex app-server` and the terminal UI attaches to it with `--remote`; hcom wakes the agent through Codex's own queue on whichever thread the UI is showing. Drafts in the composer are never touched and the first message can arrive before the first prompt. Costs one extra Codex process per agent and relies on experimental Codex APIs.
 
 For npm-style installs (npm, bun, nvm, ...) the private server runs the native Codex binary directly, without a Node launcher in front of it. Other installs use the original command.
 

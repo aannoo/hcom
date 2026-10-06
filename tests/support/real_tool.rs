@@ -438,6 +438,14 @@ fn run_lifecycle<C: ToolCase>(case: C, native: bool) {
     // Clear any surfaced startup gate (Claude onboarding/trust) before readiness.
     case.drive_startup(&h, &name);
     wait_pty_ready(&h, &name, "PTY inject endpoint");
+    // A silent fallback to terminal delivery must not pass as native.
+    if native {
+        let log = std::fs::read_to_string(h.path().join(".tmp/logs/hcom.log")).unwrap_or_default();
+        assert!(
+            log.contains("codex.native.started"),
+            "native delivery did not start"
+        );
+    }
 
     // --- Phase 2: first turn (file tool -> shell tool -> hcom send -> proof) ---
     {

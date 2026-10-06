@@ -1,5 +1,6 @@
 //! Opt-in Codex idle delivery (`codex_native_delivery`) through a private
-//! app-server. hcom starts `codex app-server` on a private Unix socket, attaches
+//! app-server. hcom starts `codex app-server` on a private Unix domain socket
+//! (AF_UNIX, which Codex also serves on Windows), attaches
 //! the TUI with `--remote`, and wakes an idle agent by queueing `<hcom>` on the
 //! thread the TUI is showing. Nothing is typed into the composer, so drafts
 //! survive. Hooks still own the inbox and its cursor; accepting a wake into
@@ -10,17 +11,15 @@
 //! notifications, because `/new` and `/resume` switch threads without a hook
 //! until the next prompt, and a wake on the old thread would run invisibly.
 //!
-//! Launches this cannot serve (Windows, flags that conflict with `--remote`,
-//! a server that fails to start) fall back to terminal delivery.
+//! Launches this cannot serve (flags that conflict with `--remote`, a server
+//! that fails to start) fall back to terminal delivery.
 
 use std::process::Child;
 
 use super::log_warn;
 
-#[cfg(unix)]
-pub(crate) use unix::Launch;
-#[cfg(unix)]
-pub(super) use unix::run;
+pub(crate) use app_server::Launch;
+pub(super) use app_server::run;
 
 /// Own the server until the PTY and delivery thread are gone. Drop also covers
 /// setup failures, so a failed TUI spawn cannot leave a server behind.
@@ -103,7 +102,6 @@ fn permission_key(raw: &str) -> bool {
 /// Config overrides must reach the server (notably hooks and writable roots).
 /// Keep ordinary TUI arguments intact, but move the writable-root overrides:
 /// Codex rejects those on a remote client.
-#[cfg_attr(not(unix), allow(dead_code))]
 fn split_args(args: &[&str]) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     use anyhow::Context;
     let mut server = Vec::new();
@@ -159,14 +157,6 @@ pub(crate) fn start(
     if !enabled {
         return None;
     }
-    if !cfg!(unix) {
-        log_warn(
-            "native",
-            "codex.native.fallback",
-            "unsupported on this platform",
-        );
-        return None;
-    }
     if let Some(flag) = incompatible(args) {
         log_warn(
             "native",
@@ -175,53 +165,31 @@ pub(crate) fn start(
         );
         return None;
     }
-    #[cfg(unix)]
-    match unix::Launch::start(command, prefix, args, env) {
-        Ok(started) => return Some(started),
-        Err(error) => log_warn(
-            "native",
-            "codex.native.fallback",
-            &format!("private app-server failed; using terminal delivery: {error:#}"),
-        ),
+    match app_server::Launch::start(command, prefix, args, env) {
+        Ok(started) => Some(started),
+        Err(error) => {
+            log_warn(
+                "native",
+                "codex.native.fallback",
+                &format!("private app-server failed; using terminal delivery: {error:#}"),
+            );
+            None
+        }
     }
-    #[cfg(not(unix))]
-    let _ = (command, prefix, env);
-    None
 }
 
-/// Uninhabited off Unix: native delivery never starts there.
-#[cfg(not(unix))]
-#[derive(Clone, Debug)]
-pub(crate) enum Launch {}
-
-#[cfg(not(unix))]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn run(
-    launch: &Launch,
-    _running: &std::sync::atomic::AtomicBool,
-    _db: &mut crate::db::HcomDb,
-    _notify: &crate::notify::NotifyServer,
-    _state: &super::DeliveryState,
-    _process_id: &str,
-    _current_name: &mut String,
-    _config: &super::ToolConfig,
-    _shared_name: &Option<std::sync::Arc<std::sync::RwLock<String>>>,
-    _shared_status: &Option<std::sync::Arc<std::sync::RwLock<String>>>,
-    _title_wake: &Option<super::TitleWake>,
-    _host_label: &mut super::host_label::HostLabel,
-    _launch_outcome: &mut super::LaunchOutcome,
-) {
-    match *launch {}
-}
-
-#[cfg(unix)]
-mod unix {
+mod app_server {
     use std::collections::HashSet;
+    #[cfg(unix)]
     use std::os::unix::{net::UnixStream, process::CommandExt};
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant};
+    #[cfg(windows)]
+    use uds_windows::UnixStream;
 
     use anyhow::{Context, Result, bail};
     use serde_json::{Value, json};
@@ -241,16 +209,20 @@ mod unix {
     /// `<wrapper pid> <server pid>`, for sweeping servers whose wrapper was
     /// killed before it could drop its [`Server`].
     const OWNER_FILE: &str = "owner";
+    const BINARY: &str = if cfg!(windows) { "codex.exe" } else { "codex" };
 
     /// The native binary an npm-style `codex.js` launcher would spawn, so the
     /// private server runs without a Node process in front of it. The launcher
     /// only adds `CODEX_MANAGED_BY_*`, which just picks the TUI's update hint.
-    /// Wrappers and unrecognized layouts keep the original command.
+    /// Wrappers and unrecognized layouts keep the original command. Windows
+    /// launches `node codex.js` (see `terminal::resolve_windows_tool_launcher`).
     fn native_server_binary(command: &str, prefix: &[String]) -> Option<std::path::PathBuf> {
-        if !prefix.is_empty() {
-            return None;
-        }
-        let launcher = std::fs::canonicalize(command).ok()?;
+        let launcher = match prefix {
+            [] => command,
+            [script] if cfg!(windows) => script,
+            _ => return None,
+        };
+        let launcher = std::fs::canonicalize(launcher).ok()?;
         if !launcher.ends_with("node_modules/@openai/codex/bin/codex.js") {
             return None;
         }
@@ -260,6 +232,7 @@ mod unix {
         let os = match std::env::consts::OS {
             "macos" => "darwin",
             "linux" => "linux",
+            "windows" => "win32",
             _ => return None,
         };
         // Take whichever platform package the installer picked rather than
@@ -284,11 +257,17 @@ mod unix {
         let mut binaries = std::fs::read_dir(vendor)
             .ok()?
             .filter_map(Result::ok)
-            .map(|entry| entry.path().join("bin/codex"))
+            .map(|entry| entry.path().join("bin").join(BINARY))
             .filter(|path| {
+                #[cfg(unix)]
                 use std::os::unix::fs::PermissionsExt;
-                path.metadata()
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                path.metadata().is_ok_and(|m| {
+                    #[cfg(unix)]
+                    let executable = m.permissions().mode() & 0o111 != 0;
+                    #[cfg(windows)]
+                    let executable = true;
+                    m.is_file() && executable
+                })
             });
         match (binaries.next(), binaries.next()) {
             (Some(binary), None) => Some(binary),
@@ -353,8 +332,13 @@ mod unix {
                 .envs(env.iter().map(|(k, v)| (k, v)))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(std::fs::File::create(&log_path)?)
-                .process_group(0);
+                .stderr(std::fs::File::create(&log_path)?);
+            // Keep terminal signals (Ctrl+C) away from the server; the TUI
+            // owns interrupts. Server::drop kills the whole tree.
+            #[cfg(unix)]
+            server_command.process_group(0);
+            #[cfg(windows)]
+            server_command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
             let child = server_command
                 .spawn()
                 .context("starting private Codex app-server")?;
@@ -577,25 +561,26 @@ mod unix {
         /// Read pending notifications without blocking, then classify threads
         /// that were loaded without a `thread/started` (a TUI `/resume`).
         fn pump(&mut self) -> Result<()> {
-            self.websocket
-                .get_mut()
-                .set_read_timeout(Some(Duration::from_millis(1)))?;
-            loop {
+            // Non-blocking rather than a short timeout: Windows documents a
+            // socket whose receive timed out as unusable.
+            self.websocket.get_mut().set_nonblocking(true)?;
+            let drained = loop {
                 match self.websocket.read() {
                     Ok(message) => {
-                        self.receive(message)?;
+                        if let Err(error) = self.receive(message) {
+                            break Err(error);
+                        }
                     }
                     Err(tungstenite::Error::Io(error))
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
+                        if error.kind() == std::io::ErrorKind::WouldBlock =>
                     {
-                        break;
+                        break Ok(());
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => break Err(error.into()),
                 }
-            }
+            };
+            self.websocket.get_mut().set_nonblocking(false)?;
+            drained?;
             while let Some(id) = self.unchecked.pop() {
                 if self.is_root(&id)? {
                     self.root = Some(id);
@@ -823,6 +808,7 @@ mod unix {
             let os = match std::env::consts::OS {
                 "macos" => "darwin",
                 "linux" => "linux",
+                "windows" => "win32",
                 _ => return,
             };
             let temp = tempfile::tempdir().unwrap();
@@ -832,6 +818,13 @@ mod unix {
             let launcher = root.join("bin/codex.js");
             std::fs::write(&launcher, "#!/usr/bin/env node\n").unwrap();
             let launcher = launcher.to_str().unwrap();
+            let resolve = || {
+                if cfg!(windows) {
+                    native_server_binary("node", &[launcher.into()])
+                } else {
+                    native_server_binary(launcher, &[])
+                }
+            };
             // Deliberately not hcom's arch: Node may run under Rosetta.
             let package = format!("@openai/codex-{os}-other");
             let manifest = json!({"name": "@openai/codex", "optionalDependencies": {
@@ -840,7 +833,7 @@ mod unix {
             }});
             std::fs::write(root.join("package.json"), manifest.to_string()).unwrap();
             let install = |dir: &std::path::Path, target: &str| {
-                let binary = dir.join("vendor").join(target).join("bin/codex");
+                let binary = dir.join("vendor").join(target).join("bin").join(BINARY);
                 std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
                 std::fs::write(&binary, "").unwrap();
                 crate::sys::fs::set_executable(&binary).unwrap();
@@ -851,15 +844,18 @@ mod unix {
             };
 
             // Neither platform package nor bundled vendor: keep the launcher.
-            assert_eq!(native_server_binary(launcher, &[]), None);
+            assert_eq!(resolve(), None);
             // Bundled vendor in the main package.
             let bundled = install(&root, "bundled-triple");
-            assert_eq!(native_server_binary(launcher, &[]), Some(bundled));
+            assert_eq!(resolve(), Some(bundled));
             // Hoisted platform package wins over the bundled fallback.
             let hoisted = install(&modules.join(&package), "triple");
-            assert_eq!(native_server_binary(launcher, &[]), Some(hoisted));
+            assert_eq!(resolve(), Some(hoisted));
             // A custom wrapper owns its own launch.
-            assert_eq!(native_server_binary(launcher, &["wrapper".into()]), None);
+            assert_eq!(
+                native_server_binary(launcher, &["wrapper".into(), "--".into()]),
+                None
+            );
             // Two installed platform packages: Node would pick by its arch.
             install(
                 &root
@@ -867,7 +863,7 @@ mod unix {
                     .join(format!("@openai/codex-{os}-x64")),
                 "x",
             );
-            assert_eq!(native_server_binary(launcher, &[]), None);
+            assert_eq!(resolve(), None);
         }
 
         /// Scripted peer: answers each expected request in order, sending
@@ -878,7 +874,10 @@ mod unix {
         ) -> Vec<Value> {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("test.sock");
+            #[cfg(unix)]
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            #[cfg(windows)]
+            let listener = uds_windows::UnixListener::bind(&socket).unwrap();
             let server = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
                 stream.set_read_timeout(Some(RPC_TIMEOUT)).unwrap();

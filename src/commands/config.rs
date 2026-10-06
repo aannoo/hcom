@@ -1497,7 +1497,7 @@ Usage:
   HCOM_CODEX_NATIVE_DELIVERY=1 hcom codex    # one launch
 
 Notes:
-  - Applies to new launches, resumes and forks (Unix only)
+  - Applies to new launches, resumes and forks
   - Uses experimental Codex APIs; one extra codex process per agent
   - Falls back to terminal delivery for launches that pass --profile,
     --remote, --no-daemon, --add-dir or --worktree, or if the server fails
