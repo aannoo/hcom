@@ -818,6 +818,33 @@ fn handle_sessionstart(
     transcript_path: Option<&str>,
     raw: &Value,
 ) -> (i32, String) {
+    let result = bind_sessionstart(db, ctx, session_id, transcript_path, raw);
+    // Print mode has no PTY delivery loop to observe readiness. A successful
+    // binding and bootstrap is its readiness signal, including resume/fork.
+    if ctx.is_launched
+        && !ctx.is_pty_mode
+        && !result.1.is_empty()
+        && let Some(batch_id) = ctx.launch_batch_id.as_deref()
+        && let Ok(Some(name)) = db.get_session_binding(session_id)
+        && !common::launch_reached_ready(db, &name, batch_id)
+        && let Err(error) = db.emit_ready_event(&name, ST_LISTENING, "start")
+    {
+        log::log_warn(
+            "hooks",
+            "sessionstart.ready_event_fail",
+            &format!("instance={name} batch_id={batch_id} err={error}"),
+        );
+    }
+    result
+}
+
+fn bind_sessionstart(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    session_id: &str,
+    transcript_path: Option<&str>,
+    raw: &Value,
+) -> (i32, String) {
     let source = raw.get("source").and_then(Value::as_str).unwrap_or("");
     // Per-run hooks only load in hcom launches, so both are always present;
     // stay silent rather than guess if a payload arrives without them.
@@ -4548,6 +4575,99 @@ mod tests {
         db.set_session_binding(session_id, instance_name).unwrap();
         db.mark_claude_session_validated(session_id, instance_name)
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn sessionstart_print_launch_signals_current_batch_ready_once() {
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, created_at)
+                 VALUES ('nova', 'sess-print', 'claude', 'inactive', 'new', 1)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("print-process", "sess-print", "nova")
+            .unwrap();
+        bind_validated_session(&db, "sess-print", "nova");
+        db.log_event(
+            "life",
+            "nova",
+            &serde_json::json!({"action": "ready", "batch_id": "old"}),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "launcher",
+            &serde_json::json!({
+                "action": "batch_launched", "batch_id": "print-batch",
+                "launched": 1, "instances": ["nova"]
+            }),
+        )
+        .unwrap();
+
+        struct BatchEnv(Option<std::ffi::OsString>);
+        impl Drop for BatchEnv {
+            fn drop(&mut self) {
+                // SAFETY: this test is serialized and holds EnvGuard.
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("HCOM_LAUNCH_BATCH_ID", value),
+                        None => std::env::remove_var("HCOM_LAUNCH_BATCH_ID"),
+                    }
+                }
+            }
+        }
+        let _batch_env = BatchEnv(std::env::var_os("HCOM_LAUNCH_BATCH_ID"));
+        // SAFETY: this test is serialized and BatchEnv restores the variable.
+        unsafe { std::env::set_var("HCOM_LAUNCH_BATCH_ID", "print-batch") };
+        let env = std::collections::HashMap::from([
+            ("HCOM_LAUNCHED".into(), "1".into()),
+            ("HCOM_PROCESS_ID".into(), "print-process".into()),
+            ("HCOM_LAUNCH_BATCH_ID".into(), "print-batch".into()),
+        ]);
+        let mut ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({"source": "startup"});
+
+        // A PTY launch still waits for the delivery loop's readiness gate.
+        ctx.is_pty_mode = true;
+        let (_, stdout) = handle_sessionstart(&db, &ctx, "sess-print", None, &raw);
+        assert!(!stdout.is_empty());
+        assert!(!common::launch_reached_ready(&db, "nova", "print-batch"));
+
+        ctx.is_pty_mode = false;
+        // Missing identity/bootstrap must not claim readiness.
+        assert!(handle_sessionstart(&db, &ctx, "", None, &raw).1.is_empty());
+        assert!(!common::launch_reached_ready(&db, "nova", "print-batch"));
+
+        for source in ["startup", "resume", "compact"] {
+            let (_, stdout) = handle_sessionstart(
+                &db,
+                &ctx,
+                "sess-print",
+                None,
+                &serde_json::json!({"source": source}),
+            );
+            assert!(!stdout.is_empty());
+        }
+        let ready_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life'
+             AND json_extract(data, '$.action') = 'ready'
+             AND json_extract(data, '$.batch_id') = 'print-batch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_count, 1);
+        let result = crate::core::launch_status::wait_for_launch(&db, None, Some("print-batch"), 0);
+        assert_eq!(
+            result.status,
+            crate::core::launch_status::LaunchStatus::Ready
+        );
+        assert_eq!(result.ready, Some(1));
     }
 
     #[test]
