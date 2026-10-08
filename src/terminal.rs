@@ -200,6 +200,13 @@ pub(crate) const TERMINAL_COLOR_VARS: &[&str] = &[
     "FORCE_COLOR",
 ];
 
+/// The color overrides among [`TERMINAL_COLOR_VARS`], also kept off the
+/// terminal launcher itself: `wezterm cli split-pane` copies its caller's env
+/// into the new pane, so a parent's `NO_COLOR` would reach the child anyway.
+/// `TERM`/`COLORTERM` stay, since launchers like tmux need a usable `TERM`.
+const TERMINAL_COLOR_OVERRIDE_VARS: &[&str] =
+    &["NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"];
+
 /// Detect terminal preset from inherited environment variables.
 /// Used for same-terminal PTY launches (run_here=True) to enable close-on-kill.
 /// Checks built-in env map first, then TOML presets with pane_id_env defined.
@@ -1402,20 +1409,25 @@ fn get_launcher_env_from<I>(vars: I) -> HashMap<String, String>
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut strip: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in tool_marker_vars() {
-        strip.insert(v);
-    }
-    for v in HCOM_IDENTITY_VARS {
-        strip.insert(v);
-    }
-    for v in TERMINAL_CONTEXT_VARS {
-        strip.insert(v);
-    }
-    strip.insert("HCOM_LAUNCHED_PRESET");
+    // Windows env names are case-insensitive: `no_color` is `NO_COLOR`.
+    let norm = |k: &str| {
+        if cfg!(windows) {
+            k.to_ascii_uppercase()
+        } else {
+            k.to_string()
+        }
+    };
+    let strip: std::collections::HashSet<String> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS)
+        .chain(TERMINAL_CONTEXT_VARS)
+        .chain(TERMINAL_COLOR_OVERRIDE_VARS)
+        .chain(&["HCOM_LAUNCHED_PRESET"])
+        .map(|v| norm(v))
+        .collect();
 
     vars.into_iter()
-        .filter(|(k, _)| !strip.contains(k.as_str()))
+        .filter(|(k, _)| !strip.contains(&norm(k)))
         .collect()
 }
 
@@ -3036,6 +3048,26 @@ mod tests {
         assert!(!env.contains_key("ZELLIJ_PANE_ID"));
         assert!(!env.contains_key("HCOM_LAUNCHED_PRESET"));
         assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn test_launcher_env_strips_color_overrides_keeps_term() {
+        let env = get_launcher_env_from(vec![
+            ("NO_COLOR".into(), "1".into()),
+            ("FORCE_COLOR".into(), "0".into()),
+            ("TERM".into(), "xterm-256color".into()),
+            ("COLORTERM".into(), "truecolor".into()),
+        ]);
+        assert!(!env.contains_key("NO_COLOR"));
+        assert!(!env.contains_key("FORCE_COLOR"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+    }
+
+    #[test]
+    fn test_launcher_env_strip_folds_case_on_windows_only() {
+        let env = get_launcher_env_from(vec![("no_color".into(), "1".into())]);
+        assert_eq!(env.contains_key("no_color"), !cfg!(windows));
     }
 
     #[test]
