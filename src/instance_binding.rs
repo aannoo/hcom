@@ -196,6 +196,7 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "STY",
         "ZELLIJ_SESSION_NAME",
         "ZELLIJ_PANE_ID",
+        "HERDR_SOCKET_PATH",
         "SSH_TTY",
         "SSH_CONNECTION",
         "WSL_DISTRO_NAME",

@@ -404,15 +404,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     // Kill orphans too
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     for orphan in &orphans {
-        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-            orphan.pid,
-            &orphan.terminal_preset,
-            &orphan.pane_id,
-            &orphan.process_id,
-            &orphan.kitty_listen_on,
-            &orphan.terminal_id,
-            &orphan.zellij_session_name,
-        );
+        let (result, pane_closed, pane_retry_command) =
+            terminal::kill_process(orphan.pid, &orphan.terminal_info());
         let names = orphan.names.join(", ");
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
         let result = normalize_kill_result(&names, orphan.pid, result, pane_closed);
@@ -512,15 +505,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
     for orphan in &tagged_orphans {
         let names = orphan.names.join(", ");
-        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-            orphan.pid,
-            &orphan.terminal_preset,
-            &orphan.pane_id,
-            &orphan.process_id,
-            &orphan.kitty_listen_on,
-            &orphan.terminal_id,
-            &orphan.zellij_session_name,
-        );
+        let (result, pane_closed, pane_retry_command) =
+            terminal::kill_process(orphan.pid, &orphan.terminal_info());
         let result = normalize_kill_result(&names, orphan.pid, result, pane_closed);
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
         match result {
@@ -600,15 +586,8 @@ fn kill_single(
                 );
             }
             if let Some(orphan) = matches.first().copied() {
-                let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-                    orphan.pid,
-                    &orphan.terminal_preset,
-                    &orphan.pane_id,
-                    &orphan.process_id,
-                    &orphan.kitty_listen_on,
-                    &orphan.terminal_id,
-                    &orphan.zellij_session_name,
-                );
+                let (result, pane_closed, pane_retry_command) =
+                    terminal::kill_process(orphan.pid, &orphan.terminal_info());
                 let result = normalize_kill_result(target, orphan.pid, result, pane_closed);
                 let pane_info =
                     pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
@@ -783,7 +762,7 @@ fn kill_instance(
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
-            terminal::kill_process(pid, "", "", "", "", "", "");
+            terminal::kill_process(pid, &terminal::TerminalInfo::default());
         let result = normalize_kill_result(name, pid, result, pane_closed);
         restore_failed_kill_status(db, instance, initiator, result);
         log_info(
@@ -808,15 +787,7 @@ fn kill_instance(
         instance.launch_context.as_deref(),
     );
 
-    let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-        pid,
-        &ti.preset_name,
-        &ti.pane_id,
-        &ti.process_id,
-        &ti.kitty_listen_on,
-        &ti.terminal_id,
-        &ti.zellij_session_name,
-    );
+    let (result, pane_closed, pane_retry_command) = terminal::kill_process(pid, &ti);
     let result = normalize_kill_result(name, pid, result, pane_closed);
     restore_failed_kill_status(db, instance, initiator, result);
 
@@ -900,6 +871,7 @@ mod tests {
             terminal_id: String::new(),
             kitty_listen_on: String::new(),
             zellij_session_name: String::new(),
+            herdr_socket_path: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,

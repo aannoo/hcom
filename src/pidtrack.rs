@@ -30,6 +30,8 @@ pub struct PidEntry {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub zellij_session_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub herdr_socket_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notify_port: u16,
@@ -56,10 +58,26 @@ pub struct OrphanProcess {
     pub terminal_id: String,
     pub kitty_listen_on: String,
     pub zellij_session_name: String,
+    pub herdr_socket_path: String,
     pub session_id: String,
     pub notify_port: u16,
     pub inject_port: u16,
     pub tag: String,
+}
+
+impl OrphanProcess {
+    /// The terminal pane this process ran in, for closing it.
+    pub fn terminal_info(&self) -> crate::terminal::TerminalInfo {
+        crate::terminal::TerminalInfo {
+            preset_name: self.terminal_preset.clone(),
+            pane_id: self.pane_id.clone(),
+            process_id: self.process_id.clone(),
+            kitty_listen_on: self.kitty_listen_on.clone(),
+            terminal_id: self.terminal_id.clone(),
+            zellij_session_name: self.zellij_session_name.clone(),
+            herdr_socket_path: self.herdr_socket_path.clone(),
+        }
+    }
 }
 
 impl From<(u32, &PidEntry)> for OrphanProcess {
@@ -75,6 +93,7 @@ impl From<(u32, &PidEntry)> for OrphanProcess {
             terminal_id: entry.terminal_id.clone(),
             kitty_listen_on: entry.kitty_listen_on.clone(),
             zellij_session_name: entry.zellij_session_name.clone(),
+            herdr_socket_path: entry.herdr_socket_path.clone(),
             session_id: entry.session_id.clone(),
             notify_port: entry.notify_port,
             inject_port: entry.inject_port,
@@ -122,6 +141,7 @@ pub struct PidRecord<'a> {
     pub terminal_id: &'a str,
     pub kitty_listen_on: &'a str,
     pub zellij_session_name: &'a str,
+    pub herdr_socket_path: &'a str,
     pub session_id: &'a str,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -149,6 +169,7 @@ impl<'a> PidRecord<'a> {
             terminal_id: "",
             kitty_listen_on: "",
             zellij_session_name: "",
+            herdr_socket_path: "",
             session_id: "",
             notify_port: 0,
             inject_port: 0,
@@ -171,6 +192,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         terminal_id,
         kitty_listen_on,
         zellij_session_name,
+        herdr_socket_path,
         session_id,
         notify_port,
         inject_port,
@@ -203,6 +225,9 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !zellij_session_name.is_empty() && entry.zellij_session_name.is_empty() {
             entry.zellij_session_name = zellij_session_name.to_string();
         }
+        if !herdr_socket_path.is_empty() && entry.herdr_socket_path.is_empty() {
+            entry.herdr_socket_path = herdr_socket_path.to_string();
+        }
         if !session_id.is_empty() && entry.session_id.is_empty() {
             entry.session_id = session_id.to_string();
         }
@@ -229,6 +254,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 terminal_id: terminal_id.to_string(),
                 kitty_listen_on: kitty_listen_on.to_string(),
                 zellij_session_name: zellij_session_name.to_string(),
+                herdr_socket_path: herdr_socket_path.to_string(),
                 session_id: session_id.to_string(),
                 notify_port: *notify_port,
                 inject_port: *inject_port,
@@ -462,14 +488,20 @@ fn attach_runtime_state(
             launch_context.insert(key.into(), serde_json::json!(value));
         }
     }
-    if !orphan.zellij_session_name.is_empty() {
+    for (key, value) in [
+        ("ZELLIJ_SESSION_NAME", &orphan.zellij_session_name),
+        ("HERDR_SOCKET_PATH", &orphan.herdr_socket_path),
+    ] {
+        if value.is_empty() {
+            continue;
+        }
         let env = launch_context
             .entry("env")
             .or_insert_with(|| serde_json::json!({}));
         if !env.is_object() {
             *env = serde_json::json!({});
         }
-        env["ZELLIJ_SESSION_NAME"] = serde_json::json!(orphan.zellij_session_name);
+        env[key] = serde_json::json!(value);
     }
     if Some(&launch_context) != existing.as_ref() && !launch_context.is_empty() {
         updates.insert(
@@ -595,6 +627,7 @@ mod tests {
             terminal_id: "term-1",
             kitty_listen_on: "/tmp/kitty.sock",
             zellij_session_name: "wise-kangaroo",
+            herdr_socket_path: "/run/herdr/sessions/work/herdr.sock",
             session_id: "sess-1",
             notify_port: 8080,
             inject_port: 8081,
@@ -612,9 +645,23 @@ mod tests {
         assert_eq!(entry.terminal_id, "term-1");
         assert_eq!(entry.kitty_listen_on, "/tmp/kitty.sock");
         assert_eq!(entry.zellij_session_name, "wise-kangaroo");
+        assert_eq!(
+            entry.herdr_socket_path,
+            "/run/herdr/sessions/work/herdr.sock"
+        );
         assert_eq!(entry.session_id, "sess-1");
         assert_eq!(entry.notify_port, 8080);
         assert_eq!(entry.inject_port, 8081);
+
+        // An orphan closes its pane on the herdr server that owns it.
+        let orphan = OrphanProcess::from((12345, entry));
+        let info = orphan.terminal_info();
+        assert_eq!(info.preset_name, "kitty");
+        assert_eq!(info.pane_id, "pane-1");
+        assert_eq!(
+            info.herdr_socket_path,
+            "/run/herdr/sessions/work/herdr.sock"
+        );
     }
 
     #[test]
@@ -753,6 +800,7 @@ mod tests {
             terminal_id: String::new(),
             kitty_listen_on: String::new(),
             zellij_session_name: String::new(),
+            herdr_socket_path: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,
@@ -782,6 +830,7 @@ mod tests {
             terminal_id: String::new(),
             kitty_listen_on: String::new(),
             zellij_session_name: String::new(),
+            herdr_socket_path: String::new(),
             session_id: "sess-retry".into(),
             notify_port: 0,
             inject_port: 0,

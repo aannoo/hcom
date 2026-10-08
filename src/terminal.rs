@@ -62,6 +62,34 @@ fn format_close_command(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// `format_close_command`, with the env vars the command needs set first, in
+/// the shell syntax the retry hint is printed for.
+fn format_command_with_env(env: &[(&str, &str)], argv: &[String]) -> String {
+    let command = format_close_command(argv);
+    if env.is_empty() {
+        return command;
+    }
+    #[cfg(windows)]
+    let assignments = env
+        .iter()
+        .map(|(key, value)| format!("$env:{key}={}; ", ps_quote(value)))
+        .collect::<String>();
+    #[cfg(not(windows))]
+    let assignments = env
+        .iter()
+        .map(|(key, value)| format!("{key}={} ", crate::tools::args_common::shell_quote(value)))
+        .collect::<String>();
+    format!("{assignments}{command}")
+}
+
+/// True if `argv` runs the herdr CLI (`herdr`, `herdr.exe` or a full path).
+fn is_herdr_argv(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|bin| std::path::Path::new(bin).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("herdr"))
+}
+
 /// Terminal info resolved for an instance.
 #[derive(Debug, Clone, Default)]
 pub struct TerminalInfo {
@@ -71,6 +99,8 @@ pub struct TerminalInfo {
     pub kitty_listen_on: String,
     pub terminal_id: String,
     pub zellij_session_name: String,
+    /// The pane's `HERDR_SOCKET_PATH`: which herdr server (session) owns it.
+    pub herdr_socket_path: String,
 }
 
 /// Result from launch_terminal.
@@ -2493,15 +2523,16 @@ fn build_full_env(config_env: &HashMap<String, String>) -> HashMap<String, Strin
 ///
 /// Must run before SIGTERM because terminal CLIs match panes by PID/pane_id.
 /// Non-fatal: caller should always proceed with SIGTERM regardless.
-pub fn close_terminal_pane(
-    pid: u32,
-    preset_name: &str,
-    pane_id: &str,
-    process_id: &str,
-    kitty_listen_on: &str,
-    terminal_id: &str,
-    zellij_session_name: &str,
-) -> PaneCloseResult {
+pub fn close_terminal_pane(pid: u32, info: &TerminalInfo) -> PaneCloseResult {
+    let TerminalInfo {
+        preset_name,
+        pane_id,
+        process_id,
+        kitty_listen_on,
+        terminal_id,
+        zellij_session_name,
+        herdr_socket_path,
+    } = info;
     let failed_without_command = || PaneCloseResult {
         closed: false,
         retry_command: None,
@@ -2591,7 +2622,16 @@ pub fn close_terminal_pane(
     if argv.is_empty() {
         return failed_without_command();
     }
-    let retry_command = format_close_command(&argv);
+    // The herdr CLI talks to the server named by `HERDR_SOCKET_PATH`, falling
+    // back to the default session's. Point it at the server that owns the
+    // pane: the same pane id exists in every session, so the killer's own
+    // environment would close another session's pane.
+    let close_env: Vec<(&str, &str)> = if is_herdr_argv(&argv) && !herdr_socket_path.is_empty() {
+        vec![("HERDR_SOCKET_PATH", herdr_socket_path.as_str())]
+    } else {
+        Vec::new()
+    };
+    let retry_command = format_command_with_env(&close_env, &argv);
     let failed = || PaneCloseResult {
         closed: false,
         retry_command: Some(retry_command.clone()),
@@ -2600,6 +2640,7 @@ pub fn close_terminal_pane(
     // Run the close command directly (no shell) so it works on Windows too.
     let mut child = match Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(close_env.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
@@ -2684,29 +2725,13 @@ fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool
 }
 
 /// Close terminal pane (if applicable) then SIGTERM the process group.
-pub fn kill_process(
-    pid: u32,
-    preset_name: &str,
-    pane_id: &str,
-    process_id: &str,
-    kitty_listen_on: &str,
-    terminal_id: &str,
-    zellij_session_name: &str,
-) -> (KillResult, bool, Option<String>) {
+pub fn kill_process(pid: u32, terminal: &TerminalInfo) -> (KillResult, bool, Option<String>) {
     // Closing the pane can take the whole process tree with it (wezterm and
     // ConPTY on Windows do this synchronously), so liveness must be sampled
     // before the close to tell "we killed it" apart from "it was already gone".
     let was_alive = crate::sys::process::is_alive(pid);
-    let pane_close = if !preset_name.is_empty() {
-        close_terminal_pane(
-            pid,
-            preset_name,
-            pane_id,
-            process_id,
-            kitty_listen_on,
-            terminal_id,
-            zellij_session_name,
-        )
+    let pane_close = if !terminal.preset_name.is_empty() {
+        close_terminal_pane(pid, terminal)
     } else {
         PaneCloseResult {
             closed: false,
@@ -2796,6 +2821,10 @@ pub fn resolve_terminal_info(
             .to_string();
         info.zellij_session_name = lc_env
             .and_then(|e| e.get("ZELLIJ_SESSION_NAME").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        info.herdr_socket_path = lc_env
+            .and_then(|e| e.get("HERDR_SOCKET_PATH").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
     }
@@ -4070,6 +4099,65 @@ mod tests {
             "/tmp/O'Brien kitty.sock".to_string(),
         ]);
         assert_eq!(command, "kitten '@' --to '/tmp/O'\\''Brien kitty.sock'");
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_reads_herdr_socket_from_env_snapshot() {
+        let info = resolve_terminal_info(
+            Some("herdr"),
+            Some(r#"{"pane_id":"w1:p1","env":{"HERDR_SOCKET_PATH":"/run/herdr/work.sock"}}"#),
+        );
+        assert_eq!(info.pane_id, "w1:p1");
+        assert_eq!(info.herdr_socket_path, "/run/herdr/work.sock");
+    }
+
+    #[test]
+    fn test_is_herdr_argv_matches_bare_name_and_paths() {
+        let is = |bin: &str| is_herdr_argv(&[bin.to_string(), "pane".to_string()]);
+        assert!(is("herdr"));
+        assert!(is("herdr.exe"));
+        // Backslashes only separate path components on Windows.
+        #[cfg(windows)]
+        assert!(is(r"C:\Users\x\.herdr\bin\herdr.exe"));
+        assert!(is("/usr/local/bin/herdr"));
+        assert!(!is("zellij"));
+        assert!(!is("herdr-wrapper"));
+        assert!(!is_herdr_argv(&[]));
+    }
+
+    #[test]
+    fn test_format_command_with_env_without_env_is_the_plain_command() {
+        let argv = argv(&["herdr", "pane", "close", "w1:p1"]);
+        assert_eq!(
+            format_command_with_env(&[], &argv),
+            "herdr pane close w1:p1"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_format_command_with_env_sets_powershell_env_first() {
+        let command = format_command_with_env(
+            &[("HERDR_SOCKET_PATH", r"C:\Users\O'Brien\herdr.sock")],
+            &argv(&["herdr", "pane", "close", "w1:p1"]),
+        );
+        assert_eq!(
+            command,
+            r"$env:HERDR_SOCKET_PATH='C:\Users\O''Brien\herdr.sock'; herdr pane close w1:p1"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_format_command_with_env_prefixes_posix_assignment() {
+        let command = format_command_with_env(
+            &[("HERDR_SOCKET_PATH", "/tmp/my herdr.sock")],
+            &argv(&["herdr", "pane", "close", "w1:p1"]),
+        );
+        assert_eq!(
+            command,
+            "HERDR_SOCKET_PATH='/tmp/my herdr.sock' herdr pane close w1:p1"
+        );
     }
 
     #[test]
