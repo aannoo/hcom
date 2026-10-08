@@ -9,10 +9,24 @@
 
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::Write;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::config::Config;
+
+fn new_parser(rows: u16, cols: u16) -> vt100::Parser {
+    vt100::Parser::new(
+        NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
+        NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
+        0,
+    )
+}
+
+fn screen_size(screen: &vt100::Screen) -> (u16, u16) {
+    let (rows, cols) = screen.size();
+    (rows.get(), cols.get())
+}
 
 /// Escape a string as a JSON string literal (with quotes).
 fn json_escape(s: &str) -> String {
@@ -223,6 +237,8 @@ impl ScreenTracker {
         ready_patterns: &[String],
         instance_name: Option<&str>,
     ) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         let config = Config::get();
         let debug_flag_path = config.hcom_dir.join(".tmp").join("pty_debug_on");
         // Enable if runtime flag file exists
@@ -234,7 +250,7 @@ impl ScreenTracker {
         };
 
         let mut tracker = Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: new_parser(rows, cols),
             vt_compat: super::vt_compat::VtCompat::new(),
             rows,
             cols,
@@ -337,7 +353,7 @@ impl ScreenTracker {
                     self.instance_name.as_deref().unwrap_or("unknown")
                 ),
             );
-            self.parser = vt100::Parser::new(self.rows, self.cols, 0);
+            self.parser = new_parser(self.rows, self.cols);
         }
 
         // Track output timing
@@ -347,12 +363,14 @@ impl ScreenTracker {
 
     /// Get terminal width in columns
     pub fn cols(&self) -> u16 {
-        let (_rows, cols) = self.parser.screen().size();
+        let (_rows, cols) = screen_size(self.parser.screen());
         cols
     }
 
     /// Resize the screen
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN);
+        let cols = NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN);
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.parser.screen_mut().set_size(rows, cols);
         }))
@@ -368,8 +386,8 @@ impl ScreenTracker {
             );
             self.parser = vt100::Parser::new(rows, cols, 0);
         }
-        self.rows = rows;
-        self.cols = cols;
+        self.rows = rows.get();
+        self.cols = cols.get();
     }
 
     /// Clear approval state immediately when the user responds.
@@ -394,7 +412,7 @@ impl ScreenTracker {
         }
 
         let screen = self.parser.screen();
-        let (_rows, cols) = screen.size();
+        let (_rows, cols) = screen_size(screen);
 
         let mut pattern_visible = false;
         for line in screen.rows(0, cols) {
@@ -480,7 +498,7 @@ impl ScreenTracker {
             "Allow remote debugging?",
         ];
         let screen = self.parser.screen();
-        let (_rows, cols) = screen.size();
+        let (_rows, cols) = screen_size(screen);
         let mut has_marker = false;
         let mut has_question = false;
         let mut has_footer = false;
@@ -508,7 +526,7 @@ impl ScreenTracker {
     /// (File edits auto-apply by default and don't prompt — verified live.)
     pub fn is_cursor_approval_visible(&self) -> bool {
         let screen = self.parser.screen();
-        let (_rows, cols) = screen.size();
+        let (_rows, cols) = screen_size(screen);
         let mut has_question = false;
         let mut has_footer = false;
         for line in screen.rows(0, cols) {
@@ -555,7 +573,7 @@ impl ScreenTracker {
     /// stays tight rather than eager.
     pub fn is_claude_subagent_nav_visible(&self) -> bool {
         let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen_size(screen);
         // The navigator is pinned to the bottom; restrict the scan there so
         // scrollback that happens to contain these phrases can't trip the gate.
         const TAIL_ROWS: u16 = 12;
@@ -620,7 +638,7 @@ impl ScreenTracker {
     /// Returns `None` if the prompt glyph can't be located on the row.
     fn is_dim_after_prompt(&self, row: u16, prompt_char: &str) -> Option<bool> {
         let screen = self.parser.screen();
-        let (_, cols) = screen.size();
+        let (_, cols) = screen_size(screen);
 
         // Find the column where prompt char is located
         let mut prompt_col: Option<u16> = None;
@@ -664,7 +682,7 @@ impl ScreenTracker {
     /// debug logs. D means dim and - means normal intensity.
     fn debug_cell_attrs_after_prompt(&self, row: u16, prompt_char: &str) -> Option<String> {
         let screen = self.parser.screen();
-        let (_, cols) = screen.size();
+        let (_, cols) = screen_size(screen);
         let mut found_prompt = false;
         let mut attrs = String::new();
 
@@ -728,7 +746,7 @@ impl ScreenTracker {
     /// Get all screen lines as strings
     fn get_screen_lines(&self) -> Vec<String> {
         let screen = self.parser.screen();
-        let (_rows, cols) = screen.size();
+        let (_rows, cols) = screen_size(screen);
         screen.rows(0, cols).collect()
     }
 
@@ -1203,7 +1221,7 @@ impl ScreenTracker {
         self.debug_counter += 1;
 
         let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen_size(screen);
         let cursor = screen.cursor_position();
 
         let mut output = String::new();
@@ -1264,7 +1282,7 @@ impl ScreenTracker {
     /// Get screen state as JSON for TCP query responses.
     pub fn get_screen_dump(&self, tool: &str, _inject_port: u16) -> String {
         let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
+        let (rows, cols) = screen_size(screen);
         let cursor = screen.cursor_position();
 
         let lines: Vec<String> = self
@@ -1323,7 +1341,7 @@ mod tests {
 
     fn make_tracker_with(rows: u16, cols: u16, ready_patterns: &[&str]) -> ScreenTracker {
         ScreenTracker {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: new_parser(rows, cols),
             vt_compat: crate::pty::vt_compat::VtCompat::new(),
             rows,
             cols,
@@ -1394,8 +1412,10 @@ mod tests {
         // panic used to unwind straight through `process`/`resize` and kill
         // the PTY wrapper (hcom issue #73, observed as repeated
         // `stopped by pty: closed` on real Codex sessions). It must now be
-        // contained: the tracker rebuilds its parser and stays usable.
+        // fixed by the dependency without requiring a parser reset.
         let mut t = make_tracker(3, 10, "");
+
+        t.process(b"keep");
 
         // Wide CJK char printed so it spans the last two columns (8, 9).
         t.process(b"\x1b[1;9H");
@@ -1408,9 +1428,52 @@ mod tests {
         // Erase-in-line on that orphaned wide cell is what panicked upstream.
         t.process(b"\x1b[1;9H\x1b[K");
 
-        // Tracker must have survived and still be fully usable.
+        // A reset would silently erase this unrelated text. Check preservation,
+        // not merely survival through the tracker's panic containment.
         assert_eq!(t.cols(), 9);
+        assert!(t.parser.screen().contents().contains("keep"));
         t.process(b"still alive\r\n");
+    }
+
+    #[test]
+    fn height_resize_preserves_bottom_prompt_and_dim_attributes() {
+        let mut t = make_tracker(4, 20, "");
+        t.process(b"\x1b[3;1Habove\x1b[4;1H\x1b[2mprompt\x1b[0m");
+
+        t.resize(2, 20);
+
+        let screen = t.parser.screen();
+        assert_eq!(screen_size(screen), (2, 20));
+        assert_eq!(screen.cursor_position(), (1, 6));
+        assert_eq!(screen.contents(), "above\nprompt");
+        assert!(screen.cell(1, 0).unwrap().dim());
+
+        t.resize(4, 20);
+        let screen = t.parser.screen();
+        assert_eq!(screen.cursor_position(), (3, 6));
+        assert_eq!(screen.cell(3, 0).unwrap().contents(), "p");
+        assert!(screen.cell(3, 0).unwrap().dim());
+    }
+
+    #[test]
+    fn resize_resets_the_previous_scroll_region() {
+        let mut t = make_tracker(4, 20, "");
+        t.process(b"\x1b[2;3r");
+        t.resize(5, 20);
+        t.process(b"\x1b[2;1H\x1b[99B");
+        assert_eq!(t.parser.screen().cursor_position(), (4, 0));
+    }
+
+    #[test]
+    fn tiny_and_zero_size_resizes_remain_usable() {
+        let mut t = make_tracker(3, 10, "");
+        for (rows, cols) in [(1, 1), (0, 0), (2, 1), (1, 2), (3, 10)] {
+            t.resize(rows, cols);
+            t.process("\x1b[H中\x1b[2J\x1b[Hx".as_bytes());
+            assert_eq!(screen_size(t.parser.screen()), (rows.max(1), cols.max(1)));
+            assert_eq!((t.rows, t.cols), (rows.max(1), cols.max(1)));
+            assert_eq!(t.parser.screen().cell(0, 0).unwrap().contents(), "x");
+        }
     }
 
     // ---- is_ready ----

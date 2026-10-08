@@ -209,7 +209,11 @@ mod tests {
     }
 
     fn screen_after(rows: u16, cols: u16, data: &[u8]) -> (String, (u16, u16)) {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = vt100::Parser::new(
+            rows.try_into().expect("test rows must be nonzero"),
+            cols.try_into().expect("test columns must be nonzero"),
+            0,
+        );
         VtCompat::new().feed(&mut parser, data);
         let screen = parser.screen();
         (screen.contents(), screen.cursor_position())

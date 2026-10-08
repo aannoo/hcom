@@ -117,6 +117,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atuin-vt100"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6541b562687e0c6682aa49aec5b7fc21aae2d57e1e228d492dcde84d3925059a"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -899,6 +910,7 @@ name = "hcom"
 version = "0.7.28"
 dependencies = [
  "anyhow",
+ "atuin-vt100",
  "base64",
  "bytes",
  "chacha20poly1305",
@@ -932,7 +944,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "uuid",
- "vt100",
  "webpki-roots",
  "windows-sys 0.61.2",
 ]
@@ -2620,16 +2631,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vt100"
-version = "0.16.2"
-source = "git+https://github.com/Junyi-99/vt100-rust?rev=131a75e72d9da43d503772578dc1f1c332befbba#131a75e72d9da43d503772578dc1f1c332befbba"
-dependencies = [
- "itoa",
- "unicode-width",
- "vte",
-]
 
 [[package]]
 name = "vte"
