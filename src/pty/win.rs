@@ -23,12 +23,13 @@ use super::ProxyConfig;
 use super::inject::{InjectResult, InjectServer, QueryCommand};
 use super::screen::ScreenTracker;
 use super::shared;
+use super::stdout_queue::StdoutQueue;
 use super::trace::{self, Hop};
 
 use crate::db::HcomDb;
 use crate::delivery::{EXIT_WAS_KILLED, ScreenState};
 use crate::integration_spec::ConsoleInput;
-use crate::log::log_error;
+use crate::log::{log_error, log_warn};
 
 /// True if `path` is a `.cmd`/`.bat` script (case-insensitive), which
 /// `CreateProcessW` cannot execute directly — only `cmd.exe /c` can run those.
@@ -570,7 +571,7 @@ impl Proxy {
         Ok(thread::spawn(move || {
             let mut screen =
                 ScreenTracker::new_with_instance(rows, cols, &ready_patterns, instance.as_deref());
-            let mut stdout = std::io::stdout();
+            let stdout = StdoutQueue::spawn(std::io::stdout(), |b| trace::bytes(Hop::Stdout, b));
             let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
 
@@ -711,9 +712,8 @@ impl Proxy {
                             {
                                 // Answer once everything before the query is on
                                 // the console, so the cursor is where it asked.
-                                trace::bytes(Hop::Stdout, &scratch[written..at]);
-                                let _ = stdout.write_all(&scratch[written..at]);
-                                let _ = stdout.flush();
+                                stdout.write(&scratch[written..at]);
+                                stdout.barrier();
                                 written = at;
                                 console::cursor_position_report()
                             } else {
@@ -731,9 +731,7 @@ impl Proxy {
                                 }
                             }
                         }
-                        trace::bytes(Hop::Stdout, &scratch[written..]);
-                        let _ = stdout.write_all(&scratch[written..]);
-                        let _ = stdout.flush();
+                        stdout.write(&scratch[written..]);
 
                         screen.process(data);
 
@@ -801,9 +799,7 @@ impl Proxy {
                                 title_mode,
                                 child_opt,
                             );
-                            trace::bytes(Hop::Stdout, esc.as_bytes());
-                            let _ = stdout.write_all(esc.as_bytes());
-                            let _ = stdout.flush();
+                            stdout.write(esc.as_bytes());
                             last_child.clear();
                             last_child.push_str(child);
                             last_name = name.clone();
@@ -811,6 +807,17 @@ impl Proxy {
                         }
                     }
                 }
+            }
+            // Get the child's last frame onto the console before run() moves on
+            // to exit and restores the console modes. Bounded below run()'s 2s
+            // join on this thread: past it, what's still queued is dropped
+            // rather than written raw after the restore.
+            if !stdout.finish(Duration::from_millis(1500)) {
+                log_warn(
+                    "native",
+                    "win.stdout",
+                    "console not draining at exit; dropped queued output",
+                );
             }
             // Do NOT store running=false here. Letting run() be the sole writer
             // ensures EXIT_WAS_KILLED is committed before the delivery thread

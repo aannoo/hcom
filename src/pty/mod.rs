@@ -16,6 +16,8 @@ mod inject;
 pub mod screen;
 #[cfg(any(unix, windows))]
 mod shared;
+#[cfg(windows)]
+mod stdout_queue;
 #[cfg(unix)]
 mod terminal;
 #[cfg(windows)]
