@@ -177,10 +177,6 @@ impl Proxy {
                     crate::sys::process::identity(pid).as_deref(),
                 )?;
 
-                // Capture minimal launch context early so kill can close the terminal pane.
-                // The start hook may later overwrite with richer context (git_branch, tty, env).
-                let _ =
-                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
                 Ok(())
             })();
             if let Err(error) = persist_result {
@@ -258,6 +254,19 @@ impl Proxy {
         self.spawn_stdin_thread();
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
+
+        // Terminal metadata may take 900ms to arrive. Collect it only after
+        // starting the IO threads: ConPTY stops capturing its startup cursor
+        // report after 1s, and a late reply can become literal prompt input.
+        // PID ownership was persisted in spawn(), so kill can still find the
+        // child during this wait. store_launch_context fills missing fields
+        // without overwriting richer context already captured by a start hook.
+        if let Some(ref instance_name) = self.config.instance_name {
+            let context = shared::build_early_launch_context();
+            if let Ok(db) = HcomDb::open() {
+                let _ = db.store_launch_context(instance_name, &context);
+            }
+        }
 
         // Poll rather than blocking solely in child.wait(): a definitive
         // delivery-init failure must terminate a long-lived child immediately.

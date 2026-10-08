@@ -9,6 +9,72 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use support::{Hcom, parse_hcom_marker};
 
+#[cfg(windows)]
+#[test]
+fn windows_pty_answers_startup_queries_while_waiting_for_terminal_metadata() {
+    let h = Hcom::new();
+    let name = h.start();
+    let process_id = "cpr-startup-metadata";
+    let id_dir = h.hcom_dir.join(".tmp/terminal_ids");
+    std::fs::create_dir_all(&id_dir).unwrap();
+    let id_file = id_dir.join(process_id);
+    let log_file = h.hcom_dir.join(".tmp/logs/hcom.log");
+
+    // The terminal ID arrives only once the proxy has answered ConPTY's
+    // cursor query. Before the fix, metadata collection finished (and missed
+    // this ID) before the reader could answer; slow launches also leaked the
+    // expired cursor reply into the child's prompt.
+    let terminal = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&log_file)
+                .unwrap_or_default()
+                .contains("\"event\":\"startup.dsr_answered\"")
+            {
+                std::fs::write(id_file, "terminal-after-cpr").unwrap();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    });
+    let output = h
+        .cmd()
+        .env("HCOM_INSTANCE_NAME", &name)
+        .env("HCOM_PROCESS_ID", process_id)
+        // Ignore pane IDs inherited from the terminal running this test.
+        .env("HCOM_LAUNCHED_PRESET", "cpr-test-without-pane")
+        .args([
+            "pty",
+            "codex",
+            "--hcom-tool-path",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo CPR_CHILD_READY",
+        ])
+        .output()
+        .unwrap();
+    assert!(terminal.join().unwrap(), "proxy did not answer startup CPR");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CPR_CHILD_READY"));
+    let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    let context: String = conn
+        .query_row(
+            "SELECT launch_context FROM instances WHERE name = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(&context).unwrap();
+    assert_eq!(context["terminal_id"], "terminal-after-cpr");
+}
+
 #[test]
 fn windows_hook_cleanup_preserves_foreign_hooks_and_stays_in_fixture() {
     let h = Hcom::new();
