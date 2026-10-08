@@ -15,12 +15,25 @@
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
 use crate::log::{log_info, log_warn};
 
 const VERSION: &str = conpty_assets::VERSION;
+
+/// Set once the bundled `conpty.dll` is loaded.
+static BUNDLED: AtomicBool = AtomicBool::new(false);
+
+/// Which ConPTY [`select`] picked, for diagnostics.
+pub(super) fn selected() -> &'static str {
+    if BUNDLED.load(Ordering::Relaxed) {
+        VERSION
+    } else {
+        "inbox"
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 const FILES: &[(&str, &[u8])] = &[
@@ -86,6 +99,8 @@ pub(super) fn select() {
                 std::io::Error::last_os_error()
             ),
         );
+    } else {
+        BUNDLED.store(true, Ordering::Relaxed);
     }
 }
 

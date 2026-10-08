@@ -18,6 +18,8 @@ pub mod screen;
 mod shared;
 #[cfg(unix)]
 mod terminal;
+#[cfg(windows)]
+mod trace;
 mod vt_compat;
 #[cfg(windows)]
 mod win;

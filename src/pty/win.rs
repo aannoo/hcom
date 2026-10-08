@@ -23,6 +23,7 @@ use super::ProxyConfig;
 use super::inject::{InjectResult, InjectServer, QueryCommand};
 use super::screen::ScreenTracker;
 use super::shared;
+use super::trace::{self, Hop};
 
 use crate::db::HcomDb;
 use crate::delivery::{EXIT_WAS_KILLED, ScreenState};
@@ -225,6 +226,17 @@ impl Proxy {
     pub fn run(&mut self) -> Result<i32> {
         // Put our console into raw + VT passthrough so the tool's TUI renders
         // and keystrokes flow through unbuffered. Restored on drop.
+        trace::note(
+            Hop::Mode,
+            &format!(
+                "tool={} input={:?} conpty={} size={}x{}",
+                self.config.target.name(),
+                self.config.target.console_input(),
+                super::conpty::selected(),
+                self.cols,
+                self.rows
+            ),
+        );
         let _console = console::RawConsoleGuard::enable(self.config.target.console_input());
 
         let startup_time = Instant::now();
@@ -664,6 +676,7 @@ impl Proxy {
                     }
                     Ok(data) => {
                         let data = data.as_slice();
+                        trace::bytes(Hop::Output, data);
                         trace.on_output(data);
                         // A genuine keystroke / injected answer flagged a pending
                         // approval for clearing; the reader owns the tracker.
@@ -674,6 +687,7 @@ impl Proxy {
                         // frame so the screen model matches the new geometry.
                         if let Some((r, c)) = pending_resize.write().ok().and_then(|mut g| g.take())
                         {
+                            trace::note(Hop::Mode, &format!("resize {c}x{r}"));
                             screen.resize(r, c);
                         }
 
@@ -697,6 +711,7 @@ impl Proxy {
                             {
                                 // Answer once everything before the query is on
                                 // the console, so the cursor is where it asked.
+                                trace::bytes(Hop::Stdout, &scratch[written..at]);
                                 let _ = stdout.write_all(&scratch[written..at]);
                                 let _ = stdout.flush();
                                 written = at;
@@ -708,6 +723,7 @@ impl Proxy {
                             if let Some(reply) = reply
                                 && let Ok(mut w) = writer.lock()
                             {
+                                trace::bytes(Hop::Input, &reply);
                                 let _ = w.write_all(&reply);
                                 let _ = w.flush();
                                 if query == shared::TerminalQuery::CursorPosition {
@@ -715,6 +731,7 @@ impl Proxy {
                                 }
                             }
                         }
+                        trace::bytes(Hop::Stdout, &scratch[written..]);
                         let _ = stdout.write_all(&scratch[written..]);
                         let _ = stdout.flush();
 
@@ -784,6 +801,7 @@ impl Proxy {
                                 title_mode,
                                 child_opt,
                             );
+                            trace::bytes(Hop::Stdout, esc.as_bytes());
                             let _ = stdout.write_all(esc.as_bytes());
                             let _ = stdout.flush();
                             last_child.clear();
@@ -830,6 +848,7 @@ impl Proxy {
         let console_input = self.config.target.console_input();
         thread::spawn(move || {
             let forward = |bytes: &[u8]| {
+                trace::bytes(Hop::Input, bytes);
                 if let Ok(mut w) = writer.lock() {
                     let _ = w.write_all(bytes);
                     let _ = w.flush();
@@ -918,6 +937,7 @@ impl Proxy {
                 while index < inject_server.client_count() {
                     let completed = match inject_server.read_client(index) {
                         Ok(InjectResult::Inject(text)) => {
+                            trace::bytes(Hop::Inject, text.as_bytes());
                             if let Ok(mut w) = writer.lock() {
                                 let _ = w.write_all(text.as_bytes());
                                 let _ = w.flush();
@@ -1270,14 +1290,16 @@ mod job {
 mod console {
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Console::{
-        CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, KEY_EVENT,
-        MOUSE_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
+        ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+        GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
+        ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
     };
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     use super::super::console_input::{InputEncoder, KeyRecord, MouseRecord};
+    use super::super::trace::{self, Hop};
     use crate::integration_spec::ConsoleInput;
 
     fn screen_info() -> Option<CONSOLE_SCREEN_BUFFER_INFO> {
@@ -1356,6 +1378,20 @@ mod console {
                     match u32::from(record.EventType) {
                         KEY_EVENT => {
                             let k = record.Event.KeyEvent;
+                            if trace::enabled() {
+                                trace::note(
+                                    Hop::Record,
+                                    &format!(
+                                        "key down={} vk={:#04x} scan={:#04x} ch={:#06x} ctrl={:#x} rep={}",
+                                        k.bKeyDown,
+                                        k.wVirtualKeyCode,
+                                        k.wVirtualScanCode,
+                                        k.uChar.UnicodeChar,
+                                        k.dwControlKeyState,
+                                        k.wRepeatCount
+                                    ),
+                                );
+                            }
                             self.encoder.key(
                                 KeyRecord {
                                     down: k.bKeyDown != 0,
@@ -1370,6 +1406,19 @@ mod console {
                         }
                         MOUSE_EVENT => {
                             let m = record.Event.MouseEvent;
+                            if trace::enabled() {
+                                trace::note(
+                                    Hop::Record,
+                                    &format!(
+                                        "mouse x={} y={} buttons={:#x} ctrl={:#x} flags={:#x}",
+                                        m.dwMousePosition.X,
+                                        m.dwMousePosition.Y,
+                                        m.dwButtonState,
+                                        m.dwControlKeyState,
+                                        m.dwEventFlags
+                                    ),
+                                );
+                            }
                             let (left, top) = *window_origin.get_or_insert_with(|| {
                                 screen_info().map_or((0, 0), |i| (i.srWindow.Left, i.srWindow.Top))
                             });
@@ -1386,7 +1435,9 @@ mod console {
                         }
                         // Focus and buffer-size records: focus reporting is
                         // kept off the outer terminal, and resizes are polled.
-                        _ => {}
+                        other => {
+                            trace::note(Hop::Record, &format!("event type={other:#x}"));
+                        }
                     }
                 }
             }
@@ -1424,15 +1475,34 @@ mod console {
                             | ENABLE_ECHO_INPUT
                             | ENABLE_PROCESSED_INPUT
                             | ENABLE_VIRTUAL_TERMINAL_INPUT);
-                    if input == ConsoleInput::Vt {
-                        raw_in |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+                    match input {
+                        ConsoleInput::Vt => raw_in |= ENABLE_VIRTUAL_TERMINAL_INPUT,
+                        // Mouse input as crossterm sets it for a child run
+                        // directly. With QuickEdit left on, an outer ConPTY
+                        // older than ours (WezTerm's) never reports the mouse.
+                        ConsoleInput::Records => {
+                            raw_in = (raw_in & !ENABLE_QUICK_EDIT_MODE)
+                                | ENABLE_MOUSE_INPUT
+                                | ENABLE_EXTENDED_FLAGS;
+                        }
                     }
                     SetConsoleMode(stdin_handle as _, raw_in);
+                    trace::note(
+                        Hop::Mode,
+                        &format!("stdin {prev_in:#06x} -> {raw_in:#06x} ({input:?})"),
+                    );
                 }
                 if ok_out {
                     SetConsoleMode(
                         stdout_handle as _,
                         prev_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                    );
+                    trace::note(
+                        Hop::Mode,
+                        &format!(
+                            "stdout {prev_out:#06x} -> {:#06x}",
+                            prev_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        ),
                     );
                 }
                 RawConsoleGuard {
@@ -1453,7 +1523,15 @@ mod console {
             }
             // SAFETY: restoring the previously-read modes on the same handles.
             unsafe {
-                SetConsoleMode(self.stdin_handle as _, self.prev_in);
+                // QuickEdit only changes alongside ENABLE_EXTENDED_FLAGS, which
+                // the mode we read back may lack; without it the QuickEdit we
+                // turned off for Records input would stay off after we exit.
+                let prev_in = if self.prev_in & ENABLE_QUICK_EDIT_MODE != 0 {
+                    self.prev_in | ENABLE_EXTENDED_FLAGS
+                } else {
+                    self.prev_in
+                };
+                SetConsoleMode(self.stdin_handle as _, prev_in);
                 SetConsoleMode(self.stdout_handle as _, self.prev_out);
             }
         }
