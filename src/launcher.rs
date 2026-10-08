@@ -874,6 +874,77 @@ fn resolve_runner_binaries(
     }
 }
 
+/// Warn (once per process) when the `hcom` a launched agent resolves by name is
+/// not this binary. Runner dirs are prepended to PATH with the selected Node's
+/// dir first (#117), so a second hcom install next to that Node, or a launch
+/// by absolute path, silently routes every hook and agent command elsewhere.
+fn warn_if_agent_hcom_differs(runner_dirs: &[String]) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    // Dev mode re-execs whichever hcom runs into the dev build; uvx hooks
+    // never resolve `hcom` by name.
+    if crate::router::resolve_effective_dev_root(&crate::paths::db_path()).is_some()
+        || crate::runtime_env::get_hcom_prefix().len() > 1
+    {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let inherited = std::env::var_os("PATH");
+    let dirs = runner_dirs
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(inherited.iter().flat_map(std::env::split_paths));
+    let message = match first_hcom_in(dirs) {
+        Some(found) if same_binary(&found, &exe) => return,
+        Some(found) => format!(
+            "agents will run {} as `hcom`, not this hcom ({}). Remove the other install or put this one first on PATH.",
+            found.display(),
+            exe.display()
+        ),
+        None => format!(
+            "agents can't run this hcom ({}) as `hcom`: its directory isn't on PATH. Add it to PATH.",
+            exe.display()
+        ),
+    };
+    WARNED.call_once(|| {
+        eprintln!("[hcom] warn: {message}");
+        crate::log::log_warn("launch", "agent_hcom_mismatch", &message);
+    });
+}
+
+/// First `hcom` a shell would run from `dirs`: shells skip non-executable files.
+fn first_hcom_in(dirs: impl Iterator<Item = std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    dirs.flat_map(|dir| terminal::which_candidates(&dir, "hcom"))
+        .find(|candidate| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(candidate)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file()
+            }
+        })
+}
+
+/// Same path after resolving symlinks, or identical bytes (uv copies rather
+/// than links tool executables on Windows).
+fn same_binary(a: &Path, b: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize())
+        && a == b
+    {
+        return true;
+    }
+    let same_len = match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.len() == b.len(),
+        _ => false,
+    };
+    same_len && matches!((std::fs::read(a), std::fs::read(b)), (Ok(a), Ok(b)) if a == b)
+}
+
 /// Windows runner: a PowerShell script that launches the tool through the hcom
 /// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
 /// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
@@ -989,6 +1060,7 @@ fn create_runner_script_windows(
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
     let binaries = resolve_runner_binaries(path_dirs, tool_bin, terminal::which_bin);
+    warn_if_agent_hcom_differs(&binaries.path_dirs);
     let path_dirs = binaries.path_dirs;
     let path_line = if path_dirs.is_empty() {
         String::new()
@@ -1190,6 +1262,7 @@ pub fn create_runner_script(
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
     let binaries = resolve_runner_binaries(path_dirs, tool_bin, terminal::which_bin);
+    warn_if_agent_hcom_differs(&binaries.path_dirs);
     let path_dirs = binaries.path_dirs;
 
     let path_export = if !path_dirs.is_empty() {
@@ -3622,6 +3695,46 @@ mod tests {
             ["nvm/bin", "system/bin"].map(ToString::to_string)
         );
         assert_eq!(binaries.tool_path.as_deref(), Some("system/bin/codex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_agent_hcom_resolution_follows_runner_dir_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |dir: &str, bytes: &[u8]| {
+            let dir = temp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("hcom"), bytes).unwrap();
+            std::fs::set_permissions(dir.join("hcom"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            dir
+        };
+        let node_dir = install("usr-local-bin", b"brew hcom");
+        let uv_tool_bin = install("uv/tools/hcom/bin", b"uv hcom");
+        let local_bin = temp.path().join("local-bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::os::unix::fs::symlink(uv_tool_bin.join("hcom"), local_bin.join("hcom")).unwrap();
+        let launching = uv_tool_bin.join("hcom");
+
+        // A second install in the selected Node's dir shadows the launcher.
+        let found = first_hcom_in([node_dir.clone(), local_bin.clone()].into_iter()).unwrap();
+        assert!(!same_binary(&found, &launching));
+
+        // A symlinked entry point and a byte-identical copy are the same hcom.
+        let found = first_hcom_in([temp.path().join("missing"), local_bin].into_iter()).unwrap();
+        assert!(same_binary(&found, &launching));
+        let copy_dir = install("copy", b"uv hcom");
+        assert!(same_binary(&copy_dir.join("hcom"), &launching));
+
+        assert!(first_hcom_in([temp.path().join("missing")].into_iter()).is_none());
+
+        // Shells skip a non-executable `hcom`, so must the check.
+        let stale = install("stale", b"uv hcom");
+        std::fs::set_permissions(stale.join("hcom"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let found = first_hcom_in([stale, node_dir.clone()].into_iter()).unwrap();
+        assert_eq!(found, node_dir.join("hcom"));
     }
 
     // Unix-only: asserts the bash runner's `. 'sidecar'` sourcing + unset block;
