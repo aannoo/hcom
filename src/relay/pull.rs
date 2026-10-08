@@ -398,33 +398,35 @@ pub fn handle_state_message(
         .cloned()
         .unwrap_or_default();
 
-    let mut seen_instances = std::collections::HashSet::new();
+    // Instance upserts and removals commit together (one sync, not one per row).
+    let instances_applied = db.with_write_scope(|| {
+        let mut seen_instances = std::collections::HashSet::new();
 
-    for (name, inst) in &instances {
-        let status_time = inst
-            .get("status_time")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let status_time_i64 = status_time as i64;
+        for (name, inst) in &instances {
+            let status_time = inst
+                .get("status_time")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let status_time_i64 = status_time as i64;
 
-        // Local reset wins: ignore remote snapshots older than our reset so
-        // cleared instances don't reappear from broker-retained state.
-        if local_reset_ts > 0.0 && status_time < local_reset_ts {
-            continue;
-        }
+            // Local reset wins: ignore remote snapshots older than our reset so
+            // cleared instances don't reappear from broker-retained state.
+            if local_reset_ts > 0.0 && status_time < local_reset_ts {
+                continue;
+            }
 
-        let namespaced = super::add_device_suffix(name, &short_id);
-        seen_instances.insert(namespaced.clone());
+            let namespaced = super::add_device_suffix(name, &short_id);
+            seen_instances.insert(namespaced.clone());
 
-        let parent = inst
-            .get("parent")
-            .and_then(|v| v.as_str())
-            .map(|p| super::add_device_suffix(p, &short_id));
+            let parent = inst
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .map(|p| super::add_device_suffix(p, &short_id));
 
-        let now = crate::shared::time::now_epoch_f64();
+            let now = crate::shared::time::now_epoch_f64();
 
-        let _ = db.conn().execute(
-            "INSERT INTO instances (
+            db.conn().execute(
+                "INSERT INTO instances (
                 name, origin_device_id, status, status_context, status_detail, status_time,
                 parent_name, directory, transcript_path, created_at,
                 session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode,
@@ -440,61 +442,64 @@ pub fn handle_state_message(
                 agent_id = excluded.agent_id, wait_timeout = excluded.wait_timeout,
                 last_stop = excluded.last_stop, tcp_mode = excluded.tcp_mode,
                 tag = excluded.tag, tool = excluded.tool, background = excluded.background",
-            params![
-                namespaced,
-                device_id,
-                inst.get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                inst.get("context").and_then(|v| v.as_str()).unwrap_or(""),
-                inst.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
-                status_time_i64,
-                parent,
-                inst.get("directory").and_then(|v| v.as_str()),
-                inst.get("transcript").and_then(|v| v.as_str()),
-                now,
-                Option::<String>::None,
-                Option::<String>::None,
-                Option::<String>::None,
-                inst.get("wait_timeout")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(86400),
-                inst.get("last_stop")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                inst.get("tcp_mode")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                inst.get("tag").and_then(|v| v.as_str()),
-                inst.get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude"),
-                inst.get("background")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            ],
-        );
-    }
-
-    // Remove stale instances (no longer in remote state)
-    let current_remote: Vec<String> = db
-        .conn()
-        .prepare("SELECT name FROM instances WHERE origin_device_id = ?")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(params![device_id], |row| row.get::<_, String>(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-    for name in &current_remote {
-        if !seen_instances.contains(name) {
-            let _ = db
-                .conn()
-                .execute("DELETE FROM instances WHERE name = ?", params![name]);
+                params![
+                    namespaced,
+                    device_id,
+                    inst.get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                    inst.get("context").and_then(|v| v.as_str()).unwrap_or(""),
+                    inst.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
+                    status_time_i64,
+                    parent,
+                    inst.get("directory").and_then(|v| v.as_str()),
+                    inst.get("transcript").and_then(|v| v.as_str()),
+                    now,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    inst.get("wait_timeout")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(86400),
+                    inst.get("last_stop")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    inst.get("tcp_mode")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    inst.get("tag").and_then(|v| v.as_str()),
+                    inst.get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("claude"),
+                    inst.get("background")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                ],
+            )?;
         }
+
+        // Remove stale instances (no longer in remote state)
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT name FROM instances WHERE origin_device_id = ?")?;
+        let current_remote = stmt
+            .query_map(params![device_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for name in &current_remote {
+            if !seen_instances.contains(name) {
+                db.conn()
+                    .execute("DELETE FROM instances WHERE name = ?", params![name])?;
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = instances_applied {
+        log::log_warn(
+            "relay",
+            "relay.instances_err",
+            &format!("device={} error={}", short_id, e),
+        );
     }
 
     // Handle control events in the events payload
@@ -653,53 +658,82 @@ fn import_remote_events(
         }
     }
 
-    let mut max_event_id = last_event_id;
+    // One write scope for the whole batch: a snapshot carries up to 100 events, and
+    // committing each separately costs one sync apiece, which on slow storage is
+    // seconds per snapshot and stalls the worker loop through a peer's history replay.
+    let mut imported = Vec::new();
+    let scoped = db.with_write_scope(|| {
+        let mut max_event_id = last_event_id;
 
-    for event in events {
-        // Skip control events (handled separately)
-        if event.get("type").and_then(|v| v.as_str()) == Some("control") {
-            continue;
-        }
-        // Skip _device events
-        if event.get("instance").and_then(|v| v.as_str()) == Some("_device") {
-            continue;
-        }
-
-        let event_id = match event.get("id").and_then(|v| v.as_i64()) {
-            Some(id) => id,
-            None => {
-                log::log_warn(
-                    "relay",
-                    "relay.bad_event_id",
-                    &format!("Skipping event with bad/missing id: {:?}", event.get("id")),
-                );
+        for event in events {
+            // Skip control events (handled separately)
+            if event.get("type").and_then(|v| v.as_str()) == Some("control") {
                 continue;
             }
-        };
-        if event_id <= last_event_id {
-            continue; // Already imported
+            // Skip _device events
+            if event.get("instance").and_then(|v| v.as_str()) == Some("_device") {
+                continue;
+            }
+
+            let event_id = match event.get("id").and_then(|v| v.as_i64()) {
+                Some(id) => id,
+                None => {
+                    log::log_warn(
+                        "relay",
+                        "relay.bad_event_id",
+                        &format!("Skipping event with bad/missing id: {:?}", event.get("id")),
+                    );
+                    continue;
+                }
+            };
+            if event_id <= last_event_id {
+                continue; // Already imported
+            }
+
+            // Skip events from before our reset
+            let event_ts = event_epoch(event);
+            if local_reset_ts > 0.0 && event_ts > 0.0 && event_ts < local_reset_ts {
+                continue;
+            }
+
+            imported.push(insert_remote_event(
+                db,
+                device_id,
+                short_id,
+                event_id,
+                event,
+                own_short_id,
+            )?);
+
+            max_event_id = max_event_id.max(event_id);
         }
 
-        // Skip events from before our reset
-        let event_ts = event_epoch(event);
-        if local_reset_ts > 0.0 && event_ts > 0.0 && event_ts < local_reset_ts {
-            continue;
+        let imported_new_events = max_event_id > last_event_id;
+        if imported_new_events {
+            db.kv_set(
+                &format!("relay_events_{}", device_id),
+                Some(&max_event_id.to_string()),
+            )?;
         }
+        Ok(imported_new_events)
+    });
 
-        insert_remote_event(db, device_id, short_id, event_id, event, own_short_id);
-
-        max_event_id = max_event_id.max(event_id);
+    match scoped {
+        Ok(imported_new_events) => {
+            finish_imported_events(db, imported);
+            imported_new_events
+        }
+        Err(e) => {
+            // Rolled back with the cursor, so the next snapshot carrying these
+            // events imports them again (or records the range as a gap).
+            log::log_warn(
+                "relay",
+                "relay.import_err",
+                &format!("device={} error={}", short_id, e),
+            );
+            false
+        }
     }
-
-    let imported_new_events = max_event_id > last_event_id;
-    if imported_new_events {
-        safe_kv_set(
-            db,
-            &format!("relay_events_{}", device_id),
-            Some(&max_event_id.to_string()),
-        );
-    }
-    imported_new_events
 }
 
 /// Seconds since the epoch for a relayed event's `ts` (0.0 when absent).
@@ -716,8 +750,26 @@ pub(crate) fn event_ts_string(event: &Value) -> String {
     }
 }
 
-/// Namespace one remote event and insert it locally. Shared by snapshot import
-/// and catch-up backfill so both produce identical rows.
+/// A remote event row written inside a write scope. Its subscriptions and wakes
+/// run through [`finish_imported_events`] once the scope commits, so they see the row.
+pub(crate) struct ImportedEvent {
+    id: i64,
+    event_type: String,
+    instance: String,
+    data: Value,
+}
+
+/// Run the side effects of imported rows after their write scope committed.
+pub(crate) fn finish_imported_events(db: &HcomDb, imported: Vec<ImportedEvent>) {
+    for event in imported {
+        db.after_event_logged(event.id, &event.event_type, &event.instance, &event.data);
+    }
+}
+
+/// Namespace one remote event and insert its row. Shared by snapshot import
+/// and catch-up backfill so both produce identical rows. Callers import a batch
+/// inside one write scope (one sync instead of one per event) and pass the
+/// returned rows to [`finish_imported_events`] after it commits.
 pub(crate) fn insert_remote_event(
     db: &HcomDb,
     device_id: &str,
@@ -725,7 +777,7 @@ pub(crate) fn insert_remote_event(
     event_id: i64,
     event: &Value,
     own_short_id: &str,
-) {
+) -> anyhow::Result<ImportedEvent> {
     let event_ts = event_epoch(event);
 
     // Namespace instance name
@@ -787,7 +839,7 @@ pub(crate) fn insert_remote_event(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    let _ = db.log_event_with_ts(event_type, &namespaced_instance, &data, Some(&ts_str));
+    let id = db.insert_event_row(event_type, &namespaced_instance, &data, Some(&ts_str))?;
 
     // Log per-message latency for message events
     if event_type == "message" && event_ts > 0.0 {
@@ -805,6 +857,13 @@ pub(crate) fn insert_remote_event(
             ],
         );
     }
+
+    Ok(ImportedEvent {
+        id,
+        event_type: event_type.to_string(),
+        instance: namespaced_instance,
+        data,
+    })
 }
 
 /// Reverse lookup: find short_id for a device UUID.
@@ -879,6 +938,40 @@ mod tests {
     use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn failed_import_rolls_back_rows_and_cursor() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_import BEFORE INSERT ON events
+             WHEN json_extract(NEW.data, '$._relay.id') = 2
+             BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        let events = vec![
+            json!({"id": 1, "type": "life", "instance": "peer", "data": {}}),
+            json!({"id": 2, "type": "life", "instance": "peer", "data": {}}),
+        ];
+        assert!(!import_remote_events(
+            &db, "remote", "PEER", &events, 0.0, "SELF"
+        ));
+        assert_eq!(event_cursor(&db, "remote"), 0);
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_import")
+            .unwrap();
+        assert!(import_remote_events(
+            &db, "remote", "PEER", &events, 0.0, "SELF"
+        ));
+        assert_eq!(event_cursor(&db, "remote"), 2);
+    }
 
     fn fixture_psk() -> [u8; 32] {
         [0x33; 32]

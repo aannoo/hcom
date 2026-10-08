@@ -120,6 +120,14 @@ impl MqttRelay {
     /// How often the worker advances catch-up backfill for skipped event ranges.
     const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
 
+    /// Most queued MQTT events handled in one loop iteration.
+    const MAX_DRAIN_PER_TICK: u32 = 1024;
+
+    /// Time after which one loop iteration stops draining queued MQTT events,
+    /// so the heartbeat, commands and pushes run between them. Well under
+    /// HEARTBEAT_STALE_SECS; the first event of an iteration always runs.
+    const DRAIN_TIME_BUDGET: Duration = Duration::from_millis(500);
+
     /// Create and connect the MQTT relay client.
     ///
     /// Returns (MqttRelay, Connection, command_sender). The Connection must be
@@ -362,15 +370,20 @@ impl MqttRelay {
             // timeout. This prevents stale error backlogs from burying a
             // ConnAck behind hours of one-error-per-backoff processing,
             // while capping per-tick work so cmd_rx and push timers stay
-            // responsive under sustained inbound traffic.
+            // responsive under sustained inbound traffic. The cap is in time
+            // as well as count: applying one inbound snapshot can take a
+            // second on slow storage, and a peer replaying its history queues
+            // hundreds, which would hold off the heartbeat for minutes.
             let mut drained = false;
             let mut channel_disconnected = false;
             let mut trigger_push = false;
             let mut drain_count: u32 = 0;
-            const MAX_DRAIN_PER_TICK: u32 = 1024;
+            let drain_started = Instant::now();
 
             // Phase 1: drain queued events without blocking (bounded)
-            while drain_count < MAX_DRAIN_PER_TICK {
+            while drain_count < Self::MAX_DRAIN_PER_TICK
+                && (drain_count == 0 || drain_started.elapsed() < Self::DRAIN_TIME_BUDGET)
+            {
                 match event_rx.try_recv() {
                     Ok(Ok(event)) => {
                         drain_count += 1;

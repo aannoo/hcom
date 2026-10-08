@@ -251,37 +251,44 @@ pub(crate) fn apply_answer(
     let reset_ts = local_reset_ts(db);
     let mut imported = 0u64;
     let mut oldest = gap.before;
-    for event in events {
-        let Some(remote_id) = event.get("id").and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        if remote_id <= gap.after || remote_id >= gap.before {
-            continue;
+    // One write scope per answer, like snapshot import: one sync for the batch.
+    let mut rows = Vec::new();
+    db.with_write_scope(|| {
+        for event in events {
+            let Some(remote_id) = event.get("id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if remote_id <= gap.after || remote_id >= gap.before {
+                continue;
+            }
+            oldest = oldest.min(remote_id);
+            if event.get("type").and_then(|v| v.as_str()) == Some("control")
+                || event.get("instance").and_then(|v| v.as_str()) == Some("_device")
+            {
+                continue;
+            }
+            let event_ts = super::pull::event_epoch(event);
+            if reset_ts > 0.0 && event_ts > 0.0 && event_ts < reset_ts {
+                continue;
+            }
+            let ts = super::pull::event_ts_string(event);
+            if already_imported(db, device_id, remote_id, &ts) {
+                continue;
+            }
+            rows.push(super::pull::insert_remote_event(
+                db,
+                device_id,
+                &gap.short_id,
+                remote_id,
+                event,
+                own_short_id,
+            )?);
+            imported += 1;
         }
-        oldest = oldest.min(remote_id);
-        if event.get("type").and_then(|v| v.as_str()) == Some("control")
-            || event.get("instance").and_then(|v| v.as_str()) == Some("_device")
-        {
-            continue;
-        }
-        let event_ts = super::pull::event_epoch(event);
-        if reset_ts > 0.0 && event_ts > 0.0 && event_ts < reset_ts {
-            continue;
-        }
-        let ts = super::pull::event_ts_string(event);
-        if already_imported(db, device_id, remote_id, &ts) {
-            continue;
-        }
-        super::pull::insert_remote_event(
-            db,
-            device_id,
-            &gap.short_id,
-            remote_id,
-            event,
-            own_short_id,
-        );
-        imported += 1;
-    }
+        Ok(())
+    })
+    .map_err(|e| format!("importing the answer failed: {e}"))?;
+    super::pull::finish_imported_events(db, rows);
     gap.recovered += imported;
     gap.wide = false;
 
