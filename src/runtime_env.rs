@@ -15,15 +15,29 @@ static HCOM_PREFIX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(
 
     if let Ok(exe) = std::env::current_exe()
         && let Ok(resolved) = exe.canonicalize()
+        && is_uvx_ephemeral_exe(&resolved)
     {
-        let has_uv = resolved.components().any(|c| c.as_os_str() == "uv");
-        if has_uv {
-            return vec!["uvx".into(), "hcom".into()];
-        }
+        return vec!["uvx".into(), "hcom".into()];
     }
 
     vec!["hcom".into()]
 });
+
+/// True when `exe` lives in a disposable `uvx` environment, which won't be on
+/// PATH for later hook invocations. uv creates those venvs inside its cache
+/// (`<cache>/archive-v0/<id>/bin/hcom`), and the cache root carries a
+/// `CACHEDIR.TAG`. `uv tool install`, `uv venv`, pip, brew, etc. install
+/// outside a tagged cache, so plain `hcom` is right for them.
+fn is_uvx_ephemeral_exe(exe: &std::path::Path) -> bool {
+    let Some(env_root) = exe.parent().and_then(|bin| bin.parent()) else {
+        return false;
+    };
+    env_root.join("pyvenv.cfg").is_file()
+        && env_root
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.join("CACHEDIR.TAG").is_file())
+}
 
 /// Detect hcom invocation prefix based on execution context.
 pub(crate) fn get_hcom_prefix() -> Vec<String> {
@@ -493,5 +507,41 @@ mod tests {
             super::opencode_family_data_dir("opencode"),
             Some(home.join(".local/share/opencode"))
         );
+    }
+
+    /// Mirrors uv's on-disk layouts: every uv venv has `pyvenv.cfg` and its own
+    /// `CACHEDIR.TAG`; only uvx's ephemeral envs sit under the tagged cache root.
+    #[test]
+    fn uvx_ephemeral_detection_matches_uv_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let venv = |root: std::path::PathBuf| {
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::fs::write(root.join("pyvenv.cfg"), "uv = 0.7.13\n").unwrap();
+            std::fs::write(root.join("CACHEDIR.TAG"), "").unwrap();
+            root.join("bin/hcom")
+        };
+
+        let cache = temp.path().join(".cache/uv");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "").unwrap();
+        let ephemeral = venv(cache.join("archive-v0/abc123"));
+        assert!(super::is_uvx_ephemeral_exe(&ephemeral));
+
+        let tool = venv(temp.path().join(".local/share/uv/tools/hcom"));
+        std::fs::write(tool.parent().unwrap().join("../uv-receipt.toml"), "").unwrap();
+        assert!(!super::is_uvx_ephemeral_exe(&tool));
+
+        let project_venv = venv(temp.path().join("project/.venv"));
+        assert!(!super::is_uvx_ephemeral_exe(&project_venv));
+
+        let cargo_target = temp.path().join("target");
+        std::fs::create_dir_all(cargo_target.join("debug")).unwrap();
+        std::fs::write(cargo_target.join("CACHEDIR.TAG"), "").unwrap();
+        assert!(!super::is_uvx_ephemeral_exe(
+            &cargo_target.join("debug/hcom")
+        ));
+        assert!(!super::is_uvx_ephemeral_exe(std::path::Path::new(
+            "/usr/local/bin/hcom"
+        )));
     }
 }
