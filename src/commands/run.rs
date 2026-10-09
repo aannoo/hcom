@@ -16,17 +16,29 @@ use crate::shared::CommandContext;
 
 #[cfg(windows)]
 fn resolve_git_bash() -> Result<String, String> {
-    let bash = crate::terminal::which_bin("bash").ok_or_else(|| BASH_MISSING_MSG.to_string())?;
-    match Command::new(&bash).arg("--version").output() {
-        Ok(output) if output.status.success() => Ok(bash),
-        Ok(_) => Err(format!(
-            "{BASH_MISSING_MSG}\nFound `{bash}`, but it is not a working Bash installation \
-             (the Windows WSL launcher is not sufficient)."
-        )),
-        Err(err) => Err(format!(
-            "{BASH_MISSING_MSG}\nFound `{bash}`, but it could not be executed: {err}"
-        )),
-    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    find_git_bash(&path, |bash| {
+        // WSL's launcher can successfully run Bash once a distro is installed,
+        // but that Bash cannot open the Windows paths passed to our scripts.
+        Command::new(bash)
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "case \"$OSTYPE\" in msys*|cygwin*) exit 0 ;; *) exit 1 ;; esac",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+    .map(|bash| bash.to_string_lossy().into_owned())
+    .ok_or_else(|| format!("{BASH_MISSING_MSG}\nThe Windows WSL launcher is not sufficient."))
+}
+
+#[cfg(windows)]
+fn find_git_bash(path: &std::ffi::OsStr, is_git_bash: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join("bash.exe"))
+        .find(|bash| bash.is_file() && is_git_bash(bash))
 }
 #[cfg(windows)]
 const BASH_MISSING_MSG: &str = "Git Bash required to run shell (.sh) workflow scripts — install it and ensure `bash` is on PATH.";
@@ -746,6 +758,24 @@ fn print_docs(show_cli: bool, show_config: bool, show_api: bool) -> i32 {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_search_skips_wsl_and_checks_later_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = dir.path().join("system32");
+        let git = dir.path().join("Git with spaces").join("bin");
+        for candidate in [&wsl, &git] {
+            std::fs::create_dir_all(candidate).unwrap();
+            std::fs::write(candidate.join("bash.exe"), "").unwrap();
+        }
+        let path = std::env::join_paths([&wsl, &git]).unwrap();
+        assert_eq!(
+            find_git_bash(&path, |bash| bash == git.join("bash.exe")),
+            Some(git.join("bash.exe"))
+        );
+        assert!(find_git_bash(&path, |_| false).is_none());
+    }
 
     #[test]
     fn run_args_capture_script_and_flags() {
