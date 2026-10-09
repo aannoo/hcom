@@ -449,6 +449,23 @@ impl ScreenTracker {
         self.last_child_title.as_deref()
     }
 
+    /// The SGR mouse reports the child has asked for (see `console_input`).
+    #[cfg(any(windows, test))]
+    pub(super) fn mouse_tracking(&self) -> super::console_input::MouseTracking {
+        use super::console_input::MouseTracking;
+        let screen = self.parser.screen();
+        if screen.mouse_protocol_encoding() != vt100::MouseProtocolEncoding::Sgr {
+            return MouseTracking::Off;
+        }
+        match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => MouseTracking::Off,
+            vt100::MouseProtocolMode::Press => MouseTracking::Press,
+            vt100::MouseProtocolMode::PressRelease => MouseTracking::PressRelease,
+            vt100::MouseProtocolMode::ButtonMotion => MouseTracking::ButtonMotion,
+            vt100::MouseProtocolMode::AnyMotion => MouseTracking::AnyMotion,
+        }
+    }
+
     /// Codex approval fallback for blocker dialogs visible on screen.
     ///
     /// Terminal-title detection is primary. This catches dialog variants that
@@ -1359,6 +1376,24 @@ mod tests {
             debug_flag_path: std::path::PathBuf::new(),
             instance_name: None,
         }
+    }
+
+    #[test]
+    fn mouse_tracking_follows_the_childs_sgr_requests() {
+        use crate::pty::console_input::MouseTracking;
+        let mut t = make_tracker(24, 80, "");
+        assert_eq!(t.mouse_tracking(), MouseTracking::Off);
+        // Tracking without SGR encoding can't be reported as SGR.
+        t.process(b"\x1b[?1000h");
+        assert_eq!(t.mouse_tracking(), MouseTracking::Off);
+        t.process(b"\x1b[?1006h");
+        assert_eq!(t.mouse_tracking(), MouseTracking::PressRelease);
+        t.process(b"\x1b[?1002h");
+        assert_eq!(t.mouse_tracking(), MouseTracking::ButtonMotion);
+        t.process(b"\x1b[?1003h");
+        assert_eq!(t.mouse_tracking(), MouseTracking::AnyMotion);
+        t.process(b"\x1b[?1003l");
+        assert_eq!(t.mouse_tracking(), MouseTracking::Off);
     }
 
     #[test]

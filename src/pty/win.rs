@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -84,6 +84,9 @@ pub struct Proxy {
     last_tail: Arc<RwLock<Option<String>>>,
     /// Set when delivery initialization fails; `run()` maps it to a nonzero exit.
     launch_failed: Arc<AtomicBool>,
+    /// The child's SGR mouse tracking (`MouseTracking` as u8), published by
+    /// the reader thread, which owns the screen tracker, for the stdin thread.
+    mouse_tracking: Arc<AtomicU8>,
     /// Job object the child is assigned to (`KILL_ON_JOB_CLOSE`). Reaps the
     /// child's whole tree even if this proxy dies abnormally and `Drop` never
     /// runs. `None` if the child couldn't be assigned (falls back to the
@@ -214,6 +217,7 @@ impl Proxy {
             pending_resize: Arc::new(RwLock::new(None)),
             last_tail: Arc::new(RwLock::new(None)),
             launch_failed: Arc::new(AtomicBool::new(false)),
+            mouse_tracking: Arc::new(AtomicU8::new(0)),
             _job: job,
             spawned_at,
         })
@@ -538,6 +542,7 @@ impl Proxy {
         let ready_signaled = self.ready_signaled.clone();
         let screen_snapshot = self.screen_snapshot.clone();
         let writer = self.writer.clone();
+        let mouse_tracking = self.mouse_tracking.clone();
         let (rows, cols) = (self.rows, self.cols);
         let console_input = self.config.target.console_input();
         let mut trace = shared::StartupTrace::new(self.spawned_at, instance.as_deref());
@@ -743,6 +748,7 @@ impl Proxy {
                         stdout.write(&scratch[written..]);
 
                         screen.process(data);
+                        mouse_tracking.store(screen.mouse_tracking() as u8, Ordering::Relaxed);
 
                         // Refresh the `hcom term` snapshot, throttled to ≤10Hz so
                         // heavy output doesn't spend the reader in screen dumps
@@ -862,6 +868,7 @@ impl Proxy {
         let instance = self.config.instance_name.clone();
         let approval_clear_requested = self.approval_clear_requested.clone();
         let console_input = self.config.target.console_input();
+        let mouse_tracking = self.mouse_tracking.clone();
         thread::spawn(move || {
             let forward = |bytes: &[u8]| {
                 trace::bytes(Hop::Input, bytes);
@@ -885,7 +892,7 @@ impl Proxy {
                 }
             };
 
-            if let Some(mut input) = console::InputReader::open(console_input) {
+            if let Some(mut input) = console::InputReader::open(console_input, mouse_tracking) {
                 let mut out = Vec::new();
                 while running.load(Ordering::Acquire) {
                     out.clear();
@@ -1314,7 +1321,10 @@ mod console {
     };
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-    use super::super::console_input::{InputEncoder, KeyRecord, MouseRecord};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use super::super::console_input::{InputEncoder, KeyRecord, MouseRecord, MouseTracking};
     use super::super::trace::{self, Hop};
     use crate::integration_spec::ConsoleInput;
 
@@ -1343,11 +1353,18 @@ mod console {
         handle: isize,
         records: Vec<INPUT_RECORD>,
         encoder: InputEncoder,
+        input: ConsoleInput,
+        /// The child's mouse tracking, from the reader thread.
+        mouse_tracking: Arc<AtomicU8>,
+        /// Vt mode: whether we turned console mouse input on for the child.
+        mouse_input: bool,
+        /// The mouse-input and QuickEdit bits before we changed them.
+        mouse_bits: CONSOLE_MODE,
     }
 
     impl InputReader {
         /// `None` when stdin isn't a console.
-        pub fn open(input: ConsoleInput) -> Option<Self> {
+        pub fn open(input: ConsoleInput, mouse_tracking: Arc<AtomicU8>) -> Option<Self> {
             // SAFETY: querying the mode of our own std handle.
             let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as isize;
             let mut mode: CONSOLE_MODE = 0;
@@ -1360,11 +1377,48 @@ mod console {
                 // SAFETY: INPUT_RECORD is plain data; all-zero is valid.
                 records: vec![unsafe { std::mem::zeroed() }; 128],
                 encoder: InputEncoder::new(input),
+                input,
+                mouse_tracking,
+                mouse_input: false,
+                mouse_bits: mode & (ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE),
             })
+        }
+
+        /// Vt mode: while the child tracks the mouse, take mouse input the
+        /// way a child run directly would (QuickEdit off, mouse input on). A
+        /// console host that parses the terminal's mouse reports into records
+        /// only delivers them in that mode; the encoder turns them back into
+        /// reports, unless reports already arrive as text. The mode stays
+        /// put until tracking ends: a host that sends text may need it too.
+        fn sync_mouse_input(&mut self, tracking: MouseTracking) {
+            let want = self.input == ConsoleInput::Vt && tracking != MouseTracking::Off;
+            if want == self.mouse_input {
+                return;
+            }
+            self.mouse_input = want;
+            let mut mode: CONSOLE_MODE = 0;
+            // SAFETY: our own console input handle; `mode` is a valid out-pointer.
+            if unsafe { GetConsoleMode(self.handle as _, &mut mode) } == 0 {
+                return;
+            }
+            let bits = ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE;
+            let new = if want {
+                (mode & !bits) | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
+            } else {
+                (mode & !bits) | self.mouse_bits | ENABLE_EXTENDED_FLAGS
+            };
+            // SAFETY: as above.
+            unsafe { SetConsoleMode(self.handle as _, new) };
+            trace::note(
+                Hop::Mode,
+                &format!("stdin {mode:#06x} -> {new:#06x} (mouse tracking {tracking:?})"),
+            );
         }
 
         /// Wait up to `timeout_ms` for input and append its encoding to `out`.
         pub fn read(&mut self, timeout_ms: u32, out: &mut Vec<u8>) -> std::io::Result<()> {
+            let tracking = MouseTracking::from_u8(self.mouse_tracking.load(Ordering::Relaxed));
+            self.sync_mouse_input(tracking);
             // SAFETY: waiting on our own console input handle.
             match unsafe { WaitForSingleObject(self.handle as _, timeout_ms) } {
                 WAIT_OBJECT_0 => {}
@@ -1446,6 +1500,7 @@ mod console {
                                     ctrl: m.dwControlKeyState,
                                     flags: m.dwEventFlags,
                                 },
+                                tracking,
                                 out,
                             );
                         }
