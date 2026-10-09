@@ -65,12 +65,21 @@ function Get-PinnedTools([string[]] $packages) {
     }
 }
 
+# Under Windows PowerShell 5.1, a caller's `*>` redirect (ci-windows.ps1's
+# Step) turns each native stderr line into an ErrorRecord, which "Stop" makes
+# terminating — so npm's "npm notice" banner aborted a successful install.
+# Native calls run under "Continue" and are judged by $LASTEXITCODE alone.
+function Invoke-Native([scriptblock] $body) {
+    $ErrorActionPreference = "Continue"
+    & $body
+}
+
 # What each launcher currently reports, or $null if it is missing or unrunnable.
 function Get-ReportedVersion([string] $tool) {
     $launcher = Resolve-Launcher $tool
     if (-not $launcher) { return $null }
     try {
-        $reported = (& $launcher --version 2>&1 | Out-String).Trim()
+        $reported = (Invoke-Native { & $launcher --version 2>&1 } | Out-String).Trim()
     } catch {
         return $null
     }
@@ -111,17 +120,20 @@ if ($needsInstall) {
     }
 
     $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
-    & $npm install `
-        --global `
-        --prefix $prefix `
-        --cache $cache `
-        --no-audit `
-        --no-fund `
-        --fetch-retries 5 `
-        --fetch-retry-mintimeout 20000 `
-        --fetch-retry-maxtimeout 120000 `
-        --fetch-timeout 600000 `
-        @Packages
+    Invoke-Native {
+        & $npm install `
+            --global `
+            --prefix $prefix `
+            --cache $cache `
+            --no-audit `
+            --no-fund `
+            --no-update-notifier `
+            --fetch-retries 5 `
+            --fetch-retry-mintimeout 20000 `
+            --fetch-retry-maxtimeout 120000 `
+            --fetch-timeout 600000 `
+            @Packages
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "npm install failed with exit code $LASTEXITCODE"
     }
