@@ -183,6 +183,8 @@ fn apply_isolated_env_ctx(
     }
     command.env("HCOM_DIR", &ctx.hcom_dir);
     command.env("HCOM_TEST_ROOT", &ctx.root_path);
+    // Fixture DBs are disposable; skip SQLite's fsyncs (see HcomDb::open_connection).
+    command.env("HCOM_TEST_DB_NOSYNC", "1");
     command.env("TMPDIR", ctx.root_path.join("tmp"));
     command.env("XDG_CONFIG_HOME", ctx.root_path.join("xdg/config"));
     command.env("XDG_CACHE_HOME", ctx.root_path.join("xdg/cache"));

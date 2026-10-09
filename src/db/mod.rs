@@ -129,6 +129,14 @@ impl HcomDb {
 
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+        // Every test opens a fresh tempdir DB, and the fsyncs of WAL conversion
+        // and the schema commit cost ~170ms per open on Windows — most of the
+        // unit suite's runtime, serialized behind the test env lock. Tests
+        // never exercise crash durability, so skip the syncs. Integration
+        // fixtures opt their hcom processes in via HCOM_TEST_DB_NOSYNC.
+        if cfg!(test) || std::env::var_os("HCOM_TEST_DB_NOSYNC").is_some() {
+            conn.execute_batch("PRAGMA synchronous=OFF;")?;
+        }
         // busy_timeout first: converting a fresh db to WAL takes a brief
         // exclusive lock, so with a 0 timeout a concurrent first-open (or heavy
         // load) fails instantly with SQLITE_BUSY. Setting the timeout up front
