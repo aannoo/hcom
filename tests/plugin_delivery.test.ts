@@ -8,10 +8,24 @@ import { join } from "node:path";
 const logDir = mkdtempSync(join(tmpdir(), "hcom-plugin-delivery-"));
 const previousDir = process.env.HCOM_DIR;
 const previousLaunched = process.env.HCOM_LAUNCHED;
+const previousResume = process.env.HCOM_RESUME_SESSION_ID;
+const previousHost = process.env.HCOM_PLUGIN_HOST_PID;
 process.env.HCOM_DIR = logDir;
 process.env.HCOM_LAUNCHED = "1";
+// Either can be inherited from an hcom agent's shell: the tests start as a fresh launch, in a process that hosts the plugin.
+delete process.env.HCOM_RESUME_SESSION_ID;
+delete process.env.HCOM_PLUGIN_HOST_PID;
 let calls: string[][] = [];
 let pending: any[] = [];
+// The reply to opencode-start for a held session waits until the hold is released.
+const heldStarts = new Map<string, Promise<void>>();
+function hold(sid: string): () => void {
+	let release!: () => void;
+	heldStarts.set(sid, new Promise<void>(resolve => { release = () => { heldStarts.delete(sid); resolve(); }; }));
+	return release;
+}
+// opencode-start for these sessions replies without a name, as when hcom fails to bind.
+const failedStarts = new Set<string>();
 mock.module("node:child_process", {
 	namedExports: {
 		spawn(_command: string, args: string[]) {
@@ -20,16 +34,18 @@ mock.module("node:child_process", {
 				stdout: Object.assign(new EventEmitter(), { setEncoding() {} }),
 				stderr: Object.assign(new EventEmitter(), { setEncoding() {} }), kill() {},
 			});
-			queueMicrotask(() => {
+			const respond = () => {
 				const reply = args[0].endsWith("-start")
-					? { name: "test", session_id: args[args.indexOf("--session-id") + 1] }
+					? (failedStarts.has(args[args.indexOf("--session-id") + 1]) ? {} : { name: "test", session_id: args[args.indexOf("--session-id") + 1] })
 					: args.includes("--ack") ? { acked_to: Number(args[args.indexOf("--up-to") + 1]) }
 					: args[0].endsWith("-read") ? { messages: pending, has_more: false }
 					: args[0].endsWith("-approve") ? { approve: args[args.indexOf("--command") + 1].startsWith("hcom ") } : { ok: true };
 				if (args.includes("--ack")) pending = [];
 				child.stdout.emit("data", JSON.stringify(reply));
 				child.emit("close", 0, null);
-			});
+			};
+			const held = args[0].endsWith("-start") ? heldStarts.get(args[args.indexOf("--session-id") + 1]) : undefined;
+			if (held) void held.then(respond); else queueMicrotask(respond);
 			return child;
 		},
 	},
@@ -224,7 +240,9 @@ test("OpenCode fills a typed bodyless wake and acks it in the same request", asy
 	assert.equal(calls.filter(c => c[0] === "opencode-read" && !c.includes("--ack")).length, 1);
 });
 
-test("OpenCode 2 steers mail, acks on inbox delivery, and fills a wake in the prompt hook", async () => {
+// The plugin remembers the location that bound a session, for the life of the process: each test gets its own.
+let openCode2Locations = 0;
+function openCode2(directory = `/project/${++openCode2Locations}`, workspaceID?: string) {
 	const hooks: Record<string, any> = {};
 	const prompts: any[] = [];
 	const queue: any[] = [];
@@ -232,6 +250,7 @@ test("OpenCode 2 steers mail, acks on inbox delivery, and fills a wake in the pr
 	const push = (type: string, data: any) => { queue.push({ type, data }); wake?.(); };
 	const registration = { dispose() {} };
 	const ctx: any = {
+		location: { directory, workspaceID },
 		agent: { transform: async () => registration },
 		session: {
 			hook: async (name: string, cb: any) => ((hooks[name] = cb), registration),
@@ -248,6 +267,11 @@ test("OpenCode 2 steers mail, acks on inbox delivery, and fills a wake in the pr
 			},
 		},
 	};
+	return { ctx, hooks, prompts, push };
+}
+
+test("OpenCode 2 steers mail, acks on inbox delivery, and fills a wake in the prompt hook", async () => {
+	const { ctx, hooks, prompts, push } = openCode2();
 	const cleanup = await opencodeModule.setup(ctx);
 	openCodeCleanups.push(cleanup);
 	push("session.created", { sessionID: "s2" });
@@ -273,8 +297,278 @@ test("OpenCode 2 steers mail, acks on inbox delivery, and fills a wake in the pr
 	await settle(() => acks().length === 2);
 });
 
+const starts = () => calls.filter(c => c[0] === "opencode-start").map(c => c[c.indexOf("--session-id") + 1]);
+// OpenCode can import the plugin module again when it reloads it.
+const freshModule = async () => (await import(`${"../src/opencode_plugin/hcom.ts"}?reload=${Math.random()}`) as typeof import("../src/opencode_plugin/hcom.ts")).default;
+
+test("OpenCode 2 binds the session again and delivers pending mail when it reloads the plugin at the same location", async () => {
+	const first = openCode2("/project/reload");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s3" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	// OpenCode evicted the idle directory and loaded the plugin again: no session event follows.
+	pending = [{ event_id: 9, from: "luna", message: "AFTER-RELOAD" }];
+	const second = openCode2("/project/reload");
+	openCodeCleanups.push(await (await freshModule()).setup(second.ctx));
+	await settle(() => second.prompts.length === 1);
+	assert.deepEqual(starts(), ["s3", "s3"]);
+	assert.equal(second.prompts[0].sessionID, "s3");
+	assert.ok(second.prompts[0].text.includes("AFTER-RELOAD"));
+	second.push("session.deleted", { sessionID: "s3" });
+	await settle(() => calls.some(c => c[0] === "opencode-stop"));
+	await openCodeCleanups.pop()!();
+	// A deleted session is not bound again.
+	const third = openCode2("/project/reload");
+	openCodeCleanups.push(await (await freshModule()).setup(third.ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s3", "s3"]);
+});
+
+test("OpenCode 2 does not bind at load a session deleted while the plugin there was unbound", async () => {
+	const first = openCode2("/project/deleted-unbound");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s20" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	// The reload's bind fails, so the plugin there is unbound when the session is deleted.
+	failedStarts.add("s20");
+	const second = openCode2("/project/deleted-unbound");
+	openCodeCleanups.push(await (await freshModule()).setup(second.ctx));
+	await settle(() => starts().length === 2);
+	failedStarts.delete("s20");
+	second.push("session.deleted", { sessionID: "s20" });
+	await drain();
+	await openCodeCleanups.pop()!();
+	const third = openCode2("/project/deleted-unbound");
+	openCodeCleanups.push(await (await freshModule()).setup(third.ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s20", "s20"]);
+});
+
+test("OpenCode 2 stops a session deleted while a reload binds it", async () => {
+	const first = openCode2("/project/deleted-reloading");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s23" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	// The deletion arrives before the reload's bind has its turn.
+	const second = openCode2("/project/deleted-reloading");
+	openCodeCleanups.push(await (await freshModule()).setup(second.ctx));
+	second.push("session.deleted", { sessionID: "s23" });
+	await settle(() => calls.some(c => c[0] === "opencode-stop"));
+	assert.deepEqual(starts(), ["s23", "s23"]);
+	await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await (await freshModule()).setup(openCode2("/project/deleted-reloading").ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s23", "s23"]);
+});
+
+test("OpenCode 2 does not bind a session from another location when it loads the plugin there", async () => {
+	const first = openCode2();
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s4" });
+	await settle(() => starts().length === 1);
+	pending = [{ event_id: 10, from: "luna", message: "FOR-S4" }];
+	const second = openCode2();
+	openCodeCleanups.push(await opencodeModule.setup(second.ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s4"]);
+	assert.deepEqual(second.prompts, []);
+});
+
+test("OpenCode 2 does not bind the session at load in another workspace of the same directory", async () => {
+	const first = openCode2("/project/shared", "wrk_1");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s5" });
+	await settle(() => starts().length === 1);
+	const second = openCode2("/project/shared", "wrk_2");
+	openCodeCleanups.push(await opencodeModule.setup(second.ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s5"]);
+});
+
+test("OpenCode 2 binds at load only the session the agent bound last", async () => {
+	const first = openCode2("/project/first");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s6" });
+	await settle(() => starts().length === 1);
+	// The agent moves to a session at another location.
+	const second = openCode2("/project/second");
+	openCodeCleanups.push(await opencodeModule.setup(second.ctx));
+	second.push("session.created", { sessionID: "s7" });
+	await settle(() => starts().length === 2);
+	await openCodeCleanups.pop()!();
+	await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/first").ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s6", "s7"]);
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/second").ctx));
+	await settle(() => starts().length === 3);
+	assert.deepEqual(starts(), ["s6", "s7", "s7"]);
+});
+
+test("OpenCode 2 does not bind a session at load after the session moved to another location", async () => {
+	const first = openCode2("/project/origin");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s8" });
+	await settle(() => starts().length === 1);
+	first.push("session.moved", { sessionID: "s8", location: { directory: "/project/destination" } });
+	await drain();
+	await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/origin").ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s8"]);
+});
+
+test("OpenCode 2 does not bind a session at load after it moved while a reload was binding it", async () => {
+	const first = openCode2("/project/moving");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s9" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	const release = hold("s9");
+	const second = openCode2("/project/moving");
+	openCodeCleanups.push(await opencodeModule.setup(second.ctx));
+	await settle(() => starts().length === 2);
+	second.push("session.moved", { sessionID: "s9", location: { directory: "/project/elsewhere" } });
+	await drain();
+	release();
+	await drain();
+	await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/moving").ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s9", "s9"]);
+});
+
+test("OpenCode 2 binds at load a moved session that the destination bound before the source saw the move", async () => {
+	const source = openCode2("/project/move-source");
+	openCodeCleanups.push(await opencodeModule.setup(source.ctx));
+	source.push("session.created", { sessionID: "s21" });
+	await settle(() => starts().length === 1);
+	// The destination binds the session; the source sees session.moved while that bind is in progress.
+	const release = hold("s21");
+	const destination = openCode2("/project/move-destination");
+	openCodeCleanups.push(await opencodeModule.setup(destination.ctx));
+	destination.push("session.status", { sessionID: "s21", status: { type: "busy" } });
+	await settle(() => starts().length === 2);
+	source.push("session.moved", { sessionID: "s21", location: { directory: "/project/move-destination" } });
+	await drain();
+	release();
+	await drain();
+	while (openCodeCleanups.length) await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/move-destination").ctx));
+	await settle(() => starts().length === 3);
+	assert.deepEqual(starts(), ["s21", "s21", "s21"]);
+});
+
+test("OpenCode 2 binds at load a moved session after the destination gets its own copy of the move", async () => {
+	const source = openCode2("/project/copy-source");
+	openCodeCleanups.push(await opencodeModule.setup(source.ctx));
+	source.push("session.created", { sessionID: "s22" });
+	await settle(() => starts().length === 1);
+	const destination = openCode2("/project/copy-destination");
+	openCodeCleanups.push(await opencodeModule.setup(destination.ctx));
+	destination.push("session.status", { sessionID: "s22", status: { type: "busy" } });
+	await settle(() => starts().length === 2);
+	// OpenCode 2 sends the move to the source and to the destination.
+	const move = { sessionID: "s22", location: { directory: "/project/copy-destination" } };
+	source.push("session.moved", move);
+	destination.push("session.moved", move);
+	await drain();
+	while (openCodeCleanups.length) await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/copy-destination").ctx));
+	await settle(() => starts().length === 3);
+	assert.deepEqual(starts(), ["s22", "s22", "s22"]);
+});
+
+test("OpenCode 2 does not bind at load a moved session when only the destination saw the move", async () => {
+	const source = openCode2("/project/unseen-move-source");
+	openCodeCleanups.push(await opencodeModule.setup(source.ctx));
+	source.push("session.created", { sessionID: "s24" });
+	await settle(() => starts().length === 1);
+	// The source is unloaded, so only the destination gets the move.
+	await openCodeCleanups.pop()!();
+	const destination = openCode2("/project/unseen-move-destination");
+	openCodeCleanups.push(await opencodeModule.setup(destination.ctx));
+	destination.push("session.moved", { sessionID: "s24", location: { directory: "/project/unseen-move-destination" } });
+	await drain();
+	openCodeCleanups.push(await (await freshModule()).setup(openCode2("/project/unseen-move-source").ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s24"]);
+});
+
+test("OpenCode 2 binds at load the session hcom bound last when binds overlap", async () => {
+	const first = openCode2("/project/early");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s10" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	// A reload starts binding s10; a bind for s11 at another location is requested before that reply comes back.
+	const release = hold("s10");
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/early").ctx));
+	await settle(() => starts().length === 2);
+	const late = openCode2("/project/late");
+	openCodeCleanups.push(await opencodeModule.setup(late.ctx));
+	late.push("session.created", { sessionID: "s11" });
+	await drain();
+	release();
+	await settle(() => starts().length === 3);
+	await drain();
+	while (openCodeCleanups.length) await openCodeCleanups.pop()!();
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/early").ctx));
+	await drain();
+	assert.deepEqual(starts(), ["s10", "s10", "s11"]);
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/late").ctx));
+	await settle(() => starts().length === 4);
+	assert.deepEqual(starts(), ["s10", "s10", "s11", "s11"]);
+});
+
+test("OpenCode 2 does not bind at load a session that a bind in progress replaces", async () => {
+	const first = openCode2("/project/a");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s12" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	const release = hold("s13");
+	const other = openCode2("/project/b");
+	openCodeCleanups.push(await opencodeModule.setup(other.ctx));
+	other.push("session.created", { sessionID: "s13" });
+	await settle(() => starts().length === 2);
+	// Loaded while s13 is binding: the record still names s12 here.
+	openCodeCleanups.push(await opencodeModule.setup(openCode2("/project/a").ctx));
+	await drain();
+	release();
+	await drain();
+	assert.deepEqual(starts(), ["s12", "s13"]);
+});
+
+test("OpenCode 2 binds a prompted session once when the reload it waited on binds nothing", async () => {
+	const first = openCode2("/project/c");
+	openCodeCleanups.push(await opencodeModule.setup(first.ctx));
+	first.push("session.created", { sessionID: "s14" });
+	await settle(() => starts().length === 1);
+	await openCodeCleanups.pop()!();
+	const release = hold("s15");
+	const other = openCode2("/project/d");
+	openCodeCleanups.push(await opencodeModule.setup(other.ctx));
+	other.push("session.created", { sessionID: "s15" });
+	await settle(() => starts().length === 2);
+	// The reload waits to bind s14, which s15 replaces; prompts for s16 arrive meanwhile.
+	const reloaded = openCode2("/project/c");
+	openCodeCleanups.push(await opencodeModule.setup(reloaded.ctx));
+	const prompted = [1, 2].map(i => reloaded.hooks.prompt({ sessionID: "s16", messageID: `msg_${i}`, prompt: { text: "hi" } }));
+	await drain();
+	release();
+	await Promise.all(prompted);
+	await drain();
+	assert.deepEqual(starts(), ["s14", "s15", "s16"]);
+});
+
 process.on("exit", () => {
 	if (previousDir === undefined) delete process.env.HCOM_DIR; else process.env.HCOM_DIR = previousDir;
 	if (previousLaunched === undefined) delete process.env.HCOM_LAUNCHED; else process.env.HCOM_LAUNCHED = previousLaunched;
+	if (previousResume === undefined) delete process.env.HCOM_RESUME_SESSION_ID; else process.env.HCOM_RESUME_SESSION_ID = previousResume;
+	if (previousHost === undefined) delete process.env.HCOM_PLUGIN_HOST_PID; else process.env.HCOM_PLUGIN_HOST_PID = previousHost;
 	rmSync(logDir, { recursive: true, force: true });
 });

@@ -235,6 +235,36 @@ type Transport = {
   // Create a session and show it in the TUI; its ID, or null on failure.
   // OpenCode 2's server plugin cannot show one, so it has none.
   startSession?: () => Promise<string | null>
+  // The plugin's OpenCode 2 location. A plugin that OpenCode loads again there
+  // binds the session the previous one bound.
+  location?: { directory: string; workspaceID?: string }
+}
+
+// The session this process last bound, and the location that bound it. OpenCode 2
+// reloads a location's plugins when it evicts the idle directory, and no session
+// event follows. A launch binds a single agent, so only the latest binding counts.
+// Kept on globalThis, which outlives this module if a reload imports it again.
+const lastBinding: { location?: string; sessionId?: string; turn?: Promise<void> } = ((globalThis as any)[Symbol.for("hcom.opencode.lastBinding")] ??= {})
+
+// Binds and record updates take turns across the process's plugins, so the record
+// keeps the binding hcom made last. Resolves once the previous turn ends; call the
+// returned function to end this one.
+async function bindingTurn(): Promise<() => void> {
+  const previous = lastBinding.turn
+  let end!: () => void
+  lastBinding.turn = new Promise<void>((resolve) => { end = resolve })
+  await previous
+  return end
+}
+
+// Clears the record if it names this session, unless it names the location to keep.
+async function forgetBinding(sid: unknown, keep?: string): Promise<void> {
+  const end = await bindingTurn()
+  if (sid && sid === lastBinding.sessionId && (keep === undefined || keep !== lastBinding.location)) {
+    delete lastBinding.location
+    delete lastBinding.sessionId
+  }
+  end()
 }
 
 // A batch handed to OpenCode. It is acknowledged only once it is admitted to
@@ -261,7 +291,13 @@ function newMessageID(): string {
   return `msg_${time}${random}`
 }
 
+// OpenCode keys a location by directory and workspace.
+function keyOf(location?: { directory: string; workspaceID?: string }): string | undefined {
+  return location ? JSON.stringify([location.directory, location.workspaceID ?? null]) : undefined
+}
+
 function createCore(transport: Transport) {
+  const locationKey = keyOf(transport.location)
   let instanceName: string | null = null
   let sessionId: string | null = null
   let bootstrapText: string | null = null
@@ -404,13 +440,23 @@ function createCore(transport: Transport) {
     currentModel = launchedModel
   }
 
-  async function bindIdentity(sid: string): Promise<void> {
+  // fromRecord: bind only if the record still names this location and session.
+  async function bindIdentity(sid: string, fromRecord = false): Promise<void> {
     if (instanceName) return
-    if (bindingPromise) return bindingPromise
+    if (bindingPromise) {
+      const waitedGen = generation
+      await bindingPromise
+      // That attempt can end unbound (a reload skips a session a newer bind replaced,
+      // or the bind fails), so a caller with its own session tries once. Callers that
+      // waited together share that attempt.
+      if (fromRecord || instanceName || waitedGen !== generation) return
+      if (bindingPromise) return bindingPromise
+    }
     if (disposed || process.env.HCOM_LAUNCHED !== "1") return
     const gen = generation
     const attempt = (async () => {
       let server: Server | null = null
+      let endTurn = () => {}
       try {
         // Start the notify server before binding so its port registers atomically.
         server = await startNotifyServer(() => {
@@ -420,6 +466,16 @@ function createCore(transport: Transport) {
         const port = serverPort(server)
         const args = ["opencode-start", "--session-id", sid]
         if (port) args.push("--notify-port", String(port))
+        endTurn = await bindingTurn()
+        if (gen !== generation || disposed) return
+        if (fromRecord && (lastBinding.location !== locationKey || lastBinding.sessionId !== sid)) {
+          log("INFO", "plugin.resume_skipped", null, {
+            session_id: sid,
+            bound_location: lastBinding.location ?? null,
+            bound_session_id: lastBinding.sessionId ?? null,
+          })
+          return
+        }
         const reply = await rpc(args, null)
         if (gen !== generation || disposed) return
         if (!reply || typeof reply.name !== "string" || !reply.name) {
@@ -434,6 +490,7 @@ function createCore(transport: Transport) {
         stopStandby()
         instanceName = reply.name
         sessionId = typeof reply.session_id === "string" && reply.session_id ? reply.session_id : sid
+        if (locationKey) Object.assign(lastBinding, { location: locationKey, sessionId })
         bootstrapText = typeof reply.bootstrap === "string" && reply.bootstrap ? reply.bootstrap : null
         currentAgent = launchedAgent
         currentModel = launchedModel
@@ -450,6 +507,7 @@ function createCore(transport: Transport) {
       } catch (e) {
         log("ERROR", "plugin.bind_error", null, { error: String(e) })
       } finally {
+        endTurn()
         // Not adopted (failed, or reset while binding): don't leak the listener.
         server?.close()
         if (gen === generation) bindingPromise = null
@@ -677,9 +735,17 @@ function createCore(transport: Transport) {
 
   async function onEvent(event: HcomEvent): Promise<void> {
     const properties = event.properties ?? {}
+    // The session belongs to another location now: a reload here must not bind it.
+    // Checked before the bound-session test, since an unbound plugin still holds the record.
+    // OpenCode 2 sends a move to both locations: either one keeps only a record that
+    // names the destination, whichever handles it first.
+    if (event.type === "session.moved") void forgetBinding(properties.sessionID, keyOf(properties.location))
     const bindSession = bindingEventSession(event)
     if (typeof bindSession === "string" && !instanceName) await bindIdentity(bindSession)
     else if (bindingPromise) await bindingPromise
+    // Nor a deleted session. Cleared after a bind in flight, so a reload that binds
+    // the session still stops it below, and before the bound-session test, as above.
+    if (event.type === "session.deleted") void forgetBinding(properties.sessionID)
     const eventSession = event.type === "session.created" ? properties.info?.id : properties.sessionID
     if (!instanceName || !isBoundSession(eventSession)) return
 
@@ -743,6 +809,7 @@ function createCore(transport: Transport) {
       case "session.deleted": {
         const name = instanceName
         log("INFO", "plugin.session_deleted", name)
+        void forgetBinding(sessionId)
         reset()
         await rpc(["opencode-stop", "--name", name, "--reason", "closed"], name)
         break
@@ -869,17 +936,28 @@ function createCore(transport: Transport) {
     }
   }
 
-  // Resumed session (`hcom r`): OpenCode emits no session.created, and no
-  // session.status until the first prompt, so bind now and deliver anything
-  // already pending. Not awaited: plugin load must not wait on hcom.
-  const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID
+  // Resumed session (`hcom r`, or a plugin reloaded where a session was bound):
+  // OpenCode emits no session.created, and no session.status until the first
+  // prompt, so bind now and deliver anything already pending. Not awaited:
+  // plugin load must not wait on hcom.
+  const reloadedSessionId = locationKey && locationKey === lastBinding.location ? lastBinding.sessionId : undefined
+  const fromRecord = !process.env.HCOM_RESUME_SESSION_ID
+  const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID || reloadedSessionId
+  if (process.env.HCOM_LAUNCHED === "1") {
+    log("INFO", "plugin.loaded", process.env.HCOM_NAME || null, {
+      pid: process.pid,
+      directory: transport.location?.directory ?? null,
+      workspace_id: transport.location?.workspaceID ?? null,
+      resume_session_id: resumeSessionId || null,
+    })
+  }
   const startSession = transport.startSession
   if (!resumeSessionId && startSession && process.env.HCOM_LAUNCHED === "1") {
     void standBy(startSession).catch((e) => log("ERROR", "plugin.standby_error", null, { error: String(e) }))
   }
   if (resumeSessionId) {
     void (async () => {
-      await bindIdentity(resumeSessionId)
+      await bindIdentity(resumeSessionId, fromRecord)
       if (disposed || !instanceName || sessionId !== resumeSessionId) return
       log("INFO", "plugin.resume_bound", instanceName, { session_id: sessionId })
       await deliverPending("resume")
@@ -914,8 +992,9 @@ function createCore(transport: Transport) {
     compactionContext,
     resync,
     // Plugin unload, not session end: the hcom instance stays bound, since a
-    // reloaded plugin rebinds the same session.
+    // reloaded plugin rebinds the same session (see bindIdentity).
     dispose: async () => {
+      if (process.env.HCOM_LAUNCHED === "1") log("INFO", "plugin.unloaded", instanceName, { session_id: sessionId })
       disposed = true
       generation++
       stopNotifyServer()
@@ -1014,6 +1093,7 @@ function v1Event({ type, data }: { type: string; data: any }): HcomEvent | null 
     case "session.status":
     case "permission.replied":
     case "session.deleted":
+    case "session.moved":
     case "session.inbox.delivered":
     case "session.inbox.cancelled":
       return { type, properties: data }
@@ -1044,6 +1124,7 @@ async function setupOpenCode2(ctx: Plugin2.Context) {
   if (!claimPluginHost()) return async () => {}
 
   const core = createCore({
+    location: ctx.location,
     async prompt({ sessionID, text, messageID }) {
       // Steering reaches the model at the next step boundary of a running turn.
       await ctx.session.prompt({ sessionID, id: messageID, text, delivery: "steer" })

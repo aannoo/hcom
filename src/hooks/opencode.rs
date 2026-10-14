@@ -142,6 +142,13 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
 
     // Re-binding detection: session already bound (compaction or reconnect)
     if let Ok(Some(existing_name)) = db.get_session_binding(&session_id) {
+        // Only the launch attached to the instance rebinds it: after `hcom stop`
+        // and `hcom r`, the old process's reloaded plugin must not take back
+        // the resumed agent's notify endpoint.
+        let attached = db.get_process_binding(&process_id).ok().flatten();
+        if attached.as_deref() != Some(existing_name.as_str()) {
+            return plugin_rpc::error(format!("{existing_name} is not attached to this process"));
+        }
         let tool = instance_tool(db, &existing_name);
         let mut rebind_updates = serde_json::Map::new();
         rebind_updates.insert("name_announced".into(), serde_json::json!(false));
@@ -1576,6 +1583,7 @@ mod tests {
             )
             .unwrap();
         db.set_session_binding("sess-1", "luna").unwrap();
+        db.set_process_binding("pid-123", "sess-1", "luna").unwrap();
 
         let env = std::collections::HashMap::from([
             (
@@ -1602,6 +1610,40 @@ mod tests {
             })
         );
         assert!(payload["bootstrap"].as_str().is_some());
+    }
+
+    /// After `hcom stop` and `hcom r`, the old process's plugin may reload and
+    /// call opencode-start for the session again. It must not rebind the
+    /// resumed agent or take its notify endpoint.
+    #[test]
+    fn test_handle_start_rebind_rejects_detached_process() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+        insert_instance(&db, "luna", "opencode");
+        db.set_session_binding("sess-1", "luna").unwrap();
+        db.set_process_binding("pid-new", "sess-1", "luna").unwrap();
+        db.upsert_notify_endpoint("luna", "plugin", 4001).unwrap();
+
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-old".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let out = reply(handle_start(
+            &ctx,
+            &db,
+            &sv(&["--session-id", "sess-1", "--notify-port", "4002"]),
+        ));
+        assert!(out.get("error").is_some(), "{out}");
+        assert_eq!(db.get_notify_endpoint_port("luna", "plugin"), Some(4001));
+        let inst = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(inst.status_context, "idle");
     }
 
     fn insert_instance(db: &HcomDb, name: &str, tool: &str) {
