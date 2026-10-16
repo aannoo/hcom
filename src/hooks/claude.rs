@@ -5327,9 +5327,17 @@ mod tests {
     }
 
     fn userpromptsubmit_wake(db: &HcomDb, ctx: &HcomContext) -> (i32, String, Option<DeliveryAck>) {
+        userpromptsubmit_prompt(db, ctx, "<hcom>")
+    }
+
+    fn userpromptsubmit_prompt(
+        db: &HcomDb,
+        ctx: &HcomContext,
+        prompt: &str,
+    ) -> (i32, String, Option<DeliveryAck>) {
         let payload = HookPayload::from_claude(serde_json::json!({
             "session_id": "sess-1",
-            "prompt": "<hcom>",
+            "prompt": prompt,
         }));
         let instance = db.get_instance_full("nova").unwrap().unwrap();
         handle_userpromptsubmit(
@@ -5392,6 +5400,180 @@ mod tests {
         assert!(stdout.contains("turn 6"), "message not delivered: {stdout}");
         common::commit_delivery_ack(&db, &ack.expect("delivery must be acknowledged"));
         assert!(!db.has_pending("nova"));
+    }
+
+    /// Claude's screen once it has put a blocked `<hcom>` back into its input
+    /// box, under a typical footer, published the way the PTY proxy does it.
+    fn leftover_wake_delivery_state(inject_port: u16) -> crate::delivery::DeliveryState {
+        let patterns: Vec<String> = crate::tool::Tool::Claude
+            .ready_patterns()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let mut screen =
+            crate::pty::screen::ScreenTracker::new_with_instance(24, 80, &patterns, None);
+        let border = "\u{2500}".repeat(80);
+        screen.process(
+            format!(
+                "{border}\r\n\u{276F} <hcom>\r\n{border}\r\n  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell, 1 monitor \u{B7} \u{2190} 1 agent\r\n"
+            )
+            .as_bytes(),
+        );
+        let input_text = screen.get_input_box_text("claude");
+        assert_eq!(input_text.as_deref(), Some("<hcom>"));
+        let settled = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(30))
+            .unwrap();
+        crate::delivery::DeliveryState {
+            screen: std::sync::Arc::new(std::sync::RwLock::new(crate::delivery::ScreenState {
+                ready: screen.is_ready(),
+                prompt_empty: screen.is_prompt_empty("claude"),
+                input_text,
+                leftover_wake: screen.is_claude_leftover_wake(),
+                last_user_input: settled,
+                last_output: settled,
+                ..Default::default()
+            })),
+            grok_acp: None,
+            launch_phase_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inject_port,
+            user_activity_cooldown_ms: 3000,
+        }
+    }
+
+    /// Stands in for Claude Code on the PTY: records every write the delivery
+    /// loop makes, types text into the box, and on Enter submits the box to
+    /// the real UserPromptSubmit hook. Returns the writes, the hook's output,
+    /// and whether anything was still pending right after the delivery.
+    fn spawn_fake_claude(
+        listener: std::net::TcpListener,
+        screen: std::sync::Arc<std::sync::RwLock<crate::delivery::ScreenState>>,
+        db_path: PathBuf,
+        running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        notify_port: u16,
+    ) -> std::thread::JoinHandle<(Vec<String>, String, bool)> {
+        use std::io::Read;
+        std::thread::spawn(move || {
+            let db = HcomDb::open_raw(&db_path).unwrap();
+            let ctx = make_pty_ctx();
+            listener.set_nonblocking(true).unwrap();
+            let mut writes = Vec::new();
+            let mut delivered = String::new();
+            let mut pending_after = true;
+            let deadline = Instant::now() + std::time::Duration::from_secs(20);
+            while delivered.is_empty() && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("fake Claude accept failed: {e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut bytes = String::new();
+                stream.read_to_string(&mut bytes).unwrap();
+                writes.push(bytes.clone());
+                let mut s = screen.write().unwrap();
+                let in_box = s.input_text.clone().unwrap_or_default();
+                if bytes == "\r" {
+                    // Enter clears the box and submits what it held.
+                    s.input_text = Some(String::new());
+                    s.prompt_empty = true;
+                    s.leftover_wake = false;
+                    drop(s);
+                    let (_code, stdout, ack) = userpromptsubmit_prompt(&db, &ctx, &in_box);
+                    if let Some(ack) = ack {
+                        common::commit_delivery_ack(&db, &ack);
+                    }
+                    pending_after = db.has_pending("nova");
+                    delivered = stdout;
+                } else {
+                    // Typed text lands beside whatever the box held.
+                    s.input_text = Some(in_box + &bytes);
+                    s.prompt_empty = false;
+                    s.leftover_wake = false;
+                }
+            }
+            running.store(false, std::sync::atomic::Ordering::Release);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", notify_port));
+            (writes, delivered, pending_after)
+        })
+    }
+
+    /// Regression: with the blocked bare wake kept idle (previous test),
+    /// Claude still put the blocked `<hcom>` back into its input
+    /// box. The next message woke the PTY loop, but the gate read hcom's own
+    /// trigger as a user draft: "Gate blocked: prompt_has_text" for 90 s,
+    /// nothing typed, until an outside monitor started a turn. Replays Stop,
+    /// the blocked wake, the token left in the box and a new message, then
+    /// runs the real delivery loop against a fake Claude.
+    #[test]
+    #[serial]
+    fn test_leftover_wake_in_the_prompt_is_submitted_with_enter_alone() {
+        crate::config::Config::init();
+        let (dir, _guard, mut db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, name_announced)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 'tool:Bash', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        // The loop resolves its name through this process's binding, if any.
+        if let Some(process_id) = crate::config::Config::get().process_id {
+            db.set_process_binding(&process_id, "sess-1", "nova")
+                .unwrap();
+        }
+        let ctx = make_pty_ctx();
+
+        // The turn ends, then a bare wake with nothing pending is blocked.
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        handle_poll(&db, &ctx, "nova", &instance);
+        let (_code, stdout, ack) = userpromptsubmit_wake(&db, &ctx);
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert!(ack.is_none());
+        assert!(db.is_idle("nova"));
+
+        // Claude puts the blocked prompt back into its box. (`ready` is false
+        // under this footer whatever the box holds; Claude does not gate on it.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let state = leftover_wake_delivery_state(listener.local_addr().unwrap().port());
+        {
+            let screen = state.screen.read().unwrap();
+            assert!(!screen.prompt_empty && screen.leftover_wake && !screen.ready);
+        }
+
+        // A message arrives; the gate submits the leftover instead of guarding it.
+        insert_broadcast_from_luna(&db, "turn 7");
+        assert!(db.has_pending("nova"));
+        let config = crate::delivery::ToolConfig::claude();
+        let gate = crate::delivery::evaluate_gate(&config, &state, db.is_idle("nova"));
+        assert!(
+            gate.submits_leftover(),
+            "gate held the wake: {}",
+            gate.reason
+        );
+
+        // The PTY loop presses Enter on it, and the hook delivers the message.
+        let notify = crate::notify::NotifyServer::new().unwrap();
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fake_claude = spawn_fake_claude(
+            listener,
+            state.screen.clone(),
+            dir.path().join(".hcom").join("test.db"),
+            running.clone(),
+            notify.port(),
+        );
+        crate::delivery::run_delivery_loop(
+            running, &mut db, &notify, &state, "nova", &config, None, None, None,
+        );
+        let (writes, delivered, pending_after) = fake_claude.join().unwrap();
+
+        assert_eq!(writes, ["\r"], "the loop must press Enter alone");
+        assert!(delivered.contains("turn 7"), "not delivered: {delivered}");
+        assert!(!pending_after);
     }
 
     /// A message that lands after the wake's first check, before it would be

@@ -157,6 +157,17 @@ fn sanitize_child_title(title: &str) -> String {
     out
 }
 
+/// Claude's bordered input box as parsed from the screen.
+struct ClaudeInputBox {
+    /// Text after the prompt glyph on the prompt row, trimmed.
+    text: String,
+    /// The text is dim placeholder styling rather than typed input.
+    is_placeholder: bool,
+    /// Only blank rows sit between the prompt row and the bottom border, so
+    /// the prompt row holds the whole input.
+    single_row: bool,
+}
+
 /// Trim whitespace including NBSP (U+00A0) from both ends
 fn trim_with_nbsp(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || c == '\u{00A0}')
@@ -820,7 +831,7 @@ impl ScreenTracker {
     /// Uses vt100's cell-level dim attribute to distinguish placeholder from user input.
     /// This enables 0.5s user_activity_cooldown (same as Gemini/Codex) instead of the
     /// previous 3s workaround needed when using text heuristics.
-    fn get_claude_input_box(&self) -> Option<(String, bool)> {
+    fn get_claude_input_box(&self) -> Option<ClaudeInputBox> {
         let lines = self.get_screen_lines();
         let num_lines = lines.len();
 
@@ -843,31 +854,37 @@ impl ScreenTracker {
                 continue;
             }
 
-            let mut has_border_below = false;
-            for offset in 1..=3 {
-                if row_idx + offset >= num_lines {
-                    break;
-                }
-                if lines[row_idx + offset].contains('─') {
-                    has_border_below = true;
-                    break;
-                }
-            }
-            if !has_border_below {
+            let Some(border_offset) = (1..=3)
+                .take_while(|offset| row_idx + offset < num_lines)
+                .find(|offset| lines[row_idx + offset].contains('─'))
+            else {
                 continue;
-            }
+            };
+            // Rows between the prompt row and the bottom border hold the rest
+            // of a multi-line draft; an empty spacer row is not part of it.
+            let single_row = lines[row_idx + 1..row_idx + border_offset]
+                .iter()
+                .all(|row| trim_with_nbsp(row).is_empty());
 
             let prompt_pos = line.find(prompt_char)?;
             let after_prompt = &line[prompt_pos + prompt_char.len_utf8()..];
             let text = trim_with_nbsp(after_prompt).to_string();
             if text.is_empty() {
-                return Some((text, false));
+                return Some(ClaudeInputBox {
+                    text,
+                    is_placeholder: false,
+                    single_row,
+                });
             }
 
             let is_placeholder = self
                 .is_dim_after_prompt(row_idx as u16, &prompt_char.to_string())
                 .unwrap_or(true);
-            return Some((text, is_placeholder));
+            return Some(ClaudeInputBox {
+                text,
+                is_placeholder,
+                single_row,
+            });
         }
 
         None
@@ -878,15 +895,31 @@ impl ScreenTracker {
     /// dim text as an empty prompt.
     pub fn is_claude_session_switcher_visible(&self) -> bool {
         self.get_claude_input_box()
-            .is_some_and(|(text, _)| text == "describe a task for a new session")
+            .is_some_and(|input| input.text == "describe a task for a new session")
+    }
+
+    /// True when Claude's input box holds nothing but hcom's `<hcom>` wake,
+    /// typed as input on one row. Claude puts a prompt its UserPromptSubmit
+    /// hook blocked back into the box, so a bare wake the hook refused (nothing
+    /// was pending) stays there; so does a wake whose Enter never landed.
+    ///
+    /// `get_claude_input_text` reads only the prompt row, so a multi-line draft
+    /// whose first line is `<hcom>` would read the same; `single_row` rules
+    /// that out. Any other text, `<hcom> plus more` included, is a user draft.
+    pub fn is_claude_leftover_wake(&self) -> bool {
+        self.get_claude_input_box().is_some_and(|input| {
+            !input.is_placeholder && input.single_row && input.text == crate::delivery::WAKE_TRIGGER
+        })
     }
 
     fn get_claude_input_text(&self) -> Option<String> {
-        self.get_claude_input_box().map(
-            |(text, is_placeholder)| {
-                if is_placeholder { String::new() } else { text }
-            },
-        )
+        self.get_claude_input_box().map(|input| {
+            if input.is_placeholder {
+                String::new()
+            } else {
+                input.text
+            }
+        })
     }
 
     /// Extract Gemini input text.
@@ -2670,6 +2703,58 @@ mod tests {
         t.process(&data);
         t.process("────────────────────\r\n".as_bytes());
         assert_eq!(t.get_claude_input_text(), Some(String::new()));
+    }
+
+    // ---- Claude leftover wake ----
+
+    /// Claude's bordered input box holding `rows` (the prompt row first).
+    fn claude_box(rows: &[&str]) -> ScreenTracker {
+        let mut t = make_tool_tracker(24, 80, crate::tool::Tool::Claude);
+        let border = "─".repeat(80);
+        let mut lines = vec![border.as_str()];
+        lines.extend_from_slice(rows);
+        lines.push(border.as_str());
+        lines.push("  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← 1 agent");
+        render_rows(&mut t, &lines);
+        t
+    }
+
+    #[test]
+    fn claude_leftover_wake_is_only_a_lone_typed_trigger() {
+        // Claude put a blocked `<hcom>` back into the box.
+        let t = claude_box(&["❯ <hcom>"]);
+        assert_eq!(t.get_claude_input_text().as_deref(), Some("<hcom>"));
+        assert!(t.is_claude_leftover_wake());
+        // The bypass-permissions box uses a plain `>`.
+        assert!(claude_box(&["> <hcom>"]).is_claude_leftover_wake());
+        // The two-row box with an empty spacer row still holds only the wake.
+        assert!(claude_box(&["❯ <hcom>", ""]).is_claude_leftover_wake());
+
+        for rows in [
+            &["❯ <hcom> hi"][..],
+            &["❯ hi <hcom>"],
+            &["❯ <hcom></hcom>"],
+            &["❯ "],
+            // A multi-line draft whose first line is the trigger: the prompt
+            // row alone reads `<hcom>`, but Enter would send the whole draft.
+            &["❯ <hcom>", "  and the rest of my draft"],
+        ] {
+            let t = claude_box(rows);
+            assert!(
+                !t.is_claude_leftover_wake(),
+                "draft taken as a wake: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_dim_trigger_is_placeholder_not_a_leftover_wake() {
+        let mut t = make_tool_tracker(24, 80, crate::tool::Tool::Claude);
+        t.process(format!("{}\r\n", "─".repeat(80)).as_bytes());
+        t.process("❯ \x1b[2m<hcom>\x1b[0m\r\n".as_bytes());
+        t.process(format!("{}\r\n", "─".repeat(80)).as_bytes());
+        assert_eq!(t.get_claude_input_text(), Some(String::new()));
+        assert!(!t.is_claude_leftover_wake());
     }
 
     // ---- trim_with_nbsp ----
