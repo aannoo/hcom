@@ -1,0 +1,33 @@
+{
+ "cursor": [
+  15,
+  5
+ ],
+ "input_text": null,
+ "lines": [
+  " main ~/src/project                                                                                  200K / 256K │ [Dashboard]",
+  "    ◆ Subagent completed in 8m43s: “Run the new tests”",
+  "    ◈ Created notes.md, explored 1 file, 1 search, ran 3 commands +26",
+  "",
+  "    Done. The change is committed and the targeted tests pass.                                                     8:08 PM",
+  "",
+  "    The new tests fail without the fix and pass with it. Nothing was installed. Full suite: 2605 pass, 1 ignored;",
+  "    both new tests ok.",
+  "",
+  "    Next I will look at the follow-up item you mentioned, unless something else comes first. The earlier",
+  "    branch stays untouched.",
+  "",
+  "    Worked for 10m8s",
+  "                                                                                                                              █",
+  " ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+  " │ ❯                                                                                                                         │",
+  " ╰──────────────────────────────────────────────────────────────────────────────────────── Grok 4.6 (high) · always-approve ─╯",
+  " Ctrl+.:shortcuts"
+ ],
+ "prompt_empty": false,
+ "ready": true,
+ "size": [
+  18,
+  127
+ ]
+}

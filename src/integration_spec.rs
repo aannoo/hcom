@@ -1309,7 +1309,8 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     // Delivery goes through Grok's prompt queue (delivery/grok.rs), never the
-    // PTY, so there is no composer to parse and no ready footer to wait for.
+    // PTY, so its gates never read the composer and there is no ready footer to
+    // wait for. The composer is still parsed for `hcom term --json`.
     ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 10,
