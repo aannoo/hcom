@@ -219,6 +219,10 @@ pub(super) fn update_delivery_state(
         state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
             && (screen.is_claude_subagent_nav_visible()
                 || screen.is_claude_session_switcher_visible());
+        // Claude only: a blocked bare wake comes back into the input box, and
+        // the gate must not mistake hcom's own trigger for a user draft.
+        state.leftover_wake =
+            matches!(target.known_tool(), Some(Tool::Claude)) && screen.is_claude_leftover_wake();
         state.startup_loading = matches!(target.known_tool(), Some(Tool::Codex))
             && launch_phase_active.load(Ordering::Acquire)
             && screen.is_codex_startup_loading();
@@ -1932,6 +1936,62 @@ No session found matching 'never-saved'"
         assert!(!cleared);
         assert!(state.read().unwrap().approval, "cursor approval untouched");
         assert_eq!(calls.get(), 0, "cursor keystroke must not publish");
+    }
+
+    #[test]
+    fn claude_gate_submits_only_a_lone_leftover_wake() {
+        // Observed: Claude put a blocked bare `<hcom>` back into its
+        // box, and the gate guarded it as a draft ("prompt_has_text") while
+        // messages queued. From the screen through the published state to the
+        // gate: the lone trigger is submitted, anything else is protected.
+        let patterns: Vec<String> = Tool::Claude
+            .ready_patterns()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let config = crate::delivery::ToolConfig::claude();
+        let border = "\u{2500}".repeat(80);
+        let gate_for = |rows: &[&str]| {
+            let mut screen = ScreenTracker::new_with_instance(24, 80, &patterns, None);
+            let mut frame = format!("\x1b[2J\x1b[H{border}\r\n");
+            for row in rows {
+                frame.push_str(&format!("{row}\r\n"));
+            }
+            frame.push_str(&format!("{border}\r\n  \u{23F8} manual mode on\r\n"));
+            screen.process(frame.as_bytes());
+            let state = Arc::new(RwLock::new(ScreenState::default()));
+            let launch = Arc::new(AtomicBool::new(false));
+            let target = PtyTarget::Known(Tool::Claude);
+            update_delivery_state(&state, &screen, &target, &launch, &|_| {});
+            {
+                let mut s = state.write().unwrap();
+                s.last_user_input = Instant::now() - Duration::from_secs(30);
+            }
+            let delivery = crate::delivery::DeliveryState {
+                screen: state,
+                grok_acp: None,
+                launch_phase_active: launch,
+                inject_port: 0,
+                user_activity_cooldown_ms: 3000,
+            };
+            let gate = crate::delivery::evaluate_gate(&config, &delivery, true);
+            (gate.safe, gate.reason, gate.submits_leftover())
+        };
+        assert_eq!(
+            gate_for(&["\u{276F} <hcom>"]),
+            (true, "leftover_wake", true)
+        );
+        assert_eq!(gate_for(&["\u{276F} "]), (true, "ok", false));
+        for rows in [
+            &["\u{276F} <hcom> hi"][..],
+            &["\u{276F} <hcom>", "  second line of a draft"],
+        ] {
+            assert_eq!(
+                gate_for(rows),
+                (false, "prompt_has_text", false),
+                "{rows:?}"
+            );
+        }
     }
 
     #[test]
