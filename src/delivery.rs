@@ -863,6 +863,12 @@ pub struct ScreenState {
     /// once output has settled. Antigravity keeps its immediate scrape.
     /// See `APPROVAL_SCRAPE_CLEAR_MS`.
     pub approval_scrape_latched: bool,
+    /// Since when Codex has shown its idle composer without a break (`None`
+    /// while it is not drawn; `ScreenTracker::is_codex_idle_composer`). Codex
+    /// draws it only when no approval or other modal holds the bottom pane, so a
+    /// composer seen for `CODEX_COMPOSER_CLEAR_MS` lets a negative approval scrape
+    /// clear the latch even while output never settles. See `codex_composer_settled`.
+    pub codex_composer_since: Option<Instant>,
     /// A Claude TUI overlay is focused whose input box is NOT the current
     /// session's root prompt — the subagent navigator (a human may be typing
     /// into a subagent's box) or the `←` session switcher (input box is a
@@ -890,6 +896,7 @@ impl Default for ScreenState {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            codex_composer_since: None,
             nav_overlay: false,
             startup_loading: false,
         }
@@ -917,6 +924,22 @@ pub(crate) fn pre_enter_settle(tool: &str) -> Option<Duration> {
 /// approval"; requiring a settled screen before clearing keeps the latch up
 /// through the burst so the gate reports `approval`, not `prompt_has_text`.
 pub(crate) const APPROVAL_SCRAPE_CLEAR_MS: u64 = 400;
+
+/// How long Codex's idle composer must stay drawn before it is trusted as proof
+/// that no approval dialog is up. Output churn alone can never clear the latch
+/// while Codex's /voice footer is on: its live mic/codex meters redraw the screen
+/// continuously, so `APPROVAL_SCRAPE_CLEAR_MS` of quiet never comes (observed: an
+/// answered approval stayed latched for almost two hours and every
+/// idle-time message waited behind "Gate blocked: approval"). Long enough to ride
+/// out a redraw that briefly shows the composer; far shorter than any real wait.
+pub(crate) const CODEX_COMPOSER_CLEAR_MS: u64 = 1500;
+
+/// Whether Codex's idle composer has been drawn for `CODEX_COMPOSER_CLEAR_MS`.
+pub(crate) fn codex_composer_settled(composer_since: Option<Instant>, now: Instant) -> bool {
+    composer_since.is_some_and(|t| {
+        now.saturating_duration_since(t).as_millis() >= CODEX_COMPOSER_CLEAR_MS as u128
+    })
+}
 
 /// Latch decision for screen-scraped approval (cursor). A partial-render frame
 /// mid-redraw scrapes as "no approval"; holding the previous latch through such
@@ -2786,6 +2809,7 @@ mod tests {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            codex_composer_since: None,
             nav_overlay: false,
             startup_loading: false,
         }
@@ -3397,6 +3421,32 @@ mod tests {
         // Never spuriously latches from a clean idle state.
         assert!(!latch_scraped_approval(false, false, false));
         assert!(!latch_scraped_approval(false, false, true));
+    }
+
+    #[test]
+    fn codex_composer_settles_only_after_a_steady_stretch() {
+        let now = Instant::now();
+        assert!(!codex_composer_settled(None, now), "no composer drawn");
+        assert!(
+            !codex_composer_settled(Some(now), now),
+            "just appeared: a redraw may be passing"
+        );
+        let short = now - Duration::from_millis(CODEX_COMPOSER_CLEAR_MS - 100);
+        assert!(!codex_composer_settled(Some(short), now));
+        let long = now - Duration::from_millis(CODEX_COMPOSER_CLEAR_MS);
+        assert!(codex_composer_settled(Some(long), now));
+        // The settled composer stands in for quiet output: a negative scrape clears.
+        assert!(!latch_scraped_approval(
+            true,
+            false,
+            codex_composer_settled(Some(long), now)
+        ));
+        // A positive scrape still latches, composer or not.
+        assert!(latch_scraped_approval(
+            false,
+            true,
+            codex_composer_settled(Some(long), now)
+        ));
     }
 
     // ---- Lookup functions ----
