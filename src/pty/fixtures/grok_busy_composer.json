@@ -1,0 +1,33 @@
+{
+ "cursor": [
+  15,
+  5
+ ],
+ "input_text": null,
+ "lines": [
+  " main ~/src/project                                                                                  198K / 256K │ [Dashboard]",
+  "",
+  "    That request is the review. I’ll read it and start an isolated test run; the reply waits on the results if     7:59 PM",
+  "    they aren't in yet.",
+  "",
+  "    ◈ Ran 2 commands",
+  "    ◆ Subagent running: “Run the new tests” · Waiting for response… (grok-4.6)",
+  "    ◈ Explored lib.rs, 1 search, ran 2 commands",
+  "                                                                                                                              █",
+  "",
+  "  ⠙ Run the new tests        … 1m56s                                                                       9m27s ⇣198k [stop]",
+  "",
+  "  ▾ Subagents 1",
+  "  ⸬ Subagent Run the new tests         · Waiting for response…                                                 grok-4.6 8m30s",
+  " ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+  " │ ❯                                                                                                                         │",
+  " ╰──────────────────────────────────────────────────────────────────────────────────────── Grok 4.6 (high) · always-approve ─╯",
+  " Ctrl+.:shortcuts"
+ ],
+ "prompt_empty": false,
+ "ready": true,
+ "size": [
+  18,
+  127
+ ]
+}

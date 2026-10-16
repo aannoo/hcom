@@ -181,6 +181,7 @@ fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
         Tool::Cursor if line.contains('→') => Some("→"),
         Tool::Copilot if line.contains('❯') => Some("❯"),
         Tool::Qoder if line.starts_with("> ") || line == ">" => Some(">"),
+        Tool::Grok if line.starts_with("│ ❯") => Some("❯"),
         _ => None,
     }
 }
@@ -777,9 +778,9 @@ impl ScreenTracker {
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
             Ok(Tool::Qoder) => self.get_qoder_input_text(),
-            // Grok: prompt-empty gate uses generic scrape when available; no
-            // tool-specific VT100 input parser yet.
-            Ok(Tool::Grok) => None,
+            // Delivery goes through Grok's ACP queue and never reads this, but
+            // `hcom term --json` reports it to scripts deciding when to wake.
+            Ok(Tool::Grok) => self.get_grok_input_text(),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -1187,6 +1188,46 @@ impl ScreenTracker {
             }
         }
         None
+    }
+
+    /// Extract Grok Build input text.
+    ///
+    /// Grok draws its composer as a rounded box over a one-line footer, with
+    /// the model and approval mode in the bottom border:
+    ///
+    /// ```text
+    ///  ╭──────────────────────────────────────────────────────────╮
+    ///  │ ❯ <user text>                                            │
+    ///  ╰──────────────────────── Grok 4.6 (high) · always-approve ─╯
+    ///  Ctrl+.:shortcuts
+    /// ```
+    ///
+    /// An empty composer is a bare `❯`: no placeholder, idle or mid-turn.
+    /// Wrapped input adds `│ … │` rows before the bottom border. Anchored to
+    /// the bottom of the screen so boxes in the transcript are never read as
+    /// the composer; no box with `❯` on its first row (a menu or approval in
+    /// its place) is `None`.
+    fn get_grok_input_text(&self) -> Option<String> {
+        let lines = self.get_screen_lines();
+        let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
+        let bottom = (last.saturating_sub(3)..=last)
+            .rev()
+            .find(|&row| lines[row].trim_start().starts_with('╰'))?;
+        let top = (bottom.saturating_sub(12)..bottom)
+            .rev()
+            .find(|&row| lines[row].trim_start().starts_with('╭'))?;
+        let inner = |row: usize| {
+            lines[row]
+                .trim()
+                .strip_prefix('│')
+                .and_then(|rest| rest.strip_suffix('│'))
+        };
+        let first = inner(top + 1)?.trim_start().strip_prefix('❯')?;
+        let mut text = vec![trim_with_nbsp(first).to_string()];
+        for row in top + 2..bottom {
+            text.push(trim_with_nbsp(inner(row)?).to_string());
+        }
+        Some(text.join("\n").trim().to_string())
     }
 
     /// Extract Qoder CLI input text.
@@ -2412,6 +2453,115 @@ mod tests {
         ]);
         assert_eq!(t.get_qoder_input_text(), None);
         assert!(!t.is_prompt_empty("qoder"));
+    }
+
+    // ---- Grok input extraction ----
+
+    /// Real `hcom term --json` captures (Grok 4.6, 18x127), transcript text
+    /// anonymized; the composer and footer rows are as Grok drew them.
+    const GROK_IDLE: &str = include_str!("fixtures/grok_idle_composer.json");
+    const GROK_BUSY: &str = include_str!("fixtures/grok_busy_composer.json");
+
+    fn grok_dump_lines(fixture: &str) -> (u16, u16, Vec<String>) {
+        let dump: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        let size = |i: usize| dump["size"][i].as_u64().unwrap() as u16;
+        let lines = dump["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap().to_string())
+            .collect();
+        (size(0), size(1), lines)
+    }
+
+    fn grok_screen(rows: u16, cols: u16, lines: &[String]) -> ScreenTracker {
+        let mut t = make_tool_tracker(rows, cols, crate::tool::Tool::Grok);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        render_rows(&mut t, &lines);
+        t
+    }
+
+    /// The idle capture with its composer replaced by `bottom` rows (the
+    /// transcript scrolls up to make room).
+    fn grok_idle_with(bottom: &[String]) -> ScreenTracker {
+        let (rows, cols, mut lines) = grok_dump_lines(GROK_IDLE);
+        let composer = lines.len() - 4;
+        lines.truncate(composer);
+        lines.extend_from_slice(bottom);
+        let excess = lines.len() - rows as usize;
+        grok_screen(rows, cols, &lines[excess..])
+    }
+
+    /// A composer row as Grok draws it at 127 columns.
+    fn grok_row(text: &str) -> String {
+        format!(" │{text:<123}│")
+    }
+
+    fn grok_box(rows: &[&str]) -> Vec<String> {
+        let (_, _, lines) = grok_dump_lines(GROK_IDLE);
+        let n = lines.len();
+        let mut out = vec![lines[n - 4].clone()];
+        out.extend(rows.iter().map(|row| grok_row(row)));
+        out.extend_from_slice(&lines[n - 2..]);
+        out
+    }
+
+    #[test]
+    fn grok_idle_empty_composer_is_empty_and_ready() {
+        // A listening agent with unread mail at a bare `❯`: `hcom term --json`
+        // said prompt_empty=false here, so wake scripts never typed.
+        let (rows, cols, lines) = grok_dump_lines(GROK_IDLE);
+        let t = grok_screen(rows, cols, &lines);
+        assert_eq!(t.get_grok_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("grok"));
+        assert!(t.is_ready());
+        let dump: serde_json::Value = serde_json::from_str(&t.get_screen_dump("grok", 0)).unwrap();
+        assert_eq!(dump["ready"], true);
+        assert_eq!(dump["prompt_empty"], true);
+        assert_eq!(dump["input_text"], "");
+    }
+
+    #[test]
+    fn grok_composer_stays_empty_mid_turn() {
+        // Spinner, subagent panel and transcript above; the composer is empty.
+        let (rows, cols, lines) = grok_dump_lines(GROK_BUSY);
+        let t = grok_screen(rows, cols, &lines);
+        assert_eq!(t.get_grok_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("grok"));
+    }
+
+    #[test]
+    fn grok_extracts_typed_and_wrapped_drafts() {
+        let t = grok_idle_with(&grok_box(&[" ❯ <hcom> 3 unread"]));
+        assert_eq!(t.get_grok_input_text().as_deref(), Some("<hcom> 3 unread"));
+        assert!(!t.is_prompt_empty("grok"));
+
+        let t = grok_idle_with(&grok_box(&[
+            " ❯ first line of a long draft",
+            "   second line │ with a bar",
+        ]));
+        assert_eq!(
+            t.get_grok_input_text().as_deref(),
+            Some("first line of a long draft\nsecond line │ with a bar")
+        );
+    }
+
+    #[test]
+    fn grok_without_a_composer_is_not_empty() {
+        // A menu in the composer's place, with an old composer-like box in the
+        // transcript above it: nothing at the bottom to read, so not safe.
+        let mut bottom = grok_box(&[" ❯"]);
+        bottom.extend(
+            [
+                "  Allow this command?",
+                "  ❯ 1. Allow once",
+                "    2. Reject",
+            ]
+            .map(String::from),
+        );
+        let t = grok_idle_with(&bottom);
+        assert_eq!(t.get_grok_input_text(), None);
+        assert!(!t.is_prompt_empty("grok"));
     }
 
     // ---- Kimi input extraction ----
