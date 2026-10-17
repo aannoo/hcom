@@ -69,7 +69,7 @@ const REQUEUE_DELAY: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 1
 const LOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Grok answers a roster or `session/load` request in well under a second. One
 /// still unanswered after this long was lost in transit.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
 /// How often to check which leader process holds the socket.
 const LEADER_CHECK: Duration = Duration::from_secs(2);
 /// Prompts hcom queues carry this `promptId` prefix.
@@ -770,13 +770,17 @@ struct InFlight {
     /// prompt when its client disconnects, so the batch is followed through
     /// the reconnected client's queue snapshots, not treated as dropped.
     detached_at: Option<Instant>,
+    /// Whether a snapshot since the drop still lists it in Grok's queue. It
+    /// then waits for its turn there, however long, rather than for
+    /// `DETACHED_WAIT`: queuing it again would deliver it twice.
+    queued_after_detach: bool,
 }
 
 /// How long to wait after `removedFromQueue` for the snapshot showing a merge.
 const MERGE_EVIDENCE_WAIT: Duration = Duration::from_secs(2);
 /// How long a batch whose connection dropped waits for a queue snapshot
 /// before the transcript decides.
-const DETACHED_WAIT: Duration = Duration::from_secs(30);
+const DETACHED_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 30 });
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -801,14 +805,19 @@ fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
     // still queued; gone means it ran (the transcript will show it) or was
     // removed.
     if flight.detached_at.is_some() {
-        let queued = params["entries"]
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(|e| e["id"] == flight.prompt_id));
-        return (!queued).then(|| Outcome::Dropped("gone from Grok's queue".into()));
+        return (!still_queued(params, flight))
+            .then(|| Outcome::Dropped("gone from Grok's queue".into()));
     }
     // Absence proves nothing, even after `removedFromQueue`: the merge
     // snapshot can come later. `MERGE_EVIDENCE_WAIT` decides that case.
     None
+}
+
+/// Whether a queue snapshot lists our prompt as waiting.
+fn still_queued(params: &Value, flight: &InFlight) -> bool {
+    params["entries"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|e| e["id"] == flight.prompt_id))
 }
 
 /// Whether the session transcript shows the prompt text as sent: durable
@@ -1179,10 +1188,13 @@ pub(super) fn run(
                 }
                 Event::Notification { method, params } => {
                     if method == "x.ai/queue/changed"
-                        && let Some(flight) = in_flight.as_ref()
+                        && let Some(flight) = in_flight.as_mut()
                         && params["sessionId"].as_str() == Some(flight.session.as_str())
                     {
                         outcome = queue_outcome(&params, flight);
+                        if flight.detached_at.is_some() && still_queued(&params, flight) {
+                            flight.queued_after_detach = true;
+                        }
                     }
                     effects.extend(tracker.on_notification(&method, &params));
                 }
@@ -1296,7 +1308,12 @@ pub(super) fn run(
             retry_at = Instant::now() + Duration::from_secs(1);
             if let Some(flight) = in_flight.as_mut() {
                 flight.request_id = None;
-                flight.detached_at.get_or_insert_with(Instant::now);
+                // A batch seen queued before this drop needs fresh evidence
+                // from the next connection.
+                if flight.queued_after_detach || flight.detached_at.is_none() {
+                    flight.detached_at = Some(Instant::now());
+                }
+                flight.queued_after_detach = false;
             }
             log_warn("native", "grok.acp.disconnected", &error);
         }
@@ -1311,6 +1328,7 @@ pub(super) fn run(
         if outcome.is_none()
             && in_flight
                 .as_ref()
+                .filter(|flight| !flight.queued_after_detach)
                 .and_then(|flight| flight.detached_at)
                 .is_some_and(|at| at.elapsed() >= DETACHED_WAIT)
         {
@@ -1442,6 +1460,7 @@ pub(super) fn run(
                         ack: prepared.ack,
                         removed_at: None,
                         detached_at: None,
+                        queued_after_detach: false,
                     });
                 }
                 Err(error) => {
@@ -1480,6 +1499,7 @@ mod tests {
             },
             removed_at: removed.then(Instant::now),
             detached_at: None,
+            queued_after_detach: false,
         }
     }
 
@@ -2007,6 +2027,11 @@ mod tests {
     /// first bridge sees the leader restart as hcom's batch goes out: the
     /// lock gets the new leader's PID, and nothing written to that bridge is
     /// ever answered again. The bridge itself stays up, as Grok's does.
+    /// Flag files beside it vary the restart: `same_pid` leaves the lock
+    /// alone, so only the unanswered requests show the loss; `queued` has
+    /// the batch reach the new leader, listed behind a user turn and run
+    /// only after `DETACHED_WAIT`. Every prompt the second bridge receives
+    /// is counted in `requeued`.
     #[cfg(unix)]
     const FAKE_BRIDGE: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
@@ -2020,33 +2045,38 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*|*'"method":"session/load"'*)
       echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
-      # The reconnected leader's queue snapshot: the lost batch is not in it.
       case "$line" in *session/load*)
-        echo '{"jsonrpc":"2.0","method":"_x.ai/queue/changed","params":{"sessionId":"s1","entries":[]}}';;
+        if [ -f "$dir/queued" ]; then
+          # The batch reached the new leader and waits behind a user turn.
+          held=$(cat "$dir/prompt")
+          echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"user-1\",\"entries\":[{\"id\":\"$held\"}]}}"
+          (sleep 4; echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"$held\",\"runningKind\":\"prompt\",\"entries\":[]}}") &
+        else
+          # The reconnected leader's queue snapshot: the lost batch is not in it.
+          echo '{"jsonrpc":"2.0","method":"_x.ai/queue/changed","params":{"sessionId":"s1","entries":[]}}'
+        fi;;
       esac ;;
     *'"method":"_x.ai/sessions/list"'*)
       echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessions\":[{\"sessionId\":\"s1\",\"resident\":true,\"activity\":\"idle\",\"lastChangeUnixMs\":1}]}}" ;;
     *'"method":"session/prompt"'*)
+      prompt=$(printf '%s' "$line" | sed -n 's/.*"promptId":"\([^"]*\)".*/\1/p')
       if [ "$run" = 1 ]; then
-        echo 2002 > "$lock"
+        echo "$prompt" > "$dir/prompt"
+        [ -f "$dir/same_pid" ] || echo 2002 > "$lock"
         lost=1
       else
-        prompt=$(printf '%s' "$line" | sed -n 's/.*"promptId":"\([^"]*\)".*/\1/p')
+        echo "$prompt" >> "$dir/requeued"
         echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"$prompt\",\"runningKind\":\"prompt\",\"entries\":[]}}"
       fi ;;
   esac
 done
 "#;
 
-    /// Observed: the leader auto-updated and restarted while idle; the
-    /// bridge reconnected without a word and the batch queued during the gap
-    /// never reached Grok. With no response or queue event for it, the batch
-    /// stayed in flight, no later mail was queued, and unread climbed until
-    /// someone typed into the agent's terminal.
+    /// Runs one delivery through the fake bridge with the given flag files
+    /// until the batch is acked or 30 s pass. Returns whether it was acked,
+    /// how many bridges hcom started, and the prompts the second one got.
     #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn batch_lost_in_a_silent_leader_restart_is_queued_again() {
+    fn deliver_across_restart(flags: &[&str]) -> (bool, String, Vec<String>) {
         use std::os::unix::fs::PermissionsExt;
 
         let (dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
@@ -2081,6 +2111,9 @@ done
         let bridge = dir.path().join("grok");
         std::fs::write(&bridge, FAKE_BRIDGE).unwrap();
         std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for flag in flags {
+            std::fs::write(dir.path().join(flag), "").unwrap();
+        }
         let socket = dir.path().join("leader.sock");
         std::fs::write(socket.with_extension("lock"), "1001\n").unwrap();
         let launch = launch_at(&bridge.to_string_lossy(), &socket);
@@ -2124,12 +2157,56 @@ done
         );
         watcher.join().unwrap();
 
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        (
+            db.get_cursor("nova") == message_id,
+            read("runs").trim().to_string(),
+            read("requeued").lines().map(str::to_string).collect(),
+        )
+    }
+
+    /// Observed: the leader auto-updated and restarted while idle; the
+    /// bridge reconnected without a word and the batch queued during the gap
+    /// never reached Grok. With no response or queue event for it, the batch
+    /// stayed in flight, no later mail was queued, and unread climbed until
+    /// someone typed into the agent's terminal.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn batch_lost_in_a_silent_leader_restart_is_queued_again() {
+        let (acked, runs, requeued) = deliver_across_restart(&[]);
+        assert!(acked, "the batch was never acked");
+        assert_eq!(runs, "2", "hcom should reconnect exactly once");
+        assert_eq!(requeued.len(), 1, "the lost batch is queued again once");
+    }
+
+    /// The lock can keep the same PID (a restart between checks, or a lost
+    /// write with no restart at all). The unanswered roster or load request
+    /// alone must still drop the connection and requeue the batch.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn batch_lost_behind_unanswered_requests_is_queued_again() {
+        let (acked, runs, requeued) = deliver_across_restart(&["same_pid"]);
+        assert!(acked, "the batch was never acked");
+        assert_eq!(runs, "2", "hcom should reconnect exactly once");
+        assert_eq!(requeued.len(), 1, "the lost batch is queued again once");
+    }
+
+    /// A batch that did reach the new leader, listed in its queue behind a
+    /// long user turn, must wait there: queuing it again would show Grok the
+    /// same mail twice.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn batch_still_queued_after_a_restart_is_not_queued_twice() {
+        let (acked, runs, requeued) = deliver_across_restart(&["queued"]);
+        assert!(acked, "the batch was never acked");
+        assert_eq!(runs, "2", "hcom should reconnect exactly once");
         assert_eq!(
-            db.get_cursor("nova"),
-            message_id,
-            "the batch was never acked"
+            requeued,
+            Vec::<String>::new(),
+            "the queued batch was sent again"
         );
-        let runs = std::fs::read_to_string(dir.path().join("runs")).unwrap();
-        assert_eq!(runs.trim(), "2", "hcom should reconnect exactly once");
     }
 }
