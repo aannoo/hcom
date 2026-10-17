@@ -525,10 +525,20 @@ impl ScreenTracker {
     /// composer and hint while an approval or other modal holds the bottom pane
     /// (whose `›` option rows can still satisfy the ready pattern and the input
     /// scrape), so this, not `is_ready()`, is the evidence that a dialog left.
+    ///
+    /// The prompt row must be drawn and the hint must sit below it: an empty
+    /// input scrape alone can come from the ready-pattern fallback with no
+    /// prompt row, and a hint line can linger in history above a modal.
     pub fn is_codex_idle_composer(&self) -> bool {
+        let lines = self.get_screen_lines();
+        let Some(prompt_row) = lines.iter().rposition(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with('›') || trimmed.starts_with('»')
+        }) else {
+            return false;
+        };
         self.get_codex_input_text().is_some_and(|t| t.is_empty())
-            && self
-                .get_screen_lines()
+            && lines[prompt_row + 1..]
                 .iter()
                 .any(|line| line.trim_start().starts_with("? for shortcuts"))
             && !self.is_codex_approval_visible()
@@ -1689,6 +1699,25 @@ mod tests {
         assert!(t.is_ready());
         assert!(!t.is_codex_approval_visible());
         assert!(t.is_codex_idle_composer());
+    }
+
+    #[test]
+    fn codex_idle_composer_needs_its_prompt_row_above_the_hint() {
+        // An unrecognized modal (no prompt row) whose breadcrumb contains `› `
+        // satisfies the ready pattern, so the input scrape falls back to an
+        // empty prompt; a `? for shortcuts` line quoted in history above it is
+        // not the composer's hint.
+        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
+        t.process(
+            "\u{2022} Press ? for shortcuts in the composer.\r\n\
+             \x20 ? for shortcuts\r\n\r\n\
+             \x20 Settings \u{203a} Model\r\n\r\n\
+             \x20   gpt-model high\r\n    gpt-model low\r\n"
+                .as_bytes(),
+        );
+        assert!(!t.is_codex_approval_visible());
+        assert_eq!(t.get_codex_input_text().as_deref(), Some(""));
+        assert!(!t.is_codex_idle_composer());
     }
 
     #[test]

@@ -2012,6 +2012,71 @@ No session found matching 'never-saved'"
     }
 
     #[test]
+    fn codex_interrupted_idle_composer_restarts_its_wait() {
+        // The idle composer must stand unbroken for CODEX_COMPOSER_CLEAR_MS: a
+        // draft or a dialog in between restarts the wait.
+        let target = PtyTarget::Known(Tool::Codex);
+        let patterns: Vec<String> = Tool::Codex
+            .ready_patterns()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let mut screen = ScreenTracker::new_with_instance(24, 100, &patterns, None);
+        let state = Arc::new(RwLock::new(ScreenState::default()));
+        let launch = Arc::new(AtomicBool::new(false));
+        let publish = |_: bool| {};
+        let dialog = "\x1b[2J\x1b[H\u{203a} 1. Yes, proceed (y)\r\n  2. No (esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n";
+        let idle = |screen: &mut ScreenTracker, level: char| {
+            screen.process(
+                format!(
+                    "\x1b[2J\x1b[H \x20voice \u{25cc} muted\r\n   mic {level}{level}{level}  codex \u{2581}\u{2581}\r\n\r\n\
+                     \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n\r\n  ? for shortcuts\r\n"
+                )
+                .as_bytes(),
+            )
+        };
+        let backdate = |state: &Arc<RwLock<ScreenState>>| {
+            let mut s = state.write().unwrap();
+            assert!(s.codex_composer_since.is_some(), "the composer is timed");
+            s.codex_composer_since = Some(
+                Instant::now() - Duration::from_millis(crate::delivery::CODEX_COMPOSER_CLEAR_MS),
+            );
+        };
+
+        screen.process(dialog.as_bytes());
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert!(state.read().unwrap().approval);
+
+        for interruption in [
+            "\x1b[2J\x1b[H \x20voice \u{25cc} muted\r\n\r\n\u{203a} half-typed draft\r\n\r\n  ? for shortcuts\r\n",
+            dialog,
+        ] {
+            idle(&mut screen, '\u{2581}');
+            update_delivery_state(&state, &screen, &target, &launch, &publish);
+            backdate(&state);
+
+            screen.process(interruption.as_bytes());
+            update_delivery_state(&state, &screen, &target, &launch, &publish);
+            assert!(state.read().unwrap().codex_composer_since.is_none());
+            assert!(state.read().unwrap().approval);
+
+            // Shown again while the meters churn: the full wait starts over.
+            idle(&mut screen, '\u{2582}');
+            assert!(!screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS));
+            update_delivery_state(&state, &screen, &target, &launch, &publish);
+            assert!(
+                state.read().unwrap().approval,
+                "a composer back after an interruption waits again"
+            );
+        }
+
+        backdate(&state);
+        idle(&mut screen, '\u{2583}');
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert!(!state.read().unwrap().approval);
+    }
+
+    #[test]
     fn codex_input_preserves_approval_until_screen_clears() {
         let target = PtyTarget::Known(Tool::Codex);
         let state = Arc::new(RwLock::new(ScreenState {
