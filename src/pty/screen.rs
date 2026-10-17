@@ -862,9 +862,12 @@ impl ScreenTracker {
             };
             // Rows between the prompt row and the bottom border hold the rest
             // of a multi-line draft; an empty spacer row is not part of it.
-            let single_row = lines[row_idx + 1..row_idx + border_offset]
-                .iter()
-                .all(|row| trim_with_nbsp(row).is_empty());
+            // Draft text can contain `─`, so only a full rule counts as the
+            // bottom border here.
+            let single_row = is_dash_rule(&lines[row_idx + border_offset])
+                && lines[row_idx + 1..row_idx + border_offset]
+                    .iter()
+                    .all(|row| trim_with_nbsp(row).is_empty());
 
             let prompt_pos = line.find(prompt_char)?;
             let after_prompt = &line[prompt_pos + prompt_char.len_utf8()..];
@@ -2738,6 +2741,8 @@ mod tests {
             // A multi-line draft whose first line is the trigger: the prompt
             // row alone reads `<hcom>`, but Enter would send the whole draft.
             &["❯ <hcom>", "  and the rest of my draft"],
+            // A second draft line holding `─` is not the bottom border.
+            &["❯ <hcom>", "  ─ draft notes"],
         ] {
             let t = claude_box(rows);
             assert!(

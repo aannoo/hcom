@@ -1381,6 +1381,17 @@ fn prompt_ownership(input_text: Option<&str>, injected_text: &str) -> PromptOwne
     }
 }
 
+/// Ownership of the prompt before an Enter (first or retry). A leftover wake is
+/// only ours while the scrape still sees it alone on one row: the prompt row
+/// keeps reading `<hcom>` after the user adds a second line, so text alone
+/// cannot tell the leftover from a draft that starts with it.
+fn submit_ownership(screen: &ScreenState, injected_text: &str, leftover: bool) -> PromptOwnership {
+    match prompt_ownership(screen.input_text.as_deref(), injected_text) {
+        PromptOwnership::Exclusive if leftover && !screen.leftover_wake => PromptOwnership::Mixed,
+        ownership => ownership,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase1Decision {
     Rendered,
@@ -1868,6 +1879,7 @@ pub fn run_delivery_loop(
         let mut inject_attempt: u32 = 0;
         let mut enter_attempt: u32 = 0;
         let mut injected_text = String::new();
+        let mut submitting_leftover = false;
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
         // Gate block tracking for TUI status updates
@@ -2065,6 +2077,7 @@ pub fn run_delivery_loop(
                                 "Prompt holds only a leftover wake; submitting it with Enter",
                             );
                             injected_text = WAKE_TRIGGER.to_string();
+                            submitting_leftover = true;
                             phase_started_at = Instant::now();
                             enter_attempt = 0;
                             delivery_state = State::WaitTextRender;
@@ -2099,6 +2112,7 @@ pub fn run_delivery_loop(
                                 ),
                             );
                             injected_text = text;
+                            submitting_leftover = false;
                             phase_started_at = Instant::now();
                             enter_attempt = 0;
                             delivery_state = State::WaitTextRender;
@@ -2285,7 +2299,7 @@ pub fn run_delivery_loop(
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
                             let ownership =
-                                prompt_ownership(screen.input_text.as_deref(), &injected_text);
+                                submit_ownership(&screen, &injected_text, submitting_leftover);
                             drop(screen);
 
                             if ownership != PromptOwnership::Exclusive {
@@ -2384,7 +2398,7 @@ pub fn run_delivery_loop(
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
                             let ownership =
-                                prompt_ownership(screen.input_text.as_deref(), &injected_text);
+                                submit_ownership(&screen, &injected_text, submitting_leftover);
                             drop(screen);
 
                             if ownership != PromptOwnership::Exclusive {
@@ -3371,6 +3385,27 @@ mod tests {
         assert_eq!(
             phase1_decision(Some("<hcom> hi"), WAKE_TRIGGER, Duration::ZERO),
             Phase1Decision::MixedPrompt
+        );
+    }
+
+    #[test]
+    fn leftover_wake_enter_needs_the_leftover_to_still_hold() {
+        // After the gate opened on a leftover, the user adds a second line:
+        // the prompt row still reads `<hcom>`, but the scrape no longer sees a
+        // lone wake. Neither the first Enter nor a retry may submit it.
+        let draft = claude_prompt("<hcom>", false);
+        assert_eq!(
+            submit_ownership(&draft, WAKE_TRIGGER, true),
+            PromptOwnership::Mixed
+        );
+        assert_eq!(
+            submit_ownership(&claude_prompt("<hcom>", true), WAKE_TRIGGER, true),
+            PromptOwnership::Exclusive
+        );
+        // A wake hcom typed itself keeps the usual text check.
+        assert_eq!(
+            submit_ownership(&draft, WAKE_TRIGGER, false),
+            PromptOwnership::Exclusive
         );
     }
 
