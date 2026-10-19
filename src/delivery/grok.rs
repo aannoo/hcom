@@ -745,6 +745,8 @@ struct InFlight {
     /// Live steer evidence, pending its removal response. A rewind invalidates
     /// the cache until its marker is durable and the live branch is rechecked.
     interjection: SteerEvidence,
+    /// Limit full transcript scans while the live evidence is pending.
+    transcript_check_at: Option<Instant>,
     /// Keep tracking this batch during the existing re-queue pause: an
     /// injection or its transcript can arrive after the merge wait.
     requeue_pending: bool,
@@ -756,6 +758,7 @@ struct InFlight {
 
 /// How long to wait after `removedFromQueue` for the snapshot showing a merge.
 const MERGE_EVIDENCE_WAIT: Duration = Duration::from_secs(2);
+const INTERJECTION_TRANSCRIPT_POLL: Duration = Duration::from_secs(1);
 /// How long a batch whose connection dropped waits for a queue snapshot
 /// before the transcript decides.
 const DETACHED_WAIT: Duration = Duration::from_secs(30);
@@ -799,6 +802,7 @@ fn observe_interjection(method: &str, params: &Value, flight: &mut InFlight) {
         // Keep the exact marker, including its event metadata, so an older
         // disk branch cannot restore the invalidated cache.
         flight.interjection = SteerEvidence::Rewound(params.clone());
+        flight.transcript_check_at = None;
     }
 }
 
@@ -825,12 +829,24 @@ fn interjected_in_transcript(flight: &InFlight) -> bool {
         })
 }
 
-fn interjection_outcome(flight: &InFlight) -> Option<Outcome> {
-    flight.removed_at?;
-    let injected = match flight.interjection {
-        SteerEvidence::Unseen | SteerEvidence::Rewound(_) => interjected_in_transcript(flight),
-        SteerEvidence::Injected => true,
-    };
+fn interjection_outcome(flight: &mut InFlight, force_transcript: bool) -> Option<Outcome> {
+    // A detached request may have lost its removal response. Keep the
+    // original transcript recovery, but require the exact steer identity.
+    if flight.removed_at.is_none() && (flight.detached_at.is_none() || flight.request_id.is_some())
+    {
+        return None;
+    }
+    let injected =
+        if flight.removed_at.is_some() && matches!(flight.interjection, SteerEvidence::Injected) {
+            true
+        } else {
+            let now = Instant::now();
+            if !force_transcript && flight.transcript_check_at.is_some_and(|at| now < at) {
+                return None;
+            }
+            flight.transcript_check_at = Some(now + INTERJECTION_TRANSCRIPT_POLL);
+            interjected_in_transcript(flight)
+        };
     injected.then_some(Outcome::Delivered)
 }
 
@@ -1300,10 +1316,15 @@ pub(super) fn run(
             }
             log_warn("native", "grok.acp.disconnected", &error);
         }
+        let requeue_due = in_flight
+            .as_ref()
+            .is_some_and(|flight| flight.requeue_pending && Instant::now() >= requeue_at);
         if outcome.is_none()
-            && let Some(flight) = in_flight.as_ref()
+            && let Some(flight) = in_flight.as_mut()
         {
-            outcome = interjection_outcome(flight);
+            // The final check must not reuse a negative poll result before
+            // discarding the batch and submitting it again.
+            outcome = interjection_outcome(flight, requeue_due);
         }
         if outcome.is_none()
             && in_flight
@@ -1330,7 +1351,7 @@ pub(super) fn run(
         {
             let outcome = match outcome {
                 Outcome::Dropped(_)
-                    if interjection_outcome(&flight).is_some()
+                    if interjection_outcome(&mut flight, requeue_due).is_some()
                         || ran_in_transcript(&flight.transcript, &flight.text) =>
                 {
                     Outcome::Delivered
@@ -1364,7 +1385,9 @@ pub(super) fn run(
                 }
                 Outcome::Dropped(reason) => {
                     // Still unread; queue it again after a pause.
-                    requeue_at = Instant::now() + REQUEUE_DELAY;
+                    if !flight.requeue_pending {
+                        requeue_at = Instant::now() + REQUEUE_DELAY;
+                    }
                     if flight.removed_at.is_some() {
                         flight.requeue_pending = true;
                         in_flight = Some(flight);
@@ -1473,6 +1496,7 @@ pub(super) fn run(
                         ack: prepared.ack,
                         removed_at: None,
                         interjection: SteerEvidence::Unseen,
+                        transcript_check_at: None,
                         requeue_pending: false,
                         detached_at: None,
                     });
@@ -1505,39 +1529,53 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn steer_removed_batch_is_not_requeued_when_injection_arrives_late() {
-        exercise_removed_steer_fixture(true, None);
+        exercise_removed_steer_fixture(true, None, 0);
     }
 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn removed_without_injection_still_requeues_and_stays_unread() {
-        exercise_removed_steer_fixture(false, None);
+        exercise_removed_steer_fixture(false, None, 0);
     }
 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn rewind_preserving_earlier_steer_does_not_requeue() {
-        exercise_removed_steer_fixture(true, Some((1, 0)));
+        exercise_removed_steer_fixture(true, Some((1, 0)), 0);
     }
 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn rewind_before_disk_rechecks_preserved_steer() {
-        exercise_removed_steer_fixture(true, Some((1, 3)));
+        exercise_removed_steer_fixture(true, Some((1, 3)), 0);
     }
 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn rewind_before_disk_removing_steer_stays_unread() {
-        exercise_removed_steer_fixture(true, Some((0, 3)));
+        exercise_removed_steer_fixture(true, Some((0, 3)), 0);
     }
 
     #[cfg(unix)]
-    fn exercise_removed_steer_fixture(inject: bool, rewind: Option<(u64, u64)>) {
+    #[test]
+    #[serial_test::serial]
+    fn reconnect_with_lost_response_acknowledges_durable_steer() {
+        exercise_removed_steer_fixture(true, None, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn reconnect_repeated_missing_snapshots_do_not_extend_retry_pause() {
+        exercise_removed_steer_fixture(false, None, 2);
+    }
+
+    #[cfg(unix)]
+    fn exercise_removed_steer_fixture(inject: bool, rewind: Option<(u64, u64)>, reconnect: u8) {
         // Exercise the production run/Client/ACK path against fixture ACP,
         // including an injection after the original two-second decision.
         let (_home_dir, _hcom, home, _env) = crate::hooks::test_helpers::isolated_test_env();
@@ -1567,6 +1605,7 @@ rewind=$5
 later=$6
 transcript=$7
 disk_delay=$8
+reconnect=$9
 while IFS= read -r line; do
     id=${line#*'"id":'}
     id=${id%%,*}
@@ -1574,12 +1613,28 @@ while IFS= read -r line; do
         *'"method":"initialize"'*)
             printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
         *'"method":"_x.ai/sessions/list"'*)
-            printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$roster" ;;
+            printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$roster"
+            if [ "$reconnect" != 0 ] && [ -f "$capture" ]; then
+                # Keep reporting the absent entry; each snapshot must not
+                # restart the retry pause. The hint keeps roster polls fast.
+                printf '%s\n' "$queue"
+                printf '{"method":"_x.ai/models/update","params":{}}\n'
+            fi ;;
         *'"method":"session/load"'*)
             printf '%s\n' "$queue"
             printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
         *'"method":"session/prompt"'*)
+            first=no
+            if [ ! -f "$capture" ]; then first=yes; fi
             printf '%s\n' "$line" >> "$capture"
+            if [ "$reconnect" != 0 ] && [ "$first" = yes ]; then
+                if [ "$injection" != '{}' ]; then printf '%s\n' "$injection" > "$transcript"; fi
+                if [ "$reconnect" = 2 ]; then
+                    # INFERRED response, not a captured production packet.
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{"completionKind":"removedFromQueue"}}}\n' "$id"
+                fi
+                exit 0
+            fi
             if [ "$rewind" != '{}' ] && [ "$sent" != yes ]; then
                 # Inject prompt 0, then rewind only the later prompt 1 (or
                 # delete prompt 0 for the negative). The response is inferred.
@@ -1593,7 +1648,7 @@ while IFS= read -r line; do
                 fi
                 sent=yes
             else
-                # INFERRED response, not a injection production packet.
+                # INFERRED response, not a captured production packet.
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{"completionKind":"removedFromQueue"}}}\n' "$id"
             fi
             if [ "$rewind" = '{}' ] && [ "$sent" != yes ]; then
@@ -1653,6 +1708,7 @@ done
                 later.to_string(),
                 transcript.to_string_lossy().into_owned(),
                 rewind.map_or(0, |(_, delay)| delay).to_string(),
+                reconnect.to_string(),
             ],
             &[],
         )
@@ -1693,30 +1749,57 @@ done
         );
         let running = Arc::new(AtomicBool::new(true));
         let stop = Arc::clone(&running);
+        let delivered = inject && rewind.is_none_or(|(target, _)| target == 1);
         let check_stale_file = rewind.is_some_and(|(_, delay)| delay > 0);
         let test_db = dir.path().join("test.db");
+        let observed_capture = capture.clone();
         let observer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
-            let early_cursor = if check_stale_file {
-                let conn = rusqlite::Connection::open_with_flags(
-                    test_db,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .unwrap();
-                Some(
-                    conn.query_row(
-                        "SELECT last_event_id FROM instances WHERE name='nova'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
-                )
-            } else {
-                None
-            };
-            std::thread::sleep(Duration::from_secs(12));
+            let deadline = Instant::now() + Duration::from_secs(22);
+            let mut first_prompt = None;
+            let mut early_cursor = None;
+            let mut covered_retry_window = false;
+            loop {
+                let prompts = std::fs::read_to_string(&observed_capture)
+                    .map_or(0, |content| content.lines().count());
+                if prompts > 0 {
+                    let first = *first_prompt.get_or_insert_with(Instant::now);
+                    if check_stale_file
+                        && early_cursor.is_none()
+                        && first.elapsed() >= Duration::from_secs(2)
+                    {
+                        let conn = rusqlite::Connection::open_with_flags(
+                            &test_db,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .unwrap();
+                        early_cursor = Some(
+                            conn.query_row(
+                                "SELECT last_event_id FROM instances WHERE name='nova'",
+                                [],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    // Delivered cases must survive a complete retry period
+                    // measured from submission, not from thread startup.
+                    if !delivered && prompts >= 2 {
+                        break;
+                    }
+                    if first.elapsed()
+                        >= MERGE_EVIDENCE_WAIT + REQUEUE_DELAY + Duration::from_secs(2)
+                    {
+                        covered_retry_window = true;
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             stop.store(false, Ordering::Release);
-            early_cursor
+            (early_cursor, covered_retry_window)
         });
         let state = DeliveryState {
             screen: Arc::new(RwLock::new(super::super::ScreenState {
@@ -1747,7 +1830,12 @@ done
             &mut super::super::host_label::HostLabel::resolve(),
             &mut LaunchOutcome::Ready,
         );
-        if let Some(early_cursor) = observer.join().unwrap() {
+        let (early_cursor, covered_retry_window) = observer.join().unwrap();
+        assert!(
+            !delivered || covered_retry_window,
+            "the deadline expired before a complete post-submission retry window"
+        );
+        if let Some(early_cursor) = early_cursor {
             assert_eq!(
                 early_cursor, 0,
                 "a live rewind must veto the not-yet-updated disk branch"
@@ -1763,7 +1851,6 @@ done
             packets.len(),
             db.get_cursor("nova")
         );
-        let delivered = inject && rewind.is_none_or(|(target, _)| target == 1);
         assert_eq!(packets.len(), if delivered { 1 } else { 2 });
         assert_eq!(packets[0]["params"]["_meta"]["sendNow"], false);
         assert_eq!(db.get_cursor("nova"), if delivered { 7 } else { 0 });
@@ -1790,6 +1877,7 @@ done
             },
             removed_at: removed.then(Instant::now),
             interjection: SteerEvidence::Unseen,
+            transcript_check_at: None,
             requeue_pending: false,
             detached_at: None,
         }
@@ -1817,7 +1905,7 @@ done
             if inject_first {
                 observe_interjection("session/update", &injection["params"], &mut flight);
                 assert_eq!(
-                    interjection_outcome(&flight),
+                    interjection_outcome(&mut flight, true),
                     None,
                     "injection alone cannot claim a batch"
                 );
@@ -1826,13 +1914,16 @@ done
             flight.removed_at = Some(Instant::now());
             if !inject_first {
                 assert_eq!(
-                    interjection_outcome(&flight),
+                    interjection_outcome(&mut flight, true),
                     None,
                     "manual queue removal stays unread"
                 );
                 observe_interjection("session/update", &injection["params"], &mut flight);
             }
-            assert_eq!(interjection_outcome(&flight), Some(Outcome::Delivered));
+            assert_eq!(
+                interjection_outcome(&mut flight, true),
+                Some(Outcome::Delivered)
+            );
         }
     }
 
@@ -1860,7 +1951,7 @@ done
             *wrong.pointer_mut(pointer).unwrap() = replacement;
             let mut pending = steer_flight(true).0;
             observe_interjection("session/update", &wrong["params"], &mut pending);
-            assert_eq!(interjection_outcome(&pending), None, "{pointer}");
+            assert_eq!(interjection_outcome(&mut pending, true), None, "{pointer}");
         }
         let mut wrong_method = steer_flight(true).0;
         observe_interjection(
@@ -1868,7 +1959,91 @@ done
             &injection["params"],
             &mut wrong_method,
         );
-        assert_eq!(interjection_outcome(&wrong_method), None);
+        assert_eq!(interjection_outcome(&mut wrong_method, true), None);
+    }
+
+    #[test]
+    fn detached_lost_response_requires_strict_durable_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        for invalid in [
+            None,
+            Some("/params/sessionId"),
+            Some("/params/update/content/_meta/displayText"),
+        ] {
+            let (mut flight, mut injection) = steer_flight(false);
+            flight.transcript = dir.path().join("updates.jsonl");
+            observe_interjection("session/update", &injection["params"], &mut flight);
+            assert_eq!(
+                interjection_outcome(&mut flight, true),
+                None,
+                "a connected request still needs its removal response"
+            );
+            flight.detached_at = Some(Instant::now());
+            assert_eq!(
+                interjection_outcome(&mut flight, true),
+                None,
+                "the old request id has not been detached yet"
+            );
+            flight.request_id = None;
+            assert_eq!(
+                interjection_outcome(&mut flight, true),
+                None,
+                "a cached live injection alone cannot replace the lost response"
+            );
+            if let Some(pointer) = invalid {
+                *injection.pointer_mut(pointer).unwrap() = json!("wrong identity");
+            }
+            std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
+            assert_eq!(
+                interjection_outcome(&mut flight, true),
+                invalid.is_none().then_some(Outcome::Delivered)
+            );
+            std::fs::remove_file(&flight.transcript).unwrap();
+        }
+    }
+
+    #[test]
+    fn rewind_invalidates_the_transcript_poll_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut flight, injection) = steer_flight(true);
+        flight.transcript = dir.path().join("updates.jsonl");
+        assert_eq!(interjection_outcome(&mut flight, false), None);
+        let later = json!({"method":"session/update", "params": {
+            "sessionId": flight.session, "update": {"sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"later"}, "_meta":{"promptIndex":1}}}});
+        let marker = json!({"method":"_x.ai/session/update", "params": {
+            "sessionId":flight.session, "update":{"sessionUpdate":"rewind_marker",
+                "target_prompt_index":1}, "_meta":{"eventId":"new-rewind"}}});
+        std::fs::write(
+            &flight.transcript,
+            format!("{injection}\n{later}\n{marker}\n"),
+        )
+        .unwrap();
+        observe_interjection("x.ai/session/update", &marker["params"], &mut flight);
+        assert_eq!(
+            interjection_outcome(&mut flight, false),
+            Some(Outcome::Delivered),
+            "a new rewind must invalidate a cached miss immediately"
+        );
+    }
+
+    #[test]
+    fn interjection_transcript_checks_are_throttled_between_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut flight, injection) = steer_flight(true);
+        flight.transcript = dir.path().join("updates.jsonl");
+        assert_eq!(interjection_outcome(&mut flight, false), None);
+        std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
+        assert_eq!(
+            interjection_outcome(&mut flight, false),
+            None,
+            "a second poll must not rescan the transcript within one second"
+        );
+        assert_eq!(
+            interjection_outcome(&mut flight, true),
+            Some(Outcome::Delivered),
+            "the last check before retry must bypass a cached miss"
+        );
     }
 
     #[test]
@@ -1878,9 +2053,12 @@ done
         flight.transcript = dir.path().join("updates.jsonl");
         flight.removed_at = Some(Instant::now() - MERGE_EVIDENCE_WAIT);
         flight.requeue_pending = true;
-        assert_eq!(interjection_outcome(&flight), None);
+        assert_eq!(interjection_outcome(&mut flight, true), None);
         std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
-        assert_eq!(interjection_outcome(&flight), Some(Outcome::Delivered));
+        assert_eq!(
+            interjection_outcome(&mut flight, true),
+            Some(Outcome::Delivered)
+        );
         // Generic substring proof must not bypass the strict steer check.
         assert!(!ran_in_transcript(&flight.transcript, &flight.text));
         let rewind = json!({"method": "_x.ai/session/update", "params": {
@@ -1889,14 +2067,14 @@ done
         observe_interjection("session/update", &injection["params"], &mut flight);
         observe_interjection("x.ai/session/update", &rewind["params"], &mut flight);
         assert_eq!(
-            interjection_outcome(&flight),
+            interjection_outcome(&mut flight, true),
             None,
             "a live rewind vetoes a stale file"
         );
         std::fs::write(&flight.transcript, format!("{injection}\n{rewind}\n")).unwrap();
         flight.interjection = SteerEvidence::Unseen;
         assert_eq!(
-            interjection_outcome(&flight),
+            interjection_outcome(&mut flight, true),
             None,
             "rewound injection is not delivery evidence"
         );
@@ -1912,7 +2090,7 @@ done
             let mut wrong = injection.clone();
             *wrong.pointer_mut(pointer).unwrap() = replacement;
             std::fs::write(&flight.transcript, format!("{wrong}\n")).unwrap();
-            assert_eq!(interjection_outcome(&flight), None, "{pointer}");
+            assert_eq!(interjection_outcome(&mut flight, true), None, "{pointer}");
             assert!(!ran_in_transcript(&flight.transcript, &flight.text));
         }
     }
@@ -1938,7 +2116,7 @@ done
         )
         .unwrap();
         assert_eq!(
-            interjection_outcome(&flight),
+            interjection_outcome(&mut flight, true),
             None,
             "an older rewind cannot unlock the stale file"
         );
@@ -1947,19 +2125,22 @@ done
             format!("{injection}\n{later}\n{marker}\n"),
         )
         .unwrap();
-        assert_eq!(interjection_outcome(&flight), Some(Outcome::Delivered));
+        assert_eq!(
+            interjection_outcome(&mut flight, true),
+            Some(Outcome::Delivered)
+        );
         let mut deleting = marker.clone();
         deleting["params"]["update"]["target_prompt_index"] = json!(0);
         deleting["params"]["_meta"]["eventId"] = json!("rewind-delete");
         observe_interjection("x.ai/session/update", &deleting["params"], &mut flight);
-        assert_eq!(interjection_outcome(&flight), None);
+        assert_eq!(interjection_outcome(&mut flight, true), None);
         std::fs::write(
             &flight.transcript,
             format!("{injection}\n{later}\n{marker}\n{deleting}\n"),
         )
         .unwrap();
         assert_eq!(
-            interjection_outcome(&flight),
+            interjection_outcome(&mut flight, true),
             None,
             "a removed injection stays unread"
         );
