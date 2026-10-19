@@ -850,6 +850,23 @@ fn interjection_outcome(flight: &mut InFlight, force_transcript: bool) -> Option
     injected.then_some(Outcome::Delivered)
 }
 
+/// The final transition out of the retry pause, evaluated at its deadline.
+fn expired_requeue_outcome(
+    flight: &mut InFlight,
+    deadline: Instant,
+    now: Instant,
+) -> Option<Outcome> {
+    if !flight.requeue_pending || now < deadline {
+        return None;
+    }
+    // Decide expiry and consume its last evidence in one transition. A
+    // deadline crossed after an earlier poll cannot reuse that cached miss.
+    Some(
+        interjection_outcome(flight, true)
+            .unwrap_or_else(|| Outcome::Dropped("removed from Grok's queue".into())),
+    )
+}
+
 /// What a queue snapshot proves about our prompt. Only identity counts: our
 /// prompt id running, or our exact text among the running combined texts
 /// (Grok merges queued plain prompts into the front one).
@@ -1316,15 +1333,10 @@ pub(super) fn run(
             }
             log_warn("native", "grok.acp.disconnected", &error);
         }
-        let requeue_due = in_flight
-            .as_ref()
-            .is_some_and(|flight| flight.requeue_pending && Instant::now() >= requeue_at);
         if outcome.is_none()
             && let Some(flight) = in_flight.as_mut()
         {
-            // The final check must not reuse a negative poll result before
-            // discarding the batch and submitting it again.
-            outcome = interjection_outcome(flight, requeue_due);
+            outcome = interjection_outcome(flight, false);
         }
         if outcome.is_none()
             && in_flight
@@ -1346,18 +1358,25 @@ pub(super) fn run(
                 "no queue evidence after reconnecting".into(),
             ));
         }
+        if matches!(outcome, Some(Outcome::Dropped(_)))
+            && let Some(flight) = in_flight.as_mut()
+            && (interjection_outcome(flight, false).is_some()
+                || ran_in_transcript(&flight.transcript, &flight.text))
+        {
+            outcome = Some(Outcome::Delivered);
+        }
+        // This is the only expiry decision. Do it after potentially slow
+        // transcript work, then apply its outcome without a second clock read.
+        let expired = in_flight
+            .as_mut()
+            .and_then(|flight| expired_requeue_outcome(flight, requeue_at, Instant::now()));
+        let requeue_expired = expired.is_some();
+        if outcome != Some(Outcome::Delivered) && expired.is_some() {
+            outcome = expired;
+        }
         if let Some(outcome) = outcome
             && let Some(mut flight) = in_flight.take()
         {
-            let outcome = match outcome {
-                Outcome::Dropped(_)
-                    if interjection_outcome(&mut flight, requeue_due).is_some()
-                        || ran_in_transcript(&flight.transcript, &flight.text) =>
-                {
-                    Outcome::Delivered
-                }
-                other => other,
-            };
             match outcome {
                 Outcome::Delivered if flight.ack.instance_name != *current_name => {
                     // Queued under an identity a session switch retired: its
@@ -1388,7 +1407,9 @@ pub(super) fn run(
                     if !flight.requeue_pending {
                         requeue_at = Instant::now() + REQUEUE_DELAY;
                     }
-                    if flight.removed_at.is_some() {
+                    if !requeue_expired
+                        && (flight.removed_at.is_some() || flight.detached_at.is_some())
+                    {
                         flight.requeue_pending = true;
                         in_flight = Some(flight);
                     } else {
@@ -1400,20 +1421,6 @@ pub(super) fn run(
                     }
                 }
             }
-        }
-        if let Some(flight) = in_flight.as_ref()
-            && flight.requeue_pending
-            && Instant::now() >= requeue_at
-        {
-            log_warn(
-                "native",
-                "grok.acp.requeue",
-                &format!(
-                    "prompt={} removed from Grok's queue; kept unread",
-                    flight.prompt_id
-                ),
-            );
-            in_flight = None;
         }
         let Some(conn) = client.as_mut() else {
             continue;
@@ -1575,6 +1582,13 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn reconnect_lost_response_tracks_injection_written_during_retry_pause() {
+        exercise_removed_steer_fixture(true, None, 3);
+    }
+
+    #[cfg(unix)]
     fn exercise_removed_steer_fixture(inject: bool, rewind: Option<(u64, u64)>, reconnect: u8) {
         // Exercise the production run/Client/ACK path against fixture ACP,
         // including an injection after the original two-second decision.
@@ -1622,13 +1636,20 @@ while IFS= read -r line; do
             fi ;;
         *'"method":"session/load"'*)
             printf '%s\n' "$queue"
-            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+            if [ "$reconnect" = 3 ] && [ -f "$capture" ] && [ "$sent" != yes ]; then
+                # The missing snapshot reaches run before the injection is
+                # durable. There is no session/prompt response to rescue it.
+                sleep 3
+                printf '%s\n' "$injection" > "$transcript"
+                sent=yes
+            fi ;;
         *'"method":"session/prompt"'*)
             first=no
             if [ ! -f "$capture" ]; then first=yes; fi
             printf '%s\n' "$line" >> "$capture"
             if [ "$reconnect" != 0 ] && [ "$first" = yes ]; then
-                if [ "$injection" != '{}' ]; then printf '%s\n' "$injection" > "$transcript"; fi
+                if [ "$injection" != '{}' ] && [ "$reconnect" != 3 ]; then printf '%s\n' "$injection" > "$transcript"; fi
                 if [ "$reconnect" = 2 ]; then
                     # INFERRED response, not a captured production packet.
                     printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{"completionKind":"removedFromQueue"}}}\n' "$id"
@@ -1960,6 +1981,46 @@ done
             &mut wrong_method,
         );
         assert_eq!(interjection_outcome(&mut wrong_method, true), None);
+    }
+
+    #[test]
+    fn retry_expiry_forces_strict_evidence_after_an_earlier_cached_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut flight, injection) = steer_flight(true);
+        flight.transcript = dir.path().join("updates.jsonl");
+        flight.requeue_pending = true;
+        assert_eq!(interjection_outcome(&mut flight, false), None);
+        std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            expired_requeue_outcome(&mut flight, deadline, deadline - Duration::from_nanos(1)),
+            None
+        );
+        // A scheduler pause crosses the deadline after the earlier poll.
+        // Explicit times make the boundary deterministic; no sleep race.
+        assert_eq!(
+            expired_requeue_outcome(&mut flight, deadline, deadline),
+            Some(Outcome::Delivered)
+        );
+        let marker = json!({"method":"_x.ai/session/update", "params": {
+            "sessionId":flight.session, "update":{"sessionUpdate":"rewind_marker",
+                "target_prompt_index":0}, "_meta":{"eventId":"expiry-rewind"}}});
+        observe_interjection("x.ai/session/update", &marker["params"], &mut flight);
+        assert!(
+            matches!(
+                expired_requeue_outcome(&mut flight, deadline, deadline),
+                Some(Outcome::Dropped(_))
+            ),
+            "expiry must not accept the stale branch before rewind is durable"
+        );
+        std::fs::write(&flight.transcript, format!("{injection}\n{marker}\n")).unwrap();
+        assert!(
+            matches!(
+                expired_requeue_outcome(&mut flight, deadline, deadline),
+                Some(Outcome::Dropped(_))
+            ),
+            "expiry must not accept an injection removed by rewind"
+        );
     }
 
     #[test]
