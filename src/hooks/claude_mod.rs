@@ -248,33 +248,7 @@ fn poll(args: &[String]) -> Result<serde_json::Value> {
             .find(|pair| pair[0] == "--detail")
             .map(|pair| pair[1].as_str())
             .unwrap_or("");
-        db.with_write_scope(|| {
-            // Reports never count as a successful cycle, so they neither refresh
-            // liveness nor clear an error.
-            if let Some(mut current) = load(&db, session, process)? {
-                if event == "submission-failed"
-                    || (event == "poll-failed" && !current.submission_failed)
-                {
-                    current.error = Some(detail.chars().take(1000).collect());
-                    current.submission_failed = event == "submission-failed";
-                    db.kv_set(
-                        &key(session, process),
-                        Some(&serde_json::to_string(&current)?),
-                    )?;
-                }
-                log(
-                    &format!("claude.mod_{event}"),
-                    session,
-                    process,
-                    &current.name,
-                    detail,
-                );
-                report_health(&db, process, &current.name)?;
-            } else {
-                log(&format!("claude.mod_{event}"), session, process, "", detail);
-            }
-            Ok(())
-        })?;
+        record_report(&db, session, process, event, detail)?;
         if let Some(name) = validated_owner(&db, session, process)? {
             crate::notify::wake(&db, &name, &[crate::notify::WakeKind::Plugin]);
         }
@@ -301,6 +275,52 @@ fn poll(args: &[String]) -> Result<serde_json::Value> {
     // Last step: a claimed wake is only committed with the healthy cycle.
     let wake = finish(&db, session, process, !observe)?;
     Ok(serde_json::json!({"wake": wake}))
+}
+
+/// Records a mod report. Reports never count as a successful cycle, so they
+/// neither refresh liveness nor clear an error.
+fn record_report(
+    db: &HcomDb,
+    session: &str,
+    process: &str,
+    event: &str,
+    detail: &str,
+) -> Result<()> {
+    db.with_write_scope(|| {
+        let Some(mut current) = load(db, session, process)? else {
+            log(&format!("claude.mod_{event}"), session, process, "", detail);
+            return Ok(());
+        };
+        // Claude holds a submitted wake until the session is idle. When a turn
+        // delivered the batch first (load() just saw the cursor move), the
+        // hook blocks the late wake as having nothing pending: no failure.
+        if event == "submission-failed" && current.attempted_cursor.is_none() {
+            log(
+                "claude.mod_stale_wake",
+                session,
+                process,
+                &current.name,
+                detail,
+            );
+            return report_health(db, process, &current.name);
+        }
+        if event == "submission-failed" || (event == "poll-failed" && !current.submission_failed) {
+            current.error = Some(detail.chars().take(1000).collect());
+            current.submission_failed = event == "submission-failed";
+            db.kv_set(
+                &key(session, process),
+                Some(&serde_json::to_string(&current)?),
+            )?;
+        }
+        log(
+            &format!("claude.mod_{event}"),
+            session,
+            process,
+            &current.name,
+            detail,
+        );
+        report_health(db, process, &current.name)
+    })
 }
 
 // Short write scopes serialize overlapping polls after a module reload. Never
@@ -492,6 +512,77 @@ mod tests {
         assert_eq!(
             state(&db, "session-1", "process-1").unwrap().unwrap().error,
             None
+        );
+    }
+
+    #[test]
+    fn a_late_wake_dropped_after_the_hook_delivered_is_not_a_failure() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        db.conn().execute(
+            "INSERT INTO events (type,timestamp,instance,data) VALUES ('message','2026-01-01T00:00:00Z','luna','{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')", [],
+        ).unwrap();
+        finish(&db, "session-1", "process-1", false).unwrap();
+        assert!(finish(&db, "session-1", "process-1", true).unwrap());
+        // A turn Claude started on its own delivers the batch while the wake
+        // waits; the wake then comes in with nothing pending and is blocked.
+        db.advance_instance_cursor("nova", 1).unwrap();
+        record_report(
+            &db,
+            "session-1",
+            "process-1",
+            "submission-failed",
+            "wake dropped",
+        )
+        .unwrap();
+        let current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        assert!(!current.submission_failed);
+        assert_eq!(current.error, None);
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+        // The next message still gets a wake.
+        db.conn().execute(
+            "INSERT INTO events (type,timestamp,instance,data) VALUES ('message','2026-01-01T00:00:01Z','luna','{\"from\":\"luna\",\"text\":\"again\",\"scope\":\"broadcast\"}')", [],
+        ).unwrap();
+        assert!(finish(&db, "session-1", "process-1", true).unwrap());
+    }
+
+    #[test]
+    fn a_dropped_wake_still_awaiting_its_hook_is_a_failure() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        db.conn().execute(
+            "INSERT INTO events (type,timestamp,instance,data) VALUES ('message','2026-01-01T00:00:00Z','luna','{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')", [],
+        ).unwrap();
+        finish(&db, "session-1", "process-1", false).unwrap();
+        assert!(finish(&db, "session-1", "process-1", true).unwrap());
+        record_report(
+            &db,
+            "session-1",
+            "process-1",
+            "submission-failed",
+            "wake dropped",
+        )
+        .unwrap();
+        assert!(
+            state(&db, "session-1", "process-1")
+                .unwrap()
+                .unwrap()
+                .submission_failed
+        );
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "tui:mod-failed"
         );
     }
 
