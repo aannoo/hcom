@@ -98,19 +98,44 @@ fn is_wezterm_argv(argv: &[String]) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("wezterm"))
 }
 
-/// Add the pane owner's tmux socket when the close template does not select one.
-fn splice_tmux_socket(argv: &mut Vec<String>, socket_path: &str) {
-    let is_tmux = argv
-        .first()
+fn is_tmux_command(argv: &[String]) -> bool {
+    argv.first()
         .and_then(|bin| std::path::Path::new(bin).file_stem())
         .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("tmux"));
-    let has_socket = argv
-        .iter()
-        .any(|arg| arg == "-S" || arg.starts_with("-S") || arg == "-L" || arg.starts_with("-L"));
-    if is_tmux && !socket_path.is_empty() && !has_socket {
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("tmux"))
+}
+
+fn has_tmux_server_selector(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|arg| arg == "-S" || arg.starts_with("-S") || arg == "-L" || arg.starts_with("-L"))
+}
+
+fn tmux_close_has_server_identity(argv: &[String], socket_path: &str) -> bool {
+    !is_tmux_command(argv) || !socket_path.is_empty() || has_tmux_server_selector(argv)
+}
+
+/// Add the pane owner's tmux socket when the close template does not select one.
+fn splice_tmux_socket(argv: &mut Vec<String>, socket_path: &str) {
+    let has_socket = has_tmux_server_selector(argv);
+    if is_tmux_command(argv) && !socket_path.is_empty() && !has_socket {
         argv.splice(1..1, ["-S".to_string(), socket_path.to_string()]);
     }
+}
+
+/// Parse the socket path from tmux's `TMUX=socket,pid,pane` environment value.
+/// Splitting from the right preserves commas that are part of the socket path.
+pub(crate) fn tmux_socket_path_from_env(value: &str) -> Option<&str> {
+    let mut parts = value.rsplitn(3, ',');
+    let pane_index = parts.next()?;
+    let server_pid = parts.next()?;
+    let socket_path = parts.next()?;
+    if socket_path.is_empty()
+        || server_pid.parse::<u32>().is_err()
+        || pane_index.parse::<u32>().is_err()
+    {
+        return None;
+    }
+    Some(socket_path)
 }
 
 /// Terminal info resolved for an instance.
@@ -2843,6 +2868,11 @@ pub fn close_terminal_pane(pid: u32, info: &TerminalInfo) -> PaneCloseResult {
         None => return failed_without_command(),
     };
 
+    if !tmux_close_has_server_identity(&argv, tmux_socket_path) {
+        // Without the launcher's server identity, the caller's default tmux
+        // server may contain an unrelated pane with the same pane ID.
+        return failed_without_command();
+    }
     splice_tmux_socket(&mut argv, tmux_socket_path);
 
     let is_zellij = is_zellij_merged(&merged);
@@ -3117,14 +3147,14 @@ pub fn resolve_terminal_info(
             .get("tmux_socket_path")
             .and_then(|v| v.as_str())
             .filter(|v| !v.is_empty())
+            .map(str::to_string)
             .or_else(|| {
                 lc_env
                     .and_then(|e| e.get("TMUX").and_then(|v| v.as_str()))
-                    .and_then(|v| v.split(',').next())
-                    .filter(|v| !v.is_empty())
+                    .and_then(tmux_socket_path_from_env)
+                    .map(str::to_string)
             })
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or_default();
     }
 
     // Legacy kitty launches may have pane/socket metadata but no persisted preset.
@@ -3331,6 +3361,25 @@ mod tests {
             Some(r#"{"pane_id":"%0","env":{"TMUX":"/tmp/tmux-owner.sock,123,0"}}"#),
         );
         assert_eq!(info.tmux_socket_path, "/tmp/tmux-owner.sock");
+
+        let info = resolve_terminal_info(
+            Some("tmux-split"),
+            Some(r#"{"pane_id":"%0","env":{"TMUX":"/tmp/tmux,owner.sock,123,0"}}"#),
+        );
+        assert_eq!(info.tmux_socket_path, "/tmp/tmux,owner.sock");
+    }
+
+    #[test]
+    fn test_tmux_close_requires_owner_or_explicit_server() {
+        let tmux = argv(&["tmux", "kill-pane", "-t", "%0"]);
+        assert!(!tmux_close_has_server_identity(&tmux, ""));
+        assert!(tmux_close_has_server_identity(
+            &tmux,
+            "/tmp/tmux-owner.sock"
+        ));
+
+        let explicit = argv(&["tmux", "-L", "custom", "kill-pane", "-t", "%0"]);
+        assert!(tmux_close_has_server_identity(&explicit, ""));
     }
 
     #[test]
