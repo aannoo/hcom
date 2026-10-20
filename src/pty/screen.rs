@@ -862,9 +862,13 @@ impl ScreenTracker {
             };
             // Rows between the prompt row and the bottom border hold the rest
             // of a multi-line draft; an empty spacer row is not part of it.
-            // Draft text can contain `─`, so only a full rule counts as the
-            // bottom border here.
-            let single_row = is_dash_rule(&lines[row_idx + border_offset])
+            // Draft text can contain `─`, even a whole row of it, so only an
+            // unindented rule as wide as the top border counts as the bottom
+            // border here. Anything else reads as a draft.
+            let bottom = lines[row_idx + border_offset].trim_end();
+            let single_row = bottom.starts_with('─')
+                && is_dash_rule(bottom)
+                && bottom.chars().count() == line_above.trim_end().chars().count()
                 && lines[row_idx + 1..row_idx + border_offset]
                     .iter()
                     .all(|row| trim_with_nbsp(row).is_empty());
@@ -2743,6 +2747,8 @@ mod tests {
             &["❯ <hcom>", "  and the rest of my draft"],
             // A second draft line holding `─` is not the bottom border.
             &["❯ <hcom>", "  ─ draft notes"],
+            &["❯ <hcom>", "  ───", "  unfinished user draft"],
+            &["❯ <hcom>", "───"],
         ] {
             let t = claude_box(rows);
             assert!(
