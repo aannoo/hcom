@@ -80,6 +80,10 @@ pub mod test_helpers {
                 "OMP_PROFILE",
                 "PI_PROFILE",
                 "HERMES_HOME",
+                // Set when the tests run inside an hcom-launched agent; they
+                // switch delivery loops to plugin mode.
+                crate::hooks::claude_mod::DELIVERY_ENV,
+                crate::hooks::copilot::EXTENSION_DELIVERY_ENV,
             ]
             .into_iter()
             .map(|key| (key, std::env::var_os(key)))
