@@ -27,11 +27,10 @@
 //! A batch that never started (removed from the queue, transport lost) stays
 //! unread and is queued again later: at-least-once, never silently dropped.
 //!
-//! The bridge reconnects on its own when the leader restarts (Grok's leader
-//! restarts itself to apply an auto-update) and tells hcom nothing. Requests
-//! written while the leader was down are lost and never answered. hcom
-//! treats a new leader PID in the socket's lock file, or a roster or load
-//! request left unanswered, as a lost connection.
+//! When the leader restarts (it does so to apply an auto-update), the bridge
+//! reconnects to the new one, replays the session loads and announces it with
+//! `x.ai/leader_reconnected`. Requests the old leader had not answered never
+//! will be, so hcom handles it as a lost connection.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -67,11 +66,6 @@ const ROSTER_SLOW_POLL: Duration = Duration::from_secs(15);
 const REQUEUE_DELAY: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 /// Wait before loading the bound session again after a failed load.
 const LOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
-/// Grok answers a roster or `session/load` request in well under a second. One
-/// still unanswered after this long was lost in transit.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
-/// How often to check which leader process holds the socket.
-const LEADER_CHECK: Duration = Duration::from_secs(2);
 /// Prompts hcom queues carry this `promptId` prefix.
 const HCOM_PROMPT_ID_PREFIX: &str = "hcom-";
 /// Leader-mode Grok ignores these (it warns and continues). Since hcom must
@@ -160,11 +154,11 @@ impl Launch {
     /// PID to the socket's sibling `.lock` (`x.sock` -> `x.lock`).
     pub(crate) fn stop_leader(&self) {
         let socket = std::path::Path::new(&self.socket);
-        let lock = self.lock_path();
-        if let Some(pid) = self
-            .leader_pid()
-            .filter(|pid| crate::sys::process::is_alive(*pid))
-        {
+        let lock = socket.with_extension("lock");
+        let pid = std::fs::read_to_string(&lock)
+            .ok()
+            .and_then(|content| content.trim().parse::<u32>().ok());
+        if let Some(pid) = pid.filter(|pid| crate::sys::process::is_alive(*pid)) {
             crate::sys::process::terminate(pid);
             let deadline = Instant::now() + Duration::from_secs(3);
             while crate::sys::process::is_alive(pid) && Instant::now() < deadline {
@@ -177,19 +171,6 @@ impl Launch {
         }
         let _ = std::fs::remove_file(socket);
         let _ = std::fs::remove_file(lock);
-    }
-
-    fn lock_path(&self) -> std::path::PathBuf {
-        std::path::Path::new(&self.socket).with_extension("lock")
-    }
-
-    /// PID of the leader that holds this launch's socket, from its `.lock`.
-    fn leader_pid(&self) -> Option<u32> {
-        std::fs::read_to_string(self.lock_path())
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
     }
 
     /// Env for the TUI and the ACP client. The leader is spawned by whichever
@@ -863,38 +844,6 @@ enum Pending {
     Load(String),
 }
 
-/// Requests awaiting a response on the current connection, and when each was
-/// sent.
-type Outstanding = HashMap<u64, (Pending, Instant)>;
-
-fn awaits(pending: &Outstanding, wanted: impl Fn(&Pending) -> bool) -> bool {
-    pending.values().any(|(request, _)| wanted(request))
-}
-
-/// A request unanswered for `REQUEST_TIMEOUT`, as its method name.
-fn stalled_request(pending: &Outstanding, now: Instant) -> Option<&'static str> {
-    pending
-        .values()
-        .find(|(_, sent)| now.saturating_duration_since(*sent) >= REQUEST_TIMEOUT)
-        .map(|(request, _)| match request {
-            Pending::Roster => "x.ai/sessions/list",
-            Pending::Load(_) => "session/load",
-        })
-}
-
-/// Whether another leader took over the socket since hcom attached. The
-/// bridge follows a restarted leader without a word, so this is the only sign
-/// that requests written in between were lost. An unreadable lock proves
-/// nothing.
-fn leader_change(attached: Option<u32>, current: Option<u32>) -> Option<String> {
-    match (attached, current) {
-        (Some(old), Some(new)) if old != new => {
-            Some(format!("Grok leader restarted (pid {old} -> {new})"))
-        }
-        _ => None,
-    }
-}
-
 /// The roster result, which the stdio bridge may wrap once more.
 fn roster_sessions(result: &Value) -> &[Value] {
     result
@@ -1002,7 +951,7 @@ pub(super) fn run(
     let mut client: Option<Client> = None;
     let mut tracker = Tracker::default();
     let mut loaded: HashSet<String> = HashSet::new();
-    let mut pending: Outstanding = HashMap::new();
+    let mut pending: HashMap<u64, Pending> = HashMap::new();
     let mut roster_due: Option<Instant> = None;
     let mut roster_fast_until = Instant::now();
     let mut in_flight: Option<InFlight> = None;
@@ -1012,8 +961,6 @@ pub(super) fn run(
     let mut connect_failures: u32 = 0;
     let mut retry_at = Instant::now();
     let mut requeue_at = Instant::now();
-    let mut attached_leader: Option<u32> = None;
-    let mut leader_checked = Instant::now();
     let launched_at = Instant::now();
     while running.load(Ordering::Acquire) {
         super::refresh_title_state(super::TitleRefresh {
@@ -1072,8 +1019,6 @@ pub(super) fn run(
                 Ok(connected) => {
                     client = Some(connected);
                     connect_failures = 0;
-                    attached_leader = launch.leader_pid();
-                    leader_checked = Instant::now();
                     tracker.reconnected();
                     loaded.clear();
                     pending.clear();
@@ -1133,10 +1078,7 @@ pub(super) fn run(
                 }
                 Event::Response(value) => {
                     let id = value["id"].as_u64();
-                    match id
-                        .and_then(|id| pending.remove(&id))
-                        .map(|(request, _)| request)
-                    {
+                    match id.and_then(|id| pending.remove(&id)) {
                         Some(Pending::Roster) => match value.get("error") {
                             Some(error) => {
                                 log_warn("native", "grok.acp.roster_failed", &error.to_string())
@@ -1187,6 +1129,10 @@ pub(super) fn run(
                     }
                 }
                 Event::Notification { method, params } => {
+                    if method == "x.ai/leader_reconnected" {
+                        closed = Some("Grok leader restarted".into());
+                        break;
+                    }
                     if method == "x.ai/queue/changed"
                         && let Some(flight) = in_flight.as_mut()
                         && params["sessionId"].as_str() == Some(flight.session.as_str())
@@ -1239,7 +1185,9 @@ pub(super) fn run(
                 }
                 Effect::Load { session, cwd } => {
                     if loaded.contains(&session)
-                        || awaits(&pending, |p| matches!(p, Pending::Load(s) if *s == session))
+                        || pending
+                            .values()
+                            .any(|p| matches!(p, Pending::Load(s) if *s == session))
                     {
                         continue;
                     }
@@ -1254,7 +1202,7 @@ pub(super) fn run(
                                "_meta": {"noReplay": true}}),
                     ) {
                         Ok(id) => {
-                            pending.insert(id, (Pending::Load(session), Instant::now()));
+                            pending.insert(id, Pending::Load(session));
                         }
                         Err(error) => closed = Some(format!("write failed: {error:#}")),
                     }
@@ -1267,7 +1215,7 @@ pub(super) fn run(
                 }
             }
         }
-        let roster_pending = awaits(&pending, |p| matches!(p, Pending::Roster));
+        let roster_pending = pending.values().any(|p| matches!(p, Pending::Roster));
         if !roster_pending && roster_due.is_none() {
             let fast = tracker.bound.is_none() || Instant::now() < roster_fast_until;
             let interval = if fast {
@@ -1281,27 +1229,10 @@ pub(super) fn run(
             roster_due = None;
             match conn.send("_x.ai/sessions/list", json!({})) {
                 Ok(id) => {
-                    pending.insert(id, (Pending::Roster, Instant::now()));
+                    pending.insert(id, Pending::Roster);
                 }
                 Err(error) => closed = Some(format!("write failed: {error:#}")),
             }
-        }
-        // The bridge is still up, but what was written to it may never be
-        // answered: drop it like a lost connection, so the in-flight batch is
-        // followed through the next connection's queue and requeued if gone.
-        if closed.is_none() && leader_checked.elapsed() >= LEADER_CHECK {
-            leader_checked = Instant::now();
-            let current = launch.leader_pid();
-            closed = leader_change(attached_leader, current);
-            attached_leader = attached_leader.or(current);
-        }
-        if closed.is_none()
-            && let Some(method) = stalled_request(&pending, Instant::now())
-        {
-            closed = Some(format!(
-                "{method} unanswered after {}s",
-                REQUEST_TIMEOUT.as_secs()
-            ));
         }
         if let Some(error) = closed {
             client = None;
@@ -1389,7 +1320,9 @@ pub(super) fn run(
         // is retried.
         if let Some(session) = tracker.bound.clone()
             && !loaded.contains(&session)
-            && !awaits(&pending, |p| matches!(p, Pending::Load(s) if *s == session))
+            && !pending
+                .values()
+                .any(|p| matches!(p, Pending::Load(s) if *s == session))
             && Instant::now() >= load_retry_at
         {
             let cwd = tracker
@@ -1406,7 +1339,7 @@ pub(super) fn run(
                        "_meta": {"noReplay": true}}),
             ) {
                 Ok(id) => {
-                    pending.insert(id, (Pending::Load(session), Instant::now()));
+                    pending.insert(id, Pending::Load(session));
                 }
                 Err(error) => {
                     log_warn("native", "grok.acp.write_failed", &format!("{error:#}"));
@@ -1969,78 +1902,19 @@ mod tests {
         assert!(plain.child_env().is_empty());
     }
 
-    fn launch_at(command: &str, socket: &std::path::Path) -> Launch {
-        Launch {
-            command: command.into(),
-            prefix: Vec::new(),
-            socket: socket.to_string_lossy().into_owned(),
-            no_subagents: false,
-        }
-    }
-
-    #[test]
-    fn leader_pid_comes_from_the_lock_beside_the_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let launch = launch_at("grok", &dir.path().join("hcom-grok-x.sock"));
-        assert_eq!(launch.leader_pid(), None);
-        let lock = dir.path().join("hcom-grok-x.lock");
-        std::fs::write(&lock, "77001\n").unwrap();
-        assert_eq!(launch.leader_pid(), Some(77001));
-        std::fs::write(&lock, "").unwrap();
-        assert_eq!(launch.leader_pid(), None);
-    }
-
-    #[test]
-    fn a_new_leader_pid_means_the_connection_was_lost() {
-        assert!(
-            leader_change(Some(77001), Some(94509))
-                .is_some_and(|why| why.contains("77001 -> 94509"))
-        );
-        assert_eq!(leader_change(Some(77001), Some(77001)), None);
-        // An unreadable lock (mid-restart, never written) proves nothing.
-        assert_eq!(leader_change(Some(77001), None), None);
-        assert_eq!(leader_change(None, Some(94509)), None);
-    }
-
-    #[test]
-    fn a_roster_or_load_left_unanswered_was_lost() {
-        let sent = Instant::now();
-        let mut pending: Outstanding = HashMap::new();
-        pending.insert(1, (Pending::Roster, sent));
-        assert_eq!(
-            stalled_request(&pending, sent + Duration::from_secs(1)),
-            None
-        );
-        assert_eq!(
-            stalled_request(&pending, sent + REQUEST_TIMEOUT),
-            Some("x.ai/sessions/list")
-        );
-        pending.clear();
-        pending.insert(2, (Pending::Load("s".into()), sent));
-        assert_eq!(
-            stalled_request(&pending, sent + REQUEST_TIMEOUT),
-            Some("session/load")
-        );
-    }
-
-    /// Stands in for `grok agent --leader --leader-socket <sock> stdio`. The
-    /// first bridge sees the leader restart as hcom's batch goes out: the
-    /// lock gets the new leader's PID, and nothing written to that bridge is
-    /// ever answered again. The bridge itself stays up, as Grok's does.
-    /// Flag files beside it vary the restart: `same_pid` leaves the lock
-    /// alone, so only the unanswered requests show the loss; `queued` has
-    /// the batch reach the new leader, listed behind a user turn and run
-    /// only after `DETACHED_WAIT`. Every prompt the second bridge receives
-    /// is counted in `requeued`.
+    /// Stands in for `grok agent --leader --leader-socket <sock> stdio`. On
+    /// the first bridge the leader restarts as hcom's batch goes out: the
+    /// bridge announces `x.ai/leader_reconnected`, and the old leader never
+    /// answers the prompt. With a `queued` flag file beside it, the batch
+    /// reached the new leader, listed behind a user turn and run only after
+    /// `DETACHED_WAIT`. Every prompt the second bridge receives is counted in
+    /// `requeued`.
     #[cfg(unix)]
     const FAKE_BRIDGE: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
-lock="${4%.sock}.lock"
 run=$(( $(cat "$dir/runs" 2>/dev/null || echo 0) + 1 ))
 echo "$run" > "$dir/runs"
-lost=
 while IFS= read -r line; do
-  [ -z "$lost" ] || continue
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*|*'"method":"session/load"'*)
@@ -2052,7 +1926,7 @@ while IFS= read -r line; do
           echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"user-1\",\"entries\":[{\"id\":\"$held\"}]}}"
           (sleep 4; echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"$held\",\"runningKind\":\"prompt\",\"entries\":[]}}") &
         else
-          # The reconnected leader's queue snapshot: the lost batch is not in it.
+          # The new leader's queue snapshot: the lost batch is not in it.
           echo '{"jsonrpc":"2.0","method":"_x.ai/queue/changed","params":{"sessionId":"s1","entries":[]}}'
         fi;;
       esac ;;
@@ -2062,8 +1936,7 @@ while IFS= read -r line; do
       prompt=$(printf '%s' "$line" | sed -n 's/.*"promptId":"\([^"]*\)".*/\1/p')
       if [ "$run" = 1 ]; then
         echo "$prompt" > "$dir/prompt"
-        [ -f "$dir/same_pid" ] || echo 2002 > "$lock"
-        lost=1
+        echo '{"jsonrpc":"2.0","method":"x.ai/leader_reconnected","params":{}}'
       else
         echo "$prompt" >> "$dir/requeued"
         echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"$prompt\",\"runningKind\":\"prompt\",\"entries\":[]}}"
@@ -2114,9 +1987,16 @@ done
         for flag in flags {
             std::fs::write(dir.path().join(flag), "").unwrap();
         }
-        let socket = dir.path().join("leader.sock");
-        std::fs::write(socket.with_extension("lock"), "1001\n").unwrap();
-        let launch = launch_at(&bridge.to_string_lossy(), &socket);
+        let launch = Launch {
+            command: bridge.to_string_lossy().into_owned(),
+            prefix: Vec::new(),
+            socket: dir
+                .path()
+                .join("leader.sock")
+                .to_string_lossy()
+                .into_owned(),
+            no_subagents: false,
+        };
 
         let running = Arc::new(AtomicBool::new(true));
         let watcher = {
@@ -2165,29 +2045,15 @@ done
         )
     }
 
-    /// Observed: the leader auto-updated and restarted while idle; the
-    /// bridge reconnected without a word and the batch queued during the gap
-    /// never reached Grok. With no response or queue event for it, the batch
-    /// stayed in flight, no later mail was queued, and unread climbed until
-    /// someone typed into the agent's terminal.
+    /// Observed: the leader auto-updated and restarted while idle, and the
+    /// batch queued across the restart was never answered. It stayed in
+    /// flight, no later mail was queued, and unread climbed until someone
+    /// typed into the agent's terminal.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn batch_lost_in_a_silent_leader_restart_is_queued_again() {
+    fn batch_lost_in_a_leader_restart_is_queued_again() {
         let (acked, runs, requeued) = deliver_across_restart(&[]);
-        assert!(acked, "the batch was never acked");
-        assert_eq!(runs, "2", "hcom should reconnect exactly once");
-        assert_eq!(requeued.len(), 1, "the lost batch is queued again once");
-    }
-
-    /// The lock can keep the same PID (a restart between checks, or a lost
-    /// write with no restart at all). The unanswered roster or load request
-    /// alone must still drop the connection and requeue the batch.
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn batch_lost_behind_unanswered_requests_is_queued_again() {
-        let (acked, runs, requeued) = deliver_across_restart(&["same_pid"]);
         assert!(acked, "the batch was never acked");
         assert_eq!(runs, "2", "hcom should reconnect exactly once");
         assert_eq!(requeued.len(), 1, "the lost batch is queued again once");
@@ -2203,10 +2069,6 @@ done
         let (acked, runs, requeued) = deliver_across_restart(&["queued"]);
         assert!(acked, "the batch was never acked");
         assert_eq!(runs, "2", "hcom should reconnect exactly once");
-        assert_eq!(
-            requeued,
-            Vec::<String>::new(),
-            "the queued batch was sent again"
-        );
+        assert!(requeued.is_empty(), "the queued batch was sent again");
     }
 }
