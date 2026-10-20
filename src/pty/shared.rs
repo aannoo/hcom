@@ -19,7 +19,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::db::HcomDb;
 use crate::delivery::{
-    APPROVAL_SCRAPE_CLEAR_MS, DeliveryState, ScreenState, ToolConfig, codex_composer_settled,
+    APPROVAL_SCRAPE_CLEAR_MS, DeliveryState, ScreenState, ToolConfig, approval_scrape_cleared,
     latch_scraped_approval, run_delivery_loop,
 };
 use crate::log::{log_error, log_info, log_warn};
@@ -182,31 +182,25 @@ pub(super) fn update_delivery_state(
         state.ready = screen.is_ready();
         // Cursor and Codex can briefly erase their approval surfaces during
         // redraws (Codex does this on focus changes). Latch positive detection
-        // until output settles so a partial frame cannot clear blocked status.
+        // until the scrape stays negative (or output goes quiet on a negative
+        // frame) so a partial frame cannot clear blocked status.
         let scrape_latched_tool = matches!(target.known_tool(), Some(Tool::Codex | Tool::Cursor));
         let scraped_approval = match target.known_tool() {
             Some(Tool::Codex) => screen.is_waiting_approval() || screen.is_codex_approval_visible(),
             Some(Tool::Cursor) => screen.is_cursor_approval_visible(),
             _ => false,
         };
-        // Codex draws its idle composer (empty, `? for shortcuts`) only when no
-        // approval or other modal holds the bottom pane. Seen for a while, that is
-        // evidence enough to trust a negative scrape: with /voice on, its meters
-        // keep output churning and the quiet-output test alone never clears.
         let now = Instant::now();
-        let input_text = screen.get_input_box_text(target.name());
-        let codex_composer =
-            matches!(target.known_tool(), Some(Tool::Codex)) && screen.is_codex_idle_composer();
-        state.codex_composer_since = if codex_composer {
-            Some(state.codex_composer_since.unwrap_or(now))
-        } else {
+        state.approval_scrape_negative_since = if scraped_approval {
             None
+        } else {
+            Some(state.approval_scrape_negative_since.unwrap_or(now))
         };
         state.approval_scrape_latched = latch_scraped_approval(
             state.approval_scrape_latched,
             scraped_approval,
             screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS)
-                || codex_composer_settled(state.codex_composer_since, now),
+                || approval_scrape_cleared(state.approval_scrape_negative_since, now),
         );
         let approval = (scrape_latched_tool && state.approval_scrape_latched)
             || (target.name() == "antigravity" && screen.is_antigravity_approval_visible());
@@ -214,6 +208,7 @@ pub(super) fn update_delivery_state(
             approval_changed = Some(approval);
         }
         state.approval = approval;
+        let input_text = screen.get_input_box_text(target.name());
         let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
         // Stamp submit-edge cooldown when input transitions from a known
         // non-empty value to empty or briefly undetected. Guards against
@@ -1948,132 +1943,61 @@ No session found matching 'never-saved'"
     }
 
     #[test]
-    fn codex_approval_clears_on_its_idle_composer_while_voice_meters_churn() {
-        // Observed: an answered approval stayed latched for almost two
-        // hours. Codex's /voice footer redraws its meters continuously, so output
-        // never stayed quiet for APPROVAL_SCRAPE_CLEAR_MS, and every idle-time
-        // message waited behind "Gate blocked: approval" until a manual inject.
+    fn approval_clears_while_output_keeps_churning() {
+        // Codex's /voice meters redraw continuously, so output is never quiet.
+        // An answered approval must still clear once the scrape stays negative.
         let target = PtyTarget::Known(Tool::Codex);
-        let patterns: Vec<String> = Tool::Codex
-            .ready_patterns()
-            .iter()
-            .map(|p| p.to_string())
-            .collect();
-        let mut screen = ScreenTracker::new_with_instance(24, 100, &patterns, None);
+        let mut screen = ScreenTracker::new_with_instance(24, 100, &[], None);
         let state = Arc::new(RwLock::new(ScreenState::default()));
         let launch = Arc::new(AtomicBool::new(false));
         let edges = std::cell::RefCell::new(Vec::new());
         let publish = |a: bool| edges.borrow_mut().push(a);
-        let idle = |screen: &mut ScreenTracker, level: char| {
-            screen.process(
-                format!(
-                    "\x1b[2J\x1b[H \x20voice \u{25cc} muted\r\n   mic {level}{level}{level}  codex \u{2581}\u{2581}\r\n\r\n\
-                     \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n\r\n  ? for shortcuts\r\n"
-                )
-                .as_bytes(),
-            )
-        };
-
-        screen.process(
-            "\u{203a} 1. Yes, proceed (y)\r\n  2. No (esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n".as_bytes(),
-        );
-        update_delivery_state(&state, &screen, &target, &launch, &publish);
-        assert!(
-            state.read().unwrap().approval,
-            "the dialog latches approval"
-        );
-
-        // Answered: the idle composer is back, but the meters keep redrawing.
-        idle(&mut screen, '\u{2581}');
-        update_delivery_state(&state, &screen, &target, &launch, &publish);
-        assert!(
-            state.read().unwrap().approval,
-            "a composer just drawn may be a passing redraw"
-        );
-
-        // Still churning, but the composer has stood for CODEX_COMPOSER_CLEAR_MS.
-        {
-            let mut s = state.write().unwrap();
-            s.codex_composer_since = Some(
-                Instant::now() - Duration::from_millis(crate::delivery::CODEX_COMPOSER_CLEAR_MS),
-            );
-        }
-        idle(&mut screen, '\u{2582}');
-        assert!(
-            !screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS),
-            "output is still churning"
-        );
-        update_delivery_state(&state, &screen, &target, &launch, &publish);
-        assert!(
-            !state.read().unwrap().approval,
-            "the idle composer clears the latch"
-        );
-        assert_eq!(*edges.borrow(), vec![true, false]);
-    }
-
-    #[test]
-    fn codex_interrupted_idle_composer_restarts_its_wait() {
-        // The idle composer must stand unbroken for CODEX_COMPOSER_CLEAR_MS: a
-        // draft or a dialog in between restarts the wait.
-        let target = PtyTarget::Known(Tool::Codex);
-        let patterns: Vec<String> = Tool::Codex
-            .ready_patterns()
-            .iter()
-            .map(|p| p.to_string())
-            .collect();
-        let mut screen = ScreenTracker::new_with_instance(24, 100, &patterns, None);
-        let state = Arc::new(RwLock::new(ScreenState::default()));
-        let launch = Arc::new(AtomicBool::new(false));
-        let publish = |_: bool| {};
         let dialog = "\x1b[2J\x1b[H\u{203a} 1. Yes, proceed (y)\r\n  2. No (esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n";
         let idle = |screen: &mut ScreenTracker, level: char| {
             screen.process(
                 format!(
-                    "\x1b[2J\x1b[H \x20voice \u{25cc} muted\r\n   mic {level}{level}{level}  codex \u{2581}\u{2581}\r\n\r\n\
-                     \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n\r\n  ? for shortcuts\r\n"
+                    "\x1b[2J\x1b[H voice \u{25cc} muted\r\n   mic {level}{level}{level}\r\n\r\n\u{203a} Ask Codex to do anything\r\n\r\n  ? for shortcuts\r\n"
                 )
                 .as_bytes(),
             )
         };
         let backdate = |state: &Arc<RwLock<ScreenState>>| {
             let mut s = state.write().unwrap();
-            assert!(s.codex_composer_since.is_some(), "the composer is timed");
-            s.codex_composer_since = Some(
-                Instant::now() - Duration::from_millis(crate::delivery::CODEX_COMPOSER_CLEAR_MS),
-            );
+            s.approval_scrape_negative_since =
+                Some(Instant::now() - Duration::from_millis(APPROVAL_SCRAPE_CLEAR_MS));
         };
 
         screen.process(dialog.as_bytes());
         update_delivery_state(&state, &screen, &target, &launch, &publish);
         assert!(state.read().unwrap().approval);
 
-        for interruption in [
-            "\x1b[2J\x1b[H \x20voice \u{25cc} muted\r\n\r\n\u{203a} half-typed draft\r\n\r\n  ? for shortcuts\r\n",
-            dialog,
-        ] {
-            idle(&mut screen, '\u{2581}');
-            update_delivery_state(&state, &screen, &target, &launch, &publish);
-            backdate(&state);
+        // A negative frame alone may be a partial redraw.
+        idle(&mut screen, '\u{2581}');
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert!(state.read().unwrap().approval);
 
-            screen.process(interruption.as_bytes());
-            update_delivery_state(&state, &screen, &target, &launch, &publish);
-            assert!(state.read().unwrap().codex_composer_since.is_none());
-            assert!(state.read().unwrap().approval);
+        // The dialog coming back restarts the wait.
+        backdate(&state);
+        screen.process(dialog.as_bytes());
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert!(
+            state
+                .read()
+                .unwrap()
+                .approval_scrape_negative_since
+                .is_none()
+        );
+        idle(&mut screen, '\u{2582}');
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert!(state.read().unwrap().approval);
 
-            // Shown again while the meters churn: the full wait starts over.
-            idle(&mut screen, '\u{2582}');
-            assert!(!screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS));
-            update_delivery_state(&state, &screen, &target, &launch, &publish);
-            assert!(
-                state.read().unwrap().approval,
-                "a composer back after an interruption waits again"
-            );
-        }
-
+        // Negative for the full wait while the meters still churn: clear.
         backdate(&state);
         idle(&mut screen, '\u{2583}');
+        assert!(!screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS));
         update_delivery_state(&state, &screen, &target, &launch, &publish);
         assert!(!state.read().unwrap().approval);
+        assert_eq!(*edges.borrow(), vec![true, false]);
     }
 
     #[test]

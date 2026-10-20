@@ -520,30 +520,6 @@ impl ScreenTracker {
                 && (visible.contains("yes") || visible.contains('❯')))
     }
 
-    /// Codex at rest: its composer is drawn and empty with the `? for shortcuts`
-    /// hint beside it, and no approval dialog is visible. Codex replaces that
-    /// composer and hint while an approval or other modal holds the bottom pane
-    /// (whose `›` option rows can still satisfy the ready pattern and the input
-    /// scrape), so this, not `is_ready()`, is the evidence that a dialog left.
-    ///
-    /// The prompt row must be drawn and the hint must sit below it: an empty
-    /// input scrape alone can come from the ready-pattern fallback with no
-    /// prompt row, and a hint line can linger in history above a modal.
-    pub fn is_codex_idle_composer(&self) -> bool {
-        let lines = self.get_screen_lines();
-        let Some(prompt_row) = lines.iter().rposition(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with('›') || trimmed.starts_with('»')
-        }) else {
-            return false;
-        };
-        self.get_codex_input_text().is_some_and(|t| t.is_empty())
-            && lines[prompt_row + 1..]
-                .iter()
-                .any(|line| line.trim_start().starts_with("? for shortcuts"))
-            && !self.is_codex_approval_visible()
-    }
-
     /// Antigravity-specific approval detection: the agy TUI renders permission
     /// prompts as plain text in the prompt area ("Requesting permission for: …",
     /// a per-kind question such as "Run this command?", a "1. Yes … 4. No" menu
@@ -1678,74 +1654,6 @@ mod tests {
         let mut t = make_tracker(24, 80, "");
         t.process(b"Run command\r\nAllow command?\r\nPress enter to confirm or esc to cancel\r\n");
         assert!(t.is_codex_approval_visible());
-    }
-
-    /// A real Codex screen (Codex 26.x, /voice on but muted, custom status
-    /// line), text anonymized: idle, nothing to approve, yet hcom had held its
-    /// approval latch for almost two hours.
-    fn idle_voice_screen() -> &'static str {
-        "\u{2022} Done: the change is in and the targeted tests pass.\r\n\r\n\
-         \x20voice \u{25cc} muted                                  \u{2303}x unmute   /voice stop\r\n\
-         \x20  mic \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2581}  codex \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\r\n\r\n\
-         \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n\r\n\
-         \x20 ~/src/project \u{b7} main \u{b7} gpt-model high \u{b7} Context 45% used\r\n\
-         \x20 ? for shortcuts                                  \u{26a0} 1 warning \u{b7} f2 to view\r\n"
-    }
-
-    #[test]
-    fn codex_idle_composer_on_an_idle_voice_screen() {
-        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
-        t.process(idle_voice_screen().as_bytes());
-        assert!(t.is_ready());
-        assert!(!t.is_codex_approval_visible());
-        assert!(t.is_codex_idle_composer());
-    }
-
-    #[test]
-    fn codex_idle_composer_needs_its_prompt_row_above_the_hint() {
-        // An unrecognized modal (no prompt row) whose breadcrumb contains `› `
-        // satisfies the ready pattern, so the input scrape falls back to an
-        // empty prompt; a `? for shortcuts` line quoted in history above it is
-        // not the composer's hint.
-        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
-        t.process(
-            "\u{2022} Press ? for shortcuts in the composer.\r\n\
-             \x20 ? for shortcuts\r\n\r\n\
-             \x20 Settings \u{203a} Model\r\n\r\n\
-             \x20   gpt-model high\r\n    gpt-model low\r\n"
-                .as_bytes(),
-        );
-        assert!(!t.is_codex_approval_visible());
-        assert_eq!(t.get_codex_input_text().as_deref(), Some(""));
-        assert!(!t.is_codex_idle_composer());
-    }
-
-    #[test]
-    fn codex_idle_composer_is_not_an_approval_dialog_or_a_draft() {
-        // History `›` rows and the dialog's own `›` option both satisfy Codex's
-        // ready pattern and the input scrape, but the dialog replaced the idle
-        // composer and its `? for shortcuts` hint.
-        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
-        t.process(
-            "\u{203a} Check the service once it is up\r\n\r\n\
-             \x20 Would you like to run the following command?\r\n\r\n  $ curl -s https://example.com/health\r\n\r\n\
-             \u{203a} 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\n\r\n\
-             \x20 Press enter to confirm or esc to cancel\r\n"
-                .as_bytes(),
-        );
-        assert!(
-            t.is_ready(),
-            "the `\u{203a}` rows satisfy the ready pattern"
-        );
-        assert!(t.is_codex_approval_visible());
-        assert!(!t.is_codex_idle_composer());
-
-        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
-        t.process("\u{203a} half-typed draft\r\n\r\n  ? for shortcuts\r\n".as_bytes());
-        assert!(
-            !t.is_codex_idle_composer(),
-            "a draft is not an idle composer"
-        );
     }
 
     #[test]
