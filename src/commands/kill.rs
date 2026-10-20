@@ -887,6 +887,7 @@ mod tests {
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
             wezterm_unix_socket: String::new(),
+            tmux: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,

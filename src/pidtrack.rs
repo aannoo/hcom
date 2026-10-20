@@ -34,7 +34,7 @@ pub struct PidEntry {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wezterm_unix_socket: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub tmux_socket_path: String,
+    pub tmux: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -64,6 +64,7 @@ pub struct OrphanProcess {
     pub zellij_session_name: String,
     pub herdr_socket_path: String,
     pub wezterm_unix_socket: String,
+    pub tmux: String,
     pub session_id: String,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -82,22 +83,7 @@ impl OrphanProcess {
             zellij_session_name: self.zellij_session_name.clone(),
             herdr_socket_path: self.herdr_socket_path.clone(),
             wezterm_unix_socket: self.wezterm_unix_socket.clone(),
-            tmux_socket_path: read_raw(&crate::paths::hcom_dir())
-                .get(&self.pid.to_string())
-                .map(|entry| entry.tmux_socket_path.clone())
-                .filter(|socket| !socket.is_empty())
-                .or_else(|| {
-                    self.names.iter().find_map(|name| {
-                        let socket = tmux_socket_path_for_instance(
-                            &crate::paths::hcom_dir(),
-                            name,
-                            self.pid,
-                            &self.process_id,
-                        );
-                        (!socket.is_empty()).then_some(socket)
-                    })
-                })
-                .unwrap_or_default(),
+            tmux: self.tmux.clone(),
         }
     }
 }
@@ -117,6 +103,7 @@ impl From<(u32, &PidEntry)> for OrphanProcess {
             zellij_session_name: entry.zellij_session_name.clone(),
             herdr_socket_path: entry.herdr_socket_path.clone(),
             wezterm_unix_socket: entry.wezterm_unix_socket.clone(),
+            tmux: entry.tmux.clone(),
             session_id: entry.session_id.clone(),
             notify_port: entry.notify_port,
             inject_port: entry.inject_port,
@@ -150,43 +137,6 @@ fn write_raw(hcom_dir: &Path, data: &HashMap<String, PidEntry>) {
     }
 }
 
-/// Read the owning pane's socket from the matching instance row. The PID or
-/// process identity must match so a reused instance name cannot supply a
-/// different process's terminal metadata.
-fn tmux_socket_path_for_instance(
-    hcom_dir: &Path,
-    name: &str,
-    pid: u32,
-    process_id: &str,
-) -> String {
-    let db_path = hcom_dir.join("hcom.db");
-    if !db_path.is_file() {
-        return String::new();
-    }
-    let Ok(db) = crate::db::HcomDb::open_at(&db_path) else {
-        return String::new();
-    };
-    let Ok(Some(row)) = db.get_instance_full(name) else {
-        return String::new();
-    };
-    let Some(context) = row.launch_context.as_deref() else {
-        return String::new();
-    };
-    let context_value: serde_json::Value =
-        serde_json::from_str(context).unwrap_or(serde_json::Value::Null);
-    let context_process_id = context_value
-        .get("process_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let identity_matches = !process_id.is_empty()
-        && context_process_id == process_id
-        && row.pid == Some(i64::from(pid));
-    if !identity_matches {
-        return String::new();
-    }
-    crate::terminal::resolve_terminal_info_from_launch_context(context).tmux_socket_path
-}
-
 /// Parameters for recording a launched process.
 #[derive(Debug)]
 pub struct PidRecord<'a> {
@@ -203,6 +153,7 @@ pub struct PidRecord<'a> {
     pub zellij_session_name: &'a str,
     pub herdr_socket_path: &'a str,
     pub wezterm_unix_socket: &'a str,
+    pub tmux: &'a str,
     pub session_id: &'a str,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -232,6 +183,7 @@ impl<'a> PidRecord<'a> {
             zellij_session_name: "",
             herdr_socket_path: "",
             wezterm_unix_socket: "",
+            tmux: "",
             session_id: "",
             notify_port: 0,
             inject_port: 0,
@@ -256,16 +208,12 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         zellij_session_name,
         herdr_socket_path,
         wezterm_unix_socket,
+        tmux,
         session_id,
         notify_port,
         inject_port,
         tag,
     } = rec;
-    let tmux_socket_path = if terminal_preset.starts_with("tmux") {
-        tmux_socket_path_for_instance(hcom_dir, name, *pid, process_id)
-    } else {
-        String::new()
-    };
     let mut data = read_raw(hcom_dir);
     let key = pid.to_string();
 
@@ -299,8 +247,8 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !wezterm_unix_socket.is_empty() && entry.wezterm_unix_socket.is_empty() {
             entry.wezterm_unix_socket = wezterm_unix_socket.to_string();
         }
-        if !tmux_socket_path.is_empty() && entry.tmux_socket_path.is_empty() {
-            entry.tmux_socket_path = tmux_socket_path.clone();
+        if !tmux.is_empty() && entry.tmux.is_empty() {
+            entry.tmux = tmux.to_string();
         }
         if !session_id.is_empty() && entry.session_id.is_empty() {
             entry.session_id = session_id.to_string();
@@ -330,7 +278,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 zellij_session_name: zellij_session_name.to_string(),
                 herdr_socket_path: herdr_socket_path.to_string(),
                 wezterm_unix_socket: wezterm_unix_socket.to_string(),
-                tmux_socket_path,
+                tmux: tmux.to_string(),
                 session_id: session_id.to_string(),
                 notify_port: *notify_port,
                 inject_port: *inject_port,
@@ -363,25 +311,8 @@ pub fn get_orphan_processes(
         }
     }
 
-    // Recover a socket recorded in the matching instance row when the early
-    // PID record was written before the terminal hook captured its context.
-    let mut changed = alive.len() != data.len();
-    for (pid_str, entry) in &mut alive {
-        if entry.tmux_socket_path.is_empty()
-            && entry.terminal_preset.starts_with("tmux")
-            && let Ok(pid) = pid_str.parse::<u32>()
-        {
-            for name in &entry.names {
-                let socket = tmux_socket_path_for_instance(hcom_dir, name, pid, &entry.process_id);
-                if !socket.is_empty() {
-                    entry.tmux_socket_path = socket;
-                    changed = true;
-                    break;
-                }
-            }
-        }
-    }
-    if changed {
+    // Write back pruned data if anything was removed
+    if alive.len() != data.len() {
         write_raw(hcom_dir, &alive);
     }
 
@@ -585,6 +516,7 @@ fn attach_runtime_state(
             ("ZELLIJ_SESSION_NAME", &orphan.zellij_session_name),
             ("HERDR_SOCKET_PATH", &orphan.herdr_socket_path),
             ("WEZTERM_UNIX_SOCKET", &orphan.wezterm_unix_socket),
+            ("TMUX", &orphan.tmux),
         ] {
             if value.is_empty() {
                 continue;
@@ -705,20 +637,6 @@ mod tests {
     #[test]
     fn test_record_and_read() {
         let dir = make_temp_dir();
-        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, created_at, pid, launch_context) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    "luna",
-                    "claude",
-                    1.0f64,
-                    12345i64,
-                    r#"{"process_id":"pid-1","tmux_socket_path":"/tmp/tmux-owner.sock"}"#
-                ],
-            )
-            .unwrap();
-        drop(db);
         record_pid(&PidRecord {
             hcom_dir: dir.path(),
             pid: 12345,
@@ -726,13 +644,14 @@ mod tests {
             name: "luna",
             directory: "/tmp",
             process_id: "pid-1",
-            terminal_preset: "tmux-split",
+            terminal_preset: "kitty",
             pane_id: "pane-1",
             terminal_id: "term-1",
             kitty_listen_on: "/tmp/kitty.sock",
             zellij_session_name: "wise-kangaroo",
             herdr_socket_path: "/run/herdr/sessions/work/herdr.sock",
             wezterm_unix_socket: "",
+            tmux: "/tmp/tmux-1000/default,4242,0",
             session_id: "sess-1",
             notify_port: 8080,
             inject_port: 8081,
@@ -745,7 +664,7 @@ mod tests {
         assert_eq!(entry.tool, "claude");
         assert_eq!(entry.names, vec!["luna"]);
         assert_eq!(entry.process_id, "pid-1");
-        assert_eq!(entry.terminal_preset, "tmux-split");
+        assert_eq!(entry.terminal_preset, "kitty");
         assert_eq!(entry.pane_id, "pane-1");
         assert_eq!(entry.terminal_id, "term-1");
         assert_eq!(entry.kitty_listen_on, "/tmp/kitty.sock");
@@ -757,58 +676,17 @@ mod tests {
         assert_eq!(entry.session_id, "sess-1");
         assert_eq!(entry.notify_port, 8080);
         assert_eq!(entry.inject_port, 8081);
-        assert_eq!(entry.tmux_socket_path, "/tmp/tmux-owner.sock");
 
-        // Orphan conversion preserves terminal metadata for pane cleanup.
+        // An orphan closes its pane on the herdr server that owns it.
         let orphan = OrphanProcess::from((12345, entry));
         let info = orphan.terminal_info();
-        assert_eq!(info.preset_name, "tmux-split");
+        assert_eq!(info.preset_name, "kitty");
         assert_eq!(info.pane_id, "pane-1");
         assert_eq!(
             info.herdr_socket_path,
             "/run/herdr/sessions/work/herdr.sock"
         );
-        assert_eq!(
-            tmux_socket_path_for_instance(dir.path(), "luna", 12345, "pid-1"),
-            "/tmp/tmux-owner.sock"
-        );
-        assert!(tmux_socket_path_for_instance(dir.path(), "luna", 12345, "pid-other").is_empty());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_orphan_terminal_info_uses_persisted_tmux_socket() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let db = crate::db::HcomDb::open().unwrap();
-        let pid = std::process::id();
-        let process_id = "tmux-owner-process";
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, created_at, pid, launch_context) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    "luna",
-                    "claude",
-                    1.0f64,
-                    i64::from(pid),
-                    r#"{"process_id":"tmux-owner-process","tmux_socket_path":"/tmp/tmux-owner.sock"}"#
-                ],
-            )
-            .unwrap();
-        drop(db);
-
-        record_pid(&PidRecord {
-            process_id,
-            terminal_preset: "tmux-split",
-            pane_id: "%1",
-            ..rec(&hcom_dir, pid, "claude", "luna")
-        });
-
-        let orphans = get_orphan_processes(&hcom_dir, None);
-        let orphan = orphans.iter().find(|orphan| orphan.pid == pid).unwrap();
-        assert_eq!(
-            orphan.terminal_info().tmux_socket_path,
-            "/tmp/tmux-owner.sock"
-        );
+        assert_eq!(info.tmux, "/tmp/tmux-1000/default,4242,0");
     }
 
     #[test]
@@ -949,6 +827,7 @@ mod tests {
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
             wezterm_unix_socket: String::new(),
+            tmux: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,
@@ -980,6 +859,7 @@ mod tests {
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
             wezterm_unix_socket: String::new(),
+            tmux: String::new(),
             session_id: "sess-retry".into(),
             notify_port: 0,
             inject_port: 0,

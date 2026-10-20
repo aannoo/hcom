@@ -1289,6 +1289,7 @@ fn stop_instance_inner(
                 let zellij_session_name = ti.zellij_session_name;
                 let herdr_socket_path = ti.herdr_socket_path;
                 let wezterm_unix_socket = ti.wezterm_unix_socket;
+                let tmux = ti.tmux;
                 // Fallback: process_bindings table
                 if proc_id.is_empty()
                     && let Ok(mut stmt) = db
@@ -1332,6 +1333,7 @@ fn stop_instance_inner(
                     zellij_session_name: &zellij_session_name,
                     herdr_socket_path: &herdr_socket_path,
                     wezterm_unix_socket: &wezterm_unix_socket,
+                    tmux: &tmux,
                     session_id: instance_data.session_id.as_deref().unwrap_or(""),
                     notify_port,
                     inject_port,

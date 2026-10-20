@@ -459,7 +459,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("tmux"),
                 None,
-                argv(&["tmux", "split-window", "-h", "{script}"]),
+                argv(&["tmux", "split-window", "-h", "bash", "{script}"]),
                 argv(&["tmux", "kill-pane", "-t", "{pane_id}"]),
                 Some("TMUX_PANE"),
                 DL,

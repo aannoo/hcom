@@ -112,72 +112,17 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     // not be overwritten with a stale pid_identity (or lose its identity).
     let result = db.with_write_scope(|| {
         let mut ctx = new_ctx;
-        if let Some(pos) = db.get_instance_full(instance_name)?
+        if !missing.is_empty()
+            && let Some(pos) = db.get_instance_full(instance_name)?
             && let Some(old_json) = &pos.launch_context
             && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
         {
-            if !missing.is_empty() {
-                for k in &missing {
-                    if let Some(val) = old_ctx.get(*k)
-                        && !launch_context_value_missing(Some(val))
-                    {
-                        ctx.insert(k.to_string(), val.clone());
-                    }
+            for k in &missing {
+                if let Some(val) = old_ctx.get(*k)
+                    && !launch_context_value_missing(Some(val))
+                {
+                    ctx.insert(k.to_string(), val.clone());
                 }
-            }
-
-            let old_process_id = old_ctx.get("process_id").and_then(|v| v.as_str());
-            let new_process_id = ctx.get("process_id").and_then(|v| v.as_str());
-            let old_socket = old_ctx
-                .get("tmux_socket_path")
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    let socket =
-                        crate::terminal::resolve_terminal_info_from_launch_context(old_json)
-                            .tmux_socket_path;
-                    (!socket.is_empty()).then_some(socket)
-                });
-
-            // Keep the socket captured for this process when later hooks run
-            // outside its tmux pane or inherit the caller's TMUX value.
-            if old_process_id.is_some() && old_process_id == new_process_id {
-                if let Some(old_socket) = old_socket {
-                    ctx.insert("tmux_socket_path".into(), serde_json::json!(old_socket));
-                    if let Some(old_tmux) = old_ctx
-                        .get("env")
-                        .and_then(|env| env.get("TMUX"))
-                        .filter(|value| !launch_context_value_missing(Some(value)))
-                    {
-                        let env = ctx.entry("env").or_insert_with(|| serde_json::json!({}));
-                        if !env.is_object() {
-                            *env = serde_json::json!({});
-                        }
-                        env["TMUX"] = old_tmux.clone();
-                    }
-                } else if let Some(env) = ctx.get_mut("env").and_then(|v| v.as_object_mut()) {
-                    // This process has no previously verified socket, so a
-                    // later hook's TMUX may belong to its caller. Refuse to
-                    // infer a pane owner from that value.
-                    env.remove("TMUX");
-                }
-            } else {
-                let current_json = serde_json::Value::Object(ctx.clone()).to_string();
-                let current_socket =
-                    crate::terminal::resolve_terminal_info_from_launch_context(&current_json)
-                        .tmux_socket_path;
-                if !current_socket.is_empty() {
-                    ctx.insert("tmux_socket_path".into(), serde_json::json!(current_socket));
-                }
-            }
-        } else {
-            let current_json = serde_json::Value::Object(ctx.clone()).to_string();
-            let current_socket =
-                crate::terminal::resolve_terminal_info_from_launch_context(&current_json)
-                    .tmux_socket_path;
-            if !current_socket.is_empty() {
-                ctx.insert("tmux_socket_path".into(), serde_json::json!(current_socket));
             }
         }
 
@@ -255,8 +200,8 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "GUAKE_TAB_UUID",
         "WT_SESSION",
         "ConEmuHWND",
-        "TMUX_PANE",
         "TMUX",
+        "TMUX_PANE",
         "STY",
         "ZELLIJ_SESSION_NAME",
         "ZELLIJ_PANE_ID",
@@ -1487,8 +1432,7 @@ mod tests {
     fn test_capture_and_store_launch_context_preserves_terminal_metadata() {
         // Preserve only the fields we can't recapture from hook env:
         // pane_id, terminal_id, kitty_listen_on, process_id, and the resolved
-        // terminal preset name. The owning tmux socket must also survive a
-        // later hook that runs with the caller's TMUX environment.
+        // terminal preset name.
         let (db, path) = setup_test_db();
         db.conn()
             .execute(
@@ -1497,26 +1441,25 @@ mod tests {
                     "luna",
                     "claude",
                     1.0f64,
-                    r#"{"terminal_preset_effective":"tmux-split","pane_id":"%1","process_id":"proc-1","pid_identity":"spawn-1","env":{"TMUX":"/tmp/tmux-owner.sock,123,0"}}"#
+                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1","pid_identity":"spawn-1"}"#
                 ],
             )
             .unwrap();
         let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "");
-        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "proc-1");
-        let _tmux = EnvVarGuard::set("TMUX", "/tmp/tmux-parent.sock,456,0");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
 
         capture_and_store_launch_context(&db, "luna");
 
         let row = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(row.terminal_preset_effective.as_deref(), Some("tmux-split"));
+        assert_eq!(row.terminal_preset_effective.as_deref(), Some("herdr"));
         let ctx: serde_json::Value =
             serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
         assert_eq!(
             ctx.get("terminal_preset_effective")
                 .and_then(|v| v.as_str()),
-            Some("tmux-split")
+            Some("herdr")
         );
-        assert_eq!(ctx.get("pane_id").and_then(|v| v.as_str()), Some("%1"));
+        assert_eq!(ctx.get("pane_id").and_then(|v| v.as_str()), Some("p_7"));
         assert_eq!(
             ctx.get("process_id").and_then(|v| v.as_str()),
             Some("proc-1")
@@ -1524,16 +1467,6 @@ mod tests {
         assert_eq!(
             ctx.get("pid_identity").and_then(|v| v.as_str()),
             Some("spawn-1")
-        );
-        assert_eq!(
-            ctx.get("env")
-                .and_then(|env| env.get("TMUX"))
-                .and_then(|v| v.as_str()),
-            Some("/tmp/tmux-owner.sock,123,0")
-        );
-        assert_eq!(
-            ctx.get("tmux_socket_path").and_then(|v| v.as_str()),
-            Some("/tmp/tmux-owner.sock")
         );
 
         cleanup(path);
