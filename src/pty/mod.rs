@@ -1007,6 +1007,16 @@ impl Proxy {
             if child_exited {
                 poll_timeout = poll_timeout.min(100);
             }
+            // A latched approval clears on a timer (`APPROVAL_SCRAPE_CLEAR_MS`),
+            // and once the dialog is gone the tool may go quiet. Wake to
+            // re-evaluate instead of holding delivery until the next 10s timeout.
+            if self
+                .delivery_state
+                .read()
+                .is_ok_and(|s| s.approval_scrape_latched)
+            {
+                poll_timeout = poll_timeout.min(crate::delivery::APPROVAL_SCRAPE_CLEAR_MS as u16);
+            }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
                     if !ready_signaled {

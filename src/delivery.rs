@@ -876,9 +876,11 @@ pub struct ScreenState {
     /// Latched Cursor/Codex approval signal. Their TUI redraws can briefly erase
     /// both the dialog and title, which would flicker `approval` false while the
     /// prompt is still up. Latch true on any positive detection and only clear
-    /// once output has settled. Antigravity keeps its immediate scrape.
-    /// See `APPROVAL_SCRAPE_CLEAR_MS`.
+    /// once the scrape has stayed negative. Antigravity keeps its immediate
+    /// scrape. See `APPROVAL_SCRAPE_CLEAR_MS`.
     pub approval_scrape_latched: bool,
+    /// When the approval scrape last turned negative (`None` while positive).
+    pub approval_scrape_negative_since: Option<Instant>,
     /// A Claude TUI overlay is focused whose input box is NOT the current
     /// session's root prompt — the subagent navigator (a human may be typing
     /// into a subagent's box) or the `←` session switcher (input box is a
@@ -913,6 +915,7 @@ impl Default for ScreenState {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            approval_scrape_negative_since: None,
             nav_overlay: false,
             leftover_wake: false,
             startup_loading: false,
@@ -935,22 +938,33 @@ pub(crate) fn pre_enter_settle(tool: &str) -> Option<Duration> {
     (tool == "qoder").then(|| Duration::from_millis(250))
 }
 
-/// How long screen output must be quiet before a negative approval scrape is
-/// trusted to clear the latched signal. Redraw bursts (cursor's approval prompt
-/// animating its selection / spinner) emit partial frames that scrape as "no
-/// approval"; requiring a settled screen before clearing keeps the latch up
-/// through the burst so the gate reports `approval`, not `prompt_has_text`.
+/// How long a negative approval scrape must hold before it clears the latched
+/// signal. Redraw bursts (cursor's approval prompt animating its selection /
+/// spinner, Codex on focus changes) emit partial frames that scrape as "no
+/// approval"; the next full frame shows the prompt again and restarts the wait,
+/// so the gate keeps reporting `approval`, not `prompt_has_text`.
+///
+/// The wait is measured on the scrape, not on quiet output: a TUI that never
+/// stops redrawing (Codex's /voice meters, an animated status line) would
+/// otherwise hold an answered approval forever.
 pub(crate) const APPROVAL_SCRAPE_CLEAR_MS: u64 = 400;
 
-/// Latch decision for screen-scraped approval (cursor). A partial-render frame
-/// mid-redraw scrapes as "no approval"; holding the previous latch through such
-/// transient false reads keeps the gate reporting `approval` instead of falling
-/// through to `prompt_has_text`. The latch only clears once `output_settled`
-/// (no redraw churn) confirms the prompt has genuinely left the screen.
-pub(crate) fn latch_scraped_approval(prev: bool, scraped: bool, output_settled: bool) -> bool {
+/// Whether a negative approval scrape has held for `APPROVAL_SCRAPE_CLEAR_MS`.
+pub(crate) fn approval_scrape_cleared(negative_since: Option<Instant>, now: Instant) -> bool {
+    negative_since.is_some_and(|t| {
+        now.saturating_duration_since(t) >= Duration::from_millis(APPROVAL_SCRAPE_CLEAR_MS)
+    })
+}
+
+/// Latch decision for screen-scraped approval (Cursor, Codex). A partial-render
+/// frame mid-redraw scrapes as "no approval"; holding the previous latch through
+/// such transient false reads keeps the gate reporting `approval` instead of
+/// falling through to `prompt_has_text`. The latch only clears once `settled`
+/// confirms the prompt has genuinely left the screen.
+pub(crate) fn latch_scraped_approval(prev: bool, scraped: bool, settled: bool) -> bool {
     if scraped {
         true
-    } else if output_settled {
+    } else if settled {
         false
     } else {
         prev
@@ -2853,6 +2867,7 @@ mod tests {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            approval_scrape_negative_since: None,
             nav_overlay: false,
             leftover_wake: false,
             startup_loading: false,
