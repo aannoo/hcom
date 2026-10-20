@@ -154,6 +154,31 @@ test('a dropped wake is reported as a failure, not a submission', async () => {
   expect(reports[0].includes('wake dropped: blocked by another plugin')).toBe(true)
 })
 
+test('polls keep observing until a finished wake is reported', async () => {
+  const h = harness()
+  const calls = [] as string[][]
+  let finishReport: Function
+  h.api.process.run = (argv: string[]) => {
+    calls.push(argv)
+    if (argv.includes('--event')) return new Promise(resolve => { finishReport = resolve }) as any
+    return Promise.resolve({ exitCode: 0, stdout: '{"wake":true}' }) as any
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await h.tick()
+  h.finishPrompt()
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  // The outcome report is still running: a poll now must not claim a wake.
+  await h.tick()
+  expect(calls.at(-1)!.includes('--observe')).toBe(true)
+  expect(h.prompts.length).toBe(1)
+  finishReport!({ exitCode: 0, stdout: '{"wake":false}' })
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  await h.tick()
+  expect(calls.at(-1)!.includes('--observe')).toBe(false)
+  expect(h.prompts.length).toBe(2)
+  h.finishPrompt()
+})
+
 test('a failed poll backs off instead of respawning every tick', async () => {
   const h = harness()
   let polls = 0

@@ -51,21 +51,23 @@ async function poll($) {
     if (currentGeneration !== generation || !state.wake || submitting) return;
     submitting = true;
     submittingSession = session;
-    // A queued submission must not block polling or a lifecycle hook.
+    // A queued submission must not block polling or a lifecycle hook. Polls
+    // only observe until its outcome is reported, so hcom judges the outcome
+    // against this wake's claim, never against a newer one.
     try {
       void $.prompt.submit({ text: '<hcom>', asUser: true }).then(
         async (result) => {
-          submitting = false;
-          // A hook may drop the wake; nothing was delivered, so it is a failure.
+          // A hook may drop the wake; hcom decides whether that was a failure.
           if (result?.drop) {
             await report($, session, 'submission-failed', 'wake dropped: ' + result.drop);
           } else {
             await report($, session, 'submitted', 'Claude completed the native wake submission');
           }
+          submitting = false;
         },
         async (error) => {
-          submitting = false;
           await report($, session, 'submission-failed', String(error));
+          submitting = false;
           $.ui.log('hcom mod wake failed; messages remain queued: ' + String(error));
         },
       );
