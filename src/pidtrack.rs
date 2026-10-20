@@ -98,7 +98,6 @@ impl OrphanProcess {
                     })
                 })
                 .unwrap_or_default(),
-            ..crate::terminal::TerminalInfo::default()
         }
     }
 }
