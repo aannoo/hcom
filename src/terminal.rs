@@ -106,8 +106,21 @@ fn is_tmux_command(argv: &[String]) -> bool {
 }
 
 fn has_tmux_server_selector(argv: &[String]) -> bool {
-    argv.iter()
-        .any(|arg| arg == "-S" || arg.starts_with("-S") || arg == "-L" || arg.starts_with("-L"))
+    let mut index = 1;
+    while let Some(arg) = argv.get(index) {
+        // Tmux server selectors are global options, so options after the
+        // subcommand cannot select the server used to reach that command.
+        if !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        match arg.as_str() {
+            "-S" | "-L" => return argv.get(index + 1).is_some(),
+            "-c" | "-f" | "-T" => index += 2,
+            _ if arg.starts_with("-S") || arg.starts_with("-L") => return true,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 fn tmux_close_has_server_identity(argv: &[String], socket_path: &str) -> bool {
@@ -3380,6 +3393,39 @@ mod tests {
 
         let explicit = argv(&["tmux", "-L", "custom", "kill-pane", "-t", "%0"]);
         assert!(tmux_close_has_server_identity(&explicit, ""));
+
+        let subcommand_selector = argv(&["tmux", "kill-pane", "-L", "custom", "-t", "%0"]);
+        assert!(!tmux_close_has_server_identity(&subcommand_selector, ""));
+
+        let selector_value = argv(&[
+            "tmux",
+            "-c",
+            "-Snot-a-selector",
+            "-f",
+            "-Lnot-a-server",
+            "-T",
+            "features",
+            "kill-pane",
+            "-t",
+            "%0",
+        ]);
+        assert!(!tmux_close_has_server_identity(&selector_value, ""));
+
+        let selector_after_values = argv(&[
+            "tmux",
+            "-c",
+            "shell",
+            "-f",
+            "/tmp/tmux.conf",
+            "-T",
+            "features",
+            "-S",
+            "/tmp/tmux-owner.sock",
+            "kill-pane",
+            "-t",
+            "%0",
+        ]);
+        assert!(tmux_close_has_server_identity(&selector_after_values, ""));
     }
 
     #[test]
