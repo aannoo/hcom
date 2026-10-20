@@ -23,8 +23,9 @@
 //!
 //! Grok uses our `promptId` as the queue entry id. The batch is acknowledged
 //! when Grok reports that entry running (`x.ai/queue/changed`), i.e. once it
-//! is part of the model's turn, or when the prompt request returns a result.
-//! A batch that never started (removed from the queue, transport lost) stays
+//! is part of the model's turn, when Grok injects it into the running turn
+//! (`x.ai/session/interjection`, follow-up behavior Steer), or when the prompt
+//! request returns a result. A batch that never started (removed from the queue, transport lost) stays
 //! unread and is queued again later: at-least-once, never silently dropped.
 
 use std::collections::{HashMap, HashSet};
@@ -739,17 +740,9 @@ struct InFlight {
     /// The session's `updates.jsonl`, checked before re-queueing.
     transcript: std::path::PathBuf,
     /// When Grok answered `removedFromQueue`: either removed, or merged into
-    /// the prompt ahead of it (which then runs its text), or injected by
-    /// steer. The confirming queue/update evidence may arrive later.
+    /// the prompt ahead of it (which then runs its text). Only a combined-turn
+    /// snapshot tells them apart, and it may arrive after the response.
     removed_at: Option<Instant>,
-    /// Live steer evidence, pending its removal response. A rewind invalidates
-    /// the cache until its marker is durable and the live branch is rechecked.
-    interjection: SteerEvidence,
-    /// Limit full transcript scans while the live evidence is pending.
-    transcript_check_at: Option<Instant>,
-    /// Keep tracking this batch during the existing re-queue pause: an
-    /// injection or its transcript can arrive after the merge wait.
-    requeue_pending: bool,
     /// When the ACP connection that queued it dropped. Grok keeps a queued
     /// prompt when its client disconnects, so the batch is followed through
     /// the reconnected client's queue snapshots, not treated as dropped.
@@ -758,7 +751,6 @@ struct InFlight {
 
 /// How long to wait after `removedFromQueue` for the snapshot showing a merge.
 const MERGE_EVIDENCE_WAIT: Duration = Duration::from_secs(2);
-const INTERJECTION_TRANSCRIPT_POLL: Duration = Duration::from_secs(1);
 /// How long a batch whose connection dropped waits for a queue snapshot
 /// before the transcript decides.
 const DETACHED_WAIT: Duration = Duration::from_secs(30);
@@ -769,102 +761,6 @@ enum Outcome {
     Delivered,
     /// Dropped before it ran: leave unread and queue again later.
     Dropped(String),
-}
-
-enum SteerEvidence {
-    Unseen,
-    Injected,
-    Rewound(Value),
-}
-
-/// Steer runs a queued prompt inside the current turn. Its display text is
-/// the original prompt, while content.text wraps it in Grok's instructions.
-fn is_interjection(params: &Value, flight: &InFlight) -> bool {
-    let update = &params["update"];
-    params["sessionId"].as_str() == Some(flight.session.as_str())
-        && update["sessionUpdate"] == "user_message_chunk"
-        && update["_meta"]["interjection"] == true
-        && update["content"]["type"] == "text"
-        && update["content"]["_meta"]["displayText"].as_str() == Some(flight.text.as_str())
-        && update["content"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains(&flight.text))
-}
-
-fn observe_interjection(method: &str, params: &Value, flight: &mut InFlight) {
-    if method == "session/update" && is_interjection(params, flight) {
-        flight.interjection = SteerEvidence::Injected;
-    } else if method == "x.ai/session/update"
-        && params["sessionId"].as_str() == Some(flight.session.as_str())
-        && params["update"]["sessionUpdate"] == "rewind_marker"
-    {
-        // A rewind can remove the injected turn before its file is flushed.
-        // Keep the exact marker, including its event metadata, so an older
-        // disk branch cannot restore the invalidated cache.
-        flight.interjection = SteerEvidence::Rewound(params.clone());
-        flight.transcript_check_at = None;
-    }
-}
-
-fn interjected_in_transcript(flight: &InFlight) -> bool {
-    let Ok(content) = std::fs::read_to_string(&flight.transcript) else {
-        return false;
-    };
-    if let SteerEvidence::Rewound(marker) = &flight.interjection
-        && !content.lines().any(|line| {
-            serde_json::from_str::<Value>(line).is_ok_and(|value| {
-                value["method"] == "_x.ai/session/update" && value["params"] == *marker
-            })
-        })
-    {
-        return false;
-    }
-    crate::transcript::grok::live_lines(&content)
-        .into_iter()
-        .rev()
-        .any(|line| {
-            serde_json::from_str::<Value>(line).is_ok_and(|value| {
-                value["method"] == "session/update" && is_interjection(&value["params"], flight)
-            })
-        })
-}
-
-fn interjection_outcome(flight: &mut InFlight, force_transcript: bool) -> Option<Outcome> {
-    // A detached request may have lost its removal response. Keep the
-    // original transcript recovery, but require the exact steer identity.
-    if flight.removed_at.is_none() && (flight.detached_at.is_none() || flight.request_id.is_some())
-    {
-        return None;
-    }
-    let injected =
-        if flight.removed_at.is_some() && matches!(flight.interjection, SteerEvidence::Injected) {
-            true
-        } else {
-            let now = Instant::now();
-            if !force_transcript && flight.transcript_check_at.is_some_and(|at| now < at) {
-                return None;
-            }
-            flight.transcript_check_at = Some(now + INTERJECTION_TRANSCRIPT_POLL);
-            interjected_in_transcript(flight)
-        };
-    injected.then_some(Outcome::Delivered)
-}
-
-/// The final transition out of the retry pause, evaluated at its deadline.
-fn expired_requeue_outcome(
-    flight: &mut InFlight,
-    deadline: Instant,
-    now: Instant,
-) -> Option<Outcome> {
-    if !flight.requeue_pending || now < deadline {
-        return None;
-    }
-    // Decide expiry and consume its last evidence in one transition. A
-    // deadline crossed after an earlier poll cannot reuse that cached miss.
-    Some(
-        interjection_outcome(flight, true)
-            .unwrap_or_else(|| Outcome::Dropped("removed from Grok's queue".into())),
-    )
 }
 
 /// What a queue snapshot proves about our prompt. Only identity counts: our
@@ -892,6 +788,15 @@ fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
     None
 }
 
+/// Whether an `x.ai/session/interjection` is our prompt. With follow-up
+/// behavior Steer, Grok moves a queued prompt into a running turn with the
+/// same owner, so only into a turn hcom started: it announces it under our
+/// prompt id, then answers the prompt `removedFromQueue`.
+fn interjected(params: &Value, flight: &InFlight) -> bool {
+    params["sessionId"].as_str() == Some(flight.session.as_str())
+        && params["interjectionId"].as_str() == Some(flight.prompt_id.as_str())
+}
+
 /// Whether the session transcript shows the prompt text as sent: durable
 /// proof it ran when the live evidence was lost (bridge disconnect, a merge
 /// snapshot that never arrived).
@@ -908,9 +813,6 @@ fn ran_in_transcript(path: &std::path::Path, text: &str) -> bool {
                 && serde_json::from_str::<Value>(line).is_ok_and(|value| {
                     let update = &value["params"]["update"];
                     update["sessionUpdate"] == "user_message_chunk"
-                        // A steer wrapper needs the stricter display-text
-                        // identity check above, not just a body substring.
-                        && update["_meta"]["interjection"] != true
                         && update["content"]["text"]
                             .as_str()
                             .is_some_and(|sent| sent.contains(text))
@@ -1223,14 +1125,16 @@ pub(super) fn run(
                     }
                 }
                 Event::Notification { method, params } => {
-                    if let Some(flight) = in_flight.as_mut() {
-                        observe_interjection(&method, &params, flight);
-                    }
                     if method == "x.ai/queue/changed"
                         && let Some(flight) = in_flight.as_ref()
                         && params["sessionId"].as_str() == Some(flight.session.as_str())
                     {
                         outcome = queue_outcome(&params, flight);
+                    }
+                    if method == "x.ai/session/interjection"
+                        && in_flight.as_ref().is_some_and(|f| interjected(&params, f))
+                    {
+                        outcome = Some(Outcome::Delivered);
                     }
                     effects.extend(tracker.on_notification(&method, &params));
                 }
@@ -1334,14 +1238,8 @@ pub(super) fn run(
             log_warn("native", "grok.acp.disconnected", &error);
         }
         if outcome.is_none()
-            && let Some(flight) = in_flight.as_mut()
-        {
-            outcome = interjection_outcome(flight, false);
-        }
-        if outcome.is_none()
             && in_flight
                 .as_ref()
-                .filter(|flight| !flight.requeue_pending)
                 .and_then(|flight| flight.removed_at)
                 .is_some_and(|at| at.elapsed() >= MERGE_EVIDENCE_WAIT)
         {
@@ -1350,7 +1248,6 @@ pub(super) fn run(
         if outcome.is_none()
             && in_flight
                 .as_ref()
-                .filter(|flight| !flight.requeue_pending)
                 .and_then(|flight| flight.detached_at)
                 .is_some_and(|at| at.elapsed() >= DETACHED_WAIT)
         {
@@ -1358,25 +1255,15 @@ pub(super) fn run(
                 "no queue evidence after reconnecting".into(),
             ));
         }
-        if matches!(outcome, Some(Outcome::Dropped(_)))
-            && let Some(flight) = in_flight.as_mut()
-            && (interjection_outcome(flight, false).is_some()
-                || ran_in_transcript(&flight.transcript, &flight.text))
-        {
-            outcome = Some(Outcome::Delivered);
-        }
-        // This is the only expiry decision. Do it after potentially slow
-        // transcript work, then apply its outcome without a second clock read.
-        let expired = in_flight
-            .as_mut()
-            .and_then(|flight| expired_requeue_outcome(flight, requeue_at, Instant::now()));
-        let requeue_expired = expired.is_some();
-        if outcome != Some(Outcome::Delivered) && expired.is_some() {
-            outcome = expired;
-        }
         if let Some(outcome) = outcome
-            && let Some(mut flight) = in_flight.take()
+            && let Some(flight) = in_flight.take()
         {
+            let outcome = match outcome {
+                Outcome::Dropped(_) if ran_in_transcript(&flight.transcript, &flight.text) => {
+                    Outcome::Delivered
+                }
+                other => other,
+            };
             match outcome {
                 Outcome::Delivered if flight.ack.instance_name != *current_name => {
                     // Queued under an identity a session switch retired: its
@@ -1404,21 +1291,12 @@ pub(super) fn run(
                 }
                 Outcome::Dropped(reason) => {
                     // Still unread; queue it again after a pause.
-                    if !flight.requeue_pending {
-                        requeue_at = Instant::now() + REQUEUE_DELAY;
-                    }
-                    if !requeue_expired
-                        && (flight.removed_at.is_some() || flight.detached_at.is_some())
-                    {
-                        flight.requeue_pending = true;
-                        in_flight = Some(flight);
-                    } else {
-                        log_warn(
-                            "native",
-                            "grok.acp.requeue",
-                            &format!("prompt={} {reason}; kept unread", flight.prompt_id),
-                        );
-                    }
+                    requeue_at = Instant::now() + REQUEUE_DELAY;
+                    log_warn(
+                        "native",
+                        "grok.acp.requeue",
+                        &format!("prompt={} {reason}; kept unread", flight.prompt_id),
+                    );
                 }
             }
         }
@@ -1502,9 +1380,6 @@ pub(super) fn run(
                         text: prepared.formatted,
                         ack: prepared.ack,
                         removed_at: None,
-                        interjection: SteerEvidence::Unseen,
-                        transcript_check_at: None,
-                        requeue_pending: false,
                         detached_at: None,
                     });
                 }
@@ -1527,360 +1402,6 @@ mod tests {
 
     const BATCH: &str = "<hcom>[request #7] luna → nova: hi</hcom>";
 
-    // Synthetic packet shaped like an observed Grok steer injection. The
-    // original session/prompt response was not captured; removal responses
-    // below are inferred fixtures, not original-response replays.
-    const STEER_INJECTION_FIXTURE: &str = r#"{"timestamp":1000,"method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"The user sent a message while you were working:\n<user_query>\n<hcom>[request #7] luna → nova: Please continue the current task and acknowledge this message.</hcom>\n</user_query>\nIf the user is asking for a response, address the user first. After replying, complete any unfinished tasks from previous turns.","_meta":{"displayText":"<hcom>[request #7] luna → nova: Please continue the current task and acknowledge this message.</hcom>"}},"_meta":{"modelId":"grok-4.7-build-fast","interjection":true}},"_meta":{"eventId":"fixture-session-injection","agentTimestampMs":1000000}}}"#;
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn steer_removed_batch_is_not_requeued_when_injection_arrives_late() {
-        exercise_removed_steer_fixture(true, None, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn removed_without_injection_still_requeues_and_stays_unread() {
-        exercise_removed_steer_fixture(false, None, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn rewind_preserving_earlier_steer_does_not_requeue() {
-        exercise_removed_steer_fixture(true, Some((1, 0)), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn rewind_before_disk_rechecks_preserved_steer() {
-        exercise_removed_steer_fixture(true, Some((1, 3)), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn rewind_before_disk_removing_steer_stays_unread() {
-        exercise_removed_steer_fixture(true, Some((0, 3)), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn reconnect_with_lost_response_acknowledges_durable_steer() {
-        exercise_removed_steer_fixture(true, None, 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn reconnect_repeated_missing_snapshots_do_not_extend_retry_pause() {
-        exercise_removed_steer_fixture(false, None, 2);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn reconnect_lost_response_tracks_injection_written_during_retry_pause() {
-        exercise_removed_steer_fixture(true, None, 3);
-    }
-
-    #[cfg(unix)]
-    fn exercise_removed_steer_fixture(inject: bool, rewind: Option<(u64, u64)>, reconnect: u8) {
-        // Exercise the production run/Client/ACK path against fixture ACP,
-        // including an injection after the original two-second decision.
-        let (_home_dir, _hcom, home, _env) = crate::hooks::test_helpers::isolated_test_env();
-        // EnvGuard does not manage GROK_HOME. Restore this override before
-        // releasing its environment lock, including during an assertion unwind.
-        struct GrokHome(Option<std::ffi::OsString>);
-        impl Drop for GrokHome {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.0 {
-                        Some(value) => std::env::set_var("GROK_HOME", value),
-                        None => std::env::remove_var("GROK_HOME"),
-                    }
-                }
-            }
-        }
-        let _grok_home = GrokHome(std::env::var_os("GROK_HOME"));
-        unsafe { std::env::set_var("GROK_HOME", home.join(".grok")) };
-        let dir = tempfile::tempdir().unwrap();
-        let capture = dir.path().join("prompts.jsonl");
-        let script = dir.path().join("acp.sh");
-        std::fs::write(&script, r#"capture=$1
-roster=$2
-queue=$3
-injection=$4
-rewind=$5
-later=$6
-transcript=$7
-disk_delay=$8
-reconnect=$9
-while IFS= read -r line; do
-    id=${line#*'"id":'}
-    id=${id%%,*}
-    case "$line" in
-        *'"method":"initialize"'*)
-            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-        *'"method":"_x.ai/sessions/list"'*)
-            printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$roster"
-            if [ "$reconnect" != 0 ] && [ -f "$capture" ]; then
-                # Keep reporting the absent entry; each snapshot must not
-                # restart the retry pause. The hint keeps roster polls fast.
-                printf '%s\n' "$queue"
-                printf '{"method":"_x.ai/models/update","params":{}}\n'
-            fi ;;
-        *'"method":"session/load"'*)
-            printf '%s\n' "$queue"
-            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
-            if [ "$reconnect" = 3 ] && [ -f "$capture" ] && [ "$sent" != yes ]; then
-                # The missing snapshot reaches run before the injection is
-                # durable. There is no session/prompt response to rescue it.
-                sleep 3
-                printf '%s\n' "$injection" > "$transcript"
-                sent=yes
-            fi ;;
-        *'"method":"session/prompt"'*)
-            first=no
-            if [ ! -f "$capture" ]; then first=yes; fi
-            printf '%s\n' "$line" >> "$capture"
-            if [ "$reconnect" != 0 ] && [ "$first" = yes ]; then
-                if [ "$injection" != '{}' ] && [ "$reconnect" != 3 ]; then printf '%s\n' "$injection" > "$transcript"; fi
-                if [ "$reconnect" = 2 ]; then
-                    # INFERRED response, not a captured production packet.
-                    printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{"completionKind":"removedFromQueue"}}}\n' "$id"
-                fi
-                exit 0
-            fi
-            if [ "$rewind" != '{}' ] && [ "$sent" != yes ]; then
-                # Inject prompt 0, then rewind only the later prompt 1 (or
-                # delete prompt 0 for the negative). The response is inferred.
-                printf '%s\n%s\n' "$injection" "$later" > "$transcript"
-                printf '%s\n%s\n%s\n' "$injection" "$later" "$rewind"
-                if [ "$disk_delay" = 0 ]; then printf '%s\n' "$rewind" >> "$transcript"; fi
-                printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{"completionKind":"removedFromQueue"}}}\n' "$id"
-                if [ "$disk_delay" != 0 ]; then
-                    sleep "$disk_delay"
-                    printf '%s\n' "$rewind" >> "$transcript"
-                fi
-                sent=yes
-            else
-                # INFERRED response, not a captured production packet.
-                printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{"completionKind":"removedFromQueue"}}}\n' "$id"
-            fi
-            if [ "$rewind" = '{}' ] && [ "$sent" != yes ]; then
-                sleep 3
-                printf '%s\n' "$injection"
-                sent=yes
-            fi ;;
-    esac
-done
-"#).unwrap();
-        let injected: Value = serde_json::from_str(STEER_INJECTION_FIXTURE).unwrap();
-        let session = injected["params"]["sessionId"].as_str().unwrap();
-        let exact = injected["params"]["update"]["content"]["_meta"]["displayText"]
-            .as_str()
-            .unwrap();
-        let text = exact
-            .strip_prefix("<hcom>[request #7] luna → nova: ")
-            .unwrap()
-            .strip_suffix("</hcom>")
-            .unwrap();
-        let cwd = dir.path().to_str().unwrap();
-        let transcript = crate::transcript::grok::session_transcript_path(cwd, session);
-        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        // Synthetic later-turn/rewind and response fixtures. The injection
-        // has the shape observed in a real steer delivery.
-        let marker = rewind.map(|(target, _)| {
-            json!({
-            "method": "_x.ai/session/update", "params": {
-                "sessionId": session, "update": {"sessionUpdate": "rewind_marker",
-                    "target_prompt_index": target},
-                "_meta": {"eventId": "fixture-rewind-500"}}})
-        });
-        let later = json!({"method": "session/update", "params": {
-            "sessionId": session, "update": {"sessionUpdate": "user_message_chunk",
-                "content": {"type": "text", "text": "later prompt"},
-                "_meta": {"promptIndex": 1}}}});
-        let roster = json!({"sessions": [{"sessionId": session, "cwd": cwd,
-            "activity": "idle", "resident": true, "lastActivityAt": 1}]});
-        let queue = json!({"method": "_x.ai/queue/changed", "params": {
-            "sessionId": session, "runningPromptId": "user-turn", "entries": []}});
-        let launch = Launch::new(
-            "/bin/sh",
-            &[
-                script.to_string_lossy().into_owned(),
-                capture.to_string_lossy().into_owned(),
-                roster.to_string(),
-                queue.to_string(),
-                if inject {
-                    STEER_INJECTION_FIXTURE
-                } else {
-                    "{}"
-                }
-                .to_string(),
-                marker
-                    .as_ref()
-                    .map_or_else(|| "{}".into(), Value::to_string),
-                later.to_string(),
-                transcript.to_string_lossy().into_owned(),
-                rewind.map_or(0, |(_, delay)| delay).to_string(),
-                reconnect.to_string(),
-            ],
-            &[],
-        )
-        .unwrap();
-        let mut db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
-        db.init_db().unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, session_id, directory, status, created_at)
-             VALUES ('nova', 'grok', ?1, ?2, 'listening', 0)",
-                rusqlite::params![session, cwd],
-            )
-            .unwrap();
-        db.set_session_binding(session, "nova").unwrap();
-        db.set_process_binding("fixture-process", session, "nova")
-            .unwrap();
-        let event = db
-            .insert_event_row(
-                "message",
-                "luna",
-                &json!({
-            "from": "luna", "text": text, "intent": "request", "scope": "mentions",
-            "mentions": ["nova"], "delivered_to": ["nova"]}),
-                None,
-            )
-            .unwrap();
-        db.conn()
-            .execute("UPDATE events SET id=7 WHERE id=?1", [event])
-            .unwrap();
-        // Consume the first-receipt tip, so the next production batch is
-        // byte-for-byte identical to the synthetic displayText.
-        common::prepare_pending_messages(&db, "nova").unwrap();
-        assert_eq!(
-            common::prepare_pending_messages(&db, "nova")
-                .unwrap()
-                .formatted,
-            exact
-        );
-        let running = Arc::new(AtomicBool::new(true));
-        let stop = Arc::clone(&running);
-        let delivered = inject && rewind.is_none_or(|(target, _)| target == 1);
-        let check_stale_file = rewind.is_some_and(|(_, delay)| delay > 0);
-        let test_db = dir.path().join("test.db");
-        let observed_capture = capture.clone();
-        let observer = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(22);
-            let mut first_prompt = None;
-            let mut early_cursor = None;
-            let mut covered_retry_window = false;
-            loop {
-                let prompts = std::fs::read_to_string(&observed_capture)
-                    .map_or(0, |content| content.lines().count());
-                if prompts > 0 {
-                    let first = *first_prompt.get_or_insert_with(Instant::now);
-                    if check_stale_file
-                        && early_cursor.is_none()
-                        && first.elapsed() >= Duration::from_secs(2)
-                    {
-                        let conn = rusqlite::Connection::open_with_flags(
-                            &test_db,
-                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                        )
-                        .unwrap();
-                        early_cursor = Some(
-                            conn.query_row(
-                                "SELECT last_event_id FROM instances WHERE name='nova'",
-                                [],
-                                |row| row.get::<_, i64>(0),
-                            )
-                            .unwrap(),
-                        );
-                    }
-                    // Delivered cases must survive a complete retry period
-                    // measured from submission, not from thread startup.
-                    if !delivered && prompts >= 2 {
-                        break;
-                    }
-                    if first.elapsed()
-                        >= MERGE_EVIDENCE_WAIT + REQUEUE_DELAY + Duration::from_secs(2)
-                    {
-                        covered_retry_window = true;
-                        break;
-                    }
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            stop.store(false, Ordering::Release);
-            (early_cursor, covered_retry_window)
-        });
-        let state = DeliveryState {
-            screen: Arc::new(RwLock::new(super::super::ScreenState {
-                ready: true,
-                input_text: Some("PRIVATE_DRAFT".into()),
-                prompt_empty: false,
-                ..Default::default()
-            })),
-            grok_acp: None,
-            launch_phase_active: Arc::new(AtomicBool::new(false)),
-            inject_port: 0,
-            user_activity_cooldown_ms: 0,
-        };
-        let notify = NotifyServer::new().unwrap();
-        let mut name = "nova".to_string();
-        run(
-            &launch,
-            &running,
-            &mut db,
-            &notify,
-            &state,
-            "fixture-process",
-            &mut name,
-            &ToolConfig::for_tool(crate::tool::Tool::Grok),
-            &None,
-            &None,
-            &None,
-            &mut super::super::host_label::HostLabel::resolve(),
-            &mut LaunchOutcome::Ready,
-        );
-        let (early_cursor, covered_retry_window) = observer.join().unwrap();
-        assert!(
-            !delivered || covered_retry_window,
-            "the deadline expired before a complete post-submission retry window"
-        );
-        if let Some(early_cursor) = early_cursor {
-            assert_eq!(
-                early_cursor, 0,
-                "a live rewind must veto the not-yet-updated disk branch"
-            );
-        }
-        let packets: Vec<Value> = std::fs::read_to_string(&capture)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        eprintln!(
-            "late steer: prompts={} cursor={}",
-            packets.len(),
-            db.get_cursor("nova")
-        );
-        assert_eq!(packets.len(), if delivered { 1 } else { 2 });
-        assert_eq!(packets[0]["params"]["_meta"]["sendNow"], false);
-        assert_eq!(db.get_cursor("nova"), if delivered { 7 } else { 0 });
-        assert_eq!(
-            state.screen.read().unwrap().input_text.as_deref(),
-            Some("PRIVATE_DRAFT")
-        );
-    }
-
     fn flight(removed: bool) -> InFlight {
         InFlight {
             request_id: Some(4),
@@ -1897,314 +1418,8 @@ done
                 mark_announced: false,
             },
             removed_at: removed.then(Instant::now),
-            interjection: SteerEvidence::Unseen,
-            transcript_check_at: None,
-            requeue_pending: false,
             detached_at: None,
         }
-    }
-
-    fn steer_flight(removed: bool) -> (InFlight, Value) {
-        let injection: Value = serde_json::from_str(STEER_INJECTION_FIXTURE).unwrap();
-        let mut flight = flight(removed);
-        flight.session = injection["params"]["sessionId"].as_str().unwrap().into();
-        flight.text = injection["params"]["update"]["content"]["_meta"]["displayText"]
-            .as_str()
-            .unwrap()
-            .into();
-        (flight, injection)
-    }
-
-    #[test]
-    fn steer_injection_and_inferred_removal_can_arrive_in_either_order() {
-        // Removal is inferred from the observed requeue branch; its original
-        // response was not captured. The notification shape is synthetic.
-        let inferred = json!({"id": 4, "result": {
-            "_meta": {"completionKind": "removedFromQueue"}}});
-        for inject_first in [false, true] {
-            let (mut flight, injection) = steer_flight(false);
-            if inject_first {
-                observe_interjection("session/update", &injection["params"], &mut flight);
-                assert_eq!(
-                    interjection_outcome(&mut flight, true),
-                    None,
-                    "injection alone cannot claim a batch"
-                );
-            }
-            assert_eq!(response_outcome(&inferred), None);
-            flight.removed_at = Some(Instant::now());
-            if !inject_first {
-                assert_eq!(
-                    interjection_outcome(&mut flight, true),
-                    None,
-                    "manual queue removal stays unread"
-                );
-                observe_interjection("session/update", &injection["params"], &mut flight);
-            }
-            assert_eq!(
-                interjection_outcome(&mut flight, true),
-                Some(Outcome::Delivered)
-            );
-        }
-    }
-
-    #[test]
-    fn steer_evidence_requires_the_exact_batch_session_and_user_injection() {
-        let (flight, injection) = steer_flight(true);
-        assert!(is_interjection(&injection["params"], &flight));
-        let variants = [
-            ("/params/sessionId", json!("another-session")),
-            ("/params/update/sessionUpdate", json!("agent_message_chunk")),
-            ("/params/update/_meta/interjection", json!(false)),
-            ("/params/update/content/type", json!("image")),
-            ("/params/update/content/text", json!("different body")),
-            (
-                "/params/update/content/_meta/displayText",
-                json!(format!("{} ", flight.text)),
-            ),
-            (
-                "/params/update/content/_meta/displayText",
-                json!("partial batch text"),
-            ),
-        ];
-        for (pointer, replacement) in variants {
-            let mut wrong = injection.clone();
-            *wrong.pointer_mut(pointer).unwrap() = replacement;
-            let mut pending = steer_flight(true).0;
-            observe_interjection("session/update", &wrong["params"], &mut pending);
-            assert_eq!(interjection_outcome(&mut pending, true), None, "{pointer}");
-        }
-        let mut wrong_method = steer_flight(true).0;
-        observe_interjection(
-            "x.ai/session_notification",
-            &injection["params"],
-            &mut wrong_method,
-        );
-        assert_eq!(interjection_outcome(&mut wrong_method, true), None);
-    }
-
-    #[test]
-    fn retry_expiry_forces_strict_evidence_after_an_earlier_cached_miss() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut flight, injection) = steer_flight(true);
-        flight.transcript = dir.path().join("updates.jsonl");
-        flight.requeue_pending = true;
-        assert_eq!(interjection_outcome(&mut flight, false), None);
-        std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        assert_eq!(
-            expired_requeue_outcome(&mut flight, deadline, deadline - Duration::from_nanos(1)),
-            None
-        );
-        // A scheduler pause crosses the deadline after the earlier poll.
-        // Explicit times make the boundary deterministic; no sleep race.
-        assert_eq!(
-            expired_requeue_outcome(&mut flight, deadline, deadline),
-            Some(Outcome::Delivered)
-        );
-        let marker = json!({"method":"_x.ai/session/update", "params": {
-            "sessionId":flight.session, "update":{"sessionUpdate":"rewind_marker",
-                "target_prompt_index":0}, "_meta":{"eventId":"expiry-rewind"}}});
-        observe_interjection("x.ai/session/update", &marker["params"], &mut flight);
-        assert!(
-            matches!(
-                expired_requeue_outcome(&mut flight, deadline, deadline),
-                Some(Outcome::Dropped(_))
-            ),
-            "expiry must not accept the stale branch before rewind is durable"
-        );
-        std::fs::write(&flight.transcript, format!("{injection}\n{marker}\n")).unwrap();
-        assert!(
-            matches!(
-                expired_requeue_outcome(&mut flight, deadline, deadline),
-                Some(Outcome::Dropped(_))
-            ),
-            "expiry must not accept an injection removed by rewind"
-        );
-    }
-
-    #[test]
-    fn detached_lost_response_requires_strict_durable_injection() {
-        let dir = tempfile::tempdir().unwrap();
-        for invalid in [
-            None,
-            Some("/params/sessionId"),
-            Some("/params/update/content/_meta/displayText"),
-        ] {
-            let (mut flight, mut injection) = steer_flight(false);
-            flight.transcript = dir.path().join("updates.jsonl");
-            observe_interjection("session/update", &injection["params"], &mut flight);
-            assert_eq!(
-                interjection_outcome(&mut flight, true),
-                None,
-                "a connected request still needs its removal response"
-            );
-            flight.detached_at = Some(Instant::now());
-            assert_eq!(
-                interjection_outcome(&mut flight, true),
-                None,
-                "the old request id has not been detached yet"
-            );
-            flight.request_id = None;
-            assert_eq!(
-                interjection_outcome(&mut flight, true),
-                None,
-                "a cached live injection alone cannot replace the lost response"
-            );
-            if let Some(pointer) = invalid {
-                *injection.pointer_mut(pointer).unwrap() = json!("wrong identity");
-            }
-            std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
-            assert_eq!(
-                interjection_outcome(&mut flight, true),
-                invalid.is_none().then_some(Outcome::Delivered)
-            );
-            std::fs::remove_file(&flight.transcript).unwrap();
-        }
-    }
-
-    #[test]
-    fn rewind_invalidates_the_transcript_poll_deadline() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut flight, injection) = steer_flight(true);
-        flight.transcript = dir.path().join("updates.jsonl");
-        assert_eq!(interjection_outcome(&mut flight, false), None);
-        let later = json!({"method":"session/update", "params": {
-            "sessionId": flight.session, "update": {"sessionUpdate":"user_message_chunk",
-                "content":{"type":"text","text":"later"}, "_meta":{"promptIndex":1}}}});
-        let marker = json!({"method":"_x.ai/session/update", "params": {
-            "sessionId":flight.session, "update":{"sessionUpdate":"rewind_marker",
-                "target_prompt_index":1}, "_meta":{"eventId":"new-rewind"}}});
-        std::fs::write(
-            &flight.transcript,
-            format!("{injection}\n{later}\n{marker}\n"),
-        )
-        .unwrap();
-        observe_interjection("x.ai/session/update", &marker["params"], &mut flight);
-        assert_eq!(
-            interjection_outcome(&mut flight, false),
-            Some(Outcome::Delivered),
-            "a new rewind must invalidate a cached miss immediately"
-        );
-    }
-
-    #[test]
-    fn interjection_transcript_checks_are_throttled_between_polls() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut flight, injection) = steer_flight(true);
-        flight.transcript = dir.path().join("updates.jsonl");
-        assert_eq!(interjection_outcome(&mut flight, false), None);
-        std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
-        assert_eq!(
-            interjection_outcome(&mut flight, false),
-            None,
-            "a second poll must not rescan the transcript within one second"
-        );
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            Some(Outcome::Delivered),
-            "the last check before retry must bypass a cached miss"
-        );
-    }
-
-    #[test]
-    fn late_steer_transcript_evidence_is_consumed_only_on_its_live_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut flight, injection) = steer_flight(true);
-        flight.transcript = dir.path().join("updates.jsonl");
-        flight.removed_at = Some(Instant::now() - MERGE_EVIDENCE_WAIT);
-        flight.requeue_pending = true;
-        assert_eq!(interjection_outcome(&mut flight, true), None);
-        std::fs::write(&flight.transcript, format!("{injection}\n")).unwrap();
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            Some(Outcome::Delivered)
-        );
-        // Generic substring proof must not bypass the strict steer check.
-        assert!(!ran_in_transcript(&flight.transcript, &flight.text));
-        let rewind = json!({"method": "_x.ai/session/update", "params": {
-            "sessionId": flight.session, "update": {
-                "sessionUpdate": "rewind_marker", "target_prompt_index": 0}}});
-        observe_interjection("session/update", &injection["params"], &mut flight);
-        observe_interjection("x.ai/session/update", &rewind["params"], &mut flight);
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            None,
-            "a live rewind vetoes a stale file"
-        );
-        std::fs::write(&flight.transcript, format!("{injection}\n{rewind}\n")).unwrap();
-        flight.interjection = SteerEvidence::Unseen;
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            None,
-            "rewound injection is not delivery evidence"
-        );
-        for (pointer, replacement) in [
-            ("/params/sessionId", json!("another-session")),
-            ("/params/update/content/text", json!("different body")),
-            (
-                "/params/update/content/_meta/displayText",
-                json!(format!("{} ", flight.text)),
-            ),
-            ("/params/update/sessionUpdate", json!("agent_message_chunk")),
-        ] {
-            let mut wrong = injection.clone();
-            *wrong.pointer_mut(pointer).unwrap() = replacement;
-            std::fs::write(&flight.transcript, format!("{wrong}\n")).unwrap();
-            assert_eq!(interjection_outcome(&mut flight, true), None, "{pointer}");
-            assert!(!ran_in_transcript(&flight.transcript, &flight.text));
-        }
-    }
-
-    #[test]
-    fn matching_rewind_must_be_durable_before_rechecking_the_surviving_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut flight, injection) = steer_flight(true);
-        flight.transcript = dir.path().join("updates.jsonl");
-        let later = json!({"method": "session/update", "params": {
-            "sessionId": flight.session, "update": {"sessionUpdate": "user_message_chunk",
-                "content": {"type": "text", "text": "later"}, "_meta": {"promptIndex": 1}}}});
-        let marker = json!({"method": "_x.ai/session/update", "params": {
-            "sessionId": flight.session, "update": {"sessionUpdate": "rewind_marker",
-                "target_prompt_index": 1}, "_meta": {"eventId": "rewind-current"}}});
-        let mut older = marker.clone();
-        older["params"]["_meta"]["eventId"] = json!("rewind-older");
-        observe_interjection("session/update", &injection["params"], &mut flight);
-        observe_interjection("x.ai/session/update", &marker["params"], &mut flight);
-        std::fs::write(
-            &flight.transcript,
-            format!("{injection}\n{later}\n{older}\n"),
-        )
-        .unwrap();
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            None,
-            "an older rewind cannot unlock the stale file"
-        );
-        std::fs::write(
-            &flight.transcript,
-            format!("{injection}\n{later}\n{marker}\n"),
-        )
-        .unwrap();
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            Some(Outcome::Delivered)
-        );
-        let mut deleting = marker.clone();
-        deleting["params"]["update"]["target_prompt_index"] = json!(0);
-        deleting["params"]["_meta"]["eventId"] = json!("rewind-delete");
-        observe_interjection("x.ai/session/update", &deleting["params"], &mut flight);
-        assert_eq!(interjection_outcome(&mut flight, true), None);
-        std::fs::write(
-            &flight.transcript,
-            format!("{injection}\n{later}\n{marker}\n{deleting}\n"),
-        )
-        .unwrap();
-        assert_eq!(
-            interjection_outcome(&mut flight, true),
-            None,
-            "a removed injection stays unread"
-        );
     }
 
     #[test]
@@ -2249,6 +1464,20 @@ done
     }
 
     #[test]
+    fn steer_injection_of_our_prompt_is_delivered() {
+        let ours = json!({"sessionId": "s", "text": BATCH, "interjectionId": "hcom-1"});
+        assert!(interjected(&ours, &flight(false)));
+        assert!(interjected(&ours, &flight(true)));
+        for other in [
+            json!({"sessionId": "s", "text": BATCH, "interjectionId": "user-1"}),
+            json!({"sessionId": "s", "text": BATCH}),
+            json!({"sessionId": "other", "text": BATCH, "interjectionId": "hcom-1"}),
+        ] {
+            assert!(!interjected(&other, &flight(true)), "{other}");
+        }
+    }
+
+    #[test]
     fn detached_batch_follows_the_reconnected_queue() {
         let mut detached = flight(false);
         detached.detached_at = Some(Instant::now());
@@ -2277,6 +1506,12 @@ done
         assert!(!ran_in_transcript(&path, BATCH));
         // Merged into a combined turn.
         std::fs::write(&path, format!("{}\n", chunk(&format!("fix it\n\n{BATCH}")))).unwrap();
+        assert!(ran_in_transcript(&path, BATCH));
+        // Injected by steer: the persisted chunk wraps the text.
+        let steer = format!(
+            "The user sent a message while you were working:\n<user_query>\n{BATCH}\n</user_query>\n..."
+        );
+        std::fs::write(&path, format!("{}\n", chunk(&steer))).unwrap();
         assert!(ran_in_transcript(&path, BATCH));
         assert!(!ran_in_transcript(&dir.path().join("missing"), BATCH));
     }
