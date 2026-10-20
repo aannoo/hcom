@@ -201,6 +201,7 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "WT_SESSION",
         "ConEmuHWND",
         "TMUX_PANE",
+        "TMUX",
         "STY",
         "ZELLIJ_SESSION_NAME",
         "ZELLIJ_PANE_ID",
@@ -1446,6 +1447,7 @@ mod tests {
             .unwrap();
         let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "");
         let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+        let _tmux = EnvVarGuard::set("TMUX", "/tmp/tmux-owner.sock,123,0");
 
         capture_and_store_launch_context(&db, "luna");
 
@@ -1466,6 +1468,12 @@ mod tests {
         assert_eq!(
             ctx.get("pid_identity").and_then(|v| v.as_str()),
             Some("spawn-1")
+        );
+        assert_eq!(
+            ctx.get("env")
+                .and_then(|env| env.get("TMUX"))
+                .and_then(|v| v.as_str()),
+            Some("/tmp/tmux-owner.sock,123,0")
         );
 
         cleanup(path);

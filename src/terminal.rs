@@ -98,6 +98,21 @@ fn is_wezterm_argv(argv: &[String]) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("wezterm"))
 }
 
+/// Add the pane owner's tmux socket when the close template does not select one.
+fn splice_tmux_socket(argv: &mut Vec<String>, socket_path: &str) {
+    let is_tmux = argv
+        .first()
+        .and_then(|bin| std::path::Path::new(bin).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("tmux"));
+    let has_socket = argv
+        .iter()
+        .any(|arg| arg == "-S" || arg.starts_with("-S") || arg == "-L" || arg.starts_with("-L"));
+    if is_tmux && !socket_path.is_empty() && !has_socket {
+        argv.splice(1..1, ["-S".to_string(), socket_path.to_string()]);
+    }
+}
+
 /// Terminal info resolved for an instance.
 #[derive(Debug, Clone, Default)]
 pub struct TerminalInfo {
@@ -111,6 +126,8 @@ pub struct TerminalInfo {
     pub herdr_socket_path: String,
     /// The pane's `WEZTERM_UNIX_SOCKET`: which wezterm GUI process owns it.
     pub wezterm_unix_socket: String,
+    /// The pane's tmux server socket path; pane IDs are unique only per server.
+    pub tmux_socket_path: String,
 }
 
 /// Result from launch_terminal.
@@ -2790,6 +2807,7 @@ pub fn close_terminal_pane(pid: u32, info: &TerminalInfo) -> PaneCloseResult {
         zellij_session_name,
         herdr_socket_path,
         wezterm_unix_socket,
+        tmux_socket_path,
     } = info;
     let failed_without_command = || PaneCloseResult {
         closed: false,
@@ -2824,6 +2842,8 @@ pub fn close_terminal_pane(pid: u32, info: &TerminalInfo) -> PaneCloseResult {
         Some(a) => a,
         None => return failed_without_command(),
     };
+
+    splice_tmux_socket(&mut argv, tmux_socket_path);
 
     let is_zellij = is_zellij_merged(&merged);
 
@@ -3093,6 +3113,18 @@ pub fn resolve_terminal_info(
             .and_then(|e| e.get("WEZTERM_UNIX_SOCKET").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
+        info.tmux_socket_path = lc
+            .get("tmux_socket_path")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                lc_env
+                    .and_then(|e| e.get("TMUX").and_then(|v| v.as_str()))
+                    .and_then(|v| v.split(',').next())
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or("")
+            .to_string();
     }
 
     // Legacy kitty launches may have pane/socket metadata but no persisted preset.
@@ -3284,6 +3316,45 @@ mod tests {
         assert_eq!(info.pane_id, "pane-1");
         assert_eq!(info.process_id, "proc-1");
         assert_eq!(info.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_reads_tmux_socket_path() {
+        let info = resolve_terminal_info(
+            Some("tmux-split"),
+            Some(r#"{"pane_id":"%0","tmux_socket_path":"/tmp/tmux-owner.sock"}"#),
+        );
+        assert_eq!(info.tmux_socket_path, "/tmp/tmux-owner.sock");
+
+        let info = resolve_terminal_info(
+            Some("tmux-split"),
+            Some(r#"{"pane_id":"%0","env":{"TMUX":"/tmp/tmux-owner.sock,123,0"}}"#),
+        );
+        assert_eq!(info.tmux_socket_path, "/tmp/tmux-owner.sock");
+    }
+
+    #[test]
+    fn test_splice_tmux_socket_targets_the_pane_owner_server() {
+        let mut command = argv(&["tmux", "kill-pane", "-t", "%0"]);
+        splice_tmux_socket(&mut command, "/tmp/tmux owner.sock");
+        assert_eq!(
+            command,
+            argv(&[
+                "tmux",
+                "-S",
+                "/tmp/tmux owner.sock",
+                "kill-pane",
+                "-t",
+                "%0"
+            ])
+        );
+
+        let mut explicit = argv(&["tmux", "-L", "custom", "kill-pane", "-t", "%0"]);
+        splice_tmux_socket(&mut explicit, "/tmp/tmux owner.sock");
+        assert_eq!(
+            explicit,
+            argv(&["tmux", "-L", "custom", "kill-pane", "-t", "%0"])
+        );
     }
 
     #[test]

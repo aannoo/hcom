@@ -80,6 +80,7 @@ impl OrphanProcess {
             zellij_session_name: self.zellij_session_name.clone(),
             herdr_socket_path: self.herdr_socket_path.clone(),
             wezterm_unix_socket: self.wezterm_unix_socket.clone(),
+            ..crate::terminal::TerminalInfo::default()
         }
     }
 }
