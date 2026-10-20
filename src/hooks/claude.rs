@@ -1857,98 +1857,49 @@ fn handle_userpromptsubmit(
     if ctx.is_pty_mode
         && let Some(prepared) = common::prepare_pending_messages(db, instance_name)
     {
-        let (user_display, model_context) =
-            format_userpromptsubmit_delivery(db, &prepared, instance_name);
+        let user_display =
+            common::format_hook_messages_for_instance(db, &prepared.messages, instance_name);
+        let model_context =
+            common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
+
         system_message = Some(user_display);
         contexts.push(model_context);
         delivery_ack = Some(prepared.ack);
     }
 
     if !contexts.is_empty() {
+        let mut output = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": contexts.join("\n\n---\n\n"),
+            },
+        });
+        if let Some(message) = system_message {
+            output
+                .as_object_mut()
+                .unwrap()
+                .insert("systemMessage".into(), Value::String(message));
+        }
         if delivery_ack.is_none() {
             lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
         }
         return (
             0,
-            userpromptsubmit_context_output(&contexts, system_message),
+            serde_json::to_string(&output).unwrap_or_default(),
             delivery_ack,
         );
     }
 
+    // Another hook already delivered the batch this wake was sent for. A
+    // blocked prompt runs no turn and no Stop follows, so leave the status:
+    // listening after Stop, the turn's own status for a prompt queued mid-turn.
     if is_bare_hcom_wake(payload) {
-        return block_empty_bare_hcom_wake(db, ctx, instance_name);
+        return block_bare_hcom_wake(
+            "This hcom wake arrived after another hook handled the queued delivery. Nothing is pending; no action is needed.",
+        );
     }
     lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
     (0, String::new(), None)
-}
-
-/// User-facing display and model context for a UserPromptSubmit delivery.
-fn format_userpromptsubmit_delivery(
-    db: &HcomDb,
-    prepared: &common::PreparedDelivery,
-    instance_name: &str,
-) -> (String, String) {
-    (
-        common::format_hook_messages_for_instance(db, &prepared.messages, instance_name),
-        common::format_messages_json_for_instance(db, &prepared.messages, instance_name),
-    )
-}
-
-/// UserPromptSubmit stdout that adds hcom context (bootstrap and/or messages)
-/// to the turn the prompt starts.
-fn userpromptsubmit_context_output(contexts: &[String], system_message: Option<String>) -> String {
-    let mut output = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": contexts.join("\n\n---\n\n"),
-        },
-    });
-    if let Some(message) = system_message {
-        output
-            .as_object_mut()
-            .unwrap()
-            .insert("systemMessage".into(), Value::String(message));
-    }
-    serde_json::to_string(&output).unwrap_or_default()
-}
-
-/// A bare `<hcom>` wake found nothing to deliver, so another hook already
-/// handled the batch it was typed for. The usual source is a wake Claude
-/// queued: the PTY injected it just as a turn hcom could not see coming (a
-/// background task's notification) started, that turn's own hook delivered
-/// the batch, and Claude submitted the leftover `<hcom>` when the turn ended,
-/// right after Stop.
-///
-/// Blocking the prompt means no turn runs, so no Stop hook follows. The
-/// instance therefore stays idle exactly as Stop leaves it. Marking it active
-/// here held the PTY gate at `not_idle`, and later messages queued unread
-/// until something else woke the session.
-fn block_empty_bare_hcom_wake(
-    db: &HcomDb,
-    ctx: &HcomContext,
-    instance_name: &str,
-) -> (i32, String, Option<DeliveryAck>) {
-    // Without the PTY wrapper nothing injects wakes or gates on this status;
-    // leave whatever Stop's poll last set.
-    if ctx.is_pty_mode {
-        lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
-        // Publish idle first, then look again: a message that landed after
-        // the first check is delivered by this wake, and any later one finds
-        // the instance idle and gets a wake of its own.
-        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-            let (user_display, model_context) =
-                format_userpromptsubmit_delivery(db, &prepared, instance_name);
-            return (
-                0,
-                userpromptsubmit_context_output(&[model_context], Some(user_display)),
-                Some(prepared.ack),
-            );
-        }
-        common::notify_hook_instance_with_db(db, instance_name);
-    }
-    block_bare_hcom_wake(
-        "This hcom wake arrived after another hook handled the queued delivery. Nothing is pending; no action is needed.",
-    )
 }
 
 /// Parent PermissionRequest: mark instance blocked immediately on approval UI.
@@ -5576,35 +5527,30 @@ mod tests {
         assert!(!pending_after);
     }
 
-    /// A message that lands after the wake's first check, before it would be
-    /// blocked, rides this wake instead of waiting for another one.
+    /// Claude also fires UserPromptSubmit for a prompt queued during a turn.
+    /// Blocking a bare wake there must not mark the busy agent idle.
     #[test]
     #[serial]
-    fn test_bare_wake_delivers_a_message_that_lands_before_it_blocks() {
+    fn test_blocked_bare_wake_mid_turn_keeps_the_turn_active() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, name_announced)
-                 VALUES ('nova', 'sess-1', 'claude', 'listening', '', 0, 0, 0, 1)",
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 'tool:Bash', 0, 0, 0, 1)",
                 [],
             )
             .unwrap();
-        let ctx = make_pty_ctx();
 
-        // The first check found nothing; the message arrives now.
-        insert_broadcast_from_luna(&db, "late");
-        let (_code, stdout, ack) = block_empty_bare_hcom_wake(&db, &ctx, "nova");
+        let (_code, stdout, ack) = userpromptsubmit_wake(&db, &make_pty_ctx());
 
         let output: Value = serde_json::from_str(&stdout).unwrap();
-        assert!(
-            output.get("decision").is_none(),
-            "wake was blocked: {stdout}"
+        assert_eq!(output["decision"], "block");
+        assert!(ack.is_none());
+        assert_eq!(
+            db.get_status("nova").unwrap(),
+            Some((ST_ACTIVE.to_string(), "tool:Bash".to_string()))
         );
-        assert!(stdout.contains("late"), "message not delivered: {stdout}");
-        common::commit_delivery_ack(&db, &ack.expect("delivery must be acknowledged"));
-        assert!(!db.has_pending("nova"));
-        assert_eq!(db.get_status("nova").unwrap().unwrap().0, ST_ACTIVE);
     }
 
     /// Property: a subagent-context hook whose row *does* resolve, but which
