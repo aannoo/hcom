@@ -11,11 +11,11 @@ pub const REQUEST_LINES: usize = 3;
 pub const RESPONSE_TAIL_LINES: usize = 8;
 pub const MAX_FILES: usize = 3;
 
+/// Non-blank lines, indentation kept (code and nested lists).
 fn nonempty_lines(text: &str) -> Vec<String> {
     text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim_end().to_string())
         .collect()
 }
 
@@ -56,10 +56,32 @@ fn strip_block(text: &str, tag: &str) -> String {
 
 /// Claude wraps some user-turn text in tags: slash commands, `!` shell
 /// commands and their output, local command output, and background task
-/// results. Show each the way a person would read it.
+/// results. Show each the way a person would read it. Only text that opens
+/// with such a tag is Claude's: a request quoting one stays as written.
 fn clean_request(user: &str) -> String {
+    let opens = |text: &str, tags: &[&str]| {
+        let text = text.trim_start();
+        tags.iter().any(|tag| text.starts_with(&format!("<{tag}>")))
+    };
+    if !opens(
+        user,
+        &[
+            "local-command-caveat",
+            "command-message",
+            "command-name",
+            "task-notification",
+            "bash-input",
+            "bash-stdout",
+            "bash-stderr",
+            "local-command-stdout",
+        ],
+    ) {
+        return user.trim().to_string();
+    }
     let user = strip_block(user, "local-command-caveat");
-    if let Some(name) = tag_body(&user, "command-name") {
+    if opens(&user, &["command-message", "command-name"])
+        && let Some(name) = tag_body(&user, "command-name")
+    {
         let args = tag_body(&user, "command-args").unwrap_or("");
         return if args.is_empty() {
             name.to_string()
@@ -67,17 +89,23 @@ fn clean_request(user: &str) -> String {
             format!("{name} {args}")
         };
     }
-    if user.contains("<task-notification>") {
+    if opens(&user, &["task-notification"]) {
         let head = tag_body(&user, "summary")
             .or_else(|| tag_body(&user, "status"))
             .unwrap_or("task");
         let result = tag_body(&user, "result").unwrap_or("");
         return format!("[task] {head}\n{result}");
     }
-    if let Some(command) = tag_body(&user, "bash-input") {
+    if opens(&user, &["bash-input"])
+        && let Some(command) = tag_body(&user, "bash-input")
+    {
         return format!("! {command}");
     }
-    let output: Vec<&str> = ["bash-stdout", "bash-stderr", "local-command-stdout"]
+    let output_tags = ["bash-stdout", "bash-stderr", "local-command-stdout"];
+    if !opens(&user, &output_tags) {
+        return user.trim().to_string();
+    }
+    let output: Vec<&str> = output_tags
         .iter()
         .filter_map(|tag| tag_body(&user, tag))
         .filter(|body| !body.is_empty())
@@ -104,9 +132,15 @@ fn build_turn(
         position,
         time: format_turn_time(timestamp),
         request_more: request.len() > REQUEST_LINES,
-        request_summary: request.first().cloned().unwrap_or_default(),
+        request_summary: request
+            .first()
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default(),
         request_lines: request.into_iter().take(REQUEST_LINES).collect(),
-        response_summary: response.last().cloned().unwrap_or_default(),
+        response_summary: response
+            .last()
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default(),
         response_tail: response[omitted..].to_vec(),
         response_omitted: omitted,
         tools,
@@ -195,7 +229,11 @@ pub fn turn_from_remote_json(row: &Value) -> Option<TurnView> {
 
 pub fn turns_from_remote_content(content: &str) -> Result<Vec<TurnView>, ()> {
     let rows: Vec<Value> = serde_json::from_str(content).map_err(|_| ())?;
-    Ok(rows.iter().filter_map(turn_from_remote_json).collect())
+    // One bad row fails the reply, so the last good conversation stays.
+    rows.iter()
+        .map(turn_from_remote_json)
+        .collect::<Option<_>>()
+        .ok_or(())
 }
 
 fn summarize_tools<'a>(names: impl Iterator<Item = &'a str>, files: &[String]) -> ToolSummary {
@@ -313,6 +351,21 @@ mod tests {
     }
 
     #[test]
+    fn compact_lines_keep_indentation() {
+        let t = turn_from_exchange(&ex(
+            "q",
+            "code:\n\n    let x = 1;  \n  - nested\n",
+            &[],
+            &[],
+        ));
+        assert_eq!(
+            t.response_tail,
+            vec!["code:", "    let x = 1;", "  - nested"]
+        );
+        assert_eq!(t.response_summary, "- nested");
+    }
+
+    #[test]
     fn request_lines_capped() {
         let t = turn_from_exchange(&ex("a\n\nb\nc\nd", "", &[], &[]));
         assert_eq!(t.request_lines, vec!["a", "b", "c"]);
@@ -419,6 +472,14 @@ mod tests {
             ""
         );
         assert_eq!(strip_block("a<x>1</x>b<x>2</x>c<x>open", "x"), "abc<x>open");
+        // Tags quoted inside a request are the user's text.
+        let quoted = "why does <command-name>/clear</command-name> show up?";
+        assert_eq!(clean_request(quoted), quoted);
+        assert_eq!(
+            clean_request("see <bash-stdout>x</bash-stdout>"),
+            "see <bash-stdout>x</bash-stdout>"
+        );
+        assert_eq!(clean_request("  <bash-input>ls</bash-input>"), "! ls");
     }
 
     #[test]
@@ -447,6 +508,13 @@ mod tests {
         let bad = json!({"position": "3", "user": "hi", "action": "yo"});
         assert!(turn_from_remote_json(&bad).is_none());
         assert!(turns_from_remote_content("not json").is_err());
+        assert!(
+            turns_from_remote_content(
+                r#"[{"position":1,"user":"a","action":"b"},{"position":"2","user":"a","action":"b"}]"#
+            )
+            .is_err(),
+            "one bad row fails the whole reply"
+        );
         assert_eq!(
             turns_from_remote_content(r#"[{"position":1,"user":"a","action":"b"}]"#)
                 .unwrap()

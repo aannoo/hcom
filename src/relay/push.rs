@@ -284,16 +284,18 @@ fn shrink_strings(value: &mut Value) {
 }
 
 /// Account e-mail for a local agent, read from the tool config dir it was
-/// launched with. Only sent when `relay_share_account` is on.
+/// launched with. Only sent when `relay_share_account` is on. A context
+/// captured without the dir key (bound by an older hcom) leaves the account
+/// unknown: the default account may not be the agent's.
 fn shared_account_email(tool: Option<&str>, launch_context: Option<&str>) -> Option<String> {
     use std::sync::{LazyLock, Mutex};
     static EMAILS: LazyLock<Mutex<crate::accounts::EmailCache>> = LazyLock::new(Default::default);
     let tool: crate::tool::Tool = tool.unwrap_or("claude").parse().ok()?;
     let key = crate::accounts::config_dir_env_key(tool)?;
-    let dir = launch_context
-        .and_then(|c| serde_json::from_str::<Value>(c).ok())
-        .and_then(|v| v.get("env")?.get(key)?.as_str().map(String::from))
-        .filter(|d| !d.is_empty());
+    let context = serde_json::from_str::<Value>(launch_context?).ok()?;
+    // "" is the tool's default dir.
+    let dir = context.get("env")?.get(key)?.as_str()?.to_string();
+    let dir = Some(dir).filter(|d| !d.is_empty());
     EMAILS
         .lock()
         .ok()?
@@ -302,9 +304,9 @@ fn shared_account_email(tool: Option<&str>, launch_context: Option<&str>) -> Opt
 
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
-pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
+/// `share_account` is the `relay_share_account` setting.
+pub fn build_state(db: &HcomDb, device_uuid: &str, share_account: bool) -> Value {
     let short_id = device_short_id_for_db(db, device_uuid);
-    let share_account = crate::config::HcomConfig::load(None).relay_share_account;
 
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,
@@ -460,8 +462,12 @@ fn log_preview_level(max_chars: usize) {
 
 /// Build push payload: state + events, returning (state, events, max_event_id, has_more).
 /// Fetches 101 rows, sends first 100 — has_more=true if 101st exists.
-pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>, i64, bool) {
-    let state = build_state(db, device_uuid);
+pub fn build_push_payload(
+    db: &HcomDb,
+    device_uuid: &str,
+    share_account: bool,
+) -> (Value, Vec<Value>, i64, bool) {
+    let state = build_state(db, device_uuid, share_account);
 
     let last_push_id: i64 = safe_kv_get(db, "relay_last_push_id")
         .and_then(|s| s.parse().ok())
@@ -548,13 +554,14 @@ pub fn push(
     relay_id: &str,
     device_uuid: &str,
     psk: &[u8; 32],
+    share_account: bool,
     is_worker: bool,
 ) -> Result<(bool, bool), String> {
     let last_push_id = safe_kv_get(db, "relay_last_push_id")
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     let (state, mut events, _unbounded_max_id, source_has_more) =
-        build_push_payload(db, device_uuid);
+        build_push_payload(db, device_uuid, share_account);
     let source_new_events = new_event_count(&events, last_push_id);
 
     let topic = state_topic(relay_id, device_uuid);
@@ -652,7 +659,7 @@ mod tests {
             .unwrap();
         safe_kv_set(&db, "relay_last_push_id", Some(&recent_id.to_string()));
 
-        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a");
+        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a", false);
 
         assert!(!has_more);
         assert_eq!(max_id, recent_id);
@@ -974,7 +981,7 @@ mod tests {
             )
             .unwrap();
 
-        let state = build_state(&db, "device-test");
+        let state = build_state(&db, "device-test", false);
         let row_detail = state["instances"]["nova"]["detail"].as_str().unwrap();
         let cmd = crate::relay::preview_fetch_command(row_detail).unwrap();
         assert!(
@@ -984,7 +991,7 @@ mod tests {
         assert!(row_detail.len() < 1000);
 
         // Relayed status events keep the whole text for subscriptions and filters.
-        let (_, events, _, _) = build_push_payload(&db, "device-test");
+        let (_, events, _, _) = build_push_payload(&db, "device-test", false);
         let event = events.iter().find(|e| e["id"] == event_id).unwrap();
         assert_eq!(event["data"]["detail"].as_str().unwrap().len(), 5000);
 
@@ -1021,7 +1028,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let state = build_state(&db, "device-test");
+        let state = build_state(&db, "device-test", false);
         let rows = state["instances"].as_object().unwrap();
         assert_eq!(rows.len(), 150, "no row is dropped");
         assert!(
@@ -1065,11 +1072,47 @@ mod tests {
     fn state_announces_this_devices_packet_limit() {
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        let state = build_state(&db, "device-test");
+        let state = build_state(&db, "device-test", false);
         assert_eq!(
             state["max_packet"].as_u64(),
             Some(crate::relay::MQTT_MAX_PACKET_BYTES as u64)
         );
+    }
+
+    #[test]
+    fn state_shares_account_emails_only_when_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"luna@example.com"}}"#,
+        )
+        .unwrap();
+        let with_dir = json!({"env": {"CLAUDE_CONFIG_DIR": claude_dir}}).to_string();
+        // Bound before the dir key was captured: the account is unknown.
+        let old = json!({"env": {"TERM_PROGRAM": "x"}}).to_string();
+        for (name, ctx) in [("luna", with_dir), ("nova", old)] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, session_id, tool, status, status_time,
+                                            created_at, launch_context)
+                     VALUES (?, ?, 'claude', 'active', 1, 0, ?)",
+                    rusqlite::params![name, format!("s-{name}"), ctx],
+                )
+                .unwrap();
+        }
+
+        let on = build_state(&db, "device-test", true);
+        assert_eq!(
+            on["instances"]["luna"]["account_email"].as_str(),
+            Some("luna@example.com")
+        );
+        assert!(on["instances"]["nova"].get("account_email").is_none());
+
+        let off = build_state(&db, "device-test", false);
+        assert!(off["instances"]["luna"].get("account_email").is_none());
     }
 
     #[test]
@@ -1087,7 +1130,7 @@ mod tests {
                          'subagent:stale', 1, 0);",
             )
             .unwrap();
-        let state = build_state(&db, "device-test");
+        let state = build_state(&db, "device-test", false);
         let instances = state["instances"].as_object().unwrap();
         assert!(instances.contains_key("nova"));
         assert!(instances.contains_key("nova_task_1"));
@@ -1105,7 +1148,7 @@ mod tests {
             .unwrap();
 
         let start = Instant::now();
-        let error = push(&db, &client, "relay", "device", &[0x42; 32], false).unwrap_err();
+        let error = push(&db, &client, "relay", "device", &[0x42; 32], false, false).unwrap_err();
         assert!(error.starts_with("publish:"), "{error}");
         // A blocking publish would wait forever; the slack only absorbs a
         // loaded debug build's db and seal work.

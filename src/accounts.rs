@@ -5,6 +5,9 @@ use std::time::SystemTime;
 
 use crate::tool::Tool;
 
+/// Every `config_dir_env_key`.
+pub const CONFIG_DIR_ENV_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
 /// Env var that points a tool at a non-default config directory.
 pub fn config_dir_env_key(tool: Tool) -> Option<&'static str> {
     match tool {
@@ -140,12 +143,13 @@ mod tests {
         assert_eq!(parse_codex_email(&auth("apikey", &tok)), None);
         assert_eq!(parse_codex_email(&auth("chatgpt", "a.b")), None);
         assert_eq!(parse_codex_email(&auth("chatgpt", "a.b.c.d")), None);
-        // Padded payloads decode too.
+        // Trailing garbage after the JSON is rejected.
         let padded = format!(
             "h.{}.s",
             base64::engine::general_purpose::URL_SAFE.encode(r#"{"email":"p@q.com"}x"#)
         );
         assert_eq!(jwt_payload_email(&padded), None);
+        // Padded payloads decode too.
         let padded = format!(
             "h.{}.s",
             base64::engine::general_purpose::URL_SAFE.encode(r#"{"email":"p@q.com"}"#)

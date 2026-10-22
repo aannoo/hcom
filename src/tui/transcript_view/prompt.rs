@@ -80,8 +80,12 @@ pub fn parse_screen(lines: &[String]) -> Option<ScreenPrompt> {
     let cursor = lines
         .iter()
         .rposition(|l| option_line(l).is_some_and(|(_, _, c)| c))?;
-    let top = lines[..cursor].iter().rposition(|l| is_rule(l))? + 1;
-    let first = (top..=cursor).find(|&i| option_line(&lines[i]).is_some())?;
+    // The cursor can sit on an option below a rule (`4. Chat about this`):
+    // the block starts at option 1, and the question above its rule.
+    let first = lines[..=cursor]
+        .iter()
+        .rposition(|l| option_line(l).is_some_and(|(n, _, _)| n == 1))?;
+    let top = lines[..first].iter().rposition(|l| is_rule(l))? + 1;
 
     let mut tabs = None;
     let mut question = Vec::new();
@@ -150,8 +154,19 @@ impl ScreenPrompt {
         self.options.iter().any(|o| o.checked.is_some())
     }
 
+    /// Everything this prompt shows, so a key never answers a different
+    /// prompt that happens to share a first line (`Bash command`).
     fn expect(&self) -> Vec<String> {
-        let mut expect: Vec<String> = self.question.first().cloned().into_iter().collect();
+        let mut expect: Vec<String> = self.tabs.iter().cloned().collect();
+        expect.extend(self.question.iter().cloned());
+        expect.extend(self.options.iter().map(|o| {
+            let checkbox = match o.checked {
+                Some(true) => "[✔] ",
+                Some(false) => "[ ] ",
+                None => "",
+            };
+            format!("{}. {checkbox}{}", o.number, o.label)
+        }));
         expect.push(self.anchor.clone());
         expect
     }
@@ -210,7 +225,15 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert_eq!(
             p.pick(2),
             Some(ScreenStep {
-                expect: vec!["과일?".into(), FOOTER.into()],
+                expect: vec![
+                    "☐ fruit  ☐ drink  ✔ Submit".into(),
+                    "과일?".into(),
+                    "1. 사과".into(),
+                    "2. 배".into(),
+                    "3. Type something.".into(),
+                    "4. Chat about this".into(),
+                    FOOTER.into(),
+                ],
                 keys: vec![b"2".to_vec()],
             })
         );
@@ -243,7 +266,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert_eq!(p.options[1].checked, Some(false));
         assert_eq!(p.options[1].description, "");
         assert_eq!(p.pick(3), None);
-        assert_eq!(p.next().unwrap().keys, vec![b"\x1b[C".to_vec()]);
+        let next = p.next().unwrap();
+        assert_eq!(next.keys, vec![b"\x1b[C".to_vec()]);
+        // Checkbox state is part of the match: a toggle in the terminal
+        // makes the step stale.
+        assert!(next.expect.contains(&"1. [✔] 물".to_string()));
+        assert!(next.expect.contains(&"2. [ ] 차".to_string()));
     }
 
     #[test]
@@ -263,13 +291,10 @@ Ready to submit your answers?
         let p = parse_screen(&screen(text)).unwrap();
         assert_eq!(p.question.last().unwrap(), "Ready to submit your answers?");
         // No footer on this screen: the cursor line anchors it.
-        assert_eq!(
-            p.pick(1).unwrap().expect,
-            vec![
-                "Review your answers".to_string(),
-                "1. Submit answers".to_string()
-            ]
-        );
+        let expect = p.pick(1).unwrap().expect;
+        assert_eq!(expect.first().unwrap(), "☒ fruit  ☒ drink  ✔ Submit");
+        assert!(expect.contains(&"Review your answers".to_string()));
+        assert_eq!(expect.last().unwrap(), "1. Submit answers");
     }
 
     #[test]
@@ -303,10 +328,33 @@ Ready to submit your answers?
         );
         assert_eq!(p.options.len(), 3);
         assert_eq!(p.options[1].description, "/private/tmp/scratchpad");
+        // The command line is matched, not only the generic first line.
         assert_eq!(
             p.pick(1).unwrap().expect,
-            vec!["Bash command".to_string(), FOOTER.to_string()]
+            vec![
+                "Bash command",
+                "Create probe-perm.txt in the working directory",
+                "touch probe-perm.txt",
+                "This command requires approval",
+                "Do you want to proceed?",
+                "1. Yes",
+                "2. Yes, and don't ask again for touch commands in",
+                "3. No",
+                FOOTER,
+            ]
         );
+    }
+
+    #[test]
+    fn reads_with_the_cursor_below_the_rule() {
+        let text = TABBED
+            .replace("❯ 1. 사과", "  1. 사과")
+            .replace("  4. Chat about this", "❯ 4. Chat about this");
+        let p = parse_screen(&screen(&text)).unwrap();
+        assert_eq!(p.question, vec!["과일?"]);
+        assert_eq!(p.options.len(), 4);
+        assert_eq!(p.options[0].description, "사과를 선택합니다");
+        assert_eq!(p.pick(1).unwrap().expect.last().unwrap(), FOOTER);
     }
 
     #[test]

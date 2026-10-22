@@ -14,7 +14,8 @@ use std::time::Instant;
 pub use model::*;
 
 use crate::tui::app::App;
-use crate::tui::model::{Agent, ViewMode};
+use crate::tui::model::{Agent, CursorTarget, ViewMode};
+use local::AccountDir;
 
 #[derive(Default)]
 pub struct TranscriptView {
@@ -89,8 +90,13 @@ impl App {
         };
         match target {
             ConversationTarget::Local { agent, .. } => {
-                let dir = data.tool_config_dirs.get(&agent.name).map(String::as_str);
-                transcript.local.poll(Some((agent, dir)), now) | transcript.remote.poll(None, now)
+                let account = if matches!(cursor, CursorTarget::StoppedAgent(_)) {
+                    AccountDir::Unknown
+                } else {
+                    AccountDir::Known(data.tool_config_dirs.get(&agent.name).map(String::as_str))
+                };
+                transcript.local.poll(Some((agent, account)), now)
+                    | transcript.remote.poll(None, now)
             }
             ConversationTarget::Remote { agent, .. } => {
                 transcript.local.poll(None, now) | transcript.remote.poll(Some(agent), now)
@@ -266,6 +272,36 @@ mod tests {
         assert!(app.ui.selected.is_empty());
     }
 
+    #[test]
+    fn enter_composes_to_the_agent_being_read() {
+        use crate::tui::model::InputMode;
+        let mut app = vertical_app();
+        app.data.agents.push(make_test_agent("nova", 0.0));
+        app.transcript.tab = RightTab::Conversation;
+        app.ui.selected.insert("nova".into());
+        app.ui.cursor = 0;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.ui.mode, InputMode::Compose);
+        assert_eq!(app.ui.input, "@luna ", "the selection is not the recipient");
+        // `m` still messages the selection.
+        app.ui.mode = InputMode::Navigate;
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(app.ui.input, "@nova ");
+    }
+
+    #[test]
+    fn enter_on_a_header_row_does_not_compose() {
+        use crate::tui::model::InputMode;
+        let mut app = vertical_app();
+        app.data.stopped_agents = vec![make_test_agent("old", 0.0)];
+        app.transcript.tab = RightTab::Conversation;
+        app.ui.cursor = 1;
+        assert_eq!(app.cursor_target(), CursorTarget::StoppedHeader);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.ui.mode, InputMode::Navigate);
+        assert!(app.ui.input.is_empty());
+    }
+
     /// `luna` blocked, with a prompt read off its screen.
     fn waiting_app(screen: &str) -> App {
         let mut app = vertical_app();
@@ -412,5 +448,55 @@ Enter to select · Esc to cancel";
             .replace(' ', "");
         assert!(text.contains("[chat]"), "tab strip missing");
         assert!(text.contains("luna"), "header missing");
+    }
+
+    fn screen_text(app: &mut App, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|f| crate::tui::render::render(f, app))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        buf.content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .replace(' ', "")
+    }
+
+    #[test]
+    fn command_output_shows_on_the_conversation_tab() {
+        let mut app = vertical_app();
+        app.transcript.tab = RightTab::Conversation;
+        app.ui.command_result = Some(crate::tui::model::CommandResult {
+            label: "relay status".into(),
+            output: vec!["relay-output-line".into()],
+        });
+        assert!(screen_text(&mut app, 100).contains("relay-output-line"));
+    }
+
+    #[test]
+    fn activity_heading_stops_before_the_tab_strip() {
+        let mut app = vertical_app();
+        let long = "x".repeat(80);
+        app.ui.selected.insert(long.clone());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|f| crate::tui::render::render(f, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|r| r.contains("[activity]"))
+            .expect("tab strip row");
+        // The heading leaves a gap instead of running under the strip.
+        assert!(row.contains(" [activity]"), "{row}");
+        assert!(row.contains("xxx"), "{row}");
     }
 }

@@ -568,10 +568,12 @@ fn render_vertical(frame: &mut Frame, app: &mut App, area: Rect) {
     let body_right = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body[2]);
 
     use crate::tui::transcript_view::{RightTab, render as conversation};
-    let scroll = if app.transcript.tab == RightTab::Conversation {
+    // A command's output shows on either tab until it is dismissed.
+    let scroll = if app.transcript.tab == RightTab::Conversation && app.ui.command_result.is_none()
+    {
         conversation::render_conversation(frame, body_right[0], body_right[1], app)
     } else {
-        render_messages_heading(frame, body_right[0], app);
+        render_messages_heading(frame, conversation::heading_area(body_right[0]), app);
         messages::render_messages(frame, body_right[1], app)
     };
     conversation::render_tabstrip(frame, body_right[0], app.transcript.tab);

@@ -92,6 +92,8 @@ fn classify(result: &Result<Value, String>) -> Result<Vec<TurnView>, FailureReas
     match result {
         Err(e) if e.starts_with("timed out waiting for rpc_result") => Err(FailureReason::Timeout),
         Err(e) if e.contains(" is offline ") => Err(FailureReason::Offline),
+        // The relay cut the result to fit a publish (`relay::push`).
+        Err(e) if e.contains("too large to relay") => Err(FailureReason::Truncated),
         Err(e) => Err(FailureReason::Remote(
             e.lines()
                 .next()
@@ -402,9 +404,19 @@ impl RemoteTranscriptWorker {
         }
     }
 
-    /// Refresh now, skipping the debounce.
-    pub fn force_refresh(&mut self, agent: &Agent, _now: Instant) {
+    /// Refresh now, skipping the debounce. Before the cursor settles this is
+    /// the settle's request too, so the agent gets one RPC, not two.
+    pub fn force_refresh(&mut self, agent: &Agent, now: Instant) {
         let idx = self.entry_index(agent);
+        let key = key_of(agent);
+        if self.cursor.as_ref().map(|c| &c.0) != Some(&key) {
+            for e in &mut self.entries {
+                e.status_change = None;
+            }
+            self.cursor = Some((key, now));
+            self.entries[idx].baseline = Some(status_key(agent));
+        }
+        self.settled = true;
         self.trigger(idx);
     }
 
@@ -550,6 +562,45 @@ mod tests {
         w.poll(Some(&a), t1 + STATUS_DEBOUNCE);
         settle(&mut w, &a, t1 + STATUS_DEBOUNCE);
         assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn refresh_before_settle_is_the_settle_request() {
+        let (mut w, log) = worker(vec![]);
+        let a = remote("luna");
+        let t0 = Instant::now();
+        w.poll(Some(&a), t0);
+        w.force_refresh(&a, t0 + Duration::from_millis(100));
+        settle(&mut w, &a, t0 + Duration::from_millis(100));
+        assert_eq!(log.lock().unwrap().len(), 1);
+        w.poll(Some(&a), t0 + CURSOR_SETTLE);
+        settle(&mut w, &a, t0 + CURSOR_SETTLE * 2);
+        assert_eq!(log.lock().unwrap().len(), 1, "no second request at settle");
+        assert!(!w.has_pending_timer());
+    }
+
+    #[test]
+    fn oversized_reply_shrinks_to_one_turn() {
+        let big = || {
+            Err::<Value, _>(
+                "transcript failed: rpc result too large to relay (300000 bytes); the relayed copy was cut"
+                    .to_string(),
+            )
+        };
+        let (mut w, log) = worker(vec![big(), big()]);
+        let a = remote("luna");
+        let t0 = Instant::now();
+        w.poll(Some(&a), t0);
+        w.poll(Some(&a), t0 + CURSOR_SETTLE);
+        settle(&mut w, &a, t0 + CURSOR_SETTLE);
+        let lasts: Vec<(usize, bool)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.last, r.detailed))
+            .collect();
+        assert_eq!(lasts, vec![(5, true), (2, true), (1, false)]);
+        assert_eq!(w.snapshot(&a).turns.unwrap().len(), 1);
     }
 
     #[test]

@@ -367,6 +367,7 @@ pub fn clear_relay_device_state(db: &HcomDb) {
         "relay_sync_time_",
         "relay_state_ts_",
         "relay_ctrl_",
+        "relay_accounts_",
         PEER_MAX_PACKET_PREFIX,
     ];
     for prefix in &prefixes {
@@ -1296,6 +1297,16 @@ mod tests {
         db.init_db().unwrap();
         std::mem::forget(dir);
         db
+    }
+
+    #[test]
+    fn clear_relay_device_state_drops_peer_accounts() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_accounts_ABCD", Some(r#"{"luna":"a@b.c"}"#));
+        safe_kv_set(&db, "relay_caps_ABCD", Some("[]"));
+        clear_relay_device_state(&db);
+        assert!(safe_kv_get(&db, "relay_accounts_ABCD").is_none());
+        assert!(safe_kv_get(&db, "relay_caps_ABCD").is_none());
     }
 
     #[test]

@@ -638,9 +638,8 @@ impl MqttRelay {
 
     /// Re-read the active PSK from disk. This is a best-effort escape hatch for
     /// same-namespace config changes; full relay resets still restart the worker.
-    fn reload_psk_if_changed(&self) {
-        let cfg = HcomConfig::load(None);
-        if let Ok(new) = load_psk(&cfg) {
+    fn reload_psk_if_changed(&self, cfg: &HcomConfig) {
+        if let Ok(new) = load_psk(cfg) {
             let mut psk = match self.psk.lock() {
                 Ok(psk) => psk,
                 Err(e) => {
@@ -672,7 +671,8 @@ impl MqttRelay {
             }
         };
 
-        self.reload_psk_if_changed();
+        let cfg = HcomConfig::load(None);
+        self.reload_psk_if_changed(&cfg);
         let psk = match self.psk.lock() {
             Ok(psk) => *psk,
             Err(e) => {
@@ -690,6 +690,7 @@ impl MqttRelay {
                 &self.relay_id,
                 &self.device_uuid,
                 &psk,
+                cfg.relay_share_account,
                 true,
             ) {
                 Ok((true, has_more)) => {

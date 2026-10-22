@@ -130,14 +130,22 @@ const STEP_SCREEN_TIMEOUT: Duration = Duration::from_secs(2);
 /// rather than one pasted string.
 const KEY_GAP: Duration = Duration::from_millis(120);
 
-/// Whitespace is dropped before matching: prompts wrap and indent long text.
+/// Whitespace runs fold to one space, so text that wraps and indents
+/// differently still matches, while `echo "a b"` stays distinct from
+/// `echo "ab"`.
 fn squash(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A step with nothing to match would send its keys blind.
+fn has_expect(expect: &[String]) -> bool {
+    expect.iter().any(|e| !squash(e).is_empty())
 }
 
 pub(crate) fn screen_shows(lines: &[String], expect: &[String]) -> bool {
-    let screen = squash(&lines.concat());
-    expect.iter().all(|e| screen.contains(&squash(e)))
+    // Rows join with a space: a wrapped line breaks where a space was.
+    let screen = squash(&lines.join(" "));
+    has_expect(expect) && expect.iter().all(|e| screen.contains(&squash(e)))
 }
 
 fn screen_lines(port: i32) -> Option<Vec<String>> {
@@ -158,21 +166,38 @@ pub(crate) fn screen_of(db: &HcomDb, name: &str) -> Option<Vec<String>> {
 }
 
 /// Send each step's keys once its text is on screen. Stops at the first
-/// step whose text does not appear, so keys never land in a prompt that
-/// changed or was already answered in the terminal.
+/// step whose text does not appear. Best effort: the screen is read just
+/// before the keys go out, so a prompt that changes in between can still
+/// receive them.
 pub fn answer_on_screen(db: &HcomDb, name: &str, steps: &[ScreenStep]) -> Result<String, String> {
+    if steps.iter().any(|s| !has_expect(&s.expect)) {
+        return Err(format!("nothing to match on {name}'s screen; nothing sent"));
+    }
     let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
     for (i, step) in steps.iter().enumerate() {
         let deadline = Instant::now() + STEP_SCREEN_TIMEOUT;
         loop {
-            if screen_lines(port).is_some_and(|lines| screen_shows(&lines, &step.expect)) {
+            let lines = screen_lines(port);
+            if lines
+                .as_ref()
+                .is_some_and(|lines| screen_shows(lines, &step.expect))
+            {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(if i == 0 {
-                    format!("the prompt is no longer on {name}'s screen; nothing sent")
-                } else {
-                    format!("{name}'s screen changed after step {i}; answer the rest there")
+                return Err(match (i, lines.is_some()) {
+                    (0, false) => format!("no response from {name}'s terminal; nothing sent"),
+                    (0, true) => {
+                        format!("the prompt is no longer on {name}'s screen; nothing sent")
+                    }
+                    (_, false) => {
+                        format!(
+                            "no response from {name}'s terminal after step {i}; answer the rest there"
+                        )
+                    }
+                    (_, true) => {
+                        format!("{name}'s screen changed after step {i}; answer the rest there")
+                    }
                 });
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -554,7 +579,16 @@ mod tests {
             ]
         ));
         assert!(!screen_shows(&lines, &["Ready to submit".into()]));
-        assert!(screen_shows(&lines, &[]));
+        // Nothing to match is not a match.
+        assert!(!screen_shows(&lines, &[]));
+        assert!(!screen_shows(&lines, &[" ".into()]));
+    }
+
+    #[test]
+    fn screen_shows_keeps_spaces_inside_text() {
+        let lines = vec![" echo \"a b\"".to_string(), "Esc to cancel".to_string()];
+        assert!(screen_shows(&lines, &["echo \"a b\"".into()]));
+        assert!(!screen_shows(&lines, &["echo \"ab\"".into()]));
     }
 
     fn test_db() -> HcomDb {
@@ -645,6 +679,108 @@ mod tests {
 
         assert_eq!(result, "Injected 6 chars to luna");
         assert_eq!(received, "status");
+    }
+
+    /// A fake PTY: answers screen queries with `lines`, records the rest.
+    fn fake_terminal(
+        db: &HcomDb,
+        lines: &[&str],
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params!["luna", port],
+            )
+            .unwrap();
+        let screen = serde_json::json!({ "lines": lines }).to_string();
+        let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = keys.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                if request == b"\x00SCREEN\n" {
+                    stream.write_all(screen.as_bytes()).unwrap();
+                } else {
+                    recorded.lock().unwrap().push(request);
+                }
+            }
+        });
+        keys
+    }
+
+    const PROMPT: [&str; 4] = [
+        " Bash command",
+        " touch probe-perm.txt",
+        " ❯ 1. Yes",
+        " Esc to cancel · Tab to amend",
+    ];
+
+    fn step(expect: &[&str]) -> ScreenStep {
+        ScreenStep {
+            expect: expect.iter().map(|e| e.to_string()).collect(),
+            keys: vec![b"2".to_vec()],
+        }
+    }
+
+    #[test]
+    fn answer_on_screen_sends_only_to_the_matching_prompt() {
+        let db = test_db();
+        let keys = fake_terminal(&db, &PROMPT);
+
+        let err = answer_on_screen(
+            &db,
+            "luna",
+            &[step(&["Bash command", "rm -rf build", "Esc to cancel"])],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "the prompt is no longer on luna's screen; nothing sent"
+        );
+        let err = answer_on_screen(&db, "luna", &[step(&[" "])]).unwrap_err();
+        assert!(err.contains("nothing sent"), "{err}");
+        assert!(keys.lock().unwrap().is_empty());
+
+        let ok = answer_on_screen(
+            &db,
+            "luna",
+            &[step(&[
+                "Bash command",
+                "touch probe-perm.txt",
+                "Esc to cancel",
+            ])],
+        );
+        assert_eq!(ok, Ok("Sent keys to luna".to_string()));
+        for _ in 0..100 {
+            if !keys.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*keys.lock().unwrap(), vec![b"2".to_vec()]);
+    }
+
+    #[test]
+    fn answer_on_screen_reports_a_silent_terminal() {
+        let db = test_db();
+        // Bound and dropped: nothing listens on the port.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params!["luna", port],
+            )
+            .unwrap();
+        let err = answer_on_screen(&db, "luna", &[step(&["Esc to cancel"])]).unwrap_err();
+        assert_eq!(err, "no response from luna's terminal; nothing sent");
     }
 
     #[test]

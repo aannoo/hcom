@@ -381,8 +381,14 @@ impl App {
                 self.ui.msg_scroll = self.ui.msg_scroll.saturating_sub(5);
             }
 
-            // Conversation tab: Enter messages the agent being read.
-            KeyCode::Enter if self.conversation_visible() => self.compose_to_targets(),
+            // Conversation tab: Enter messages the agent being read, not the
+            // selection. Header and orphan rows keep the toggle below.
+            KeyCode::Enter
+                if self.conversation_visible() && self.cursor_display_name().is_some() =>
+            {
+                let names: Vec<String> = self.cursor_display_name().into_iter().collect();
+                self.compose_to(&names);
+            }
             // SELECTION — in inline mode, auto-apply as scrollback filter
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.toggle_select_at_cursor();
@@ -1299,15 +1305,19 @@ fn push_agent_command_suggestions(s: &mut Vec<CommandSuggestion>, agent: &Agent)
 impl App {
     /// Message: pre-fill @mentions for selected or cursor agent
     fn compose_to_targets(&mut self) {
+        let names: Vec<String> = if self.ui.selected.is_empty() {
+            self.cursor_display_name().into_iter().collect()
+        } else {
+            self.ui.selected.iter().cloned().collect()
+        };
+        self.compose_to(&names);
+    }
+
+    fn compose_to(&mut self, names: &[String]) {
         self.ui.mode = InputMode::Compose;
         self.ui.input.clear();
-        self.ui.input_cursor = 0;
-        if !self.ui.selected.is_empty() {
-            for name in self.ui.selected.iter() {
-                self.ui.input.push_str(&format!("@{} ", name));
-            }
-        } else if let Some(name) = self.cursor_display_name() {
-            self.ui.input = format!("@{} ", name);
+        for name in names {
+            self.ui.input.push_str(&format!("@{} ", name));
         }
         self.ui.input_cursor = self.ui.input.len();
     }

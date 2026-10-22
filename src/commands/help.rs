@@ -668,7 +668,8 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     ),
 ];
 
-/// Registry keys left out of help: relay keys are managed by `hcom relay`;
+/// Registry keys left out of help: the relay worker's keys are managed by
+/// `hcom relay` (`relay_share_account` is set with `hcom config`, so listed);
 /// `timeout` only affects headless/vanilla Claude (see `config timeout --info`).
 #[cfg(test)]
 const CONFIG_KEYS_NOT_IN_HELP: &[&str] = &[

@@ -26,6 +26,14 @@ fn tabstrip_width() -> usize {
     TAB_ACTIVITY.width() + 1 + TAB_CONVERSATION.width()
 }
 
+/// The heading row left of the tab strip.
+pub fn heading_area(area: Rect) -> Rect {
+    Rect {
+        width: area.width.saturating_sub(tabstrip_width() as u16 + 1),
+        ..area
+    }
+}
+
 /// Draw `[activity] [chat]` at the right end of the heading row.
 pub fn render_tabstrip(frame: &mut Frame, area: Rect, tab: RightTab) {
     let w = tabstrip_width() as u16;
