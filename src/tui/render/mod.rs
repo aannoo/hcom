@@ -1399,14 +1399,26 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             }
         }
-        InputMode::Compose => vec![
-            Span::raw("  "),
-            Span::styled("enter", key),
-            Span::styled(" send ", lbl),
-            Span::styled("\u{00b7} ", dot),
-            Span::styled("esc", key),
-            Span::styled(" cancel", lbl),
-        ],
+        InputMode::Compose => {
+            let mut hints = vec![
+                Span::raw("  "),
+                Span::styled("enter", key),
+                Span::styled(" send ", lbl),
+                Span::styled("\u{00b7} ", dot),
+                Span::styled("esc", key),
+                Span::styled(" cancel", lbl),
+            ];
+            let blocked = app.blocked_recipients();
+            if !blocked.is_empty() {
+                let names: Vec<String> = blocked.iter().map(|n| format!("@{n}")).collect();
+                hints.push(Span::styled(" \u{00b7} ", dot));
+                hints.push(Span::styled(
+                    format!("{} blocked: delivered after it's answered", names.join(" ")),
+                    Theme::blocked(),
+                ));
+            }
+            hints
+        }
         InputMode::Navigate => {
             if let Some(ref overlay) = app.ui.overlay {
                 if overlay.kind == OverlayKind::Command && overlay.palette.is_some() {
@@ -1774,6 +1786,10 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
         Line::from(vec![key("R"), desc("refresh conversation")]),
         Line::from(vec![key("e"), desc("full conversation text")]),
         Line::from(vec![key("enter"), desc("message agent (conversation tab)")]),
+        Line::from(vec![
+            key("1-9"),
+            desc("answer a waiting question (conversation tab)"),
+        ]),
         Line::from(vec![key("b"), desc("broadcast to all")]),
         Line::from(vec![key("ctrl+r"), desc("relay settings")]),
         Line::from(vec![key("ctrl+s"), desc("all stopped agents")]),

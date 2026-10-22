@@ -11,6 +11,7 @@ use super::model::{
     ConversationSnapshot, ConversationTarget, RightTab, ToolSummary, TurnView, remote_account_key,
     resolve_target,
 };
+use super::prompt::ScreenPrompt;
 use crate::tui::app::App;
 use crate::tui::model::{Agent, AgentStatus, Message, format_duration_short};
 use crate::tui::render::SPINNER_FRAMES;
@@ -85,6 +86,9 @@ pub fn render_conversation(frame: &mut Frame, head: Rect, body: Rect, app: &App)
     {
         lines.push(live);
     }
+    if let Some((_, prompt)) = app.waiting_prompt() {
+        lines.extend(prompt_lines(prompt, width));
+    }
 
     let head_rect = Rect::new(head.x, head.y, head_w as u16, head.height.min(1));
     frame.render_widget(
@@ -104,8 +108,29 @@ fn target_agent<'a>(target: &ConversationTarget<'a>) -> Option<&'a Agent> {
 }
 
 /// While the agent works: a spinner, what it is doing, and for how long.
+/// While it waits on a prompt in its terminal: what it waits on, and that
+/// messages are held until then.
 pub fn live_line(agent: &Agent, tick: u64, width: usize) -> Option<Line<'static>> {
-    if agent.status != AgentStatus::Active || width == 0 {
+    if width == 0 {
+        return None;
+    }
+    if agent.status == AgentStatus::Blocked {
+        let waiting = match agent.context_display() {
+            c if c.is_empty() => "blocked".to_string(),
+            c => format!("blocked: {}", c.lines().next().unwrap_or("")),
+        };
+        return Some(Line::from(Span::styled(
+            fit(
+                format!(
+                    "■ {waiting} · messages wait until answered · {}",
+                    agent.age_display()
+                ),
+                width,
+            ),
+            Theme::blocked(),
+        )));
+    }
+    if agent.status != AgentStatus::Active {
         return None;
     }
     let frame = SPINNER_FRAMES[(tick as usize / 2) % SPINNER_FRAMES.len()];
@@ -121,6 +146,70 @@ pub fn live_line(agent: &Agent, tick: u64, width: usize) -> Option<Line<'static>
         fit(format!("{frame} {doing}{age}"), width),
         Theme::active(),
     )))
+}
+
+/// The prompt waiting on the agent's screen, as numbered options, and the
+/// keys that answer it from here.
+pub fn prompt_lines(prompt: &ScreenPrompt, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let dim = Theme::dim();
+    let mut lines = Vec::new();
+    let push = |segments: Vec<markdown::Segment>, lines: &mut Vec<Line<'static>>| {
+        for row in markdown::wrap(&segments, width) {
+            lines.push(Line::from(markdown::spans(row)));
+        }
+    };
+    if let Some(tabs) = &prompt.tabs {
+        push(vec![(format!("  {tabs}"), Theme::blocked())], &mut lines);
+    }
+    for text in &prompt.question {
+        push(
+            vec![
+                ("  ".to_string(), Style::default()),
+                (text.clone(), Theme::title()),
+            ],
+            &mut lines,
+        );
+    }
+    for option in &prompt.options {
+        let mark = match option.checked {
+            None => "",
+            Some(true) => "[x] ",
+            Some(false) => "[ ] ",
+        };
+        let style = if option.needs_typing() {
+            dim
+        } else {
+            Style::default()
+        };
+        let mut segs = vec![
+            (
+                format!("   {mark}{} ", option.number),
+                Style::default().fg(palette::FG_DIM),
+            ),
+            (option.label.clone(), style),
+        ];
+        if !option.description.is_empty() {
+            segs.push((format!("  {}", option.description), dim));
+        }
+        push(segs, &mut lines);
+    }
+    let last = prompt
+        .options
+        .iter()
+        .filter(|o| !o.needs_typing())
+        .map(|o| o.number)
+        .max()
+        .unwrap_or(1);
+    let hint = if prompt.is_multi() {
+        format!("  1-{last} toggle · enter next · typing answers in the terminal")
+    } else {
+        format!("  1-{last} answer · typing answers in the terminal")
+    };
+    push(vec![(hint, dim)], &mut lines);
+    lines
 }
 
 fn status_line(text: &str) -> Vec<Line<'static>> {
@@ -505,6 +594,44 @@ mod tests {
     }
 
     #[test]
+    fn prompt_lists_screen_options() {
+        let screen: Vec<String> = "────────────────────────────────
+←  ☒ fruit  ☐ drink  ✔ Submit  →
+
+음료?
+
+❯ 1. [✔] 물
+         기본 생수
+  2. [ ] 차
+  3. [ ] Type something
+     Submit
+
+Enter to select · Esc to cancel"
+            .lines()
+            .map(String::from)
+            .collect();
+        let prompt = super::super::prompt::parse_screen(&screen).unwrap();
+        let out = text(&prompt_lines(&prompt, 80));
+        assert_eq!(
+            out,
+            vec![
+                "  ☒ fruit  ☐ drink  ✔ Submit",
+                "  음료?",
+                "   [x] 1 물  기본 생수",
+                "   [ ] 2 차",
+                "   [ ] 3 Type something",
+                "  1-2 toggle · enter next · typing answers in the terminal",
+            ]
+        );
+        for w in 2..20 {
+            for line in text(&prompt_lines(&prompt, w)) {
+                assert!(line.width() <= w, "{line:?} at {w}");
+            }
+        }
+        assert!(prompt_lines(&prompt, 0).is_empty());
+    }
+
+    #[test]
     fn latest_turn_expanded_previous_collapsed() {
         let tools = ToolSummary::Some {
             counts: vec![("Bash".into(), 3)],
@@ -625,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn live_line_only_while_active() {
+    fn live_line_while_active_or_blocked() {
         use crate::tui::test_helpers::make_test_agent;
         let mut a = make_test_agent("luna", 0.0);
         a.status = AgentStatus::Listening;
@@ -642,6 +769,22 @@ mod tests {
         a.status_context = "prompt".into();
         let l = text(&[live_line(&a, 0, 40).unwrap()]).remove(0);
         assert!(l.contains("thinking"), "{l}");
+        for w in 1..12 {
+            let l = text(&[live_line(&a, 0, w).unwrap()]).remove(0);
+            assert!(l.width() <= w, "{l:?} at {w}");
+        }
+
+        // Waiting on a prompt: says so, and that messages are held.
+        a.status = AgentStatus::Blocked;
+        a.status_context = "approval".into();
+        a.status_detail = String::new();
+        let line = live_line(&a, 0, 80).unwrap();
+        let l = text(std::slice::from_ref(&line)).remove(0);
+        assert!(
+            l.starts_with("■ blocked: approval · messages wait until answered"),
+            "{l}"
+        );
+        assert_eq!(line.spans[0].style, Theme::blocked());
         for w in 1..12 {
             let l = text(&[live_line(&a, 0, w).unwrap()]).remove(0);
             assert!(l.width() <= w, "{l:?} at {w}");

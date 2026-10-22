@@ -51,6 +51,11 @@ pub enum RpcOp {
     Command {
         cmd: String,
     },
+    /// Answer a question waiting in an agent's terminal.
+    AnswerPrompt {
+        name: String,
+        steps: Vec<crate::commands::term::ScreenStep>,
+    },
 }
 
 pub struct RpcResult {
@@ -157,6 +162,16 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
         RpcOp::Command { cmd } => {
             let argv = rpc::parse_command_argv(cmd)?;
             commands::run_native(&argv)
+        }
+
+        RpcOp::AnswerPrompt { name, steps } => {
+            let db = crate::db::HcomDb::open().map_err(|e| e.to_string())?;
+            let stdout = crate::commands::term::answer_on_screen(&db, name, steps)?;
+            Ok(Response {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            })
         }
 
         RpcOp::KillAgent { name } => commands::run_native(&["kill".into(), name.clone()]),

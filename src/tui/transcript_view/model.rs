@@ -139,6 +139,8 @@ pub struct ConversationSnapshot<'a> {
     pub loading: bool,
     /// Logged-in account; only the local worker knows it.
     pub email: Option<&'a str>,
+    /// A choice prompt waiting on the agent's screen; local Claude only.
+    pub prompt: Option<&'a super::prompt::ScreenPrompt>,
 }
 
 pub fn parse_turn_epoch(ts: &str) -> Option<f64> {

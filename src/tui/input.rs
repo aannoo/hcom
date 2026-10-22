@@ -335,6 +335,10 @@ impl App {
         if self.ui.overlay.is_some() && self.handle_overlay_key(code) {
             return;
         }
+        // A question the agent under the cursor waits on takes digits first.
+        if self.ui.overlay.is_none() && self.transcript_answer_key(code) {
+            return;
+        }
 
         match code {
             // MOVEMENT — always work, no conditions
@@ -1307,6 +1311,21 @@ impl App {
         }
         self.ui.input_cursor = self.ui.input.len();
     }
+
+    /// Recipients in the compose input that are waiting on a prompt in their
+    /// terminal; delivery holds messages to them until it is answered.
+    pub(crate) fn blocked_recipients(&self) -> Vec<String> {
+        let (recipients, _) = parse_outbound_message(&self.ui.input);
+        recipients
+            .into_iter()
+            .filter(|r| {
+                self.all_agents().any(|a| {
+                    a.status == AgentStatus::Blocked
+                        && (a.display_name() == *r || a.action_name() == *r)
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1509,6 +1528,22 @@ mod tests {
         assert_eq!(app.ui.mode, InputMode::Compose);
         assert_eq!(app.ui.input, "@luna @nova ");
         assert_eq!(app.ui.input_cursor, app.ui.input.len());
+    }
+
+    #[test]
+    fn blocked_recipients_lists_mentioned_agents_waiting_on_a_prompt() {
+        let mut app = test_app();
+        let luna = app
+            .data
+            .agents
+            .iter_mut()
+            .find(|a| a.name == "luna")
+            .expect("luna");
+        luna.status = AgentStatus::Blocked;
+        app.ui.input = "@luna @nova hi".into();
+        assert_eq!(app.blocked_recipients(), vec!["luna".to_string()]);
+        app.ui.input = "@nova hi".into();
+        assert!(app.blocked_recipients().is_empty());
     }
 
     #[test]

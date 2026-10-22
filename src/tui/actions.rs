@@ -275,6 +275,16 @@ impl App {
             RpcOp::Command { cmd } => {
                 self.show_command_output(&cmd, rpc_output_lines(result.result));
             }
+            RpcOp::AnswerPrompt { name, .. } => match result.result {
+                Ok(resp) if resp.ok() => {
+                    // Read the screen again for the next question or tab.
+                    if let Some(agent) = self.data.agents.iter().find(|a| a.name == name) {
+                        self.transcript.local.force_refresh(agent);
+                    }
+                    self.reload_data_force();
+                }
+                other => self.ui.flash = Some(rpc_error_flash("Answer failed", other)),
+            },
         }
     }
 

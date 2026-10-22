@@ -4,6 +4,7 @@ pub mod convert;
 pub mod local;
 pub mod markdown;
 pub mod model;
+pub mod prompt;
 pub mod remote;
 pub mod render;
 
@@ -112,6 +113,70 @@ impl App {
         self.ui.msg_scroll = 0;
     }
 
+    /// The prompt the agent under the cursor waits on, when the
+    /// conversation tab shows it.
+    pub(crate) fn waiting_prompt(&self) -> Option<(&Agent, &prompt::ScreenPrompt)> {
+        if !self.conversation_visible() {
+            return None;
+        }
+        match resolve_target(&self.data, self.cursor_target()) {
+            ConversationTarget::Local { agent, .. }
+                if agent.status == crate::tui::model::AgentStatus::Blocked =>
+            {
+                self.transcript
+                    .local
+                    .snapshot(agent)
+                    .prompt
+                    .map(|p| (agent, p))
+            }
+            _ => None,
+        }
+    }
+
+    /// A digit picks an option of the waiting prompt; Enter moves on from a
+    /// multi-select question. False when the key is not for the prompt.
+    pub(crate) fn transcript_answer_key(&mut self, code: crossterm::event::KeyCode) -> bool {
+        use crate::tui::model::Flash;
+        use crate::tui::theme::Theme;
+        use crossterm::event::KeyCode;
+        let Some((agent, prompt)) = self.waiting_prompt() else {
+            return false;
+        };
+        let name = agent.name.clone();
+        let step = match code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let n = (c as u8 - b'0') as usize;
+                match prompt.pick(n) {
+                    Some(step) => step,
+                    None => {
+                        if prompt.options.iter().any(|o| o.number == n) {
+                            self.ui.flash = Some(Flash::new(
+                                format!("Option {n} needs typing: answer it in {name}'s terminal"),
+                                Theme::flash_info(),
+                            ));
+                        }
+                        return true;
+                    }
+                }
+            }
+            KeyCode::Enter => match prompt.next() {
+                Some(step) => step,
+                None => return false,
+            },
+            _ => return false,
+        };
+        if let Err(e) = self.enqueue_rpc(crate::tui::rpc_async::RpcOp::AnswerPrompt {
+            name,
+            steps: vec![step],
+        }) {
+            self.ui.flash = Some(Flash::new(
+                format!("Answer failed: {e}"),
+                Theme::flash_err(),
+            ));
+        }
+        true
+    }
+
     /// `R`: refresh the conversation now. Does nothing outside the tab.
     pub(crate) fn transcript_refresh(&mut self, now: Instant) {
         if !self.conversation_visible() {
@@ -199,6 +264,82 @@ mod tests {
         assert_eq!(app.ui.mode, InputMode::Compose);
         assert_eq!(app.ui.input, "@luna ");
         assert!(app.ui.selected.is_empty());
+    }
+
+    /// `luna` blocked, with a prompt read off its screen.
+    fn waiting_app(screen: &str) -> App {
+        let mut app = vertical_app();
+        app.transcript.tab = RightTab::Conversation;
+        let luna = &mut app.data.agents[0];
+        luna.status = crate::tui::model::AgentStatus::Blocked;
+        luna.status_context = "approval".into();
+        luna.transcript_path = Some("/nonexistent/s.jsonl".into());
+        let lines: Vec<String> = screen.lines().map(String::from).collect();
+        let prompt = prompt::parse_screen(&lines).unwrap();
+        app.transcript
+            .local
+            .set_prompt_for_test(&app.data.agents[0], prompt);
+        app
+    }
+
+    const QUESTION: &str = "────────────────────────────────
+과일?
+
+❯ 1. 사과
+  2. 배
+  3. Type something.
+
+Enter to select · Esc to cancel";
+
+    const MULTI: &str = "────────────────────────────────
+음료?
+
+❯ 1. [ ] 물
+  2. [ ] 차
+
+Enter to select · Esc to cancel";
+
+    #[test]
+    fn digits_answer_a_waiting_prompt() {
+        let mut app = waiting_app(QUESTION);
+        assert!(app.waiting_prompt().is_some());
+        app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        // Sent (offline: no RPC worker, so it reports the failure).
+        let flash = app.ui.flash.take().unwrap();
+        assert!(flash.text.contains("Answer failed"), "{}", flash.text);
+
+        app.handle_key(KeyCode::Char('3'), KeyModifiers::NONE);
+        let flash = app.ui.flash.take().unwrap();
+        assert!(flash.text.contains("needs typing"), "{}", flash.text);
+
+        // Not an option: swallowed without a message.
+        app.handle_key(KeyCode::Char('7'), KeyModifiers::NONE);
+        assert!(app.ui.flash.is_none());
+
+        // Enter still composes on a single-select question.
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.ui.mode, crate::tui::model::InputMode::Compose);
+    }
+
+    #[test]
+    fn enter_moves_on_from_multi_select() {
+        let mut app = waiting_app(MULTI);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.ui.mode, crate::tui::model::InputMode::Navigate);
+        assert!(app.ui.flash.take().unwrap().text.contains("Answer failed"));
+    }
+
+    #[test]
+    fn digits_are_ordinary_keys_without_a_waiting_prompt() {
+        let mut app = waiting_app(QUESTION);
+        app.transcript.tab = RightTab::Activity;
+        assert!(app.waiting_prompt().is_none());
+        app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(app.ui.flash.is_none());
+
+        app.transcript.tab = RightTab::Conversation;
+        app.data.agents[0].status = crate::tui::model::AgentStatus::Listening;
+        assert!(app.waiting_prompt().is_none());
     }
 
     #[test]

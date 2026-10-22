@@ -117,6 +117,74 @@ pub fn inject_text_remote_result(
     Ok(label)
 }
 
+/// One step of answering a prompt in an agent's terminal: every `expect`
+/// string must be on screen before `keys` are sent, one chunk at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenStep {
+    pub expect: Vec<String>,
+    pub keys: Vec<Vec<u8>>,
+}
+
+const STEP_SCREEN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Gap between key chunks, so the agent's TUI reads each as its own key
+/// rather than one pasted string.
+const KEY_GAP: Duration = Duration::from_millis(120);
+
+/// Whitespace is dropped before matching: prompts wrap and indent long text.
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+pub(crate) fn screen_shows(lines: &[String], expect: &[String]) -> bool {
+    let screen = squash(&lines.concat());
+    expect.iter().all(|e| screen.contains(&squash(e)))
+}
+
+fn screen_lines(port: i32) -> Option<Vec<String>> {
+    let screen = query_screen(port)?;
+    Some(
+        screen
+            .get("lines")?
+            .as_array()?
+            .iter()
+            .filter_map(|l| l.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// The agent's terminal screen, one string per row; `None` without a PTY.
+pub(crate) fn screen_of(db: &HcomDb, name: &str) -> Option<Vec<String>> {
+    screen_lines(get_inject_port(db, name)?)
+}
+
+/// Send each step's keys once its text is on screen. Stops at the first
+/// step whose text does not appear, so keys never land in a prompt that
+/// changed or was already answered in the terminal.
+pub fn answer_on_screen(db: &HcomDb, name: &str, steps: &[ScreenStep]) -> Result<String, String> {
+    let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
+    for (i, step) in steps.iter().enumerate() {
+        let deadline = Instant::now() + STEP_SCREEN_TIMEOUT;
+        loop {
+            if screen_lines(port).is_some_and(|lines| screen_shows(&lines, &step.expect)) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(if i == 0 {
+                    format!("the prompt is no longer on {name}'s screen; nothing sent")
+                } else {
+                    format!("{name}'s screen changed after step {i}; answer the rest there")
+                });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for chunk in &step.keys {
+            inject_raw(port, chunk)?;
+            std::thread::sleep(KEY_GAP);
+        }
+    }
+    Ok(format!("Sent keys to {name}"))
+}
+
 /// Poll the screen until the injected text exclusively fills the input box
 /// before returning, so Enter is sent once the TUI has actually rendered it
 /// rather than after a guessed delay. Tools with no input-box parser (e.g.
@@ -467,6 +535,27 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn screen_shows_ignores_wrapping() {
+        let lines: Vec<String> = [
+            "  · 검증 로직은 그대로인데 기존 테스트가",
+            "     확인하지 않는 케이스가 있습니다.",
+            "Enter to select · Esc to cancel",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(screen_shows(
+            &lines,
+            &[
+                "검증 로직은 그대로인데 기존 테스트가 확인하지 않는 케이스가 있습니다.".into(),
+                "Esc to cancel".into()
+            ]
+        ));
+        assert!(!screen_shows(&lines, &["Ready to submit".into()]));
+        assert!(screen_shows(&lines, &[]));
+    }
 
     fn test_db() -> HcomDb {
         let dir = tempfile::tempdir().unwrap();

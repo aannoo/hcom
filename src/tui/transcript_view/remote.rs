@@ -396,6 +396,7 @@ impl RemoteTranscriptWorker {
                 failure: e.failure.as_deref(),
                 loading: e.job.is_some(),
                 email: None,
+                prompt: None,
             },
             None => ConversationSnapshot::default(),
         }

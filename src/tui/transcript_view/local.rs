@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::convert::turn_from_exchange;
 use super::model::{ConversationSnapshot, LocalSource, TurnView};
+use super::prompt::{ScreenPrompt, parse_screen};
 use crate::accounts::EmailCache;
 use crate::tool::Tool;
 use crate::transcript::{self, ReadOptions};
@@ -21,12 +22,15 @@ struct Request {
     config_dir: Option<String>,
     tool: Option<Tool>,
     force: bool,
+    /// The agent waits on its terminal: read the prompt off its screen.
+    prompt_of: Option<String>,
 }
 
 struct Reply {
     source: LocalSource,
     turns: Result<Vec<TurnView>, String>,
     email: Option<String>,
+    prompt: Option<ScreenPrompt>,
 }
 
 struct Entry {
@@ -35,6 +39,7 @@ struct Entry {
     last_success: Option<Instant>,
     failure: Option<String>,
     email: Option<String>,
+    prompt: Option<ScreenPrompt>,
 }
 
 struct Cached {
@@ -110,22 +115,34 @@ fn read_turns(req: &Request, cache: &mut Vec<Cached>) -> Result<Vec<TurnView>, S
     })
 }
 
-fn collect(req: Request, cache: &mut Vec<Cached>, emails: &mut EmailCache) -> Reply {
+fn collect(
+    req: Request,
+    cache: &mut Vec<Cached>,
+    emails: &mut EmailCache,
+    db: &mut Option<crate::db::HcomDb>,
+) -> Reply {
     let turns = read_turns(&req, cache);
     let email = req
         .tool
         .and_then(|tool| emails.email(tool, req.config_dir.as_deref().map(Path::new)));
+    let prompt = req.prompt_of.as_deref().and_then(|name| {
+        if db.is_none() {
+            *db = crate::db::HcomDb::open().ok();
+        }
+        parse_screen(&crate::commands::term::screen_of(db.as_ref()?, name)?)
+    });
     Reply {
         source: req.source,
         turns,
         email,
+        prompt,
     }
 }
 
 /// Transcripts only grow while the agent works; idle rechecks catch late writes.
 fn recheck_interval(status: Option<AgentStatus>) -> Duration {
     match status {
-        Some(AgentStatus::Active) => Duration::from_secs(2),
+        Some(AgentStatus::Active | AgentStatus::Blocked) => Duration::from_secs(2),
         _ => Duration::from_secs(30),
     }
 }
@@ -175,6 +192,7 @@ impl LocalTranscriptWorker {
                             last_success: None,
                             failure: None,
                             email: None,
+                            prompt: None,
                         });
                         self.entries.len() - 1
                     }
@@ -189,6 +207,7 @@ impl LocalTranscriptWorker {
                     Err(e) => entry.failure = Some(e),
                 }
                 entry.email = reply.email;
+                entry.prompt = reply.prompt;
             }
         }
 
@@ -207,8 +226,12 @@ impl LocalTranscriptWorker {
                 std::thread::spawn(move || {
                     let mut cache = Vec::new();
                     let mut emails = EmailCache::default();
+                    let mut db = None;
                     while let Ok(req) = requests.recv() {
-                        if results.send(collect(req, &mut cache, &mut emails)).is_err() {
+                        if results
+                            .send(collect(req, &mut cache, &mut emails, &mut db))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -221,6 +244,9 @@ impl LocalTranscriptWorker {
                     config_dir: config_dir.map(String::from),
                     tool: agent.tool.canonical(),
                     force: self.force,
+                    prompt_of: (agent.status == AgentStatus::Blocked
+                        && agent.tool.canonical() == Some(Tool::Claude))
+                    .then(|| agent.name.clone()),
                 })
                 .is_ok();
             self.checked = Some(now);
@@ -244,6 +270,7 @@ impl LocalTranscriptWorker {
                 failure: e.failure.as_deref(),
                 loading,
                 email: e.email.as_deref(),
+                prompt: e.prompt.as_ref(),
             },
             None => ConversationSnapshot {
                 loading,
@@ -262,6 +289,20 @@ impl LocalTranscriptWorker {
 
     pub fn has_pending_timer(&self) -> bool {
         self.pending
+    }
+
+    #[cfg(test)]
+    pub fn set_prompt_for_test(&mut self, agent: &Agent, prompt: ScreenPrompt) {
+        let source = LocalSource::for_agent(agent).expect("agent has a transcript");
+        self.entries.retain(|e| e.source != source);
+        self.entries.push(Entry {
+            source,
+            turns: Some(Vec::new()),
+            last_success: None,
+            failure: None,
+            email: None,
+            prompt: Some(prompt),
+        });
     }
 }
 
