@@ -85,7 +85,25 @@ pub fn parse_screen(lines: &[String]) -> Option<ScreenPrompt> {
     let first = lines[..=cursor]
         .iter()
         .rposition(|l| option_line(l).is_some_and(|(n, _, _)| n == 1))?;
-    let top = lines[..first].iter().rposition(|l| is_rule(l))? + 1;
+    // A permission prompt draws its command between dashed lines, and a
+    // command line can look like a rule. The top is the nearest rule outside
+    // a dashed pair. A dashed line above it means the pairs cannot be told
+    // apart (a command can draw dashed lines too), so nothing is read.
+    let mut inside = false;
+    let mut top = None;
+    for (i, line) in lines[..first].iter().enumerate().rev() {
+        if is_dashed(line) {
+            inside = !inside;
+        } else if !inside && is_rule(line) {
+            top = Some(i);
+            break;
+        }
+    }
+    let top = top?;
+    if lines[..top].iter().any(|l| is_dashed(l)) {
+        return None;
+    }
+    let top = top + 1;
 
     let mut tabs = None;
     let mut question = Vec::new();
@@ -335,6 +353,85 @@ Ready to submit your answers?
         let other = text.replace(" touch probe-perm.txt\n", " rm -rf build\n");
         assert_ne!(other, text);
         assert!(!expect.shown_on(&screen(&other)));
+    }
+
+    /// `PERMISSION` with `command` in place of its one command line.
+    fn permission_with(command: &str) -> String {
+        const PERMISSION: &str = "  ⎿  earlier output
+────────────────────────────────
+ Bash command
+ Run the build
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+COMMAND
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend";
+        PERMISSION.replace("COMMAND", command)
+    }
+
+    /// SEC-002: a rule-like line inside the command is not the prompt's
+    /// top, so no command line is left out of what the user approves.
+    #[test]
+    fn a_rule_inside_the_command_keeps_the_whole_command() {
+        let text = permission_with(
+            " make clean
+ ────────────────────────────────
+ make build",
+        );
+        let p = parse_screen(&screen(&text)).unwrap();
+        assert_eq!(
+            p.question,
+            vec![
+                "Bash command",
+                "Run the build",
+                "make clean",
+                "────────────────────────────────",
+                "make build",
+                "This command requires approval",
+                "Do you want to proceed?",
+            ]
+        );
+        // The line above the rule is part of the match as well.
+        let other = text.replace(" make clean\n", " make other\n");
+        assert!(!p.pick(1).unwrap().expect.shown_on(&screen(&other)));
+    }
+
+    /// SEC-002: when the command draws its own rule and dashed line, the
+    /// prompt's bounds are not known, and the prompt cannot be answered
+    /// from the TUI.
+    #[test]
+    fn a_command_that_draws_prompt_lines_is_not_read() {
+        // A rule and a dashed line that look like the start of a prompt.
+        let forged = permission_with(
+            " make clean
+────────────────────────────────
+ Bash command
+ Run the build
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ make build",
+        );
+        assert_eq!(parse_screen(&screen(&forged)), None);
+        // Dashed lines that do not pair up.
+        let unpaired = permission_with(
+            " make build
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+        );
+        assert_eq!(parse_screen(&screen(&unpaired)), None);
+        // An unpaired dashed line with a rule inside it.
+        let unpaired_rule = permission_with(
+            " make clean
+────────────────────────────────
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ make build",
+        );
+        assert_eq!(parse_screen(&screen(&unpaired_rule)), None);
+        // The plain prompt still reads.
+        assert!(parse_screen(&screen(&permission_with(" make build"))).is_some());
     }
 
     #[test]
