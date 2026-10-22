@@ -424,6 +424,10 @@ pub fn send_message(
             data["reply_to"] = serde_json::json!(reply_to);
             // Resolve to local event ID
             if let Some(local_id) = resolve_reply_to_local(db, reply_to) {
+                data["reply_to"] = serde_json::json!(
+                    portable_reply_to(db, reply_to, local_id)
+                        .ok_or("Invalid --reply-to: relay origin is malformed or ambiguous")?
+                );
                 data["reply_to_local"] = serde_json::json!(local_id);
 
                 // Ack-on-ack loop prevention
@@ -532,6 +536,33 @@ fn resolve_reply_to_local(db: &HcomDb, reply_to: &str) -> Option<i64> {
 
         if exists { Some(local_id) } else { None }
     }
+}
+
+/// A bare local reference to an imported message must travel as its origin
+/// reference. Keep explicit qualified references and genuine local references
+/// unchanged. Refuse corrupt/duplicate relay identities rather than exporting a
+/// device-local number that could identify an unrelated message elsewhere.
+fn portable_reply_to(db: &HcomDb, supplied: &str, local_id: i64) -> Option<String> {
+    if crate::relay::control::split_device_suffix(supplied.trim()).is_some() {
+        return Some(supplied.to_string());
+    }
+    let raw: String = db
+        .conn()
+        .query_row(
+            "SELECT data FROM events WHERE id = ? AND type = 'message'",
+            [local_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let data: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let Some(relay) = data.get("_relay") else {
+        return Some(supplied.to_string());
+    };
+    let origin_id = relay.get("id")?.as_i64()?;
+    let short = relay.get("short")?.as_str()?;
+    let qualified = format!("{origin_id}:{short}");
+    crate::relay::control::split_device_suffix(&qualified)?;
+    (resolve_reply_to_local(db, &qualified) == Some(local_id)).then_some(qualified)
 }
 
 /// Get thread from an event (for --reply-to thread inheritance).
@@ -836,6 +867,11 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     if let Some(ref reply_to) = envelope.reply_to {
         if let Some(local_id) = resolve_reply_to_local(db, reply_to) {
+            // Refuse before any inline bundle is created; send_message repeats this check for its direct callers.
+            if portable_reply_to(db, reply_to, local_id).is_none() {
+                eprintln!("Error: Invalid --reply-to: relay origin is malformed or ambiguous");
+                return 1;
+            }
             if envelope.thread.is_none()
                 && let Some(parent_thread) = get_thread_from_event(db, local_id)
             {
@@ -2074,6 +2110,166 @@ mod tests {
         assert_eq!(reply_to_local, Some(100));
         assert_eq!(thread.as_deref(), Some("thread-remote-99"));
 
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cmd_send_bare_imported_reply_preserves_origin() {
+        let (db, path, _env) = setup_test_db();
+        db.conn().execute(
+            "INSERT INTO instances (name, created_at) VALUES ('sender', 1000.0), ('target', 1000.0)",
+            [],
+        ).unwrap();
+        // A bare reply names the receiving device's local row (100), which differs
+        // from the origin event ID (42).
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote request",
+            Some("origin-thread"),
+            Some("request"),
+        );
+        db.conn().execute(
+            "INSERT INTO events (id, type, instance, timestamp, data)
+             VALUES (42, 'message', 'target', '2026-09-04T00:00:00Z', ?)",
+            [serde_json::json!({"from":"target", "text":"local request", "intent":"request"}).to_string()],
+        ).unwrap();
+        for (supplied, expected, local) in [
+            ("100", "42:BOXE", 100),
+            ("42:BOXE", "42:BOXE", 100),
+            ("42", "42", 42),
+        ] {
+            let mut args = SendArgs::try_parse_from([
+                "send",
+                "@target",
+                "--from",
+                "sender",
+                "--intent",
+                "ack",
+                "--reply-to",
+                supplied,
+                "--",
+                "reply text",
+            ])
+            .unwrap();
+            args.had_separator = true;
+            assert_eq!(cmd_send(&db, &args, None), 0);
+            let raw: String = db
+                .conn()
+                .query_row(
+                    "SELECT data FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(data["reply_to"], expected);
+            assert_eq!(data["reply_to_local"], local);
+            assert_eq!(data["intent"], "ack");
+            assert_eq!(data["text"], "reply text");
+            assert_eq!(data["from"], "sender");
+            assert_eq!(data["delivered_to"], serde_json::json!(["target"]));
+            if local == 100 {
+                assert_eq!(data["thread"], "origin-thread");
+            }
+        }
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cmd_send_bare_imported_reply_invalid_origin_emits_no_message() {
+        let (db, path, _env) = setup_test_db();
+        db.conn().execute(
+            "INSERT INTO instances (name, created_at) VALUES ('sender', 1000.0), ('target', 1000.0)",
+            [],
+        ).unwrap();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "request",
+            None,
+            Some("request"),
+        );
+        insert_imported_remote_message(
+            &db,
+            101,
+            serde_json::json!(42),
+            "BOXE",
+            "duplicate",
+            None,
+            Some("request"),
+        );
+        insert_imported_remote_message(
+            &db,
+            102,
+            serde_json::json!("43"),
+            "BOXE",
+            "bad ID type",
+            None,
+            Some("request"),
+        );
+        insert_imported_remote_message(
+            &db,
+            103,
+            serde_json::json!(44),
+            "boxe",
+            "bad suffix",
+            None,
+            Some("request"),
+        );
+        let count = || {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = count();
+        for supplied in ["100", "101", "102", "103", "999", "42:BOXE"] {
+            let mut args = SendArgs::try_parse_from([
+                "send",
+                "@target",
+                "--from",
+                "sender",
+                "--reply-to",
+                supplied,
+                "--",
+                "reply",
+            ])
+            .unwrap();
+            args.had_separator = true;
+            assert_eq!(cmd_send(&db, &args, None), 1, "must refuse {supplied}");
+            assert_eq!(count(), before, "must not store a reply to {supplied}");
+        }
+        // The refusal comes before an inline bundle, so a refused reply creates no bundle event either.
+        let mut args = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--reply-to",
+            "100",
+            "--title",
+            "context",
+            "--description",
+            "bundle with a refused reply",
+            "--events",
+            "100",
+            "--files",
+            "src/main.rs",
+            "--transcript",
+            "1-2:normal",
+            "--",
+            "reply",
+        ])
+        .unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, None), 1, "must refuse a bundled reply");
+        assert_eq!(count(), before, "must not create a bundle for a refused reply");
         cleanup_test_db(path);
     }
 
