@@ -7,7 +7,7 @@
 //! by it. With several questions or a multi-select one the prompt has tabs:
 //! a single-select digit moves to the next tab, multi-select digits toggle
 //! and → moves on, and the last tab submits on `1`.
-use crate::commands::term::ScreenStep;
+use crate::commands::term::{ScreenCheck, ScreenStep};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenOption {
@@ -154,39 +154,31 @@ impl ScreenPrompt {
         self.options.iter().any(|o| o.checked.is_some())
     }
 
-    /// Everything this prompt shows, so a key never answers a different
-    /// prompt that happens to share a first line (`Bash command`).
-    fn expect(&self) -> Vec<String> {
-        let mut expect: Vec<String> = self.tabs.iter().cloned().collect();
-        expect.extend(self.question.iter().cloned());
-        expect.extend(self.options.iter().map(|o| {
-            let checkbox = match o.checked {
-                Some(true) => "[✔] ",
-                Some(false) => "[ ] ",
-                None => "",
-            };
-            format!("{}. {checkbox}{}", o.number, o.label)
-        }));
-        expect.push(self.anchor.clone());
-        expect
-    }
-
     /// Digit `n`: the step that sends it. `None` for an option that needs
     /// typing in the terminal, or no such option.
-    pub fn pick(&self, n: usize) -> Option<ScreenStep> {
+    pub fn pick(&self, n: usize) -> Option<ScreenStep<ScreenPrompt>> {
         let option = self.options.iter().find(|o| o.number == n)?;
         (!option.needs_typing()).then(|| ScreenStep {
-            expect: self.expect(),
+            expect: self.clone(),
             keys: vec![n.to_string().into_bytes()],
         })
     }
 
     /// Enter on a multi-select question: move to the next tab.
-    pub fn next(&self) -> Option<ScreenStep> {
+    pub fn next(&self) -> Option<ScreenStep<ScreenPrompt>> {
         self.is_multi().then(|| ScreenStep {
-            expect: self.expect(),
+            expect: self.clone(),
             keys: vec![b"\x1b[C".to_vec()],
         })
+    }
+}
+
+/// The screen is read again just before a key goes out, and must parse to
+/// this same prompt: question, options, tab row and anchor. A different
+/// prompt that repeats this one's text in its own command does not match.
+impl ScreenCheck for ScreenPrompt {
+    fn shown_on(&self, lines: &[String]) -> bool {
+        parse_screen(lines).as_ref() == Some(self)
     }
 }
 
@@ -225,18 +217,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert_eq!(
             p.pick(2),
             Some(ScreenStep {
-                expect: vec![
-                    "☐ fruit  ☐ drink  ✔ Submit".into(),
-                    "과일?".into(),
-                    "1. 사과".into(),
-                    "2. 배".into(),
-                    "3. Type something.".into(),
-                    "4. Chat about this".into(),
-                    FOOTER.into(),
-                ],
+                expect: p.clone(),
                 keys: vec![b"2".to_vec()],
             })
         );
+        assert_eq!(p.anchor, FOOTER);
+        assert!(p.pick(2).unwrap().expect.shown_on(&screen(TABBED)));
         assert_eq!(p.pick(3), None, "typing happens in the terminal");
         assert_eq!(p.pick(4), None);
         assert_eq!(p.pick(7), None);
@@ -270,8 +256,17 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert_eq!(next.keys, vec![b"\x1b[C".to_vec()]);
         // Checkbox state is part of the match: a toggle in the terminal
         // makes the step stale.
-        assert!(next.expect.contains(&"1. [✔] 물".to_string()));
-        assert!(next.expect.contains(&"2. [ ] 차".to_string()));
+        assert!(next.expect.shown_on(&screen(text)));
+        assert!(
+            !next
+                .expect
+                .shown_on(&screen(&text.replace("[✔] 물", "[ ] 물")))
+        );
+        assert!(
+            !next
+                .expect
+                .shown_on(&screen(&text.replace("[ ] 차", "[✔] 차")))
+        );
     }
 
     #[test]
@@ -292,9 +287,15 @@ Ready to submit your answers?
         assert_eq!(p.question.last().unwrap(), "Ready to submit your answers?");
         // No footer on this screen: the cursor line anchors it.
         let expect = p.pick(1).unwrap().expect;
-        assert_eq!(expect.first().unwrap(), "☒ fruit  ☒ drink  ✔ Submit");
-        assert!(expect.contains(&"Review your answers".to_string()));
-        assert_eq!(expect.last().unwrap(), "1. Submit answers");
+        assert_eq!(expect.tabs.as_deref(), Some("☒ fruit  ☒ drink  ✔ Submit"));
+        assert!(expect.question.contains(&"Review your answers".to_string()));
+        assert_eq!(expect.anchor, "1. Submit answers");
+        assert!(expect.shown_on(&screen(text)));
+        // The cursor moved to Cancel: no longer the screen the key was for.
+        let moved = text
+            .replace("❯ 1. Submit answers", "  1. Submit answers")
+            .replace("  2. Cancel", "❯ 2. Cancel");
+        assert!(!expect.shown_on(&screen(&moved)));
     }
 
     #[test]
@@ -329,20 +330,11 @@ Ready to submit your answers?
         assert_eq!(p.options.len(), 3);
         assert_eq!(p.options[1].description, "/private/tmp/scratchpad");
         // The command line is matched, not only the generic first line.
-        assert_eq!(
-            p.pick(1).unwrap().expect,
-            vec![
-                "Bash command",
-                "Create probe-perm.txt in the working directory",
-                "touch probe-perm.txt",
-                "This command requires approval",
-                "Do you want to proceed?",
-                "1. Yes",
-                "2. Yes, and don't ask again for touch commands in",
-                "3. No",
-                FOOTER,
-            ]
-        );
+        let expect = p.pick(1).unwrap().expect;
+        assert!(expect.shown_on(&screen(text)));
+        let other = text.replace(" touch probe-perm.txt\n", " rm -rf build\n");
+        assert_ne!(other, text);
+        assert!(!expect.shown_on(&screen(&other)));
     }
 
     #[test]
@@ -354,7 +346,7 @@ Ready to submit your answers?
         assert_eq!(p.question, vec!["과일?"]);
         assert_eq!(p.options.len(), 4);
         assert_eq!(p.options[0].description, "사과를 선택합니다");
-        assert_eq!(p.pick(1).unwrap().expect.last().unwrap(), FOOTER);
+        assert_eq!(p.pick(1).unwrap().expect.anchor, FOOTER);
     }
 
     #[test]

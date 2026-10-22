@@ -117,11 +117,18 @@ pub fn inject_text_remote_result(
     Ok(label)
 }
 
-/// One step of answering a prompt in an agent's terminal: every `expect`
-/// string must be on screen before `keys` are sent, one chunk at a time.
+/// What a step answers. Keys go out only while the screen shows exactly
+/// it: the caller reads the screen the way it read the prompt it showed,
+/// so a different prompt that merely contains the same text does not pass.
+pub trait ScreenCheck {
+    fn shown_on(&self, lines: &[String]) -> bool;
+}
+
+/// One step of answering a prompt in an agent's terminal: `keys` are sent,
+/// one chunk at a time, once `expect` is what the screen shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScreenStep {
-    pub expect: Vec<String>,
+pub struct ScreenStep<C> {
+    pub expect: C,
     pub keys: Vec<Vec<u8>>,
 }
 
@@ -129,24 +136,6 @@ const STEP_SCREEN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Gap between key chunks, so the agent's TUI reads each as its own key
 /// rather than one pasted string.
 const KEY_GAP: Duration = Duration::from_millis(120);
-
-/// Whitespace runs fold to one space, so text that wraps and indents
-/// differently still matches, while `echo "a b"` stays distinct from
-/// `echo "ab"`.
-fn squash(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// A step with nothing to match would send its keys blind.
-fn has_expect(expect: &[String]) -> bool {
-    expect.iter().any(|e| !squash(e).is_empty())
-}
-
-pub(crate) fn screen_shows(lines: &[String], expect: &[String]) -> bool {
-    // Rows join with a space: a wrapped line breaks where a space was.
-    let screen = squash(&lines.join(" "));
-    has_expect(expect) && expect.iter().all(|e| screen.contains(&squash(e)))
-}
 
 fn screen_lines(port: i32) -> Option<Vec<String>> {
     let screen = query_screen(port)?;
@@ -165,14 +154,15 @@ pub(crate) fn screen_of(db: &HcomDb, name: &str) -> Option<Vec<String>> {
     screen_lines(get_inject_port(db, name)?)
 }
 
-/// Send each step's keys once its text is on screen. Stops at the first
-/// step whose text does not appear. Best effort: the screen is read just
+/// Send each step's keys once the screen shows what it answers. Stops at
+/// the first step whose prompt does not appear. The screen is read just
 /// before the keys go out, so a prompt that changes in between can still
 /// receive them.
-pub fn answer_on_screen(db: &HcomDb, name: &str, steps: &[ScreenStep]) -> Result<String, String> {
-    if steps.iter().any(|s| !has_expect(&s.expect)) {
-        return Err(format!("nothing to match on {name}'s screen; nothing sent"));
-    }
+pub fn answer_on_screen<C: ScreenCheck>(
+    db: &HcomDb,
+    name: &str,
+    steps: &[ScreenStep<C>],
+) -> Result<String, String> {
     let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
     for (i, step) in steps.iter().enumerate() {
         let deadline = Instant::now() + STEP_SCREEN_TIMEOUT;
@@ -180,7 +170,7 @@ pub fn answer_on_screen(db: &HcomDb, name: &str, steps: &[ScreenStep]) -> Result
             let lines = screen_lines(port);
             if lines
                 .as_ref()
-                .is_some_and(|lines| screen_shows(lines, &step.expect))
+                .is_some_and(|lines| step.expect.shown_on(lines))
             {
                 break;
             }
@@ -561,36 +551,6 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    #[test]
-    fn screen_shows_ignores_wrapping() {
-        let lines: Vec<String> = [
-            "  · 검증 로직은 그대로인데 기존 테스트가",
-            "     확인하지 않는 케이스가 있습니다.",
-            "Enter to select · Esc to cancel",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert!(screen_shows(
-            &lines,
-            &[
-                "검증 로직은 그대로인데 기존 테스트가 확인하지 않는 케이스가 있습니다.".into(),
-                "Esc to cancel".into()
-            ]
-        ));
-        assert!(!screen_shows(&lines, &["Ready to submit".into()]));
-        // Nothing to match is not a match.
-        assert!(!screen_shows(&lines, &[]));
-        assert!(!screen_shows(&lines, &[" ".into()]));
-    }
-
-    #[test]
-    fn screen_shows_keeps_spaces_inside_text() {
-        let lines = vec![" echo \"a b\"".to_string(), "Esc to cancel".to_string()];
-        assert!(screen_shows(&lines, &["echo \"a b\"".into()]));
-        assert!(!screen_shows(&lines, &["echo \"ab\"".into()]));
-    }
-
     fn test_db() -> HcomDb {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -712,18 +672,42 @@ mod tests {
         keys
     }
 
-    const PROMPT: [&str; 4] = [
+    use crate::tui::transcript_view::prompt::{ScreenPrompt, parse_screen};
+
+    /// The prompt the TUI read off the screen and answers with `2`.
+    const PROMPT: [&str; 11] = [
+        "────────────────────────────────",
         " Bash command",
+        " Create probe-perm.txt",
+        "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
         " touch probe-perm.txt",
+        "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+        " Do you want to proceed?",
         " ❯ 1. Yes",
+        "   2. Yes, and don't ask again",
+        "   3. No",
         " Esc to cancel · Tab to amend",
     ];
 
-    fn step(expect: &[&str]) -> ScreenStep {
+    fn lines(screen: &[&str]) -> Vec<String> {
+        screen.iter().map(|l| l.to_string()).collect()
+    }
+
+    fn step(screen: &[&str]) -> ScreenStep<ScreenPrompt> {
         ScreenStep {
-            expect: expect.iter().map(|e| e.to_string()).collect(),
+            expect: parse_screen(&lines(screen)).unwrap(),
             keys: vec![b"2".to_vec()],
         }
+    }
+
+    fn sent(keys: &std::sync::Mutex<Vec<Vec<u8>>>) -> Vec<Vec<u8>> {
+        for _ in 0..100 {
+            if !keys.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        keys.lock().unwrap().clone()
     }
 
     #[test]
@@ -731,37 +715,33 @@ mod tests {
         let db = test_db();
         let keys = fake_terminal(&db, &PROMPT);
 
-        let err = answer_on_screen(
-            &db,
-            "luna",
-            &[step(&["Bash command", "rm -rf build", "Esc to cancel"])],
-        )
-        .unwrap_err();
+        let mut other = PROMPT;
+        other[4] = " rm -rf build";
+        let err = answer_on_screen(&db, "luna", &[step(&other)]).unwrap_err();
         assert_eq!(
             err,
             "the prompt is no longer on luna's screen; nothing sent"
         );
-        let err = answer_on_screen(&db, "luna", &[step(&[" "])]).unwrap_err();
-        assert!(err.contains("nothing sent"), "{err}");
         assert!(keys.lock().unwrap().is_empty());
 
-        let ok = answer_on_screen(
-            &db,
-            "luna",
-            &[step(&[
-                "Bash command",
-                "touch probe-perm.txt",
-                "Esc to cancel",
-            ])],
-        );
+        let ok = answer_on_screen(&db, "luna", &[step(&PROMPT)]);
         assert_eq!(ok, Ok("Sent keys to luna".to_string()));
-        for _ in 0..100 {
-            if !keys.lock().unwrap().is_empty() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(*keys.lock().unwrap(), vec![b"2".to_vec()]);
+        assert_eq!(sent(&keys), vec![b"2".to_vec()]);
+    }
+
+    /// SEC-003: a key meant for prompt A must not reach a later prompt B
+    /// whose command contains A's. Every line of A is somewhere on B's
+    /// screen, so a text-contains match would send it.
+    #[test]
+    fn answer_on_screen_blocks_a_prompt_that_contains_the_answered_one() {
+        let db = test_db();
+        let mut b = PROMPT;
+        b[4] = " touch probe-perm.txt; touch other.txt";
+        assert!(parse_screen(&lines(&b)).is_some(), "B is a prompt");
+        let keys = fake_terminal(&db, &b);
+        let err = answer_on_screen(&db, "luna", &[step(&PROMPT)]).unwrap_err();
+        assert!(err.contains("nothing sent"), "{err}");
+        assert!(keys.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -779,7 +759,7 @@ mod tests {
                 rusqlite::params!["luna", port],
             )
             .unwrap();
-        let err = answer_on_screen(&db, "luna", &[step(&["Esc to cancel"])]).unwrap_err();
+        let err = answer_on_screen(&db, "luna", &[step(&PROMPT)]).unwrap_err();
         assert_eq!(err, "no response from luna's terminal; nothing sent");
     }
 

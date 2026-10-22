@@ -54,7 +54,9 @@ pub enum RpcOp {
     /// Answer a question waiting in an agent's terminal.
     AnswerPrompt {
         name: String,
-        steps: Vec<crate::commands::term::ScreenStep>,
+        steps: Vec<
+            crate::commands::term::ScreenStep<crate::tui::transcript_view::prompt::ScreenPrompt>,
+        >,
     },
 }
 
@@ -74,7 +76,9 @@ impl RpcClient {
         Self::start_with(run_op)
     }
 
-    fn start_with(run: impl Fn(&RpcOp) -> Result<Response, String> + Send + 'static) -> Self {
+    pub(crate) fn start_with(
+        run: impl Fn(&RpcOp) -> Result<Response, String> + Send + 'static,
+    ) -> Self {
         let (tx_req, rx_req) = mpsc::channel::<RpcOp>();
         let (tx_res, rx_res) = mpsc::channel::<RpcResult>();
 

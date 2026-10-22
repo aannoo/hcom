@@ -34,6 +34,7 @@ struct Request {
     force: bool,
     /// The agent waits on its terminal: read the prompt off its screen.
     prompt_of: Option<String>,
+    prompt_epoch: u64,
 }
 
 struct Reply {
@@ -41,6 +42,7 @@ struct Reply {
     turns: Result<Vec<TurnView>, String>,
     email: Option<String>,
     prompt: Option<ScreenPrompt>,
+    prompt_epoch: u64,
 }
 
 struct Entry {
@@ -132,6 +134,7 @@ fn collect(
     db: &mut Option<crate::db::HcomDb>,
 ) -> Reply {
     let turns = read_turns(&req, cache);
+    let prompt_epoch = req.prompt_epoch;
     let email = req
         .tool
         .and_then(|tool| emails.email(tool, req.config_dir.as_deref().map(Path::new)));
@@ -147,6 +150,7 @@ fn collect(
         turns,
         email,
         prompt,
+        prompt_epoch,
     }
 }
 
@@ -168,6 +172,9 @@ pub struct LocalTranscriptWorker {
     status: Option<(AgentStatus, u64)>,
     force: bool,
     entries: Vec<Entry>,
+    /// Bumped when an answered prompt is dropped: a screen read sent
+    /// before the answer must not bring it back.
+    prompt_epoch: u64,
 }
 
 impl LocalTranscriptWorker {
@@ -228,7 +235,9 @@ impl LocalTranscriptWorker {
                     Err(e) => entry.failure = Some(e),
                 }
                 entry.email = reply.email;
-                entry.prompt = reply.prompt;
+                entry.prompt = reply
+                    .prompt
+                    .filter(|_| reply.prompt_epoch == self.prompt_epoch);
             }
         }
         if gone {
@@ -256,6 +265,7 @@ impl LocalTranscriptWorker {
                     let mut db = None;
                     while let Ok(req) = requests.recv() {
                         let source = req.source.clone();
+                        let prompt_epoch = req.prompt_epoch;
                         let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             collect(req, &mut cache, &mut emails, &mut db)
                         }))
@@ -268,6 +278,7 @@ impl LocalTranscriptWorker {
                                 turns: Err("read panicked".to_string()),
                                 email: None,
                                 prompt: None,
+                                prompt_epoch,
                             }
                         });
                         if results.send(reply).is_err() {
@@ -293,6 +304,7 @@ impl LocalTranscriptWorker {
                     prompt_of: (agent.status == AgentStatus::Blocked
                         && agent.tool.canonical() == Some(Tool::Claude))
                     .then(|| agent.name.clone()),
+                    prompt_epoch: self.prompt_epoch,
                 })
                 .is_ok();
             self.checked = Some(now);
@@ -335,6 +347,20 @@ impl LocalTranscriptWorker {
 
     pub fn has_pending_timer(&self) -> bool {
         self.pending
+    }
+
+    /// An answer to `agent`'s prompt went out: forget the prompt until the
+    /// screen is read again, so no second key is sent against it.
+    pub fn drop_prompt(&mut self, agent: &Agent) {
+        let source = LocalSource::for_agent(agent);
+        self.prompt_epoch += 1;
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| Some(&e.source) == source.as_ref())
+        {
+            entry.prompt = None;
+        }
     }
 
     #[cfg(test)]

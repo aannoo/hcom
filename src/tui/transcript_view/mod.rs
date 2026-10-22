@@ -8,7 +8,7 @@ pub mod prompt;
 pub mod remote;
 pub mod render;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 pub use model::*;
@@ -28,6 +28,9 @@ pub struct TranscriptView {
     pub expanded: HashMap<String, bool>,
     pub local: local::LocalTranscriptWorker,
     pub remote: remote::RemoteTranscriptWorker,
+    /// Agents with an answer on its way: one at a time, so a repeated key
+    /// does not land on whatever prompt comes next.
+    pub answering: HashSet<String>,
 }
 
 /// `HCOM_TUI_TAB=chat` opens vertical view on the conversation tab.
@@ -149,6 +152,7 @@ impl App {
             return false;
         };
         let name = agent.name.clone();
+        let answering = self.transcript.answering.contains(&name);
         let step = match code {
             KeyCode::Char(c @ '1'..='9') => {
                 let n = (c as u8 - b'0') as usize;
@@ -171,14 +175,28 @@ impl App {
             },
             _ => return false,
         };
-        if let Err(e) = self.enqueue_rpc(crate::tui::rpc_async::RpcOp::AnswerPrompt {
-            name,
+        if answering {
+            self.ui.flash = Some(Flash::new(
+                format!("Still answering {name}: wait for its screen to update"),
+                Theme::flash_info(),
+            ));
+            return true;
+        }
+        let agent = agent.clone();
+        match self.enqueue_rpc(crate::tui::rpc_async::RpcOp::AnswerPrompt {
+            name: name.clone(),
             steps: vec![step],
         }) {
-            self.ui.flash = Some(Flash::new(
-                format!("Answer failed: {e}"),
-                Theme::flash_err(),
-            ));
+            Ok(()) => {
+                self.transcript.answering.insert(name);
+                self.transcript.local.drop_prompt(&agent);
+            }
+            Err(e) => {
+                self.ui.flash = Some(Flash::new(
+                    format!("Answer failed: {e}"),
+                    Theme::flash_err(),
+                ));
+            }
         }
         true
     }
@@ -355,6 +373,53 @@ Enter to select · Esc to cancel";
         // Enter still composes on a single-select question.
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.ui.mode, crate::tui::model::InputMode::Compose);
+    }
+
+    /// SEC-003: while an answer is on its way, the prompt it answered is
+    /// gone and a repeated key for the same agent is not sent: it would
+    /// otherwise land on whatever prompt the agent shows next.
+    #[test]
+    fn a_repeated_key_waits_for_the_answer_in_flight() {
+        let mut app = waiting_app(QUESTION);
+        app.rpc_client = Some(crate::tui::rpc_async::RpcClient::start_with(|_| {
+            Err("offline".into())
+        }));
+        app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(app.ui.flash.is_none());
+        assert!(app.transcript.answering.contains("luna"));
+        assert!(
+            app.waiting_prompt().is_none(),
+            "the answered prompt is dropped"
+        );
+        let sent = |app: &App| app.rpc_client.as_ref().unwrap().pending_count();
+        assert_eq!(sent(&app), 1);
+
+        // A screen read from before the answer shows the same prompt again.
+        let lines: Vec<String> = QUESTION.lines().map(String::from).collect();
+        app.transcript
+            .local
+            .set_prompt_for_test(&app.data.agents[0], prompt::parse_screen(&lines).unwrap());
+        app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        let flash = app.ui.flash.take().unwrap();
+        assert!(
+            flash.text.contains("Still answering luna"),
+            "{}",
+            flash.text
+        );
+        assert_eq!(sent(&app), 1, "nothing more is sent");
+
+        // The answer comes back: the next key may go out.
+        for _ in 0..200 {
+            if app.drain_rpc_results() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.transcript.answering.is_empty());
+        app.ui.flash = None;
+        app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(app.ui.flash.is_none());
+        assert!(app.transcript.answering.contains("luna"));
     }
 
     #[test]
