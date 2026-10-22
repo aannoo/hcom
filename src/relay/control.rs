@@ -706,10 +706,13 @@ fn string_list_param(params: &Value, key: &str) -> Vec<String> {
 }
 
 fn normalize_config_field(field: &str) -> String {
-    if field.starts_with("HCOM_") {
-        field.to_string()
+    // Config keys match case-insensitively, so the remote guards must compare
+    // the uppercased form or `hcom_relay_psk` would slip past them.
+    let upper = field.to_uppercase();
+    if upper.starts_with("HCOM_") {
+        upper
     } else {
-        format!("HCOM_{}", field.to_uppercase())
+        format!("HCOM_{upper}")
     }
 }
 
@@ -1979,14 +1982,16 @@ mod tests {
     #[test]
     fn test_handle_remote_config_get_blocks_relay_psk() {
         let db = test_db();
-        let err = handle_remote_config_get(
-            &db,
-            &json!({"fields": ["relay_psk"]}),
-            "initiator",
-            &HcomConfig::default(),
-        )
-        .unwrap_err();
-        assert_eq!(err, "relay_psk is not remotely queryable");
+        for field in ["relay_psk", "HCOM_relay_psk", "hcom_RELAY_PSK"] {
+            let err = handle_remote_config_get(
+                &db,
+                &json!({"fields": [field]}),
+                "initiator",
+                &HcomConfig::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err, "relay_psk is not remotely queryable");
+        }
     }
 
     #[test]
@@ -2031,7 +2036,12 @@ mod tests {
     #[test]
     fn test_handle_remote_config_set_blocks_relay_share_account() {
         let db = test_db();
-        for field in ["relay_share_account", "HCOM_RELAY_SHARE_ACCOUNT"] {
+        for field in [
+            "relay_share_account",
+            "HCOM_RELAY_SHARE_ACCOUNT",
+            "HCOM_relay_share_account",
+            "hcom_Relay_Share_Account",
+        ] {
             let err = handle_remote_config_set(
                 &db,
                 &json!({"field": field, "value": "1"}),
