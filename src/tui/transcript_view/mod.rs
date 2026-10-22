@@ -142,17 +142,43 @@ impl App {
         }
     }
 
+    /// The local agent under the cursor whose answer is still on its way,
+    /// when the conversation tab shows it.
+    fn answering_agent(&self) -> Option<String> {
+        if !self.conversation_visible() {
+            return None;
+        }
+        match resolve_target(&self.data, self.cursor_target()) {
+            ConversationTarget::Local { agent, .. }
+                if self.transcript.answering.contains(&agent.name) =>
+            {
+                Some(agent.name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// A digit picks an option of the waiting prompt; Enter moves on from a
     /// multi-select question. False when the key is not for the prompt.
     pub(crate) fn transcript_answer_key(&mut self, code: crossterm::event::KeyCode) -> bool {
         use crate::tui::model::Flash;
         use crate::tui::theme::Theme;
         use crossterm::event::KeyCode;
+        // The answered prompt is dropped until the screen is read again, so
+        // this comes first: otherwise a repeated Enter would compose.
+        if matches!(code, KeyCode::Char('1'..='9') | KeyCode::Enter)
+            && let Some(name) = self.answering_agent()
+        {
+            self.ui.flash = Some(Flash::new(
+                format!("Still answering {name}: wait for its screen to update"),
+                Theme::flash_info(),
+            ));
+            return true;
+        }
         let Some((agent, prompt)) = self.waiting_prompt() else {
             return false;
         };
         let name = agent.name.clone();
-        let answering = self.transcript.answering.contains(&name);
         let step = match code {
             KeyCode::Char(c @ '1'..='9') => {
                 let n = (c as u8 - b'0') as usize;
@@ -175,13 +201,6 @@ impl App {
             },
             _ => return false,
         };
-        if answering {
-            self.ui.flash = Some(Flash::new(
-                format!("Still answering {name}: wait for its screen to update"),
-                Theme::flash_info(),
-            ));
-            return true;
-        }
         let agent = agent.clone();
         match self.enqueue_rpc(crate::tui::rpc_async::RpcOp::AnswerPrompt {
             name: name.clone(),
@@ -420,6 +439,42 @@ Enter to select · Esc to cancel";
         app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
         assert!(app.ui.flash.is_none());
         assert!(app.transcript.answering.contains("luna"));
+    }
+
+    /// Right after an answer no prompt is cached until the screen is read
+    /// again: a second key is still held, and Enter does not compose.
+    #[test]
+    fn a_key_right_after_an_answer_is_held() {
+        use crate::tui::model::InputMode;
+        for screen in [QUESTION, MULTI] {
+            let mut app = waiting_app(screen);
+            app.rpc_client = Some(crate::tui::rpc_async::RpcClient::start_with(|_| {
+                Err("offline".into())
+            }));
+            let first = if screen == MULTI {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char('1')
+            };
+            app.handle_key(first, KeyModifiers::NONE);
+            assert!(app.ui.flash.is_none());
+            assert!(app.waiting_prompt().is_none());
+            let sent = |app: &App| app.rpc_client.as_ref().unwrap().pending_count();
+            assert_eq!(sent(&app), 1);
+
+            for key in [KeyCode::Enter, KeyCode::Char('2')] {
+                app.handle_key(key, KeyModifiers::NONE);
+                assert_eq!(app.ui.mode, InputMode::Navigate, "{key:?} composed");
+                assert!(app.ui.input.is_empty());
+                let flash = app.ui.flash.take().unwrap();
+                assert!(
+                    flash.text.contains("Still answering luna"),
+                    "{}",
+                    flash.text
+                );
+            }
+            assert_eq!(sent(&app), 1, "nothing more is sent");
+        }
     }
 
     #[test]

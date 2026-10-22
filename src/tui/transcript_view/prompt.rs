@@ -103,6 +103,17 @@ pub fn parse_screen(lines: &[String]) -> Option<ScreenPrompt> {
     if lines[..top].iter().any(|l| is_dashed(l)) {
         return None;
     }
+    // The top is only taken outside a pair, so the count below it is even.
+    // More than one pair means an unpaired line may have been paired off by
+    // one above the real top, and the top may be a scrollback rule.
+    if lines[top + 1..first]
+        .iter()
+        .filter(|l| is_dashed(l))
+        .count()
+        > 2
+    {
+        return None;
+    }
     let top = top + 1;
 
     let mut tabs = None;
@@ -430,6 +441,19 @@ COMMAND
  make build",
         );
         assert_eq!(parse_screen(&screen(&unpaired_rule)), None);
+        // An unpaired dashed line in the command, paired off by one in the
+        // scrollback: the top would land on a scrollback rule.
+        let scrollback = format!(
+            "  ⎿  older output
+────────────────────────────────
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+{}",
+            permission_with(
+                " make build
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌"
+            )
+        );
+        assert_eq!(parse_screen(&screen(&scrollback)), None);
         // The plain prompt still reads.
         assert!(parse_screen(&screen(&permission_with(" make build"))).is_some());
     }

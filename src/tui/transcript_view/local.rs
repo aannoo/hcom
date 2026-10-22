@@ -52,6 +52,38 @@ struct Entry {
     failure: Option<String>,
     email: Option<String>,
     prompt: Option<ScreenPrompt>,
+    /// Bumped when an answered prompt is dropped: a screen read sent
+    /// before the answer must not bring it back.
+    prompt_epoch: u64,
+}
+
+impl Entry {
+    fn new(source: LocalSource) -> Self {
+        Entry {
+            source,
+            turns: None,
+            last_success: None,
+            failure: None,
+            email: None,
+            prompt: None,
+            prompt_epoch: 0,
+        }
+    }
+}
+
+/// `source`'s entry, made (and the oldest dropped when full) if missing.
+fn entry_in<'a>(entries: &'a mut Vec<Entry>, source: &LocalSource) -> &'a mut Entry {
+    let idx = match entries.iter().position(|e| &e.source == source) {
+        Some(i) => i,
+        None => {
+            if entries.len() >= CACHE_LIMIT {
+                entries.remove(0);
+            }
+            entries.push(Entry::new(source.clone()));
+            entries.len() - 1
+        }
+    };
+    &mut entries[idx]
 }
 
 struct Cached {
@@ -172,9 +204,6 @@ pub struct LocalTranscriptWorker {
     status: Option<(AgentStatus, u64)>,
     force: bool,
     entries: Vec<Entry>,
-    /// Bumped when an answered prompt is dropped: a screen read sent
-    /// before the answer must not bring it back.
-    prompt_epoch: u64,
 }
 
 impl LocalTranscriptWorker {
@@ -208,24 +237,7 @@ impl LocalTranscriptWorker {
                 };
                 self.pending = false;
                 changed |= self.selected.as_ref() == Some(&reply.source);
-                let idx = match self.entries.iter().position(|e| e.source == reply.source) {
-                    Some(i) => i,
-                    None => {
-                        if self.entries.len() >= CACHE_LIMIT {
-                            self.entries.remove(0);
-                        }
-                        self.entries.push(Entry {
-                            source: reply.source.clone(),
-                            turns: None,
-                            last_success: None,
-                            failure: None,
-                            email: None,
-                            prompt: None,
-                        });
-                        self.entries.len() - 1
-                    }
-                };
-                let entry = &mut self.entries[idx];
+                let entry = entry_in(&mut self.entries, &reply.source);
                 match reply.turns {
                     Ok(turns) => {
                         entry.turns = Some(turns);
@@ -235,9 +247,11 @@ impl LocalTranscriptWorker {
                     Err(e) => entry.failure = Some(e),
                 }
                 entry.email = reply.email;
-                entry.prompt = reply
-                    .prompt
-                    .filter(|_| reply.prompt_epoch == self.prompt_epoch);
+                // A read sent before this agent's answer keeps the prompt
+                // already dropped; other agents' answers do not matter.
+                if reply.prompt_epoch == entry.prompt_epoch {
+                    entry.prompt = reply.prompt;
+                }
             }
         }
         if gone {
@@ -256,6 +270,11 @@ impl LocalTranscriptWorker {
             && let Some((agent, account)) = agent
             && let Some(source) = self.selected.clone()
         {
+            let prompt_epoch = self
+                .entries
+                .iter()
+                .find(|e| e.source == source)
+                .map_or(0, |e| e.prompt_epoch);
             let (tx, _) = self.channels.get_or_insert_with(|| {
                 let (tx, requests) = mpsc::channel::<Request>();
                 let (results, rx) = mpsc::channel();
@@ -304,7 +323,7 @@ impl LocalTranscriptWorker {
                     prompt_of: (agent.status == AgentStatus::Blocked
                         && agent.tool.canonical() == Some(Tool::Claude))
                     .then(|| agent.name.clone()),
-                    prompt_epoch: self.prompt_epoch,
+                    prompt_epoch,
                 })
                 .is_ok();
             self.checked = Some(now);
@@ -352,13 +371,9 @@ impl LocalTranscriptWorker {
     /// An answer to `agent`'s prompt went out: forget the prompt until the
     /// screen is read again, so no second key is sent against it.
     pub fn drop_prompt(&mut self, agent: &Agent) {
-        let source = LocalSource::for_agent(agent);
-        self.prompt_epoch += 1;
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| Some(&e.source) == source.as_ref())
-        {
+        if let Some(source) = LocalSource::for_agent(agent) {
+            let entry = entry_in(&mut self.entries, &source);
+            entry.prompt_epoch += 1;
             entry.prompt = None;
         }
     }
@@ -366,15 +381,9 @@ impl LocalTranscriptWorker {
     #[cfg(test)]
     pub fn set_prompt_for_test(&mut self, agent: &Agent, prompt: ScreenPrompt) {
         let source = LocalSource::for_agent(agent).expect("agent has a transcript");
-        self.entries.retain(|e| e.source != source);
-        self.entries.push(Entry {
-            source,
-            turns: Some(Vec::new()),
-            last_success: None,
-            failure: None,
-            email: None,
-            prompt: Some(prompt),
-        });
+        let entry = entry_in(&mut self.entries, &source);
+        entry.turns.get_or_insert_with(Vec::new);
+        entry.prompt = Some(prompt);
     }
 }
 
@@ -555,5 +564,106 @@ mod tests {
         let snap = w.snapshot(&agent);
         assert_eq!(snap.turns.unwrap().len(), 2);
         assert!(snap.failure.is_some());
+    }
+
+    fn a_prompt() -> ScreenPrompt {
+        let screen = "────────────────────────────────
+과일?
+
+❯ 1. 사과
+  2. 배
+
+Enter to select · Esc to cancel";
+        parse_screen(&screen.lines().map(String::from).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// A worker whose replies the test writes: `requests` sees what the
+    /// worker asks for, `replies` answers it.
+    fn scripted() -> (LocalTranscriptWorker, Receiver<Request>, Sender<Reply>) {
+        let (tx, requests) = mpsc::channel();
+        let (replies, rx) = mpsc::channel();
+        let w = LocalTranscriptWorker {
+            channels: Some((tx, rx)),
+            ..Default::default()
+        };
+        (w, requests, replies)
+    }
+
+    /// Ask for `agent`'s screen and return the request the worker sent.
+    fn ask(w: &mut LocalTranscriptWorker, requests: &Receiver<Request>, agent: &Agent) -> Request {
+        w.force_refresh(agent);
+        w.poll(Some((agent, AccountDir::Known(None))), Instant::now());
+        assert!(w.pending);
+        requests.try_recv().unwrap()
+    }
+
+    fn answer(
+        w: &mut LocalTranscriptWorker,
+        replies: &Sender<Reply>,
+        agent: &Agent,
+        req: Request,
+        prompt: Option<ScreenPrompt>,
+    ) {
+        replies
+            .send(Reply {
+                source: req.source,
+                turns: Ok(Vec::new()),
+                email: None,
+                prompt,
+                prompt_epoch: req.prompt_epoch,
+            })
+            .unwrap();
+        w.poll(Some((agent, AccountDir::Known(None))), Instant::now());
+        assert!(!w.pending);
+    }
+
+    /// SEC-003: a screen read sent before an answer shows the answered
+    /// prompt; it must not come back when that read returns.
+    #[test]
+    fn a_read_sent_before_an_answer_does_not_bring_its_prompt_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = agent_at(&dir.path().join("s.jsonl"));
+        let (mut w, requests, replies) = scripted();
+        let req = ask(&mut w, &requests, &agent);
+        answer(&mut w, &replies, &agent, req, Some(a_prompt()));
+        assert!(w.snapshot(&agent).prompt.is_some());
+
+        let stale = ask(&mut w, &requests, &agent);
+        w.drop_prompt(&agent);
+        answer(&mut w, &replies, &agent, stale, Some(a_prompt()));
+        assert!(w.snapshot(&agent).prompt.is_none());
+
+        // A read sent after the answer shows the screen again.
+        let fresh = ask(&mut w, &requests, &agent);
+        answer(&mut w, &replies, &agent, fresh, Some(a_prompt()));
+        assert!(w.snapshot(&agent).prompt.is_some());
+    }
+
+    /// Answering one agent leaves another agent's prompt alone, even with
+    /// a read of that other agent in flight.
+    #[test]
+    fn answering_one_agent_keeps_anothers_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let luna = agent_at(&dir.path().join("luna.jsonl"));
+        let mut nova = agent_at(&dir.path().join("nova.jsonl"));
+        nova.name = "nova".into();
+        let (mut w, requests, replies) = scripted();
+        let req = ask(&mut w, &requests, &luna);
+        answer(&mut w, &replies, &luna, req, Some(a_prompt()));
+        let req = ask(&mut w, &requests, &nova);
+        answer(&mut w, &replies, &nova, req, Some(a_prompt()));
+
+        let in_flight = ask(&mut w, &requests, &nova);
+        w.drop_prompt(&luna);
+        assert!(w.snapshot(&luna).prompt.is_none());
+        answer(&mut w, &replies, &nova, in_flight, Some(a_prompt()));
+        assert!(w.snapshot(&nova).prompt.is_some());
+
+        // A dropped read leaves the prompt it would have replaced.
+        let in_flight = ask(&mut w, &requests, &nova);
+        w.drop_prompt(&nova);
+        w.set_prompt_for_test(&nova, a_prompt());
+        answer(&mut w, &replies, &nova, in_flight, None);
+        assert!(w.snapshot(&nova).prompt.is_some());
     }
 }
