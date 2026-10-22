@@ -217,6 +217,9 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "GITPOD_WORKSPACE_ID",
         "CLOUD_SHELL",
         "REPL_ID",
+        // Where the tool keeps its login; the TUI reads the account from it.
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
     ];
     let mut env_map = serde_json::Map::new();
     for key in &env_keys {

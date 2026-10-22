@@ -22,6 +22,7 @@ pub struct App {
     pub(crate) source: Box<dyn DataSource>,
     pub(crate) rpc_client: Option<RpcClient>,
     pub(crate) usage: crate::tui::usage::UsageWorker,
+    pub(crate) transcript: crate::tui::transcript_view::TranscriptView,
 }
 
 impl Default for App {
@@ -48,6 +49,7 @@ impl App {
             source,
             rpc_client,
             usage: Default::default(),
+            transcript: Default::default(),
             ejector: Ejector::new(),
             ui: UiState {
                 cursor: 0,
@@ -229,6 +231,7 @@ impl App {
                 };
                 dirty |= self.usage.poll(agent);
             }
+            dirty |= self.transcript_poll(std::time::Instant::now());
             if self.drain_rpc_results() {
                 dirty = true;
             }
@@ -298,8 +301,11 @@ impl App {
                     .iter()
                     .any(|a| a.status == AgentStatus::Launching)
                 || self.ejector.is_replaying()
-                || rpc_pending;
-            let poll_ms = if animating || resize_cooldown > 0 {
+                || rpc_pending
+                || self.transcript.has_pending_timer();
+            // Spinner redraws only; data reload keeps its idle pace.
+            let spinning = self.transcript_spinning();
+            let poll_ms = if animating || spinning || resize_cooldown > 0 {
                 80
             } else {
                 500
@@ -345,7 +351,7 @@ impl App {
             self.ui.tick += 1;
 
             // Animations need redraws for spinner frames etc.
-            if animating {
+            if animating || spinning {
                 dirty = true;
             }
 
@@ -491,6 +497,7 @@ mod tests {
             source: Box::new(NullSource),
             rpc_client: None,
             usage: Default::default(),
+            transcript: Default::default(),
         }
     }
 

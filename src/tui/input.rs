@@ -377,6 +377,8 @@ impl App {
                 self.ui.msg_scroll = self.ui.msg_scroll.saturating_sub(5);
             }
 
+            // Conversation tab: Enter messages the agent being read.
+            KeyCode::Enter if self.conversation_visible() => self.compose_to_targets(),
             // SELECTION — in inline mode, auto-apply as scrollback filter
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.toggle_select_at_cursor();
@@ -471,20 +473,7 @@ impl App {
             }
 
             // COMPOSE ENTRY
-            KeyCode::Char('m') => {
-                // Message: pre-fill @mentions for selected or cursor agent
-                self.ui.mode = InputMode::Compose;
-                self.ui.input.clear();
-                self.ui.input_cursor = 0;
-                if !self.ui.selected.is_empty() {
-                    for name in self.ui.selected.iter() {
-                        self.ui.input.push_str(&format!("@{} ", name));
-                    }
-                } else if let Some(name) = self.cursor_display_name() {
-                    self.ui.input = format!("@{} ", name);
-                }
-                self.ui.input_cursor = self.ui.input.len();
-            }
+            KeyCode::Char('m') => self.compose_to_targets(),
             KeyCode::Char('b') => {
                 // Broadcast: compose with no @mentions (sends to all)
                 self.ui.mode = InputMode::Compose;
@@ -516,6 +505,10 @@ impl App {
             KeyCode::Char('?') => {
                 self.ui.help_open = true;
             }
+            // CONVERSATION TAB
+            KeyCode::Char('c') => self.transcript_toggle_tab(),
+            KeyCode::Char('R') => self.transcript_refresh(std::time::Instant::now()),
+            KeyCode::Char('e') => self.transcript_toggle_expand(),
 
             _ => {}
         }
@@ -1296,6 +1289,23 @@ fn push_agent_command_suggestions(s: &mut Vec<CommandSuggestion>, agent: &Agent)
             command: format!("config -i {} tag", name),
             description: "set tag",
         });
+    }
+}
+
+impl App {
+    /// Message: pre-fill @mentions for selected or cursor agent
+    fn compose_to_targets(&mut self) {
+        self.ui.mode = InputMode::Compose;
+        self.ui.input.clear();
+        self.ui.input_cursor = 0;
+        if !self.ui.selected.is_empty() {
+            for name in self.ui.selected.iter() {
+                self.ui.input.push_str(&format!("@{} ", name));
+            }
+        } else if let Some(name) = self.cursor_display_name() {
+            self.ui.input = format!("@{} ", name);
+        }
+        self.ui.input_cursor = self.ui.input.len();
     }
 }
 

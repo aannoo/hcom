@@ -1,4 +1,5 @@
 mod agents;
+pub(crate) use agents::SPINNER_FRAMES;
 pub mod launch;
 pub(crate) mod messages;
 pub(crate) mod text;
@@ -566,8 +567,14 @@ fn render_vertical(frame: &mut Frame, app: &mut App, area: Rect) {
     // Split right panel: 1-line heading + messages content
     let body_right = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body[2]);
 
-    render_messages_heading(frame, body_right[0], app);
-    let scroll = messages::render_messages(frame, body_right[1], app);
+    use crate::tui::transcript_view::{RightTab, render as conversation};
+    let scroll = if app.transcript.tab == RightTab::Conversation {
+        conversation::render_conversation(frame, body_right[0], body_right[1], app)
+    } else {
+        render_messages_heading(frame, body_right[0], app);
+        messages::render_messages(frame, body_right[1], app)
+    };
+    conversation::render_tabstrip(frame, body_right[0], app.transcript.tab);
     app.ui.scroll_max = scroll.max;
     app.ui.msg_scroll = scroll.offset;
     app.ui.last_msg_total = scroll.total;
@@ -1434,14 +1441,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 }
             } else {
                 // Hints are in the input bar
-                vec![
+                let mut hints = vec![
                     Span::raw("  "),
                     Span::styled("?", key),
                     Span::styled(" help ", lbl),
                     Span::styled("\u{00b7} ", dot),
-                    Span::styled("\\", key),
-                    Span::styled(" view", lbl),
-                ]
+                ];
+                if app.ui.view_mode == ViewMode::Vertical {
+                    hints.extend([
+                        Span::styled("c", key),
+                        Span::styled(" chat ", lbl),
+                        Span::styled("\u{00b7} ", dot),
+                    ]);
+                }
+                hints.extend([Span::styled("\\", key), Span::styled(" view", lbl)]);
+                hints
             }
         }
     };
@@ -1756,6 +1770,10 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
         ]),
         Line::from(vec![key("enter/space"), desc("select + filter scrollback")]),
         Line::from(vec![key("a"), desc("select all")]),
+        Line::from(vec![key("c"), desc("conversation tab")]),
+        Line::from(vec![key("R"), desc("refresh conversation")]),
+        Line::from(vec![key("e"), desc("full conversation text")]),
+        Line::from(vec![key("enter"), desc("message agent (conversation tab)")]),
         Line::from(vec![key("b"), desc("broadcast to all")]),
         Line::from(vec![key("ctrl+r"), desc("relay settings")]),
         Line::from(vec![key("ctrl+s"), desc("all stopped agents")]),

@@ -2,6 +2,14 @@
 
 UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
+## Unreleased
+
+### Added
+
+- Added a conversation tab to the TUI's vertical view (`c`): the selected agent's recent turns with the request, a tool summary and the reply, for local and remote agents. The latest turn is open and earlier ones are one line each; `e` shows every turn in full, `R` refreshes, and Enter messages the agent. Markdown headings, lists, bold, code and tables are rendered. Set `HCOM_TUI_TAB=chat` to open vertical view on it.
+- Showed which account an agent runs under (tool and logged-in e-mail, read from `CLAUDE_CONFIG_DIR` / `CODEX_HOME` when set) in the conversation tab header. Remote agents' e-mail is shared only when their device sets `hcom config relay_share_account 1`.
+- Showed a spinner with the current tool and elapsed time under the conversation while the agent is working.
+
 ## 0.7.31 — 2026-10-21
 
 ### Breaking changes

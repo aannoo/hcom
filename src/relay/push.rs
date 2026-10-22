@@ -283,15 +283,33 @@ fn shrink_strings(value: &mut Value) {
     }
 }
 
+/// Account e-mail for a local agent, read from the tool config dir it was
+/// launched with. Only sent when `relay_share_account` is on.
+fn shared_account_email(tool: Option<&str>, launch_context: Option<&str>) -> Option<String> {
+    use std::sync::{LazyLock, Mutex};
+    static EMAILS: LazyLock<Mutex<crate::accounts::EmailCache>> = LazyLock::new(Default::default);
+    let tool: crate::tool::Tool = tool.unwrap_or("claude").parse().ok()?;
+    let key = crate::accounts::config_dir_env_key(tool)?;
+    let dir = launch_context
+        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        .and_then(|v| v.get("env")?.get(key)?.as_str().map(String::from))
+        .filter(|d| !d.is_empty());
+    EMAILS
+        .lock()
+        .ok()?
+        .email(tool, dir.as_deref().map(std::path::Path::new))
+}
+
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
 pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
     let short_id = device_short_id_for_db(db, device_uuid);
+    let share_account = crate::config::HcomConfig::load(None).relay_share_account;
 
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,
                 directory, transcript_path,
-                wait_timeout, last_stop, tcp_mode, tag, tool, background
+                wait_timeout, last_stop, tcp_mode, tag, tool, background, launch_context
          FROM instances WHERE COALESCE(origin_device_id, '') = ''",
     ) {
         Ok(mut stmt) => {
@@ -312,6 +330,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                         row.get::<_, Option<String>>(11)?, // tag
                         row.get::<_, Option<String>>(12)?, // tool
                         row.get::<_, Option<bool>>(13)?,   // background
+                        row.get::<_, Option<String>>(14)?, // launch_context
                     ))
                 })
                 .ok()
@@ -325,10 +344,12 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                 if name.starts_with('_') || name.starts_with("sys_") {
                     continue;
                 }
-                entries.push((
-                    name.clone(),
-                    row.3.clone().unwrap_or_default(),
-                    json!({
+                let account = if share_account {
+                    shared_account_email(row.12.as_deref(), row.14.as_deref())
+                } else {
+                    None
+                };
+                let mut entry = json!({
                         "enabled": true,
                         "status": row.1.as_deref().unwrap_or("unknown"),
                         "context": row.2.as_deref().unwrap_or(""),
@@ -342,8 +363,11 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                         "tag": row.11,
                         "tool": row.12.as_deref().unwrap_or("claude"),
                         "background": row.13.unwrap_or(false),
-                    }),
-                ));
+                });
+                if let Some(email) = account {
+                    entry["account_email"] = json!(email);
+                }
+                entries.push((name.clone(), row.3.clone().unwrap_or_default(), entry));
             }
             Value::Object(with_detail_previews(db, &short_id, entries))
         }

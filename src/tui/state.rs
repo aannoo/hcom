@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::tui::model::{
     Agent, CommandResult, Event, Flash, InputMode, LaunchState, Message, OrphanProcess, Overlay,
@@ -23,6 +23,10 @@ pub struct DataState {
     pub relay_health: crate::relay::RelayHealth,
     /// FTS search results. `Some` when a text search query is active (both inline and vertical modes).
     pub search_results: Option<(Vec<Message>, Vec<Event>)>,
+    /// Remote row name (`base:DEVICE`) → account e-mail its device shared.
+    pub remote_accounts: HashMap<String, String>,
+    /// Local agent name → tool config dir it was launched with.
+    pub tool_config_dirs: HashMap<String, String>,
 }
 
 impl DataState {
@@ -37,6 +41,8 @@ impl DataState {
             relay_enabled: false,
             relay_health: crate::relay::RelayHealth::NotConfigured,
             search_results: None,
+            remote_accounts: HashMap::new(),
+            tool_config_dirs: HashMap::new(),
         }
     }
 
