@@ -50,6 +50,8 @@ pub struct TerminalPreset {
     pub pane_id_env: Option<&'static str>,
     /// Supported platforms.
     pub platforms: &'static [&'static str],
+    /// Argv to register the hcom handle; supports `{pane_id}` and `{instance_name}`.
+    pub context_report: Option<ArgvTemplate>,
 }
 
 /// An argv template available on all platforms (Windows reuses the default).
@@ -89,6 +91,28 @@ const fn p(
         close,
         pane_id_env,
         platforms,
+        context_report: None,
+    }
+}
+
+impl TerminalPreset {
+    /// Expand `context_report` placeholders and return the argv, or `None`
+    /// if this preset has no context report command.
+    pub fn expand_context_report(
+        &self,
+        pane_id: &str,
+        instance_name: &str,
+    ) -> Option<Vec<String>> {
+        let template = self.context_report?;
+        Some(
+            template
+                .iter()
+                .map(|s| {
+                    s.replace("{pane_id}", pane_id)
+                        .replace("{instance_name}", instance_name)
+                })
+                .collect(),
+        )
     }
 }
 
@@ -571,23 +595,35 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
         // itself via the `HERDR_AGENT` hint on `hcom pty`.
         (
             "herdr",
-            p(
-                Some("herdr"),
-                None,
-                argv(&[
+            TerminalPreset {
+                context_report: Some(&[
                     "herdr",
-                    "tab",
-                    "create",
-                    "--cwd",
-                    "{cwd}",
-                    "--no-focus",
-                    "--label",
-                    "{instance_name}",
+                    "pane",
+                    "report-metadata",
+                    "{pane_id}",
+                    "--source",
+                    "hcom",
+                    "--token",
+                    "hcom={instance_name}", // herdr's --token takes key=value pairs; agents sidebar reads tokens.hcom
                 ]),
-                argv(&["herdr", "pane", "close", "{pane_id}"]),
-                Some("HERDR_PANE_ID"),
-                DL,
-            ),
+                ..p(
+                    Some("herdr"),
+                    None,
+                    argv(&[
+                        "herdr",
+                        "tab",
+                        "create",
+                        "--cwd",
+                        "{cwd}",
+                        "--no-focus",
+                        "--label",
+                        "{instance_name}",
+                    ]),
+                    argv(&["herdr", "pane", "close", "{pane_id}"]),
+                    Some("HERDR_PANE_ID"),
+                    DL,
+                )
+            },
         ),
     ]
 });

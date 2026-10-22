@@ -2419,6 +2419,15 @@ fn launch_herdr_two_step(
         }
     };
 
+    // Register the hcom handle with herdr once the CVCV name is known.
+    if ran && ctx.instance_name != ctx.process_id {
+        if let Some(argv) = crate::shared::terminal_presets::get_terminal_preset("herdr")
+            .and_then(|p| p.expand_context_report(&pane_id, ctx.instance_name))
+        {
+            let _ = spawn_terminal_process(&argv, inside_ai_tool);
+        }
+    }
+
     // Return the `tab create` stdout so `write_terminal_id` records the pane id.
     Ok((created && ran, captured))
 }

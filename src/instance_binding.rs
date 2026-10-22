@@ -139,6 +139,39 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
             &format!("instance={instance_name} err={e}"),
         );
     }
+    // Push hcom handle into the terminal's metadata store.
+    let Some((pane_id, preset_name)) = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            let ctx: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref()?).ok()?;
+            Some((
+                ctx.get("pane_id")?.as_str()?.to_string(),
+                ctx.get("terminal_preset_effective")?.as_str()?.to_string(),
+            ))
+        })
+    else {
+        return;
+    };
+    let Some(preset) =
+        crate::shared::terminal_presets::get_terminal_preset(&preset_name)
+    else {
+        return;
+    };
+    let Some(argv) = preset.expand_context_report(&pane_id, instance_name) else {
+        return;
+    };
+    let Some((bin, args)) = argv.split_first() else {
+        return;
+    };
+    let _ = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// "Missing" for the preserve-from-prior-context check. Treats absent, JSON
