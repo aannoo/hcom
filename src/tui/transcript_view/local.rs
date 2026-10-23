@@ -379,8 +379,15 @@ impl LocalTranscriptWorker {
     }
 
     #[cfg(test)]
+    pub fn take_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.force)
+    }
+
+    #[cfg(test)]
     pub fn set_prompt_for_test(&mut self, agent: &Agent, prompt: ScreenPrompt) {
         let source = LocalSource::for_agent(agent).expect("agent has a transcript");
+        // A prompt is only read for the agent being viewed.
+        self.selected = Some(source.clone());
         let entry = entry_in(&mut self.entries, &source);
         entry.turns.get_or_insert_with(Vec::new);
         entry.prompt = Some(prompt);

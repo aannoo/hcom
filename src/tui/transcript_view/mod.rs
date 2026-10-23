@@ -432,7 +432,9 @@ Enter to select · Esc to cancel";
         );
         assert_eq!(sent(&app), 1, "nothing more is sent");
 
-        // The answer comes back: the next key may go out.
+        // The answer comes back failed: the next key may go out, and the
+        // screen is read again so the dropped prompt shows up.
+        app.transcript.local.take_refresh_request();
         for _ in 0..200 {
             if app.drain_rpc_results() {
                 break;
@@ -440,6 +442,7 @@ Enter to select · Esc to cancel";
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.transcript.answering.is_empty());
+        assert!(app.transcript.local.take_refresh_request());
         app.ui.flash = None;
         app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
         assert!(app.ui.flash.is_none());
