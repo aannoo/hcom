@@ -164,22 +164,34 @@ pub fn prompt_lines(prompt: &ScreenPrompt, width: usize) -> Vec<Line<'static>> {
     }
     let dim = Theme::dim();
     let mut lines = Vec::new();
-    let push = |segments: Vec<markdown::Segment>, lines: &mut Vec<Line<'static>>| {
-        for row in markdown::wrap(&segments, width) {
-            lines.push(Line::from(markdown::spans(row)));
-        }
-    };
+    // Wrapped rows line up under the text after `lead`.
+    let push =
+        |lead: markdown::Segment, body: Vec<markdown::Segment>, lines: &mut Vec<Line<'static>>| {
+            let hang = lead.0.width();
+            if hang >= width {
+                let mut segments = vec![lead];
+                segments.extend(body);
+                for row in markdown::wrap(&segments, width) {
+                    lines.push(Line::from(markdown::spans(row)));
+                }
+                return;
+            }
+            for (r, row) in markdown::wrap(&body, width - hang).into_iter().enumerate() {
+                let mut spans = if r == 0 {
+                    vec![Span::styled(lead.0.clone(), lead.1)]
+                } else {
+                    vec![Span::raw(" ".repeat(hang))]
+                };
+                spans.extend(markdown::spans(row));
+                lines.push(Line::from(spans));
+            }
+        };
+    let indent = || ("  ".to_string(), Style::default());
     if let Some(tabs) = &prompt.tabs {
-        push(vec![(format!("  {tabs}"), Theme::blocked())], &mut lines);
+        push(indent(), vec![(tabs.clone(), Theme::blocked())], &mut lines);
     }
     for text in &prompt.question {
-        push(
-            vec![
-                ("  ".to_string(), Style::default()),
-                (text.clone(), Theme::title()),
-            ],
-            &mut lines,
-        );
+        push(indent(), vec![(text.clone(), Theme::title())], &mut lines);
     }
     for option in &prompt.options {
         let mark = match option.checked {
@@ -192,17 +204,22 @@ pub fn prompt_lines(prompt: &ScreenPrompt, width: usize) -> Vec<Line<'static>> {
         } else {
             Style::default()
         };
-        let mut segs = vec![
-            (
-                format!("   {mark}{} ", option.number),
-                Style::default().fg(palette::FG_DIM),
-            ),
-            (option.label.clone(), style),
-        ];
+        let lead = format!("   {mark}{} ", option.number);
+        let under = " ".repeat(lead.width());
+        push(
+            (lead, Style::default().fg(palette::FG_DIM)),
+            vec![(option.label.clone(), style)],
+            &mut lines,
+        );
+        // The screen's own layout: the description sits under the label.
+        // A label too long for the screen also continues there.
         if !option.description.is_empty() {
-            segs.push((format!("  {}", option.description), dim));
+            push(
+                (under, Style::default()),
+                vec![(option.description.clone(), dim)],
+                &mut lines,
+            );
         }
-        push(segs, &mut lines);
     }
     let last = prompt
         .options
@@ -212,11 +229,11 @@ pub fn prompt_lines(prompt: &ScreenPrompt, width: usize) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(1);
     let hint = if prompt.is_multi() {
-        format!("  1-{last} toggle · enter next · typing answers in the terminal")
+        format!("1-{last} toggle · enter next · typing answers in the terminal")
     } else {
-        format!("  1-{last} answer · typing answers in the terminal")
+        format!("1-{last} answer · typing answers in the terminal")
     };
-    push(vec![(hint, dim)], &mut lines);
+    push(indent(), vec![(hint, dim)], &mut lines);
     lines
 }
 
@@ -625,7 +642,8 @@ Enter to select · Esc to cancel"
             vec![
                 "  ☒ fruit  ☐ drink  ✔ Submit",
                 "  Drink?",
-                "   [x] 1 Water  Still water",
+                "   [x] 1 Water",
+                "         Still water",
                 "   [ ] 2 Tea",
                 "   [ ] 3 Type something",
                 "  1-2 toggle · enter next · typing answers in the terminal",
@@ -637,6 +655,40 @@ Enter to select · Esc to cancel"
             }
         }
         assert!(prompt_lines(&prompt, 0).is_empty());
+    }
+
+    #[test]
+    fn wrapped_option_rows_hang_under_the_label() {
+        let screen: Vec<String> = "────────────────────────────────
+ Edit file
+ format.py
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ 1 -old
+ 1 +new
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to format.py?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file
+      commands) for this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend"
+            .lines()
+            .map(String::from)
+            .collect();
+        let prompt = super::super::prompt::parse_screen(&screen).unwrap();
+        let out = text(&prompt_lines(&prompt, 40));
+        let at = out.iter().position(|l| l.starts_with("   2 ")).unwrap();
+        assert_eq!(out[at].trim_end(), "   2 Yes, and switch to accept edits");
+        // Every row up to option 3 continues under the label.
+        let rest: Vec<&String> = out[at + 1..]
+            .iter()
+            .take_while(|l| !l.starts_with("   3 "))
+            .collect();
+        assert!(rest.len() >= 2, "{out:?}");
+        for line in rest {
+            assert!(line.starts_with("     ") && line.width() <= 40, "{line:?}");
+        }
     }
 
     #[test]
