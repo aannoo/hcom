@@ -14,7 +14,7 @@ use std::time::Instant;
 pub use model::*;
 
 use crate::tui::app::App;
-use crate::tui::model::{Agent, CursorTarget, ViewMode};
+use crate::tui::model::{Agent, CursorTarget, InputMode, ViewMode};
 use local::AccountDir;
 
 #[derive(Default)]
@@ -105,9 +105,12 @@ impl App {
         };
         if transcript.shown != shown {
             // Another conversation opens at its latest turn, not at the
-            // scroll left in the previous one.
+            // scroll left in the previous one. Command output drawn over the
+            // tab keeps its place; closing it resets the scroll anyway.
             transcript.shown = shown;
-            ui.msg_scroll = 0;
+            if ui.mode != InputMode::CommandOutput {
+                ui.msg_scroll = 0;
+            }
         }
         match target {
             ConversationTarget::Local { agent, .. } => {
@@ -313,6 +316,13 @@ mod tests {
         assert_eq!(app.cursor_target(), CursorTarget::Agent(1));
         app.transcript_poll(now);
         assert_eq!(app.ui.msg_scroll, 0);
+
+        // Command output drawn over the tab keeps its own place.
+        app.ui.mode = InputMode::CommandOutput;
+        app.ui.msg_scroll = 7;
+        app.ui.cursor = 0;
+        app.transcript_poll(now);
+        assert_eq!(app.ui.msg_scroll, 7);
     }
 
     #[test]
