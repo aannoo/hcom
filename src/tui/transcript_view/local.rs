@@ -15,7 +15,8 @@ use crate::tui::model::{Agent, AgentStatus};
 pub const LOCAL_LAST: usize = 10;
 const CACHE_LIMIT: usize = 32;
 
-type Stamp = Vec<Option<(u64, Option<SystemTime>)>>;
+/// Per file: size and mtime, or why it could not be read.
+type Stamp = Vec<Result<(u64, Option<SystemTime>), std::io::ErrorKind>>;
 
 /// Where a local agent's login lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,8 +104,8 @@ fn stamp_of(source: &LocalSource) -> Stamp {
         .iter()
         .map(|p| {
             std::fs::metadata(p)
-                .ok()
                 .map(|m| (m.len(), m.modified().ok()))
+                .map_err(|e| e.kind())
         })
         .collect()
 }
@@ -118,25 +119,28 @@ fn read_turns(req: &Request, cache: &mut Vec<Cached>) -> Result<Vec<TurnView>, S
     {
         return Ok(hit.turns.clone());
     }
-    let turns = if !req.source.path.exists() {
+    let turns = match req.source.path.try_exists() {
         // Not written yet: an empty conversation, not an error.
-        Ok(Vec::new())
-    } else {
-        let source = req.source.clone();
-        std::panic::catch_unwind(move || {
-            transcript::read(
-                &source.path,
-                source.backend,
-                &ReadOptions {
-                    last: LOCAL_LAST,
-                    detailed: false,
-                    session_id: source.session.clone(),
-                    allow_codex_retry: false,
-                },
-            )
-        })
-        .unwrap_or_else(|_| Err("parse panicked".to_string()))
-        .map(|t| t.exchanges.iter().map(turn_from_exchange).collect())
+        Ok(false) => Ok(Vec::new()),
+        // Unreadable (permissions, I/O): a failure, not an empty one.
+        Err(e) => Err(format!("cannot read transcript: {e}")),
+        Ok(true) => {
+            let source = req.source.clone();
+            std::panic::catch_unwind(move || {
+                transcript::read(
+                    &source.path,
+                    source.backend,
+                    &ReadOptions {
+                        last: LOCAL_LAST,
+                        detailed: false,
+                        session_id: source.session.clone(),
+                        allow_codex_retry: false,
+                    },
+                )
+            })
+            .unwrap_or_else(|_| Err("parse panicked".to_string()))
+            .map(|t| t.exchanges.iter().map(turn_from_exchange).collect())
+        }
     };
     if let Ok(t) = &turns {
         cache.retain(|c| c.source != req.source);
@@ -481,6 +485,30 @@ mod tests {
         assert!(!w.pending);
         wait(&mut w, &agent, Instant::now());
         assert_eq!(w.snapshot(&agent).turns, Some(&[][..]));
+    }
+
+    /// A path that cannot be checked is a failure, not an empty conversation.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_path_is_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let path = locked.join("s.jsonl");
+        write_turns(&path, 1);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can still look inside: nothing to check then.
+        let checkable = path.try_exists().is_err();
+        let agent = agent_at(&path);
+        let mut w = LocalTranscriptWorker::default();
+        wait(&mut w, &agent, Instant::now());
+        let snap = w.snapshot(&agent);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if checkable {
+            assert!(snap.failure.is_some());
+            assert_eq!(snap.turns, None);
+        }
     }
 
     #[test]
