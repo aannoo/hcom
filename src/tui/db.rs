@@ -331,10 +331,12 @@ fn load_all(conn: &Connection, default_limit: usize) -> DataState {
 
 /// For the conversation header: each local agent's launch-time tool config
 /// dir (where its login lives), and e-mails peers shared for their agents.
+/// A context from before the dir was recorded has no key: such an agent is
+/// left out, as its account is not known.
 fn load_account_maps(
     conn: &Connection,
     device_uuid: &str,
-) -> (HashMap<String, String>, HashMap<String, String>) {
+) -> (HashMap<String, Option<String>>, HashMap<String, String>) {
     let mut dirs = HashMap::new();
     let mut shared: HashMap<String, Option<serde_json::Value>> = HashMap::new();
     let Ok(mut stmt) =
@@ -367,9 +369,9 @@ fn load_account_maps(
                 .get("env")
                 .and_then(|e| e.get(key))
                 .and_then(|d| d.as_str())
-                .filter(|d| !d.is_empty())
         {
-            dirs.insert(name, dir.to_string());
+            // "" is the tool's default.
+            dirs.insert(name, (!dir.is_empty()).then(|| dir.to_string()));
         }
     }
     let mut accounts = HashMap::new();
@@ -1510,6 +1512,26 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    /// An agent launched before the config dir was recorded is not given the
+    /// default account: its row has no key, unlike a recorded default ("").
+    #[test]
+    fn account_maps_tell_a_missing_dir_from_the_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instances (name TEXT, tool TEXT, origin_device_id TEXT,
+                                     launch_context TEXT);
+             INSERT INTO instances VALUES
+               ('luna', 'claude', NULL, '{\"env\":{\"CLAUDE_CONFIG_DIR\":\"/work\"}}'),
+               ('nova', 'claude', NULL, '{\"env\":{\"CLAUDE_CONFIG_DIR\":\"\"}}'),
+               ('kira', 'claude', NULL, '{\"env\":{}}');",
+        )
+        .unwrap();
+        let (dirs, _) = super::load_account_maps(&conn, "this-device");
+        assert_eq!(dirs.get("luna"), Some(&Some("/work".to_string())));
+        assert_eq!(dirs.get("nova"), Some(&None));
+        assert_eq!(dirs.get("kira"), None);
     }
 
     #[test]

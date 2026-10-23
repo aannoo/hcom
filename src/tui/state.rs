@@ -25,8 +25,9 @@ pub struct DataState {
     pub search_results: Option<(Vec<Message>, Vec<Event>)>,
     /// Remote row name (`base:DEVICE`) → account e-mail its device shared.
     pub remote_accounts: HashMap<String, String>,
-    /// Local agent name → tool config dir it was launched with.
-    pub tool_config_dirs: HashMap<String, String>,
+    /// Local agent name → tool config dir it was launched with; `None` for
+    /// the tool's default. Absent when the launch did not record it.
+    pub tool_config_dirs: HashMap<String, Option<String>>,
 }
 
 impl DataState {

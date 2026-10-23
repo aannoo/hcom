@@ -31,6 +31,8 @@ pub struct TranscriptView {
     /// Agents with an answer on its way: one at a time, so a repeated key
     /// does not land on whatever prompt comes next.
     pub answering: HashSet<String>,
+    /// The agent whose conversation is shown: the scroll is its own.
+    shown: Option<String>,
 }
 
 /// `HCOM_TUI_TAB=chat` opens vertical view on the conversation tab.
@@ -84,19 +86,38 @@ impl App {
         let cursor = self.cursor_target();
         let visible = self.conversation_visible();
         let App {
-            data, transcript, ..
+            data,
+            transcript,
+            ui,
+            ..
         } = self;
         let target = if visible {
             resolve_target(data, cursor)
         } else {
             ConversationTarget::NoAgent
         };
+        let shown = match &target {
+            ConversationTarget::Local { agent, .. }
+            | ConversationTarget::Remote { agent, .. }
+            | ConversationTarget::LocalNoPath(agent)
+            | ConversationTarget::Unsupported(agent) => Some(agent.display_name()),
+            ConversationTarget::NoAgent => None,
+        };
+        if transcript.shown != shown {
+            // Another conversation opens at its latest turn, not at the
+            // scroll left in the previous one.
+            transcript.shown = shown;
+            ui.msg_scroll = 0;
+        }
         match target {
             ConversationTarget::Local { agent, .. } => {
                 let account = if matches!(cursor, CursorTarget::StoppedAgent(_)) {
                     AccountDir::Unknown
                 } else {
-                    AccountDir::Known(data.tool_config_dirs.get(&agent.name).map(String::as_str))
+                    match data.tool_config_dirs.get(&agent.name) {
+                        Some(dir) => AccountDir::Known(dir.as_deref()),
+                        None => AccountDir::Unknown,
+                    }
                 };
                 transcript.local.poll(Some((agent, account)), now)
                     | transcript.remote.poll(None, now)
@@ -273,6 +294,25 @@ mod tests {
         app.data.agents = vec![make_test_agent("luna", 0.0)];
         app.ui.view_mode = ViewMode::Vertical;
         app
+    }
+
+    /// Scrolled up in one conversation, then on to another: it opens at its
+    /// latest turn. Staying on the same agent keeps the scroll.
+    #[test]
+    fn another_conversation_opens_at_its_latest_turn() {
+        let mut app = vertical_app();
+        app.data.agents.push(make_test_agent("nova", 0.0));
+        app.transcript.tab = RightTab::Conversation;
+        let now = Instant::now();
+        app.transcript_poll(now);
+        app.ui.msg_scroll = 5;
+        app.transcript_poll(now);
+        assert_eq!(app.ui.msg_scroll, 5);
+
+        app.ui.cursor = 1;
+        assert_eq!(app.cursor_target(), CursorTarget::Agent(1));
+        app.transcript_poll(now);
+        assert_eq!(app.ui.msg_scroll, 0);
     }
 
     #[test]
