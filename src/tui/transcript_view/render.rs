@@ -228,7 +228,9 @@ pub fn prompt_lines(prompt: &ScreenPrompt, width: usize) -> Vec<Line<'static>> {
         .map(|o| o.number)
         .max()
         .unwrap_or(1);
-    let hint = if prompt.is_multi() {
+    let hint = if prompt.notes_in_use() {
+        "notes are open · answer in the terminal".to_string()
+    } else if prompt.is_multi() {
         format!("1-{last} toggle · enter next · typing answers in the terminal")
     } else {
         format!("1-{last} answer · typing answers in the terminal")

@@ -179,13 +179,18 @@ impl App {
             return false;
         };
         let name = agent.name.clone();
-        let step = match code {
+        let steps = match code {
             KeyCode::Char(c @ '1'..='9') => {
                 let n = (c as u8 - b'0') as usize;
                 match prompt.pick(n) {
-                    Some(step) => step,
+                    Some(steps) => steps,
                     None => {
-                        if prompt.options.iter().any(|o| o.number == n) {
+                        if prompt.notes_in_use() {
+                            self.ui.flash = Some(Flash::new(
+                                format!("Notes are open: answer in {name}'s terminal"),
+                                Theme::flash_info(),
+                            ));
+                        } else if prompt.options.iter().any(|o| o.number == n) {
                             self.ui.flash = Some(Flash::new(
                                 format!("Option {n} needs typing: answer it in {name}'s terminal"),
                                 Theme::flash_info(),
@@ -196,7 +201,7 @@ impl App {
                 }
             }
             KeyCode::Enter => match prompt.next() {
-                Some(step) => step,
+                Some(step) => vec![step],
                 None => return false,
             },
             _ => return false,
@@ -204,7 +209,7 @@ impl App {
         let agent = agent.clone();
         match self.enqueue_rpc(crate::tui::rpc_async::RpcOp::AnswerPrompt {
             name: name.clone(),
-            steps: vec![step],
+            steps,
         }) {
             Ok(()) => {
                 self.transcript.answering.insert(name);

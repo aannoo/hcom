@@ -6,8 +6,11 @@
 //! Code 2.x: a digit picks an option; one single-select question is answered
 //! by it. With several questions or a multi-select one the prompt has tabs:
 //! a single-select digit moves to the next tab, multi-select digits toggle
-//! and → moves on, and the last tab submits on `1`.
+//! and → moves on, and the last tab submits on `1`. Options with previews
+//! draw a preview box to their right; there a digit only moves the cursor,
+//! and Enter picks the option under it.
 use crate::commands::term::{ScreenCheck, ScreenStep};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenOption {
@@ -34,11 +37,25 @@ pub struct ScreenPrompt {
     pub options: Vec<ScreenOption>,
     /// Text that is on screen only while this prompt waits.
     anchor: String,
+    /// `Some` when the options carry previews.
+    preview: Option<Preview>,
+}
+
+/// The parts of a preview prompt that decide where Enter lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Preview {
+    /// The option under the cursor.
+    cursor: usize,
+    /// The notes line after `Notes:`. While notes are open or written, a
+    /// digit is typed into them.
+    notes: Option<String>,
 }
 
 const RULE: char = '─';
 const DASH: char = '╌';
 const FOOTER: &str = "Esc to cancel";
+const NOTES: &str = "Notes:";
+const NOTES_EMPTY: &str = "press n to add notes";
 
 fn is_rule(line: &str) -> bool {
     let t = line.trim();
@@ -63,6 +80,33 @@ fn option_line(line: &str) -> Option<(usize, &str, bool)> {
     (1..=9)
         .contains(&number)
         .then(|| (number, t[dot + 2..].trim(), cursor))
+}
+
+/// The display column of `corner` in `line`.
+fn column_of(line: &str, corner: char) -> Option<usize> {
+    line.find(corner).map(|i| line[..i].width())
+}
+
+/// The column the preview box starts at: its top corner is on option 1's
+/// line, its bottom corner at the same column further down.
+fn preview_column(block: &[String]) -> Option<usize> {
+    let column = column_of(block.first()?, '┌')?;
+    block[1..]
+        .iter()
+        .any(|l| column_of(l, '└') == Some(column))
+        .then_some(column)
+}
+
+/// `line` left of display column `column`.
+fn left_of(line: &str, column: usize) -> &str {
+    let mut width = 0;
+    for (i, c) in line.char_indices() {
+        width += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if width > column {
+            return &line[..i];
+        }
+    }
+    line
 }
 
 fn checkbox(label: &str) -> (Option<bool>, &str) {
@@ -130,14 +174,25 @@ pub fn parse_screen(lines: &[String]) -> Option<ScreenPrompt> {
         }
     }
 
+    let end = lines[first..]
+        .iter()
+        .position(|l| l.contains(FOOTER))
+        .map_or(lines.len(), |i| first + i);
+    let footer = end < lines.len();
+    // Below a preview box only the options are read: the box, the notes
+    // line and an unnumbered `Chat about this` are not descriptions.
+    let column = preview_column(&lines[first..end]);
+    let mut notes = None;
     let mut options: Vec<ScreenOption> = Vec::new();
-    let mut footer = false;
-    for line in &lines[first..] {
-        let t = line.trim();
-        if t.contains(FOOTER) {
-            footer = true;
-            break;
+    for line in &lines[first..end] {
+        if column.is_some()
+            && let Some(rest) = line.trim().strip_prefix(NOTES)
+        {
+            notes = Some(rest.trim().to_string());
+            continue;
         }
+        let line = column.map_or(line.as_str(), |c| left_of(line, c));
+        let t = line.trim();
         if let Some((number, label, _)) = option_line(line) {
             let (checked, label) = checkbox(label);
             options.push(ScreenOption {
@@ -146,7 +201,8 @@ pub fn parse_screen(lines: &[String]) -> Option<ScreenPrompt> {
                 description: String::new(),
                 checked,
             });
-        } else if !t.is_empty()
+        } else if column.is_none()
+            && !t.is_empty()
             && !is_rule(t)
             && t != "Submit"
             && let Some(last) = options.last_mut()
@@ -170,11 +226,16 @@ pub fn parse_screen(lines: &[String]) -> Option<ScreenPrompt> {
             .trim_start()
             .to_string()
     };
+    let preview = column.map(|_| Preview {
+        cursor: option_line(&lines[cursor]).map_or(0, |(n, _, _)| n),
+        notes,
+    });
     Some(ScreenPrompt {
         tabs,
         question,
         options,
         anchor,
+        preview,
     })
 }
 
@@ -183,14 +244,44 @@ impl ScreenPrompt {
         self.options.iter().any(|o| o.checked.is_some())
     }
 
-    /// Digit `n`: the step that sends it. `None` for an option that needs
-    /// typing in the terminal, or no such option.
-    pub fn pick(&self, n: usize) -> Option<ScreenStep<ScreenPrompt>> {
+    /// Notes are open or written on a preview prompt, so a digit would be
+    /// typed into them.
+    pub fn notes_in_use(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|p| p.notes.as_deref() != Some(NOTES_EMPTY))
+    }
+
+    /// Digit `n`: the steps that pick option `n`. `None` for an option that
+    /// needs typing in the terminal, no such option, or notes in use.
+    pub fn pick(&self, n: usize) -> Option<Vec<ScreenStep<ScreenPrompt>>> {
         let option = self.options.iter().find(|o| o.number == n)?;
-        (!option.needs_typing()).then(|| ScreenStep {
+        if option.needs_typing() {
+            return None;
+        }
+        let digit = ScreenStep {
             expect: self.clone(),
             keys: vec![n.to_string().into_bytes()],
-        })
+        };
+        if self.preview.is_none() {
+            return Some(vec![digit]);
+        }
+        if self.is_multi() || self.notes_in_use() {
+            return None;
+        }
+        // The digit only moves the cursor. Enter picks the option under it,
+        // so it goes out only once the screen shows the cursor on `n`.
+        let mut moved = self.clone();
+        if let Some(preview) = &mut moved.preview {
+            preview.cursor = n;
+        }
+        Some(vec![
+            digit,
+            ScreenStep {
+                expect: moved,
+                keys: vec![b"\r".to_vec()],
+            },
+        ])
     }
 
     /// Enter on a multi-select question: move to the next tab.
@@ -248,13 +339,13 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert!(!p.is_multi());
         assert_eq!(
             p.pick(2),
-            Some(ScreenStep {
+            Some(vec![ScreenStep {
                 expect: p.clone(),
                 keys: vec![b"2".to_vec()],
-            })
+            }])
         );
         assert_eq!(p.anchor, FOOTER);
-        assert!(p.pick(2).unwrap().expect.shown_on(&screen(TABBED)));
+        assert!(p.pick(2).unwrap()[0].expect.shown_on(&screen(TABBED)));
         assert_eq!(p.pick(3), None, "typing happens in the terminal");
         assert_eq!(p.pick(4), None);
         assert_eq!(p.pick(7), None);
@@ -318,7 +409,7 @@ Ready to submit your answers?
         let p = parse_screen(&screen(text)).unwrap();
         assert_eq!(p.question.last().unwrap(), "Ready to submit your answers?");
         // No footer on this screen: the cursor line anchors it.
-        let expect = p.pick(1).unwrap().expect;
+        let expect = p.pick(1).unwrap().remove(0).expect;
         assert_eq!(expect.tabs.as_deref(), Some("☒ fruit  ☒ drink  ✔ Submit"));
         assert!(expect.question.contains(&"Review your answers".to_string()));
         assert_eq!(expect.anchor, "1. Submit answers");
@@ -362,7 +453,7 @@ Ready to submit your answers?
         assert_eq!(p.options.len(), 3);
         assert_eq!(p.options[1].description, "/private/tmp/scratchpad");
         // The command line is matched, not only the generic first line.
-        let expect = p.pick(1).unwrap().expect;
+        let expect = p.pick(1).unwrap().remove(0).expect;
         assert!(expect.shown_on(&screen(text)));
         let other = text.replace(" touch probe-perm.txt\n", " rm -rf build\n");
         assert_ne!(other, text);
@@ -412,7 +503,7 @@ COMMAND
         );
         // The line above the rule is part of the match as well.
         let other = text.replace(" make clean\n", " make other\n");
-        assert!(!p.pick(1).unwrap().expect.shown_on(&screen(&other)));
+        assert!(!p.pick(1).unwrap()[0].expect.shown_on(&screen(&other)));
     }
 
     /// SEC-002: when the command draws its own rule and dashed line, the
@@ -470,7 +561,105 @@ COMMAND
         assert_eq!(p.question, vec!["Fruit?"]);
         assert_eq!(p.options.len(), 4);
         assert_eq!(p.options[0].description, "Pick an apple");
-        assert_eq!(p.pick(1).unwrap().expect.anchor, FOOTER);
+        assert_eq!(p.pick(1).unwrap()[0].expect.anchor, FOOTER);
+    }
+
+    /// Measured on Claude Code 2.1.309: two questions whose options carry
+    /// previews, on the first tab.
+    const PREVIEW: &str = "  ⎿  earlier output
+
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Wind unit  ☐ Temp unit  ✔ Submit  →
+
+Which unit should the app use for wind speed?
+
+❯ 1. km/h                         ┌──────────────────────────────────────────┐
+  2. m/s                          │ Wind: 12 km/h NE, gusts up to 20 km/h    │
+  3. mph                          └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions ·
+Esc to cancel";
+
+    /// `PREVIEW` with the cursor on option 2, its preview redrawn.
+    fn preview_on_two() -> String {
+        PREVIEW
+            .replace("❯ 1. km/h", "  1. km/h")
+            .replace("  2. m/s ", "❯ 2. m/s ")
+            .replace(
+                "│ Wind: 12 km/h NE, gusts up to 20 km/h    │",
+                "│ Wind: 3.3 m/s NE, gusts up to 5.6 m/s    │",
+            )
+    }
+
+    #[test]
+    fn reads_options_beside_a_preview() {
+        let p = parse_screen(&screen(PREVIEW)).unwrap();
+        assert_eq!(
+            p.tabs.as_deref(),
+            Some("☐ Wind unit  ☐ Temp unit  ✔ Submit")
+        );
+        assert_eq!(
+            p.question,
+            vec!["Which unit should the app use for wind speed?"]
+        );
+        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["km/h", "m/s", "mph"]);
+        assert!(p.options.iter().all(|o| o.description.is_empty()));
+        assert!(!p.notes_in_use());
+    }
+
+    #[test]
+    fn a_preview_pick_sends_enter_once_the_cursor_is_on_it() {
+        let p = parse_screen(&screen(PREVIEW)).unwrap();
+        let steps = p.pick(2).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].keys, vec![b"2".to_vec()]);
+        assert_eq!(steps[1].keys, vec![b"\r".to_vec()]);
+        assert!(steps[0].expect.shown_on(&screen(PREVIEW)));
+        // Enter waits for the cursor on 2: not before the digit lands.
+        assert!(!steps[1].expect.shown_on(&screen(PREVIEW)));
+        assert!(steps[1].expect.shown_on(&screen(&preview_on_two())));
+        // Nor on another option.
+        let on_three = PREVIEW
+            .replace("❯ 1. km/h", "  1. km/h")
+            .replace("  3. mph ", "❯ 3. mph ");
+        assert!(!steps[1].expect.shown_on(&screen(&on_three)));
+        // The option under the cursor already: the digit changes nothing.
+        let steps = p.pick(1).unwrap();
+        assert!(steps[1].expect.shown_on(&screen(PREVIEW)));
+        assert_eq!(p.pick(4), None);
+    }
+
+    #[test]
+    fn a_preview_with_notes_in_use_is_not_answered() {
+        // Open: a digit would be typed into the notes.
+        let open = PREVIEW.replace(NOTES_EMPTY, "Add notes on this design…");
+        let p = parse_screen(&screen(&open)).unwrap();
+        assert!(p.notes_in_use());
+        assert_eq!(p.pick(2), None);
+        // Closed with text: Enter would send the notes along.
+        let written = PREVIEW.replace(NOTES_EMPTY, "2");
+        assert_eq!(parse_screen(&screen(&written)).unwrap().pick(2), None);
+        // Notes opened between the digit and Enter.
+        let steps = parse_screen(&screen(PREVIEW)).unwrap().pick(2).unwrap();
+        let typed = preview_on_two().replace(NOTES_EMPTY, "");
+        assert!(!steps[1].expect.shown_on(&screen(&typed)));
+        // No notes line found: not answered.
+        let gone = PREVIEW.replace("Notes: press n to add notes", "");
+        assert_eq!(parse_screen(&screen(&gone)).unwrap().pick(2), None);
+    }
+
+    #[test]
+    fn a_box_without_its_bottom_corner_is_not_a_preview() {
+        let text = TABBED.replace("❯ 1. Apple", "❯ 1. Apple ┌─┐");
+        let p = parse_screen(&screen(&text)).unwrap();
+        assert_eq!(p.options[0].label, "Apple ┌─┐");
+        assert_eq!(p.pick(1).unwrap().len(), 1);
     }
 
     #[test]
