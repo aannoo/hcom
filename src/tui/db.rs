@@ -4,6 +4,7 @@
 //! Used when HCOM_MOCK_TUI is not set.
 
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::log::log_warn;
@@ -311,6 +312,7 @@ fn load_all(conn: &Connection, default_limit: usize) -> DataState {
     remote_agents.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
 
     let relay_health = load_relay_state(conn, configured, enabled);
+    let (tool_config_dirs, remote_accounts) = load_account_maps(conn, &device_uuid);
 
     DataState {
         agents,
@@ -322,7 +324,71 @@ fn load_all(conn: &Connection, default_limit: usize) -> DataState {
         relay_enabled,
         relay_health,
         search_results: None,
+        remote_accounts,
+        tool_config_dirs,
     }
+}
+
+/// For the conversation header: each local agent's launch-time tool config
+/// dir (where its login lives), and e-mails peers shared for their agents.
+/// A context from before the dir was recorded has no key: such an agent is
+/// left out, as its account is not known.
+fn load_account_maps(
+    conn: &Connection,
+    device_uuid: &str,
+) -> (HashMap<String, Option<String>>, HashMap<String, String>) {
+    let mut dirs = HashMap::new();
+    let mut shared: HashMap<String, Option<serde_json::Value>> = HashMap::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT name, tool, origin_device_id, launch_context FROM instances")
+    else {
+        return (dirs, HashMap::new());
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    }) else {
+        return (dirs, HashMap::new());
+    };
+    let mut remote_rows = Vec::new();
+    for (name, tool, origin, ctx) in rows.flatten() {
+        let origin = origin.unwrap_or_default();
+        if !origin.is_empty() && origin != device_uuid {
+            remote_rows.push((name, origin));
+            continue;
+        }
+        if let Some(tool) = AgentTool::parse(&tool).canonical()
+            && let Some(key) = crate::accounts::config_dir_env_key(tool)
+            && let Some(ctx) = ctx.filter(|c| !c.is_empty())
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ctx)
+            && let Some(dir) = v
+                .get("env")
+                .and_then(|e| e.get(key))
+                .and_then(|d| d.as_str())
+        {
+            // "" is the tool's default.
+            dirs.insert(name, (!dir.is_empty()).then(|| dir.to_string()));
+        }
+    }
+    let mut accounts = HashMap::new();
+    for (name, origin) in remote_rows {
+        let map = shared.entry(origin.clone()).or_insert_with(|| {
+            kv_get(conn, &format!("relay_accounts_{origin}"))
+                .and_then(|s| serde_json::from_str(&s).ok())
+        });
+        if let Some(email) = map
+            .as_ref()
+            .and_then(|m| m.get(&name))
+            .and_then(|e| e.as_str())
+        {
+            accounts.insert(name, email.to_string());
+        }
+    }
+    (dirs, accounts)
 }
 
 // ── Instance loading ────────────────────────────────────────────
@@ -1446,6 +1512,26 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    /// An agent launched before the config dir was recorded is not given the
+    /// default account: its row has no key, unlike a recorded default ("").
+    #[test]
+    fn account_maps_tell_a_missing_dir_from_the_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instances (name TEXT, tool TEXT, origin_device_id TEXT,
+                                     launch_context TEXT);
+             INSERT INTO instances VALUES
+               ('luna', 'claude', NULL, '{\"env\":{\"CLAUDE_CONFIG_DIR\":\"/work\"}}'),
+               ('nova', 'claude', NULL, '{\"env\":{\"CLAUDE_CONFIG_DIR\":\"\"}}'),
+               ('kira', 'claude', NULL, '{\"env\":{}}');",
+        )
+        .unwrap();
+        let (dirs, _) = super::load_account_maps(&conn, "this-device");
+        assert_eq!(dirs.get("luna"), Some(&Some("/work".to_string())));
+        assert_eq!(dirs.get("nova"), Some(&None));
+        assert_eq!(dirs.get("kira"), None);
     }
 
     #[test]

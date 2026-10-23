@@ -770,6 +770,16 @@ fn config_bootstrap(db: &HcomDb, args: &[String]) -> i32 {
 }
 
 /// Main entry point for `hcom config` command.
+/// Keys only `hcom relay` sets. `HCOM_RELAY_SHARE_ACCOUNT` is not one: it
+/// changes what the worker sends, not whether or where it runs.
+const RELAY_MANAGED_KEYS: &[&str] = &[
+    "HCOM_RELAY",
+    "HCOM_RELAY_ID",
+    "HCOM_RELAY_TOKEN",
+    "HCOM_RELAY_ENABLED",
+    "HCOM_RELAY_PSK",
+];
+
 pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) -> i32 {
     if args.key.as_deref() != Some("bootstrap") && !args.extra.is_empty() {
         eprintln!("Error: quote multi-word config values");
@@ -999,7 +1009,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         }
         // Relay settings change what the relay worker does and must go through
         // `hcom relay`, which validates them and starts/stops the worker to match.
-        if key.starts_with("HCOM_RELAY") {
+        if RELAY_MANAGED_KEYS.contains(&key.as_str()) {
             eprintln!(
                 "Error: {key} is managed by 'hcom relay' (new, connect, on, off).\nRun: hcom relay --help"
             );
@@ -2325,6 +2335,29 @@ mod tests {
                 .unwrap()
                 .contains("--future-upstream-flag")
         );
+    }
+
+    #[test]
+    fn test_relay_share_account_is_set_through_config() {
+        assert!(!RELAY_MANAGED_KEYS.contains(&normalize_key("relay_share_account").as_str()));
+        for key in [
+            "relay",
+            "relay_id",
+            "relay_token",
+            "relay_enabled",
+            "relay_psk",
+        ] {
+            assert!(
+                RELAY_MANAGED_KEYS.contains(&normalize_key(key).as_str()),
+                "{key}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config_set_at_path(&path, "HCOM_RELAY_SHARE_ACCOUNT", Some("1")).unwrap();
+        let parsed: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(parsed["relay"]["share_account"].as_bool(), Some(true));
     }
 
     #[test]

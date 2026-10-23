@@ -117,6 +117,89 @@ pub fn inject_text_remote_result(
     Ok(label)
 }
 
+/// What a step answers. Keys go out only while the screen shows exactly
+/// it: the caller reads the screen the way it read the prompt it showed,
+/// so a different prompt that merely contains the same text does not pass.
+pub trait ScreenCheck {
+    fn shown_on(&self, lines: &[String]) -> bool;
+}
+
+/// One step of answering a prompt in an agent's terminal: `keys` are sent,
+/// one chunk at a time, once `expect` is what the screen shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenStep<C> {
+    pub expect: C,
+    pub keys: Vec<Vec<u8>>,
+}
+
+const STEP_SCREEN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Gap between key chunks, so the agent's TUI reads each as its own key
+/// rather than one pasted string.
+const KEY_GAP: Duration = Duration::from_millis(120);
+
+fn screen_lines(port: i32) -> Option<Vec<String>> {
+    let screen = query_screen(port)?;
+    Some(
+        screen
+            .get("lines")?
+            .as_array()?
+            .iter()
+            .filter_map(|l| l.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// The agent's terminal screen, one string per row; `None` without a PTY.
+pub(crate) fn screen_of(db: &HcomDb, name: &str) -> Option<Vec<String>> {
+    screen_lines(get_inject_port(db, name)?)
+}
+
+/// Send each step's keys once the screen shows what it answers. Stops at
+/// the first step whose prompt does not appear. The screen is read just
+/// before the keys go out, so a prompt that changes in between can still
+/// receive them.
+pub fn answer_on_screen<C: ScreenCheck>(
+    db: &HcomDb,
+    name: &str,
+    steps: &[ScreenStep<C>],
+) -> Result<String, String> {
+    let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
+    for (i, step) in steps.iter().enumerate() {
+        let deadline = Instant::now() + STEP_SCREEN_TIMEOUT;
+        loop {
+            let lines = screen_lines(port);
+            if lines
+                .as_ref()
+                .is_some_and(|lines| step.expect.shown_on(lines))
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(match (i, lines.is_some()) {
+                    (0, false) => format!("no response from {name}'s terminal; nothing sent"),
+                    (0, true) => {
+                        format!("the prompt is no longer on {name}'s screen; nothing sent")
+                    }
+                    (_, false) => {
+                        format!(
+                            "no response from {name}'s terminal after step {i}; answer the rest there"
+                        )
+                    }
+                    (_, true) => {
+                        format!("{name}'s screen changed after step {i}; answer the rest there")
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for chunk in &step.keys {
+            inject_raw(port, chunk)?;
+            std::thread::sleep(KEY_GAP);
+        }
+    }
+    Ok(format!("Sent keys to {name}"))
+}
+
 /// Poll the screen until the injected text exclusively fills the input box
 /// before returning, so Enter is sent once the TUI has actually rendered it
 /// rather than after a guessed delay. Tools with no input-box parser (e.g.
@@ -556,6 +639,128 @@ mod tests {
 
         assert_eq!(result, "Injected 6 chars to luna");
         assert_eq!(received, "status");
+    }
+
+    /// A fake PTY: answers screen queries with `lines`, records the rest.
+    fn fake_terminal(
+        db: &HcomDb,
+        lines: &[&str],
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params!["luna", port],
+            )
+            .unwrap();
+        let screen = serde_json::json!({ "lines": lines }).to_string();
+        let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = keys.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                if request == b"\x00SCREEN\n" {
+                    stream.write_all(screen.as_bytes()).unwrap();
+                } else {
+                    recorded.lock().unwrap().push(request);
+                }
+            }
+        });
+        keys
+    }
+
+    use crate::tui::transcript_view::prompt::{ScreenPrompt, parse_screen};
+
+    /// The prompt the TUI read off the screen and answers with `2`.
+    const PROMPT: [&str; 11] = [
+        "────────────────────────────────",
+        " Bash command",
+        " Create probe-perm.txt",
+        "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+        " touch probe-perm.txt",
+        "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+        " Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. Yes, and don't ask again",
+        "   3. No",
+        " Esc to cancel · Tab to amend",
+    ];
+
+    fn lines(screen: &[&str]) -> Vec<String> {
+        screen.iter().map(|l| l.to_string()).collect()
+    }
+
+    fn step(screen: &[&str]) -> ScreenStep<ScreenPrompt> {
+        ScreenStep {
+            expect: parse_screen(&lines(screen)).unwrap(),
+            keys: vec![b"2".to_vec()],
+        }
+    }
+
+    fn sent(keys: &std::sync::Mutex<Vec<Vec<u8>>>) -> Vec<Vec<u8>> {
+        for _ in 0..100 {
+            if !keys.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        keys.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn answer_on_screen_sends_only_to_the_matching_prompt() {
+        let db = test_db();
+        let keys = fake_terminal(&db, &PROMPT);
+
+        let mut other = PROMPT;
+        other[4] = " rm -rf build";
+        let err = answer_on_screen(&db, "luna", &[step(&other)]).unwrap_err();
+        assert_eq!(
+            err,
+            "the prompt is no longer on luna's screen; nothing sent"
+        );
+        assert!(keys.lock().unwrap().is_empty());
+
+        let ok = answer_on_screen(&db, "luna", &[step(&PROMPT)]);
+        assert_eq!(ok, Ok("Sent keys to luna".to_string()));
+        assert_eq!(sent(&keys), vec![b"2".to_vec()]);
+    }
+
+    /// SEC-003: a key meant for prompt A must not reach a later prompt B
+    /// whose command contains A's. Every line of A is somewhere on B's
+    /// screen, so a text-contains match would send it.
+    #[test]
+    fn answer_on_screen_blocks_a_prompt_that_contains_the_answered_one() {
+        let db = test_db();
+        let mut b = PROMPT;
+        b[4] = " touch probe-perm.txt; touch other.txt";
+        assert!(parse_screen(&lines(&b)).is_some(), "B is a prompt");
+        let keys = fake_terminal(&db, &b);
+        let err = answer_on_screen(&db, "luna", &[step(&PROMPT)]).unwrap_err();
+        assert!(err.contains("nothing sent"), "{err}");
+        assert!(keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn answer_on_screen_reports_a_silent_terminal() {
+        let db = test_db();
+        // Bound and dropped: nothing listens on the port.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params!["luna", port],
+            )
+            .unwrap();
+        let err = answer_on_screen(&db, "luna", &[step(&PROMPT)]).unwrap_err();
+        assert_eq!(err, "no response from luna's terminal; nothing sent");
     }
 
     #[test]

@@ -706,10 +706,13 @@ fn string_list_param(params: &Value, key: &str) -> Vec<String> {
 }
 
 fn normalize_config_field(field: &str) -> String {
-    if field.starts_with("HCOM_") {
-        field.to_string()
+    // Config keys match case-insensitively, so the remote guards must compare
+    // the uppercased form or `hcom_relay_psk` would slip past them.
+    let upper = field.to_uppercase();
+    if upper.starts_with("HCOM_") {
+        upper
     } else {
-        format!("HCOM_{}", field.to_uppercase())
+        format!("HCOM_{upper}")
     }
 }
 
@@ -937,6 +940,10 @@ fn handle_remote_config_set(
         // Flipping the flag alone leaves the worker running; relay_off stops it.
         return Err("relay_enabled is not remotely settable; use relay off".to_string());
     }
+    if normalized == "HCOM_RELAY_SHARE_ACCOUNT" {
+        // Sharing this device's e-mails is its own user's opt-in.
+        return Err("relay_share_account is not remotely settable".to_string());
+    }
     crate::commands::config::config_set_and_apply(&normalized, value)?;
     Ok(json!({"field": field, "value": value}))
 }
@@ -1061,9 +1068,9 @@ const REMOTE_EVENTS_MIN_BYTES: usize = 1024;
 /// Largest events answer this device can publish right now. The answer rides
 /// in this device's next push next to its state snapshot, so it gets the push
 /// budget (sized for every live receiver) minus that snapshot and the wrapper.
-fn remote_events_byte_cap(db: &HcomDb) -> usize {
+fn remote_events_byte_cap(db: &HcomDb, share_account: bool) -> usize {
     let state_bytes = super::existing_device_uuid()
-        .map(|uuid| super::push::build_state(db, &uuid))
+        .map(|uuid| super::push::build_state(db, &uuid, share_account))
         .and_then(|state| serde_json::to_vec(&state).ok())
         .map_or(0, |v| v.len());
     super::push::sealed_payload_budget(db)
@@ -1077,7 +1084,7 @@ fn handle_remote_events(
     db: &HcomDb,
     params: &Value,
     _initiated_by: &str,
-    _config: &HcomConfig,
+    config: &HcomConfig,
 ) -> Result<Value, String> {
     let filters: crate::core::filters::FilterMap = match params.get("filters") {
         Some(v) if !v.is_null() => {
@@ -1088,7 +1095,7 @@ fn handle_remote_events(
     let sql = optional_param(params, "sql").map(|s| s.to_string());
     // Callers whose answer must share a snapshot with other data (catch-up
     // backfill) ask for a smaller byte budget; the widest is what fits a publish.
-    let widest = remote_events_byte_cap(db);
+    let widest = remote_events_byte_cap(db, config.relay_share_account);
     let byte_cap = usize_param(params, "max_bytes", widest).clamp(REMOTE_EVENTS_MIN_BYTES, widest);
     let mut last_n = usize_param(params, "last", 20);
     if last_n == 0 {
@@ -1975,14 +1982,16 @@ mod tests {
     #[test]
     fn test_handle_remote_config_get_blocks_relay_psk() {
         let db = test_db();
-        let err = handle_remote_config_get(
-            &db,
-            &json!({"fields": ["relay_psk"]}),
-            "initiator",
-            &HcomConfig::default(),
-        )
-        .unwrap_err();
-        assert_eq!(err, "relay_psk is not remotely queryable");
+        for field in ["relay_psk", "HCOM_relay_psk", "hcom_RELAY_PSK"] {
+            let err = handle_remote_config_get(
+                &db,
+                &json!({"fields": [field]}),
+                "initiator",
+                &HcomConfig::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err, "relay_psk is not remotely queryable");
+        }
     }
 
     #[test]
@@ -2022,6 +2031,26 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "relay_psk is not remotely queryable");
+    }
+
+    #[test]
+    fn test_handle_remote_config_set_blocks_relay_share_account() {
+        let db = test_db();
+        for field in [
+            "relay_share_account",
+            "HCOM_RELAY_SHARE_ACCOUNT",
+            "HCOM_relay_share_account",
+            "hcom_Relay_Share_Account",
+        ] {
+            let err = handle_remote_config_set(
+                &db,
+                &json!({"field": field, "value": "1"}),
+                "initiator",
+                &HcomConfig::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err, "relay_share_account is not remotely settable");
+        }
     }
 
     fn seed_events(db: &HcomDb, count: usize) {
@@ -2122,7 +2151,7 @@ mod tests {
         );
         let envelope_len = serde_json::to_string(&out).unwrap().len();
         assert!(
-            envelope_len <= remote_events_byte_cap(&db),
+            envelope_len <= remote_events_byte_cap(&db, false),
             "envelope {envelope_len} bytes exceeds cap"
         );
     }
@@ -2163,7 +2192,7 @@ mod tests {
             &HcomConfig::default(),
         )
         .unwrap();
-        assert!(serde_json::to_string(&out).unwrap().len() <= remote_events_byte_cap(&db));
+        assert!(serde_json::to_string(&out).unwrap().len() <= remote_events_byte_cap(&db, false));
     }
 
     #[test]
@@ -2179,7 +2208,7 @@ mod tests {
         .unwrap();
         let out = handle_remote_events(
             &db,
-            &json!({"last": 1, "max_bytes": remote_events_byte_cap(&db)}),
+            &json!({"last": 1, "max_bytes": remote_events_byte_cap(&db, false)}),
             "initiator",
             &HcomConfig::default(),
         )
@@ -2189,7 +2218,7 @@ mod tests {
         assert_eq!(out["truncated"].as_bool(), Some(true));
         assert_eq!(events[0]["data"]["from"], "luna");
         assert_eq!(events[0]["data"]["_relay_truncated"]["level"], 1);
-        assert!(serde_json::to_string(&out).unwrap().len() <= remote_events_byte_cap(&db));
+        assert!(serde_json::to_string(&out).unwrap().len() <= remote_events_byte_cap(&db, false));
     }
 
     #[test]
@@ -2216,7 +2245,7 @@ mod tests {
         assert_eq!(narrow["truncated"].as_bool(), Some(true));
         let wide = handle_remote_events(
             &db,
-            &json!({"last": 1, "max_bytes": remote_events_byte_cap(&db)}),
+            &json!({"last": 1, "max_bytes": remote_events_byte_cap(&db, false)}),
             "initiator",
             &HcomConfig::default(),
         )

@@ -12,6 +12,7 @@ pub mod rpc_async;
 pub mod state;
 pub mod status;
 pub mod theme;
+pub mod transcript_view;
 mod usage;
 
 use std::io::{Write, stdout};
@@ -72,6 +73,7 @@ fn prepare_vertical_viewport(app: &mut App) {
     app.source.set_timeline_limit(5000);
     app.ui.eject_filter = None;
     app.ui.msg_scroll = 0;
+    app.transcript.on_enter_vertical();
 }
 
 fn prepare_inline_viewport(app: &mut App) {
@@ -191,9 +193,12 @@ fn run_inner(viewport_height: u16) -> Result<()> {
 
     // HCOM_TUI_FULLSCREEN=1 starts directly in alternate screen (fullscreen) mode,
     // bypassing inline viewport which requires cursor position queries.
+    app.transcript.default_tab =
+        transcript_view::default_tab_from_env(std::env::var("HCOM_TUI_TAB").ok().as_deref());
     if std::env::var("HCOM_TUI_FULLSCREEN").as_deref() == Ok("1") {
         app.ui.view_mode = self::model::ViewMode::Vertical;
         app.source.set_timeline_limit(5000);
+        app.transcript.tab = app.transcript.default_tab;
     }
 
     let mut in_alt_screen = false;

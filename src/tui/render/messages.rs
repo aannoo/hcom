@@ -618,7 +618,7 @@ fn render_command_output(
 
 /// Render lines with bottom-anchored scroll and an auto-hiding scrollbar.
 /// Return the total and adjusted offset for the next frame.
-fn render_scrolled(
+pub(crate) fn render_scrolled(
     frame: &mut Frame,
     area: Rect,
     lines: Vec<Line<'_>>,

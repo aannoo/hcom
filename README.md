@@ -87,6 +87,8 @@ hcom codex
 hcom
 ```
 
+In the TUI, `\` switches to the side-by-side view and `c` there shows the selected agent's recent conversation: each request, the tools it used, and the reply. Set `HCOM_TUI_TAB=chat` to open on it.
+
 ## What agents can do
 
 - **Message** each other in real time. Messages arrive mid-turn (after tool calls) or wake idle agents immediately.
@@ -300,6 +302,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
+| `relay_share_account` | Send each agent's logged-in account e-mail to relay peers so their TUI can show it (default: off) |
 | `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `qoder_args` / `grok_args` / `hermes_args` | Default args passed to the tool |
 
 #### Scope

@@ -226,6 +226,18 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
             env_map.insert((*key).to_string(), serde_json::json!(val));
         }
     }
+    // Where the tool keeps its login, read later from other processes: so
+    // absolute, and "" for the tool's default, which tells a reader this
+    // context was captured with the key rather than before it existed.
+    for key in crate::accounts::CONFIG_DIR_ENV_KEYS {
+        let dir = std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .map(|p| std::path::absolute(&p).unwrap_or(p))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        env_map.insert(key.to_string(), serde_json::json!(dir));
+    }
     ctx.insert("env".into(), serde_json::Value::Object(env_map));
 
     // The launcher already resolved the effective preset; record it so
@@ -1399,6 +1411,25 @@ mod tests {
             ctx.get("pane_id").is_none(),
             "pane_id should be absent when HERDR_PANE_ID isn't set"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_context_records_config_dirs() {
+        crate::config::Config::init();
+        let _claude = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "rel/claude");
+        let _codex = EnvVarGuard::set("CODEX_HOME", "");
+
+        let ctx = capture_context();
+        let env = ctx.get("env").unwrap();
+
+        let claude = env["CLAUDE_CONFIG_DIR"].as_str().unwrap();
+        assert_eq!(
+            std::path::Path::new(claude),
+            std::env::current_dir().unwrap().join("rel/claude")
+        );
+        // Unset is recorded as the default, not left out.
+        assert_eq!(env["CODEX_HOME"].as_str(), Some(""));
     }
 
     #[test]

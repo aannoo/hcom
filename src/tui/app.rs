@@ -22,6 +22,7 @@ pub struct App {
     pub(crate) source: Box<dyn DataSource>,
     pub(crate) rpc_client: Option<RpcClient>,
     pub(crate) usage: crate::tui::usage::UsageWorker,
+    pub(crate) transcript: crate::tui::transcript_view::TranscriptView,
 }
 
 impl Default for App {
@@ -48,6 +49,7 @@ impl App {
             source,
             rpc_client,
             usage: Default::default(),
+            transcript: Default::default(),
             ejector: Ejector::new(),
             ui: UiState {
                 cursor: 0,
@@ -229,6 +231,7 @@ impl App {
                 };
                 dirty |= self.usage.poll(agent);
             }
+            dirty |= self.transcript_poll(std::time::Instant::now());
             if self.drain_rpc_results() {
                 dirty = true;
             }
@@ -299,11 +302,13 @@ impl App {
                     .any(|a| a.status == AgentStatus::Launching)
                 || self.ejector.is_replaying()
                 || rpc_pending;
-            let poll_ms = if animating || resize_cooldown > 0 {
-                80
-            } else {
-                500
-            };
+            let pace = LoopPace::new(
+                animating,
+                self.transcript_spinning(),
+                self.transcript.has_pending_timer(),
+                resize_cooldown > 0,
+            );
+            let poll_ms = pace.poll_ms;
 
             if event::poll(Duration::from_millis(poll_ms))? {
                 loop {
@@ -345,12 +350,12 @@ impl App {
             self.ui.tick += 1;
 
             // Animations need redraws for spinner frames etc.
-            if animating {
+            if pace.redraw {
                 dirty = true;
             }
 
             // Data reload — refresh faster while launching/pending RPC, slower when idle.
-            let reload_ms = if animating { 120 } else { 350 };
+            let reload_ms = pace.reload_ms;
             if last_reload.elapsed() >= Duration::from_millis(reload_ms) {
                 self.reload_data();
                 last_reload = std::time::Instant::now();
@@ -380,6 +385,32 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+/// How fast the event loop turns, redraws and reloads data.
+#[derive(Debug, PartialEq, Eq)]
+struct LoopPace {
+    poll_ms: u64,
+    /// Redraw every turn.
+    redraw: bool,
+    reload_ms: u64,
+}
+
+impl LoopPace {
+    /// The conversation tab's spinner redraws but leaves data reload at its
+    /// idle pace. Its timers (cursor settle, RPCs, reads) only need the loop
+    /// to turn fast: what they change marks the frame dirty itself.
+    fn new(animating: bool, spinning: bool, transcript_timer: bool, resizing: bool) -> Self {
+        Self {
+            poll_ms: if animating || spinning || transcript_timer || resizing {
+                80
+            } else {
+                500
+            },
+            redraw: animating || spinning,
+            reload_ms: if animating { 120 } else { 350 },
+        }
     }
 }
 
@@ -491,6 +522,7 @@ mod tests {
             source: Box::new(NullSource),
             rpc_client: None,
             usage: Default::default(),
+            transcript: Default::default(),
         }
     }
 
@@ -668,5 +700,38 @@ mod tests {
         app.data.orphans = vec![dummy_orphan(42)];
         // 2 agents + 1 remote header + 1 stopped header + 1 orphan header
         assert_eq!(app.total_visible_rows(), 5);
+    }
+
+    #[test]
+    fn transcript_timers_turn_the_loop_without_redraw_or_reload() {
+        let idle = LoopPace {
+            poll_ms: 500,
+            redraw: false,
+            reload_ms: 350,
+        };
+        assert_eq!(LoopPace::new(false, false, false, false), idle);
+        assert_eq!(
+            LoopPace::new(false, false, true, false),
+            LoopPace {
+                poll_ms: 80,
+                ..idle
+            }
+        );
+        assert_eq!(
+            LoopPace::new(false, true, false, false),
+            LoopPace {
+                poll_ms: 80,
+                redraw: true,
+                reload_ms: 350
+            }
+        );
+        assert_eq!(
+            LoopPace::new(true, false, false, false),
+            LoopPace {
+                poll_ms: 80,
+                redraw: true,
+                reload_ms: 120
+            }
+        );
     }
 }

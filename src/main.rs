@@ -4,6 +4,7 @@
 //! each tool's own UI. Agents use `hcom` CLI commands (learnt through bootstrap.rs)
 //! as a side-channel for messaging and coordination with other agents.
 
+mod accounts;
 mod bootstrap;
 mod claude_actor;
 mod cli_context;

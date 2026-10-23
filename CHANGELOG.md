@@ -2,6 +2,16 @@
 
 UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
+## Unreleased
+
+### Added
+
+- Added a conversation tab to the TUI's vertical view (`c`): the selected agent's recent turns with the request, a tool summary and the reply, for local and remote agents. The latest turn is open and earlier ones are one line each; `e` shows every turn in full, `R` refreshes, and Enter messages the agent. Markdown headings, lists, bold, code and tables are rendered. Set `HCOM_TUI_TAB=chat` to open vertical view on it.
+- Showed which account a Claude or Codex agent runs under (tool and logged-in e-mail, read from `CLAUDE_CONFIG_DIR` / `CODEX_HOME` when set) in the conversation tab header. Remote agents' e-mail is shared only when their device sets `hcom config relay_share_account 1`, and only for agents started after upgrading; a stopped agent's account is not shown.
+- Showed a spinner with the current tool and elapsed time under the conversation while the agent is working.
+- Answered a Claude agent's choice prompt from the conversation tab: while a local agent waits on a question (`AskUserQuestion`) or a permission prompt, its options are read off the agent's screen and listed under the conversation; a digit picks one and Enter moves on from a multi-select question. Keys are sent only while the same prompt is still on screen. Options that need typing are left to the agent's terminal.
+- Marked a blocked agent in the conversation tab and in the compose footer: messages to it are held until its prompt is answered.
+
 ## 0.7.31 — 2026-10-21
 
 ### Breaking changes

@@ -335,6 +335,10 @@ impl App {
         if self.ui.overlay.is_some() && self.handle_overlay_key(code) {
             return;
         }
+        // A question the agent under the cursor waits on takes digits first.
+        if self.ui.overlay.is_none() && self.transcript_answer_key(code) {
+            return;
+        }
 
         match code {
             // MOVEMENT — always work, no conditions
@@ -377,6 +381,14 @@ impl App {
                 self.ui.msg_scroll = self.ui.msg_scroll.saturating_sub(5);
             }
 
+            // Conversation tab: Enter messages the agent being read, not the
+            // selection. Header and orphan rows keep the toggle below.
+            KeyCode::Enter
+                if self.conversation_visible() && self.cursor_display_name().is_some() =>
+            {
+                let names: Vec<String> = self.cursor_display_name().into_iter().collect();
+                self.compose_to(&names);
+            }
             // SELECTION — in inline mode, auto-apply as scrollback filter
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.toggle_select_at_cursor();
@@ -471,20 +483,7 @@ impl App {
             }
 
             // COMPOSE ENTRY
-            KeyCode::Char('m') => {
-                // Message: pre-fill @mentions for selected or cursor agent
-                self.ui.mode = InputMode::Compose;
-                self.ui.input.clear();
-                self.ui.input_cursor = 0;
-                if !self.ui.selected.is_empty() {
-                    for name in self.ui.selected.iter() {
-                        self.ui.input.push_str(&format!("@{} ", name));
-                    }
-                } else if let Some(name) = self.cursor_display_name() {
-                    self.ui.input = format!("@{} ", name);
-                }
-                self.ui.input_cursor = self.ui.input.len();
-            }
+            KeyCode::Char('m') => self.compose_to_targets(),
             KeyCode::Char('b') => {
                 // Broadcast: compose with no @mentions (sends to all)
                 self.ui.mode = InputMode::Compose;
@@ -516,6 +515,10 @@ impl App {
             KeyCode::Char('?') => {
                 self.ui.help_open = true;
             }
+            // CONVERSATION TAB
+            KeyCode::Char('c') => self.transcript_toggle_tab(),
+            KeyCode::Char('R') => self.transcript_refresh(std::time::Instant::now()),
+            KeyCode::Char('e') => self.transcript_toggle_expand(),
 
             _ => {}
         }
@@ -1299,6 +1302,42 @@ fn push_agent_command_suggestions(s: &mut Vec<CommandSuggestion>, agent: &Agent)
     }
 }
 
+impl App {
+    /// Message: pre-fill @mentions for selected or cursor agent
+    fn compose_to_targets(&mut self) {
+        let names: Vec<String> = if self.ui.selected.is_empty() {
+            self.cursor_display_name().into_iter().collect()
+        } else {
+            self.ui.selected.iter().cloned().collect()
+        };
+        self.compose_to(&names);
+    }
+
+    fn compose_to(&mut self, names: &[String]) {
+        self.ui.mode = InputMode::Compose;
+        self.ui.input.clear();
+        for name in names {
+            self.ui.input.push_str(&format!("@{} ", name));
+        }
+        self.ui.input_cursor = self.ui.input.len();
+    }
+
+    /// Recipients in the compose input that are waiting on a prompt in their
+    /// terminal; delivery holds messages to them until it is answered.
+    pub(crate) fn blocked_recipients(&self) -> Vec<String> {
+        let (recipients, _) = parse_outbound_message(&self.ui.input);
+        recipients
+            .into_iter()
+            .filter(|r| {
+                self.all_agents().any(|a| {
+                    a.status == AgentStatus::Blocked
+                        && (a.display_name() == *r || a.action_name() == *r)
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,6 +1538,22 @@ mod tests {
         assert_eq!(app.ui.mode, InputMode::Compose);
         assert_eq!(app.ui.input, "@luna @nova ");
         assert_eq!(app.ui.input_cursor, app.ui.input.len());
+    }
+
+    #[test]
+    fn blocked_recipients_lists_mentioned_agents_waiting_on_a_prompt() {
+        let mut app = test_app();
+        let luna = app
+            .data
+            .agents
+            .iter_mut()
+            .find(|a| a.name == "luna")
+            .expect("luna");
+        luna.status = AgentStatus::Blocked;
+        app.ui.input = "@luna @nova hi".into();
+        assert_eq!(app.blocked_recipients(), vec!["luna".to_string()]);
+        app.ui.input = "@nova hi".into();
+        assert!(app.blocked_recipients().is_empty());
     }
 
     #[test]

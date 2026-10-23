@@ -275,6 +275,19 @@ impl App {
             RpcOp::Command { cmd } => {
                 self.show_command_output(&cmd, rpc_output_lines(result.result));
             }
+            RpcOp::AnswerPrompt { name, .. } => {
+                // Done either way: the next key may go out.
+                self.transcript.answering.remove(&name);
+                // Read the screen again either way: the next question or tab,
+                // or the prompt that was dropped when a failed answer left it.
+                if let Some(agent) = self.data.agents.iter().find(|a| a.name == name) {
+                    self.transcript.local.force_refresh(agent);
+                }
+                match result.result {
+                    Ok(resp) if resp.ok() => self.reload_data_force(),
+                    other => self.ui.flash = Some(rpc_error_flash("Answer failed", other)),
+                }
+            }
         }
     }
 

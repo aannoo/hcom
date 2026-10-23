@@ -118,6 +118,7 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     safe_kv_set(db, &format!("relay_sync_time_{}", device_id), None);
     safe_kv_set(db, &format!("relay_caps_{}", device_id), None);
     safe_kv_set(db, &format!("relay_ctrl_{}", device_id), None);
+    safe_kv_set(db, &format!("relay_accounts_{}", device_id), None);
     safe_kv_set(
         db,
         &format!("{}{}", super::PEER_MAX_PACKET_PREFIX, device_id),
@@ -415,6 +416,28 @@ pub fn handle_state_message(
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
+
+    // Account e-mails the peer chose to share, keyed by the namespaced row name.
+    let accounts: serde_json::Map<String, Value> = instances
+        .iter()
+        .filter_map(|(name, inst)| {
+            let email = inst.get("account_email")?.as_str()?;
+            Some((
+                super::add_device_suffix(name, &short_id),
+                Value::from(email),
+            ))
+        })
+        .collect();
+    let accounts_key = format!("relay_accounts_{}", device_id);
+    if accounts.is_empty() {
+        safe_kv_set(db, &accounts_key, None);
+    } else {
+        safe_kv_set(
+            db,
+            &accounts_key,
+            Some(&Value::Object(accounts).to_string()),
+        );
+    }
 
     // Instance upserts and removals commit together (one sync, not one per row).
     let instances_applied = db.with_write_scope(|| {

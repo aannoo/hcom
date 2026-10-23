@@ -50,7 +50,7 @@ fn selected_name_style(is_selected: bool) -> Style {
     }
 }
 
-const SPINNER_FRAMES: &[&str] = &[
+pub(crate) const SPINNER_FRAMES: &[&str] = &[
     "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280f}",
 ];

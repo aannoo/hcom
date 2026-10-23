@@ -242,6 +242,7 @@ pub(crate) static FIELDS: LazyLock<Vec<ConfigField>> = LazyLock::new(|| {
     f("relay_id", "HCOM_RELAY_ID", "relay.id", Str, "Relay group identifier (managed by hcom relay)"),
     f("relay_token", "HCOM_RELAY_TOKEN", "relay.token", Str, "Relay authentication token (managed by hcom relay)"),
     f("relay_enabled", "HCOM_RELAY_ENABLED", "relay.enabled", Bool, "Enable relay sync (managed by hcom relay)"),
+    f("relay_share_account", "HCOM_RELAY_SHARE_ACCOUNT", "relay.share_account", Bool, "Share agents' logged-in account e-mail with relay peers"),
     // Forge/decrypt authority for the whole relay group: never shown by
     // `hcom config`, never settable through it, never exported to env.
     f("relay_psk", "HCOM_RELAY_PSK", "relay.psk", Str, "Relay pre-shared key"),
@@ -316,6 +317,7 @@ pub struct HcomConfig {
     pub relay_token: String,
     pub relay_psk: String,
     pub relay_enabled: bool,
+    pub relay_share_account: bool,
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
@@ -350,6 +352,7 @@ impl Default for HcomConfig {
             relay_token: String::new(),
             relay_psk: String::new(),
             relay_enabled: true,
+            relay_share_account: false,
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
@@ -530,6 +533,7 @@ impl HcomConfig {
             "relay_token" => Some(self.relay_token.clone()),
             "relay_psk" => Some(self.relay_psk.clone()),
             "relay_enabled" => Some(if self.relay_enabled { "1" } else { "0" }.into()),
+            "relay_share_account" => Some(if self.relay_share_account { "1" } else { "0" }.into()),
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
@@ -576,6 +580,7 @@ impl HcomConfig {
             "relay_token" => self.relay_token = value.to_string(),
             "relay_psk" => self.relay_psk = value.to_string(),
             "relay_enabled" => self.relay_enabled = !is_falsy(value),
+            "relay_share_account" => self.relay_share_account = !is_falsy(value),
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
@@ -2265,6 +2270,7 @@ auto_approve = false
     fn sample_value(field: &ConfigField) -> &'static str {
         match (field.kind, field.name) {
             (FieldKind::Int, _) => "123",
+            (FieldKind::Bool, "relay_share_account") => "1",
             (FieldKind::Bool, _) => "0",
             (_, "terminal") => "print",
             (_, "title_mode") => "label",
