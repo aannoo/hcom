@@ -223,11 +223,11 @@ mod tests {
 ────────────────────────────────────────────────────────────────────────────────
 ←  ☐ fruit  ☐ drink  ✔ Submit  →
 
-과일?
+Fruit?
 
-❯ 1. 사과
-     사과를 선택합니다
-  2. 배
+❯ 1. Apple
+     Pick an apple
+  2. Pear
   3. Type something.
 ────────────────────────────────────────────────────────────────────────────────
   4. Chat about this
@@ -238,10 +238,13 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
     fn reads_a_tabbed_question() {
         let p = parse_screen(&screen(TABBED)).unwrap();
         assert_eq!(p.tabs.as_deref(), Some("☐ fruit  ☐ drink  ✔ Submit"));
-        assert_eq!(p.question, vec!["과일?"]);
+        assert_eq!(p.question, vec!["Fruit?"]);
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(labels, ["사과", "배", "Type something.", "Chat about this"]);
-        assert_eq!(p.options[0].description, "사과를 선택합니다");
+        assert_eq!(
+            labels,
+            ["Apple", "Pear", "Type something.", "Chat about this"]
+        );
+        assert_eq!(p.options[0].description, "Pick an apple");
         assert!(!p.is_multi());
         assert_eq!(
             p.pick(2),
@@ -263,11 +266,11 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         let text = "────────────────────────────────
 ←  ☒ fruit  ☐ drink  ✔ Submit  →
 
-음료?
+Drink?
 
-❯ 1. [✔] 물
-         기본 생수
-  2. [ ] 차
+❯ 1. [✔] Water
+         Still water
+  2. [ ] Tea
   3. [ ] Type something
      Submit
 ────────────────────────────────
@@ -277,7 +280,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         let p = parse_screen(&screen(text)).unwrap();
         assert!(p.is_multi());
         assert_eq!(p.options[0].checked, Some(true));
-        assert_eq!(p.options[0].label, "물");
+        assert_eq!(p.options[0].label, "Water");
         assert_eq!(p.options[1].checked, Some(false));
         assert_eq!(p.options[1].description, "");
         assert_eq!(p.pick(3), None);
@@ -289,12 +292,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert!(
             !next
                 .expect
-                .shown_on(&screen(&text.replace("[✔] 물", "[ ] 물")))
+                .shown_on(&screen(&text.replace("[✔] Water", "[ ] Water")))
         );
         assert!(
             !next
                 .expect
-                .shown_on(&screen(&text.replace("[ ] 차", "[✔] 차")))
+                .shown_on(&screen(&text.replace("[ ] Tea", "[✔] Tea")))
         );
     }
 
@@ -305,8 +308,8 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
 
 Review your answers
 
- ● 과일?
-   → 배
+ ● Fruit?
+   → Pear
 
 Ready to submit your answers?
 
@@ -461,12 +464,12 @@ COMMAND
     #[test]
     fn reads_with_the_cursor_below_the_rule() {
         let text = TABBED
-            .replace("❯ 1. 사과", "  1. 사과")
+            .replace("❯ 1. Apple", "  1. Apple")
             .replace("  4. Chat about this", "❯ 4. Chat about this");
         let p = parse_screen(&screen(&text)).unwrap();
-        assert_eq!(p.question, vec!["과일?"]);
+        assert_eq!(p.question, vec!["Fruit?"]);
         assert_eq!(p.options.len(), 4);
-        assert_eq!(p.options[0].description, "사과를 선택합니다");
+        assert_eq!(p.options[0].description, "Pick an apple");
         assert_eq!(p.pick(1).unwrap().expect.anchor, FOOTER);
     }
 
@@ -474,7 +477,7 @@ COMMAND
     fn nothing_waiting() {
         // Answered: the question remains in the scrollback, the selector does not.
         let answered = "⏺ User answered Claude's questions:
-  ⎿  · 과일? → 배
+  ⎿  · Fruit? → Pear
 ────────────────────────────────
 ❯
 ────────────────────────────────";

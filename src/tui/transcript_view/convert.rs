@@ -341,12 +341,12 @@ mod tests {
 
     #[test]
     fn long_response_keeps_tail() {
-        let action: String = (1..=20).map(|i| format!("줄 {i}\n")).collect();
+        let action: String = (1..=20).map(|i| format!("line {i}\n")).collect();
         let t = turn_from_exchange(&ex("q", &action, &[], &[]));
         assert_eq!(t.response_omitted, 12);
         assert_eq!(t.response_tail.len(), 8);
-        assert_eq!(t.response_tail[0], "줄 13");
-        assert_eq!(t.response_summary, "줄 20");
+        assert_eq!(t.response_tail[0], "line 13");
+        assert_eq!(t.response_summary, "line 20");
         assert_eq!(t.tools, ToolSummary::None);
     }
 
@@ -378,13 +378,13 @@ mod tests {
     #[test]
     fn slash_command_request_and_full_text() {
         let t = turn_from_exchange(&ex(
-            "<command-message>personal</command-message>\n<command-name>/personal</command-name>\n<command-args>질문 하나</command-args>",
+            "<command-message>personal</command-message>\n<command-name>/personal</command-name>\n<command-args>one question</command-args>",
             "a\n\n\nb  \n\n",
             &[],
             &[],
         ));
-        assert_eq!(t.request_summary, "/personal 질문 하나");
-        assert_eq!(t.request_full, vec!["/personal 질문 하나"]);
+        assert_eq!(t.request_summary, "/personal one question");
+        assert_eq!(t.request_full, vec!["/personal one question"]);
         assert_eq!(t.response_full, vec!["a", "", "b"]);
         assert_eq!(clean_request("plain"), "plain");
         assert_eq!(
@@ -416,7 +416,7 @@ mod tests {
         let mut turns = vec![first, wake];
         let messages = vec![
             msg("bigboss", &["lava:TUGA"], "too early", 90.0),
-            msg("bigboss", &["lava:TUGA"], "얼마나 남았어?", 199.5),
+            msg("bigboss", &["lava:TUGA"], "how long left?", 199.5),
             msg("luna", &["nova"], "not for lava", 199.0),
             msg("lava:TUGA", &[], "own broadcast", 199.0),
             msg("nova", &[], "all hands\nline 2", 201.0),
@@ -426,9 +426,9 @@ mod tests {
         assert_eq!(turns[0].request_summary, "q");
         assert_eq!(
             turns[1].request_full,
-            vec!["bigboss: 얼마나 남았어?", "nova: all hands", "line 2"]
+            vec!["bigboss: how long left?", "nova: all hands", "line 2"]
         );
-        assert_eq!(turns[1].request_summary, "bigboss: 얼마나 남았어?");
+        assert_eq!(turns[1].request_summary, "bigboss: how long left?");
 
         // Nothing found: the trigger stays.
         let mut lone = vec![turns[1].clone()];

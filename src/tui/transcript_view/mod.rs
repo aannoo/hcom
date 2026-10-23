@@ -356,19 +356,19 @@ mod tests {
     }
 
     const QUESTION: &str = "────────────────────────────────
-과일?
+Fruit?
 
-❯ 1. 사과
-  2. 배
+❯ 1. Apple
+  2. Pear
   3. Type something.
 
 Enter to select · Esc to cancel";
 
     const MULTI: &str = "────────────────────────────────
-음료?
+Drink?
 
-❯ 1. [ ] 물
-  2. [ ] 차
+❯ 1. [ ] Water
+  2. [ ] Tea
 
 Enter to select · Esc to cancel";
 

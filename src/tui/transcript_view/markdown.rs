@@ -261,8 +261,8 @@ mod tests {
     fn block_lines() {
         let base = Style::default();
         let mut code = false;
-        let h = line("## 제목 **굵게**", &mut code, base).unwrap();
-        assert_eq!(texts(&h), vec!["제목 ", "굵게"]);
+        let h = line("## Title **bold**", &mut code, base).unwrap();
+        assert_eq!(texts(&h), vec!["Title ", "bold"]);
         assert!(h[0].1.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             texts(&line("  - item", &mut code, base).unwrap()),
@@ -289,9 +289,9 @@ mod tests {
     #[test]
     fn tables_align() {
         let rows: Vec<String> = [
-            "| 대상 | 방법 |",
+            "| ＩＤ | Tool |",
             "|---|:--:|",
-            "| **커밋** | `git diff` |",
+            "| **ＧＯ** | `git diff` |",
             "| a |",
         ]
         .iter()
@@ -304,9 +304,9 @@ mod tests {
         assert_eq!(
             joined,
             vec![
-                "대상 │ 방법",
+                "ＩＤ │ Tool",
                 "─────┼─────────",
-                "커밋 │ git diff",
+                "ＧＯ │ git diff",
                 "a    │ "
             ]
         );
@@ -325,10 +325,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(texts(&rows[0]), vec!["ab "]);
         assert_eq!(rows[1], vec![("cdef".to_string(), bold)]);
-        let rows = wrap(&[("가나다라".to_string(), Style::default())], 4);
+        let rows = wrap(&[("ＡＢＣＤ".to_string(), Style::default())], 4);
         assert_eq!(
             rows.iter().map(|r| texts(r).concat()).collect::<Vec<_>>(),
-            vec!["가나", "다라"]
+            vec!["ＡＢ", "ＣＤ"]
         );
         assert_eq!(wrap(&[], 4), vec![Vec::<Segment>::new()]);
     }

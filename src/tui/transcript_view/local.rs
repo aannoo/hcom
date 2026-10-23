@@ -568,10 +568,10 @@ mod tests {
 
     fn a_prompt() -> ScreenPrompt {
         let screen = "────────────────────────────────
-과일?
+Fruit?
 
-❯ 1. 사과
-  2. 배
+❯ 1. Apple
+  2. Pear
 
 Enter to select · Esc to cancel";
         parse_screen(&screen.lines().map(String::from).collect::<Vec<_>>()).unwrap()

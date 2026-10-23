@@ -606,11 +606,11 @@ mod tests {
         let screen: Vec<String> = "────────────────────────────────
 ←  ☒ fruit  ☐ drink  ✔ Submit  →
 
-음료?
+Drink?
 
-❯ 1. [✔] 물
-         기본 생수
-  2. [ ] 차
+❯ 1. [✔] Water
+         Still water
+  2. [ ] Tea
   3. [ ] Type something
      Submit
 
@@ -624,9 +624,9 @@ Enter to select · Esc to cancel"
             out,
             vec![
                 "  ☒ fruit  ☐ drink  ✔ Submit",
-                "  음료?",
-                "   [x] 1 물  기본 생수",
-                "   [ ] 2 차",
+                "  Drink?",
+                "   [x] 1 Water  Still water",
+                "   [ ] 2 Tea",
                 "   [ ] 3 Type something",
                 "  1-2 toggle · enter next · typing answers in the terminal",
             ]
@@ -647,17 +647,17 @@ Enter to select · Esc to cancel"
             extra_files: 0,
         };
         let turns = vec![
-            turn(12, "분석해줘", "가능 판정", tools.clone()),
-            turn(13, "fork", "생성", ToolSummary::Unknown),
-            turn(14, "테스트 돌려봐", "6개 통과", tools),
+            turn(12, "analyze it", "feasible", tools.clone()),
+            turn(13, "fork", "created", ToolSummary::Unknown),
+            turn(14, "run the tests", "6 passed", tools),
         ];
         let out = text(&body_lines(&turns, false, 80));
-        assert_eq!(out[0], "▸ #12 16:02 분석해줘 → 가능 판정  Tool×3");
-        assert_eq!(out[1], "▸ #13 16:02 fork → 생성  Tool —");
+        assert_eq!(out[0], "▸ #12 16:02 analyze it → feasible  Tool×3");
+        assert_eq!(out[1], "▸ #13 16:02 fork → created  Tool —");
         assert!(out[2].starts_with("── #14 · 16:02 "));
-        assert_eq!(out[3], "▶ 테스트 돌려봐");
+        assert_eq!(out[3], "▶ run the tests");
         assert_eq!(out[4], "⚙ Bash×3");
-        assert_eq!(out[5], "◀ 6개 통과");
+        assert_eq!(out[5], "◀ 6 passed");
 
         let all = text(&body_lines(&turns, true, 80));
         assert!(all[0].starts_with("── #12"));
@@ -676,7 +676,12 @@ Enter to select · Esc to cancel"
 
     #[test]
     fn narrow_width_never_panics() {
-        let t = turn(1, "한글 요청 🦀🦀🦀", "응답 🦀", ToolSummary::Unknown);
+        let t = turn(
+            1,
+            "ｗｉｄｅ ask 🦀🦀🦀",
+            "ｒｅｐｌｙ 🦀",
+            ToolSummary::Unknown,
+        );
         for w in 0..12 {
             for l in text(&body_lines(std::slice::from_ref(&t), true, w)) {
                 assert!(l.width() <= w.max(1), "{l:?} at {w}");
@@ -740,7 +745,7 @@ Enter to select · Esc to cancel"
     #[test]
     fn full_mode_shows_every_turn_wrapped() {
         let mut first = turn(1, "q1", "a1", ToolSummary::None);
-        first.response_full = vec!["가나다라마바".into(), "".into(), "end".into()];
+        first.response_full = vec!["ＡＢＣＤＥＦ".into(), "".into(), "end".into()];
         let second = turn(2, "q2", "a2", ToolSummary::None);
         let out = text(&body_lines(&[first, second], true, 8));
         assert_eq!(
@@ -748,8 +753,8 @@ Enter to select · Esc to cancel"
             vec![
                 "── #1 ·…",
                 "▶ q1",
-                "◀ 가나다",
-                "  라마바",
+                "◀ ＡＢＣ",
+                "  ＤＥＦ",
                 "  ",
                 "  end",
                 "── #2 ·…",
@@ -801,20 +806,25 @@ Enter to select · Esc to cancel"
 
     #[test]
     fn markdown_in_turns() {
-        let mut t = turn(1, "**요청**", "## 결과\n- `a.rs` 수정", ToolSummary::None);
-        t.response_tail = vec!["## 결과".into(), "- `a.rs` 수정".into()];
-        t.response_summary = "- `a.rs` 수정".into();
+        let mut t = turn(
+            1,
+            "**request**",
+            "## Result\n- `a.rs` changed",
+            ToolSummary::None,
+        );
+        t.response_tail = vec!["## Result".into(), "- `a.rs` changed".into()];
+        t.response_summary = "- `a.rs` changed".into();
         let out = text(&body_lines(std::slice::from_ref(&t), false, 40));
-        assert_eq!(out[1], "▶ 요청");
-        assert_eq!(out[2], "◀ 결과");
-        assert_eq!(out[3], "  • a.rs 수정");
+        assert_eq!(out[1], "▶ request");
+        assert_eq!(out[2], "◀ Result");
+        assert_eq!(out[3], "  • a.rs changed");
         // Collapsed summaries drop the markers.
         let out = text(&body_lines(
             &[t.clone(), turn(2, "q", "a", ToolSummary::None)],
             false,
             60,
         ));
-        assert!(out[0].contains("요청 → • a.rs 수정"), "{}", out[0]);
+        assert!(out[0].contains("request → • a.rs changed"), "{}", out[0]);
 
         // The tail starts inside a block opened in the omitted part.
         let mut code = turn(3, "q", "", ToolSummary::None);
