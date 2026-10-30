@@ -533,6 +533,20 @@ fn start_rebind(
             eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
         }
 
+        // Persist the numeric PID on the instance row.
+        //
+        // The stale-instance cleanup already spares rows whose `instances.pid` is
+        // alive (`skip_live_pid`), but nothing on the `hcom start` path used to
+        // write that column. With a symbolic process id (e.g. a custom launcher token
+        // token) the row kept `pid = NULL`, so the cleanup deleted a live session:
+        // the instance and both bindings disappeared, and every later hook
+        // resolved to `no_instance` with no path back.
+        if let Some(pid_num) = process_id.trim().parse::<u32>().ok()
+            && let Err(e) = db.update_instance_pid(&target_name, pid_num)
+        {
+            eprintln!("[hcom] warn: update_instance_pid failed for {target_name}: {e}");
+        }
+
         // Migrate notify endpoints before notify so wake reaches correct port
         if !current_name.is_empty()
             && current_name != target_name
@@ -817,6 +831,21 @@ fn start_bare(db: &HcomDb, ctx: &HcomContext, explicit_name: Option<&str>) -> Re
         eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
+    // Same PID persistence as the rebind path above: this is the ORDINARY start
+    // path, where a session is registered for the first time. Without it the
+    // instance keeps `pid = NULL` and the stale cleanup has nothing to check, so
+    // an idle-but-live session is deleted (instance + bindings) and every later
+    // hook resolves to `no_instance`.
+    if let Some(ref process_id) = ctx.process_id
+        && let Some(pid_num) = process_id.trim().parse::<u32>().ok()
+        && process_owner
+            .as_ref()
+            .is_none_or(|owner| owner.name == name)
+        && let Err(e) = db.update_instance_pid(&name, pid_num)
+    {
+        eprintln!("[hcom] warn: update_instance_pid failed for {name}: {e}");
+    }
+
     print_bootstrap(db, ctx, &name, tool);
 
     // Log
@@ -960,6 +989,35 @@ mod tests {
         assert!(
             err.to_string().contains("Remote start is not supported"),
             "unexpected error: {err}"
+        );
+    }
+
+    // Regression for the reported case: `hcom start --name <agent>` goes through
+    // `start_bare` (no `--as`), so the PID write must happen there too. Before the
+    // fix the row kept `pid = NULL` and the clock-based stale cleanup deleted a
+    // session that was still alive.
+    #[test]
+    #[serial]
+    fn ordinary_start_persists_numeric_pid() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        let pid = std::process::id();
+        let env = HashMap::from([("HCOM_PROCESS_ID".to_string(), pid.to_string())]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+
+        start_bare(&db, &ctx, Some("probe")).unwrap();
+
+        let stored: Option<i64> = db
+            .conn()
+            .query_row("SELECT pid FROM instances WHERE name = 'probe'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            stored,
+            Some(i64::from(pid)),
+            "ordinary start must persist the numeric pid so stale cleanup spares the live session"
         );
     }
 

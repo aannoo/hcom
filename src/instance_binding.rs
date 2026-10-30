@@ -1447,6 +1447,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_path2_placeholder() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1474,6 +1475,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_path1a_true_placeholder_merge() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1509,6 +1511,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_path1b_session_switch_marks_old_inactive() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1549,6 +1552,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_no_match() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1560,6 +1564,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_create_orphaned_pty_identity_basic() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1582,6 +1587,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_create_orphaned_pty_identity_no_process_id() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1598,6 +1604,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_from_binding_process_binding() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1619,6 +1626,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_from_binding_session_alone_resolves_nothing() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1639,6 +1647,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_from_binding_rejects_session_owned_elsewhere() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1667,6 +1676,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_from_binding_process_binding_instance_deleted() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1680,6 +1690,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_from_binding_no_match() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1691,6 +1702,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_session_binding_cascade_on_instance_delete() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1716,6 +1728,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_restores_deleted_canonical_from_placeholder() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1967,6 +1980,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_tool_checked_bind_rolls_back_failed_rebind() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -2105,6 +2119,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_restore_stopped_keeps_active_no_session_row() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -2173,6 +2188,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_delete_placeholder_failure_keeps_notify_on_canonical() {
         let (db, path) = setup_test_db();
 
@@ -2232,6 +2248,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_bind_session_idempotent_same_session() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
