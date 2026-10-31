@@ -1513,6 +1513,91 @@ mod tests {
         cleanup_test_db(db_path);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn own_pid_namespace() -> String {
+        std::fs::read_link("/proc/self/ns/pid")
+            .expect("test needs a readable /proc/self/ns/pid")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stored_launch_context(db: &HcomDb, name: &str) -> serde_json::Value {
+        let launch_context: String = db
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&launch_context).unwrap()
+    }
+
+    /// A PID identity only means something in the PID namespace it was
+    /// observed from, so that namespace is stored beside it — replacing any
+    /// namespace left from an earlier incarnation.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pid_identity_write_records_observer_pid_namespace() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\",\"pid_identity\":\"old\",\"pid_namespace\":\"pid:[1]\"}'),
+                        ('nova', 1.0, '{}')",
+                [],
+            )
+            .unwrap();
+        let own = own_pid_namespace();
+
+        db.update_instance_pid_with_identity("luna", 4242, Some("spawn-1"))
+            .unwrap();
+        let ctx = stored_launch_context(&db, "luna");
+        assert_eq!(ctx["pid_identity"], "spawn-1");
+        assert_eq!(ctx["pid_namespace"], own.as_str());
+        assert_eq!(ctx["pane_id"], "42");
+
+        // The observing path (`observe_pid_identity`) records it as well.
+        db.update_instance_pid("nova", std::process::id()).unwrap();
+        let ctx = stored_launch_context(&db, "nova");
+        assert!(ctx.get("pid_identity").is_some());
+        assert_eq!(ctx["pid_namespace"], own.as_str());
+
+        cleanup_test_db(db_path);
+    }
+
+    /// Wherever the identity is dropped, its namespace goes with it: a
+    /// namespace without an identity would describe nothing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pid_namespace_is_removed_with_pid_identity() {
+        let (db, db_path) = setup_full_test_db();
+        let ctx = r#"{"pane_id":"42","pid_identity":"old","pid_namespace":"pid:[1]"}"#;
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, ?1), ('nova', 1.0, ?1)",
+                params![ctx],
+            )
+            .unwrap();
+
+        db.update_instance_pid_with_identity("luna", 4242, None)
+            .unwrap();
+        let ctx = stored_launch_context(&db, "luna");
+        assert!(ctx.get("pid_identity").is_none());
+        assert!(ctx.get("pid_namespace").is_none());
+        assert_eq!(ctx["pane_id"], "42");
+
+        db.clear_instance_pid("nova").unwrap();
+        let ctx = stored_launch_context(&db, "nova");
+        assert!(ctx.get("pid_identity").is_none());
+        assert!(ctx.get("pid_namespace").is_none());
+        assert_eq!(ctx["pane_id"], "42");
+
+        cleanup_test_db(db_path);
+    }
+
     #[test]
     fn test_update_instance_pid_with_fields_can_join_outer_transaction() {
         let (db, db_path) = setup_full_test_db();

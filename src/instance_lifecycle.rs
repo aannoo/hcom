@@ -1308,6 +1308,230 @@ mod tests {
         cleanup(path);
     }
 
+    /// A namespace link no Linux kernel hands out (namespace inodes are large),
+    /// so it can never be the PID namespace this test process runs in.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const FOREIGN_PID_NAMESPACE: &str = "pid:[1]";
+
+    /// The PID namespace of this test process, as `readlink /proc/self/ns/pid`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn own_pid_namespace() -> String {
+        let link = std::fs::read_link("/proc/self/ns/pid")
+            .expect("test needs a readable /proc/self/ns/pid");
+        let own = link.to_string_lossy().into_owned();
+        assert_ne!(own, FOREIGN_PID_NAMESPACE, "foreign fixture must differ");
+        own
+    }
+
+    /// A fresh `active` row whose launch context records `pid_identity` and,
+    /// when given, the PID namespace the identity was observed from. Written
+    /// directly so the namespace is exactly the fixture's, not the writer's.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn insert_with_pid_namespace(
+        db: &HcomDb,
+        name: &str,
+        pid: i64,
+        identity: &str,
+        pid_namespace: Option<&str>,
+    ) {
+        insert_stale_active(db, name, 0, 0, pid);
+        let mut ctx = serde_json::json!({ "pid_identity": identity });
+        if let Some(ns) = pid_namespace {
+            ctx["pid_namespace"] = serde_json::json!(ns);
+        }
+        db.conn()
+            .execute(
+                "UPDATE instances SET launch_context = ? WHERE name = ?",
+                rusqlite::params![ctx.to_string(), name],
+            )
+            .unwrap();
+    }
+
+    /// Reasons of the `stopped` life events logged for `name`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stop_reasons(db: &HcomDb, name: &str) -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT data FROM events WHERE type = 'life' AND instance = ? ORDER BY id")
+            .unwrap();
+        stmt.query_map(rusqlite::params![name], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data.unwrap()).unwrap())
+            .filter(|data| data["action"] == "stopped")
+            .map(|data| data["reason"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// A caller in another PID namespace (a sandboxed tool calling hcom) sees
+    /// none of the host's PIDs: the recorded process looks gone to it while it
+    /// still runs. It must leave the row alone instead of stopping it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_reap_skips_dead_pid_recorded_in_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_with_pid_namespace(
+            &db,
+            "host-agent",
+            DEAD_PID,
+            "linux:host-boot:12345",
+            Some(FOREIGN_PID_NAMESPACE),
+        );
+        let row = db.get_instance_full("host-agent").unwrap().unwrap();
+
+        assert_eq!(
+            reap_if_process_gone(&db, &row),
+            TrackedProcess::Unverifiable,
+            "a PID recorded in another PID namespace can't be checked from here"
+        );
+        assert!(instance_exists(&db, "host-agent"), "row must survive");
+        assert!(stop_reasons(&db, "host-agent").is_empty(), "no stop event");
+        cleanup(path);
+    }
+
+    /// Same caller, but its own namespace happens to hold a different process
+    /// under the recorded PID: the identity mismatch says nothing about the
+    /// process the row tracks.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_reap_skips_identity_mismatch_recorded_in_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_with_pid_namespace(
+            &db,
+            "host-agent",
+            std::process::id() as i64,
+            "linux:host-boot:12345",
+            Some(FOREIGN_PID_NAMESPACE),
+        );
+        let row = db.get_instance_full("host-agent").unwrap().unwrap();
+
+        assert_eq!(
+            reap_if_process_gone(&db, &row),
+            TrackedProcess::Unverifiable
+        );
+        assert!(instance_exists(&db, "host-agent"), "row must survive");
+        assert!(stop_reasons(&db, "host-agent").is_empty(), "no stop event");
+        cleanup(path);
+    }
+
+    /// The namespace check comes before the identity comparison: even when
+    /// the recorded identity matches a live process here, a PID recorded in
+    /// another namespace is no evidence about that process.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_reap_skips_matching_identity_recorded_in_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let pid = std::process::id();
+        let identity =
+            crate::sys::process::identity(pid).expect("test needs its own process identity");
+        insert_with_pid_namespace(
+            &db,
+            "host-agent",
+            pid as i64,
+            &identity,
+            Some(FOREIGN_PID_NAMESPACE),
+        );
+        let row = db.get_instance_full("host-agent").unwrap().unwrap();
+
+        assert_eq!(
+            reap_if_process_gone(&db, &row),
+            TrackedProcess::Unverifiable,
+            "a matching identity must not turn the row into Alive"
+        );
+        assert!(instance_exists(&db, "host-agent"), "row must survive");
+        assert!(stop_reasons(&db, "host-agent").is_empty(), "no stop event");
+        cleanup(path);
+    }
+
+    /// The namespace check must not weaken reaping where the PID is meaningful.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_reap_stops_dead_pid_recorded_in_own_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let own = own_pid_namespace();
+        insert_with_pid_namespace(&db, "exited", DEAD_PID, "exited-process", Some(&own));
+        let row = db.get_instance_full("exited").unwrap().unwrap();
+
+        assert_eq!(reap_if_process_gone(&db, &row), TrackedProcess::Reaped);
+        assert!(!instance_exists(&db, "exited"));
+        assert_eq!(
+            stop_reasons(&db, "exited"),
+            vec!["process_exit".to_string()]
+        );
+        cleanup(path);
+    }
+
+    /// Rows written before `pid_namespace` existed keep the 0.7.31 behaviour:
+    /// a gone PID is reaped, whatever namespace the caller runs in.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_reap_stops_dead_pid_of_legacy_row_without_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_with_pid_namespace(&db, "legacy", DEAD_PID, "exited-process", None);
+        let row = db.get_instance_full("legacy").unwrap().unwrap();
+
+        assert_eq!(reap_if_process_gone(&db, &row), TrackedProcess::Reaped);
+        assert!(!instance_exists(&db, "legacy"));
+        assert_eq!(
+            stop_reasons(&db, "legacy"),
+            vec!["process_exit".to_string()]
+        );
+        cleanup(path);
+    }
+
+    /// The router's periodic sweep runs in whatever process calls hcom, so it
+    /// must spare foreign-namespace rows while still reaping its own.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_throttled_sweep_spares_row_from_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let own = own_pid_namespace();
+        insert_with_pid_namespace(
+            &db,
+            "host-agent",
+            DEAD_PID,
+            "linux:host-boot:12345",
+            Some(FOREIGN_PID_NAMESPACE),
+        );
+        insert_with_pid_namespace(&db, "exited", DEAD_PID, "exited-process", Some(&own));
+
+        assert_eq!(reap_dead_processes_throttled(&db), 1);
+        assert!(instance_exists(&db, "host-agent"), "foreign row kept");
+        assert!(stop_reasons(&db, "host-agent").is_empty());
+        assert!(!instance_exists(&db, "exited"), "own dead row reaped");
+        cleanup(path);
+    }
+
+    /// `hcom list` cleanup: same contract as the sweep.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_cleanup_spares_row_from_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let own = own_pid_namespace();
+        insert_with_pid_namespace(
+            &db,
+            "host-agent",
+            DEAD_PID,
+            "linux:host-boot:12345",
+            Some(FOREIGN_PID_NAMESPACE),
+        );
+        insert_with_pid_namespace(&db, "exited", DEAD_PID, "exited-process", Some(&own));
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 1);
+        assert!(instance_exists(&db, "host-agent"), "foreign row kept");
+        assert!(stop_reasons(&db, "host-agent").is_empty());
+        assert!(!instance_exists(&db, "exited"), "own dead row reaped");
+        cleanup(path);
+    }
+
     #[test]
     fn test_instance_pid_reused() {
         let _guard = wake_test_guard();

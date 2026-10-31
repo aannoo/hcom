@@ -1446,6 +1446,45 @@ mod tests {
         cleanup(path);
     }
 
+    /// The PID namespace stored beside `pid_identity` was observed by whoever
+    /// recorded the PID; a hook re-capturing the context can't observe it again
+    /// and must carry it over unchanged, like the identity itself.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn test_capture_and_store_launch_context_preserves_pid_namespace() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"pid_identity":"spawn-1","pid_namespace":"pid:[1]"}"#
+                ],
+            )
+            .unwrap();
+        let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let ctx: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            ctx.get("pid_identity").and_then(|v| v.as_str()),
+            Some("spawn-1")
+        );
+        assert_eq!(
+            ctx.get("pid_namespace").and_then(|v| v.as_str()),
+            Some("pid:[1]")
+        );
+
+        cleanup(path);
+    }
+
     #[test]
     fn test_bind_session_path2_placeholder() {
         crate::config::Config::init();
