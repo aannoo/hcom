@@ -216,6 +216,10 @@ pub struct ArgFlags {
     /// Flags with an optional value or several values: they take the following
     /// tokens up to the next flag, even after `--flag=value`.
     pub multi_value: &'static [&'static str],
+    /// Flags with at most one value (clap `num_args = 0..=1`): the next token
+    /// unless the value is inline (`--flag=value`) or the next token is `--`, a
+    /// flag or a subcommand.
+    pub optional_value: &'static [&'static str],
     /// Root subcommands that terminate optional or variadic option values.
     /// Required single values can still equal a subcommand name.
     pub subcommands: &'static [&'static str],
@@ -238,6 +242,7 @@ impl ArgFlags {
     const EMPTY: Self = Self {
         value: &[],
         multi_value: &[],
+        optional_value: &[],
         subcommands: &[],
         boolean: &[],
         drop: &[],
@@ -1275,7 +1280,7 @@ static QODER_RESUME_FLAGS: ArgFlags = ArgFlags {
 };
 
 /// Devin CLI (clap). `--resume`, `--export` and `--respect-workspace-trust`
-/// take an optional value.
+/// take an optional single value.
 static DEVIN_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--prompt-file",
@@ -1284,7 +1289,7 @@ static DEVIN_RESUME_FLAGS: ArgFlags = ArgFlags {
         "--model",
         "--verbosity",
     ],
-    multi_value: &["--resume", "--export", "--respect-workspace-trust"],
+    optional_value: &["--resume", "--export", "--respect-workspace-trust"],
     boolean: &["--sandbox", "--continue"],
     drop: &["--resume", "--continue", "--prompt-file"],
     aliases: &[("-r", "--resume"), ("-c", "--continue")],
@@ -2749,6 +2754,7 @@ mod tests {
             let tables = [
                 flags.value,
                 flags.multi_value,
+                flags.optional_value,
                 flags.boolean,
                 flags.drop,
                 flags.repeatable,
@@ -2762,7 +2768,9 @@ mod tests {
             }
             for name in flags.repeatable {
                 assert!(
-                    flags.value.contains(name) || flags.multi_value.contains(name),
+                    flags.value.contains(name)
+                        || flags.multi_value.contains(name)
+                        || flags.optional_value.contains(name),
                     "{}: repeatable {name} has no value arity",
                     spec.name
                 );

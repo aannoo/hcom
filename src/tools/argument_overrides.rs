@@ -19,6 +19,7 @@ impl ArgFlags {
         [
             self.value,
             self.multi_value,
+            self.optional_value,
             self.boolean,
             self.drop,
             self.repeatable,
@@ -92,13 +93,20 @@ fn parts(tool: Tool, args: &[String]) -> Vec<ArgPart> {
                 {
                     end += 1;
                 }
-            } else if !inline
-                && flags.value.contains(&name.as_str())
-                && end < args.len()
-                && args[end] != "--"
-                && flags.option(&args[end]).is_none()
-            {
-                end += 1;
+            } else if !inline && end < args.len() {
+                let next = args[end].as_str();
+                // A required value may look like a dash or a subcommand; an
+                // optional one is only taken when it can't be anything else.
+                let takes_next = if flags.value.contains(&name.as_str()) {
+                    next != "--" && flags.option(next).is_none()
+                } else {
+                    flags.optional_value.contains(&name.as_str())
+                        && !next.starts_with('-')
+                        && !flags.subcommands.contains(&next)
+                };
+                if takes_next {
+                    end += 1;
+                }
             }
         } else if args[i].starts_with('-')
             && !args[i].contains('=')
@@ -292,6 +300,46 @@ mod tests {
                 &s(&["--continue", "old", "chat", "-m", "new"])
             ),
             s(&["chat", "-m", "new"]),
+        );
+    }
+
+    #[test]
+    fn optional_single_values_take_at_most_one_token() {
+        // An inline value leaves the next token to the prompt, which is dropped.
+        assert_eq!(
+            saved_args(
+                Tool::Devin,
+                &s(&["--respect-workspace-trust=false", "summarize this repo"])
+            ),
+            s(&["--respect-workspace-trust=false"]),
+        );
+        assert_eq!(
+            saved_args(
+                Tool::Devin,
+                &s(&["--export", "out.md", "summarize", "--model", "opus"])
+            ),
+            s(&["--export", "out.md", "--model", "opus"]),
+        );
+        // No value: a following flag or `--` is not taken.
+        assert_eq!(
+            saved_args(
+                Tool::Devin,
+                &s(&["--export", "--model", "opus", "--", "hi"])
+            ),
+            s(&["--export", "--model", "opus"]),
+        );
+        // The session selector goes with exactly its own value.
+        assert_eq!(
+            saved_args(Tool::Devin, &s(&["-r", "oasis-jump", "fix it"])),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            override_args(
+                Tool::Devin,
+                &s(&["--export=a.md", "--model", "x"]),
+                &s(&["--export", "b.md"])
+            ),
+            s(&["--model", "x", "--export", "b.md"]),
         );
     }
 
