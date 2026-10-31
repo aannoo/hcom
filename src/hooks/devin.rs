@@ -5,7 +5,7 @@
 //! run. hcom loads its hooks for one run by copying the effective config (the
 //! caller's `--config`, else `~/.config/devin/config.json`), merging its hooks
 //! into the copy, and passing the copy with `--config`. Nothing is written to
-//! the user's config. Devin runs no hooks until its workspace trust prompt is
+//! the user's config, and the copy is read-only (see `prepare_per_run`). Devin runs no hooks until its workspace trust prompt is
 //! answered, so the launcher passes `--respect-workspace-trust false`
 //! (`launcher::inject_workspace_trust_args`).
 //!
@@ -64,7 +64,9 @@ const DEVIN_HOOK_CONFIGS: &[(&str, &str, &str)] = &[
 
 pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     prepare: prepare_per_run,
-    cleanup_legacy: cleanup_legacy_per_run,
+    // Devin support was added as per-run only; no older hcom wrote a
+    // persistent Devin install, so there is nothing to clean up.
+    cleanup_legacy: |_| Ok(()),
     ensure_permissions: None,
     managed_value_flags: &["--config"],
     strip_legacy_args: None,
@@ -144,22 +146,6 @@ fn base_config(ctx: &LaunchCtx, caller: Option<&str>) -> Result<Value> {
     Ok(config)
 }
 
-/// Devin rewrites its `--config` file in place: on every interactive start
-/// (same settings, its own formatting) and when a setting such as the model is
-/// changed in a session. The published copy is shared by every launch with the
-/// same base config, so restore it when a session left different settings in
-/// it; otherwise a later launch would inherit them.
-fn restore_published_config(path: &std::path::Path, config: &Value) -> Result<()> {
-    let current = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    if current.as_ref() != Some(config) {
-        crate::paths::atomic_write_io(path, &serde_json::to_string_pretty(config)?)
-            .with_context(|| format!("Cannot restore Devin runtime config {}", path.display()))?;
-    }
-    Ok(())
-}
-
 /// The caller's last `--config` value is the base config; it is merged with
 /// hcom's hooks and passed as the only `--config`. Earlier caller values are
 /// dropped, as Devin itself only uses the last one.
@@ -171,7 +157,14 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     let text = serde_json::to_string_pretty(&config)?;
     let path = runtime::publish_file("devin", CONFIG_FILE, text.as_bytes())
         .context("Cannot publish Devin runtime config")?;
-    restore_published_config(&path, &config)?;
+    // Devin saves settings into its `--config` file (on every interactive start
+    // and when e.g. the model changes in a session), and launches with the same
+    // base config share this copy. Sealed, Devin's save fails quietly and every
+    // launch reads what hcom published; in-session changes last for the session.
+    let dir = path
+        .parent()
+        .context("Devin runtime config has no parent dir")?;
+    runtime::seal_dir(dir).context("Cannot make Devin runtime config read-only")?;
     runtime::insert_before_separator(
         &mut args,
         ["--config".to_string(), path.to_string_lossy().into_owned()],
@@ -180,12 +173,6 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
         args,
         env: Vec::new(),
     })
-}
-
-/// Devin support was added as per-run only; no older hcom wrote a persistent
-/// Devin install, so there is nothing to clean up.
-fn cleanup_legacy_per_run(_ctx: &LaunchCtx) -> Result<()> {
-    Ok(())
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -584,21 +571,19 @@ pub fn dispatch_devin_hook_native(hook_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::test_helpers::{EnvGuard, EnvVarGuard};
+    use crate::hooks::test_helpers::EnvGuard;
     use serial_test::serial;
 
-    fn devin_test_env() -> (tempfile::TempDir, PathBuf, (EnvGuard, EnvVarGuard)) {
+    fn devin_test_env() -> (tempfile::TempDir, PathBuf, EnvGuard) {
         let guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        // The user config lives under APPDATA on Windows.
-        let appdata = EnvVarGuard::set("APPDATA", dir.path().join("appdata"));
         unsafe {
             std::env::set_var("HOME", dir.path().join("home"));
             std::env::set_var("HCOM_DIR", workspace.join(".hcom"));
         }
-        (dir, workspace, (guard, appdata))
+        (dir, workspace, guard)
     }
 
     fn user_config_path() -> PathBuf {
@@ -710,16 +695,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn per_run_restores_settings_a_session_saved_into_the_shared_copy() {
+    fn per_run_copy_is_shared_and_read_only() {
         let (_dir, workspace, _guard) = devin_test_env();
-        let (_, path, original) = prepared(&[], workspace.clone());
-        // Devin saved an in-session model switch into the published copy.
-        let mut changed = original.clone();
-        changed["agent"] = json!({"model": "swe"});
-        std::fs::write(&path, serde_json::to_string(&changed).unwrap()).unwrap();
-        let (_, again, restored) = prepared(&[], workspace);
+        let (_, path, original) = prepared(&["--model", "x"], workspace.clone());
+        // A Devin session cannot save settings into the copy other launches use.
+        assert!(std::fs::write(&path, "{}").is_err());
+        #[cfg(unix)]
+        assert!(std::fs::write(path.with_file_name("tmp.json"), "{}").is_err());
+        let (_, again, config) = prepared(&["--model", "y"], workspace);
         assert_eq!(again, path);
-        assert_eq!(restored, original);
+        assert_eq!(config, original);
     }
 
     fn db_with_instance(session: &str) -> (tempfile::TempDir, HcomDb) {

@@ -114,13 +114,15 @@ pub mod test_helpers {
     /// Tool config dirs and delivery modes a developer's shell may export;
     /// inheriting one would point a test at the real tool config, or switch
     /// delivery loops to plugin mode when tests run inside an hcom agent.
-    const TOOL_CONFIG_OVERRIDES: [&str; 19] = [
+    const TOOL_CONFIG_OVERRIDES: [&str; 20] = [
         "CLAUDE_CONFIG_DIR",
         "OPENCODE_CONFIG_DIR",
         "CODEX_HOME",
         "CURSOR_CONFIG_DIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        // Windows user config root (Devin's `%APPDATA%\devin`).
+        "APPDATA",
         "GEMINI_CLI_HOME",
         "KILO_CONFIG_DIR",
         "KIMI_CODE_HOME",

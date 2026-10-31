@@ -197,7 +197,7 @@ pub(crate) fn clear_full_reset_artifacts() {
     let _ = fs::remove_file(&instance_count_file);
 
     // Every instance was stopped first, so no running agent loads these.
-    let _ = fs::remove_dir_all(crate::hooks::runtime::integrations_dir());
+    let _ = crate::hooks::runtime::remove_artifact_tree(&crate::hooks::runtime::integrations_dir());
 }
 
 pub(crate) fn bootstrap_fresh_db() {
