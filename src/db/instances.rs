@@ -151,6 +151,24 @@ impl InstanceRow {
         ctx.get("pid_identity")?.as_str().map(str::to_string)
     }
 
+    /// PID namespace `pid_identity` was observed from, if recorded.
+    pub fn pid_namespace(&self) -> Option<String> {
+        let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;
+        ctx.get("pid_namespace")?.as_str().map(str::to_string)
+    }
+
+    /// Whether this row's PID was recorded in a PID namespace other than the
+    /// caller's, or in one the caller can't tell apart from its own because it
+    /// can't read its namespace. Such a PID can't be judged from here: a caller
+    /// in another namespace (e.g. a sandboxed tool running hcom) sees none of
+    /// the host's PIDs, so a live process looks gone. Rows without a recorded
+    /// namespace (written before it existed) report `false`, as before.
+    pub fn pid_in_foreign_namespace(&self) -> bool {
+        self.pid_namespace().is_some_and(|recorded| {
+            crate::sys::process::own_pid_namespace().as_deref() != Some(recorded.as_str())
+        })
+    }
+
     /// Whether a *different* live process now holds `pid` (the identity in
     /// this snapshot no longer matches), so it must not be signalled on this
     /// instance's behalf. Checked against the snapshot, not a fresh read, so
@@ -290,29 +308,67 @@ impl HcomDb {
     /// Update an instance PID with an already-observed process incarnation.
     /// `None` stores the PID without reuse protection and drops any stale
     /// identity so it can't be mistaken for this process.
+    ///
+    /// The identity was observed by this process, so the PID namespace it
+    /// runs in is stored beside it (see [`InstanceRow::pid_namespace`]).
+    /// Where that namespace can't be read, an older one is dropped rather
+    /// than left describing a different observation.
     pub fn update_instance_pid_with_identity(
         &self,
         name: &str,
         pid: u32,
         pid_identity: Option<&str>,
     ) -> Result<()> {
-        match pid_identity {
-            Some(pid_identity) => self.conn.execute(
+        let pid_namespace = pid_identity.and_then(|_| crate::sys::process::own_pid_namespace());
+        self.update_instance_pid_with_identity_in_namespace(
+            name,
+            pid,
+            pid_identity,
+            pid_namespace.as_deref(),
+        )
+    }
+
+    /// Like [`Self::update_instance_pid_with_identity`], for an identity that
+    /// another process observed: `pid_namespace` is that observer's namespace
+    /// (`None` when unknown), not this process's own.
+    pub fn update_instance_pid_with_identity_in_namespace(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: Option<&str>,
+        pid_namespace: Option<&str>,
+    ) -> Result<()> {
+        match (pid_identity, pid_namespace) {
+            (Some(pid_identity), Some(pid_namespace)) => self.conn.execute(
                 "UPDATE instances
                  SET pid = ?,
                      launch_context = json_set(
                          CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                         '$.pid_identity', ?
+                         '$.pid_identity', ?,
+                         '$.pid_namespace', ?
+                     )
+                 WHERE name = ?",
+                params![pid as i64, pid_identity, pid_namespace, name],
+            )?,
+            (Some(pid_identity), None) => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = json_remove(
+                         json_set(
+                             CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                             '$.pid_identity', ?
+                         ),
+                         '$.pid_namespace'
                      )
                  WHERE name = ?",
                 params![pid as i64, pid_identity, name],
             )?,
-            None => self.conn.execute(
+            (None, _) => self.conn.execute(
                 "UPDATE instances
                  SET pid = ?,
                      launch_context = CASE
                          WHEN json_valid(launch_context)
-                         THEN json_remove(launch_context, '$.pid_identity')
+                         THEN json_remove(launch_context, '$.pid_identity', '$.pid_namespace')
                          ELSE launch_context
                      END
                  WHERE name = ?",
@@ -367,14 +423,30 @@ impl HcomDb {
             .flatten())
     }
 
-    /// Clear a PID and its stored process identity.
+    /// PID namespace stored beside an instance's process incarnation.
+    pub fn get_instance_pid_namespace(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(launch_context)
+                        THEN json_extract(launch_context, '$.pid_namespace') END
+                 FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Clear a PID and its stored process identity (and the namespace it was
+    /// observed in).
     pub fn clear_instance_pid(&self, name: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE instances
              SET pid = NULL,
                  launch_context = CASE
                      WHEN json_valid(launch_context)
-                     THEN json_remove(launch_context, '$.pid_identity')
+                     THEN json_remove(launch_context, '$.pid_identity', '$.pid_namespace')
                      ELSE launch_context
                  END
              WHERE name = ?",
@@ -1510,6 +1582,154 @@ mod tests {
         let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
         assert_eq!(launch_context["pane_id"], "42");
 
+        cleanup_test_db(db_path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn own_pid_namespace() -> String {
+        std::fs::read_link("/proc/self/ns/pid")
+            .expect("test needs a readable /proc/self/ns/pid")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stored_launch_context(db: &HcomDb, name: &str) -> serde_json::Value {
+        let launch_context: String = db
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&launch_context).unwrap()
+    }
+
+    /// A PID identity only means something in the PID namespace it was
+    /// observed from, so that namespace is stored beside it — replacing any
+    /// namespace left from an earlier incarnation.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pid_identity_write_records_observer_pid_namespace() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\",\"pid_identity\":\"old\",\"pid_namespace\":\"pid:[1]\"}'),
+                        ('nova', 1.0, '{}')",
+                [],
+            )
+            .unwrap();
+        let own = own_pid_namespace();
+
+        db.update_instance_pid_with_identity("luna", 4242, Some("spawn-1"))
+            .unwrap();
+        let ctx = stored_launch_context(&db, "luna");
+        assert_eq!(ctx["pid_identity"], "spawn-1");
+        assert_eq!(ctx["pid_namespace"], own.as_str());
+        assert_eq!(ctx["pane_id"], "42");
+
+        // The observing path (`observe_pid_identity`) records it as well.
+        db.update_instance_pid("nova", std::process::id()).unwrap();
+        let ctx = stored_launch_context(&db, "nova");
+        assert!(ctx.get("pid_identity").is_some());
+        assert_eq!(ctx["pid_namespace"], own.as_str());
+
+        cleanup_test_db(db_path);
+    }
+
+    /// Wherever the identity is dropped, its namespace goes with it: a
+    /// namespace without an identity would describe nothing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pid_namespace_is_removed_with_pid_identity() {
+        let (db, db_path) = setup_full_test_db();
+        let ctx = r#"{"pane_id":"42","pid_identity":"old","pid_namespace":"pid:[1]"}"#;
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, ?1), ('nova', 1.0, ?1)",
+                params![ctx],
+            )
+            .unwrap();
+
+        db.update_instance_pid_with_identity("luna", 4242, None)
+            .unwrap();
+        let ctx = stored_launch_context(&db, "luna");
+        assert!(ctx.get("pid_identity").is_none());
+        assert!(ctx.get("pid_namespace").is_none());
+        assert_eq!(ctx["pane_id"], "42");
+
+        db.clear_instance_pid("nova").unwrap();
+        let ctx = stored_launch_context(&db, "nova");
+        assert!(ctx.get("pid_identity").is_none());
+        assert!(ctx.get("pid_namespace").is_none());
+        assert_eq!(ctx["pane_id"], "42");
+
+        cleanup_test_db(db_path);
+    }
+
+    /// Where the writer can't read its own namespace, a namespace left by an
+    /// earlier observation is dropped instead of describing the new identity.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pid_identity_write_drops_old_pid_namespace_when_own_is_unreadable() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\",\"pid_identity\":\"old\",\"pid_namespace\":\"pid:[1]\"}')",
+                [],
+            )
+            .unwrap();
+        let _unreadable = crate::sys::process::test_pid_namespace::force_unreadable();
+
+        db.update_instance_pid_with_identity("luna", 4242, Some("spawn-1"))
+            .unwrap();
+
+        let ctx = stored_launch_context(&db, "luna");
+        assert_eq!(ctx["pid_identity"], "spawn-1");
+        assert!(ctx.get("pid_namespace").is_none());
+        assert_eq!(ctx["pane_id"], "42");
+        cleanup_test_db(db_path);
+    }
+
+    /// The writer's own namespace is only right for an identity it observed
+    /// itself; one carried over from another process keeps the namespace
+    /// stored with it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pid_identity_carried_over_keeps_the_namespace_it_was_observed_in() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        db.update_instance_pid_with_identity_in_namespace(
+            "luna",
+            4242,
+            Some("spawn-1"),
+            Some("pid:[7]"),
+        )
+        .unwrap();
+        let ctx = stored_launch_context(&db, "luna");
+        assert_eq!(ctx["pid_namespace"], "pid:[7]");
+        assert_eq!(
+            db.get_instance_pid_namespace("luna").unwrap().as_deref(),
+            Some("pid:[7]")
+        );
+
+        db.update_instance_pid_with_identity_in_namespace("luna", 4242, Some("spawn-1"), None)
+            .unwrap();
+        assert!(
+            stored_launch_context(&db, "luna")
+                .get("pid_namespace")
+                .is_none()
+        );
         cleanup_test_db(db_path);
     }
 

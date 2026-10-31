@@ -101,6 +101,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "process_id",
         "terminal_preset_effective",
         "pid_identity",
+        "pid_namespace",
     ];
     let missing: Vec<&str> = preserve_keys
         .iter()
@@ -356,8 +357,16 @@ fn migrate_placeholder_runtime_state(
         {
             // Carry the placeholder's stored identity (or its absence) over as-is:
             // re-observing now could adopt an unrelated process that reused the PID.
+            // The namespace goes with it: it names where that identity was observed,
+            // not where this binding happens to run.
             let identity = db.get_instance_pid_identity(&ph.name)?;
-            db.update_instance_pid_with_identity(canonical_name, pid_u32, identity.as_deref())?;
+            let namespace = db.get_instance_pid_namespace(&ph.name)?;
+            db.update_instance_pid_with_identity_in_namespace(
+                canonical_name,
+                pid_u32,
+                identity.as_deref(),
+                namespace.as_deref(),
+            )?;
         }
         if let Some(ref ctx) = ph.launch_context {
             db.store_launch_context(canonical_name, ctx)?;
@@ -1446,6 +1455,45 @@ mod tests {
         cleanup(path);
     }
 
+    /// The PID namespace stored beside `pid_identity` was observed by whoever
+    /// recorded the PID; a hook re-capturing the context can't observe it again
+    /// and must carry it over unchanged, like the identity itself.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn test_capture_and_store_launch_context_preserves_pid_namespace() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"pid_identity":"spawn-1","pid_namespace":"pid:[1]"}"#
+                ],
+            )
+            .unwrap();
+        let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let ctx: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            ctx.get("pid_identity").and_then(|v| v.as_str()),
+            Some("spawn-1")
+        );
+        assert_eq!(
+            ctx.get("pid_namespace").and_then(|v| v.as_str()),
+            Some("pid:[1]")
+        );
+
+        cleanup(path);
+    }
+
     #[test]
     fn test_bind_session_path2_placeholder() {
         crate::config::Config::init();
@@ -1961,6 +2009,62 @@ mod tests {
                 .contains("kitty-99"),
             "launch_context not migrated: {:?}",
             fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    /// The placeholder's identity was observed by the PTY wrapper, possibly in
+    /// another PID namespace than the hook binding the session: the canonical
+    /// row must keep the namespace stored with it, not take the hook's.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_carries_pid_namespace_with_the_identity() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-oc-ns", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc-ns", "", "mozi").unwrap();
+        db.update_instance_pid_with_identity_in_namespace(
+            "mozi",
+            4242,
+            Some("spawn-incarnation"),
+            Some("pid:[1]"),
+        )
+        .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-oc-ns", Some("pid-oc-ns"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert_eq!(
+            db.get_instance_pid_identity("fano").unwrap().as_deref(),
+            Some("spawn-incarnation")
+        );
+        assert_eq!(
+            db.get_instance_pid_namespace("fano").unwrap().as_deref(),
+            Some("pid:[1]")
         );
 
         cleanup(path);

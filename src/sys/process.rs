@@ -13,6 +13,62 @@ pub fn identity(pid: u32) -> Option<String> {
     process_identity_platform(pid)
 }
 
+/// PID namespace the calling process runs in, as the target of
+/// `/proc/self/ns/pid` (e.g. `pid:[4026531836]`).
+///
+/// PIDs, and the identities derived from them, only mean something inside one
+/// PID namespace: a sandboxed tool in its own namespace sees none of the
+/// host's PIDs. `None` where the platform has no PID namespaces (anything but
+/// Linux and Android) or the link can't be read.
+pub fn own_pid_namespace() -> Option<String> {
+    #[cfg(test)]
+    if let Some(forced) = test_pid_namespace::forced() {
+        return forced;
+    }
+    own_pid_namespace_platform()
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn own_pid_namespace_platform() -> Option<String> {
+    let link = std::fs::read_link("/proc/self/ns/pid").ok()?;
+    Some(link.to_string_lossy().into_owned())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn own_pid_namespace_platform() -> Option<String> {
+    None
+}
+
+/// Test switch for [`own_pid_namespace`]: forces the answer on the current
+/// thread only, so tests running in parallel keep reading the real namespace.
+#[cfg(test)]
+pub(crate) mod test_pid_namespace {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FORCED: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn forced() -> Option<Option<String>> {
+        FORCED.with(|cell| cell.borrow().clone())
+    }
+
+    /// Restores the real lookup when dropped.
+    pub(crate) struct Forced;
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    /// Make the namespace lookup fail, as in a sandbox that hides `/proc/self/ns`.
+    pub(crate) fn force_unreadable() -> Forced {
+        FORCED.with(|cell| *cell.borrow_mut() = Some(None));
+        Forced
+    }
+}
+
 /// Whether this process runs inside an OS sandbox. Children inherit it for
 /// life, so long-lived daemons must not be started from one.
 ///
@@ -744,6 +800,21 @@ mod tests {
     #[test]
     fn test_process_identity_is_absent_for_dead_pid() {
         assert!(identity(u32::MAX).is_none());
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn test_own_pid_namespace_is_the_proc_self_ns_link() {
+        let namespace = own_pid_namespace().expect("/proc/self/ns/pid must be readable");
+        assert!(namespace.starts_with("pid:["), "got {namespace}");
+    }
+
+    #[test]
+    fn test_own_pid_namespace_switch_makes_lookup_fail_on_this_thread() {
+        let forced = test_pid_namespace::force_unreadable();
+        assert_eq!(own_pid_namespace(), None);
+        drop(forced);
+        assert_eq!(own_pid_namespace(), own_pid_namespace_platform());
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
