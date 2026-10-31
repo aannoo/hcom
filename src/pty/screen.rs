@@ -731,6 +731,38 @@ impl ScreenTracker {
         Some(!(non_dim_count > 0 && non_dim_count > dim_count))
     }
 
+    /// Whether every visible cell after the prompt glyph on `row` has a
+    /// non-default foreground color: how Devin draws its placeholder (typed
+    /// text uses the default color). `None` when the row has no prompt glyph or
+    /// nothing after it.
+    fn is_colored_after_prompt(&self, row: u16, prompt_char: &str) -> Option<bool> {
+        let screen = self.parser.screen();
+        let (_, cols) = screen_size(screen);
+        let prompt_col = (0..cols).find(|&col| {
+            screen
+                .cell(row, col)
+                .is_some_and(|c| c.contents() == prompt_char)
+        })?;
+        let mut seen = false;
+        for col in prompt_col + 1..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell
+                .contents()
+                .chars()
+                .all(|c| c.is_whitespace() || c == '\u{00A0}')
+            {
+                continue;
+            }
+            if cell.fgcolor() == vt100::Color::Default {
+                return Some(false);
+            }
+            seen = true;
+        }
+        seen.then_some(true)
+    }
+
     /// Render the non-whitespace cells after a prompt as char:style pairs for
     /// debug logs. D means dim and - means normal intensity.
     fn debug_cell_attrs_after_prompt(&self, row: u16, prompt_char: &str) -> Option<String> {
@@ -1293,6 +1325,9 @@ impl ScreenTracker {
     /// short with `…`. Submitted prompts and the approval menu reuse the `❭`
     /// glyph, so anchor to the lowest full rule just above the footer. No
     /// framed composer (an approval or trust prompt, a menu) is `None`.
+    ///
+    /// Text alone cannot tell a cut placeholder from a draft such as
+    /// `Ask Devin to…`, so the placeholder must also be drawn in its own color.
     fn get_devin_input_text(&self) -> Option<String> {
         const PLACEHOLDERS: &[&str] = &[
             "Ask Devin to build features, fix bugs, or work on your code",
@@ -1320,12 +1355,14 @@ impl ScreenTracker {
             text.push(trim_with_nbsp(line).to_string());
         }
         let text = text.join("\n").trim().to_string();
-        let is_placeholder = PLACEHOLDERS.iter().any(|placeholder| {
+        let matches_placeholder = PLACEHOLDERS.iter().any(|placeholder| {
             text == *placeholder
                 || text
                     .strip_suffix('…')
                     .is_some_and(|head| !head.is_empty() && placeholder.starts_with(head))
         });
+        let is_placeholder =
+            matches_placeholder && self.is_colored_after_prompt(top as u16 + 1, "❭") == Some(true);
         Some(if is_placeholder { String::new() } else { text })
     }
 
@@ -2392,7 +2429,7 @@ mod tests {
             "❭ say hi only",
             " Hi",
             DEVIN_TITLED_RULE,
-            "❭ Ask Devin to build features, fix bugs, or work on your code",
+            "❭ \x1b[38;2;107;107;107mAsk Devin to build features, fix bugs, or work on your code\x1b[39m",
             QODER_RULE,
             DEVIN_FOOTER,
         ]);
@@ -2419,7 +2456,7 @@ mod tests {
         let t = devin_screen(&[
             "⡱⢎ Thinking · 2s (esc twice to interrupt)",
             DEVIN_TITLED_RULE,
-            "❭ Guide Devin while it works",
+            "❭ \x1b[38;2;107;107;107mGuide Devin while it works\x1b[39m",
             QODER_RULE,
             DEVIN_FOOTER,
         ]);
@@ -2444,7 +2481,7 @@ mod tests {
             &[
                 "   devprobe/ws",
                 &rule60,
-                "❭ Ask Devin to build features, fix bugs, or work on your c…",
+                "❭ \x1b[38;2;107;107;107mAsk Devin to build features, fix bugs, or work on your c…\x1b[39m",
                 &rule60,
                 "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
                 "See usage and cost: /session-stats",
@@ -2459,7 +2496,7 @@ mod tests {
             40,
             &[
                 &rule40,
-                "❭ Ask Devin to build features, fix bug…",
+                "❭ \x1b[38;2;107;107;107mAsk Devin to build features, fix bug…\x1b[39m",
                 &rule40,
                 "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
                 "Use /bug to report a bug to the Devin",
@@ -2494,7 +2531,7 @@ mod tests {
         let mut lines = vec![""; 20];
         lines.extend_from_slice(&[
             wide.as_str(),
-            "❭ Ask Devin to build features, fix bugs, or work on your code",
+            "❭ \x1b[38;2;107;107;107mAsk Devin to build features, fix bugs, or work on your code\x1b[39m",
             wide.as_str(),
             "Fusion · Claude Opus 5.5 ◆ SWE-2 High                         Press opt+m to switch between available models",
         ]);
@@ -2508,7 +2545,7 @@ mod tests {
         lines.extend_from_slice(&[
             "   bd31a8e3004a/scratchpad/devprobe/ws",
             narrow.as_str(),
-            "❭ Ask Devin to build features, fix bugs, or work…",
+            "❭ \x1b[38;2;107;107;107mAsk Devin to build features, fix bugs, or work…\x1b[39m",
             narrow.as_str(),
             "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
             "Press opt+m to switch between available models",
@@ -2519,11 +2556,19 @@ mod tests {
     }
 
     #[test]
-    fn devin_typed_text_ending_in_an_ellipsis_is_not_the_placeholder() {
+    fn devin_typed_text_that_looks_like_the_placeholder_is_a_draft() {
+        // Devin draws typed text in the default color, the placeholder in gray.
         let rule = "─".repeat(80);
-        let t = devin_screen(&[&rule, "❭ wait for it…", &rule, DEVIN_FOOTER]);
-        assert_eq!(t.get_devin_input_text().as_deref(), Some("wait for it…"));
-        assert!(!t.is_prompt_empty("devin"));
+        for draft in [
+            "Ask Devin to…",
+            "Ask Devin to build features, fix bugs, or work on your code",
+            "wait for it…",
+        ] {
+            let row = format!("❭ {draft}");
+            let t = devin_screen(&[&rule, &row, &rule, DEVIN_FOOTER]);
+            assert_eq!(t.get_devin_input_text().as_deref(), Some(draft), "{draft}");
+            assert!(!t.is_prompt_empty("devin"), "{draft}");
+        }
     }
 
     #[test]
