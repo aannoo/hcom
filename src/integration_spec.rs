@@ -426,6 +426,16 @@ const QODER_HOOKS: &[&str] = &[
     "qoder-sessionend",
 ];
 
+const DEVIN_HOOKS: &[&str] = &[
+    "devin-sessionstart",
+    "devin-userpromptsubmit",
+    "devin-pretooluse",
+    "devin-posttooluse",
+    "devin-permissionrequest",
+    "devin-stop",
+    "devin-sessionend",
+];
+
 const COPILOT_HOOKS: &[&str] = &[
     "copilot-sessionstart",
     "copilot-userpromptsubmit",
@@ -558,6 +568,14 @@ const QODER_HELP_EXAMPLES: &[HelpEntry] = &[
     (
         "hcom qoder --permission-mode accept_edits",
         "Flags forwarded to qodercli",
+    ),
+];
+
+const DEVIN_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom devin --model opus", "Use a specific model"),
+    (
+        "hcom devin --permission-mode accept-edits",
+        "Flags forwarded to devin",
     ),
 ];
 
@@ -1252,6 +1270,24 @@ static QODER_RESUME_FLAGS: ArgFlags = ArgFlags {
         ("-i", "--prompt-interactive"),
         ("-w", "--cwd"),
     ],
+    positional_prompt: true,
+    ..ArgFlags::EMPTY
+};
+
+/// Devin CLI (clap). `--resume`, `--export` and `--respect-workspace-trust`
+/// take an optional value.
+static DEVIN_RESUME_FLAGS: ArgFlags = ArgFlags {
+    value: &[
+        "--prompt-file",
+        "--config",
+        "--permission-mode",
+        "--model",
+        "--verbosity",
+    ],
+    multi_value: &["--resume", "--export", "--respect-workspace-trust"],
+    boolean: &["--sandbox", "--continue"],
+    drop: &["--resume", "--continue", "--prompt-file"],
+    aliases: &[("-r", "--resume"), ("-c", "--continue")],
     positional_prompt: true,
     ..ArgFlags::EMPTY
 };
@@ -2246,6 +2282,73 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static DEVIN: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Devin,
+    name: "devin",
+    label: "Devin",
+    aliases: &[],
+    cli_binary: "devin",
+    tui_prefix: "dev ",
+    adhoc_icon: None,
+    released: true,
+    // Placeholder of the idle, empty composer. While a turn runs the composer
+    // reads "Guide Devin while it works" instead.
+    ready_patterns: &["Ask Devin to"],
+    pty: PtySpec {
+        delivery_start_timeout_secs: 60,
+        console_input: ConsoleInput::Records,
+        // Devin 3000.11 inserts a newline instead of submitting when Enter
+        // follows the typed text within ~50ms; 150ms measured, plus margin.
+        pre_enter_settle_ms: 250,
+    },
+    instance_state_env: &[],
+    detection: DetectionSpec {
+        // Set in its exec tool and hook processes. Hook processes also get
+        // CLAUDE_PROJECT_DIR, which is deliberately not a Claude marker.
+        markers: &[EnvPredicate::set("CHISEL_SESSION_DB")],
+        clear_for_child: &["AI_AGENT", "DEVIN_PROJECT_DIR", "DEVIN_TRACEPARENT"],
+    },
+    hooks: HooksSpec {
+        names: DEVIN_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: true,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+        launch_ready_on_plugin_bind: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_DEVIN_ARGS"),
+        config_dir_env: None,
+        initial_prompt: InitialPromptShape::DashDashPositional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    args: &DEVIN_RESUME_FLAGS,
+    // No fork: Devin has no flag that copies a session into a new one.
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+        merge: ResumeMerge::Prepend,
+    }),
+    help: HelpSpec {
+        unique_examples: DEVIN_HELP_EXAMPLES,
+        extra_env: &[],
+        notes: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["exec"],
+        file: &["write", "edit"],
+        delegate: &["run_subagent"],
+    },
+};
+
 pub static GROK: IntegrationSpec = IntegrationSpec {
     tool: Tool::Grok,
     name: "grok",
@@ -2384,6 +2487,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &KIMI,
     &COPILOT,
     &QODER,
+    &DEVIN,
     &GROK,
     &ADHOC,
 ];
@@ -2405,6 +2509,7 @@ impl Tool {
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
             Tool::Qoder => &QODER,
+            Tool::Devin => &DEVIN,
             Tool::Grok => &GROK,
             Tool::Adhoc => &ADHOC,
         }
@@ -2593,6 +2698,7 @@ mod tests {
                 | Tool::Omp
                 | Tool::Copilot
                 | Tool::Qoder
+                | Tool::Devin
                 | Tool::Grok => true,
                 Tool::Gemini | Tool::Antigravity | Tool::Cursor | Tool::Kimi | Tool::Hermes => {
                     false
@@ -2685,6 +2791,7 @@ mod tests {
             Tool::Kimi,
             Tool::Copilot,
             Tool::Qoder,
+            Tool::Devin,
             Tool::Grok,
             Tool::Pi,
             Tool::Omp,
@@ -2755,10 +2862,11 @@ mod tests {
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
         assert!(names.contains(&"qoder"));
+        assert!(names.contains(&"devin"));
         assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
         assert!(names.contains(&"hermes"));
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
     }
 
     #[test]

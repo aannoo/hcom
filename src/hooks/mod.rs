@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Hermes, Antigravity, Cursor, Kimi, Copilot, Qoder). Grok has none (see `delivery/grok.rs`).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Hermes, Antigravity, Cursor, Kimi, Copilot, Qoder, Devin). Grok has none (see `delivery/grok.rs`).
 
 pub mod antigravity;
 pub mod claude;
@@ -7,6 +7,7 @@ pub mod codex;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
+pub mod devin;
 pub mod family;
 pub mod gemini;
 pub mod hermes;
@@ -253,7 +254,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "hermes", "antigravity", "cursor", "kimi", "copilot", "qoder", "grok").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "hermes", "antigravity", "cursor", "kimi", "copilot", "qoder", "devin", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -543,6 +544,42 @@ impl HookPayload {
         }
     }
 
+    /// Build from Devin CLI hook JSON.
+    ///
+    /// Devin follows Claude Code's hook payload shape (snake_case, all keys at
+    /// the root) but sends no `transcript_path` or `cwd`: `session_id`,
+    /// `hook_event_name`, `prompt_id`, plus `prompt`, `tool_name`, `tool_input`,
+    /// `tool_response` (`{success, output, error}`), `source`, `reason`
+    /// depending on the event.
+    pub fn from_devin(hook_type: &str, raw: Value) -> Self {
+        let response = raw.get("tool_response");
+        let tool_result = response
+            .and_then(|r| r.get("error"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                response
+                    .and_then(|r| r.get("output"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("")
+            .to_string();
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id"]),
+            transcript_path: None,
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "devin".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result,
+            notification_type: None,
+            raw,
+        }
+    }
+
     /// Build from OpenCode hook JSON.
     ///
     /// OpenCode hooks: session_id from env, minimal tool info.
@@ -705,6 +742,36 @@ mod tests {
         assert_eq!(payload.session_id.as_deref(), Some("oc-111"));
         assert_eq!(payload.tool, "opencode");
         assert_eq!(payload.tool_name, "bash");
+    }
+
+    #[test]
+    fn test_hook_payload_from_devin() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "oasis-jump",
+            "prompt_id": "p-1",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "toolu_1",
+            "tool_response": {"success": true, "output": "a\nb", "error": null},
+        });
+        let payload = HookPayload::from_devin("PostToolUse", raw);
+        assert_eq!(payload.tool, "devin");
+        assert_eq!(payload.session_id.as_deref(), Some("oasis-jump"));
+        assert_eq!(payload.transcript_path, None);
+        assert_eq!(payload.tool_name, "exec");
+        assert_eq!(payload.tool_input["command"], "ls");
+        assert_eq!(payload.tool_result, "a\nb");
+
+        let failed = HookPayload::from_devin(
+            "",
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_response": {"success": false, "output": "", "error": "denied"},
+            }),
+        );
+        assert_eq!(failed.hook_name, "PostToolUse");
+        assert_eq!(failed.tool_result, "denied");
     }
 
     #[test]

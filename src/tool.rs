@@ -21,6 +21,7 @@ pub enum Tool {
     Kimi,
     Copilot,
     Qoder,
+    Devin,
     Grok,
     Pi,
     Omp,
@@ -128,7 +129,7 @@ impl Tool {
                 crate::hooks::hermes::remove_hermes_plugin().map_err(|e| format!("{e:#}"))
             }
             // Per-run from the start: never installed anything globally.
-            Tool::Qoder | Tool::Grok => Ok(false),
+            Tool::Qoder | Tool::Devin | Tool::Grok => Ok(false),
             Tool::Gemini => persistent(installed(), crate::hooks::gemini::remove_gemini_hooks),
             Tool::Antigravity => persistent(
                 installed(),
@@ -299,6 +300,15 @@ mod tests {
         assert_eq!(
             Tool::from_hook_name("qoder-sessionstart"),
             Some(Tool::Qoder)
+        );
+    }
+
+    #[test]
+    fn devin_from_name() {
+        assert_eq!("devin".parse::<Tool>(), Ok(Tool::Devin));
+        assert_eq!(
+            Tool::from_hook_name("devin-sessionstart"),
+            Some(Tool::Devin)
         );
     }
 

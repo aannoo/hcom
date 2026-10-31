@@ -2067,7 +2067,9 @@ pub fn run_delivery_loop(
                         let text = match parsed_tool {
                             Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor)
                             | Some(Tool::Kimi) | Some(Tool::Copilot) | Some(Tool::Qoder)
-                            | Some(Tool::Pi) | Some(Tool::Omp) => WAKE_TRIGGER.to_string(),
+                            | Some(Tool::Devin) | Some(Tool::Pi) | Some(Tool::Omp) => {
+                                WAKE_TRIGGER.to_string()
+                            }
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 

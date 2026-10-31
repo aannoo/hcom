@@ -9,6 +9,7 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod devin;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
@@ -46,6 +47,7 @@ pub enum TranscriptBackend {
     PiJsonl,
     GrokUpdatesJsonl,
     HermesSqlite,
+    DevinAtifJson,
 }
 
 impl TranscriptBackend {
@@ -76,6 +78,7 @@ enum TranscriptDiscovery {
     OmpSessions,
     GrokSessions,
     HermesDatabase,
+    DevinTranscripts,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +154,11 @@ static TRANSCRIPT_PROFILES: &[TranscriptProfile] = &[
         tool: Tool::Qoder,
         backend: TranscriptBackend::ClaudeJsonl,
         discovery: TranscriptDiscovery::QoderProjects,
+    },
+    TranscriptProfile {
+        tool: Tool::Devin,
+        backend: TranscriptBackend::DevinAtifJson,
+        discovery: TranscriptDiscovery::DevinTranscripts,
     },
     TranscriptProfile {
         tool: Tool::Grok,
@@ -253,6 +261,7 @@ pub fn read(
         TranscriptBackend::GrokUpdatesJsonl => {
             grok::parse_grok_updates_jsonl_with_usage(path, opts.detailed)
         }
+        TranscriptBackend::DevinAtifJson => devin::parse_devin_json_with_usage(path),
         TranscriptBackend::OpenCodeSqlite => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -313,6 +322,8 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
         Some(Tool::Copilot)
     } else if lower.contains("/.qoder/") || under_custom_qoder_root(&lower) {
         Some(Tool::Qoder)
+    } else if lower.contains("/devin/cli/transcripts/") && file_name.ends_with(".json") {
+        Some(Tool::Devin)
     } else if lower.contains("/.omp/") {
         // Covers the default tree (`/.omp/agent/sessions/`) and named-profile
         // trees (`/.omp/profiles/<name>/agent/sessions/`). XDG and
@@ -432,6 +443,23 @@ fn under_custom_qoder_root(lower: &str) -> bool {
 pub(crate) fn qoder_projects_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     env_or_default_dir("QODER_CONFIG_DIR", home.join(".qoder")).join("projects")
+}
+
+/// Devin CLI's data dir: `$XDG_DATA_HOME/devin/cli`, else
+/// `~/.local/share/devin/cli` (also on macOS). Holds `transcripts/`,
+/// `sessions.db` and `trusted_workspaces.json`.
+pub(crate) fn devin_data_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    env_or_default_dir("XDG_DATA_HOME", home.join(".local").join("share"))
+        .join("devin")
+        .join("cli")
+}
+
+/// Where Devin writes the ATIF transcript of a session.
+pub(crate) fn devin_transcript_path(session_id: &str) -> PathBuf {
+    devin_data_dir()
+        .join("transcripts")
+        .join(format!("{session_id}.json"))
 }
 
 /// Active OMP profile from the environment. `OMP_PROFILE` is canonical and wins;
@@ -621,6 +649,7 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         TranscriptDiscovery::GrokSessions => {
             vec![crate::transcript::grok::grok_config_dir().join("sessions")]
         }
+        TranscriptDiscovery::DevinTranscripts => vec![devin_data_dir().join("transcripts")],
         TranscriptDiscovery::OpenCodeDatabase
         | TranscriptDiscovery::KiloDatabase
         | TranscriptDiscovery::HermesDatabase => Vec::new(),

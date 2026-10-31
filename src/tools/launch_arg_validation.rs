@@ -199,6 +199,136 @@ pub(crate) const QODER_REJECTED_ARGS: &[RejectedArg] = &[
     },
 ];
 
+const DEVIN_UTILITY_REASON: &str = "runs a utility subcommand instead of the interactive TUI";
+
+pub(crate) const DEVIN_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "-p",
+        reason: "runs one prompt non-interactively and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--print",
+        reason: "runs one prompt non-interactively and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--cloud",
+        reason: "drives Devin Cloud sessions instead of the local agent",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "acp",
+        reason: "starts an ACP server instead of the interactive TUI",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "cloud",
+        reason: "starts a Devin Cloud session instead of the local agent",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "desktop",
+        reason: "opens Devin Desktop instead of the interactive TUI",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "auth",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "mcp",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "models",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "doctor",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "rules",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "skills",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "plugins",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "list",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "ls",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "rm",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "ssh",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "forward",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "update",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "version",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "migrate",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "sandbox",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "setup",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "uninstall",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "help",
+        reason: DEVIN_UTILITY_REASON,
+        kind: RejectedArgKind::RootSubcommand,
+    },
+];
+
 pub(crate) const OPENCODE_REJECTED_ARGS: &[RejectedArg] = &[
     RejectedArg {
         token: "run",
@@ -386,6 +516,30 @@ mod tests {
     }
 
     #[test]
+    fn devin_rejects_modes_without_an_interactive_agent() {
+        for args in [
+            vec!["-p"],
+            vec!["--print=task"],
+            vec!["--cloud"],
+            vec!["acp"],
+            vec!["cloud"],
+            vec!["models"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(
+                validate_rejected_args("Devin", "hcom devin", &args, DEVIN_REJECTED_ARGS).len(),
+                1,
+                "{args:?}"
+            );
+        }
+        // A subcommand name is only one in the subcommand position.
+        let args: Vec<String> = ["--model", "models"].map(String::from).to_vec();
+        assert!(
+            validate_rejected_args("Devin", "hcom devin", &args, DEVIN_REJECTED_ARGS).is_empty()
+        );
+    }
+
+    #[test]
     fn long_flags_match_equals_form() {
         let errors = validate_rejected_args(
             "Kimi",
@@ -402,6 +556,7 @@ mod tests {
         for (tool, invocation, rejected) in [
             ("Kimi", "hcom kimi", KIMI_REJECTED_ARGS),
             ("Qoder", "hcom qoder", QODER_REJECTED_ARGS),
+            ("Devin", "hcom devin", DEVIN_REJECTED_ARGS),
             ("OpenCode", "hcom opencode", OPENCODE_REJECTED_ARGS),
             ("Kilo", "hcom kilo", KILO_REJECTED_ARGS),
             ("Pi", "hcom pi", PI_REJECTED_ARGS),

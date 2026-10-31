@@ -311,7 +311,12 @@ pub(crate) fn capture_tool_output(output: &str) -> Option<String> {
 /// Normalize tool names across agents to canonical Claude names.
 pub(crate) fn normalize_tool_name(name: &str) -> &str {
     match name {
-        "run_shell_command" | "shell" | "shell_command" | "bash" | "run_terminal_command" => "Bash",
+        "run_shell_command"
+        | "shell"
+        | "shell_command"
+        | "bash"
+        | "run_terminal_command"
+        | "exec" => "Bash",
         "read_file" | "read" | "read_many_files" => "Read",
         "write_file" | "write" => "Write",
         "edit_file" | "edit" | "apply_patch" | "patch" | "replace" | "search_replace" => "Edit",

@@ -1457,6 +1457,12 @@ fn find_session_on_disk(session_id: &str) -> Option<(Tool, Option<String>)> {
         return Some((Tool::Qoder, Some(path)));
     }
 
+    // 6c. Devin (one ATIF JSON per session under its data dir)
+    let devin_path = crate::transcript::devin_transcript_path(session_id);
+    if !session_id.contains(['/', '\\']) && devin_path.is_file() {
+        return Some((Tool::Devin, Some(devin_path.to_string_lossy().into_owned())));
+    }
+
     // 7. Copilot
     if let Some(path) = derive_copilot_transcript_path(session_id)
         && let Some(tool) = detect_tool_from_path(&path)
@@ -1711,6 +1717,7 @@ fn recover_cursor_cwd(transcript_path: &str) -> Option<String> {
 ///   `~/.cursor/projects/<slug>/.workspace-trusted` marker (`workspacePath`).
 /// - **Copilot**: `session.start` entry carries `cwd` in the `data` object;
 ///   scan the first few lines for it.
+/// - **Devin**: the `<system_info>` system step lists the session's cwd.
 fn extract_cwd_from_transcript(path: &str, tool: Tool) -> Option<String> {
     match tool {
         // Qoder transcripts are Claude-format: `cwd` rides on the first user record.
@@ -1729,6 +1736,7 @@ fn extract_cwd_from_transcript(path: &str, tool: Tool) -> Option<String> {
         Tool::Cursor => recover_cursor_cwd(path),
         Tool::Kimi => None, // Kimi context.jsonl does not store cwd
         Tool::Grok => recover_grok_cwd(path),
+        Tool::Devin => recover_devin_cwd(path),
         Tool::Copilot => scan_lines_for_cwd(path, 20, |v| {
             v.get("event")
                 .or_else(|| v.get("type"))
@@ -1777,6 +1785,14 @@ fn scan_lines_for_cwd(
         }
     }
     None
+}
+
+/// Devin's transcript is one JSON document; its `<system_info>` step records
+/// the working directory the session started in.
+fn recover_devin_cwd(transcript_path: &str) -> Option<String> {
+    let data = std::fs::read_to_string(transcript_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    crate::transcript::devin::session_cwd(parsed.get("steps")?.as_array()?)
 }
 
 /// Gemini session JSON has `projectHash = hex(sha256(cwd))`. Read it, then
@@ -1864,12 +1880,16 @@ fn build_adopt_plan(
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
                  - Qoder:    ~/.qoder/projects/*/{sid}.jsonl\n  \
+                 - Devin:    {devin}/{sid}.json\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
                  - Grok:     {grok}/*/{sid}/updates.jsonl\n  \
                  - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
                  - Pi:       ~/.pi/agent/sessions/**/*{sid}*.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
+                devin = crate::transcript::devin_data_dir()
+                    .join("transcripts")
+                    .display(),
                 grok = crate::transcript::grok::grok_config_dir()
                     .join("sessions")
                     .display(),

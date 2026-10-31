@@ -192,6 +192,7 @@ fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
         Tool::Cursor if line.contains('→') => Some("→"),
         Tool::Copilot if line.contains('❯') => Some("❯"),
         Tool::Qoder if line.starts_with("> ") || line == ">" => Some(">"),
+        Tool::Devin if line.starts_with('❭') => Some("❭"),
         _ => None,
     }
 }
@@ -788,6 +789,7 @@ impl ScreenTracker {
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
             Ok(Tool::Qoder) => self.get_qoder_input_text(),
+            Ok(Tool::Devin) => self.get_devin_input_text(),
             // Grok: prompt-empty gate uses generic scrape when available; no
             // tool-specific VT100 input parser yet.
             Ok(Tool::Grok) => None,
@@ -1268,6 +1270,55 @@ impl ScreenTracker {
         }
         let text = text.join("\n").trim().to_string();
         Some(if text == PLACEHOLDER {
+            String::new()
+        } else {
+            text
+        })
+    }
+
+    /// Extract Devin CLI input text.
+    ///
+    /// Devin draws the composer between two `─` rules with a one-line status
+    /// footer below the bottom rule. The top rule may carry the session title:
+    ///
+    /// ```text
+    /// ──────────────────────────────────────────── Fix the flaky test ─
+    /// ❭ Ask Devin to build features, fix bugs, or work on your code
+    /// ──────────────────────────────────────────────────────────────────
+    /// Fusion · Claude Opus 5.5 ◆ SWE-2 High          Context: 28k / 1.0M
+    /// ```
+    ///
+    /// Submitted prompts and the approval menu reuse the `❭` glyph, so anchor
+    /// to the last non-empty row (the footer) as for Qoder. No framed composer
+    /// (an approval or trust prompt, a menu) is `None`.
+    fn get_devin_input_text(&self) -> Option<String> {
+        const PLACEHOLDERS: &[&str] = &[
+            "Ask Devin to build features, fix bugs, or work on your code",
+            "Guide Devin while it works",
+        ];
+        let lines = self.get_screen_lines();
+        let status = lines.iter().rposition(|line| !line.trim().is_empty())?;
+        let bottom = status.checked_sub(1)?;
+        if !is_dash_rule(&lines[bottom]) || is_dash_rule(&lines[status]) {
+            return None;
+        }
+        let is_top_rule = |line: &str| {
+            let trimmed = line.trim();
+            trimmed.starts_with("───") && trimmed.ends_with('─')
+        };
+        let top = (bottom.saturating_sub(12)..bottom)
+            .rev()
+            .find(|&row| is_top_rule(&lines[row]))?;
+        if top + 1 >= bottom {
+            return None;
+        }
+        let first = lines[top + 1].trim_start().strip_prefix('❭')?;
+        let mut text = vec![trim_with_nbsp(first).to_string()];
+        for line in &lines[top + 2..bottom] {
+            text.push(trim_with_nbsp(line).to_string());
+        }
+        let text = text.join("\n").trim().to_string();
+        Some(if PLACEHOLDERS.contains(&text.as_str()) {
             String::new()
         } else {
             text
@@ -2312,6 +2363,81 @@ mod tests {
         t.process(format!("{}\r\n", bottom).as_bytes());
         // Ready pattern visible in prompt text → empty
         assert_eq!(t.get_gemini_input_text(), Some(String::new()));
+    }
+
+    // ---- Devin input extraction ----
+    // Fixtures are bottom-of-screen captures from devin 3000.11.234 (120
+    // columns, narrowed to 80 here).
+
+    fn devin_screen(rows: &[&str]) -> ScreenTracker {
+        let mut t = make_tool_tracker(30, 80, crate::tool::Tool::Devin);
+        let mut lines = vec![""; 30 - rows.len()];
+        lines.extend_from_slice(rows);
+        render_rows(&mut t, &lines);
+        t
+    }
+
+    const DEVIN_TITLED_RULE: &str =
+        "───────────────────────────────────────────────────── Investigate the bug a… ─";
+    const DEVIN_FOOTER: &str =
+        "Fusion · Claude Opus 5.5 ◆ SWE-2 High        Context: 28k / 1.0M tokens (2%)";
+
+    #[test]
+    fn devin_idle_placeholder_is_empty_and_ready() {
+        let t = devin_screen(&[
+            "❭ say hi only",
+            " Hi",
+            DEVIN_TITLED_RULE,
+            "❭ Ask Devin to build features, fix bugs, or work on your code",
+            QODER_RULE,
+            DEVIN_FOOTER,
+        ]);
+        assert!(t.is_ready());
+        assert_eq!(t.get_devin_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("devin"));
+    }
+
+    #[test]
+    fn devin_extracts_typed_text_under_an_untitled_rule() {
+        let t = devin_screen(&[
+            QODER_RULE,
+            "❭ run the tests",
+            QODER_RULE,
+            "Fusion · Claude Opus 5.5 ◆ SWE-2 High     See usage and cost: /session-stats",
+        ]);
+        assert_eq!(t.get_devin_input_text().as_deref(), Some("run the tests"));
+        assert!(!t.is_ready());
+        assert!(!t.is_prompt_empty("devin"));
+    }
+
+    #[test]
+    fn devin_busy_composer_is_empty_but_not_ready() {
+        let t = devin_screen(&[
+            "⡱⢎ Thinking · 2s (esc twice to interrupt)",
+            DEVIN_TITLED_RULE,
+            "❭ Guide Devin while it works",
+            QODER_RULE,
+            DEVIN_FOOTER,
+        ]);
+        assert!(!t.is_ready());
+        assert_eq!(t.get_devin_input_text().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn devin_approval_menu_is_not_an_empty_composer() {
+        let t = devin_screen(&[
+            " ⏺ Running command",
+            " └ $ touch approved.txt",
+            "",
+            "❭ Allow",
+            "  Bypass mode",
+            "  Deny",
+            "",
+            "↑↓ select · e edit · ↵ confirm · esc cancel",
+        ]);
+        assert_eq!(t.get_devin_input_text(), None);
+        assert!(!t.is_prompt_empty("devin"));
+        assert!(!t.is_ready());
     }
 
     // ---- Qoder input extraction ----
