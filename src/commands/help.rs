@@ -640,7 +640,7 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args / hermes_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / devin_args / grok_args / hermes_args",
         "Default launch args per tool",
     ),
     (
@@ -1200,6 +1200,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "copilot",
     "qoder",
     "qodercli",
+    "devin",
     "grok",
     "grok-build",
     "hermes",

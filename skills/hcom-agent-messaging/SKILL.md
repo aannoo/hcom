@@ -20,7 +20,7 @@ Use hcom to:
 
 ```bash
 uv tool install hcom
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor, hcom kimi, hcom copilot, hcom qoder, hcom grok, hcom hermes
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor, hcom kimi, hcom copilot, hcom qoder, hcom devin, hcom grok, hcom hermes
 hcom              # TUI dashboard
 ```
 

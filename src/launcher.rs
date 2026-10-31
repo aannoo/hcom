@@ -24,9 +24,9 @@ use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tool::Tool;
 use crate::tools::launch_arg_validation::{
-    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
-    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, QODER_REJECTED_ARGS,
-    validate_grok_args, validate_rejected_args,
+    ANTIGRAVITY_REJECTED_ARGS, DEVIN_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS,
+    KIMI_REJECTED_ARGS, OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS,
+    QODER_REJECTED_ARGS, validate_grok_args, validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -110,7 +110,7 @@ impl LaunchTool {
 ///
 /// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
 /// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder and for default claude `--headless`.
+///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder/devin and for default claude `--headless`.
 /// - `NativePrint`:       background, direct claude spawn in print mode
 ///   (`-p --output-format stream-json --verbose`). Claude only, opt-in via an
 ///   explicit `-p`/`--print`; kept alive across turns by hcom's stop-hook loop.
@@ -1602,6 +1602,19 @@ pub(crate) fn inject_workspace_trust_args(
             args.push("--skip-trust".to_string());
         }
         Tool::Gemini => {}
+        // Skips Devin's trust prompt for this run only; until it is answered
+        // Devin runs no hooks. Nothing is written to its trust file.
+        Tool::Devin
+            if !args
+                .iter()
+                .any(|a| a.starts_with("--respect-workspace-trust")) =>
+        {
+            crate::hooks::runtime::insert_before_separator(
+                args,
+                ["--respect-workspace-trust".to_string(), "false".to_string()],
+            );
+        }
+        Tool::Devin => {}
         Tool::Codex => {
             let already_set = args
                 .windows(2)
@@ -2453,6 +2466,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         ),
         Tool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
         Tool::Qoder => validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS),
+        Tool::Devin => validate_rejected_args("Devin", "hcom devin", args, DEVIN_REJECTED_ARGS),
         Tool::Grok => {
             let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
             validate_grok_args(&borrowed)

@@ -87,7 +87,7 @@ pub const FILE_OP_CONTEXTS: &[&str] = &[
 ];
 
 /// Shell tool contexts.
-pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command', 'tool:terminal')";
+pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command', 'tool:terminal', 'tool:exec')";
 
 /// Parsed filter values — multiple values per key (OR semantics).
 pub type FilterMap = HashMap<String, Vec<String>>;

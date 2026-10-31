@@ -131,6 +131,7 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         Tool::Codex => Some(&crate::hooks::codex::PER_RUN),
         Tool::Copilot => Some(&crate::hooks::copilot::PER_RUN),
         Tool::Qoder => Some(&crate::hooks::qoder::PER_RUN),
+        Tool::Devin => Some(&crate::hooks::devin::PER_RUN),
         Tool::Pi => Some(&crate::hooks::pi::PER_RUN),
         Tool::Omp => Some(&crate::hooks::omp::PER_RUN),
         Tool::OpenCode => Some(&crate::hooks::opencode::OPENCODE_PER_RUN),
@@ -514,7 +515,7 @@ fn sweep_idle_artifacts(tool_dir: &Path, keep: &Path, cutoff: SystemTime) {
             .metadata()
             .and_then(|m| m.modified())
             .is_ok_and(|modified| modified < cutoff);
-        if idle && let Err(error) = std::fs::remove_dir_all(&path) {
+        if idle && let Err(error) = remove_artifact_tree(&path) {
             crate::log::log_warn(
                 "launcher",
                 "runtime.artifact_sweep_failed",
@@ -522,6 +523,63 @@ fn sweep_idle_artifacts(tool_dir: &Path, keep: &Path, cutoff: SystemTime) {
             );
         }
     }
+}
+
+/// Make a published dir and its files read-only, for a tool that writes back
+/// into the files it is given. Launches share a digest dir, so a write would
+/// carry one session's state into every later launch. On Unix the dir itself
+/// is sealed too: an atomic save replaces a read-only file through a writable
+/// dir. Idempotent. Removal goes through [`remove_artifact_tree`].
+pub fn seal_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        set_writable(&entry?.path(), false)?;
+    }
+    set_writable(dir, false)
+}
+
+/// `remove_dir_all` for artifacts, lifting a [`seal_dir`] seal first.
+pub(crate) fn remove_artifact_tree(path: &Path) -> std::io::Result<()> {
+    // A partial unseal still lets remove_dir_all delete what it can.
+    let _ = make_tree_writable(path);
+    std::fs::remove_dir_all(path)
+}
+
+fn make_tree_writable(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        set_writable(path, true)?;
+        for entry in std::fs::read_dir(path)? {
+            make_tree_writable(&entry?.path())?;
+        }
+    } else if metadata.is_file() {
+        set_writable(path, true)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_writable(path: &Path, writable: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    let mode = if writable {
+        mode | 0o200
+    } else {
+        mode & !0o222
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Windows ignores the read-only attribute on directories; a read-only file
+/// already refuses to be replaced.
+#[cfg(not(unix))]
+fn set_writable(path: &Path, writable: bool) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(!writable);
+    std::fs::set_permissions(path, permissions)
 }
 
 fn set_dir_mtime(path: &Path, time: SystemTime) -> std::io::Result<()> {
@@ -782,6 +840,29 @@ mod tests {
         assert_eq!(mode(&integrations.join("claude")), 0o700);
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("a/settings.json")), 0o600);
+    }
+
+    #[test]
+    fn sealed_dirs_refuse_writes_and_still_sweep_and_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let integrations = root.path().join("integrations");
+        let dir = publish_dir_at(&integrations, "devin", &[("config.json", b"{}")]).unwrap();
+        seal_dir(&dir).unwrap();
+        seal_dir(&dir).unwrap();
+        let file = dir.join("config.json");
+        assert!(std::fs::write(&file, "changed").is_err());
+        #[cfg(unix)]
+        assert!(std::fs::write(dir.join("new.json"), "{}").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"{}");
+
+        // An idle sealed digest is still swept by the next publish.
+        set_dir_mtime(&dir, SystemTime::now() - ARTIFACT_MAX_IDLE * 2).unwrap();
+        let next =
+            publish_dir_at(&integrations, "devin", &[("config.json", b"{\"a\":1}")]).unwrap();
+        assert!(!dir.exists());
+        seal_dir(&next).unwrap();
+        remove_artifact_tree(&integrations).unwrap();
+        assert!(!integrations.exists());
     }
 
     #[test]
