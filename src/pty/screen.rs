@@ -1278,8 +1278,8 @@ impl ScreenTracker {
 
     /// Extract Devin CLI input text.
     ///
-    /// Devin draws the composer between two `─` rules with a one-line status
-    /// footer below the bottom rule. The top rule may carry the session title:
+    /// Devin draws the composer between two `─` rules with a status footer
+    /// below the bottom rule. The top rule may carry the session title:
     ///
     /// ```text
     /// ──────────────────────────────────────────── Fix the flaky test ─
@@ -1288,20 +1288,22 @@ impl ScreenTracker {
     /// Fusion · Claude Opus 5.5 ◆ SWE-2 High          Context: 28k / 1.0M
     /// ```
     ///
-    /// Submitted prompts and the approval menu reuse the `❭` glyph, so anchor
-    /// to the last non-empty row (the footer) as for Qoder. No framed composer
-    /// (an approval or trust prompt, a menu) is `None`.
+    /// In narrow panes the footer splits into a model row and a hint row, and
+    /// the hint wraps, so it can take up to three rows; the placeholder is cut
+    /// short with `…`. Submitted prompts and the approval menu reuse the `❭`
+    /// glyph, so anchor to the lowest full rule just above the footer. No
+    /// framed composer (an approval or trust prompt, a menu) is `None`.
     fn get_devin_input_text(&self) -> Option<String> {
         const PLACEHOLDERS: &[&str] = &[
             "Ask Devin to build features, fix bugs, or work on your code",
             "Guide Devin while it works",
         ];
+        const MAX_FOOTER_ROWS: usize = 3;
         let lines = self.get_screen_lines();
-        let status = lines.iter().rposition(|line| !line.trim().is_empty())?;
-        let bottom = status.checked_sub(1)?;
-        if !is_dash_rule(&lines[bottom]) || is_dash_rule(&lines[status]) {
-            return None;
-        }
+        let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
+        let bottom = (last.saturating_sub(MAX_FOOTER_ROWS)..last)
+            .rev()
+            .find(|&row| is_dash_rule(&lines[row]))?;
         let is_top_rule = |line: &str| {
             let trimmed = line.trim();
             trimmed.starts_with("───") && trimmed.ends_with('─')
@@ -1318,11 +1320,13 @@ impl ScreenTracker {
             text.push(trim_with_nbsp(line).to_string());
         }
         let text = text.join("\n").trim().to_string();
-        Some(if PLACEHOLDERS.contains(&text.as_str()) {
-            String::new()
-        } else {
-            text
-        })
+        let is_placeholder = PLACEHOLDERS.iter().any(|placeholder| {
+            text == *placeholder
+                || text
+                    .strip_suffix('…')
+                    .is_some_and(|head| !head.is_empty() && placeholder.starts_with(head))
+        });
+        Some(if is_placeholder { String::new() } else { text })
     }
 
     /// Check and perform periodic dump if 5 seconds elapsed
@@ -2421,6 +2425,105 @@ mod tests {
         ]);
         assert!(!t.is_ready());
         assert_eq!(t.get_devin_input_text().as_deref(), Some(""));
+    }
+
+    fn devin_screen_at(cols: u16, rows: &[&str]) -> ScreenTracker {
+        let mut t = make_tool_tracker(24, cols, crate::tool::Tool::Devin);
+        let mut lines = vec![""; 24 - rows.len()];
+        lines.extend_from_slice(rows);
+        render_rows(&mut t, &lines);
+        t
+    }
+
+    #[test]
+    fn devin_narrow_panes_split_the_footer_and_cut_the_placeholder() {
+        // devin 3000.11.234 at 60 and 40 columns.
+        let rule60 = "─".repeat(60);
+        let t = devin_screen_at(
+            60,
+            &[
+                "   devprobe/ws",
+                &rule60,
+                "❭ Ask Devin to build features, fix bugs, or work on your c…",
+                &rule60,
+                "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
+                "See usage and cost: /session-stats",
+            ],
+        );
+        assert!(t.is_ready());
+        assert_eq!(t.get_devin_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("devin"));
+
+        let rule40 = "─".repeat(40);
+        let t = devin_screen_at(
+            40,
+            &[
+                &rule40,
+                "❭ Ask Devin to build features, fix bug…",
+                &rule40,
+                "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
+                "Use /bug to report a bug to the Devin",
+                "CLI developers",
+            ],
+        );
+        assert!(t.is_ready());
+        assert!(t.is_prompt_empty("devin"));
+
+        let t = devin_screen_at(
+            40,
+            &[
+                &rule40,
+                "❭ run the tests in the whole repository",
+                "  please and then report back",
+                &rule40,
+                "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
+                "See usage and cost: /session-stats",
+            ],
+        );
+        assert!(!t.is_ready());
+        assert_eq!(
+            t.get_devin_input_text().as_deref(),
+            Some("run the tests in the whole repository\nplease and then report back")
+        );
+    }
+
+    #[test]
+    fn devin_resized_pane_reflows_to_a_narrow_composer() {
+        let mut t = make_tool_tracker(24, 120, crate::tool::Tool::Devin);
+        let wide = "─".repeat(120);
+        let mut lines = vec![""; 20];
+        lines.extend_from_slice(&[
+            wide.as_str(),
+            "❭ Ask Devin to build features, fix bugs, or work on your code",
+            wide.as_str(),
+            "Fusion · Claude Opus 5.5 ◆ SWE-2 High                         Press opt+m to switch between available models",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_prompt_empty("devin"));
+        // Devin clears and redraws for 50 columns after a resize.
+        t.resize(24, 50);
+        t.process(b"\x1b[2J\x1b[H");
+        let narrow = "─".repeat(50);
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "   bd31a8e3004a/scratchpad/devprobe/ws",
+            narrow.as_str(),
+            "❭ Ask Devin to build features, fix bugs, or work…",
+            narrow.as_str(),
+            "Fusion · Claude Opus 5.5 ◆ SWE-2 High",
+            "Press opt+m to switch between available models",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_ready());
+        assert!(t.is_prompt_empty("devin"));
+    }
+
+    #[test]
+    fn devin_typed_text_ending_in_an_ellipsis_is_not_the_placeholder() {
+        let rule = "─".repeat(80);
+        let t = devin_screen(&[&rule, "❭ wait for it…", &rule, DEVIN_FOOTER]);
+        assert_eq!(t.get_devin_input_text().as_deref(), Some("wait for it…"));
+        assert!(!t.is_prompt_empty("devin"));
     }
 
     #[test]
