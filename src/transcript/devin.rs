@@ -93,9 +93,9 @@ struct Turn {
     user: String,
     timestamp: String,
     action: String,
-    /// Where the text after the last tool call starts in `action`.
+    /// Where the text after the last tool call starts in `action`; every tool
+    /// call moves it to the end, so earlier text never counts as the final one.
     final_start: usize,
-    tool_since_text: bool,
     tools: Vec<ToolUse>,
     files: Vec<String>,
     errors: Vec<Value>,
@@ -175,10 +175,6 @@ pub(crate) fn parse_devin_json_with_usage(path: &Path) -> Result<Transcript, Str
                     if !turn.action.is_empty() {
                         turn.action.push('\n');
                     }
-                    // Text after the last tool call is the turn's conclusion.
-                    if std::mem::take(&mut turn.tool_since_text) {
-                        turn.final_start = turn.action.len();
-                    }
                     turn.action.push_str(text);
                 }
                 let outputs: HashMap<&str, &str> = step
@@ -227,7 +223,7 @@ pub(crate) fn parse_devin_json_with_usage(path: &Path) -> Result<Transcript, Str
                         }));
                     }
                     turn.last_was_error = is_error;
-                    turn.tool_since_text = true;
+                    turn.final_start = turn.action.len();
                 }
             }
             _ => {}
@@ -320,6 +316,18 @@ mod tests {
             parsed.exchanges[0].final_text,
             "Fixed the bug.\nTests pass."
         );
+
+        // Text between two tool calls is not the conclusion.
+        let file = transcript(json!([
+            {"source": "user", "message": "fix it"},
+            {"source": "agent", "message": "",
+             "tool_calls": [{"tool_call_id": "a", "function_name": "exec", "arguments": {"command": "make"}}]},
+            {"source": "agent", "message": "Now the tests.",
+             "tool_calls": [{"tool_call_id": "b", "function_name": "exec", "arguments": {"command": "make test"}}]}
+        ]));
+        let parsed = parse_devin_json_with_usage(file.path()).unwrap();
+        assert_eq!(parsed.exchanges[0].final_text, "");
+        assert_eq!(parsed.exchanges[0].action, "Now the tests.");
 
         // A turn without tools has no separate conclusion.
         let file = transcript(json!([
