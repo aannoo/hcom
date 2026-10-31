@@ -584,27 +584,25 @@ pub fn dispatch_devin_hook_native(hook_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::test_helpers::EnvGuard;
+    use crate::hooks::test_helpers::{EnvGuard, EnvVarGuard};
     use serial_test::serial;
 
-    fn devin_test_env() -> (tempfile::TempDir, PathBuf, EnvGuard) {
+    fn devin_test_env() -> (tempfile::TempDir, PathBuf, (EnvGuard, EnvVarGuard)) {
         let guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
+        // The user config lives under APPDATA on Windows.
+        let appdata = EnvVarGuard::set("APPDATA", dir.path().join("appdata"));
         unsafe {
             std::env::set_var("HOME", dir.path().join("home"));
             std::env::set_var("HCOM_DIR", workspace.join(".hcom"));
         }
-        (dir, workspace, guard)
+        (dir, workspace, (guard, appdata))
     }
 
-    fn user_config_path(dir: &tempfile::TempDir) -> PathBuf {
-        dir.path()
-            .join("home")
-            .join(".config")
-            .join("devin")
-            .join(CONFIG_FILE)
+    fn user_config_path() -> PathBuf {
+        default_config_path(&LaunchCtx::ambient(crate::tool::Tool::Devin, false))
     }
 
     fn prepared(args: &[&str], workspace: PathBuf) -> (Vec<String>, PathBuf, Value) {
@@ -638,8 +636,8 @@ mod tests {
     #[test]
     #[serial]
     fn per_run_config_copies_user_config_and_adds_hcom_hooks() {
-        let (dir, workspace, _guard) = devin_test_env();
-        let user = user_config_path(&dir);
+        let (_dir, workspace, _guard) = devin_test_env();
+        let user = user_config_path();
         std::fs::create_dir_all(user.parent().unwrap()).unwrap();
         std::fs::write(
             &user,
@@ -867,7 +865,10 @@ mod tests {
         );
         let inst = db.get_instance_full("memo").unwrap().unwrap();
         assert_eq!(inst.session_id.as_deref(), Some("late-sid"));
-        assert!(inst.transcript_path.ends_with("transcripts/late-sid.json"));
+        assert!(
+            std::path::Path::new(&inst.transcript_path)
+                .ends_with(std::path::Path::new("transcripts").join("late-sid.json"))
+        );
         assert_eq!(inst.status_context, "trigger");
 
         let (again, _) = handle_userpromptsubmit(&db, &ctx, &payload);
