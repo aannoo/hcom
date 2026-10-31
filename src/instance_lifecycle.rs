@@ -777,12 +777,22 @@ pub enum TrackedProcess {
 /// incarnation). The stored status is deliberately ignored: several paths
 /// mark a live process `inactive` (soft-finalize, StopFailure), so only the
 /// identity can tell. Rows without a stored identity are left to the
-/// clock-based cleanup: plain liveness can't rule out PID reuse.
+/// clock-based cleanup: plain liveness can't rule out PID reuse. So are rows
+/// recorded in another PID namespace than the caller's (see
+/// [`InstanceRow::pid_in_foreign_namespace`]).
 pub fn reap_if_process_gone(db: &HcomDb, data: &InstanceRow) -> TrackedProcess {
     if data.status == ST_LAUNCHING
         || crate::instances::is_launching_placeholder(data)
         || data.origin_device_id.is_some()
     {
+        return TrackedProcess::Unverifiable;
+    }
+    // A PID recorded in another PID namespace means nothing here, so neither
+    // does the check below: a caller in its own namespace (a sandboxed tool
+    // such as Codex running hcom) sees none of the host's PIDs and would read
+    // every live host process as gone. This comes before any identity
+    // comparison: a matching or mismatching identity is no evidence either.
+    if data.pid_in_foreign_namespace() {
         return TrackedProcess::Unverifiable;
     }
     let (Some(pid), Some(expected_identity)) = (
@@ -942,6 +952,21 @@ pub fn cleanup_stale_instances(
             // above. For legacy rows without one, a recycled PID can keep a dead
             // row listed. That costs a stale line in `hcom list`; the opposite
             // mistake costs a running agent.
+            //
+            // A PID recorded in another PID namespace can't be probed from here
+            // at all (a sandboxed caller sees none of the host's processes), so
+            // the clock must lose there too.
+            if reason != "exit_cleanup" && data.pid.is_some() && data.pid_in_foreign_namespace() {
+                crate::log::log_info(
+                    "cleanup",
+                    "skip_foreign_pid_namespace",
+                    &format!(
+                        "instance={} reason={} context={} age={}s",
+                        data.name, reason, context, age
+                    ),
+                );
+                continue;
+            }
             if reason != "exit_cleanup"
                 && let Some(pid) = data.pid
                 && crate::sys::process::is_alive(pid as u32)
@@ -1529,6 +1554,65 @@ mod tests {
         assert!(instance_exists(&db, "host-agent"), "foreign row kept");
         assert!(stop_reasons(&db, "host-agent").is_empty());
         assert!(!instance_exists(&db, "exited"), "own dead row reaped");
+        cleanup(path);
+    }
+
+    /// A caller that can't read its own PID namespace can't tell whether a
+    /// recorded one is its own, so it leaves such a row alone; rows that never
+    /// recorded a namespace keep being reaped.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_reap_skips_row_with_pid_namespace_when_own_namespace_is_unreadable() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let own = own_pid_namespace();
+        insert_with_pid_namespace(&db, "recorded", DEAD_PID, "exited-process", Some(&own));
+        insert_with_pid_namespace(&db, "legacy", DEAD_PID, "exited-process", None);
+        let recorded = db.get_instance_full("recorded").unwrap().unwrap();
+        let legacy = db.get_instance_full("legacy").unwrap().unwrap();
+
+        let _unreadable = crate::sys::process::test_pid_namespace::force_unreadable();
+
+        assert_eq!(
+            reap_if_process_gone(&db, &recorded),
+            TrackedProcess::Unverifiable,
+            "an unreadable own namespace can't confirm the recorded one"
+        );
+        assert!(instance_exists(&db, "recorded"), "row must survive");
+        assert!(stop_reasons(&db, "recorded").is_empty(), "no stop event");
+        assert_eq!(reap_if_process_gone(&db, &legacy), TrackedProcess::Reaped);
+        cleanup(path);
+    }
+
+    /// The clock-based cleanup lets a live PID win over staleness; for a PID
+    /// recorded in another namespace it can't probe liveness, so the row stays.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_cleanup_clock_spares_stale_row_from_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_stale_active(&db, "host-agent", 3700, 3700, DEAD_PID);
+        // The namespace is stored beside the identity, as a writer does.
+        db.conn()
+            .execute(
+                "UPDATE instances SET launch_context = ? WHERE name = 'host-agent'",
+                rusqlite::params![
+                    serde_json::json!({
+                        "pid_identity": "linux:host-boot:12345",
+                        "pid_namespace": FOREIGN_PID_NAMESPACE,
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        insert_stale_active(&db, "legacy", 3700, 3700, DEAD_PID);
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 1);
+        assert!(instance_exists(&db, "host-agent"), "foreign row kept");
+        assert!(stop_reasons(&db, "host-agent").is_empty());
+        assert!(!instance_exists(&db, "legacy"), "legacy dead row reaped");
         cleanup(path);
     }
 
