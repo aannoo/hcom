@@ -93,7 +93,9 @@ struct Turn {
     user: String,
     timestamp: String,
     action: String,
+    /// Where the text after the last tool call starts in `action`.
     final_start: usize,
+    tool_since_text: bool,
     tools: Vec<ToolUse>,
     files: Vec<String>,
     errors: Vec<Value>,
@@ -174,7 +176,7 @@ pub(crate) fn parse_devin_json_with_usage(path: &Path) -> Result<Transcript, Str
                         turn.action.push('\n');
                     }
                     // Text after the last tool call is the turn's conclusion.
-                    if calls.is_empty() {
+                    if std::mem::take(&mut turn.tool_since_text) {
                         turn.final_start = turn.action.len();
                     }
                     turn.action.push_str(text);
@@ -225,6 +227,7 @@ pub(crate) fn parse_devin_json_with_usage(path: &Path) -> Result<Transcript, Str
                         }));
                     }
                     turn.last_was_error = is_error;
+                    turn.tool_since_text = true;
                 }
             }
             _ => {}
@@ -301,6 +304,31 @@ mod tests {
         assert_eq!(usage.tokens.input, 30);
         assert_eq!(usage.context_tokens, Some(120));
         assert_eq!(usage.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn final_text_spans_every_step_after_the_last_tool_call() {
+        let file = transcript(json!([
+            {"source": "user", "message": "fix it"},
+            {"source": "agent", "message": "Looking",
+             "tool_calls": [{"tool_call_id": "a", "function_name": "exec", "arguments": {"command": "make"}}]},
+            {"source": "agent", "message": "Fixed the bug.", "tool_calls": []},
+            {"source": "agent", "message": "Tests pass.", "tool_calls": []}
+        ]));
+        let parsed = parse_devin_json_with_usage(file.path()).unwrap();
+        assert_eq!(
+            parsed.exchanges[0].final_text,
+            "Fixed the bug.\nTests pass."
+        );
+
+        // A turn without tools has no separate conclusion.
+        let file = transcript(json!([
+            {"source": "user", "message": "hi"},
+            {"source": "agent", "message": "Hello.", "tool_calls": []},
+            {"source": "agent", "message": "Anything else?", "tool_calls": []}
+        ]));
+        let parsed = parse_devin_json_with_usage(file.path()).unwrap();
+        assert_eq!(parsed.exchanges[0].final_text, "");
     }
 
     #[test]
