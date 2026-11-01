@@ -403,7 +403,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const run = statusChain.then(async () => {
 			const name = instanceName;
 			if (!name || gen !== generation) return;
-			const reply = await rpc([args[0], "--name", name, ...args.slice(1)], name);
+			const reply = await rpc(withProcessId([args[0], "--name", name, ...args.slice(1)]), name);
 			if (reply && gen === generation) lastReportedStatusKey = key;
 		});
 		statusChain = run.catch(() => {});
@@ -500,7 +500,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const terminal = event.reason === undefined || event.reason === "quit";
 		resetBinding();
 		if (name && terminal) {
-			await rpc(["pi-stop", "--name", name, "--reason", event.reason ?? "shutdown"], name);
+			await rpc(withProcessId(["pi-stop", "--name", name, "--reason", event.reason ?? "shutdown"]), name);
 		}
 	});
 

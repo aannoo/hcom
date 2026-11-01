@@ -377,7 +377,7 @@ function createCore(transport: Transport) {
       const [status, context, detail] = desiredStatus()
       const key = statusKey(status, context, detail)
       if (key === lastReportedStatusKey) return
-      const args = ["opencode-status", "--name", name, "--status", status]
+      const args = withProcessId(["opencode-status", "--name", name, "--status", status])
       if (context) args.push("--context", context)
       if (detail) args.push("--detail", detail)
       const reply = await rpc(args, name)
@@ -402,7 +402,7 @@ function createCore(transport: Transport) {
     const run = statusChain.then(async () => {
       const name = instanceName
       if (!name || gen !== generation) return
-      const reply = await rpc(["opencode-status", "--name", name, "--tool", tool, "--input-json", JSON.stringify(args)], name)
+      const reply = await rpc(withProcessId(["opencode-status", "--name", name, "--tool", tool, "--input-json", JSON.stringify(args)]), name)
       // The tool detail is a form of active: a later sync must not overwrite it
       // with a bare active, but must still report the idle edge.
       if (reply && gen === generation) lastReportedStatusKey = statusKey("active")
@@ -834,7 +834,7 @@ function createCore(transport: Transport) {
         log("INFO", "plugin.session_deleted", name)
         void forgetBinding(sessionId)
         reset()
-        await rpc(["opencode-stop", "--name", name, "--reason", "closed"], name)
+        await rpc(withProcessId(["opencode-stop", "--name", name, "--reason", "closed"]), name)
         break
       }
     }
