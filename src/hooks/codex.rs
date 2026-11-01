@@ -1030,32 +1030,6 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
     }
 }
 
-/// Mint a binding for a Codex session that the hcom launcher did not start.
-///
-/// Opt-in through `HCOM_AUTO_ATTACH=1`, mirroring the plugin clients: without
-/// it the historical behaviour (drop the hook) is unchanged. The key follows the
-/// same `tool:pid:sid` shape so stale cleanup and owner checks treat it alike.
-fn self_mint_codex_binding(db: &HcomDb, raw: &Value) -> Option<String> {
-    if std::env::var("HCOM_AUTO_ATTACH").ok().as_deref() != Some("1") {
-        return None;
-    }
-    let session_id = raw
-        .get("session_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let key = format!("codex:{}:{}", std::process::id(), session_id);
-    match instance_binding::bind_session_to_process_for_tool(
-        db,
-        session_id,
-        Some(&key),
-        "codex",
-        true,
-    ) {
-        instance_binding::ToolCheckedBind::Bound(_) => Some(key),
-        _ => None,
-    }
-}
-
 /// Main entry point for native Codex hooks.
 pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     let start = std::time::Instant::now();
@@ -1083,16 +1057,9 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         }
     };
 
-    let mut ctx = HcomContext::from_os();
+    let ctx = HcomContext::from_os();
     if !common::hook_gate_check(&ctx) {
-        // Codex has no plugin that could mint a binding key, so a session the
-        // launcher never started carries no HCOM_PROCESS_ID and every hook was
-        // silently dropped. Mint the key here from the session id the hook
-        // already carries — same rule pi/opencode use, but derived server-side.
-        match self_mint_codex_binding(&db, &raw) {
-            Some(key) => ctx.process_id = Some(key),
-            None => return 0,
-        }
+        return 0;
     }
 
     let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
