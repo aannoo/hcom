@@ -85,8 +85,10 @@ pub(crate) fn require_attached(
     argv: &[String],
 ) -> Result<(), (i32, String)> {
     let name = parse_flag(argv, "--name").ok_or_else(|| error("Missing --name"))?;
-    let owner = ctx
-        .process_id
+    // A launchless session mints its key with `--process-id`, so read/ack/stop
+    // must resolve the same way `plugin start` did: flag first, then env.
+    let process_id = resolve_process_id(argv, ctx.process_id.as_deref());
+    let owner = process_id
         .as_deref()
         .and_then(|token| db.get_process_binding(token).ok().flatten());
     if owner.as_deref() != Some(name.as_str()) {
@@ -273,6 +275,31 @@ mod tests {
         row.insert("last_event_id".into(), json!(last_event_id));
         row.insert("created_at".into(), json!(1.0));
         db.save_instance_named(name, &row).unwrap();
+    }
+
+    #[test]
+    fn rpc_accepts_the_self_minted_process_id_flag() {
+        // A session opened WITHOUT the launcher mints its key with `--process-id`
+        // and repeats it on read/ack. The owner check must resolve the same way
+        // `plugin start` did, or binding would not survive into delivery.
+        let (_dir, db) = test_db();
+        save_instance(&db, "luna", 0);
+        db.set_process_binding("pi:4242:sid-1", "", "luna").unwrap();
+        let argv = sv(&["--name", "luna", "--process-id", "pi:4242:sid-1"]);
+        let ctx = |token: Option<&str>| {
+            let mut env = std::collections::HashMap::new();
+            if let Some(t) = token {
+                env.insert("HCOM_PROCESS_ID".to_string(), t.to_string());
+            }
+            crate::shared::context::HcomContext::from_env(&env, std::env::temp_dir())
+        };
+        // No env at all: the flag alone authorizes the launchless session.
+        assert!(require_attached(&ctx(None), &db, &argv).is_ok());
+        // Another launch's key is still rejected.
+        let outro = sv(&["--name", "luna", "--process-id", "pi:9:sid-9"]);
+        assert!(require_attached(&ctx(None), &db, &outro).is_err());
+        // The flag wins over an inherited env, mirroring resolve_process_id.
+        assert!(require_attached(&ctx(Some("pi:9:sid-9")), &db, &argv).is_ok());
     }
 
     #[test]

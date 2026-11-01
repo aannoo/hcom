@@ -105,9 +105,18 @@ async function rpc(args: string[], instance: string | null): Promise<RpcReply | 
 
 type Batch = { messages: any[]; ackId: number; hasMore: boolean }
 
+// Repeat the self-minted `--process-id` on follow-up RPCs (read/ack/standby): the
+// Rust side resolves the owner from the flag first, so a launchless session keeps
+// delivery authorized without inheriting HCOM_PROCESS_ID.
+let mintedProcessId: string | null = null
+
+function withProcessId(args: string[]): string[] {
+  return mintedProcessId ? [...args, "--process-id", mintedProcessId] : args
+}
+
 // The oldest unread messages (hcom bounds the batch), or null when the read failed.
 async function readBatch(instance: string): Promise<Batch | null> {
-  const reply = await rpc(["opencode-read", "--name", instance], instance)
+  const reply = await rpc(withProcessId(["opencode-read", "--name", instance]), instance)
   if (!reply) return null
   const messages = reply.messages
   const valid =
@@ -476,7 +485,8 @@ function createCore(transport: Transport) {
         // Session opened WITHOUT the hcom launcher: mint the binding key and
         // persist the numeric pid, otherwise stale cleanup drops a live agent.
         if (!process.env.HCOM_LAUNCHED) {
-          args.push("--process-id", `oc:${process.pid}:${sid}`)
+          mintedProcessId = `oc:${process.pid}:${sid}`
+          args.push("--process-id", mintedProcessId)
           args.push("--pid", String(process.pid))
         }
         endTurn = await bindingTurn()
@@ -612,7 +622,7 @@ function createCore(transport: Transport) {
     const gen = generation
     if (!sent?.admitted || !name) return Promise.resolve()
     const attempt = (async () => {
-      const reply = await rpc(["opencode-read", "--name", name, "--ack", "--up-to", String(sent.ackId)], name)
+      const reply = await rpc(withProcessId(["opencode-read", "--name", name, "--ack", "--up-to", String(sent.ackId)]), name)
       if (gen !== generation || delivery !== sent) return
       if (reply?.acked_to !== sent.ackId) {
         if (reply) log("WARN", "plugin.rpc_failed", name, { command: "opencode-read", error: "unexpected ack reply", reply })
@@ -929,7 +939,7 @@ function createCore(transport: Transport) {
       return
     }
     standbyServer = server
-    if (!(await rpc(["opencode-standby", "--port", String(port)], null))) stopStandby()
+    if (!(await rpc(withProcessId(["opencode-standby", "--port", String(port)]), null))) stopStandby()
   }
 
   // hcom wakes again until the session binds, so a failed start is retried.
