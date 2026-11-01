@@ -210,7 +210,13 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         self_minted,
     ) {
         instance_binding::ToolCheckedBind::Bound(name) => name,
-        _ => {
+        instance_binding::ToolCheckedBind::Rejected => {
+            return (
+                0,
+                r#"{"error":"This binding key belongs to another tool"}"#.to_string(),
+            );
+        }
+        instance_binding::ToolCheckedBind::Unbound => {
             return (
                 0,
                 r#"{"error":"No instance bound to this process"}"#.to_string(),
@@ -298,10 +304,10 @@ fn handle_standby(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, Stri
     let Some(port) = parse_flag(argv, "--port").and_then(|s| s.parse::<u16>().ok()) else {
         return (0, r#"{"error":"Missing --port"}"#.to_string());
     };
-    let Some(process_id) = &ctx.process_id else {
+    let Some(process_id) = resolve_process_id(argv, ctx.process_id.as_deref()) else {
         return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string());
     };
-    let Ok(Some(name)) = db.get_process_binding(process_id) else {
+    let Ok(Some(name)) = db.get_process_binding(&process_id) else {
         return (
             0,
             r#"{"error":"No instance bound to this process"}"#.to_string(),
@@ -942,10 +948,8 @@ mod tests {
         crate::config::Config::init();
         let temp = tempfile::TempDir::new().unwrap();
         let (_dir, db) = test_db();
-        let env = std::collections::HashMap::from([(
-            "HCOM_TOOL".to_string(),
-            "opencode".to_string(),
-        )]);
+        let env =
+            std::collections::HashMap::from([("HCOM_TOOL".to_string(), "opencode".to_string())]);
         let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
         let live = std::process::id();
         let argv = sv(&[
@@ -964,13 +968,21 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(!name.is_empty(), "sem nome na resposta: {out}");
-        assert_eq!(out.get("session_id").and_then(|v| v.as_str()), Some("ses-nova"));
+        assert_eq!(
+            out.get("session_id").and_then(|v| v.as_str()),
+            Some("ses-nova")
+        );
 
-        let inst = db.get_instance_full(&name).unwrap().expect("instancia criada");
+        let inst = db
+            .get_instance_full(&name)
+            .unwrap()
+            .expect("instancia criada");
         assert_eq!(inst.tool, "opencode");
         assert_eq!(inst.pid, Some(live as i64), "pid numerico deve ser gravado");
         assert_eq!(
-            db.get_process_binding("oc:999:abcdef12").unwrap().as_deref(),
+            db.get_process_binding("oc:999:abcdef12")
+                .unwrap()
+                .as_deref(),
             Some(name.as_str())
         );
     }
@@ -996,10 +1008,7 @@ mod tests {
 
     #[test]
     fn test_parse_pid_flag_rejects_non_numeric() {
-        assert_eq!(
-            parse_pid_flag(&sv(&["--pid", "4242"])),
-            Some(4242)
-        );
+        assert_eq!(parse_pid_flag(&sv(&["--pid", "4242"])), Some(4242));
         assert_eq!(parse_pid_flag(&sv(&["--pid", "abc"])), None);
         assert_eq!(parse_pid_flag(&sv(&["--session-id", "x"])), None);
     }

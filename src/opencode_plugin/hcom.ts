@@ -476,7 +476,7 @@ function createCore(transport: Transport) {
         // Session opened WITHOUT the hcom launcher: mint the binding key and
         // persist the numeric pid, otherwise stale cleanup drops a live agent.
         if (!process.env.HCOM_LAUNCHED) {
-          args.push("--process-id", `oc:${process.pid}:${sid.slice(0, 8)}`)
+          args.push("--process-id", `oc:${process.pid}:${sid}`)
           args.push("--pid", String(process.pid))
         }
         endTurn = await bindingTurn()
