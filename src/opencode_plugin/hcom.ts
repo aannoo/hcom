@@ -1,7 +1,7 @@
 // hcom-managed-plugin: installed by hcom; removed automatically. Do not add this line to your own plugins.
 import type { Plugin as Plugin2 } from "@opencode/plugin"
 import { spawn } from "node:child_process"
-import { appendFileSync, mkdirSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs"
 import { createServer, type Server } from "node:net"
 import { homedir } from "node:os"
 import { dirname } from "node:path"
@@ -22,6 +22,19 @@ function claimPluginHost(): boolean {
   if (owner && owner !== current) return false
   process.env.HCOM_PLUGIN_HOST_PID = current
   return true
+}
+
+// Persistent opt-in for sessions the launcher did not start. Read once: a
+// missing file or key means "not opted in".
+let optInCache: boolean | null = null
+function configOptIn(): boolean {
+  if (optInCache !== null) return optInCache
+  optInCache = false
+  try {
+    const dir = process.env.HCOM_DIR || `${homedir()}/.hcom`
+    optInCache = /^\s*auto_attach\s*=\s*true\s*$/m.test(readFileSync(`${dir}/config.toml`, "utf8"))
+  } catch {}
+  return optInCache
 }
 
 function log(
@@ -306,12 +319,13 @@ function keyOf(location?: { directory: string; workspaceID?: string }): string |
 }
 
 function createCore(transport: Transport) {
-  // A session can attach without the hcom launcher when the operator opts in
-  // (`HCOM_AUTO_ATTACH=1`). The launcher path stays the default; config-driven
-  // opt-in is a follow-up, so this only reads the environment here.
-  const autoAttach =
-    process.env.HCOM_LAUNCHED === "1" || process.env.HCOM_AUTO_ATTACH === "1"
+  // A session can attach without the hcom launcher when the operator opts in.
+  // The environment is not enough on its own: opencode does not carry the
+  // parent's variables into the plugin runtime (measured — `HCOM_AUTO_ATTACH`
+  // arrived as null even with the shell exporting it), so the opt-in is also
+  // read from `~/.hcom/config.toml` (`auto_attach = true`).
   const isLaunched = process.env.HCOM_LAUNCHED === "1"
+  const autoAttach = isLaunched || process.env.HCOM_AUTO_ATTACH === "1" || configOptIn()
 
   const locationKey = keyOf(transport.location)
   let instanceName: string | null = null
