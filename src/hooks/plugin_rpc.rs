@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
+use crate::log::log_error;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 use super::common;
@@ -22,6 +23,35 @@ pub(crate) fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
 
 pub(crate) fn has_flag(argv: &[String], flag: &str) -> bool {
     argv.iter().any(|a| a == flag)
+}
+
+/// Resolve the process binding key for `plugin start`.
+///
+/// `--process-id` lets a session opened WITHOUT the hcom launcher mint its own
+/// binding key; `HCOM_PROCESS_ID` stays the launcher path. The flag wins so a
+/// caller can override an inherited environment.
+pub(crate) fn resolve_process_id(argv: &[String], env_process_id: Option<&str>) -> Option<String> {
+    parse_flag(argv, "--process-id").or_else(|| env_process_id.map(str::to_string))
+}
+
+/// `--pid <n>`: numeric pid of the client process.
+///
+/// Persisting it is what makes stale cleanup spare a live session: without a
+/// numeric pid the collector drops an instance whose process is very much alive
+/// (the failure mode `hcom start` had before this flag).
+pub(crate) fn parse_pid_flag(argv: &[String]) -> Option<u32> {
+    parse_flag(argv, "--pid").and_then(|s| s.parse::<u32>().ok())
+}
+
+pub(crate) fn persist_pid(db: &HcomDb, name: &str, pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    if let Err(e) = db.update_instance_pid(name, pid) {
+        log_error(
+            "hooks",
+            "hook.error",
+            &format!("hook=plugin-start op=update_instance_pid err={e}"),
+        );
+    }
 }
 
 pub(crate) fn error(message: impl std::fmt::Display) -> (i32, String) {

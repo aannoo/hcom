@@ -297,6 +297,13 @@ function keyOf(location?: { directory: string; workspaceID?: string }): string |
 }
 
 function createCore(transport: Transport) {
+  // A session can attach without the hcom launcher when the operator opts in
+  // (`HCOM_AUTO_ATTACH=1`). The launcher path stays the default; config-driven
+  // opt-in is a follow-up, so this only reads the environment here.
+  const autoAttach =
+    process.env.HCOM_LAUNCHED === "1" || process.env.HCOM_AUTO_ATTACH === "1"
+  const isLaunched = process.env.HCOM_LAUNCHED === "1"
+
   const locationKey = keyOf(transport.location)
   let instanceName: string | null = null
   let sessionId: string | null = null
@@ -452,7 +459,7 @@ function createCore(transport: Transport) {
       if (fromRecord || instanceName || waitedGen !== generation) return
       if (bindingPromise) return bindingPromise
     }
-    if (disposed || process.env.HCOM_LAUNCHED !== "1") return
+    if (disposed || !autoAttach) return
     const gen = generation
     const attempt = (async () => {
       let server: Server | null = null
@@ -466,6 +473,12 @@ function createCore(transport: Transport) {
         const port = serverPort(server)
         const args = ["opencode-start", "--session-id", sid]
         if (port) args.push("--notify-port", String(port))
+        // Session opened WITHOUT the hcom launcher: mint the binding key and
+        // persist the numeric pid, otherwise stale cleanup drops a live agent.
+        if (!process.env.HCOM_LAUNCHED) {
+          args.push("--process-id", `oc:${process.pid}:${sid.slice(0, 8)}`)
+          args.push("--pid", String(process.pid))
+        }
         endTurn = await bindingTurn()
         if (gen !== generation || disposed) return
         if (fromRecord && (lastBinding.location !== locationKey || lastBinding.sessionId !== sid)) {
@@ -943,7 +956,7 @@ function createCore(transport: Transport) {
   const reloadedSessionId = locationKey && locationKey === lastBinding.location ? lastBinding.sessionId : undefined
   const fromRecord = !process.env.HCOM_RESUME_SESSION_ID
   const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID || reloadedSessionId
-  if (process.env.HCOM_LAUNCHED === "1") {
+  if (isLaunched) {
     log("INFO", "plugin.loaded", process.env.HCOM_NAME || null, {
       pid: process.pid,
       directory: transport.location?.directory ?? null,
@@ -952,7 +965,7 @@ function createCore(transport: Transport) {
     })
   }
   const startSession = transport.startSession
-  if (!resumeSessionId && startSession && process.env.HCOM_LAUNCHED === "1") {
+  if (!resumeSessionId && startSession && autoAttach) {
     void standBy(startSession).catch((e) => log("ERROR", "plugin.standby_error", null, { error: String(e) }))
   }
   if (resumeSessionId) {

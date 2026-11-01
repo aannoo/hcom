@@ -15,7 +15,7 @@ use crate::shared::context::HcomContext;
 use crate::tool::Tool;
 
 use super::common;
-use super::plugin_rpc::{self, parse_flag};
+use super::plugin_rpc::{self, parse_flag, parse_pid_flag, persist_pid, resolve_process_id};
 
 pub(crate) struct PiFamily {
     pub tool: Tool,
@@ -101,19 +101,33 @@ impl PiFamily {
         let notify_port: Option<u16> =
             parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
 
-        let process_id = match &ctx.process_id {
-            Some(pid) => pid.clone(),
+        let requested_pid = parse_pid_flag(argv);
+
+        let process_id = match resolve_process_id(argv, ctx.process_id.as_deref()) {
+            Some(pid) => pid,
             None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
         };
 
-        let Some(instance_name) =
-            instance_binding::bind_session_to_process(db, &session_id, Some(&process_id))
-                .or_else(|| self.recover_binding(ctx, &session_id, &process_id, db))
-        else {
-            return (
-                0,
-                r#"{"error":"No instance bound to this process"}"#.to_string(),
-            );
+        // Same rule as opencode-start: a caller that declares its own binding key
+        // (`--process-id`, no launcher) gets an identity created instead of a failure.
+        let self_minted = parse_flag(argv, "--process-id").is_some();
+        let instance_name = match instance_binding::bind_session_to_process_for_tool(
+            db,
+            &session_id,
+            Some(&process_id),
+            self.name(),
+            self_minted,
+        ) {
+            instance_binding::ToolCheckedBind::Bound(name) => name,
+            _ => match self.recover_binding(ctx, &session_id, &process_id, db) {
+                Some(name) => name,
+                None => {
+                    return (
+                        0,
+                        r#"{"error":"No instance bound to this process"}"#.to_string(),
+                    );
+                }
+            },
         };
 
         plugin_rpc::initialize_last_event_id(db, &instance_name);
@@ -124,6 +138,7 @@ impl PiFamily {
             "start",
             Default::default(),
         );
+        persist_pid(db, &instance_name, requested_pid);
         instance_binding::capture_and_store_launch_context(db, &instance_name);
 
         let mut updates = serde_json::Map::new();
@@ -173,7 +188,7 @@ impl PiFamily {
                 return plugin_rpc::error(format!("DB open failed: {}", e));
             }
         };
-        if !common::hook_gate_check(&ctx) {
+        if !common::hook_gate_check_argv(&ctx, argv) {
             return (0, String::new());
         }
         let handler_argv = argv.strip_prefix(&[hook_name.to_string()]).unwrap_or(argv);
