@@ -733,7 +733,7 @@ function createCore(transport: Transport) {
     const sid = sessionId
     const command = properties.metadata?.command
     if (!transport.allowOnce || !name || !sid || properties.permission !== "bash" || typeof command !== "string") return false
-    const reply = await rpc(["opencode-approve", "--name", name, "--command", command], name)
+    const reply = await rpc(withProcessId(["opencode-approve", "--name", name, "--command", command]), name)
     if (reply?.approve !== true) return false
     const error = await transport.allowOnce(sid, requestID).catch((e) => String(e))
     if (error) {
