@@ -108,26 +108,31 @@ impl PiFamily {
             None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
         };
 
-        // Same rule as opencode-start: a caller that declares its own binding key
-        // (`--process-id`, no launcher) gets an identity created instead of a failure.
+        // A caller that declares its own binding key (`--process-id`, no launcher)
+        // gets an identity created; the launcher/`hcom start` path keeps the previous
+        // behaviour exactly, including adopting an `adhoc` row.
         let self_minted = parse_flag(argv, "--process-id").is_some();
-        let instance_name = match instance_binding::bind_session_to_process_for_tool(
-            db,
-            &session_id,
-            Some(&process_id),
-            self.name(),
-            self_minted,
-        ) {
-            instance_binding::ToolCheckedBind::Bound(name) => name,
-            _ => match self.recover_binding(ctx, &session_id, &process_id, db) {
-                Some(name) => name,
-                None => {
-                    return (
-                        0,
-                        r#"{"error":"No instance bound to this process"}"#.to_string(),
-                    );
-                }
-            },
+        let bound = if self_minted {
+            match instance_binding::bind_session_to_process_for_tool(
+                db,
+                &session_id,
+                Some(&process_id),
+                self.name(),
+                true,
+            ) {
+                instance_binding::ToolCheckedBind::Bound(name) => Some(name),
+                _ => None,
+            }
+        } else {
+            instance_binding::bind_session_to_process(db, &session_id, Some(&process_id))
+        };
+        let Some(instance_name) =
+            bound.or_else(|| self.recover_binding(ctx, &session_id, &process_id, db))
+        else {
+            return (
+                0,
+                r#"{"error":"No instance bound to this process"}"#.to_string(),
+            );
         };
 
         plugin_rpc::initialize_last_event_id(db, &instance_name);

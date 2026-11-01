@@ -202,26 +202,31 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     // no placeholder to adopt: create the identity instead of failing. The launcher
     // path keeps the strict behaviour (no implicit creation).
     let self_minted = parse_flag(argv, "--process-id").is_some();
-    let instance_name = match instance_binding::bind_session_to_process_for_tool(
-        db,
-        &session_id,
-        Some(&process_id),
-        "opencode",
-        self_minted,
-    ) {
-        instance_binding::ToolCheckedBind::Bound(name) => name,
-        instance_binding::ToolCheckedBind::Rejected => {
-            return (
-                0,
-                r#"{"error":"This binding key belongs to another tool"}"#.to_string(),
-            );
+    let bound = if self_minted {
+        match instance_binding::bind_session_to_process_for_tool(
+            db,
+            &session_id,
+            Some(&process_id),
+            "opencode",
+            true,
+        ) {
+            instance_binding::ToolCheckedBind::Bound(name) => Some(name),
+            instance_binding::ToolCheckedBind::Rejected => {
+                return (
+                    0,
+                    r#"{"error":"This binding key belongs to another tool"}"#.to_string(),
+                );
+            }
+            instance_binding::ToolCheckedBind::Unbound => None,
         }
-        instance_binding::ToolCheckedBind::Unbound => {
-            return (
-                0,
-                r#"{"error":"No instance bound to this process"}"#.to_string(),
-            );
-        }
+    } else {
+        instance_binding::bind_session_to_process(db, &session_id, Some(&process_id))
+    };
+    let Some(instance_name) = bound else {
+        return (
+            0,
+            r#"{"error":"No instance bound to this process"}"#.to_string(),
+        );
     };
     let tool = instance_tool(db, &instance_name);
 
