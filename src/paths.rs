@@ -274,6 +274,17 @@ pub(crate) fn ensure_private_db(db_path: &Path) -> std::io::Result<()> {
 /// Write content to file atomically (temp file + rename).
 /// Returns the underlying IO error on failure for callers that need error detail.
 pub fn atomic_write_io(filepath: &Path, content: &str) -> std::io::Result<()> {
+    // Renaming over a symlink replaces the link itself, which detaches
+    // config-managed files (e.g. a home-manager-linked ~/.claude/settings.json)
+    // from their source. Write through to the link's final target instead.
+    let resolved;
+    let filepath = if fs::symlink_metadata(filepath).is_ok_and(|m| m.file_type().is_symlink()) {
+        resolved = fs::canonicalize(filepath)?;
+        resolved.as_path()
+    } else {
+        filepath
+    };
+
     // Ensure parent directory exists
     if let Some(parent) = filepath.parent() {
         fs::create_dir_all(parent)?;
@@ -438,6 +449,26 @@ mod tests {
         // Overwrite
         assert!(atomic_write(&filepath, "new content"));
         assert_eq!(fs::read_to_string(&filepath).unwrap(), "new content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_follows_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real").join("settings.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "old").unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(atomic_write(&link, "new"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
     }
 
     #[test]
