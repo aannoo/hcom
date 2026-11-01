@@ -217,7 +217,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
-		if (process.env.HCOM_LAUNCHED !== "1") return;
+		// A session opened by the user can attach when the operator opts in; the
+		// launcher path stays the default.
+		const isLaunched = process.env.HCOM_LAUNCHED === "1";
+		const autoAttach = isLaunched || process.env.HCOM_AUTO_ATTACH === "1";
+		if (!autoAttach) return;
 		const gen = generation;
 		const attempt = (async () => {
 			let server: Server | null = null;
@@ -232,6 +236,12 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				const args = ["pi-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
+				// Not launched by hcom: mint the binding key and persist the pid, so
+				// stale cleanup spares this session.
+				if (!isLaunched) {
+					args.push("--process-id", `pi:${process.pid}:${sid}`);
+					args.push("--pid", String(process.pid));
+				}
 				const reply = await rpc(args, null);
 				if (gen !== generation) return;
 				if (!reply || typeof reply.name !== "string" || !reply.name) {

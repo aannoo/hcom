@@ -1015,6 +1015,8 @@ mod tests {
     fn test_parse_pid_flag_rejects_non_numeric() {
         assert_eq!(parse_pid_flag(&sv(&["--pid", "4242"])), Some(4242));
         assert_eq!(parse_pid_flag(&sv(&["--pid", "abc"])), None);
+        // 0 is not a client pid: it must be treated as absent, not persisted.
+        assert_eq!(parse_pid_flag(&sv(&["--pid", "0"])), None);
         assert_eq!(parse_pid_flag(&sv(&["--session-id", "x"])), None);
     }
 

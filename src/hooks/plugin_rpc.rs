@@ -40,7 +40,11 @@ pub(crate) fn resolve_process_id(argv: &[String], env_process_id: Option<&str>) 
 /// numeric pid the collector drops an instance whose process is very much alive
 /// (the failure mode `hcom start` had before this flag).
 pub(crate) fn parse_pid_flag(argv: &[String]) -> Option<u32> {
-    parse_flag(argv, "--pid").and_then(|s| s.parse::<u32>().ok())
+    // 0 is not a real client pid (it is the swapper on Linux and rejected by the
+    // DB layer), so treat it as "no pid given" instead of attempting to persist it.
+    parse_flag(argv, "--pid")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
 }
 
 pub(crate) fn persist_pid(db: &HcomDb, name: &str, pid: Option<u32>) {
