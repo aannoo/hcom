@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
+use crate::log::log_error;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 use super::common;
@@ -22,6 +23,39 @@ pub(crate) fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
 
 pub(crate) fn has_flag(argv: &[String], flag: &str) -> bool {
     argv.iter().any(|a| a == flag)
+}
+
+/// Resolve the process binding key for `plugin start`.
+///
+/// `--process-id` lets a session opened WITHOUT the hcom launcher mint its own
+/// binding key; `HCOM_PROCESS_ID` stays the launcher path. The flag wins so a
+/// caller can override an inherited environment.
+pub(crate) fn resolve_process_id(argv: &[String], env_process_id: Option<&str>) -> Option<String> {
+    parse_flag(argv, "--process-id").or_else(|| env_process_id.map(str::to_string))
+}
+
+/// `--pid <n>`: numeric pid of the client process.
+///
+/// Persisting it is what makes stale cleanup spare a live session: without a
+/// numeric pid the collector drops an instance whose process is very much alive
+/// (the failure mode `hcom start` had before this flag).
+pub(crate) fn parse_pid_flag(argv: &[String]) -> Option<u32> {
+    // 0 is not a real client pid (it is the swapper on Linux and rejected by the
+    // DB layer), so treat it as "no pid given" instead of attempting to persist it.
+    parse_flag(argv, "--pid")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+pub(crate) fn persist_pid(db: &HcomDb, name: &str, pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    if let Err(e) = db.update_instance_pid(name, pid) {
+        log_error(
+            "hooks",
+            "hook.error",
+            &format!("hook=plugin-start op=update_instance_pid err={e}"),
+        );
+    }
 }
 
 pub(crate) fn error(message: impl std::fmt::Display) -> (i32, String) {
@@ -51,8 +85,10 @@ pub(crate) fn require_attached(
     argv: &[String],
 ) -> Result<(), (i32, String)> {
     let name = parse_flag(argv, "--name").ok_or_else(|| error("Missing --name"))?;
-    let owner = ctx
-        .process_id
+    // A launchless session mints its key with `--process-id`, so read/ack/stop
+    // must resolve the same way `plugin start` did: flag first, then env.
+    let process_id = resolve_process_id(argv, ctx.process_id.as_deref());
+    let owner = process_id
         .as_deref()
         .and_then(|token| db.get_process_binding(token).ok().flatten());
     if owner.as_deref() != Some(name.as_str()) {
@@ -239,6 +275,31 @@ mod tests {
         row.insert("last_event_id".into(), json!(last_event_id));
         row.insert("created_at".into(), json!(1.0));
         db.save_instance_named(name, &row).unwrap();
+    }
+
+    #[test]
+    fn rpc_accepts_the_self_minted_process_id_flag() {
+        // A session opened WITHOUT the launcher mints its key with `--process-id`
+        // and repeats it on read/ack. The owner check must resolve the same way
+        // `plugin start` did, or binding would not survive into delivery.
+        let (_dir, db) = test_db();
+        save_instance(&db, "luna", 0);
+        db.set_process_binding("pi:4242:sid-1", "", "luna").unwrap();
+        let argv = sv(&["--name", "luna", "--process-id", "pi:4242:sid-1"]);
+        let ctx = |token: Option<&str>| {
+            let mut env = std::collections::HashMap::new();
+            if let Some(t) = token {
+                env.insert("HCOM_PROCESS_ID".to_string(), t.to_string());
+            }
+            crate::shared::context::HcomContext::from_env(&env, std::env::temp_dir())
+        };
+        // No env at all: the flag alone authorizes the launchless session.
+        assert!(require_attached(&ctx(None), &db, &argv).is_ok());
+        // Another launch's key is still rejected.
+        let outro = sv(&["--name", "luna", "--process-id", "pi:9:sid-9"]);
+        assert!(require_attached(&ctx(None), &db, &outro).is_err());
+        // The flag wins over an inherited env, mirroring resolve_process_id.
+        assert!(require_attached(&ctx(Some("pi:9:sid-9")), &db, &argv).is_ok());
     }
 
     #[test]

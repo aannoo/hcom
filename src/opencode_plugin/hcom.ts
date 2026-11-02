@@ -1,7 +1,7 @@
 // hcom-managed-plugin: installed by hcom; removed automatically. Do not add this line to your own plugins.
 import type { Plugin as Plugin2 } from "@opencode/plugin"
 import { spawn } from "node:child_process"
-import { appendFileSync, mkdirSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs"
 import { createServer, type Server } from "node:net"
 import { homedir } from "node:os"
 import { dirname } from "node:path"
@@ -22,6 +22,19 @@ function claimPluginHost(): boolean {
   if (owner && owner !== current) return false
   process.env.HCOM_PLUGIN_HOST_PID = current
   return true
+}
+
+// Persistent opt-in for sessions the launcher did not start. Read once: a
+// missing file or key means "not opted in".
+let optInCache: boolean | null = null
+function configOptIn(): boolean {
+  if (optInCache !== null) return optInCache
+  optInCache = false
+  try {
+    const dir = process.env.HCOM_DIR || `${homedir()}/.hcom`
+    optInCache = /^\s*auto_attach\s*=\s*true\s*$/m.test(readFileSync(`${dir}/config.toml`, "utf8"))
+  } catch {}
+  return optInCache
 }
 
 function log(
@@ -105,9 +118,18 @@ async function rpc(args: string[], instance: string | null): Promise<RpcReply | 
 
 type Batch = { messages: any[]; ackId: number; hasMore: boolean }
 
+// Repeat the self-minted `--process-id` on follow-up RPCs (read/ack/standby): the
+// Rust side resolves the owner from the flag first, so a launchless session keeps
+// delivery authorized without inheriting HCOM_PROCESS_ID.
+let mintedProcessId: string | null = null
+
+function withProcessId(args: string[]): string[] {
+  return mintedProcessId ? [...args, "--process-id", mintedProcessId] : args
+}
+
 // The oldest unread messages (hcom bounds the batch), or null when the read failed.
 async function readBatch(instance: string): Promise<Batch | null> {
-  const reply = await rpc(["opencode-read", "--name", instance], instance)
+  const reply = await rpc(withProcessId(["opencode-read", "--name", instance]), instance)
   if (!reply) return null
   const messages = reply.messages
   const valid =
@@ -297,6 +319,14 @@ function keyOf(location?: { directory: string; workspaceID?: string }): string |
 }
 
 function createCore(transport: Transport) {
+  // A session can attach without the hcom launcher when the operator opts in.
+  // The environment is not enough on its own: opencode does not carry the
+  // parent's variables into the plugin runtime (measured — `HCOM_AUTO_ATTACH`
+  // arrived as null even with the shell exporting it), so the opt-in is also
+  // read from `~/.hcom/config.toml` (`auto_attach = true`).
+  const isLaunched = process.env.HCOM_LAUNCHED === "1"
+  const autoAttach = isLaunched || process.env.HCOM_AUTO_ATTACH === "1" || configOptIn()
+
   const locationKey = keyOf(transport.location)
   let instanceName: string | null = null
   let sessionId: string | null = null
@@ -361,7 +391,7 @@ function createCore(transport: Transport) {
       const [status, context, detail] = desiredStatus()
       const key = statusKey(status, context, detail)
       if (key === lastReportedStatusKey) return
-      const args = ["opencode-status", "--name", name, "--status", status]
+      const args = withProcessId(["opencode-status", "--name", name, "--status", status])
       if (context) args.push("--context", context)
       if (detail) args.push("--detail", detail)
       const reply = await rpc(args, name)
@@ -386,7 +416,7 @@ function createCore(transport: Transport) {
     const run = statusChain.then(async () => {
       const name = instanceName
       if (!name || gen !== generation) return
-      const reply = await rpc(["opencode-status", "--name", name, "--tool", tool, "--input-json", JSON.stringify(args)], name)
+      const reply = await rpc(withProcessId(["opencode-status", "--name", name, "--tool", tool, "--input-json", JSON.stringify(args)]), name)
       // The tool detail is a form of active: a later sync must not overwrite it
       // with a bare active, but must still report the idle edge.
       if (reply && gen === generation) lastReportedStatusKey = statusKey("active")
@@ -452,7 +482,7 @@ function createCore(transport: Transport) {
       if (fromRecord || instanceName || waitedGen !== generation) return
       if (bindingPromise) return bindingPromise
     }
-    if (disposed || process.env.HCOM_LAUNCHED !== "1") return
+    if (disposed || !autoAttach) return
     const gen = generation
     const attempt = (async () => {
       let server: Server | null = null
@@ -466,6 +496,13 @@ function createCore(transport: Transport) {
         const port = serverPort(server)
         const args = ["opencode-start", "--session-id", sid]
         if (port) args.push("--notify-port", String(port))
+        // Session opened WITHOUT the hcom launcher: mint the binding key and
+        // persist the numeric pid, otherwise stale cleanup drops a live agent.
+        if (!process.env.HCOM_LAUNCHED) {
+          mintedProcessId = `oc:${process.pid}:${sid}`
+          args.push("--process-id", mintedProcessId)
+          args.push("--pid", String(process.pid))
+        }
         endTurn = await bindingTurn()
         if (gen !== generation || disposed) return
         if (fromRecord && (lastBinding.location !== locationKey || lastBinding.sessionId !== sid)) {
@@ -599,7 +636,7 @@ function createCore(transport: Transport) {
     const gen = generation
     if (!sent?.admitted || !name) return Promise.resolve()
     const attempt = (async () => {
-      const reply = await rpc(["opencode-read", "--name", name, "--ack", "--up-to", String(sent.ackId)], name)
+      const reply = await rpc(withProcessId(["opencode-read", "--name", name, "--ack", "--up-to", String(sent.ackId)]), name)
       if (gen !== generation || delivery !== sent) return
       if (reply?.acked_to !== sent.ackId) {
         if (reply) log("WARN", "plugin.rpc_failed", name, { command: "opencode-read", error: "unexpected ack reply", reply })
@@ -710,7 +747,7 @@ function createCore(transport: Transport) {
     const sid = sessionId
     const command = properties.metadata?.command
     if (!transport.allowOnce || !name || !sid || properties.permission !== "bash" || typeof command !== "string") return false
-    const reply = await rpc(["opencode-approve", "--name", name, "--command", command], name)
+    const reply = await rpc(withProcessId(["opencode-approve", "--name", name, "--command", command]), name)
     if (reply?.approve !== true) return false
     const error = await transport.allowOnce(sid, requestID).catch((e) => String(e))
     if (error) {
@@ -811,7 +848,7 @@ function createCore(transport: Transport) {
         log("INFO", "plugin.session_deleted", name)
         void forgetBinding(sessionId)
         reset()
-        await rpc(["opencode-stop", "--name", name, "--reason", "closed"], name)
+        await rpc(withProcessId(["opencode-stop", "--name", name, "--reason", "closed"]), name)
         break
       }
     }
@@ -916,7 +953,7 @@ function createCore(transport: Transport) {
       return
     }
     standbyServer = server
-    if (!(await rpc(["opencode-standby", "--port", String(port)], null))) stopStandby()
+    if (!(await rpc(withProcessId(["opencode-standby", "--port", String(port)]), null))) stopStandby()
   }
 
   // hcom wakes again until the session binds, so a failed start is retried.
@@ -943,7 +980,7 @@ function createCore(transport: Transport) {
   const reloadedSessionId = locationKey && locationKey === lastBinding.location ? lastBinding.sessionId : undefined
   const fromRecord = !process.env.HCOM_RESUME_SESSION_ID
   const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID || reloadedSessionId
-  if (process.env.HCOM_LAUNCHED === "1") {
+  if (isLaunched) {
     log("INFO", "plugin.loaded", process.env.HCOM_NAME || null, {
       pid: process.pid,
       directory: transport.location?.directory ?? null,
@@ -952,7 +989,7 @@ function createCore(transport: Transport) {
     })
   }
   const startSession = transport.startSession
-  if (!resumeSessionId && startSession && process.env.HCOM_LAUNCHED === "1") {
+  if (!resumeSessionId && startSession && autoAttach) {
     void standBy(startSession).catch((e) => log("ERROR", "plugin.standby_error", null, { error: String(e) }))
   }
   if (resumeSessionId) {

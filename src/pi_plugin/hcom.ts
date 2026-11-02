@@ -101,9 +101,20 @@ async function rpc(args: string[], instance: string | null): Promise<RpcReply | 
 
 type Batch = { messages: any[]; ackId: number; hasMore: boolean };
 
+// Repeat the self-minted `--process-id` on every follow-up RPC: the Rust side
+// resolves the owner from the flag first, so a launchless session keeps read/ack
+// authorized without inheriting HCOM_PROCESS_ID.
+// Set when this session minted its own binding key (`--process-id`). Read/ack
+// RPCs repeat it so a launchless session stays authorized after the start.
+let mintedProcessId: string | null = null;
+
+function withProcessId(args: string[], minted: string | null = mintedProcessId): string[] {
+	return minted ? [...args, "--process-id", minted] : args;
+}
+
 // The oldest unread messages (hcom bounds the batch), or null when the read failed.
 async function readBatch(instance: string): Promise<Batch | null> {
-	const reply = await rpc(["pi-read", "--name", instance], instance);
+	const reply = await rpc(withProcessId(["pi-read", "--name", instance], mintedProcessId), instance);
 	if (!reply) return null;
 	const messages = reply.messages;
 	const valid =
@@ -217,7 +228,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
-		if (process.env.HCOM_LAUNCHED !== "1") return;
+		// A session opened by the user can attach when the operator opts in; the
+		// launcher path stays the default.
+		const isLaunched = process.env.HCOM_LAUNCHED === "1";
+		const autoAttach = isLaunched || process.env.HCOM_AUTO_ATTACH === "1";
+		if (!autoAttach) return;
 		const gen = generation;
 		const attempt = (async () => {
 			let server: Server | null = null;
@@ -232,6 +247,13 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				const args = ["pi-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
+				// Not launched by hcom: mint the binding key and persist the pid, so
+				// stale cleanup spares this session.
+				if (!isLaunched) {
+					mintedProcessId = `pi:${process.pid}:${sid}`;
+					args.push("--process-id", mintedProcessId);
+					args.push("--pid", String(process.pid));
+				}
 				const reply = await rpc(args, null);
 				if (gen !== generation) return;
 				if (!reply || typeof reply.name !== "string" || !reply.name) {
@@ -341,7 +363,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const gen = generation;
 		if (!sent?.admitted || !name) return Promise.resolve();
 		const attempt = (async () => {
-			const reply = await rpc(["pi-read", "--name", name, "--ack", "--up-to", String(sent.ackId)], name);
+			const reply = await rpc(withProcessId(["pi-read", "--name", name, "--ack", "--up-to", String(sent.ackId)], mintedProcessId), name);
 			if (gen !== generation || delivery !== sent) return;
 			if (reply?.acked_to !== sent.ackId) {
 				if (reply) log("WARN", "plugin.rpc_failed", name, { command: "pi-read", error: "unexpected ack reply", reply });
@@ -381,7 +403,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const run = statusChain.then(async () => {
 			const name = instanceName;
 			if (!name || gen !== generation) return;
-			const reply = await rpc([args[0], "--name", name, ...args.slice(1)], name);
+			const reply = await rpc(withProcessId([args[0], "--name", name, ...args.slice(1)]), name);
 			if (reply && gen === generation) lastReportedStatusKey = key;
 		});
 		statusChain = run.catch(() => {});
@@ -478,7 +500,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const terminal = event.reason === undefined || event.reason === "quit";
 		resetBinding();
 		if (name && terminal) {
-			await rpc(["pi-stop", "--name", name, "--reason", event.reason ?? "shutdown"], name);
+			await rpc(withProcessId(["pi-stop", "--name", name, "--reason", event.reason ?? "shutdown"]), name);
 		}
 	});
 
