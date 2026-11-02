@@ -1312,14 +1312,14 @@ fn merge_hcom_hooks_into_json(existing: &mut Value) {
         return;
     };
     let obj = existing.as_object_mut().unwrap();
-    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
     let Some(hooks_obj) = hooks.as_object_mut() else {
         return;
     };
     for (event, groups) in expected_hooks {
-        let Some(add) = groups.as_array() else {
-            continue;
-        };
+        let Some(add) = groups.as_array() else { continue };
         let slot = hooks_obj
             .entry(event.clone())
             .or_insert_with(|| Value::Array(Vec::new()));
@@ -1338,7 +1338,8 @@ pub fn try_setup_codex_hooks(_include_permissions: bool) -> AnyResult<()> {
         if raw.trim().is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "hooks": {} }))
+            serde_json::from_str(&raw)
+                .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }))
         }
     } else {
         serde_json::json!({ "hooks": {} })
@@ -1370,11 +1371,13 @@ pub fn verify_codex_hooks_installed(_local: bool) -> bool {
             .and_then(|v| v.as_array())
             .is_some_and(|groups| {
                 groups.iter().any(|g| {
-                    g.get("hooks").and_then(|v| v.as_array()).is_some_and(|hs| {
-                        hs.iter().any(|h| {
-                            h.get("command").and_then(|v| v.as_str()) == Some(want.as_str())
+                    g.get("hooks")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|hs| {
+                            hs.iter().any(|h| {
+                                h.get("command").and_then(|v| v.as_str()) == Some(want.as_str())
+                            })
                         })
-                    })
                 })
             })
     })

@@ -181,7 +181,9 @@ impl Tool {
             // with `HCOM_AUTO_ATTACH=1` instead of requiring the launcher.
             Tool::Codex => HookInstaller {
                 verify: crate::hooks::codex::verify_codex_hooks_installed,
-                setup: |p| crate::hooks::codex::try_setup_codex_hooks(p).map_err(|e| e.to_string()),
+                setup: |p| {
+                    crate::hooks::codex::try_setup_codex_hooks(p).map_err(|e| e.to_string())
+                },
                 settings_path: crate::hooks::codex::codex_hooks_path,
             },
             // Hermes has its own approval system; hcom grants no permissions.
