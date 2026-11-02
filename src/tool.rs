@@ -176,16 +176,6 @@ impl Tool {
                 setup: |p| kimi::try_setup_kimi_hooks(p).map_err(|e| e.to_string()),
                 settings_path: kimi::get_kimi_settings_path,
             },
-            // Codex used to be per-run only. It has native hooks, so hcom can
-            // install them persistently and let a user-opened session attach
-            // with `HCOM_AUTO_ATTACH=1` instead of requiring the launcher.
-            Tool::Codex => HookInstaller {
-                verify: crate::hooks::codex::verify_codex_hooks_installed,
-                setup: |p| {
-                    crate::hooks::codex::try_setup_codex_hooks(p).map_err(|e| e.to_string())
-                },
-                settings_path: crate::hooks::codex::codex_hooks_path,
-            },
             // Hermes has its own approval system; hcom grants no permissions.
             Tool::Hermes => HookInstaller {
                 verify: |_| hermes::verify_hermes_plugin_installed(),
