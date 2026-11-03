@@ -350,6 +350,27 @@ mod tests {
     }
 
     #[test]
+    fn grok_approval_flag_is_singleton_and_does_not_keep_old_prompt() {
+        let saved = saved_args(
+            Tool::Grok,
+            &s(&["--always-approve", "--always-approve", "old prompt"]),
+        );
+        assert_eq!(saved, s(&["--always-approve", "--always-approve"]));
+        assert_eq!(
+            override_args(Tool::Grok, &saved, &[]),
+            s(&["--always-approve"]),
+        );
+        assert_eq!(
+            override_args(
+                Tool::Grok,
+                &saved,
+                &s(&["--always-approve", "--model", "grok-4.7", "new prompt"]),
+            ),
+            s(&["--always-approve", "--model", "grok-4.7", "new prompt"]),
+        );
+    }
+
+    #[test]
     fn inherited_session_and_prompt_controls_are_removed_before_new_overrides() {
         for (tool, args) in [
             (

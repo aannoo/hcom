@@ -1258,6 +1258,7 @@ static QODER_RESUME_FLAGS: ArgFlags = ArgFlags {
 
 /// Grok (clap, which rejects a repeated singular flag). `--worktree` takes an optional value.
 static GROK_RESUME_FLAGS: ArgFlags = ArgFlags {
+    boolean: &["--always-approve"],
     value: &[
         "--model",
         "--rules",
