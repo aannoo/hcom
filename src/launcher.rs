@@ -159,6 +159,8 @@ pub struct LaunchParams {
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
     pub background: bool,
+    /// Single foreground Claude print process, retaining the caller's pipes.
+    pub stdio: bool,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub launcher: Option<String>,
@@ -183,6 +185,7 @@ impl Default for LaunchParams {
             system_prompt: None,
             initial_prompt: None,
             background: false,
+            stdio: false,
             cwd: None,
             env: None,
             launcher: None,
@@ -199,6 +202,8 @@ impl Default for LaunchParams {
 /// Launch result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaunchResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub tool: String,
     pub batch_id: String,
     pub launched: usize,
@@ -1748,6 +1753,24 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             .iter()
             .any(|arg| matches!(arg.as_str(), "-p" | "--print"));
 
+    if params.stdio {
+        if !cfg!(unix) {
+            bail!("--stdio is currently supported on Unix only");
+        }
+        if params.tool != "claude"
+            || !claude_print
+            || params.count != 1
+            || params.background
+            || params.terminal.is_some()
+            || params.run_here == Some(false)
+        {
+            bail!(
+                "--stdio requires one local claude -p/--print process without a terminal or background mode"
+            );
+        }
+        params.run_here = Some(true);
+    }
+
     // `claude-pty` is the PTY surface; `-p`/`--print` selects the NativePrint
     // surface. The two are mutually exclusive: passing both would route print
     // mode through the HeadlessPty runner, which is broken. Fail fast.
@@ -1839,6 +1862,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     let bootstrap_excluded = crate::bootstrap::parse_excluded_parts(&bootstrap_exclude_value)
         .map_err(anyhow::Error::msg)?;
     base_env.remove("HCOM_TERMINAL");
+    base_env.insert(
+        "HCOM_STDIO_MODE".into(),
+        if params.stdio { "1" } else { "0" }.into(),
+    );
     ensure_tool_config_env(&normalized, &mut base_env);
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
@@ -2026,6 +2053,15 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     for _ in 0..params.count {
         let mut instance_env = base_env.clone();
+        // Never inherit a parent's delivery mode into a fresh launch.
+        instance_env.insert(
+            "HCOM_STDIO_MODE".into(),
+            if params.stdio { "1" } else { "0" }.into(),
+        );
+        if params.stdio {
+            instance_env.insert("HCOM_PTY_MODE".into(), "0".into());
+            instance_env.remove("HCOM_BACKGROUND");
+        }
         // A resume's message cursor predates its previous incarnation's
         // events (e.g. the kill that stopped it), so "did this launch get
         // killed" needs its own marker for where this launch began.
@@ -2130,6 +2166,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 normalized.is_claude_pty(),
             )
         {
+            if params.stdio {
+                return Err(error.context("Cannot pin Claude stdio launch environment"));
+            }
             errors.push(json!({"tool": base_tool, "error": error.to_string()}));
             continue;
         }
@@ -2148,11 +2187,37 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             db.set_process_binding(&process_id, "", &instance_name)?;
             Ok(())
         })() {
+            if params.stdio {
+                cleanup_instance(db, &instance_name, &process_id);
+                return Err(e.context("Cannot register Claude stdio launch"));
+            }
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
         }
 
         // Dispatch to tool-specific launcher
+        if params.stdio {
+            instances::update_instance_position(
+                db,
+                &instance_name,
+                &serde_json::Map::from_iter([(
+                    "launch_args".to_string(),
+                    json!(&stored_launch_args),
+                )]),
+            );
+            let result = launch_stdio(
+                db,
+                &params,
+                &instance_env,
+                &instance_name,
+                &process_id,
+                &batch_id,
+            );
+            if result.is_err() {
+                cleanup_instance(db, &instance_name, &process_id);
+            }
+            return result;
+        }
         let launch_result = (|| -> Result<bool> {
             match normalized.tool() {
                 Tool::Claude if !normalized.is_claude_pty() => {
@@ -2418,6 +2483,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     crate::relay::spawn_background_push();
 
     Ok(LaunchResult {
+        exit_code: None,
         // User-facing identity. The PTY-vs-print backend distinction lives in
         // `LaunchBackend`, not the tool string, so consumers see `claude`.
         tool: base_tool.to_string(),
@@ -2428,6 +2494,98 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         log_files,
         handles,
         errors,
+    })
+}
+
+/// A pipe client owns the native streams and process lifetime. Keep registration
+/// in the ordinary launcher, but bypass terminal scripts, banners and readiness
+/// output. Native SessionStart is still what establishes the session identity.
+fn launch_stdio(
+    db: &HcomDb,
+    params: &LaunchParams,
+    env: &HashMap<String, String>,
+    instance_name: &str,
+    process_id: &str,
+    batch_id: &str,
+) -> Result<LaunchResult> {
+    let working_dir = params.cwd.as_deref().unwrap_or(".");
+    let mut command = std::process::Command::new("claude");
+    command
+        .args(&params.args)
+        .env_clear()
+        .envs(env)
+        .current_dir(working_dir);
+    let created_at = db
+        .get_instance_full(instance_name)?
+        .ok_or_else(|| anyhow::anyhow!("stdio launch registration disappeared"))?
+        .created_at;
+    let mut child_pid = 0;
+    let exit_code = crate::sys::process::run_stdio_child(&mut command, |pid| {
+        child_pid = pid;
+        let identity = crate::db::observe_pid_identity(pid)?;
+        db.update_instance_pid_with_identity_and_fields(
+            instance_name,
+            pid,
+            identity.as_deref(),
+            &serde_json::Map::new(),
+        )?;
+        crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
+            process_id,
+            terminal_preset: "stdio",
+            tag: params.tag.as_deref().unwrap_or(""),
+            ..crate::pidtrack::PidRecord::new(
+                &paths::hcom_dir(),
+                pid,
+                "claude",
+                instance_name,
+                working_dir,
+            )
+        });
+        db.log_event(
+            "life",
+            params.launcher.as_deref().unwrap_or("user"),
+            &json!({
+                "action": "batch_launched", "batch_id": batch_id, "tool": "claude",
+                "count_requested": 1, "launched": 1, "failed": 0,
+                "background": false, "stdio": true, "instances": [instance_name],
+            }),
+        )?;
+        Ok(())
+    })?;
+    if !crate::hooks::common::launch_reached_ready(db, instance_name, batch_id) {
+        let _ = db.emit_launch_failed_event(
+            instance_name,
+            crate::shared::ST_INACTIVE,
+            "launch_failed",
+            "exited_before_ready",
+            &format!("Claude stdio exited with status {exit_code} before SessionStart"),
+        );
+    }
+    // SessionEnd normally stops the row. EOF, cancellation, startup failure or
+    // a native crash may omit it. Only clean up the row still owning this child.
+    if let Err(error) = db.with_write_scope(|| {
+        if db.get_process_binding(process_id)?.as_deref() == Some(instance_name)
+            && db
+                .get_instance_full(instance_name)?
+                .is_some_and(|row| row.created_at == created_at)
+        {
+            crate::hooks::common::finalize_session(db, instance_name, &exit_code.to_string(), None);
+        }
+        Ok(())
+    }) {
+        crate::log::log_warn("launcher", "stdio.cleanup_failed", &error.to_string());
+    }
+    crate::pidtrack::remove_pid(&paths::hcom_dir(), child_pid);
+    Ok(LaunchResult {
+        exit_code: Some(exit_code),
+        tool: "claude".into(),
+        batch_id: batch_id.into(),
+        launched: 1,
+        failed: 0,
+        background: false,
+        log_files: vec![],
+        errors: vec![],
+        handles: vec![json!({"tool": "claude", "instance_name": instance_name, "pid": child_pid})],
     })
 }
 

@@ -1026,6 +1026,12 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
         "    {:<29}{}",
         "--device <name>", "Launch on a remote relay device"
     ));
+    if spec.tool == crate::tool::Tool::Claude {
+        lines.push(format!(
+            "    {:<29}{}",
+            "--stdio", "Keep -p on caller's pipes (Unix, one process)"
+        ));
+    }
 
     // Environment
     lines.push(String::new());

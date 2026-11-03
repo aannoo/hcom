@@ -1808,7 +1808,23 @@ fn handle_poll(
         return (0, String::new(), None);
     }
 
-    // Non-PTY: poll for messages
+    // Pipe clients own turn completion. Drain what is queued now, but never
+    // hold a completed SDK turn open waiting for future hcom traffic.
+    if ctx
+        .raw_env
+        .get("HCOM_STDIO_MODE")
+        .is_some_and(|value| value == "1")
+    {
+        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+            let output = serde_json::json!({"decision": "block", "reason": prepared.formatted});
+            return (0, output.to_string(), Some(prepared.ack));
+        }
+        lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
+        common::notify_hook_instance_with_db(db, instance_name);
+        return (0, String::new(), None);
+    }
+
+    // Detached print mode: poll for messages.
     let wait_timeout = instance_data.wait_timeout;
     let timeout = wait_timeout.unwrap_or_else(HcomConfig::effective_timeout);
 
@@ -1869,8 +1885,13 @@ fn handle_userpromptsubmit(
         paths::increment_flag_counter("instance_count");
     }
 
-    // PTY mode: deliver messages
-    if ctx.is_pty_mode
+    // Pipe clients have no idle injector; queued messages arrive on the next
+    // native prompt or tool/Stop hook.
+    if (ctx.is_pty_mode
+        || ctx
+            .raw_env
+            .get("HCOM_STDIO_MODE")
+            .is_some_and(|value| value == "1"))
         && let Some(prepared) = common::prepare_pending_messages(db, instance_name)
     {
         let user_display =
@@ -2793,14 +2814,22 @@ pub(crate) fn object_field<'a>(
         .with_context(|| format!("Caller --settings field '{field}' must be an object"))
 }
 
-fn merge_per_run_settings(settings: &mut Value, auto_approve: bool) -> Result<()> {
+fn merge_per_run_settings(
+    settings: &mut Value,
+    auto_approve: bool,
+    hook_executable: Option<&str>,
+) -> Result<()> {
     let hooks = object_field(settings, "hooks")?;
     for &(event, matcher, command, timeout) in CLAUDE_HOOK_CONFIGS {
         let entries = hooks.entry(event).or_insert_with(|| serde_json::json!([]));
         let entries = entries
             .as_array_mut()
             .with_context(|| format!("Caller --settings hooks.{event} must be an array"))?;
-        let mut hook = build_hook_entry(command);
+        let mut hook = if let Some(executable) = hook_executable {
+            serde_json::json!({"type": "command", "command": executable, "args": [command]})
+        } else {
+            build_hook_entry(command)
+        };
         if let Some(seconds) = timeout {
             hook["timeout"] = serde_json::json!(seconds);
         }
@@ -2844,7 +2873,15 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
         Some(value) => caller_settings(value, &ctx.cwd)?,
         None => serde_json::json!({}),
     };
-    merge_per_run_settings(&mut settings, ctx.auto_approve)?;
+    // A foreground pipe build may coexist with an older hcom on PATH. Its
+    // Stop hook must run this exact implementation, or it could block the
+    // SDK turn using the old detached-print polling behavior.
+    let hook_executable = if ctx.var("HCOM_STDIO_MODE") == Some("1") {
+        Some(std::env::current_exe()?.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    merge_per_run_settings(&mut settings, ctx.auto_approve, hook_executable.as_deref())?;
     // Freeze one delivery mode in both the wrapper and Claude. Caller settings
     // cannot accidentally select a different transport from the wrapper.
     // Print sessions deliver through hooks; skip a mod they would never run.
@@ -2914,6 +2951,7 @@ pub(crate) fn pin_launch_environment(
         "HCOM_LAUNCHED",
         "HCOM_LAUNCHED_BY",
         "HCOM_LAUNCH_BATCH_ID",
+        "HCOM_STDIO_MODE",
         "HCOM_DEV_ROOT",
     ] {
         // Clear values inherited from whichever launch started the supervisor.
@@ -3284,7 +3322,7 @@ mod tests {
             "permissions": {"allow": ["Bash(caller:*)"]},
             "custom": 42
         });
-        super::merge_per_run_settings(&mut settings, true).unwrap();
+        super::merge_per_run_settings(&mut settings, true, None).unwrap();
         assert_eq!(
             settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             "caller"
@@ -3352,9 +3390,9 @@ mod tests {
     fn per_run_settings_rejects_invalid_caller_shapes() {
         assert!(super::caller_settings("{invalid", std::path::Path::new(".")).is_err());
         let mut settings = serde_json::json!({"hooks": {"SessionStart": "bad"}});
-        assert!(super::merge_per_run_settings(&mut settings, false).is_err());
+        assert!(super::merge_per_run_settings(&mut settings, false, None).is_err());
         let mut settings = serde_json::json!({"permissions": {"allow": "bad"}});
-        assert!(super::merge_per_run_settings(&mut settings, true).is_err());
+        assert!(super::merge_per_run_settings(&mut settings, true, None).is_err());
     }
 
     #[test]
@@ -4607,7 +4645,7 @@ mod tests {
 
         // Plant a legacy install (same shape older hcom wrote).
         let mut legacy = user_settings.clone();
-        merge_per_run_settings(&mut legacy, true).unwrap();
+        merge_per_run_settings(&mut legacy, true, None).unwrap();
         for groups in legacy["hooks"].as_object_mut().unwrap().values_mut() {
             for group in groups.as_array_mut().unwrap() {
                 for hook in group["hooks"].as_array_mut().unwrap() {
@@ -5337,6 +5375,51 @@ mod tests {
                 [data.to_string()],
             )
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn stdio_stop_drains_pending_once_and_completes_without_timeout() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_delivery_test_db();
+        db.conn()
+            .execute(
+                "UPDATE instances SET wait_timeout = 0, name_announced = 1 WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        let ctx = HcomContext::from_env(
+            &std::collections::HashMap::from([("HCOM_STDIO_MODE".into(), "1".into())]),
+            PathBuf::from("/tmp"),
+        );
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        let (code, output, ack) = handle_poll(&db, &ctx, "nova", &instance);
+        assert_eq!(code, 0);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["decision"], "block");
+        assert!(value["reason"].as_str().unwrap().contains("hello"));
+        assert_eq!(delivery_cursor(&db), 0);
+        common::commit_delivery_ack(&db, &ack.unwrap());
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        let (code, output, ack) = handle_poll(&db, &ctx, "nova", &instance);
+        assert_eq!(code, 0);
+        assert!(output.is_empty());
+        assert!(ack.is_none());
+        assert_eq!(
+            db.get_status("nova").unwrap(),
+            Some((ST_LISTENING.into(), String::new()))
+        );
+        assert_eq!(
+            db.get_instance_full("nova").unwrap().unwrap().wait_timeout,
+            Some(0)
+        );
+
+        // Messages arriving between SDK turns remain queued until a native
+        // prompt; no PTY wake or synthetic prompt is invented.
+        insert_broadcast_from_luna(&db, "between turns");
+        let (_, output, ack) = userpromptsubmit_prompt(&db, &ctx, "next question");
+        assert!(output.contains("between turns"));
+        assert!(ack.is_some());
     }
 
     /// Claude's screen sitting at an empty, settled prompt.
