@@ -204,6 +204,13 @@ Copilot delivers hcom messages through trusted hcom hooks:
 
 Messages arrive automatically — end your turn to receive them."#;
 
+const DELIVERY_STDIO: &str = r#"## DELIVERY
+
+This session is controlled by a pipe client. Queued hcom messages arrive through
+native prompt, tool and Stop hooks during a turn. Messages that arrive while
+the client is idle wait for its next turn; hcom does not start a new client turn.
+Complete the current task before returning control to the client."#;
+
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
 Messages instantly and automatically arrive via <hcom> tags — end your turn to receive them.
@@ -606,7 +613,15 @@ fn render_bootstrap_with_exclusions(
     // Every integration delivers automatically when launched through hcom;
     // anything else (plain `hcom start`) has to poll with `hcom listen`.
     if !excluded.contains("messages") {
-        if hcom_ctx.is_launched && tool != Tool::Adhoc {
+        if hcom_ctx.is_launched
+            && tool == Tool::Claude
+            && hcom_ctx
+                .raw_env
+                .get("HCOM_STDIO_MODE")
+                .is_some_and(|mode| mode == "1")
+        {
+            parts.push(DELIVERY_STDIO.to_string());
+        } else if hcom_ctx.is_launched && tool != Tool::Adhoc {
             parts.push(DELIVERY_AUTO.to_string());
             parts.extend(tool_delivery_section(tool).map(str::to_string));
         } else {
@@ -942,6 +957,16 @@ mod tests {
         } else {
             assert!(result.contains("send @p0c- -- msg"));
         }
+    }
+
+    #[test]
+    fn stdio_bootstrap_describes_client_owned_turns() {
+        let (tmp, db) = setup_test_db();
+        let mut ctx = test_ctx(tmp.path(), true, None, "", None);
+        ctx.raw_env.insert("HCOM_STDIO_MODE".into(), "1".into());
+        let text = render_bootstrap(&db, &ctx, "luna", "claude", false);
+        assert!(text.contains("wait for its next turn"));
+        assert!(!text.contains("Messages instantly and automatically arrive"));
     }
 
     #[test]

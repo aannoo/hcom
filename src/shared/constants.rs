@@ -52,6 +52,7 @@ pub const HCOM_IDENTITY_VARS: &[&str] = &[
     "HCOM_LAUNCHED",
     // HCOM_LAUNCHED_PRESET excluded — must survive into Rust binary for hook forwarding
     "HCOM_PTY_MODE",
+    "HCOM_STDIO_MODE",
     "HCOM_BACKGROUND",
     "HCOM_LAUNCHED_BY",
     "HCOM_LAUNCH_BATCH_ID",

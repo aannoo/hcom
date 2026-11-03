@@ -127,6 +127,9 @@ pub fn do_resume(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<i32> {
+    if extract_resume_flags(extra_args).1.stdio {
+        bail!("--stdio is a launch transport; use hcom claude --stdio -- -p --resume <session-id>");
+    }
     let db = HcomDb::open()?;
     let name = crate::identity::resolve_display_name_or_stopped(&db, name)
         .unwrap_or_else(|| name.to_string());
@@ -590,6 +593,7 @@ fn prepare_resume_plan_from_source(
             json: launch_flags.json,
         },
         launch: LaunchParams {
+            stdio: false,
             tool: launch_tool.as_str().to_string(),
             count: 1,
             args: merged_args,
@@ -3469,6 +3473,7 @@ mod tests {
         let output = build_remote_resume_output(
             &db,
             &LaunchResult {
+                exit_code: None,
                 tool: "claude".to_string(),
                 batch_id: "batch-1".to_string(),
                 launched: 1,
@@ -3497,6 +3502,7 @@ mod tests {
         let output = build_remote_resume_output(
             &db,
             &LaunchResult {
+                exit_code: None,
                 tool: "codex".to_string(),
                 batch_id: "batch-2".to_string(),
                 launched: 1,

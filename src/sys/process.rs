@@ -5,6 +5,68 @@
 
 use std::process::Command;
 
+/// Run a foreground pipe client without a shell or PTY. The hcom process
+/// remains the native child's parent and forwards cancellation to its group.
+/// SIGCHLD wakes the same loop as cancellation: no polling, and no signalling
+/// thread can race the reaping of a PID that the OS might reuse.
+#[cfg(unix)]
+pub fn run_stdio_child(
+    command: &mut Command,
+    on_spawn: impl FnOnce(u32) -> anyhow::Result<()>,
+) -> anyhow::Result<i32> {
+    use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let mut signals = Signals::new([SIGCHLD, SIGHUP, SIGINT, SIGTERM])?;
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    detach_session(command);
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    let result = (|| {
+        on_spawn(pid)?;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
+            }
+            for signal in signals.wait() {
+                // The child stays unreaped until this single-threaded loop
+                // observes it. Never signal after a successful wait.
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
+                }
+                if signal != SIGCHLD {
+                    // SAFETY: this is our unreaped child's own process group.
+                    unsafe {
+                        libc::kill(-(pid as i32), signal);
+                    }
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        kill_group(pid);
+        let _ = child.wait();
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub fn run_stdio_child(
+    _command: &mut Command,
+    _on_spawn: impl FnOnce(u32) -> anyhow::Result<()>,
+) -> anyhow::Result<i32> {
+    anyhow::bail!("--stdio is currently supported on Unix only")
+}
+
 /// Stable identity for one PID incarnation.
 ///
 /// PIDs are reusable, so liveness checks for persisted ownership records must

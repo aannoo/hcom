@@ -24,6 +24,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let (count, tool, mut hcom_flags, tool_args) = parse_launch_argv(argv)?;
     let launch_tool = LaunchTool::from_str(&tool)?;
     hcom_flags.run_here = json_run_here(&hcom_flags)?;
+    validate_stdio_flags(&hcom_flags, &tool, count)?;
+    if hcom_flags.stdio {
+        hcom_flags.run_here = Some(true);
+    }
     let json_output = hcom_flags.json;
 
     // Count validation
@@ -48,6 +52,9 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 
     let ctx = HcomContext::from_os();
     if ctx.is_inside_ai_tool() && !flags.go && (!tool_args.is_empty() || count > 5) {
+        if hcom_flags.stdio {
+            bail!("--stdio requires --go when launched from an agent");
+        }
         let remote_launch_note = "Remote launch requested; the target device will still apply its own configured defaults.";
         let remote_preview_note = "Mode shown here is only a local preview; the remote target decides the final launch mode.";
         let notes = if remote_device.is_some() {
@@ -141,8 +148,14 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let initial_prompt = hcom_flags.initial_prompt;
 
     // Merge env config args with CLI args
-    let (merged_args, background) =
-        prepare_launch_execution(&launch_tool, &tool_args, &hcom_config, headless);
+    let (merged_args, background) = if hcom_flags.stdio {
+        (
+            merge_tool_args(&launch_tool, &tool_args, &hcom_config),
+            false,
+        )
+    } else {
+        prepare_launch_execution(&launch_tool, &tool_args, &hcom_config, headless)
+    };
 
     // Open DB
     let db = HcomDb::open()?;
@@ -183,6 +196,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             system_prompt,
             initial_prompt,
             background,
+            stdio: hcom_flags.stdio,
             cwd: Some(if let Some(ref dir) = dir_override {
                 let path = std::path::Path::new(dir);
                 if !path.is_dir() {
@@ -207,6 +221,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             append_reply_handoff: true,
         },
     )?;
+
+    if hcom_flags.stdio {
+        return result
+            .exit_code
+            .ok_or_else(|| anyhow::anyhow!("stdio child did not return an exit status"));
+    }
 
     let readiness_state = report_launch(&db, &result, &output)?;
 
@@ -450,6 +470,8 @@ pub(crate) struct HcomLaunchFlags {
     pub terminal: Option<String>,
     pub device: Option<String>,
     pub headless: bool,
+    /// Keep the native Claude print process on the caller's three pipes.
+    pub stdio: bool,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
     pub run_here: Option<bool>,
@@ -457,6 +479,26 @@ pub(crate) struct HcomLaunchFlags {
     pub dir: Option<String>,
     /// `--json`: report the outcome as one JSON object on stdout.
     pub json: bool,
+}
+
+fn validate_stdio_flags(flags: &HcomLaunchFlags, tool: &str, count: usize) -> Result<()> {
+    if !flags.stdio {
+        return Ok(());
+    }
+    if tool != "claude" || count != 1 {
+        bail!("--stdio requires exactly one claude process");
+    }
+    if flags.headless
+        || flags.json
+        || flags.device.is_some()
+        || flags.terminal.is_some()
+        || flags.run_here == Some(false)
+    {
+        bail!(
+            "--stdio cannot be combined with --headless, --json, --device, --terminal or --no-run-here"
+        );
+    }
+    Ok(())
 }
 
 /// `--json` output is meant to be captured by a script, so the agent must not
@@ -654,6 +696,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             }
             "--headless" => {
                 flags.headless = true;
+                i += 1;
+            }
+            "--stdio" => {
+                flags.stdio = true;
                 i += 1;
             }
             "--json" => {
@@ -1317,6 +1363,7 @@ mod tests {
     #[test]
     fn test_launch_result_json_roundtrip() {
         let result = LaunchResult {
+            exit_code: None,
             tool: "claude".to_string(),
             batch_id: "batch-1".to_string(),
             launched: 1,
@@ -1336,6 +1383,7 @@ mod tests {
     #[test]
     fn test_format_inline_launch_readiness_ready() {
         let result = LaunchResult {
+            exit_code: None,
             tool: "codex".to_string(),
             batch_id: "batch-1".to_string(),
             launched: 1,
@@ -1360,6 +1408,7 @@ mod tests {
     #[test]
     fn test_format_inline_launch_readiness_launching_has_followup_command() {
         let result = LaunchResult {
+            exit_code: None,
             tool: "gemini".to_string(),
             batch_id: "batch-2".to_string(),
             launched: 1,
@@ -1386,6 +1435,7 @@ mod tests {
     #[test]
     fn test_format_inline_launch_readiness_failed_includes_detail() {
         let result = LaunchResult {
+            exit_code: None,
             tool: "claude".to_string(),
             batch_id: "batch-3".to_string(),
             launched: 1,
@@ -1422,6 +1472,7 @@ mod tests {
             &db,
             &GlobalFlags::default(),
             &LaunchResult {
+                exit_code: None,
                 tool: "claude".to_string(),
                 batch_id: "batch-1".to_string(),
                 launched: 1,
@@ -1455,6 +1506,7 @@ mod tests {
             &db,
             &GlobalFlags::default(),
             &LaunchResult {
+                exit_code: None,
                 tool: "codex".to_string(),
                 batch_id: "batch-2".to_string(),
                 launched: 1,

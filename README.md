@@ -205,6 +205,10 @@ hcom claude -p 'say hi in hcom'   # print mode (separate Agent SDK credits)
 hcom claude --headless            # Run normal claude in background pty (works for any tool)
 ```
 
+Pipe clients can use `hcom claude --stdio --go -- -p ...` on Unix to retain
+their stdin/stdout/stderr and native exit status. This keeps SDK control frames
+out of a PTY and allows each turn to complete. See [Claude pipe clients](docs/claude-stdio.md).
+
 For subagents, run `hcom claude`, then prompt:
 
 > run 2x task tool and get them to talk to each other in hcom
