@@ -271,9 +271,42 @@ pub(crate) fn ensure_private_db(db_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Follow `path` through symlinks to the file they name. Unlike
+/// `fs::canonicalize`, the final target does not have to exist yet, so a
+/// write through a dangling link creates the file it points to.
+fn resolve_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut resolved = path.to_path_buf();
+    // Follow at most 40 links like Linux's MAXSYMLINKS; the extra pass checks
+    // what the 40th link names. A cycle would otherwise spin.
+    for _ in 0..=40 {
+        match fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(resolved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(resolved),
+            // Guessing "not a link" here would let the rename replace a link.
+            Err(error) => return Err(error),
+        }
+        let target = fs::read_link(&resolved)?;
+        resolved = match resolved.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        };
+    }
+    Err(std::io::Error::other(format!(
+        "too many levels of symbolic links: {}",
+        path.display()
+    )))
+}
+
 /// Write content to file atomically (temp file + rename).
 /// Returns the underlying IO error on failure for callers that need error detail.
 pub fn atomic_write_io(filepath: &Path, content: &str) -> std::io::Result<()> {
+    // Renaming over a symlink replaces the link itself, which detaches
+    // config-managed files (e.g. a home-manager-linked ~/.claude/settings.json)
+    // from their source. Write through to the link's final target instead.
+    let resolved = resolve_symlink_target(filepath)?;
+    let filepath = resolved.as_path();
+
     // Ensure parent directory exists
     if let Some(parent) = filepath.parent() {
         fs::create_dir_all(parent)?;
@@ -438,6 +471,64 @@ mod tests {
         // Overwrite
         assert!(atomic_write(&filepath, "new content"));
         assert_eq!(fs::read_to_string(&filepath).unwrap(), "new content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_follows_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real").join("settings.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "old").unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(atomic_write(&link, "new"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_symlink_hop_limit() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("settings.json");
+        fs::write(&target, "old").unwrap();
+        let mut link = target.clone();
+        for i in 1..=41 {
+            let next = tmp.path().join(format!("link{i}"));
+            std::os::unix::fs::symlink(&link, &next).unwrap();
+            link = next;
+        }
+
+        assert!(atomic_write(&tmp.path().join("link40"), "new"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert!(!atomic_write(&link, "newer"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_creates_missing_symlink_target() {
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink("real/settings.json", &link).unwrap();
+
+        assert!(atomic_write(&link, "new"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("real").join("settings.json")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
