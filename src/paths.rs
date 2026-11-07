@@ -271,19 +271,36 @@ pub(crate) fn ensure_private_db(db_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Follow `path` through symlinks to the file they name. Unlike
+/// `fs::canonicalize`, the final target does not have to exist yet, so a
+/// write through a dangling link creates the file it points to.
+fn resolve_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut resolved = path.to_path_buf();
+    // Same hop limit as Linux's MAXSYMLINKS; a cycle would otherwise spin.
+    for _ in 0..40 {
+        if !fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Ok(resolved);
+        }
+        let target = fs::read_link(&resolved)?;
+        resolved = match resolved.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        };
+    }
+    Err(std::io::Error::other(format!(
+        "too many levels of symbolic links: {}",
+        path.display()
+    )))
+}
+
 /// Write content to file atomically (temp file + rename).
 /// Returns the underlying IO error on failure for callers that need error detail.
 pub fn atomic_write_io(filepath: &Path, content: &str) -> std::io::Result<()> {
     // Renaming over a symlink replaces the link itself, which detaches
     // config-managed files (e.g. a home-manager-linked ~/.claude/settings.json)
     // from their source. Write through to the link's final target instead.
-    let resolved;
-    let filepath = if fs::symlink_metadata(filepath).is_ok_and(|m| m.file_type().is_symlink()) {
-        resolved = fs::canonicalize(filepath)?;
-        resolved.as_path()
-    } else {
-        filepath
-    };
+    let resolved = resolve_symlink_target(filepath)?;
+    let filepath = resolved.as_path();
 
     // Ensure parent directory exists
     if let Some(parent) = filepath.parent() {
@@ -469,6 +486,26 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_creates_missing_symlink_target() {
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink("real/settings.json", &link).unwrap();
+
+        assert!(atomic_write(&link, "new"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("real").join("settings.json")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
