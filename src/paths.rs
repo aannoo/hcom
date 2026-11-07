@@ -276,8 +276,9 @@ pub(crate) fn ensure_private_db(db_path: &Path) -> std::io::Result<()> {
 /// write through a dangling link creates the file it points to.
 fn resolve_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
     let mut resolved = path.to_path_buf();
-    // Same hop limit as Linux's MAXSYMLINKS; a cycle would otherwise spin.
-    for _ in 0..40 {
+    // Follow at most 40 links like Linux's MAXSYMLINKS; the extra pass checks
+    // what the 40th link names. A cycle would otherwise spin.
+    for _ in 0..=40 {
         match fs::symlink_metadata(&resolved) {
             Ok(metadata) if metadata.file_type().is_symlink() => {}
             Ok(_) => return Ok(resolved),
@@ -490,6 +491,24 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_symlink_hop_limit() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("settings.json");
+        fs::write(&target, "old").unwrap();
+        let mut link = target.clone();
+        for i in 1..=41 {
+            let next = tmp.path().join(format!("link{i}"));
+            std::os::unix::fs::symlink(&link, &next).unwrap();
+            link = next;
+        }
+
+        assert!(atomic_write(&tmp.path().join("link40"), "new"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert!(!atomic_write(&link, "newer"));
     }
 
     #[cfg(unix)]
