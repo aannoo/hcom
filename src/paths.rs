@@ -278,8 +278,12 @@ fn resolve_symlink_target(path: &Path) -> std::io::Result<PathBuf> {
     let mut resolved = path.to_path_buf();
     // Same hop limit as Linux's MAXSYMLINKS; a cycle would otherwise spin.
     for _ in 0..40 {
-        if !fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Ok(resolved);
+        match fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(resolved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(resolved),
+            // Guessing "not a link" here would let the rename replace a link.
+            Err(error) => return Err(error),
         }
         let target = fs::read_link(&resolved)?;
         resolved = match resolved.parent() {
