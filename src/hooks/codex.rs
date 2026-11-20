@@ -1030,6 +1030,32 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
     }
 }
 
+/// Mint a binding for a Codex session that the hcom launcher did not start.
+///
+/// Opt-in through `HCOM_AUTO_ATTACH=1`, mirroring the plugin clients: without
+/// it the historical behaviour (drop the hook) is unchanged. The key follows the
+/// same `tool:pid:sid` shape so stale cleanup and owner checks treat it alike.
+fn self_mint_codex_binding(db: &HcomDb, raw: &Value) -> Option<String> {
+    if std::env::var("HCOM_AUTO_ATTACH").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let session_id = raw
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let key = format!("codex:{}:{}", std::process::id(), session_id);
+    match instance_binding::bind_session_to_process_for_tool(
+        db,
+        session_id,
+        Some(&key),
+        "codex",
+        true,
+    ) {
+        instance_binding::ToolCheckedBind::Bound(_) => Some(key),
+        _ => None,
+    }
+}
+
 /// Main entry point for native Codex hooks.
 pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     let start = std::time::Instant::now();
@@ -1057,9 +1083,16 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         }
     };
 
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
     if !common::hook_gate_check(&ctx) {
-        return 0;
+        // Codex has no plugin that could mint a binding key, so a session the
+        // launcher never started carries no HCOM_PROCESS_ID and every hook was
+        // silently dropped. Mint the key here from the session id the hook
+        // already carries — same rule pi/opencode use, but derived server-side.
+        match self_mint_codex_binding(&db, &raw) {
+            Some(key) => ctx.process_id = Some(key),
+            None => return 0,
+        }
     }
 
     let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
@@ -1100,9 +1133,15 @@ fn get_codex_config_path() -> PathBuf {
     codex_config_path_at(&codex_config_dir())
 }
 
-/// Get path to Codex hooks.json.
+/// Get path to Codex hooks.json (production).
+pub fn codex_hooks_path() -> PathBuf {
+    let ctx = LaunchCtx::ambient(crate::tool::Tool::Codex, false);
+    codex_hooks_path_at(&per_run_home(&ctx))
+}
+
+/// Get path to Codex hooks.json (tests, isolated CODEX_HOME).
 #[cfg(test)]
-fn get_codex_hooks_path() -> PathBuf {
+pub fn get_codex_hooks_path() -> PathBuf {
     codex_hooks_path_at(&codex_config_dir())
 }
 
@@ -1258,6 +1297,87 @@ fn remove_hcom_hooks_from_json(existing: &mut Value) {
     if hooks_obj.is_empty() {
         existing.as_object_mut().unwrap().remove("hooks");
     }
+}
+
+/// Merge hcom's hook block into an existing `hooks.json`, preserving every
+/// entry that belongs to the user or another tool (Orca, for instance). hcom's
+/// own groups are stripped first, so repeated installs are idempotent.
+fn merge_hcom_hooks_into_json(existing: &mut Value) {
+    if !existing.is_object() {
+        *existing = serde_json::json!({});
+    }
+    remove_hcom_hooks_from_json(existing);
+    let expected = build_expected_hook_json();
+    let Some(expected_hooks) = expected.get("hooks").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let obj = existing.as_object_mut().unwrap();
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let Some(hooks_obj) = hooks.as_object_mut() else {
+        return;
+    };
+    for (event, groups) in expected_hooks {
+        let Some(add) = groups.as_array() else {
+            continue;
+        };
+        let slot = hooks_obj
+            .entry(event.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(arr) = slot.as_array_mut() {
+            arr.extend(add.iter().cloned());
+        }
+    }
+}
+
+/// Install hcom's persistent hooks for Codex, next to whatever the user (or
+/// another tool) already wrote into `hooks.json`.
+pub fn try_setup_codex_hooks(_include_permissions: bool) -> AnyResult<()> {
+    let path = codex_hooks_path();
+    let mut existing: Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path)?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "hooks": {} }))
+        }
+    } else {
+        serde_json::json!({ "hooks": {} })
+    };
+    merge_hcom_hooks_into_json(&mut existing);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&existing)?)?;
+    Ok(())
+}
+
+/// True when every hcom Codex hook command is present in `hooks.json`.
+pub fn verify_codex_hooks_installed(_local: bool) -> bool {
+    let path = codex_hooks_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Some(hooks) = json.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    CODEX_HOOK_COMMANDS.iter().all(|(event, command, _)| {
+        let want = build_codex_hook_command(command);
+        hooks
+            .get(*event)
+            .and_then(|v| v.as_array())
+            .is_some_and(|groups| {
+                groups.iter().any(|g| {
+                    g.get("hooks").and_then(|v| v.as_array()).is_some_and(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("command").and_then(|v| v.as_str()) == Some(want.as_str())
+                        })
+                    })
+                })
+            })
+    })
 }
 
 /// Returns true if `hook` is a legacy hcom Codex entry written in the old

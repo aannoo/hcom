@@ -301,6 +301,33 @@ const starts = () => calls.filter(c => c[0] === "opencode-start").map(c => c[c.i
 // OpenCode can import the plugin module again when it reloads it.
 const freshModule = async () => (await import(`${"../src/opencode_plugin/hcom.ts"}?reload=${Math.random()}`) as typeof import("../src/opencode_plugin/hcom.ts")).default;
 
+test("automatic OpenCode reload may reconnect but cannot enroll the conversation again", async () => {
+	const previousAuto = process.env.HCOM_AUTO_ATTACH;
+	const launched = process.env.HCOM_LAUNCHED;
+	delete process.env.HCOM_LAUNCHED;
+	process.env.HCOM_AUTO_ATTACH = "1";
+	try {
+		const first = openCode2("/project/auto-reload");
+		openCodeCleanups.push(await (await freshModule()).setup(first.ctx));
+		first.push("session.created", { sessionID: "s-auto" });
+		await settle(() => calls.some(c => c[0] === "opencode-start"));
+		await drain();
+		await openCodeCleanups.pop()!();
+		const second = openCode2("/project/auto-reload");
+		openCodeCleanups.push(await (await freshModule()).setup(second.ctx));
+		await settle(() => calls.filter(c => c[0] === "opencode-start").length === 2);
+		const starts = calls.filter(c => c[0] === "opencode-start");
+		assert.ok(starts.every(c => c.includes("--process-id")));
+		assert.equal(starts[0].includes("--rebind-only"), false);
+		assert.equal(starts[1].includes("--rebind-only"), true);
+	} finally {
+		if (previousAuto === undefined) delete process.env.HCOM_AUTO_ATTACH;
+		else process.env.HCOM_AUTO_ATTACH = previousAuto;
+		if (launched === undefined) delete process.env.HCOM_LAUNCHED;
+		else process.env.HCOM_LAUNCHED = launched;
+	}
+});
+
 test("OpenCode 2 binds the session again and delivers pending mail when it reloads the plugin at the same location", async () => {
 	const first = openCode2("/project/reload");
 	openCodeCleanups.push(await opencodeModule.setup(first.ctx));

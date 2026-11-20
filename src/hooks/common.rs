@@ -126,6 +126,23 @@ pub fn hook_gate_check(ctx: &HcomContext) -> bool {
         .is_some_and(|token| !token.is_empty())
 }
 
+/// Like [`hook_gate_check`], but also accepts a self-minted binding key passed as
+/// `--process-id <key>`.
+///
+/// A session opened WITHOUT the hcom launcher has no `HCOM_PROCESS_ID`, so the
+/// strict gate would silently drop the whole hook (empty reply) and the plugin
+/// could never bind. The flag is the documented way for such a caller to declare
+/// its own key, so it must pass the gate.
+pub fn hook_gate_check_argv(ctx: &HcomContext, argv: &[String]) -> bool {
+    if hook_gate_check(ctx) {
+        return true;
+    }
+    argv.iter()
+        .position(|a| a == "--process-id")
+        .and_then(|i| argv.get(i + 1))
+        .is_some_and(|value| !value.is_empty())
+}
+
 /// Convert a db::Message to a serde_json::Value object.
 pub(crate) fn message_to_value(m: &Message) -> Value {
     let mut obj = serde_json::Map::new();

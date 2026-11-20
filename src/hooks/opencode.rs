@@ -17,7 +17,7 @@ use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 
 use super::common;
-use super::plugin_rpc::{self, parse_flag};
+use super::plugin_rpc::{self, parse_flag, parse_pid_flag, persist_pid, resolve_process_id};
 use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
 
 /// Extract `--flag value` or `--flag=value` from argv.
@@ -135,8 +135,10 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
 
     let notify_port: Option<u16> = parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
 
-    let process_id = match &ctx.process_id {
-        Some(pid) => pid.clone(),
+    let requested_pid = parse_pid_flag(argv);
+
+    let process_id = match resolve_process_id(argv, ctx.process_id.as_deref()) {
+        Some(pid) => pid,
         None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
     };
 
@@ -166,6 +168,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
             "start",
             Default::default(),
         );
+        persist_pid(db, &existing_name, requested_pid);
 
         let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &existing_name, &tool);
 
@@ -194,17 +197,43 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         return (0, serde_json::to_string(&result).unwrap_or_default());
     }
 
-    // Normal binding path
-    let instance_name =
-        match instance_binding::bind_session_to_process(db, &session_id, Some(&process_id)) {
-            Some(name) => name,
-            None => {
+    // A plugin reloaded in an already enrolled window may only reconnect. Its
+    // registry can have been reset, in which case even the stop history is gone.
+    if argv.iter().any(|arg| arg == "--rebind-only") {
+        return plugin_rpc::error("There is no live binding for this OpenCode session");
+    }
+
+    // Normal binding path. When the caller declares its own binding key
+    // (`--process-id`, i.e. a session opened WITHOUT the hcom launcher), there is
+    // no placeholder to adopt: create the identity instead of failing. The launcher
+    // path keeps the strict behaviour (no implicit creation).
+    let self_minted = parse_flag(argv, "--process-id").is_some();
+    let bound = if self_minted {
+        match instance_binding::bind_session_to_process_for_tool(
+            db,
+            &session_id,
+            Some(&process_id),
+            "opencode",
+            true,
+        ) {
+            instance_binding::ToolCheckedBind::Bound(name) => Some(name),
+            instance_binding::ToolCheckedBind::Rejected => {
                 return (
                     0,
-                    r#"{"error":"No instance bound to this process"}"#.to_string(),
+                    r#"{"error":"This binding key belongs to another tool"}"#.to_string(),
                 );
             }
-        };
+            instance_binding::ToolCheckedBind::Unbound => None,
+        }
+    } else {
+        instance_binding::bind_session_to_process(db, &session_id, Some(&process_id))
+    };
+    let Some(instance_name) = bound else {
+        return (
+            0,
+            r#"{"error":"No instance bound to this process"}"#.to_string(),
+        );
+    };
     let tool = instance_tool(db, &instance_name);
 
     // Rebind session and initialize
@@ -219,6 +248,8 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     // Initialize last_event_id BEFORE set_status(): set_status wakes the
     // plugin, which would otherwise deliver the whole backlog from 0.
     plugin_rpc::initialize_last_event_id(db, &instance_name);
+
+    persist_pid(db, &instance_name, requested_pid);
 
     lifecycle::set_status(
         db,
@@ -284,10 +315,10 @@ fn handle_standby(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, Stri
     let Some(port) = parse_flag(argv, "--port").and_then(|s| s.parse::<u16>().ok()) else {
         return (0, r#"{"error":"Missing --port"}"#.to_string());
     };
-    let Some(process_id) = &ctx.process_id else {
+    let Some(process_id) = resolve_process_id(argv, ctx.process_id.as_deref()) else {
         return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string());
     };
-    let Ok(Some(name)) = db.get_process_binding(process_id) else {
+    let Ok(Some(name)) = db.get_process_binding(&process_id) else {
         return (
             0,
             r#"{"error":"No instance bound to this process"}"#.to_string(),
@@ -345,8 +376,9 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
         }
     };
 
-    // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx) {
+    // Pre-gate: non-participants with empty DB → exit 0, no output.
+    // `--process-id` (session opened without the launcher) counts as participation.
+    if !common::hook_gate_check_argv(&ctx, argv) {
         return (0, String::new());
     }
 
@@ -919,6 +951,159 @@ mod tests {
         assert_eq!(
             parse_flag(&argv, "--notify-port"),
             Some("12345".to_string())
+        );
+    }
+
+    #[test]
+    fn test_start_creates_identity_when_caller_mints_its_own_process_id() {
+        crate::config::Config::init();
+        let temp = tempfile::TempDir::new().unwrap();
+        let (_dir, db) = test_db();
+        let env =
+            std::collections::HashMap::from([("HCOM_TOOL".to_string(), "opencode".to_string())]);
+        let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+        let live = std::process::id();
+        let argv = sv(&[
+            "--session-id",
+            "ses-nova",
+            "--process-id",
+            "oc:999:abcdef12",
+            "--pid",
+            &live.to_string(),
+        ]);
+
+        let out = reply(handle_start(&ctx, &db, &argv));
+        let name = out
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(!name.is_empty(), "sem nome na resposta: {out}");
+        assert_eq!(
+            out.get("session_id").and_then(|v| v.as_str()),
+            Some("ses-nova")
+        );
+
+        let inst = db
+            .get_instance_full(&name)
+            .unwrap()
+            .expect("instancia criada");
+        assert_eq!(inst.tool, "opencode");
+        assert_eq!(inst.pid, Some(live as i64), "pid numerico deve ser gravado");
+        assert_eq!(
+            db.get_process_binding("oc:999:abcdef12")
+                .unwrap()
+                .as_deref(),
+            Some(name.as_str())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auto_attach_reload_respects_stop_and_explicit_resume() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = test_db();
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().into_owned(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().into_owned()),
+        ]);
+        let ctx = HcomContext::from_env(&env, test_home.clone());
+        let sid = "ses-reload";
+        let key = "oc:123:ses-reload";
+        let argv = sv(&[
+            "--session-id",
+            sid,
+            "--process-id",
+            key,
+            "--notify-port",
+            "4021",
+        ]);
+
+        let first = reply(handle_start(&ctx, &db, &argv));
+        let name = first["name"].as_str().expect("first attachment").to_owned();
+        let mut reload = argv.clone();
+        reload.push("--rebind-only".into());
+        assert_eq!(reply(handle_start(&ctx, &db, &reload))["name"], name);
+        crate::hooks::common::stop_instance(&db, &name, "cli", "stop_all");
+        for _ in 0..2 {
+            let after_stop = reply(handle_start(&ctx, &db, &argv));
+            assert!(after_stop.get("name").is_none(), "{after_stop}");
+            assert!(db.get_session_binding(sid).unwrap().is_none());
+            assert!(db.get_process_binding(key).unwrap().is_none());
+        }
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT count(*) FROM instances", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        // A deliberate relaunch creates a placeholder and owns a new process key.
+        insert_instance(&db, "phoc", "opencode");
+        db.set_process_binding("resumed-oc", "", "phoc").unwrap();
+        let mut resume_env = env;
+        resume_env.insert("HCOM_PROCESS_ID".into(), "resumed-oc".into());
+        let resumed = HcomContext::from_env(&resume_env, test_home);
+        let launch = sv(&["--session-id", sid, "--notify-port", "4022"]);
+        assert_eq!(reply(handle_start(&resumed, &db, &launch))["name"], name);
+        assert!(reply(handle_start(&ctx, &db, &argv)).get("name").is_none());
+        assert_eq!(db.get_notify_endpoint_port(&name, "plugin"), Some(4022));
+
+        let (_fresh_dir, fresh_db) = test_db();
+        assert!(
+            reply(handle_start(&ctx, &fresh_db, &reload))
+                .get("name")
+                .is_none()
+        );
+        assert!(fresh_db.get_session_binding(sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_resolve_process_id_flag_wins_over_env() {
+        let argv = sv(&["--session-id", "abc", "--process-id", "oc:4242:deadbeef"]);
+        assert_eq!(
+            resolve_process_id(&argv, Some("launcher-env")),
+            Some("oc:4242:deadbeef".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_process_id_falls_back_to_env_then_none() {
+        let argv = sv(&["--session-id", "abc"]);
+        assert_eq!(
+            resolve_process_id(&argv, Some("launcher-env")),
+            Some("launcher-env".to_string())
+        );
+        assert_eq!(resolve_process_id(&argv, None), None);
+    }
+
+    #[test]
+    fn test_parse_pid_flag_rejects_non_numeric() {
+        assert_eq!(parse_pid_flag(&sv(&["--pid", "4242"])), Some(4242));
+        assert_eq!(parse_pid_flag(&sv(&["--pid", "abc"])), None);
+        // 0 is not a client pid: it must be treated as absent, not persisted.
+        assert_eq!(parse_pid_flag(&sv(&["--pid", "0"])), None);
+        assert_eq!(parse_pid_flag(&sv(&["--session-id", "x"])), None);
+    }
+
+    #[test]
+    fn test_persist_pid_writes_numeric_pid_and_is_noop_without_flag() {
+        let live = std::process::id();
+        let (_dir, db) = test_db();
+        insert_instance(&db, "pidtest", "opencode");
+
+        persist_pid(&db, "pidtest", None);
+        assert_eq!(db.get_instance_full("pidtest").unwrap().unwrap().pid, None);
+
+        persist_pid(&db, "pidtest", Some(live));
+        assert_eq!(
+            db.get_instance_full("pidtest").unwrap().unwrap().pid,
+            Some(live as i64)
         );
     }
 

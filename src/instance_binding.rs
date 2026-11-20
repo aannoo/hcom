@@ -817,6 +817,7 @@ pub fn bind_session_to_process_for_tool(
             return ToolCheckedBind::Rejected;
         }
     };
+    let mut allow_new_identity = create_if_unbound;
     if let Some(ref name) = session_owner {
         let tool = db
             .get_instance_full(name)
@@ -827,24 +828,37 @@ pub fn bind_session_to_process_for_tool(
             return ToolCheckedBind::Rejected;
         }
     } else {
-        match db.find_stopped_instance_by_session_id(session_id) {
-            Ok(Some(name)) => {
-                let tool = db
-                    .conn()
-                    .query_row(
-                        "SELECT json_extract(data, '$.snapshot.tool') FROM events
-                         WHERE type = 'life'
-                           AND instance = ?1
-                           AND json_extract(data, '$.action') = 'stopped'
-                           AND json_extract(data, '$.snapshot.session_id') = ?2
-                         ORDER BY id DESC LIMIT 1",
-                        rusqlite::params![name, session_id],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .ok()
-                    .flatten();
+        match db.find_stopped_event_by_session_id(session_id) {
+            Ok(Some((name, event_id))) => {
+                let Ok((tool, reason)) = db.conn().query_row(
+                    "SELECT json_extract(data, '$.snapshot.tool'), json_extract(data, '$.reason')
+                         FROM events WHERE id = ?1",
+                    [event_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                ) else {
+                    return ToolCheckedBind::Rejected;
+                };
                 if !owner_matches("stopped_session", &name, tool.as_deref()) {
                     return ToolCheckedBind::Rejected;
+                }
+                // Automatic OpenCode enrollment can mint only for a new session.
+                // Recovery may reclaim its original name. An operator stop
+                // requires an explicit relaunch, even if a placeholder exists.
+                if create_if_unbound && expected_tool == "opencode" {
+                    if matches!(
+                        reason.as_deref(),
+                        Some(
+                            "self" | "external" | "stop_all" | "tag_stop" | "multi_stop" | "killed"
+                        )
+                    ) {
+                        return ToolCheckedBind::Unbound;
+                    }
+                    allow_new_identity = false;
                 }
             }
             Ok(None) => {}
@@ -863,7 +877,7 @@ pub fn bind_session_to_process_for_tool(
     // the transaction drops and ownership stays where it was.
     let bound = match bind_session_to_process_checked(db, session_id, process_id) {
         Ok(Some(name)) => Some(name),
-        Ok(None) if create_if_unbound => {
+        Ok(None) if allow_new_identity => {
             create_orphaned_pty_identity(db, session_id, process_id, expected_tool)
         }
         Ok(None) => None,

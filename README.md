@@ -196,6 +196,20 @@ hcom r <session_id>   # Resume a session started outside hcom
 hcom f <session_id>   # Fork a session in hcom
 ```
 
+#### Attaching a session hcom did not launch
+
+By default the OpenCode and Pi plugins only bind when hcom launched the tool
+(`hcom opencode`, `hcom pi`), because the participation gate requires
+`HCOM_PROCESS_ID`. To let a session you opened yourself attach, opt in:
+
+```bash
+HCOM_AUTO_ATTACH=1 opencode    # or: HCOM_AUTO_ATTACH=1 pi
+```
+
+The plugin then mints its own binding key (`--process-id`) and passes its pid
+(`--pid`), so the identity survives stale cleanup. Without the variable nothing
+changes: the launcher path is still the only one that binds.
+
 #### Claude Code headless and subagents
 
 Detached background processes in print mode stay alive. Manage through the TUI.
