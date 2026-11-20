@@ -197,6 +197,12 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         return (0, serde_json::to_string(&result).unwrap_or_default());
     }
 
+    // A plugin reloaded in an already enrolled window may only reconnect. Its
+    // registry can have been reset, in which case even the stop history is gone.
+    if argv.iter().any(|arg| arg == "--rebind-only") {
+        return plugin_rpc::error("There is no live binding for this OpenCode session");
+    }
+
     // Normal binding path. When the caller declares its own binding key
     // (`--process-id`, i.e. a session opened WITHOUT the hcom launcher), there is
     // no placeholder to adopt: create the identity instead of failing. The launcher
@@ -990,6 +996,71 @@ mod tests {
                 .as_deref(),
             Some(name.as_str())
         );
+    }
+
+    #[test]
+    #[serial]
+    fn auto_attach_reload_respects_stop_and_explicit_resume() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = test_db();
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().into_owned(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().into_owned()),
+        ]);
+        let ctx = HcomContext::from_env(&env, test_home.clone());
+        let sid = "ses-reload";
+        let key = "oc:123:ses-reload";
+        let argv = sv(&[
+            "--session-id",
+            sid,
+            "--process-id",
+            key,
+            "--notify-port",
+            "4021",
+        ]);
+
+        let first = reply(handle_start(&ctx, &db, &argv));
+        let name = first["name"].as_str().expect("first attachment").to_owned();
+        let mut reload = argv.clone();
+        reload.push("--rebind-only".into());
+        assert_eq!(reply(handle_start(&ctx, &db, &reload))["name"], name);
+        crate::hooks::common::stop_instance(&db, &name, "cli", "stop_all");
+        for _ in 0..2 {
+            let after_stop = reply(handle_start(&ctx, &db, &argv));
+            assert!(after_stop.get("name").is_none(), "{after_stop}");
+            assert!(db.get_session_binding(sid).unwrap().is_none());
+            assert!(db.get_process_binding(key).unwrap().is_none());
+        }
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT count(*) FROM instances", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        // A deliberate relaunch creates a placeholder and owns a new process key.
+        insert_instance(&db, "phoc", "opencode");
+        db.set_process_binding("resumed-oc", "", "phoc").unwrap();
+        let mut resume_env = env;
+        resume_env.insert("HCOM_PROCESS_ID".into(), "resumed-oc".into());
+        let resumed = HcomContext::from_env(&resume_env, test_home);
+        let launch = sv(&["--session-id", sid, "--notify-port", "4022"]);
+        assert_eq!(reply(handle_start(&resumed, &db, &launch))["name"], name);
+        assert!(reply(handle_start(&ctx, &db, &argv)).get("name").is_none());
+        assert_eq!(db.get_notify_endpoint_port(&name, "plugin"), Some(4022));
+
+        let (_fresh_dir, fresh_db) = test_db();
+        assert!(
+            reply(handle_start(&ctx, &fresh_db, &reload))
+                .get("name")
+                .is_none()
+        );
+        assert!(fresh_db.get_session_binding(sid).unwrap().is_none());
     }
 
     #[test]
