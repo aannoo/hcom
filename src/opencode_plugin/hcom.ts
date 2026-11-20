@@ -513,6 +513,9 @@ function createCore(transport: Transport) {
           })
           return
         }
+        if (mintedProcessId && locationKey && lastBinding.location === locationKey && lastBinding.sessionId === sid) {
+          args.push("--rebind-only")
+        }
         const reply = await rpc(args, null)
         if (gen !== generation || disposed) return
         if (!reply || typeof reply.name !== "string" || !reply.name) {
