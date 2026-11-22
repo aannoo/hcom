@@ -163,6 +163,47 @@ function serverPort(server: Server | null): number | null {
   return typeof address === "object" && address ? address.port : null
 }
 
+// One notify port per OpenCode process. OpenCode 2 loads the plugin once per
+// location, and a session opened from another location makes both copies bind
+// the agent. hcom keeps one plugin port per agent, so a port owned by one copy
+// would close when OpenCode evicts that copy's idle location, while the other
+// copy stays bound and never registers again. Every bound copy shares this port
+// instead; a wake goes to the copy that bound last, since only the latest binding
+// counts. Kept on globalThis, which outlives this module if a reload imports it again.
+type WakeReceiver = { wake: () => void }
+const wakeHub: { server: Server | null; starting: Promise<Server | null> | null; receivers: WakeReceiver[] } =
+  ((globalThis as any)[Symbol.for("hcom.opencode.wakeHub")] ??= { server: null, starting: null, receivers: [] })
+
+async function joinWakeHub(receiver: WakeReceiver): Promise<number | null> {
+  if (!wakeHub.server) {
+    const starting = (wakeHub.starting ??= startNotifyServer(() => wakeHub.receivers.at(-1)?.wake()))
+    const server = await starting
+    if (wakeHub.starting === starting) wakeHub.starting = null
+    if (!wakeHub.server) wakeHub.server = server
+  }
+  const port = serverPort(wakeHub.server)
+  // Not bound yet: wakes keep going to the copy that is, until this one is adopted.
+  if (port) wakeHub.receivers.unshift(receiver)
+  return port
+}
+
+// The receiver joins before its bind; on adoption it becomes the latest binding.
+function adoptWakeReceiver(receiver: WakeReceiver): void {
+  const index = wakeHub.receivers.indexOf(receiver)
+  if (index < 0) return
+  wakeHub.receivers.splice(index, 1)
+  wakeHub.receivers.push(receiver)
+}
+
+function leaveWakeHub(receiver: WakeReceiver | null): void {
+  const index = receiver ? wakeHub.receivers.indexOf(receiver) : -1
+  if (index < 0) return
+  wakeHub.receivers.splice(index, 1)
+  if (wakeHub.receivers.length || wakeHub.starting) return
+  try { wakeHub.server?.close() } catch {}
+  wakeHub.server = null
+}
+
 type PromptModel = {
   providerID: string
   modelID: string
@@ -305,7 +346,7 @@ function createCore(transport: Transport) {
   // Bumped on every reset. Async work started under an older generation must
   // not touch state after it resumes.
   let generation = 0
-  let notifyServer: Server | null = null
+  let notifyReceiver: WakeReceiver | null = null
   let standbyServer: Server | null = null
   let standbyStarting = false
   let reconcileTimer: ReturnType<typeof setInterval> | null = null
@@ -396,8 +437,8 @@ function createCore(transport: Transport) {
   }
 
   function stopNotifyServer(): void {
-    try { notifyServer?.close() } catch {}
-    notifyServer = null
+    leaveWakeHub(notifyReceiver)
+    notifyReceiver = null
   }
 
   function stopStandby(): void {
@@ -455,15 +496,16 @@ function createCore(transport: Transport) {
     if (disposed || process.env.HCOM_LAUNCHED !== "1") return
     const gen = generation
     const attempt = (async () => {
-      let server: Server | null = null
-      let endTurn = () => {}
-      try {
-        // Start the notify server before binding so its port registers atomically.
-        server = await startNotifyServer(() => {
+      let receiver: WakeReceiver | null = {
+        wake: () => {
           log("DEBUG", "notify_server.wake", instanceName, { pending_ack: delivery?.ackId ?? null })
           void deliverPending("notify")
-        })
-        const port = serverPort(server)
+        },
+      }
+      let endTurn = () => {}
+      try {
+        // Join the notify port before binding so it registers atomically.
+        const port = await joinWakeHub(receiver)
         const args = ["opencode-start", "--session-id", sid]
         if (port) args.push("--notify-port", String(port))
         endTurn = await bindingTurn()
@@ -485,8 +527,9 @@ function createCore(transport: Transport) {
         const boundModel = normalizePromptModel(reply.model)
         if (typeof reply.agent === "string") launchedAgent = reply.agent
         if (boundModel) launchedModel = boundModel
-        notifyServer = server
-        server = null
+        adoptWakeReceiver(receiver)
+        notifyReceiver = receiver
+        receiver = null
         stopStandby()
         instanceName = reply.name
         sessionId = typeof reply.session_id === "string" && reply.session_id ? reply.session_id : sid
@@ -508,8 +551,8 @@ function createCore(transport: Transport) {
         log("ERROR", "plugin.bind_error", null, { error: String(e) })
       } finally {
         endTurn()
-        // Not adopted (failed, or reset while binding): don't leak the listener.
-        server?.close()
+        // Not adopted (failed, or reset while binding): stop receiving wakes.
+        leaveWakeHub(receiver)
         if (gen === generation) bindingPromise = null
       }
     })()

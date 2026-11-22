@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection } from "node:net";
 
 const logDir = mkdtempSync(join(tmpdir(), "hcom-plugin-delivery-"));
 const previousDir = process.env.HCOM_DIR;
@@ -571,4 +572,92 @@ process.on("exit", () => {
 	if (previousResume === undefined) delete process.env.HCOM_RESUME_SESSION_ID; else process.env.HCOM_RESUME_SESSION_ID = previousResume;
 	if (previousHost === undefined) delete process.env.HCOM_PLUGIN_HOST_PID; else process.env.HCOM_PLUGIN_HOST_PID = previousHost;
 	rmSync(logDir, { recursive: true, force: true });
+});
+
+const notifyPorts = () => calls.filter(c => c[0] === "opencode-start" && c.includes("--notify-port")).map(c => Number(c[c.indexOf("--notify-port") + 1]));
+// A cleanup a test may run early; afterEach runs it otherwise, so a failed
+// assertion cannot leave a notify server open.
+function tracked(cleanup: () => Promise<void>): () => Promise<void> {
+	let done: Promise<void> | null = null;
+	const once = () => (done ??= cleanup());
+	openCodeCleanups.push(once);
+	return once;
+}
+// hcom wakes a plugin by opening a connection to its notify port.
+function wakePort(port: number): Promise<boolean> {
+	return new Promise(resolve => {
+		const socket = createConnection({ host: "127.0.0.1", port });
+		socket.on("connect", () => { socket.end(); resolve(true); });
+		socket.on("error", () => resolve(false));
+	});
+}
+
+test("OpenCode 2 keeps the agent's notify port when it evicts the location that bound last and another location stays bound", async () => {
+	// Launched in a parent directory, working on a session from a subdirectory:
+	// OpenCode 2 loads the plugin at both locations, and both bind the agent.
+	const parent = openCode2("/project/evict");
+	const sub = openCode2("/project/evict/sub");
+	const disposeParent = tracked(await opencodeModule.setup(parent.ctx));
+	tracked(await opencodeModule.setup(sub.ctx));
+	sub.push("session.created", { sessionID: "s20" });
+	parent.push("session.created", { sessionID: "s20" });
+	await settle(() => notifyPorts().length === 2);
+	const [port, other] = notifyPorts();
+	assert.equal(port, other, "both copies register the same notify port");
+	// OpenCode evicts the idle parent directory; no session event follows.
+	await disposeParent();
+	pending = [{ event_id: 21, from: "luna", message: "AFTER-EVICT" }];
+	assert.ok(await wakePort(port), "the port hcom holds still accepts wakes");
+	await settle(() => sub.prompts.length === 1);
+	assert.ok(sub.prompts[0].text.includes("AFTER-EVICT"));
+	assert.equal(parent.prompts.length, 0);
+});
+
+test("OpenCode 2 delivers a wake once when several locations bound the agent", async () => {
+	const parent = openCode2("/project/once");
+	const sub = openCode2("/project/once/sub");
+	tracked(await opencodeModule.setup(parent.ctx));
+	tracked(await opencodeModule.setup(sub.ctx));
+	parent.push("session.created", { sessionID: "s22" });
+	sub.push("session.created", { sessionID: "s22" });
+	await settle(() => notifyPorts().length === 2);
+	pending = [{ event_id: 23, from: "luna", message: "ONCE" }];
+	assert.ok(await wakePort(notifyPorts()[0]));
+	await settle(() => parent.prompts.length + sub.prompts.length === 1);
+	await drain();
+	assert.equal(parent.prompts.length + sub.prompts.length, 1);
+});
+
+test("OpenCode 2 closes the notify port when the last location that bound the agent unloads", async () => {
+	const parent = openCode2("/project/last");
+	const sub = openCode2("/project/last/sub");
+	const disposeParent = tracked(await opencodeModule.setup(parent.ctx));
+	const disposeSub = tracked(await opencodeModule.setup(sub.ctx));
+	parent.push("session.created", { sessionID: "s24" });
+	sub.push("session.created", { sessionID: "s24" });
+	await settle(() => notifyPorts().length === 2);
+	const port = notifyPorts()[0];
+	await disposeParent();
+	assert.ok(await wakePort(port));
+	await disposeSub();
+	assert.equal(await wakePort(port), false);
+});
+
+test("OpenCode 2 delivers a wake that arrives while another location is still binding the agent", async () => {
+	const parent = openCode2("/project/joining");
+	const sub = openCode2("/project/joining/sub");
+	tracked(await opencodeModule.setup(parent.ctx));
+	tracked(await opencodeModule.setup(sub.ctx));
+	parent.push("session.created", { sessionID: "s26" });
+	await settle(() => notifyPorts().length === 1);
+	// The second location's bind has joined the port but not heard back yet.
+	const release = hold("s26");
+	sub.push("session.created", { sessionID: "s26" });
+	await settle(() => notifyPorts().length === 2);
+	pending = [{ event_id: 27, from: "luna", message: "MID-BIND" }];
+	assert.ok(await wakePort(notifyPorts()[0]));
+	await settle(() => parent.prompts.length === 1);
+	release();
+	await drain();
+	assert.equal(parent.prompts.length + sub.prompts.length, 1);
 });
