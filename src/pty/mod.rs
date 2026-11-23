@@ -776,7 +776,8 @@ impl Proxy {
             winsize.ws_col,
             &config.ready_patterns,
             config.instance_name.as_deref(),
-        );
+        )
+        .with_tool(config.target.known_tool());
 
         // Start injection server (port is registered to DB by delivery thread)
         let inject_server = InjectServer::new()?;

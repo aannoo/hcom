@@ -227,6 +227,7 @@ pub struct ScreenTracker {
     rows: u16,
     cols: u16,
     ready_patterns: Vec<String>,
+    tool: Option<crate::tool::Tool>,
     waiting_approval: bool,
     // Last complete, sanitized OSC 0/2 title the wrapped tool set, cached for the
     // Combined title passthrough. Only ever holds a fully-terminated title (see
@@ -270,6 +271,63 @@ fn is_codex_modal_footer(line: &str) -> bool {
     line.starts_with("enter ") && line.contains(" \u{b7} esc ")
 }
 
+fn is_horizontal_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.chars().count() >= 8 && trimmed.chars().all(|c| c == '\u{2500}')
+}
+
+fn is_antigravity_modal_or_trust(lines: &[String]) -> bool {
+    lines.iter().any(|l| {
+        l.contains("Antigravity CLI requires permission")
+            || l.contains("\u{2191}/\u{2193} Navigate")
+            || l.contains("Enter to select")
+            || l.contains("esc to cancel")
+            || l.contains("Esc to cancel")
+    })
+}
+
+/// Antigravity CLI 1.5+ dropped the `? for shortcuts` footer and renders its
+/// composer as a `>` prompt enclosed between two horizontal rules near the
+/// bottom of the screen.
+fn is_antigravity_prompt_box(lines: &[String]) -> bool {
+    if is_antigravity_modal_or_trust(lines) {
+        return false;
+    }
+    let rule_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| is_horizontal_rule(l).then_some(i))
+        .collect();
+
+    for pair in rule_indices.windows(2).rev() {
+        let (top_rule, bottom_rule) = (pair[0], pair[1]);
+        // Only treat a box at the bottom of the screen (at most a compact
+        // footer below it) as the composer; ignore scrollback markdown.
+        let trailing_non_empty = lines[bottom_rule + 1..]
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if trailing_non_empty > 2 {
+            return false;
+        }
+        let inner = &lines[top_rule + 1..bottom_rule];
+        let Some(prompt_line) = inner
+            .iter()
+            .map(|l| l.trim_start())
+            .find(|l| *l == ">" || l.starts_with("> "))
+        else {
+            continue;
+        };
+        // Reject numbered picker/menu cursors (`> 1. ...` with a `2. ` option).
+        if prompt_line.starts_with("> 1.") && inner.iter().any(|l| l.trim_start().starts_with("2."))
+        {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
 impl ScreenTracker {
     /// Create a new screen tracker with instance name (for debug logging)
     pub fn new_with_instance(
@@ -296,6 +354,7 @@ impl ScreenTracker {
             rows,
             cols,
             ready_patterns: ready_patterns.to_vec(),
+            tool: None,
             waiting_approval: false,
             last_child_title: None,
             last_output: Instant::now(),
@@ -319,6 +378,14 @@ impl ScreenTracker {
         }
 
         tracker
+    }
+
+    /// Tag this screen tracker with the known tool so tool-specific readiness
+    /// checks (such as Antigravity 1.5+ bordered prompt box) can run alongside
+    /// `ready_patterns`.
+    pub fn with_tool(mut self, tool: Option<crate::tool::Tool>) -> Self {
+        self.tool = tool;
+        self
     }
 
     /// Open debug log file
@@ -455,6 +522,12 @@ impl ScreenTracker {
         let lines = self.get_screen_lines();
         if is_codex_startup_screen(&lines) {
             return false;
+        }
+        if self.tool == Some(crate::tool::Tool::Antigravity)
+            && !self.is_antigravity_approval_visible()
+            && is_antigravity_prompt_box(&lines)
+        {
+            return true;
         }
         lines.iter().any(|line| {
             self.ready_patterns
@@ -1432,7 +1505,7 @@ mod tests {
 
     /// Tracker using a tool's real `ready_patterns` from its IntegrationSpec.
     fn make_tool_tracker(rows: u16, cols: u16, tool: crate::tool::Tool) -> ScreenTracker {
-        make_tracker_with(rows, cols, tool.ready_patterns())
+        make_tracker_with(rows, cols, tool.ready_patterns()).with_tool(Some(tool))
     }
 
     fn make_tracker_with(rows: u16, cols: u16, ready_patterns: &[&str]) -> ScreenTracker {
@@ -1442,6 +1515,7 @@ mod tests {
             rows,
             cols,
             ready_patterns: ready_patterns.iter().map(|p| p.to_string()).collect(),
+            tool: None,
             waiting_approval: false,
             last_child_title: None,
             last_output: Instant::now(),
@@ -2603,6 +2677,91 @@ mod tests {
         t.process("some agent output\r\n".as_bytes());
         t.process("> \r\n? for shortcuts\r\n".as_bytes());
         assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_1_5_prompt_box_is_ready_without_shortcuts_footer() {
+        let mut t =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        let rule = "\u{2500}".repeat(80);
+        let screen = format!("Antigravity CLI 1.5.14\r\n{rule}\r\n>\r\n{rule}\r\n");
+        t.process(screen.as_bytes());
+        assert!(t.is_ready());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_1_5_approval_dialog_not_ready() {
+        let mut t =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        let rule = "\u{2500}".repeat(80);
+        let screen = format!(
+            "Requesting permission for:\r\nRun this command?\r\n{rule}\r\n> 1. Yes\r\n{rule}\r\n\u{2191}/\u{2193} Navigate\r\n"
+        );
+        t.process(screen.as_bytes());
+        assert!(t.is_antigravity_approval_visible());
+        assert!(!t.is_ready());
+    }
+
+    #[test]
+    fn antigravity_1_5_draft_still_blocks_prompt_empty() {
+        let mut t =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        let rule = "\u{2500}".repeat(80);
+        let screen = format!("{rule}\r\n> user draft\r\n{rule}\r\n");
+        t.process(screen.as_bytes());
+        assert!(t.is_ready());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("user draft".to_string())
+        );
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_1_5_trust_and_picker_not_ready() {
+        let mut t =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        let rule = "\u{2500}".repeat(80);
+        let trust = format!(
+            "Antigravity CLI requires permission to read, edit, and execute files here\r\n{rule}\r\n> 1. Yes, I trust\r\n  2. No\r\n{rule}\r\n"
+        );
+        t.process(trust.as_bytes());
+        assert!(!t.is_ready());
+
+        let mut t2 =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        let picker = format!("{rule}\r\n> 1. Option A\r\n  2. Option B\r\n{rule}\r\n");
+        t2.process(picker.as_bytes());
+        assert!(!t2.is_ready());
+    }
+
+    #[test]
+    fn antigravity_1_5_edge_cases_scrollback_narrow_header_and_footer() {
+        let rule = "\u{2500}".repeat(80);
+        // Scrollback markdown above active streaming output must not match.
+        let mut scrollback =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        scrollback.process(
+            format!("{rule}\r\n> quote\r\n{rule}\r\nline 1\r\nline 2\r\nline 3\r\n").as_bytes(),
+        );
+        assert!(!scrollback.is_ready());
+
+        // Narrow terminal (< 20 cols) still matches.
+        let mut narrow =
+            make_tracker(24, 12, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        let short_rule = "\u{2500}".repeat(12);
+        narrow.process(format!("{short_rule}\r\n>\r\n{short_rule}\r\n").as_bytes());
+        assert!(narrow.is_ready());
+
+        // Non-empty line above `>` inside the box + footer divider below box still match.
+        let mut inner_header =
+            make_tracker(24, 80, "? for shortcuts").with_tool(Some(crate::tool::Tool::Antigravity));
+        inner_header.process(
+            format!("{rule}\r\n[attached: foo.rs]\r\n>\r\n{rule}\r\n{rule}\r\n").as_bytes(),
+        );
+        assert!(inner_header.is_ready());
     }
 
     // ---- Claude input extraction ----

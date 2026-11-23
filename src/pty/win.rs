@@ -588,7 +588,8 @@ impl Proxy {
         let cutoff = stdout.cutoff();
         let handle = thread::spawn(move || {
             let mut screen =
-                ScreenTracker::new_with_instance(rows, cols, &ready_patterns, instance.as_deref());
+                ScreenTracker::new_with_instance(rows, cols, &ready_patterns, instance.as_deref())
+                    .with_tool(target.known_tool());
             let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
 
