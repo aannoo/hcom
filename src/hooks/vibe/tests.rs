@@ -41,6 +41,7 @@ fn hook_names(doc: &DocumentMut) -> Vec<String> {
 }
 
 #[test]
+#[serial]
 fn merge_keeps_user_rows_replaces_hcom_rows_and_is_idempotent() {
     let mut doc: DocumentMut = USER_ROWS.parse().unwrap();
     merge_hcom_hooks(&mut doc);
@@ -68,6 +69,7 @@ fn merge_keeps_user_rows_replaces_hcom_rows_and_is_idempotent() {
 }
 
 #[test]
+#[serial]
 fn inline_hook_arrays_are_merged_verified_and_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hooks.toml");
@@ -454,6 +456,52 @@ fn stopped_instance_does_not_rejoin_from_a_later_hook() {
         .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "no identity may be recreated after hcom stop");
+}
+
+#[test]
+#[serial]
+fn stopped_process_does_not_attach_to_the_replacement_of_its_session() {
+    // `hcom r luna` starts a new process. Vibe 3.1.4 `--resume` gives it a
+    // new session id; the same id must be safe too.
+    for new_session in ["ses-2", "ses-1"] {
+        let (_dir, db) = make_test_db();
+        let old_process = ctx("pid-1", "vibe");
+        seed_instance(&db, "luna", "ses-1", "pid-1", ST_LISTENING);
+        crate::hooks::common::stop_instance(&db, "luna", "cli", "stop");
+        seed_instance(&db, "luna", new_session, "pid-2", ST_LISTENING);
+        let cursor = last_event_id(&db, "luna");
+        insert_message(&db, "bob", "for the resumed luna");
+
+        for hook_type in ["pre_agent", "pre_tool", "post_tool"] {
+            let p = payload(
+                hook_type,
+                json!({"session_id": "ses-1", "prompt": "<hcom>", "tool_name": "bash", "tool_status": "success"}),
+            );
+            let (output, ack) = match hook_type {
+                "pre_agent" => handle_preagent(&db, &old_process, &p),
+                "pre_tool" => (super::handle_pretool(&db, &old_process, &p), None),
+                _ => handle_posttool(&db, &old_process, &p),
+            };
+            assert_eq!(output, json!({}), "{new_session} {hook_type}");
+            assert!(ack.is_none(), "{new_session} {hook_type}");
+        }
+        assert_eq!(
+            db.get_process_binding("pid-1").unwrap(),
+            None,
+            "{new_session}"
+        );
+        assert_eq!(
+            db.get_process_binding("pid-2").unwrap().as_deref(),
+            Some("luna"),
+            "{new_session}"
+        );
+        let luna = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(luna.session_id.as_deref(), Some(new_session));
+        assert_eq!(
+            luna.last_event_id, cursor,
+            "{new_session}: message must stay queued"
+        );
+    }
 }
 
 #[test]

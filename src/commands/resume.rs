@@ -2432,9 +2432,7 @@ mod tests {
     #[serial_test::serial]
     fn test_find_session_on_disk_finds_vibe_session_and_its_cwd() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        unsafe {
-            std::env::remove_var("VIBE_HOME");
-        }
+        let _vibe_home = crate::hooks::test_helpers::EnvVarGuard::unset("VIBE_HOME");
         let workdir = home.join("proj");
         std::fs::create_dir_all(&workdir).unwrap();
         let session = home.join(".vibe/logs/session/unified/vibe-sess-1");

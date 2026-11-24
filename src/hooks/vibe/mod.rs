@@ -109,7 +109,10 @@ fn bind_session(
 }
 
 /// The instance for a post-start hook, binding lazily when `session_start`
-/// was missed or the session changed without one. Never creates an identity.
+/// was missed or the session changed without one. Never creates an identity,
+/// and only binds a process that is still attached: `hcom stop` drops the
+/// process binding, and binding again would hand the stopped process to
+/// whoever owns its session now (e.g. a replacement started by `hcom r`).
 fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
     let incoming = payload.session_id.as_deref().filter(|sid| !sid.is_empty());
     let mut instance = resolve_instance(db, ctx, payload);
@@ -119,6 +122,7 @@ fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> O
         _ => false,
     };
     if stale {
+        instance_binding::resolve_process_binding(db, ctx.process_id.as_deref())?;
         let name = bind_session(db, ctx, payload, false)?;
         lifecycle::set_status(db, &name, ST_LISTENING, "start", Default::default());
         instance = db.get_instance_full(&name).ok().flatten();
