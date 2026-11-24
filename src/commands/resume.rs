@@ -1457,6 +1457,11 @@ fn find_session_on_disk(session_id: &str) -> Option<(Tool, Option<String>)> {
         return Some((Tool::Qoder, Some(path)));
     }
 
+    // 6c. Vibe (unified session store; the transcript path is the session's meta.json)
+    if let Some(path) = derive_vibe_transcript_path(session_id) {
+        return Some((Tool::Vibe, Some(path)));
+    }
+
     // 7. Copilot
     if let Some(path) = derive_copilot_transcript_path(session_id)
         && let Some(tool) = detect_tool_from_path(&path)
@@ -1623,6 +1628,18 @@ fn derive_qoder_transcript_path(session_id: &str) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+/// Locate a Vibe session by id:
+/// `<VIBE_HOME or ~/.vibe>/logs/session/unified/<id>/meta.json`.
+fn derive_vibe_transcript_path(session_id: &str) -> Option<String> {
+    let meta = crate::hooks::vibe::vibe_config_dir()
+        .join("logs")
+        .join("session")
+        .join("unified")
+        .join(session_id)
+        .join("meta.json");
+    meta.is_file().then(|| meta.to_string_lossy().into_owned())
+}
+
 /// Locate a Copilot CLI transcript by session UUID.
 /// Copilot stores transcripts at `$COPILOT_HOME/session-state/<uuid>/events.jsonl`
 /// where `COPILOT_HOME` defaults to `~/.copilot`.
@@ -1728,8 +1745,16 @@ fn extract_cwd_from_transcript(path: &str, tool: Tool) -> Option<String> {
         Tool::Gemini | Tool::Antigravity => recover_gemini_cwd(path),
         Tool::Cursor => recover_cursor_cwd(path),
         Tool::Kimi => None, // Kimi context.jsonl does not store cwd
-        // hcom has no Vibe transcript; the instance row keeps the directory.
-        Tool::Vibe => None,
+        // The transcript path is the session's meta.json.
+        Tool::Vibe => std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|meta| {
+                meta.pointer("/environment/working_directory")
+                    .and_then(|cwd| cwd.as_str())
+                    .filter(|cwd| !cwd.is_empty())
+                    .map(str::to_string)
+            }),
         Tool::Grok => recover_grok_cwd(path),
         Tool::Copilot => scan_lines_for_cwd(path, 20, |v| {
             v.get("event")
@@ -1866,6 +1891,7 @@ fn build_adopt_plan(
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
                  - Qoder:    ~/.qoder/projects/*/{sid}.jsonl\n  \
+                 - Vibe:     ~/.vibe/logs/session/unified/{sid}/meta.json\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
                  - Grok:     {grok}/*/{sid}/updates.jsonl\n  \
                  - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
@@ -2400,6 +2426,41 @@ mod tests {
             path.contains("session-xyz.jsonl"),
             "unexpected path: {path}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_find_session_on_disk_finds_vibe_session_and_its_cwd() {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::remove_var("VIBE_HOME");
+        }
+        let workdir = home.join("proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let session = home.join(".vibe/logs/session/unified/vibe-sess-1");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("meta.json"),
+            serde_json::json!({
+                "session_id": "vibe-sess-1",
+                "environment": {"working_directory": workdir.to_string_lossy()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (tool, path) = find_session_on_disk("vibe-sess-1").unwrap();
+        assert_eq!(tool, Tool::Vibe);
+        let path = path.unwrap();
+        assert_eq!(
+            std::path::Path::new(&path),
+            session.join("meta.json").as_path()
+        );
+        assert_eq!(
+            extract_cwd_from_transcript(&path, Tool::Vibe).as_deref(),
+            Some(workdir.to_string_lossy().as_ref())
+        );
+        assert!(find_session_on_disk("vibe-sess-missing").is_none());
     }
 
     // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s

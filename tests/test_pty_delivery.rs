@@ -619,6 +619,11 @@ fn initial_screen_ready(screen: &serde_json::Value, tool: &str) -> bool {
     if tool == "gemini" && screen_has_text(screen, "Executing Hook:") {
         return false;
     }
+    // Vibe has no ready patterns: its composer parser is the readiness signal,
+    // so wait until the composer is drawn and empty.
+    if tool == "vibe" && screen["prompt_empty"].as_bool() != Some(true) {
+        return false;
+    }
     true
 }
 

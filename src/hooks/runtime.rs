@@ -141,7 +141,8 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         // asynchronously and beforeSubmitPrompt/stop often never fire from them.
         // Hermes has no per-run plugin path; hcom installs into the launch's
         // profile (`hooks::hermes::ensure_installed`). Vibe has no per-run
-        // hooks flag; its rows live in `$VIBE_HOME/hooks.toml`.
+        // hooks flag; its rows live in the launch's `$VIBE_HOME/hooks.toml`
+        // (`hooks::vibe::ensure_installed`).
         Tool::Cursor
         | Tool::Gemini
         | Tool::Kimi

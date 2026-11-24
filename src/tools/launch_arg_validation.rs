@@ -385,7 +385,9 @@ pub(crate) fn validate_rejected_args(
     rejected: &[RejectedArg],
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
+    // Tokens after `--` are positional (e.g. an initial prompt), not options.
+    let options = tokens.iter().take_while(|token| *token != "--");
+    for (index, token) in options.enumerate() {
         if let Some(rule) = rejected.iter().find(|rule| {
             long_flag_matches(token, rule.token)
                 && match rule.kind {
@@ -428,6 +430,21 @@ mod tests {
                 "{flag}"
             );
         }
+    }
+
+    #[test]
+    fn vibe_rejects_headless_options_but_not_positionals_after_separator() {
+        let s = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let errors = |args: &[&str]| {
+            validate_rejected_args("Vibe", "hcom vibe", &s(args), VIBE_REJECTED_ARGS).len()
+        };
+        assert_eq!(errors(&["-p", "hi"]), 1);
+        assert_eq!(errors(&["--prompt=hi"]), 1);
+        assert_eq!(errors(&["--agent", "lean", "--", "--prompt"]), 0);
+        assert_eq!(errors(&["--", "-p"]), 0);
+        // A root subcommand still counts from the first token only.
+        assert_eq!(errors(&["config"]), 1);
+        assert_eq!(errors(&["--", "config"]), 0);
     }
 
     #[test]

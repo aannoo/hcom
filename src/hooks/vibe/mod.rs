@@ -16,8 +16,9 @@ mod config;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use config::vibe_config_dir;
 pub use config::{
-    SetupError, get_vibe_hooks_path, remove_vibe_hooks, try_setup_vibe_hooks,
+    SetupError, ensure_installed, get_vibe_hooks_path, remove_vibe_hooks, try_setup_vibe_hooks,
     verify_vibe_hooks_installed,
 };
 
@@ -70,7 +71,17 @@ fn update_position(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload, instan
 
 /// Bind the hook's session to the launching process and record its position.
 /// Returns the instance name. Refuses a process that belongs to another tool.
-fn bind_session(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<String> {
+///
+/// `create_if_unbound` lets a fresh session with no binding left start a new
+/// identity, as Claude's SessionStart does. A live launch always keeps its
+/// process binding, so only `session_start` passes it: after `hcom stop` the
+/// running process must not rejoin from its next tool or prompt hook.
+fn bind_session(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+    create_if_unbound: bool,
+) -> Option<String> {
     let session_id = payload
         .session_id
         .as_deref()
@@ -81,7 +92,7 @@ fn bind_session(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option
         session_id,
         Some(process_id),
         "vibe",
-        true,
+        create_if_unbound,
     ) {
         instance_binding::ToolCheckedBind::Bound(name) => name,
         instance_binding::ToolCheckedBind::Rejected
@@ -98,7 +109,7 @@ fn bind_session(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option
 }
 
 /// The instance for a post-start hook, binding lazily when `session_start`
-/// was missed or the session changed without one.
+/// was missed or the session changed without one. Never creates an identity.
 fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
     let incoming = payload.session_id.as_deref().filter(|sid| !sid.is_empty());
     let mut instance = resolve_instance(db, ctx, payload);
@@ -108,7 +119,7 @@ fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> O
         _ => false,
     };
     if stale {
-        let name = bind_session(db, ctx, payload)?;
+        let name = bind_session(db, ctx, payload, false)?;
         lifecycle::set_status(db, &name, ST_LISTENING, "start", Default::default());
         instance = db.get_instance_full(&name).ok().flatten();
     }
@@ -126,7 +137,7 @@ fn context_output(text: &str) -> Value {
 /// `pre_agent` (ahead of the messages). Only `/clear`, which drops the
 /// conversation, re-sends it here.
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
-    let Some(instance_name) = bind_session(db, ctx, payload) else {
+    let Some(instance_name) = bind_session(db, ctx, payload, true) else {
         return json!({});
     };
     lifecycle::set_status(

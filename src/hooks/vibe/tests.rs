@@ -68,6 +68,72 @@ fn merge_keeps_user_rows_replaces_hcom_rows_and_is_idempotent() {
 }
 
 #[test]
+fn inline_hook_arrays_are_merged_verified_and_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hooks.toml");
+    for (source, user_rows) in [
+        ("hooks = []\n", vec![]),
+        (
+            "hooks = [{ name = \"my-lint\", type = \"post_tool\", command = \"ruff check .\" }]\n",
+            vec!["my-lint".to_string()],
+        ),
+    ] {
+        let mut doc: DocumentMut = source.parse().unwrap();
+        merge_hcom_hooks(&mut doc);
+        assert!(doc.to_string().contains("[[hooks]]\n"), "{doc}");
+        let names = hook_names(&doc);
+        assert_eq!(names[..user_rows.len()], user_rows[..], "{source}");
+        assert_eq!(names.len(), user_rows.len() + VIBE_HOOK_COMMANDS.len());
+        std::fs::write(&path, doc.to_string()).unwrap();
+        assert!(verify_hooks_at(&path), "{source}");
+
+        remove_hcom_hooks(&mut doc);
+        assert_eq!(hook_names(&doc), user_rows, "{source}");
+    }
+
+    // An inline list that already holds hcom's rows verifies as installed.
+    let mut doc = DocumentMut::new();
+    merge_hcom_hooks(&mut doc);
+    let inline: Vec<String> = doc["hooks"]
+        .as_array_of_tables()
+        .unwrap()
+        .iter()
+        .map(|t| t.clone().into_inline_table().to_string())
+        .collect();
+    std::fs::write(&path, format!("hooks = [{}]\n", inline.join(", "))).unwrap();
+    assert!(verify_hooks_at(&path));
+}
+
+#[test]
+fn launch_hooks_path_follows_the_launch_env() {
+    use crate::hooks::runtime::LaunchCtx;
+    let launch = |env: &[(&str, &str)]| LaunchCtx {
+        tool: crate::tool::Tool::Vibe,
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        cwd: std::path::PathBuf::from("/work/proj"),
+        args: Vec::new(),
+        auto_approve: false,
+    };
+    let path = |env: &[(&str, &str)]| super::config::launch_hooks_path(&launch(env));
+    assert_eq!(
+        path(&[("HOME", "/home/u")]),
+        std::path::Path::new("/home/u/.vibe/hooks.toml")
+    );
+    assert_eq!(
+        path(&[("HOME", "/home/u"), ("VIBE_HOME", "/opt/vibe")]),
+        std::path::Path::new("/opt/vibe/hooks.toml")
+    );
+    // Relative to the launch dir, where Vibe resolves it.
+    assert_eq!(
+        path(&[("HOME", "/home/u"), ("VIBE_HOME", "vh")]),
+        std::path::Path::new("/work/proj/vh/hooks.toml")
+    );
+}
+
+#[test]
 fn remove_drops_empty_hooks_array() {
     let mut doc = DocumentMut::new();
     merge_hcom_hooks(&mut doc);
@@ -359,6 +425,35 @@ fn session_end_stops_only_on_own_session_and_not_on_clear() {
             .is_none_or(|row| row.status != ST_LISTENING),
         "exit must stop the instance"
     );
+}
+
+#[test]
+#[serial]
+fn stopped_instance_does_not_rejoin_from_a_later_hook() {
+    let (_dir, db) = make_test_db();
+    let context = ctx("pid-1", "vibe");
+    seed_instance(&db, "luna", "ses-1", "pid-1", ST_LISTENING);
+    crate::hooks::common::stop_instance(&db, "luna", "cli", "stop");
+    insert_message(&db, "bob", "hello after stop");
+
+    for hook_type in ["pre_agent", "post_tool"] {
+        let p = payload(
+            hook_type,
+            json!({"session_id": "ses-1", "prompt": "<hcom>", "tool_name": "bash", "tool_status": "success"}),
+        );
+        let (output, ack) = if hook_type == "pre_agent" {
+            handle_preagent(&db, &context, &p)
+        } else {
+            handle_posttool(&db, &context, &p)
+        };
+        assert_eq!(output, json!({}), "{hook_type}");
+        assert!(ack.is_none(), "{hook_type}");
+    }
+    let rows: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "no identity may be recreated after hcom stop");
 }
 
 #[test]

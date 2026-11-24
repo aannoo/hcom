@@ -202,6 +202,19 @@ fn is_dash_rule(line: &str) -> bool {
     trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
 }
 
+/// Vibe's activity line ends in a parenthesised timer and interrupt hint:
+/// `⠋  Generating… (4s Esc/Ctrl+C to interrupt)`,
+/// `⠶  Generating… (5s Esc to interrupt · Enter to steer)`. Matching the
+/// timer keeps a reply that merely mentions "to interrupt" from reading busy.
+fn is_vibe_activity_line(line: &str) -> bool {
+    line.rsplit_once('(').is_some_and(|(_, hint)| {
+        let after_digits = hint.trim_start_matches(|c: char| c.is_ascii_digit());
+        after_digits.len() < hint.len()
+            && after_digits.starts_with(['s', 'm', 'h'])
+            && hint.contains("Esc")
+    })
+}
+
 /// A `─` rule that may carry a label near its right end (Vibe's
 /// `──── model · mode ─`).
 fn is_labeled_dash_rule(line: &str) -> bool {
@@ -1286,7 +1299,7 @@ impl ScreenTracker {
         let lines = self.get_screen_lines();
         let busy = top
             .checked_sub(1)
-            .is_some_and(|row| lines[row].contains("to interrupt"));
+            .is_some_and(|row| is_vibe_activity_line(&lines[row]));
         (!busy).then_some(text)
     }
 
@@ -2560,6 +2573,19 @@ mod tests {
             ]);
             assert_eq!(t.get_vibe_input_text(), None, "{activity}");
             assert!(!t.is_prompt_empty("vibe"));
+        }
+    }
+
+    #[test]
+    fn vibe_reply_mentioning_interrupt_above_the_composer_is_idle() {
+        for reply in [
+            "  Press Esc to interrupt a running turn.",
+            "  Esc (or Ctrl+C) is how you get to interrupt it.",
+            "  Wait 5s, then press Esc to interrupt",
+        ] {
+            let t = vibe_screen(&[reply, VIBE_TOP_RULE, ">", QODER_RULE, VIBE_STATUS]);
+            assert_eq!(t.get_vibe_input_text().as_deref(), Some(""), "{reply}");
+            assert!(t.is_prompt_empty("vibe"), "{reply}");
         }
     }
 

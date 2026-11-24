@@ -1894,15 +1894,21 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             }
             Some(injection)
         }
-        None if normalized.tool() == Tool::Hermes => {
-            // Installed per profile, so it needs the launch's args and env.
-            crate::hooks::hermes::ensure_installed(&crate::hooks::runtime::LaunchCtx {
+        None if matches!(normalized.tool(), Tool::Hermes | Tool::Vibe) => {
+            // Installed where the child looks (Hermes: per profile, Vibe: its
+            // VIBE_HOME), so it needs the launch's args and env.
+            let ctx = crate::hooks::runtime::LaunchCtx {
                 tool: normalized.tool(),
                 env: base_env.clone(),
                 cwd: canonical_dir.clone(),
                 args: params.args.clone(),
                 auto_approve: hcom_config.auto_approve,
-            })?;
+            };
+            if normalized.tool() == Tool::Hermes {
+                crate::hooks::hermes::ensure_installed(&ctx)?;
+            } else {
+                crate::hooks::vibe::ensure_installed(&ctx)?;
+            }
             None
         }
         None => {

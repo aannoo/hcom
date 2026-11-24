@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
+use crate::hooks::runtime::LaunchCtx;
+
 pub const HOOK_TIMEOUT_SECS: i64 = 30;
 
 /// `(row name, Vibe hook type, hcom hook command)`. Row names must be unique
@@ -107,6 +109,29 @@ fn write_toml(path: &Path, doc: &DocumentMut) -> Result<(), SetupError> {
     })
 }
 
+/// The `hooks` list as `[[hooks]]` tables. Vibe also reads the inline forms
+/// `hooks = []` and `hooks = [{ … }, …]`; those are converted, rows kept in
+/// order. `None` when `hooks` is missing (and `create` is false) or is not a
+/// list of tables.
+fn hooks_tables(doc: &mut DocumentMut, create: bool) -> Option<&mut ArrayOfTables> {
+    let inline = doc.get("hooks").is_some_and(Item::is_array);
+    if inline || (create && !doc.contains_key("hooks")) {
+        // Re-inserted under a fresh key: the inline form's `hooks = ` spacing
+        // would otherwise print as `[[hooks ]]`.
+        let tables = match doc.remove("hooks") {
+            Some(item) if item.as_array().is_some_and(|arr| !arr.is_empty()) => {
+                match item.into_array_of_tables() {
+                    Ok(tables) => Item::ArrayOfTables(tables),
+                    Err(original) => original,
+                }
+            }
+            _ => Item::ArrayOfTables(ArrayOfTables::new()),
+        };
+        doc.insert("hooks", tables);
+    }
+    doc.get_mut("hooks")?.as_array_of_tables_mut()
+}
+
 /// Drop hcom's rows from `[[hooks]]`, keeping every user row in order.
 fn strip_hcom_rows(arr: &mut ArrayOfTables) {
     let mut kept = ArrayOfTables::new();
@@ -123,10 +148,7 @@ fn strip_hcom_rows(arr: &mut ArrayOfTables) {
 }
 
 pub(crate) fn merge_hcom_hooks(doc: &mut DocumentMut) {
-    let hooks = doc
-        .entry("hooks")
-        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
-    let Item::ArrayOfTables(arr) = hooks else {
+    let Some(arr) = hooks_tables(doc, true) else {
         return;
     };
     strip_hcom_rows(arr);
@@ -144,7 +166,7 @@ pub(crate) fn merge_hcom_hooks(doc: &mut DocumentMut) {
 }
 
 pub(crate) fn remove_hcom_hooks(doc: &mut DocumentMut) {
-    let Some(Item::ArrayOfTables(arr)) = doc.get_mut("hooks") else {
+    let Some(arr) = hooks_tables(doc, false) else {
         return;
     };
     strip_hcom_rows(arr);
@@ -154,10 +176,10 @@ pub(crate) fn remove_hcom_hooks(doc: &mut DocumentMut) {
 }
 
 pub(crate) fn verify_hooks_at(path: &Path) -> bool {
-    let Ok(doc) = read_toml_document(path) else {
+    let Ok(mut doc) = read_toml_document(path) else {
         return false;
     };
-    let Some(Item::ArrayOfTables(arr)) = doc.get("hooks") else {
+    let Some(arr) = hooks_tables(&mut doc, false) else {
         return false;
     };
     VIBE_HOOK_COMMANDS.iter().all(|(name, hook_type, command)| {
@@ -195,14 +217,37 @@ fn remove_vibe_hooks_at(path: &Path) -> bool {
 /// Vibe has no permission rules hcom could add, so `_include_permissions` is
 /// ignored.
 pub fn try_setup_vibe_hooks(_include_permissions: bool) -> Result<(), SetupError> {
-    let path = get_vibe_hooks_path();
-    let mut doc = read_toml_document(&path)?;
+    setup_hooks_at(&get_vibe_hooks_path())
+}
+
+fn setup_hooks_at(path: &Path) -> Result<(), SetupError> {
+    let mut doc = read_toml_document(path)?;
     merge_hcom_hooks(&mut doc);
-    write_toml(&path, &doc)?;
-    if !verify_hooks_at(&path) {
-        return Err(SetupError::PostWriteVerifyFailed(path));
+    write_toml(path, &doc)?;
+    if !verify_hooks_at(path) {
+        return Err(SetupError::PostWriteVerifyFailed(path.to_path_buf()));
     }
     Ok(())
+}
+
+/// `hooks.toml` in the Vibe home the launched child will use: `VIBE_HOME`
+/// from the effective launch env (`~/.hcom/env`, caller env; relative to the
+/// launch dir), else `~/.vibe`.
+pub(crate) fn launch_hooks_path(ctx: &LaunchCtx) -> PathBuf {
+    ctx.path_var("VIBE_HOME")
+        .unwrap_or_else(|| ctx.home().join(".vibe"))
+        .join("hooks.toml")
+}
+
+/// Launch-time install (verify first, write only if needed). Strict: the
+/// launch is refused without hooks.
+pub fn ensure_installed(ctx: &LaunchCtx) -> anyhow::Result<()> {
+    let path = launch_hooks_path(ctx);
+    if verify_hooks_at(&path) {
+        return Ok(());
+    }
+    setup_hooks_at(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to setup Vibe hooks: {e}\nRun: hcom hooks add vibe"))
 }
 
 pub fn verify_vibe_hooks_installed(_check_permissions: bool) -> bool {
