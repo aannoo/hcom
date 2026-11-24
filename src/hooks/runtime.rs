@@ -140,10 +140,12 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         // Cursor stays persistent: cursor-agent loads --plugin-dir hooks
         // asynchronously and beforeSubmitPrompt/stop often never fire from them.
         // Hermes has no per-run plugin path; hcom installs into the launch's
-        // profile (`hooks::hermes::ensure_installed`).
+        // profile (`hooks::hermes::ensure_installed`). Vibe has no per-run
+        // hooks flag; its rows live in `$VIBE_HOME/hooks.toml`.
         Tool::Cursor
         | Tool::Gemini
         | Tool::Kimi
+        | Tool::Vibe
         | Tool::Antigravity
         | Tool::Hermes
         | Tool::Adhoc => None,

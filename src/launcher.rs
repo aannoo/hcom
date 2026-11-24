@@ -26,7 +26,7 @@ use crate::tool::Tool;
 use crate::tools::launch_arg_validation::{
     ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
     OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, QODER_REJECTED_ARGS,
-    validate_grok_args, validate_rejected_args,
+    VIBE_REJECTED_ARGS, validate_grok_args, validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -2453,6 +2453,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         ),
         Tool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
         Tool::Qoder => validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS),
+        Tool::Vibe => validate_rejected_args("Vibe", "hcom vibe", args, VIBE_REJECTED_ARGS),
         Tool::Grok => {
             let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
             validate_grok_args(&borrowed)

@@ -191,7 +191,7 @@ fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
         Tool::Antigravity if line.starts_with("> ") || line == ">" => Some(">"),
         Tool::Cursor if line.contains('→') => Some("→"),
         Tool::Copilot if line.contains('❯') => Some("❯"),
-        Tool::Qoder if line.starts_with("> ") || line == ">" => Some(">"),
+        Tool::Qoder | Tool::Vibe if line.starts_with("> ") || line == ">" => Some(">"),
         _ => None,
     }
 }
@@ -200,6 +200,13 @@ fn debug_prompt_glyph(tool: &str, line: &str) -> Option<&'static str> {
 fn is_dash_rule(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
+}
+
+/// A `─` rule that may carry a label near its right end (Vibe's
+/// `──── model · mode ─`).
+fn is_labeled_dash_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("───") && trimmed.ends_with('─')
 }
 
 /// Check if a line is a Gemini dash border (all ─ chars, at least 20 wide)
@@ -788,6 +795,7 @@ impl ScreenTracker {
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
             Ok(Tool::Copilot) => self.get_copilot_input_text(),
             Ok(Tool::Qoder) => self.get_qoder_input_text(),
+            Ok(Tool::Vibe) => self.get_vibe_input_text(),
             // Grok: prompt-empty gate uses generic scrape when available; no
             // tool-specific VT100 input parser yet.
             Ok(Tool::Grok) => None,
@@ -1249,6 +1257,43 @@ impl ScreenTracker {
     /// callers treat as "not safe to inject".
     fn get_qoder_input_text(&self) -> Option<String> {
         const PLACEHOLDER: &str = "Type your message or @path/to/file";
+        let (_, text) = self.get_ruled_composer(is_dash_rule)?;
+        Some(if text == PLACEHOLDER {
+            String::new()
+        } else {
+            text
+        })
+    }
+
+    /// Vibe's composer has Qoder's frame, but the top rule carries the model and
+    /// mode, and there is no placeholder:
+    ///
+    /// ```text
+    /// ──────────────────────────────────────────── mock[off] · accept edits ─
+    /// > draft text
+    /// ────────────────────────────────────────────────────────────────────────
+    /// ~/path/to/cwd                                          ctx        0/68k
+    /// ```
+    ///
+    /// The composer stays drawn (and empty) while a turn runs, with the
+    /// activity line (`⠋ Generating… (4s Esc/Ctrl+C to interrupt)`) directly
+    /// above it from the prompt until the reply. That line reads as busy
+    /// (`None`): Vibe fires no hook when a turn is interrupted, and its idle
+    /// cursor blink defeats output-stability recovery, so the screen is the
+    /// idle signal. An approval dialog replaces the composer (also `None`).
+    fn get_vibe_input_text(&self) -> Option<String> {
+        let (top, text) = self.get_ruled_composer(is_labeled_dash_rule)?;
+        let lines = self.get_screen_lines();
+        let busy = top
+            .checked_sub(1)
+            .is_some_and(|row| lines[row].contains("to interrupt"));
+        (!busy).then_some(text)
+    }
+
+    /// Top-rule row and text of a `>` composer framed by two `─` rules directly
+    /// above the status footer (the last non-empty row). `is_top_rule` matches
+    /// the upper rule.
+    fn get_ruled_composer(&self, is_top_rule: fn(&str) -> bool) -> Option<(usize, String)> {
         let lines = self.get_screen_lines();
         let status = lines.iter().rposition(|line| !line.trim().is_empty())?;
         let bottom = status.checked_sub(1)?;
@@ -1257,7 +1302,7 @@ impl ScreenTracker {
         }
         let top = (bottom.saturating_sub(12)..bottom)
             .rev()
-            .find(|&row| is_dash_rule(&lines[row]))?;
+            .find(|&row| is_top_rule(&lines[row]))?;
         let first = lines.get(top + 1)?.trim_start().strip_prefix('>')?;
         if top + 1 >= bottom {
             return None;
@@ -1266,12 +1311,7 @@ impl ScreenTracker {
         for line in &lines[top + 2..bottom] {
             text.push(trim_with_nbsp(line).to_string());
         }
-        let text = text.join("\n").trim().to_string();
-        Some(if text == PLACEHOLDER {
-            String::new()
-        } else {
-            text
-        })
+        Some((top, text.join("\n").trim().to_string()))
     }
 
     /// Check and perform periodic dump if 5 seconds elapsed
@@ -2455,6 +2495,112 @@ mod tests {
         ]);
         assert_eq!(t.get_qoder_input_text(), None);
         assert!(!t.is_prompt_empty("qoder"));
+    }
+
+    // ---- Vibe input extraction ----
+    // Fixtures are bottom-of-screen captures from vibe 3.1.4 (120 columns,
+    // narrowed to 80 here).
+
+    const VIBE_TOP_RULE: &str =
+        "─────────────────────────────────────────────────── mock[off] · accept edits ─";
+    const VIBE_STATUS: &str =
+        "~/work/dir                                                    ctx        0/68k";
+
+    fn vibe_screen(rows: &[&str]) -> ScreenTracker {
+        let mut t = make_tool_tracker(30, 80, crate::tool::Tool::Vibe);
+        let mut lines = vec![""; 30 - rows.len()];
+        lines.extend_from_slice(rows);
+        render_rows(&mut t, &lines);
+        t
+    }
+
+    #[test]
+    fn vibe_idle_composer_is_empty() {
+        let t = vibe_screen(&[
+            "  Type /help for more information",
+            VIBE_TOP_RULE,
+            ">",
+            QODER_RULE,
+            VIBE_STATUS,
+        ]);
+        assert_eq!(t.get_vibe_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("vibe"));
+    }
+
+    #[test]
+    fn vibe_draft_is_read_and_past_prompts_are_ignored() {
+        let t = vibe_screen(&[
+            "> SLOW please",
+            QODER_RULE,
+            "  MOCK-REPLY",
+            VIBE_TOP_RULE,
+            "> hello draft text",
+            QODER_RULE,
+            VIBE_STATUS,
+        ]);
+        assert_eq!(t.get_vibe_input_text().as_deref(), Some("hello draft text"));
+        assert!(!t.is_prompt_empty("vibe"));
+    }
+
+    #[test]
+    fn vibe_running_turn_is_busy_even_with_an_empty_composer() {
+        for activity in [
+            "⠋  Generating… (4s Esc/Ctrl+C to interrupt)",
+            "⠙  Running command… (12s Esc/Ctrl+C to interrupt)",
+            "⠶  Generating… (5s Esc to interrupt · Enter to steer)",
+        ] {
+            let t = vibe_screen(&[
+                "> SLOW please",
+                QODER_RULE,
+                activity,
+                VIBE_TOP_RULE,
+                ">",
+                QODER_RULE,
+                VIBE_STATUS,
+            ]);
+            assert_eq!(t.get_vibe_input_text(), None, "{activity}");
+            assert!(!t.is_prompt_empty("vibe"));
+        }
+    }
+
+    #[test]
+    fn vibe_reply_mentioning_interrupt_in_scrollback_is_still_idle() {
+        let t = vibe_screen(&[
+            "  Press Esc to interrupt a running turn.",
+            "  MOCK-REPLY",
+            VIBE_TOP_RULE,
+            ">",
+            QODER_RULE,
+            VIBE_STATUS,
+        ]);
+        assert_eq!(t.get_vibe_input_text().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn vibe_approval_dialog_has_no_composer() {
+        let t = vibe_screen(&[
+            "⠐⠒ Running command… (0s Esc/Ctrl+C to interrupt)",
+            "┌──────────────────────────────────────────────────────────────────────────────┐",
+            "│ Permission for the file_system.bash tool (sleep *)                           │",
+            "│   1. Allow once                                                              │",
+            "│ ↑↓/jk navigate  Enter select  Esc reject                                     │",
+            "└──────────────────────────────────────────────────────────────────────────────┘",
+            VIBE_STATUS,
+        ]);
+        assert_eq!(t.get_vibe_input_text(), None);
+    }
+
+    #[test]
+    fn vibe_onboarding_screen_has_no_composer() {
+        let t = vibe_screen(&[
+            "┌──────────────────────────────────────────────────────┐",
+            "│   Welcome to Mistral Vibe - Let's get you started!   │",
+            "└──────────────────────────────────────────────────────┘",
+            "",
+            "                     Enter continue",
+        ]);
+        assert_eq!(t.get_vibe_input_text(), None);
+        assert!(!t.is_prompt_empty("vibe"));
     }
 
     #[test]

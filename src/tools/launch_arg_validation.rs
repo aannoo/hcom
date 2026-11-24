@@ -156,6 +156,51 @@ pub(crate) const KIMI_REJECTED_ARGS: &[RejectedArg] = &[
     },
 ];
 
+const VIBE_HEADLESS_REASON: &str = "runs Vibe headless instead of the interactive TUI";
+
+pub(crate) const VIBE_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "-p",
+        reason: VIBE_HEADLESS_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--prompt",
+        reason: VIBE_HEADLESS_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--prompt-file",
+        reason: VIBE_HEADLESS_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--setup",
+        reason: "sets up an API key and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--check-upgrade",
+        reason: "checks for an update and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "mcp",
+        reason: "manages MCP config without starting a session",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "config",
+        reason: "describes the config without starting a session",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+    RejectedArg {
+        token: "update",
+        reason: "checks for an update and exits",
+        kind: RejectedArgKind::RootSubcommand,
+    },
+];
+
 pub(crate) const QODER_REJECTED_ARGS: &[RejectedArg] = &[
     RejectedArg {
         token: "-p",

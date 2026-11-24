@@ -579,7 +579,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot, .grok",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot, .vibe, .grok",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -640,7 +640,7 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args / hermes_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / vibe_args / grok_args / hermes_args",
         "Default launch args per tool",
     ),
     (
@@ -964,7 +964,7 @@ fn expand_hook_tools(text: &str) -> String {
         .replace("{hookless_list}", &names(&|m| m == HookMode::None, ", "))
 }
 
-// ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder) ─────────────────────
+// ── Tool launch help (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder/vibe) ─────────────────────
 
 /// Resolve the launch-help spec for a CLI name (`claude`, `agy`, …).
 fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::IntegrationSpec> {
@@ -1200,6 +1200,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "copilot",
     "qoder",
     "qodercli",
+    "vibe",
     "grok",
     "grok-build",
     "hermes",

@@ -20,7 +20,7 @@ Use hcom to:
 
 ```bash
 uv tool install hcom
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor, hcom kimi, hcom copilot, hcom qoder, hcom grok, hcom hermes
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor, hcom kimi, hcom copilot, hcom qoder, hcom vibe, hcom grok, hcom hermes
 hcom              # TUI dashboard
 ```
 
@@ -68,7 +68,7 @@ run `hcom --help` for full command syntax and flags.
 
 ---
 
-Works with Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Qoder CLI, Grok Build, Hermes Agent, and other tools
+Works with Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Qoder CLI, Mistral Vibe, Grok Build, Hermes Agent, and other tools
 
 ---
 

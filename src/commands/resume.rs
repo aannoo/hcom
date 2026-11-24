@@ -1728,6 +1728,8 @@ fn extract_cwd_from_transcript(path: &str, tool: Tool) -> Option<String> {
         Tool::Gemini | Tool::Antigravity => recover_gemini_cwd(path),
         Tool::Cursor => recover_cursor_cwd(path),
         Tool::Kimi => None, // Kimi context.jsonl does not store cwd
+        // hcom has no Vibe transcript; the instance row keeps the directory.
+        Tool::Vibe => None,
         Tool::Grok => recover_grok_cwd(path),
         Tool::Copilot => scan_lines_for_cwd(path, 20, |v| {
             v.get("event")

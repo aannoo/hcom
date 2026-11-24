@@ -145,6 +145,7 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             String::new(),
         ),
         Tool::Kimi => (crate::hooks::kimi::dispatch_kimi_hook(hook), String::new()),
+        Tool::Vibe => (crate::hooks::vibe::dispatch_vibe_hook(hook), String::new()),
         Tool::Copilot if hook.starts_with("copilot-ext-") => {
             crate::hooks::copilot::dispatch_copilot_ext(hook, args)
         }
