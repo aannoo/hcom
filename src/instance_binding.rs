@@ -1171,6 +1171,9 @@ pub fn create_orphaned_pty_identity(
         }
     };
 
+    // Same process as before /clear, so it keeps the tag it was launched with.
+    let launch_tag = std::env::var("HCOM_TAG").ok().filter(|tag| !tag.is_empty());
+
     let success = initialize_instance_in_position_file(
         db,
         &name,
@@ -1181,7 +1184,7 @@ pub fn create_orphaned_pty_identity(
         None,
         Some(tool),
         false,
-        None,
+        launch_tag.as_deref(),
         None,
         None,
         None,
@@ -1593,6 +1596,64 @@ mod tests {
         let inst = db.get_instance_full(&name).unwrap().unwrap();
         assert_eq!(inst.tool, "gemini");
         assert_eq!(db.get_session_binding("sess-orphan2").unwrap(), Some(name));
+
+        cleanup(path);
+    }
+
+    /// Register a launched instance, then stop it the way SessionEnd does on /clear.
+    fn launch_then_clear(db: &HcomDb, name: &str, tag: Option<&str>, pid: &str) {
+        assert!(initialize_instance_in_position_file(
+            db,
+            name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            tag,
+            None,
+            None,
+            None,
+            None,
+        ));
+        db.set_process_binding(pid, "", name).unwrap();
+        crate::hooks::common::stop_instance(db, name, "session", "exit:clear");
+        assert_eq!(db.get_process_binding(pid).unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_orphaned_pty_identity_keeps_launch_tag() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let _tag = EnvVarGuard::set("HCOM_TAG", "team_a");
+
+        launch_then_clear(&db, "luna", Some("team_a"), "pid-a");
+        let name =
+            create_orphaned_pty_identity(&db, "sess-after-clear", Some("pid-a"), "claude").unwrap();
+
+        let inst = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(inst.tag.as_deref(), Some("team_a"));
+        assert_eq!(db.get_process_binding("pid-a").unwrap(), Some(name));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_orphaned_pty_identity_untagged_launch_stays_untagged() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let _tag = EnvVarGuard::set("HCOM_TAG", "");
+
+        launch_then_clear(&db, "luna", None, "pid-b");
+        let name =
+            create_orphaned_pty_identity(&db, "sess-after-clear", Some("pid-b"), "claude").unwrap();
+
+        let inst = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(inst.tag, None);
 
         cleanup(path);
     }

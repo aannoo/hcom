@@ -2914,6 +2914,7 @@ pub(crate) fn pin_launch_environment(
         "HCOM_LAUNCHED",
         "HCOM_LAUNCHED_BY",
         "HCOM_LAUNCH_BATCH_ID",
+        "HCOM_TAG",
         "HCOM_DEV_ROOT",
     ] {
         // Clear values inherited from whichever launch started the supervisor.
@@ -3317,7 +3318,7 @@ mod tests {
         std::fs::write(
             &source,
             serde_json::json!({
-                "env": {"CALLER": "kept", "HCOM_PROCESS_ID": "stale"},
+                "env": {"CALLER": "kept", "HCOM_PROCESS_ID": "stale", "HCOM_TAG": "stale"},
                 "hooks": {"Stop": [{"hooks": [{"command": "caller-hook"}]}]},
             })
             .to_string(),
@@ -3331,12 +3332,14 @@ mod tests {
             let env = std::collections::HashMap::from([
                 ("HCOM_PROCESS_ID".to_string(), process.to_string()),
                 ("HCOM_DIR".to_string(), "/tmp/launch-db".to_string()),
+                ("HCOM_TAG".to_string(), format!("tag-{process}")),
             ]);
             pin_launch_environment(&mut args, &env, true).unwrap();
             let settings: Value =
                 serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
             assert_eq!(settings["env"]["HCOM_PROCESS_ID"], process);
             assert_eq!(settings["env"]["HCOM_DIR"], "/tmp/launch-db");
+            assert_eq!(settings["env"]["HCOM_TAG"], format!("tag-{process}"));
             assert_eq!(settings["env"]["HCOM_PTY_MODE"], "1");
             assert_eq!(settings["env"]["HCOM_IS_FORK"], "0");
             assert_eq!(settings["env"]["HCOM_DEV_ROOT"], "");
