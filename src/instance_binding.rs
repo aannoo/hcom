@@ -2010,6 +2010,7 @@ mod tests {
     /// its transaction: a process `hcom stop` detached never attaches to the
     /// session's new owner, while an attached process still binds.
     #[test]
+    #[serial]
     fn test_tool_checked_lazy_bind_requires_attached_process() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();

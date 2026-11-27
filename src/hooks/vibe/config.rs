@@ -202,10 +202,15 @@ pub(crate) fn verify_hooks_at(path: &Path) -> bool {
     })
 }
 
-/// Cleans ~/.vibe, $VIBE_HOME and legacy `<HCOM_DIR parent>/.vibe`.
+/// Cleans ~/.vibe, $VIBE_HOME, legacy `<HCOM_DIR parent>/.vibe` and the home
+/// `hcom hooks add vibe` writes to (a `VIBE_HOME` in `~/.hcom/env` counts).
 pub fn remove_vibe_hooks() -> bool {
-    crate::runtime_env::tool_config_cleanup_dirs(".vibe", "VIBE_HOME")
-        .iter()
+    let mut dirs = crate::runtime_env::tool_config_cleanup_dirs(".vibe", "VIBE_HOME");
+    let configured = vibe_config_dir();
+    if crate::runtime_env::hook_cleanup_allowed(&configured) && !dirs.contains(&configured) {
+        dirs.push(configured);
+    }
+    dirs.iter()
         .filter(|dir| !remove_vibe_hooks_at(&dir.join("hooks.toml")))
         .count()
         == 0

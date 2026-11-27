@@ -175,6 +175,28 @@ fn vibe_home_follows_the_launch_precedence_and_is_absolute() {
 }
 
 #[test]
+#[serial]
+fn hooks_add_and_remove_use_the_home_from_the_hcom_env_file() {
+    use super::{remove_vibe_hooks, try_setup_vibe_hooks};
+    use crate::hooks::test_helpers::{EnvVarGuard, isolated_test_env};
+    let (_dir, hcom_dir, home, _guard) = isolated_test_env();
+    let _vibe_home = EnvVarGuard::unset("VIBE_HOME");
+    let env_file_home = home.join("env-file-vh");
+    std::fs::write(
+        hcom_dir.join("env"),
+        format!("VIBE_HOME={}\n", env_file_home.display()),
+    )
+    .unwrap();
+    let hooks = env_file_home.join("hooks.toml");
+
+    try_setup_vibe_hooks(false).unwrap();
+    assert!(verify_hooks_at(&hooks));
+    assert!(!home.join(".vibe").join("hooks.toml").exists());
+    assert!(remove_vibe_hooks());
+    assert!(!verify_hooks_at(&hooks));
+}
+
+#[test]
 fn remove_drops_empty_hooks_array() {
     let mut doc = DocumentMut::new();
     merge_hcom_hooks(&mut doc);
