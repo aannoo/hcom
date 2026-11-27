@@ -16,11 +16,11 @@ mod config;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use config::vibe_config_dir;
 pub use config::{
     SetupError, ensure_installed, get_vibe_hooks_path, remove_vibe_hooks, try_setup_vibe_hooks,
     verify_vibe_hooks_installed,
 };
+pub(crate) use config::{configured_vibe_home, vibe_config_dir};
 
 use std::io::Write;
 
@@ -74,8 +74,9 @@ fn update_position(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload, instan
 ///
 /// `create_if_unbound` lets a fresh session with no binding left start a new
 /// identity, as Claude's SessionStart does. A live launch always keeps its
-/// process binding, so only `session_start` passes it: after `hcom stop` the
-/// running process must not rejoin from its next tool or prompt hook.
+/// process binding, so only `session_start` passes it: without it the shared
+/// bind requires that binding in its transaction, so after `hcom stop` the
+/// running process does not rejoin from its next tool or prompt hook.
 fn bind_session(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -122,7 +123,6 @@ fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> O
         _ => false,
     };
     if stale {
-        instance_binding::resolve_process_binding(db, ctx.process_id.as_deref())?;
         let name = bind_session(db, ctx, payload, false)?;
         lifecycle::set_status(db, &name, ST_LISTENING, "start", Default::default());
         instance = db.get_instance_full(&name).ok().flatten();

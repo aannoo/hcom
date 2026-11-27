@@ -637,12 +637,7 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         }
         // Matches land on a session's chunk or journal files; the Vibe parser
         // reads any file inside a session directory.
-        TranscriptDiscovery::VibeSessions => vec![
-            env_or_default_dir("VIBE_HOME", home.join(".vibe"))
-                .join("logs")
-                .join("session")
-                .join("unified"),
-        ],
+        TranscriptDiscovery::VibeSessions => vec![vibe::sessions_dir()],
         TranscriptDiscovery::OpenCodeDatabase
         | TranscriptDiscovery::KiloDatabase
         | TranscriptDiscovery::HermesDatabase => Vec::new(),

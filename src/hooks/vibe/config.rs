@@ -52,14 +52,24 @@ pub enum SetupError {
     PostWriteVerifyFailed(PathBuf),
 }
 
-/// Vibe's data root (`VIBE_HOME`, default `~/.vibe`).
+/// Vibe's data root as a launch from here would set it: the configured
+/// `VIBE_HOME` (see [`configured_vibe_home`]), default `~/.vibe`.
 pub(crate) fn vibe_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("VIBE_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
-    }
-    crate::runtime_env::tool_home().join(".vibe")
+    configured_vibe_home().unwrap_or_else(|| crate::runtime_env::tool_home().join(".vibe"))
+}
+
+/// `VIBE_HOME` with the launcher's precedence: a non-empty value in
+/// `~/.hcom/env` wins over the process env. A relative value is made absolute
+/// against the current dir, which is where a launch from here resolves it.
+pub(crate) fn configured_vibe_home() -> Option<PathBuf> {
+    let env_file = crate::config::load_env_extras(&crate::paths::hcom_path(&["env"]));
+    let value = env_file
+        .get("VIBE_HOME")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("VIBE_HOME").ok().filter(|v| !v.is_empty()))?;
+    let path = PathBuf::from(value);
+    Some(std::path::absolute(&path).unwrap_or(path))
 }
 
 pub fn get_vibe_hooks_path() -> PathBuf {

@@ -136,6 +136,45 @@ fn launch_hooks_path_follows_the_launch_env() {
 }
 
 #[test]
+#[serial]
+fn vibe_home_follows_the_launch_precedence_and_is_absolute() {
+    use super::config::{configured_vibe_home, vibe_config_dir};
+    use crate::hooks::test_helpers::{EnvVarGuard, isolated_test_env};
+    let (_dir, hcom_dir, home, _guard) = isolated_test_env();
+    let _vibe_home = EnvVarGuard::unset("VIBE_HOME");
+    assert_eq!(configured_vibe_home(), None);
+    assert_eq!(vibe_config_dir(), home.join(".vibe"));
+
+    let process_home = home.join("process-vh");
+    let _vibe_home = EnvVarGuard::set("VIBE_HOME", &process_home);
+    assert_eq!(vibe_config_dir(), process_home);
+
+    // `~/.hcom/env` wins, as in the launcher; an empty value there does not.
+    let env_file_home = home.join("env-file-vh");
+    let env_file = hcom_dir.join("env");
+    std::fs::write(&env_file, "VIBE_HOME=\n").unwrap();
+    assert_eq!(vibe_config_dir(), process_home);
+    std::fs::write(
+        &env_file,
+        format!("VIBE_HOME={}\n", env_file_home.display()),
+    )
+    .unwrap();
+    assert_eq!(vibe_config_dir(), env_file_home);
+    // Transcript search reads the same store as resume.
+    assert_eq!(
+        crate::transcript::disk_search_roots(crate::tool::Tool::Vibe),
+        vec![env_file_home.join("logs").join("session").join("unified")]
+    );
+
+    // Relative: absolute against the current dir, where a launch from here
+    // resolves it.
+    std::fs::write(&env_file, "VIBE_HOME=rel/vh\n").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(vibe_config_dir(), cwd.join("rel").join("vh"));
+    assert!(vibe_config_dir().is_absolute());
+}
+
+#[test]
 fn remove_drops_empty_hooks_array() {
     let mut doc = DocumentMut::new();
     merge_hcom_hooks(&mut doc);

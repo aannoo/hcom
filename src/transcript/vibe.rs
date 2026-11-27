@@ -26,6 +26,15 @@ use super::shared::{
     tool_input_file, truncate_str,
 };
 
+/// The unified session store (`<VIBE_HOME>/logs/session/unified`). Resume and
+/// `transcript search` both read it, so they find the same sessions.
+pub(crate) fn sessions_dir() -> PathBuf {
+    crate::hooks::vibe::vibe_config_dir()
+        .join("logs")
+        .join("session")
+        .join("unified")
+}
+
 /// The session directory: the nearest ancestor of `path` holding `CURRENT`.
 fn session_dir(path: &Path) -> Option<PathBuf> {
     path.ancestors()
