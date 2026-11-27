@@ -36,6 +36,8 @@ fn shell_only_markers(tool: Tool) -> &'static [&'static str] {
         Tool::Gemini => &["GEMINI_CLI"],
         // Grok sets it on agent terminal children only (`apply_grok_agent_marker`).
         Tool::Grok => &["GROK_AGENT"],
+        // Vibe sets it for its bash tool only, not its hooks (verified 3.1.4).
+        Tool::Vibe => &["VIBE_SESSION"],
         _ => &[],
     }
 }

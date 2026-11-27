@@ -46,7 +46,7 @@ const MESSAGE_FLAGS: &[&str] = &[
 const LIFE_FLAGS: &[&str] = &["action"];
 
 /// File-write tool contexts for SQL filters.
-pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create', 'tool:search_replace', 'tool:MultiEdit', 'tool:patch')";
+pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create', 'tool:search_replace', 'tool:MultiEdit', 'tool:patch', 'tool:file_system.write_file', 'tool:file_system.edit')";
 
 /// Whether `context` is listed in [`FILE_WRITE_CONTEXTS`].
 pub fn is_file_write_context(context: &str) -> bool {
@@ -84,10 +84,14 @@ pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:search_replace",
     "tool:MultiEdit",
     "tool:patch",
+    // Vibe reports qualified tool names.
+    "tool:file_system.write_file",
+    "tool:file_system.edit",
+    "tool:file_system.read_file",
 ];
 
 /// Shell tool contexts.
-pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command', 'tool:terminal')";
+pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command', 'tool:terminal', 'tool:file_system.bash')";
 
 /// Parsed filter values — multiple values per key (OR semantics).
 pub type FilterMap = HashMap<String, Vec<String>>;

@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Hermes, Antigravity, Cursor, Kimi, Copilot, Qoder). Grok has none (see `delivery/grok.rs`).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Hermes, Antigravity, Cursor, Kimi, Copilot, Qoder, Vibe). Grok has none (see `delivery/grok.rs`).
 
 pub mod antigravity;
 pub mod claude;
@@ -19,6 +19,7 @@ pub(crate) mod plugin_rpc;
 pub mod qoder;
 pub mod runtime;
 pub mod utils;
+pub mod vibe;
 
 use serde_json::Value;
 
@@ -253,7 +254,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "hermes", "antigravity", "cursor", "kimi", "copilot", "qoder", "grok").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "hermes", "antigravity", "cursor", "kimi", "copilot", "qoder", "vibe", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -538,6 +539,33 @@ impl HookPayload {
             tool_name: Self::str_field(&raw, &["tool_name"]),
             tool_input: Self::obj_field(&raw, &["tool_input"]),
             tool_result,
+            notification_type: Self::opt_str_field(&raw, &["notification_type"]),
+            raw,
+        }
+    }
+
+    /// Build from Mistral Vibe hook JSON (`hooks.toml` command hooks).
+    ///
+    /// Vibe 3.x sends the session directory as `transcript_path`; its
+    /// `meta.json` stands for the session (see `transcript::vibe`).
+    pub fn from_vibe(hook_type: &str, raw: Value) -> Self {
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcript_path"]).map(|dir| {
+                std::path::Path::new(&dir)
+                    .join("meta.json")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "vibe".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result: Self::str_field(&raw, &["tool_output_text"]),
             notification_type: Self::opt_str_field(&raw, &["notification_type"]),
             raw,
         }

@@ -1498,7 +1498,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot/qoder)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot/qoder/vibe)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),

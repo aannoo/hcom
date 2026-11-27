@@ -5,7 +5,7 @@
 //!
 //! Requires:
 //! - tmux installed and available by default, or another terminal preset via HCOM_TEST_TERMINAL
-//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder)
+//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot/qoder/vibe)
 //!
 //! Phases (claude/gemini/codex/antigravity/cursor/copilot):
 //! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=<terminal>
@@ -102,6 +102,9 @@ fn ready_patterns(tool: &str) -> &'static [&'static str] {
         "cursor" => &[],
         "copilot" => &["/ commands"],
         "qoder" => &["Type your message", "? for shortcuts"],
+        // Vibe's composer parser is its readiness signal (spec ready_patterns
+        // is empty); readiness is asserted via ready/prompt_empty, like cursor.
+        "vibe" => &[],
         _ => panic!("Unknown tool: {tool}"),
     }
 }
@@ -117,6 +120,7 @@ fn prompt_marker(tool: &str) -> &'static str {
         // Copilot 1.0.100+: the input sits in a ┃-bordered box.
         "copilot" => "┃",
         "qoder" => ">",
+        "vibe" => ">",
         _ => panic!("No prompt marker for {tool}"),
     }
 }
@@ -131,6 +135,7 @@ fn frame_marker(tool: &str) -> Option<&'static str> {
         "cursor" => None,
         "copilot" => None,
         "qoder" => Some("─"),
+        "vibe" => Some("─"),
         _ => None,
     }
 }
@@ -148,6 +153,7 @@ fn gate_block_context(tool: &str) -> &'static str {
         "cursor" => "tui:prompt-has-text",
         "copilot" => "tui:prompt-has-text",
         "qoder" => "tui:prompt-has-text",
+        "vibe" => "tui:prompt-has-text",
         _ => panic!("No gate block context for {tool}"),
     }
 }
@@ -611,6 +617,11 @@ fn initial_screen_ready(screen: &serde_json::Value, tool: &str) -> bool {
         return false;
     }
     if tool == "gemini" && screen_has_text(screen, "Executing Hook:") {
+        return false;
+    }
+    // Vibe has no ready patterns: its composer parser is the readiness signal,
+    // so wait until the composer is drawn and empty.
+    if tool == "vibe" && screen["prompt_empty"].as_bool() != Some(true) {
         return false;
     }
     true
@@ -1641,4 +1652,10 @@ fn test_pty_copilot() {
 #[ignore]
 fn test_pty_qoder() {
     run_pty_test("qoder");
+}
+
+#[test]
+#[ignore]
+fn test_pty_vibe() {
+    run_pty_test("vibe");
 }

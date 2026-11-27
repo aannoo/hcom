@@ -426,6 +426,15 @@ const QODER_HOOKS: &[&str] = &[
     "qoder-sessionend",
 ];
 
+const VIBE_HOOKS: &[&str] = &[
+    "vibe-sessionstart",
+    "vibe-preagent",
+    "vibe-pretool",
+    "vibe-posttool",
+    "vibe-notification",
+    "vibe-sessionend",
+];
+
 const COPILOT_HOOKS: &[&str] = &[
     "copilot-sessionstart",
     "copilot-userpromptsubmit",
@@ -535,6 +544,11 @@ const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
     ),
     ("hcom kimi --auto", "Never ask for approval"),
     ("hcom kimi --plan", "Flags forwarded to kimi"),
+];
+
+const VIBE_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom vibe --auto-approve", "Never ask for approval"),
+    ("hcom vibe --agent lean", "Flags forwarded to vibe"),
 ];
 
 const GROK_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -921,6 +935,29 @@ static KIMI_RESUME_FLAGS: ArgFlags = ArgFlags {
         ("-y", "--yolo"),
     ],
     ..ArgFlags::EMPTY
+};
+
+/// Vibe. The initial prompt is positional; `--resume` and `--worktree` take an
+/// optional value.
+static VIBE_RESUME_FLAGS: ArgFlags = ArgFlags {
+    value: &[
+        "--workdir",
+        "--model",
+        "--thinking",
+        "--agent",
+        "--approval-policy",
+        "--enabled-tools",
+        "--disabled-tools",
+        "--add-dir",
+    ],
+    multi_value: &["--resume", "--worktree"],
+    subcommands: &["mcp", "config", "help", "update"],
+    boolean: &["--continue", "--auto-approve", "--smart-approve", "--trust"],
+    drop: &["--resume", "--continue", "--workdir", "--worktree"],
+    repeatable: &["--enabled-tools", "--disabled-tools", "--add-dir"],
+    aliases: &[("-c", "--continue"), ("--yolo", "--auto-approve")],
+    positional_prompt: true,
+    single_dash_long: false,
 };
 
 /// Pi. The initial prompt is positional.
@@ -2246,6 +2283,77 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static VIBE: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Vibe,
+    name: "vibe",
+    label: "Vibe",
+    aliases: &[],
+    cli_binary: "vibe",
+    tui_prefix: "vib ",
+    adhoc_icon: None,
+    released: true,
+    // The composer parser (`get_vibe_input_text`) is the readiness signal: it
+    // only reads a composer once the TUI has drawn one, so onboarding and
+    // trust screens never look ready.
+    ready_patterns: &[],
+    pty: PtySpec {
+        delivery_start_timeout_secs: 30,
+        console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
+    },
+    instance_state_env: &[],
+    detection: DetectionSpec {
+        // Set only in Vibe's shell commands, not in its hooks (verified 3.1.4).
+        markers: &[EnvPredicate::equals("VIBE_SESSION", "1")],
+        ..DetectionSpec::NONE
+    },
+    hooks: HooksSpec {
+        names: VIBE_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        // The screen is the idle signal (see `get_vibe_input_text`): the
+        // composer reads as busy while a turn runs. Hook status alone can stay
+        // `active` forever, since an interrupted turn fires no hook and Vibe's
+        // idle cursor blink defeats output-stability recovery.
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_VIBE_ARGS"),
+        // Vibe's data root (config, hooks.toml, sessions, credentials).
+        config_dir_env: Some("VIBE_HOME"),
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    args: &VIBE_RESUME_FLAGS,
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        // Forking is the interactive `/branch` command only.
+        fork: None,
+        merge: ResumeMerge::Prepend,
+    }),
+    help: HelpSpec {
+        unique_examples: VIBE_HELP_EXAMPLES,
+        extra_env: &[],
+        notes: &[],
+    },
+    // Hook payloads carry qualified tool names (`file_system.bash`).
+    status_detail: StatusDetailSpec {
+        bash: &["file_system.bash"],
+        file: &["file_system.write_file", "file_system.edit"],
+        delegate: &[],
+    },
+};
+
 pub static GROK: IntegrationSpec = IntegrationSpec {
     tool: Tool::Grok,
     name: "grok",
@@ -2384,6 +2492,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &KIMI,
     &COPILOT,
     &QODER,
+    &VIBE,
     &GROK,
     &ADHOC,
 ];
@@ -2405,6 +2514,7 @@ impl Tool {
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
             Tool::Qoder => &QODER,
+            Tool::Vibe => &VIBE,
             Tool::Grok => &GROK,
             Tool::Adhoc => &ADHOC,
         }
@@ -2594,9 +2704,12 @@ mod tests {
                 | Tool::Copilot
                 | Tool::Qoder
                 | Tool::Grok => true,
-                Tool::Gemini | Tool::Antigravity | Tool::Cursor | Tool::Kimi | Tool::Hermes => {
-                    false
-                }
+                Tool::Gemini
+                | Tool::Antigravity
+                | Tool::Cursor
+                | Tool::Kimi
+                | Tool::Vibe
+                | Tool::Hermes => false,
                 Tool::Adhoc => unreachable!(),
             };
             let per_run = crate::hooks::runtime::adapter(spec.tool).is_some();
@@ -2758,7 +2871,8 @@ mod tests {
         assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
         assert!(names.contains(&"hermes"));
-        assert_eq!(names.len(), 14);
+        assert!(names.contains(&"vibe"));
+        assert_eq!(names.len(), 15);
     }
 
     #[test]

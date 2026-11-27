@@ -1698,6 +1698,10 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
                 "/home/user/.grok/sessions/%2Fhome%2Fuser%2Fproj/019f-uuid/updates.jsonl",
                 "grok",
             ),
+            (
+                "/home/user/.vibe/logs/session/unified/0b1c-uuid/meta.json",
+                "vibe",
+            ),
             ("/home/user/.pi/agent/sessions/x/20260603_abc.jsonl", "pi"),
             ("/home/user/.omp/agent/sessions/x/20260603_abc.jsonl", "omp"),
             ("/home/user/.hermes/state.db", "hermes"),

@@ -16,6 +16,7 @@ pub mod kimi;
 pub mod opencode;
 pub mod pi;
 pub mod shared;
+pub mod vibe;
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ pub enum TranscriptBackend {
     PiJsonl,
     GrokUpdatesJsonl,
     HermesSqlite,
+    VibeSessionStore,
 }
 
 impl TranscriptBackend {
@@ -76,6 +78,7 @@ enum TranscriptDiscovery {
     OmpSessions,
     GrokSessions,
     HermesDatabase,
+    VibeSessions,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +154,11 @@ static TRANSCRIPT_PROFILES: &[TranscriptProfile] = &[
         tool: Tool::Qoder,
         backend: TranscriptBackend::ClaudeJsonl,
         discovery: TranscriptDiscovery::QoderProjects,
+    },
+    TranscriptProfile {
+        tool: Tool::Vibe,
+        backend: TranscriptBackend::VibeSessionStore,
+        discovery: TranscriptDiscovery::VibeSessions,
     },
     TranscriptProfile {
         tool: Tool::Grok,
@@ -253,6 +261,9 @@ pub fn read(
         TranscriptBackend::GrokUpdatesJsonl => {
             grok::parse_grok_updates_jsonl_with_usage(path, opts.detailed)
         }
+        TranscriptBackend::VibeSessionStore => {
+            vibe::parse_vibe_session_with_usage(path, opts.detailed)
+        }
         TranscriptBackend::OpenCodeSqlite => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -335,6 +346,9 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
     } else if lower.contains("/.kimi-code/sessions/") || lower.ends_with("/agents/main/wire.jsonl")
     {
         Some(Tool::Kimi)
+    } else if lower.contains("/logs/session/unified/") && file_name == "meta.json" {
+        // Vibe's unified session store; the session's meta.json stands for it.
+        Some(Tool::Vibe)
     } else if lower.contains("/.codex/sessions/")
         || (file_name.starts_with("rollout-") && file_name.ends_with(".jsonl"))
     {
@@ -621,6 +635,9 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         TranscriptDiscovery::GrokSessions => {
             vec![crate::transcript::grok::grok_config_dir().join("sessions")]
         }
+        // Matches land on a session's chunk or journal files; the Vibe parser
+        // reads any file inside a session directory.
+        TranscriptDiscovery::VibeSessions => vec![vibe::sessions_dir()],
         TranscriptDiscovery::OpenCodeDatabase
         | TranscriptDiscovery::KiloDatabase
         | TranscriptDiscovery::HermesDatabase => Vec::new(),

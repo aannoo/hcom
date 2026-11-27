@@ -746,6 +746,12 @@ fn bind_session_to_process_inner(
 /// The ownership checks and the existing binding operation share one SQLite
 /// transaction. A disagreement therefore rolls back any mutation performed by
 /// `bind_session_to_process`, including placeholder retirement and rebinding.
+///
+/// `create_if_unbound` is the session-start bind: with nothing to bind, a new
+/// identity is created. Without it (a lazy bind from a later hook) only a
+/// process that is still attached binds. `hcom stop` drops the process binding,
+/// and checking it in this transaction keeps a stop that commits first from
+/// being undone by a hook already in flight.
 pub fn bind_session_to_process_for_tool(
     db: &HcomDb,
     session_id: &str,
@@ -793,6 +799,16 @@ pub fn bind_session_to_process_for_tool(
                 if !owner_matches("process", &name, tool.as_deref()) {
                     return ToolCheckedBind::Rejected;
                 }
+            }
+            Ok(None) if !create_if_unbound => {
+                crate::log::log_info(
+                    "binding",
+                    "bind_for_tool.process_detached",
+                    &format!(
+                        "session_id={session_id} process_id={pid} expected_tool={expected_tool}"
+                    ),
+                );
+                return ToolCheckedBind::Unbound;
             }
             Ok(None) => {}
             Err(error) => {
@@ -1987,6 +2003,49 @@ mod tests {
                 .is_none()
         );
         assert!(db.conn().is_autocommit());
+        cleanup(path);
+    }
+
+    /// A lazy bind (no `create_if_unbound`) checks the process binding inside
+    /// its transaction: a process `hcom stop` detached never attaches to the
+    /// session's new owner, while an attached process still binds.
+    #[test]
+    #[serial]
+    fn test_tool_checked_lazy_bind_requires_attached_process() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let row = |status: &str| {
+            serde_json::json!({"tool": "vibe", "created_at": 1.0, "status": status})
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        // `luna` was resumed into pid-2 and owns ses-1; pid-1 was stopped.
+        db.save_instance_named("luna", &row("listening")).unwrap();
+        db.rebind_session("ses-1", "luna").unwrap();
+        db.set_process_binding("pid-2", "ses-1", "luna").unwrap();
+
+        assert_eq!(
+            bind_session_to_process_for_tool(&db, "ses-1", Some("pid-1"), "vibe", false),
+            ToolCheckedBind::Unbound
+        );
+        assert_eq!(db.get_process_binding("pid-1").unwrap(), None);
+        assert_eq!(
+            db.get_process_binding("pid-2").unwrap().as_deref(),
+            Some("luna")
+        );
+        assert!(db.conn().is_autocommit());
+
+        db.save_instance_named("nova", &row("pending")).unwrap();
+        db.set_process_binding("pid-3", "", "nova").unwrap();
+        assert_eq!(
+            bind_session_to_process_for_tool(&db, "ses-3", Some("pid-3"), "vibe", false),
+            ToolCheckedBind::Bound("nova".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-3").unwrap().as_deref(),
+            Some("nova")
+        );
         cleanup(path);
     }
 
